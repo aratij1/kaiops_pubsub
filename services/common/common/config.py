@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     context_agent_url: str = Field(default="http://context-agent:8000", alias="CONTEXT_AGENT_URL")
     approval_service_url: str = Field(default="http://approval-service:8000", alias="APPROVAL_SERVICE_URL")
     kafka_enabled: bool = Field(default=True, alias="KAFKA_ENABLED")
+    kafka_startup_attempts: int = Field(default=30, alias="KAFKA_STARTUP_ATTEMPTS")
+    kafka_startup_retry_seconds: float = Field(default=2.0, alias="KAFKA_STARTUP_RETRY_SECONDS")
     database_enabled: bool = Field(default=True, alias="DATABASE_ENABLED")
     local_llm_endpoint: str = Field(default="http://ollama:11434", alias="LOCAL_LLM_ENDPOINT")
 

@@ -1,5 +1,3 @@
-version: "3.9"
-
 x-service-env: &service-env
   KAFKA_BOOTSTRAP_SERVERS: kafka:9092
   REDIS_URL: redis://redis:6379/0
@@ -24,10 +22,20 @@ services:
     ports: ["5432:5432"]
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kaiops -d kaiops"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   redis:
     image: redis:7
     ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.7.1
@@ -45,6 +53,12 @@ services:
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
 
   monitoring-adapter:
     build: *service-build
@@ -52,7 +66,10 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/services/monitoring-adapter
     ports: ["8001:8000"]
-    depends_on: [kafka, postgres, redis]
+    depends_on:
+      kafka: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
 
   alert-intelligence:
     build: *service-build
@@ -60,7 +77,10 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/services/alert-intelligence
     ports: ["8002:8000"]
-    depends_on: [kafka, postgres, redis]
+    depends_on:
+      kafka: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
 
   orchestrator:
     build: *service-build
@@ -68,7 +88,10 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/services/orchestrator
     ports: ["8003:8000"]
-    depends_on: [kafka, context-agent]
+    depends_on:
+      kafka: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      context-agent: { condition: service_started }
 
   context-agent:
     build: *service-build
@@ -76,7 +99,9 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/services/context-agent
     ports: ["8004:8000"]
-    depends_on: [kafka, postgres]
+    depends_on:
+      kafka: { condition: service_healthy }
+      postgres: { condition: service_healthy }
 
   model-router:
     build: *service-build
@@ -84,6 +109,9 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/services/model-router
     ports: ["8005:8000"]
+    depends_on:
+      kafka: { condition: service_healthy }
+      postgres: { condition: service_healthy }
 
   resolution-agent:
     build: *service-build
@@ -91,7 +119,10 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/services/resolution-agent
     ports: ["8006:8000"]
-    depends_on: [kafka, model-router, postgres]
+    depends_on:
+      kafka: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      model-router: { condition: service_started }
 
   approval-service:
     build: *service-build
@@ -99,7 +130,9 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/services/approval-service
     ports: ["8007:8000"]
-    depends_on: [kafka, postgres]
+    depends_on:
+      kafka: { condition: service_healthy }
+      postgres: { condition: service_healthy }
 
   remediation-engine:
     build: *service-build
@@ -107,7 +140,9 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/services/remediation-engine
     ports: ["8008:8000"]
-    depends_on: [kafka, postgres]
+    depends_on:
+      kafka: { condition: service_healthy }
+      postgres: { condition: service_healthy }
 
   closure-service:
     build: *service-build
@@ -115,7 +150,9 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/services/closure-service
     ports: ["8009:8000"]
-    depends_on: [kafka, postgres]
+    depends_on:
+      kafka: { condition: service_healthy }
+      postgres: { condition: service_healthy }
 
   ui:
     build: *service-build
@@ -125,7 +162,9 @@ services:
     command: ["streamlit", "run", "app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
     working_dir: /app/services/ui
     ports: ["8501:8501"]
-    depends_on: [approval-service, monitoring-adapter]
+    depends_on:
+      approval-service: { condition: service_started }
+      monitoring-adapter: { condition: service_started }
 
 volumes:
   postgres-data:

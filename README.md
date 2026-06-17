@@ -75,6 +75,15 @@ pytest
 docker compose up --build
 ```
 
+If a service logs `Unable connect to "kafka:9092"` during Docker startup, Kafka
+is still booting. The Compose file includes Kafka health checks and app-level
+startup retries; after pulling the latest code, restart cleanly:
+
+```bash
+docker compose down
+docker compose up --build
+```
+
 If your editor reports `import common.embeddings cannot be resolved`, make sure it
 is using the `.venv` interpreter created above. The repository also includes
 `pyrightconfig.json` with monorepo `extraPaths` for Cursor/Pylance.
