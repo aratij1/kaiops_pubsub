@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from context_agent import ContextIntelligenceAgent
 from common.config import get_settings
 from common.models import Alert, Context, Incident
 from common.service import create_app
 from common.topics import CONTEXT_EVENTS
+from context_agent import ContextIntelligenceAgent
 
 settings = get_settings()
 settings.service_name = "context-agent"

@@ -58,9 +58,7 @@ class IncidentRepository:
         )
 
     async def get_incident(self, incident_id: str) -> dict[str, Any] | None:
-        result = await self.session.execute(
-            select(IncidentRecord).where(IncidentRecord.id == incident_id)
-        )
+        result = await self.session.execute(select(IncidentRecord).where(IncidentRecord.id == incident_id))
         record = result.scalar_one_or_none()
         return record.payload if record else None
 

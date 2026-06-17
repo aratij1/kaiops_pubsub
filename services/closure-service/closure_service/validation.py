@@ -23,8 +23,7 @@ class ClosureValidationAgent:
             alerts_cleared=validation["alerts_cleared"],
             health_restored=restored,
             knowledge_base_entry=(
-                f"Incident {action.incident_id} resolved via {action.action_type}. "
-                f"Validation: {validation}."
+                f"Incident {action.incident_id} resolved via {action.action_type}. Validation: {validation}."
             ),
             lessons_learned=[
                 "Compare alert onset with deployment/change windows.",

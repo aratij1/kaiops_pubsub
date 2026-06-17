@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from pydantic import BaseModel
-
 from common.config import get_settings
 from common.models import AlertSeverity
 from common.service import create_app
 from model_router import ModelRouter, ModelTask
+from pydantic import BaseModel
 
 settings = get_settings()
 settings.service_name = "model-router"

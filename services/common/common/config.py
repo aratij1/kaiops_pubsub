@@ -19,9 +19,7 @@ class Settings(BaseSettings):
     otlp_endpoint: str | None = Field(default=None, alias="OTEL_EXPORTER_OTLP_ENDPOINT")
     model_router_url: str = Field(default="http://model-router:8000", alias="MODEL_ROUTER_URL")
     context_agent_url: str = Field(default="http://context-agent:8000", alias="CONTEXT_AGENT_URL")
-    approval_service_url: str = Field(
-        default="http://approval-service:8000", alias="APPROVAL_SERVICE_URL"
-    )
+    approval_service_url: str = Field(default="http://approval-service:8000", alias="APPROVAL_SERVICE_URL")
     kafka_enabled: bool = Field(default=True, alias="KAFKA_ENABLED")
     database_enabled: bool = Field(default=True, alias="DATABASE_ENABLED")
     local_llm_endpoint: str = Field(default="http://ollama:11434", alias="LOCAL_LLM_ENDPOINT")

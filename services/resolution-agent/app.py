@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import FastAPI
-
 from common.config import get_settings
 from common.kafka import KafkaConsumer, consume_forever
 from common.models import Context, Incident, Recommendation
@@ -11,6 +9,7 @@ from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
 from common.topics import CONTEXT_EVENTS, RESOLUTION_EVENTS
+from fastapi import FastAPI
 from resolution_agent import ResolutionIntelligenceAgent
 
 settings = get_settings()

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from prometheus_client import Counter, Histogram, generate_latest
-from starlette.responses import Response
-
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from prometheus_client import Counter, Histogram, generate_latest
+from starlette.responses import Response
 
 from common.config import Settings
 

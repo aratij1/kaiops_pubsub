@@ -3,15 +3,14 @@ from __future__ import annotations
 import asyncio
 from uuid import UUID
 
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
-
 from common.config import get_settings
 from common.kafka import KafkaConsumer, consume_forever
 from common.models import Approval, ApprovalDecision
 from common.repository import IncidentRepository
 from common.service import create_app
 from common.topics import APPROVAL_EVENTS, RESOLUTION_EVENTS
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
 
 settings = get_settings()
 settings.service_name = "approval-service"

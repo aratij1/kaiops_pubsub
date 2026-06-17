@@ -3,14 +3,13 @@ from __future__ import annotations
 import asyncio
 
 import httpx
-from fastapi import FastAPI
-
 from common.config import get_settings
 from common.kafka import KafkaConsumer, consume_forever
 from common.models import Alert, Incident
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
 from common.topics import ENRICHED_ALERTS
+from fastapi import FastAPI
 from orchestrator import OrchestratorAgent
 
 settings = get_settings()

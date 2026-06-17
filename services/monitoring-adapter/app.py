@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from fastapi import Body
-
 from common.config import get_settings
 from common.models import Alert, AlertSeverity
 from common.service import create_app
 from common.topics import RAW_ALERTS
+from fastapi import Body
+
+ALERT_BODY = Body(...)
 
 settings = get_settings()
 settings.service_name = "monitoring-adapter"
@@ -13,7 +14,7 @@ app = create_app(title="KaiOps Monitoring Adapter", settings=settings)
 
 
 @app.post("/alerts", response_model=Alert)
-async def ingest_alert(payload: dict = Body(...)) -> Alert:
+async def ingest_alert(payload: dict = ALERT_BODY) -> Alert:
     alert = Alert(
         source=payload.get("source", payload.get("generatorURL", "unknown")),
         name=payload.get("name", payload.get("alertname", "unknown-alert")),

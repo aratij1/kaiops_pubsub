@@ -1,5 +1,4 @@
 import pytest
-
 from common.models import AlertSeverity
 from model_router import ModelRouter, ModelTask
 

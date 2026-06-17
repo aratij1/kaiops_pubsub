@@ -1,5 +1,4 @@
 import pytest
-
 from closure_service import ClosureValidationAgent
 from common.models import Approval, ApprovalDecision, RemediationStatus
 from remediation_engine import RemediationEngine

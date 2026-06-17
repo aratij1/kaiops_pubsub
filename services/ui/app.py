@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from uuid import UUID
 
 import httpx
 import streamlit as st

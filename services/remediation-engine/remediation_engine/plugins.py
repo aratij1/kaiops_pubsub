@@ -11,8 +11,7 @@ from common.resilience import CircuitBreaker, circuit_breaker
 class RemediationPlugin(Protocol):
     action_type: str
 
-    async def execute(self, action: RemediationAction) -> RemediationAction:
-        ...
+    async def execute(self, action: RemediationAction) -> RemediationAction: ...
 
 
 @dataclass
@@ -79,6 +78,7 @@ class RemediationEngine:
             "restart_service": AnsibleRemediationPlugin(),
             "clear_cache": ApiExecutionPlugin(),
             "failover_database": ApiExecutionPlugin(),
+            "api_execution": ApiExecutionPlugin(),
             "terraform_rollback": TerraformRollbackPlugin(),
         }
     )

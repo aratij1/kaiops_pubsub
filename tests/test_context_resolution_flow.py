@@ -1,5 +1,4 @@
 import pytest
-
 from common.models import Alert, AlertSeverity, Incident
 from context_agent import ContextIntelligenceAgent
 from resolution_agent import ResolutionIntelligenceAgent

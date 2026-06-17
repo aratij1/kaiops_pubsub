@@ -34,9 +34,7 @@ class AlertIntelligenceAgent:
         best_match: Alert | None = None
         best_score = 0.0
         for candidate in self._recent_alerts:
-            candidate_score = cosine_similarity(
-                vector, self.embedding_model.embed(self._correlation_text(candidate))
-            )
+            candidate_score = cosine_similarity(vector, self.embedding_model.embed(self._correlation_text(candidate)))
             if candidate_score > best_score:
                 best_match = candidate
                 best_score = candidate_score
@@ -89,9 +87,7 @@ class AlertIntelligenceAgent:
         return self.enrich_alert(alert)
 
     def _fingerprint(self, alert: Alert) -> str:
-        stable = "|".join(
-            [alert.source, alert.name, alert.service, alert.environment, alert.labels.get("pod", "")]
-        )
+        stable = "|".join([alert.source, alert.name, alert.service, alert.environment, alert.labels.get("pod", "")])
         return hashlib.sha256(stable.encode("utf-8")).hexdigest()
 
     def _correlation_text(self, alert: Alert) -> str:

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import FastAPI
-
 from common.config import get_settings
 from common.kafka import KafkaConsumer, consume_forever
 from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus
@@ -11,6 +9,7 @@ from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
 from common.topics import APPROVAL_EVENTS, REMEDIATION_EVENTS
+from fastapi import FastAPI
 from remediation_engine import RemediationEngine
 
 settings = get_settings()

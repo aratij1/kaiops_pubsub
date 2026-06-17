@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from typing import Any, TypedDict
 
-from langgraph.graph import END, StateGraph
-
 from common.models import AlertSeverity, Context, Recommendation
+from langgraph.graph import END, StateGraph
 from model_router import ModelRouter, ModelTask
 
 

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import FastAPI
-
 from closure_service import ClosureValidationAgent
 from common.config import get_settings
 from common.kafka import KafkaConsumer, consume_forever
@@ -12,6 +10,7 @@ from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
 from common.topics import CLOSURE_EVENTS, REMEDIATION_EVENTS
+from fastapi import FastAPI
 
 settings = get_settings()
 settings.service_name = "closure-service"

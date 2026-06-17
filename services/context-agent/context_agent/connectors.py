@@ -119,20 +119,20 @@ class ContextIntelligenceAgent:
 
     async def collect(self, alert: Alert, incident: Incident) -> Context:
         results = await asyncio.gather(
-            *[retry_async(lambda connector=connector: connector.fetch(alert, incident)) for connector in self.connectors]
+            *[
+                retry_async(lambda connector=connector: connector.fetch(alert, incident))
+                for connector in self.connectors
+            ]
         )
         by_name = {connector.name: result for connector, result in zip(self.connectors, results, strict=True)}
         vector_matches = by_name["vector-db"]["matches"]
         runbook = next((doc["content"] for doc in vector_matches if doc["kind"] == "runbook"), "")
         related = [doc for doc in vector_matches if doc["kind"] == "incident"]
-        deployment = (
-            by_name["jenkins"].get("recent_deployments", [{}])[0].get("version")
-            or alert.labels.get("deployment")
+        deployment = by_name["jenkins"].get("recent_deployments", [{}])[0].get("version") or alert.labels.get(
+            "deployment"
         )
         dependencies = by_name["cmdb"].get("dependencies", [])
-        recent_changes = by_name["servicenow"].get("change_records", []) + by_name["github"].get(
-            "recent_commits", []
-        )
+        recent_changes = by_name["servicenow"].get("change_records", []) + by_name["github"].get("recent_commits", [])
         return Context(
             incident_id=incident.id,
             alert=alert,
