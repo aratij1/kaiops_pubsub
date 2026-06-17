@@ -105,6 +105,23 @@ streamlit run services/ui/app.py
 On PowerShell, use `$env:KAFKA_ENABLED="false"` and
 `$env:DATABASE_ENABLED="false"` instead of `export`.
 
+Windows users can start the local demo services and UI with:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+.\scripts\run-local-windows.ps1
+```
+
+This opens separate terminals for:
+
+- `monitoring-adapter` on <http://localhost:8001>
+- `approval-service` on <http://localhost:8007>
+- Streamlit UI on <http://localhost:8501>
+
+If Streamlit shows `WinError 10061`, the target FastAPI service is not running
+on the expected port. Start it with the helper script above or run the service
+manually in a separate terminal.
+
 ## Kubernetes
 
 ```bash
