@@ -122,6 +122,19 @@ If Streamlit shows `WinError 10061`, the target FastAPI service is not running
 on the expected port. Start it with the helper script above or run the service
 manually in a separate terminal.
 
+When running locally with `KAFKA_ENABLED=false`, `POST /sample/payment-latency`
+only creates and publishes the alert through the monitoring adapter. Because
+Kafka is disabled, no downstream service will consume `raw-alerts`. For a local
+end-to-end demo without Kafka, use the Streamlit **Run payment latency
+workflow** button or call:
+
+```powershell
+Invoke-RestMethod -Method Post http://localhost:8001/sample/payment-latency/workflow
+```
+
+That local endpoint runs alert intelligence, orchestration, context collection,
+and resolution recommendation generation in-process for demo purposes.
+
 ## Kubernetes
 
 ```bash
