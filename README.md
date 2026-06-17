@@ -121,6 +121,13 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 .\scripts\run-local-windows.ps1
 ```
 
+If your local Docker/UI still shows old behavior, follow
+[`docs/WINDOWS_UPDATE_AND_RUN.md`](docs/WINDOWS_UPDATE_AND_RUN.md) and run:
+
+```powershell
+.\scripts\verify-local-update.ps1
+```
+
 This opens separate terminals for:
 
 - `monitoring-adapter` on <http://localhost:8001>
