@@ -5,8 +5,19 @@ import os
 import httpx
 import streamlit as st
 
-API_BASE = os.getenv("APPROVAL_SERVICE_URL", "http://approval-service:8000")
-MONITORING_BASE = os.getenv("MONITORING_ADAPTER_URL", "http://monitoring-adapter:8000")
+API_BASE = os.getenv("APPROVAL_SERVICE_URL", "http://localhost:8007")
+MONITORING_BASE = os.getenv("MONITORING_ADAPTER_URL", "http://localhost:8001")
+
+
+def request_json(method: str, url: str, **kwargs) -> dict:
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.request(method, url, **kwargs)
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPError as exc:
+        st.error(f"Unable to reach {url}. Is the target FastAPI service running? {exc}")
+        return {}
 
 st.set_page_config(page_title="KaiOps Incident Resolution", layout="wide")
 st.title("KaiOps Agentic Incident Resolution Platform")
@@ -14,9 +25,7 @@ st.title("KaiOps Agentic Incident Resolution Platform")
 with st.sidebar:
     st.header("Sample Flow")
     if st.button("Inject payment latency alert"):
-        with httpx.Client(timeout=10.0) as client:
-            response = client.post(f"{MONITORING_BASE}/sample/payment-latency")
-            st.json(response.json())
+        st.json(request_json("POST", f"{MONITORING_BASE}/sample/payment-latency"))
 
 tab_alerts, tab_incidents, tab_rca, tab_approval, tab_remediation, tab_closed = st.tabs(
     [
@@ -35,9 +44,7 @@ with tab_alerts:
 with tab_incidents:
     incident_id = st.text_input("Incident ID")
     if incident_id:
-        with httpx.Client(timeout=10.0) as client:
-            response = client.get(f"{API_BASE}/incident/{incident_id}")
-            st.json(response.json())
+        st.json(request_json("GET", f"{API_BASE}/incident/{incident_id}"))
 
 with tab_rca:
     st.write("Resolution reports include root cause, impact, recommended action, and confidence score.")
@@ -58,15 +65,12 @@ with tab_approval:
         "comment": action,
     }
     if col1.button("Approve", disabled=not approval_incident_id or not recommendation_id):
-        with httpx.Client(timeout=10.0) as client:
-            st.json(client.post(f"{API_BASE}/approve", json=payload).json())
+        st.json(request_json("POST", f"{API_BASE}/approve", json=payload))
     if col2.button("Reject", disabled=not approval_incident_id or not recommendation_id):
-        with httpx.Client(timeout=10.0) as client:
-            st.json(client.post(f"{API_BASE}/reject", json=payload).json())
+        st.json(request_json("POST", f"{API_BASE}/reject", json=payload))
     if col3.button("Modify", disabled=not approval_incident_id or not recommendation_id):
         payload["modified_action"] = action
-        with httpx.Client(timeout=10.0) as client:
-            st.json(client.post(f"{API_BASE}/modify", json=payload).json())
+        st.json(request_json("POST", f"{API_BASE}/modify", json=payload))
 
 with tab_remediation:
     st.write("Remediation events are published to remediation-events and persisted in the actions table.")

@@ -92,6 +92,19 @@ Service ports:
 - Remediation engine: <http://localhost:8008>
 - Closure service: <http://localhost:8009>
 
+For local non-Docker UI runs, start the backing API services in separate
+terminals before using the dashboard buttons. For example:
+
+```bash
+export KAFKA_ENABLED=false
+export DATABASE_ENABLED=false
+uvicorn app:app --host 0.0.0.0 --port 8001 --app-dir services/monitoring-adapter
+streamlit run services/ui/app.py
+```
+
+On PowerShell, use `$env:KAFKA_ENABLED="false"` and
+`$env:DATABASE_ENABLED="false"` instead of `export`.
+
 ## Kubernetes
 
 ```bash
