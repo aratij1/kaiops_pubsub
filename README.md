@@ -75,6 +75,19 @@ pytest
 docker compose up --build
 ```
 
+If a service logs `Unable connect to "kafka:9092"` during Docker startup, Kafka
+is still booting. The Compose file includes Kafka health checks and app-level
+startup retries; after pulling the latest code, restart cleanly:
+
+```bash
+docker compose down
+docker compose up --build
+```
+
+If your editor reports `import common.embeddings cannot be resolved`, make sure it
+is using the `.venv` interpreter created above. The repository also includes
+`pyrightconfig.json` with monorepo `extraPaths` for Cursor/Pylance.
+
 Service ports:
 
 - UI: <http://localhost:8501>
@@ -87,6 +100,56 @@ Service ports:
 - Approval service: <http://localhost:8007>
 - Remediation engine: <http://localhost:8008>
 - Closure service: <http://localhost:8009>
+
+For local non-Docker UI runs, start the backing API services in separate
+terminals before using the dashboard buttons. For example:
+
+```bash
+export KAFKA_ENABLED=false
+export DATABASE_ENABLED=false
+uvicorn app:app --host 0.0.0.0 --port 8001 --app-dir services/monitoring-adapter
+streamlit run services/ui/app.py
+```
+
+On PowerShell, use `$env:KAFKA_ENABLED="false"` and
+`$env:DATABASE_ENABLED="false"` instead of `export`.
+
+Windows users can start the local demo services and UI with:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+.\scripts\run-local-windows.ps1
+```
+
+If your local Docker/UI still shows old behavior, follow
+[`docs/WINDOWS_UPDATE_AND_RUN.md`](docs/WINDOWS_UPDATE_AND_RUN.md) and run:
+
+```powershell
+.\scripts\verify-local-update.ps1
+```
+
+This opens separate terminals for:
+
+- `monitoring-adapter` on <http://localhost:8001>
+- `approval-service` on <http://localhost:8007>
+- Streamlit UI on <http://localhost:8501>
+
+If Streamlit shows `WinError 10061`, the target FastAPI service is not running
+on the expected port. Start it with the helper script above or run the service
+manually in a separate terminal.
+
+When running locally with `KAFKA_ENABLED=false`, `POST /sample/payment-latency`
+only creates and publishes the alert through the monitoring adapter. Because
+Kafka is disabled, no downstream service will consume `raw-alerts`. For a local
+end-to-end demo without Kafka, use the Streamlit **Run payment latency
+workflow** button or call:
+
+```powershell
+Invoke-RestMethod -Method Post http://localhost:8001/sample/payment-latency/workflow
+```
+
+That local endpoint runs alert intelligence, orchestration, context collection,
+and resolution recommendation generation in-process for demo purposes.
 
 ## Kubernetes
 

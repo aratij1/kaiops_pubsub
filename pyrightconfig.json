@@ -1,0 +1,17 @@
+{
+  "include": ["services", "tests"],
+  "extraPaths": [
+    "services/common",
+    "services/alert-intelligence",
+    "services/context-agent",
+    "services/model-router",
+    "services/resolution-agent",
+    "services/orchestrator",
+    "services/approval-service",
+    "services/remediation-engine",
+    "services/closure-service",
+    "services/monitoring-adapter"
+  ],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic"
+}

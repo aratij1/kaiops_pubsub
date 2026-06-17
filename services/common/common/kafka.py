@@ -34,11 +34,32 @@ class KafkaProducer:
     async def start(self) -> None:
         if not self._settings.kafka_enabled:
             return
-        self._producer = AIOKafkaProducer(
-            bootstrap_servers=self._settings.kafka_bootstrap_servers,
-            value_serializer=lambda value: json.dumps(value, default=str).encode("utf-8"),
-        )
-        await self._producer.start()
+        last_error: Exception | None = None
+        for attempt in range(1, self._settings.kafka_startup_attempts + 1):
+            producer = AIOKafkaProducer(
+                bootstrap_servers=self._settings.kafka_bootstrap_servers,
+                value_serializer=lambda value: json.dumps(value, default=str).encode("utf-8"),
+            )
+            try:
+                await producer.start()
+                self._producer = producer
+                logger.info("connected kafka producer", extra={"bootstrap": self._settings.kafka_bootstrap_servers})
+                return
+            except Exception as exc:
+                last_error = exc
+                await producer.stop()
+                logger.warning(
+                    "kafka producer not ready; retrying",
+                    extra={
+                        "attempt": attempt,
+                        "attempts": self._settings.kafka_startup_attempts,
+                        "bootstrap": self._settings.kafka_bootstrap_servers,
+                        "error": str(exc),
+                    },
+                )
+                await asyncio.sleep(self._settings.kafka_startup_retry_seconds)
+        assert last_error is not None
+        raise last_error
 
     async def stop(self) -> None:
         if self._producer is not None:
@@ -66,14 +87,39 @@ class KafkaConsumer:
     async def start(self) -> None:
         if not self._settings.kafka_enabled:
             return
-        self._consumer = AIOKafkaConsumer(
-            self._topic,
-            bootstrap_servers=self._settings.kafka_bootstrap_servers,
-            group_id=self._settings.kafka_group_id,
-            value_deserializer=lambda value: json.loads(value.decode("utf-8")),
-            enable_auto_commit=True,
-        )
-        await self._consumer.start()
+        last_error: Exception | None = None
+        for attempt in range(1, self._settings.kafka_startup_attempts + 1):
+            consumer = AIOKafkaConsumer(
+                self._topic,
+                bootstrap_servers=self._settings.kafka_bootstrap_servers,
+                group_id=self._settings.kafka_group_id,
+                value_deserializer=lambda value: json.loads(value.decode("utf-8")),
+                enable_auto_commit=True,
+            )
+            try:
+                await consumer.start()
+                self._consumer = consumer
+                logger.info(
+                    "connected kafka consumer",
+                    extra={"topic": self._topic, "bootstrap": self._settings.kafka_bootstrap_servers},
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                await consumer.stop()
+                logger.warning(
+                    "kafka consumer not ready; retrying",
+                    extra={
+                        "topic": self._topic,
+                        "attempt": attempt,
+                        "attempts": self._settings.kafka_startup_attempts,
+                        "bootstrap": self._settings.kafka_bootstrap_servers,
+                        "error": str(exc),
+                    },
+                )
+                await asyncio.sleep(self._settings.kafka_startup_retry_seconds)
+        assert last_error is not None
+        raise last_error
 
     async def stop(self) -> None:
         if self._consumer is not None:
