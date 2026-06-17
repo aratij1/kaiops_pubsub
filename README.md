@@ -75,6 +75,10 @@ pytest
 docker compose up --build
 ```
 
+If your editor reports `import common.embeddings cannot be resolved`, make sure it
+is using the `.venv` interpreter created above. The repository also includes
+`pyrightconfig.json` with monorepo `extraPaths` for Cursor/Pylance.
+
 Service ports:
 
 - UI: <http://localhost:8501>

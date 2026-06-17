@@ -29,8 +29,27 @@ dependencies = [
 requires = ["setuptools>=75.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = []
+[tool.setuptools.packages.find]
+where = [
+    "services/common",
+    "services/alert-intelligence",
+    "services/context-agent",
+    "services/model-router",
+    "services/resolution-agent",
+    "services/orchestrator",
+    "services/remediation-engine",
+    "services/closure-service",
+]
+include = [
+    "common*",
+    "alert_intelligence*",
+    "context_agent*",
+    "model_router*",
+    "resolution_agent*",
+    "orchestrator*",
+    "remediation_engine*",
+    "closure_service*",
+]
 
 [project.optional-dependencies]
 dev = [
