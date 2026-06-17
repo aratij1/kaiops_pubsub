@@ -1,0 +1,307 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monitoring-adapter
+  namespace: kaiops
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: monitoring-adapter } }
+  template:
+    metadata: { labels: { app: monitoring-adapter } }
+    spec:
+      containers:
+        - name: monitoring-adapter
+          image: ghcr.io/example/kaiops/monitoring-adapter:latest
+          imagePullPolicy: IfNotPresent
+          workingDir: /app/services/monitoring-adapter
+          command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+          envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
+          env: [{ name: SERVICE_NAME, value: monitoring-adapter }]
+          ports: [{ containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /readyz, port: 8000 } }
+          livenessProbe: { httpGet: { path: /healthz, port: 8000 } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: monitoring-adapter
+  namespace: kaiops
+spec:
+  selector: { app: monitoring-adapter }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-intelligence
+  namespace: kaiops
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: alert-intelligence } }
+  template:
+    metadata: { labels: { app: alert-intelligence } }
+    spec:
+      containers:
+        - name: alert-intelligence
+          image: ghcr.io/example/kaiops/alert-intelligence:latest
+          workingDir: /app/services/alert-intelligence
+          command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+          envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
+          env: [{ name: SERVICE_NAME, value: alert-intelligence }]
+          ports: [{ containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /readyz, port: 8000 } }
+          livenessProbe: { httpGet: { path: /healthz, port: 8000 } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alert-intelligence
+  namespace: kaiops
+spec:
+  selector: { app: alert-intelligence }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: kaiops
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: orchestrator } }
+  template:
+    metadata: { labels: { app: orchestrator } }
+    spec:
+      containers:
+        - name: orchestrator
+          image: ghcr.io/example/kaiops/orchestrator:latest
+          workingDir: /app/services/orchestrator
+          command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+          envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
+          env: [{ name: SERVICE_NAME, value: orchestrator }]
+          ports: [{ containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /readyz, port: 8000 } }
+          livenessProbe: { httpGet: { path: /healthz, port: 8000 } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: kaiops
+spec:
+  selector: { app: orchestrator }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: context-agent
+  namespace: kaiops
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: context-agent } }
+  template:
+    metadata: { labels: { app: context-agent } }
+    spec:
+      containers:
+        - name: context-agent
+          image: ghcr.io/example/kaiops/context-agent:latest
+          workingDir: /app/services/context-agent
+          command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+          envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
+          env: [{ name: SERVICE_NAME, value: context-agent }]
+          ports: [{ containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /readyz, port: 8000 } }
+          livenessProbe: { httpGet: { path: /healthz, port: 8000 } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: context-agent
+  namespace: kaiops
+spec:
+  selector: { app: context-agent }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-router
+  namespace: kaiops
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: model-router } }
+  template:
+    metadata: { labels: { app: model-router } }
+    spec:
+      containers:
+        - name: model-router
+          image: ghcr.io/example/kaiops/model-router:latest
+          workingDir: /app/services/model-router
+          command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+          envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
+          env: [{ name: SERVICE_NAME, value: model-router }]
+          ports: [{ containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /readyz, port: 8000 } }
+          livenessProbe: { httpGet: { path: /healthz, port: 8000 } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-router
+  namespace: kaiops
+spec:
+  selector: { app: model-router }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resolution-agent
+  namespace: kaiops
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: resolution-agent } }
+  template:
+    metadata: { labels: { app: resolution-agent } }
+    spec:
+      containers:
+        - name: resolution-agent
+          image: ghcr.io/example/kaiops/resolution-agent:latest
+          workingDir: /app/services/resolution-agent
+          command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+          envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
+          env: [{ name: SERVICE_NAME, value: resolution-agent }]
+          ports: [{ containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /readyz, port: 8000 } }
+          livenessProbe: { httpGet: { path: /healthz, port: 8000 } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resolution-agent
+  namespace: kaiops
+spec:
+  selector: { app: resolution-agent }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: approval-service
+  namespace: kaiops
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: approval-service } }
+  template:
+    metadata: { labels: { app: approval-service } }
+    spec:
+      containers:
+        - name: approval-service
+          image: ghcr.io/example/kaiops/approval-service:latest
+          workingDir: /app/services/approval-service
+          command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+          envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
+          env: [{ name: SERVICE_NAME, value: approval-service }]
+          ports: [{ containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /readyz, port: 8000 } }
+          livenessProbe: { httpGet: { path: /healthz, port: 8000 } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: approval-service
+  namespace: kaiops
+spec:
+  selector: { app: approval-service }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: remediation-engine
+  namespace: kaiops
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: remediation-engine } }
+  template:
+    metadata: { labels: { app: remediation-engine } }
+    spec:
+      containers:
+        - name: remediation-engine
+          image: ghcr.io/example/kaiops/remediation-engine:latest
+          workingDir: /app/services/remediation-engine
+          command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+          envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
+          env: [{ name: SERVICE_NAME, value: remediation-engine }]
+          ports: [{ containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /readyz, port: 8000 } }
+          livenessProbe: { httpGet: { path: /healthz, port: 8000 } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: remediation-engine
+  namespace: kaiops
+spec:
+  selector: { app: remediation-engine }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: closure-service
+  namespace: kaiops
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: closure-service } }
+  template:
+    metadata: { labels: { app: closure-service } }
+    spec:
+      containers:
+        - name: closure-service
+          image: ghcr.io/example/kaiops/closure-service:latest
+          workingDir: /app/services/closure-service
+          command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+          envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
+          env: [{ name: SERVICE_NAME, value: closure-service }]
+          ports: [{ containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /readyz, port: 8000 } }
+          livenessProbe: { httpGet: { path: /healthz, port: 8000 } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: closure-service
+  namespace: kaiops
+spec:
+  selector: { app: closure-service }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ui
+  namespace: kaiops
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: ui } }
+  template:
+    metadata: { labels: { app: ui } }
+    spec:
+      containers:
+        - name: ui
+          image: ghcr.io/example/kaiops/ui:latest
+          workingDir: /app/services/ui
+          command: ["streamlit", "run", "app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
+          envFrom: [{ configMapRef: { name: kaiops-config } }]
+          ports: [{ containerPort: 8501 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ui
+  namespace: kaiops
+spec:
+  selector: { app: ui }
+  ports: [{ port: 8501, targetPort: 8501 }]

@@ -1,0 +1,131 @@
+version: "3.9"
+
+x-service-env: &service-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  REDIS_URL: redis://redis:6379/0
+  DATABASE_URL: postgresql+asyncpg://kaiops:kaiops@postgres:5432/kaiops
+  CONTEXT_AGENT_URL: http://context-agent:8000
+  APPROVAL_SERVICE_URL: http://approval-service:8000
+  MODEL_ROUTER_URL: http://model-router:8000
+  KAFKA_ENABLED: "true"
+  DATABASE_ENABLED: "true"
+
+x-service-build: &service-build
+  context: .
+  dockerfile: Dockerfile.service
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: kaiops
+      POSTGRES_PASSWORD: kaiops
+      POSTGRES_DB: kaiops
+    ports: ["5432:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    depends_on: [zookeeper]
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+  monitoring-adapter:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: monitoring-adapter }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/services/monitoring-adapter
+    ports: ["8001:8000"]
+    depends_on: [kafka, postgres, redis]
+
+  alert-intelligence:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: alert-intelligence }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/services/alert-intelligence
+    ports: ["8002:8000"]
+    depends_on: [kafka, postgres, redis]
+
+  orchestrator:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: orchestrator }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/services/orchestrator
+    ports: ["8003:8000"]
+    depends_on: [kafka, context-agent]
+
+  context-agent:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: context-agent }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/services/context-agent
+    ports: ["8004:8000"]
+    depends_on: [kafka, postgres]
+
+  model-router:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: model-router }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/services/model-router
+    ports: ["8005:8000"]
+
+  resolution-agent:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: resolution-agent }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/services/resolution-agent
+    ports: ["8006:8000"]
+    depends_on: [kafka, model-router, postgres]
+
+  approval-service:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: approval-service }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/services/approval-service
+    ports: ["8007:8000"]
+    depends_on: [kafka, postgres]
+
+  remediation-engine:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: remediation-engine }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/services/remediation-engine
+    ports: ["8008:8000"]
+    depends_on: [kafka, postgres]
+
+  closure-service:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: closure-service }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/services/closure-service
+    ports: ["8009:8000"]
+    depends_on: [kafka, postgres]
+
+  ui:
+    build: *service-build
+    environment:
+      APPROVAL_SERVICE_URL: http://approval-service:8000
+      MONITORING_ADAPTER_URL: http://monitoring-adapter:8000
+    command: ["streamlit", "run", "app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
+    working_dir: /app/services/ui
+    ports: ["8501:8501"]
+    depends_on: [approval-service, monitoring-adapter]
+
+volumes:
+  postgres-data:
