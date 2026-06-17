@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kaiops-ingress
+  namespace: kaiops
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: kaiops.local
+      http:
+        paths:
+          - path: /ui(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend: { service: { name: ui, port: { number: 8501 } } }
+          - path: /monitoring(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend: { service: { name: monitoring-adapter, port: { number: 8000 } } }
+          - path: /approval(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend: { service: { name: approval-service, port: { number: 8000 } } }
+          - path: /model-router(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend: { service: { name: model-router, port: { number: 8000 } } }
