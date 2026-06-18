@@ -41,6 +41,12 @@ def status_badge(label: str, value: str) -> None:
     st.markdown(f"**{label}:** `{value}`")
 
 
+def render_copyable_id(label: str, value: Any) -> None:
+    if value:
+        st.markdown(f"**{label}**")
+        st.code(str(value), language=None)
+
+
 def table_from_dict(values: dict[str, Any], key_label: str = "Metric", value_label: str = "Value") -> None:
     if not values:
         st.caption("No data.")
@@ -89,6 +95,20 @@ def render_gateway_events(events: list[dict[str, Any]]) -> None:
         )
     if rows:
         st.dataframe(rows, hide_index=True, use_container_width=True)
+        for event in events:
+            with st.expander(f"Full trace for {event.get('path')} · {event.get('status_code')}"):
+                render_copyable_id("Trace ID", event.get("trace_id"))
+                table_from_dict(
+                    {
+                        "path": event.get("path"),
+                        "target_url": event.get("target_url"),
+                        "status_code": event.get("status_code"),
+                        "latency_ms": round(float(event.get("latency_ms", 0)), 2),
+                        "safety_decision": event.get("safety", {}).get("decision"),
+                    },
+                    "Field",
+                    "Value",
+                )
     else:
         st.caption("No gateway events yet.")
 
@@ -159,6 +179,8 @@ if not workflow:
     st.info("Choose one of the 10 incident flows in the sidebar and click Run Flow.")
 else:
     st.subheader(scenario.get("title", "Incident Flow"))
+    render_copyable_id("Incident ID", incident.get("id"))
+    render_copyable_id("Trace ID", gateway_response.get("trace_id"))
     metric_row(
         [
             ("Severity", str(metrics.get("severity", "unknown")).upper()),
@@ -177,6 +199,7 @@ with tab_summary:
         left, right = st.columns([1.2, 1])
         with left:
             st.markdown("### What happened")
+            render_copyable_id("Incident ID", incident.get("id"))
             st.markdown(
                 f"""
                 <div class="kaiops-card">
@@ -203,12 +226,12 @@ with tab_summary:
                 }
             )
             st.markdown("### Context")
+            render_copyable_id("Trace ID", gateway_response.get("trace_id"))
             table_from_dict(
                 {
                     "deployment": context.get("deployment"),
                     "runbook_found": bool(context.get("runbook")),
                     "dependencies": ", ".join(context.get("dependency_services", [])),
-                    "trace_id": gateway_response.get("trace_id"),
                 }
             )
 
@@ -220,9 +243,9 @@ with tab_gateway:
     st.markdown("### Gateway safety and observability")
     if gateway_response:
         safety = gateway.get("safety", {})
+        render_copyable_id("Full Trace ID", gateway_response.get("trace_id"))
         metric_row(
             [
-                ("Trace ID", gateway_response.get("trace_id", "")),
                 ("Decision", str(safety.get("decision", "unknown")).upper()),
                 ("Safety Score", safety.get("score", 0)),
                 ("Latency", f"{gateway.get('latency_ms', 0)} ms"),
@@ -255,6 +278,8 @@ with tab_closed:
     if not closure:
         st.info("Run a flow to generate a closed incident report.")
     else:
+        render_copyable_id("Closed Incident ID", closure.get("incident_id"))
+        render_copyable_id("Trace ID", closure.get("trace_id"))
         metric_row(
             [
                 ("Health Restored", "YES" if closure.get("health_restored") else "NO"),
@@ -266,11 +291,9 @@ with tab_closed:
         st.markdown("#### Final RCA")
         table_from_dict(
             {
-                "incident_id": closure.get("incident_id"),
                 "root_cause": closure.get("root_cause"),
                 "impact": closure.get("impact"),
                 "action_taken": closure.get("action_taken"),
-                "trace_id": closure.get("trace_id"),
             }
         )
         st.markdown("#### Validation checks")
