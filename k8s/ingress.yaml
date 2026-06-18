@@ -17,6 +17,9 @@ spec:
           - path: /monitoring(/|$)(.*)
             pathType: ImplementationSpecific
             backend: { service: { name: monitoring-adapter, port: { number: 8000 } } }
+          - path: /gateway(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend: { service: { name: api-gateway, port: { number: 8000 } } }
           - path: /approval(/|$)(.*)
             pathType: ImplementationSpecific
             backend: { service: { name: approval-service, port: { number: 8000 } } }

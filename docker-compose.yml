@@ -5,6 +5,8 @@ x-service-env: &service-env
   CONTEXT_AGENT_URL: http://context-agent:8000
   APPROVAL_SERVICE_URL: http://approval-service:8000
   MODEL_ROUTER_URL: http://model-router:8000
+  MONITORING_ADAPTER_URL: http://monitoring-adapter:8000
+  API_GATEWAY_URL: http://api-gateway:8000
   KAFKA_ENABLED: "true"
   DATABASE_ENABLED: "true"
 
@@ -70,6 +72,16 @@ services:
       kafka: { condition: service_healthy }
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+
+  api-gateway:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: api-gateway }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/services/api-gateway
+    ports: ["8010:8000"]
+    depends_on:
+      monitoring-adapter: { condition: service_started }
+      approval-service: { condition: service_started }
 
   alert-intelligence:
     build: *service-build
@@ -159,10 +171,12 @@ services:
     environment:
       APPROVAL_SERVICE_URL: http://approval-service:8000
       MONITORING_ADAPTER_URL: http://monitoring-adapter:8000
+      API_GATEWAY_URL: http://api-gateway:8000
     command: ["streamlit", "run", "app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
     working_dir: /app/services/ui
     ports: ["8501:8501"]
     depends_on:
+      api-gateway: { condition: service_started }
       approval-service: { condition: service_started }
       monitoring-adapter: { condition: service_started }
 

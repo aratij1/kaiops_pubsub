@@ -18,9 +18,11 @@ def load_monitoring_app_module():
 async def test_local_payment_workflow_generates_recommendation() -> None:
     module = load_monitoring_app_module()
 
-    workflow = await module.run_local_payment_workflow()
+    workflow = await module.run_local_payment_workflow(trace_id="trace-123")
 
     assert workflow["mode"] == "local-no-kafka"
+    assert workflow["alert"].trace_id == "trace-123"
+    assert workflow["recommendation"].trace_id == "trace-123"
     assert workflow["alert"].severity == "critical"
     assert workflow["incident"].service == "payments"
     assert workflow["decision"]["workflow"] == "critical-auto-remediation"

@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     model_router_url: str = Field(default="http://model-router:8000", alias="MODEL_ROUTER_URL")
     context_agent_url: str = Field(default="http://context-agent:8000", alias="CONTEXT_AGENT_URL")
     approval_service_url: str = Field(default="http://approval-service:8000", alias="APPROVAL_SERVICE_URL")
+    monitoring_adapter_url: str = Field(default="http://monitoring-adapter:8000", alias="MONITORING_ADAPTER_URL")
+    api_gateway_url: str = Field(default="http://api-gateway:8000", alias="API_GATEWAY_URL")
     kafka_enabled: bool = Field(default=True, alias="KAFKA_ENABLED")
     kafka_startup_attempts: int = Field(default=30, alias="KAFKA_STARTUP_ATTEMPTS")
     kafka_startup_retry_seconds: float = Field(default=2.0, alias="KAFKA_STARTUP_RETRY_SECONDS")

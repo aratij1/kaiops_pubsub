@@ -44,6 +44,12 @@ class RemediationStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+class SafetyDecision(StrEnum):
+    ALLOW = "allow"
+    REVIEW = "review"
+    BLOCK = "block"
+
+
 class BaseEvent(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
@@ -148,3 +154,23 @@ class ResolutionReport(BaseEvent):
     health_restored: bool = False
     knowledge_base_entry: str = ""
     lessons_learned: list[str] = Field(default_factory=list)
+
+
+class SafetyCheckResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: SafetyDecision = SafetyDecision.ALLOW
+    score: float = Field(default=0.0, ge=0.0, le=1.0)
+    categories: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+
+
+class GatewayAuditEvent(BaseEvent):
+    method: str
+    path: str
+    target_url: str | None = None
+    status_code: int | None = None
+    latency_ms: float = 0.0
+    safety: SafetyCheckResult = Field(default_factory=SafetyCheckResult)
+    request_preview: dict[str, Any] = Field(default_factory=dict)
+    response_preview: dict[str, Any] = Field(default_factory=dict)

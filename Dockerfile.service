@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app/services/common:/app/services/alert-intelligence:/app/services/orchestrator:/app/services/context-agent:/app/services/model-router:/app/services/resolution-agent:/app/services/approval-service:/app/services/remediation-engine:/app/services/closure-service:/app/services/monitoring-adapter
+    PYTHONPATH=/app/services/common:/app/services/api-gateway:/app/services/alert-intelligence:/app/services/orchestrator:/app/services/context-agent:/app/services/model-router:/app/services/resolution-agent:/app/services/approval-service:/app/services/remediation-engine:/app/services/closure-service:/app/services/monitoring-adapter
 
 WORKDIR /app
 

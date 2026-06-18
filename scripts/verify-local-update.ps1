@@ -5,8 +5,13 @@ $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Checks = @(
     @{
         Path = "services\ui\app.py"
-        Pattern = "Run payment latency workflow"
-        Description = "updated Streamlit workflow button"
+        Pattern = "Gateway Trace & Safety"
+        Description = "Streamlit gateway observability tab"
+    },
+    @{
+        Path = "services\api-gateway\app.py"
+        Pattern = "/security/check"
+        Description = "API Gateway safety endpoint"
     },
     @{
         Path = "services\monitoring-adapter\app.py"

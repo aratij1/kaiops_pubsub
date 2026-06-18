@@ -32,6 +32,7 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = [
     "services/common",
+    "services/api-gateway",
     "services/alert-intelligence",
     "services/context-agent",
     "services/model-router",
@@ -42,6 +43,7 @@ where = [
 ]
 include = [
     "common*",
+    "api_gateway*",
     "alert_intelligence*",
     "context_agent*",
     "model_router*",
@@ -62,6 +64,7 @@ dev = [
 asyncio_mode = "auto"
 pythonpath = [
     "services/common",
+    "services/api-gateway",
     "services/alert-intelligence",
     "services/context-agent",
     "services/model-router",

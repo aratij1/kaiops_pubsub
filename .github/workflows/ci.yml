@@ -27,6 +27,7 @@ jobs:
       matrix:
         service:
           - monitoring-adapter
+          - api-gateway
           - alert-intelligence
           - orchestrator
           - context-agent
