@@ -11,5 +11,7 @@ data:
   MONITORING_ADAPTER_URL: http://monitoring-adapter:8000
   MODEL_ROUTER_URL: http://model-router:8000
   API_GATEWAY_URL: http://api-gateway:8000
+  OPENAI_GPT5_MODEL: gpt-5
+  OPENAI_GPT4O_MODEL: gpt-4o
   KAFKA_ENABLED: "true"
   DATABASE_ENABLED: "true"

@@ -84,6 +84,23 @@ pytest
 docker compose up --build
 ```
 
+Real LLM calls are made through the model router. Set an API key in your
+environment; do not hardcode keys in source files:
+
+```bash
+export OPENAI_API_KEY="your-rotated-key"
+export OPENAI_GPT5_MODEL="gpt-5"
+export OPENAI_GPT4O_MODEL="gpt-4o"
+```
+
+PowerShell:
+
+```powershell
+$env:OPENAI_API_KEY = "your-rotated-key"
+$env:OPENAI_GPT5_MODEL = "gpt-5"
+$env:OPENAI_GPT4O_MODEL = "gpt-4o"
+```
+
 If a service logs `Unable connect to "kafka:9092"` during Docker startup, Kafka
 is still booting. The Compose file includes Kafka health checks and app-level
 startup retries; after pulling the latest code, restart cleanly:

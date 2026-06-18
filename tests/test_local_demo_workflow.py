@@ -3,6 +3,27 @@ from pathlib import Path
 
 import pytest
 from common.models import RemediationStatus
+from model_router import ModelRouter
+from model_router.router import ModelProvider
+
+
+class StaticProvider(ModelProvider):
+    async def generate(self, prompt: str, payload: dict) -> str:
+        self._ensure_available()
+        self.breaker.record_success()
+        return f"{self.name}:{prompt}:{payload.get('summary', payload.get('service', 'incident'))}"
+
+
+def static_router() -> ModelRouter:
+    return ModelRouter(
+        providers={
+            "gpt-5": StaticProvider("gpt-5"),
+            "gpt-4o": StaticProvider("gpt-4o"),
+            "claude": StaticProvider("claude"),
+            "gemini": StaticProvider("gemini"),
+            "local-llama": StaticProvider("local-llama"),
+        }
+    )
 
 
 def load_monitoring_app_module():
@@ -19,7 +40,7 @@ def load_monitoring_app_module():
 async def test_local_payment_workflow_generates_recommendation() -> None:
     module = load_monitoring_app_module()
 
-    workflow = await module.run_local_payment_workflow(trace_id="trace-123")
+    workflow = await module.run_local_payment_workflow(trace_id="trace-123", model_router=static_router())
 
     assert workflow["mode"] == "local-no-kafka"
     assert workflow["alert"].trace_id == "trace-123"

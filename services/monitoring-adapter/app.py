@@ -189,7 +189,11 @@ def build_payment_latency_alert(trace_id: str | None = None) -> Alert:
     return build_sample_alert("payment-latency", trace_id)
 
 
-async def run_local_payment_workflow(trace_id: str | None = None, flow_id: str = "payment-latency") -> dict[str, Any]:
+async def run_local_payment_workflow(
+    trace_id: str | None = None,
+    flow_id: str = "payment-latency",
+    model_router: Any | None = None,
+) -> dict[str, Any]:
     """Run the agent workflow in-process for local demos with Kafka disabled."""
     from alert_intelligence import AlertIntelligenceAgent
     from closure_service import ClosureValidationAgent
@@ -246,7 +250,7 @@ async def run_local_payment_workflow(trace_id: str | None = None, flow_id: str =
             "runbook_found": bool(context.runbook),
         },
     }
-    recommendation = await ResolutionIntelligenceAgent().resolve(context)
+    recommendation = await ResolutionIntelligenceAgent(model_router=model_router).resolve(context)
     recommendation.root_cause = scenario["root_cause"]
     recommendation.impact = scenario["impact"]
     recommendation.recommended_action = scenario["recommended_action"]

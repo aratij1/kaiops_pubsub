@@ -41,6 +41,9 @@ Set-Location -LiteralPath '$EscapedRepoRoot'
 `$env:PYTHONPATH = '$EscapedPythonPath'
 `$env:KAFKA_ENABLED = 'false'
 `$env:DATABASE_ENABLED = 'false'
+`$env:OPENAI_API_KEY = '$($env:OPENAI_API_KEY)'
+`$env:OPENAI_GPT5_MODEL = '$($env:OPENAI_GPT5_MODEL)'
+`$env:OPENAI_GPT4O_MODEL = '$($env:OPENAI_GPT4O_MODEL)'
 `$Host.UI.RawUI.WindowTitle = '$EscapedTitle'
 $Command
 "@

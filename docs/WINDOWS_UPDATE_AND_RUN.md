@@ -73,6 +73,7 @@ If Docker is not installed, use the helper script:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+$env:OPENAI_API_KEY = "your-rotated-key"
 .\scripts\run-local-windows.ps1
 ```
 
@@ -82,6 +83,7 @@ If you start services manually in PowerShell, quote environment variable values:
 $env:PYTHONPATH = "$PWD\services\common;$PWD\services\api-gateway;$PWD\services\alert-intelligence;$PWD\services\context-agent;$PWD\services\model-router;$PWD\services\resolution-agent;$PWD\services\orchestrator;$PWD\services\approval-service;$PWD\services\remediation-engine;$PWD\services\closure-service;$PWD\services\monitoring-adapter"
 $env:KAFKA_ENABLED = "false"
 $env:DATABASE_ENABLED = "false"
+$env:OPENAI_API_KEY = "your-rotated-key"
 ```
 
 Do not use unquoted values like `$env:KAFKA_ENABLED=false`; PowerShell treats

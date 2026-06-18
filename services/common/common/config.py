@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     kafka_startup_retry_seconds: float = Field(default=2.0, alias="KAFKA_STARTUP_RETRY_SECONDS")
     database_enabled: bool = Field(default=True, alias="DATABASE_ENABLED")
     local_llm_endpoint: str = Field(default="http://ollama:11434", alias="LOCAL_LLM_ENDPOINT")
+    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
+    openai_base_url: str = Field(default="https://api.openai.com/v1", alias="OPENAI_BASE_URL")
+    openai_gpt5_model: str = Field(default="gpt-5", alias="OPENAI_GPT5_MODEL")
+    openai_gpt4o_model: str = Field(default="gpt-4o", alias="OPENAI_GPT4O_MODEL")
+    llm_request_timeout_seconds: float = Field(default=45.0, alias="LLM_REQUEST_TIMEOUT_SECONDS")
 
 
 @lru_cache
