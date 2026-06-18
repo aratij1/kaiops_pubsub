@@ -67,7 +67,27 @@ This old UI check should print nothing:
 Select-String -Path .\services\ui\app.py -Pattern "Inject payment latency alert"
 ```
 
-## 3. Rebuild Docker from the updated source
+## 3. Run locally without Docker
+
+If Docker is not installed, use the helper script:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+.\scripts\run-local-windows.ps1
+```
+
+If you start services manually in PowerShell, quote environment variable values:
+
+```powershell
+$env:PYTHONPATH = "$PWD\services\common;$PWD\services\api-gateway;$PWD\services\alert-intelligence;$PWD\services\context-agent;$PWD\services\model-router;$PWD\services\resolution-agent;$PWD\services\orchestrator;$PWD\services\approval-service;$PWD\services\remediation-engine;$PWD\services\closure-service;$PWD\services\monitoring-adapter"
+$env:KAFKA_ENABLED = "false"
+$env:DATABASE_ENABLED = "false"
+```
+
+Do not use unquoted values like `$env:KAFKA_ENABLED=false`; PowerShell treats
+`false` and semicolon-separated paths as commands.
+
+## 4. Rebuild Docker from the updated source
 
 ```powershell
 docker compose down -v --remove-orphans
@@ -77,7 +97,7 @@ docker compose up
 
 Keep this terminal open.
 
-## 4. Confirm services are running
+## 5. Confirm services are running
 
 Open another PowerShell terminal:
 
@@ -119,7 +139,7 @@ JSON:
 - `Closed Incidents` shows the final closure report, validation checks,
   knowledge-base update, and lessons learned.
 
-## 5. Test the workflows
+## 6. Test the workflows
 
 Kafka publishing path:
 

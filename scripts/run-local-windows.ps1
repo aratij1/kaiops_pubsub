@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 
 if (-not (Test-Path $Python)) {
@@ -33,36 +33,40 @@ function Start-KaiOpsWindow {
         [string]$Command
     )
 
+    $EscapedRepoRoot = $RepoRoot.Replace("'", "''")
+    $EscapedPythonPath = $PythonPath.Replace("'", "''")
+    $EscapedTitle = $Title.Replace("'", "''")
     $Bootstrap = @"
-cd "$RepoRoot"
-`$env:PYTHONPATH="$PythonPath"
-`$env:KAFKA_ENABLED="false"
-`$env:DATABASE_ENABLED="false"
-`$Host.UI.RawUI.WindowTitle="$Title"
+Set-Location -LiteralPath '$EscapedRepoRoot'
+`$env:PYTHONPATH = '$EscapedPythonPath'
+`$env:KAFKA_ENABLED = 'false'
+`$env:DATABASE_ENABLED = 'false'
+`$Host.UI.RawUI.WindowTitle = '$EscapedTitle'
 $Command
 "@
+    $Encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Bootstrap))
 
-    Start-Process powershell -ArgumentList @("-NoExit", "-Command", $Bootstrap)
+    Start-Process powershell -ArgumentList @("-NoExit", "-EncodedCommand", $Encoded)
 }
 
 Start-KaiOpsWindow `
     -Title "KaiOps monitoring-adapter :8001" `
-    -Command "& `"$Python`" -m uvicorn app:app --host 127.0.0.1 --port 8001 --app-dir services/monitoring-adapter"
+    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8001 --app-dir services/monitoring-adapter"
 
 Start-KaiOpsWindow `
     -Title "KaiOps approval-service :8007" `
-    -Command "& `"$Python`" -m uvicorn app:app --host 127.0.0.1 --port 8007 --app-dir services/approval-service"
+    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8007 --app-dir services/approval-service"
 
 Start-KaiOpsWindow `
     -Title "KaiOps api-gateway :8010" `
-    -Command "`$env:MONITORING_ADAPTER_URL='http://localhost:8001'; `$env:APPROVAL_SERVICE_URL='http://localhost:8007'; & `"$Python`" -m uvicorn app:app --host 127.0.0.1 --port 8010 --app-dir services/api-gateway"
+    -Command "`$env:MONITORING_ADAPTER_URL = 'http://localhost:8001'; `$env:APPROVAL_SERVICE_URL = 'http://localhost:8007'; & '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8010 --app-dir services/api-gateway"
 
 if (-not $NoUi) {
     $UiCommand = @"
 `$env:MONITORING_ADAPTER_URL="http://localhost:8001"
 `$env:APPROVAL_SERVICE_URL="http://localhost:8007"
 `$env:API_GATEWAY_URL="http://localhost:8010"
-& "$Python" -m streamlit run services/ui/app.py
+& '$Python' -m streamlit run services/ui/app.py
 "@
 
     Start-KaiOpsWindow -Title "KaiOps Streamlit UI :8501" -Command $UiCommand
