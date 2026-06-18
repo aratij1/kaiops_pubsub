@@ -6,12 +6,15 @@ from common.models import (
     Approval,
     ApprovalDecision,
     Context,
+    GatewayAuditEvent,
     Incident,
     IncidentStatus,
     Recommendation,
     RemediationAction,
     RemediationStatus,
     ResolutionReport,
+    SafetyCheckResult,
+    SafetyDecision,
 )
 
 __all__ = [
@@ -20,10 +23,13 @@ __all__ = [
     "Approval",
     "ApprovalDecision",
     "Context",
+    "GatewayAuditEvent",
     "Incident",
     "IncidentStatus",
     "Recommendation",
     "RemediationAction",
     "RemediationStatus",
     "ResolutionReport",
+    "SafetyCheckResult",
+    "SafetyDecision",
 ]

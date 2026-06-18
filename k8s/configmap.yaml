@@ -8,6 +8,8 @@ data:
   REDIS_URL: redis://redis:6379/0
   CONTEXT_AGENT_URL: http://context-agent:8000
   APPROVAL_SERVICE_URL: http://approval-service:8000
+  MONITORING_ADAPTER_URL: http://monitoring-adapter:8000
   MODEL_ROUTER_URL: http://model-router:8000
+  API_GATEWAY_URL: http://api-gateway:8000
   KAFKA_ENABLED: "true"
   DATABASE_ENABLED: "true"

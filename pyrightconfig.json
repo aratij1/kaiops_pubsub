@@ -2,6 +2,7 @@
   "include": ["services", "tests"],
   "extraPaths": [
     "services/common",
+    "services/api-gateway",
     "services/alert-intelligence",
     "services/context-agent",
     "services/model-router",
