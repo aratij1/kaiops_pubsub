@@ -25,13 +25,19 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.settings = settings
         app.state.producer = KafkaProducer(settings)
-        await app.state.producer.start()
-        if settings.database_enabled:
-            app.state.db_engine = create_engine(settings)
-            app.state.session_factory = create_session_factory(app.state.db_engine)
-            await create_schema(app.state.db_engine)
-        if startup:
-            await startup(app)
+        try:
+            await app.state.producer.start()
+            if settings.database_enabled:
+                app.state.db_engine = create_engine(settings)
+                app.state.session_factory = create_session_factory(app.state.db_engine)
+                await create_schema(app.state.db_engine)
+            if startup:
+                await startup(app)
+        except Exception:
+            await app.state.producer.stop()
+            if getattr(app.state, "db_engine", None):
+                await app.state.db_engine.dispose()
+            raise
         try:
             yield
         finally:

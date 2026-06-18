@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import JSON, DateTime, MetaData, String, Text
+from sqlalchemy import JSON, DateTime, MetaData, String, Text, text
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -120,4 +120,10 @@ def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessi
 
 async def create_schema(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+        if engine.dialect.name == "postgresql":
+            await connection.execute(text("SELECT pg_advisory_lock(742031991)"))
+        try:
+            await connection.run_sync(Base.metadata.create_all)
+        finally:
+            if engine.dialect.name == "postgresql":
+                await connection.execute(text("SELECT pg_advisory_unlock(742031991)"))
