@@ -59,7 +59,8 @@ async def proxy(
     target_url = f"{target_base.rstrip('/')}/{path.lstrip('/')}"
     headers = {"x-trace-id": trace_id}
     last_error: Exception | None = None
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    timeout = httpx.Timeout(settings.gateway_request_timeout_seconds, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(1, 6):
             try:
                 response = await client.request(method, target_url, json=payload or None, headers=headers)

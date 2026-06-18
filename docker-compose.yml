@@ -10,6 +10,9 @@ x-service-env: &service-env
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
   OPENAI_GPT5_MODEL: ${OPENAI_GPT5_MODEL:-gpt-5}
   OPENAI_GPT4O_MODEL: ${OPENAI_GPT4O_MODEL:-gpt-4o}
+  LOCAL_LLM_ENABLED: ${LOCAL_LLM_ENABLED:-false}
+  LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-120}
+  GATEWAY_REQUEST_TIMEOUT_SECONDS: ${GATEWAY_REQUEST_TIMEOUT_SECONDS:-180}
   KAFKA_ENABLED: "true"
   DATABASE_ENABLED: "true"
 
@@ -175,6 +178,7 @@ services:
       APPROVAL_SERVICE_URL: http://approval-service:8000
       MONITORING_ADAPTER_URL: http://monitoring-adapter:8000
       API_GATEWAY_URL: http://api-gateway:8000
+      UI_REQUEST_TIMEOUT_SECONDS: "240"
     command: ["streamlit", "run", "app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
     working_dir: /app/services/ui
     ports: ["8501:8501"]

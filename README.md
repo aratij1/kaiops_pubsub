@@ -100,6 +100,17 @@ PowerShell:
 $env:OPENAI_API_KEY = "your-rotated-key"
 $env:OPENAI_GPT5_MODEL = "gpt-5"
 $env:OPENAI_GPT4O_MODEL = "gpt-4o"
+$env:LLM_REQUEST_TIMEOUT_SECONDS = "120"
+```
+
+Real LLM-backed workflows can take longer than mock flows. The API Gateway
+defaults to a 180 second downstream timeout and the Streamlit UI defaults to a
+240 second request timeout. Local Llama/Ollama fallback is disabled by default;
+enable it only when Ollama is running:
+
+```powershell
+$env:LOCAL_LLM_ENABLED = "true"
+$env:LOCAL_LLM_ENDPOINT = "http://localhost:11434"
 ```
 
 If a service logs `Unable connect to "kafka:9092"` during Docker startup, Kafka

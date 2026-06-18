@@ -174,6 +174,19 @@ class ModelRouter:
 
 
 def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
+    local_llama_provider: ModelProvider
+    if settings.local_llm_enabled:
+        local_llama_provider = OllamaModelProvider(
+            name="local-llama",
+            endpoint=settings.local_llm_endpoint,
+            timeout_seconds=settings.llm_request_timeout_seconds,
+        )
+    else:
+        local_llama_provider = UnconfiguredModelProvider(
+            name="local-llama",
+            reason="set LOCAL_LLM_ENABLED=true and LOCAL_LLM_ENDPOINT to use Ollama",
+        )
+
     return {
         "gpt-5": OpenAIModelProvider(
             name="gpt-5",
@@ -197,9 +210,5 @@ def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
             name="gemini",
             reason="set GEMINI_API_KEY and add a Gemini provider implementation",
         ),
-        "local-llama": OllamaModelProvider(
-            name="local-llama",
-            endpoint=settings.local_llm_endpoint,
-            timeout_seconds=settings.llm_request_timeout_seconds,
-        ),
+        "local-llama": local_llama_provider,
     }

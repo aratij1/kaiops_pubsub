@@ -85,10 +85,20 @@ $env:PYTHONPATH = "$PWD\services\common;$PWD\services\api-gateway;$PWD\services\
 $env:KAFKA_ENABLED = "false"
 $env:DATABASE_ENABLED = "false"
 $env:OPENAI_API_KEY = "your-rotated-key"
+$env:LLM_REQUEST_TIMEOUT_SECONDS = "120"
+$env:GATEWAY_REQUEST_TIMEOUT_SECONDS = "180"
 ```
 
 Do not use unquoted values like `$env:KAFKA_ENABLED=false`; PowerShell treats
 `false` and semicolon-separated paths as commands.
+
+Local Llama/Ollama fallback is disabled by default to avoid long timeouts when
+Ollama is not running. Enable it only when you have Ollama available:
+
+```powershell
+$env:LOCAL_LLM_ENABLED = "true"
+$env:LOCAL_LLM_ENDPOINT = "http://localhost:11434"
+```
 
 ## 4. Rebuild Docker from the updated source
 

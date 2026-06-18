@@ -7,11 +7,12 @@ import httpx
 import streamlit as st
 
 GATEWAY_BASE = os.getenv("API_GATEWAY_URL", "http://localhost:8010")
+UI_REQUEST_TIMEOUT_SECONDS = float(os.getenv("UI_REQUEST_TIMEOUT_SECONDS", "240"))
 
 
 def request_json(method: str, url: str, **kwargs) -> dict[str, Any]:
     try:
-        with httpx.Client(timeout=15.0) as client:
+        with httpx.Client(timeout=UI_REQUEST_TIMEOUT_SECONDS) as client:
             response = client.request(method, url, **kwargs)
             response.raise_for_status()
             return response.json()
