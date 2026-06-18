@@ -176,9 +176,11 @@ class ContextIntelligenceAgent:
         deployment_doc = next((doc for doc in vector_matches if doc["kind"] == "deployment"), {})
         dependency_docs = [doc for doc in vector_matches if doc["kind"] == "dependency"]
         change_docs = [doc for doc in vector_matches if doc["kind"] == "change"]
-        deployment = by_name["jenkins"].get("recent_deployments", [{}])[0].get("version") or alert.labels.get(
-            "deployment"
-        ) or deployment_doc.get("deployment")
+        deployment = (
+            by_name["jenkins"].get("recent_deployments", [{}])[0].get("version")
+            or alert.labels.get("deployment")
+            or deployment_doc.get("deployment")
+        )
         dependencies = list(by_name["cmdb"].get("dependencies", []))
         for doc in dependency_docs:
             for dependency in doc.get("dependencies", []):
