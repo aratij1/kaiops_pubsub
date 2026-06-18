@@ -184,6 +184,7 @@ contains 10 incident flows covering rollback, pod restart, scaling, cache clear,
 database failover, service restart, Terraform rollback, and API remediation:
 
 - **Incident Summary**: what happened, recommendation, context, and key test metrics.
+- **Approval**: prefilled human approval form with full incident/recommendation IDs and approve/reject/modify actions.
 - **Agent Trace**: full agent-by-agent event timeline showing inputs, decisions, outputs, and handoffs.
 - **Gateway & Safety**: latest trace ID, safety decision, policy reasons, gateway route, summary, and recent audit events.
 - **Closed Incidents**: closure report, validation checks, knowledge-base entry, and lessons learned.

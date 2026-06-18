@@ -14,6 +14,11 @@ $Checks = @(
         Description = "Streamlit closed incidents tab"
     },
     @{
+        Path = "services\ui\app.py"
+        Pattern = "Human approval"
+        Description = "Streamlit approval screen"
+    },
+    @{
         Path = "services\api-gateway\app.py"
         Pattern = "/security/check"
         Description = "API Gateway safety endpoint"

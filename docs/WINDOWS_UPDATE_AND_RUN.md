@@ -53,6 +53,7 @@ Or manually check:
 Select-String -Path .\services\ui\app.py -Pattern "Run Flow"
 Select-String -Path .\services\ui\app.py -Pattern "Gateway & Safety"
 Select-String -Path .\services\ui\app.py -Pattern "Closed Incidents"
+Select-String -Path .\services\ui\app.py -Pattern "Human approval"
 Select-String -Path .\services\api-gateway\app.py -Pattern "/security/check"
 Select-String -Path .\services\api-gateway\app.py -Pattern "/sample/flows"
 Select-String -Path .\services\monitoring-adapter\app.py -Pattern "payment-latency/workflow"
@@ -125,6 +126,7 @@ The UI should also contain these tabs:
 
 ```text
 Incident Summary
+Approval
 Agent Trace
 Gateway & Safety
 Closed Incidents
@@ -135,6 +137,8 @@ JSON:
 
 - `Incident Summary` shows severity, RCA confidence, gateway safety, latency, handoffs,
   dependencies, changes, and recommendation.
+- `Approval` shows full incident and recommendation IDs plus approve, reject,
+  and modify actions.
 - `Agent Trace` shows every agent handoff, input, decision, output, and metrics.
 - `Gateway & Safety` shows trace ID, policy decision, policy reasons,
   route, recent audit events, and gateway summary.

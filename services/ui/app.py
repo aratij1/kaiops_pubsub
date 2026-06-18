@@ -190,8 +190,8 @@ else:
         ]
     )
 
-tab_summary, tab_trace, tab_gateway, tab_closed = st.tabs(
-    ["Incident Summary", "Agent Trace", "Gateway & Safety", "Closed Incidents"]
+tab_summary, tab_approval, tab_trace, tab_gateway, tab_closed = st.tabs(
+    ["Incident Summary", "Approval", "Agent Trace", "Gateway & Safety", "Closed Incidents"]
 )
 
 with tab_summary:
@@ -232,6 +232,69 @@ with tab_summary:
                     "deployment": context.get("deployment"),
                     "runbook_found": bool(context.get("runbook")),
                     "dependencies": ", ".join(context.get("dependency_services", [])),
+                }
+            )
+
+with tab_approval:
+    st.markdown("### Human approval")
+    if not workflow:
+        st.info("Run a flow first. The approval form will be prefilled with incident and recommendation IDs.")
+    else:
+        render_copyable_id("Incident ID", incident.get("id"))
+        render_copyable_id("Recommendation ID", recommendation.get("id"))
+        render_copyable_id("Trace ID", gateway_response.get("trace_id"))
+
+        default_action = recommendation.get("recommended_action", "Rollback deployment")
+        approval_incident_id = st.text_input("Incident ID for approval", value=incident.get("id", ""))
+        recommendation_id = st.text_input("Recommendation ID for approval", value=recommendation.get("id", ""))
+        approver = st.text_input("Approver", value="sre@example.com")
+        channel = st.selectbox("Channel", ["web", "slack", "teams", "email"])
+        comment = st.text_input("Approval comment / action", value=default_action)
+
+        payload = {
+            "incident_id": approval_incident_id,
+            "recommendation_id": recommendation_id,
+            "approver": approver,
+            "channel": channel,
+            "comment": comment,
+        }
+
+        col_approve, col_reject, col_modify = st.columns(3)
+        if col_approve.button("Approve", type="primary", use_container_width=True):
+            st.session_state["approval_response"] = request_json(
+                "POST", f"{GATEWAY_BASE}/approval/approve", json=payload
+            )
+        if col_reject.button("Reject", use_container_width=True):
+            st.session_state["approval_response"] = request_json(
+                "POST", f"{GATEWAY_BASE}/approval/reject", json=payload
+            )
+        if col_modify.button("Modify", use_container_width=True):
+            payload["modified_action"] = comment
+            st.session_state["approval_response"] = request_json(
+                "POST", f"{GATEWAY_BASE}/approval/modify", json=payload
+            )
+
+        approval_response = st.session_state.get("approval_response", {})
+        if approval_response:
+            approval_data = approval_response.get("data", {})
+            approval_gateway = approval_response.get("gateway", {})
+            st.markdown("### Latest approval result")
+            metric_row(
+                [
+                    ("Decision", str(approval_data.get("decision", "unknown")).upper()),
+                    ("Channel", approval_data.get("channel", "N/A")),
+                    ("Gateway", str(approval_gateway.get("safety", {}).get("decision", "unknown")).upper()),
+                    ("Latency", f"{approval_gateway.get('latency_ms', 0)} ms"),
+                ]
+            )
+            render_copyable_id("Approval ID", approval_data.get("id"))
+            render_copyable_id("Approval Trace ID", approval_response.get("trace_id"))
+            table_from_dict(
+                {
+                    "approver": approval_data.get("approver"),
+                    "comment": approval_data.get("comment"),
+                    "modified_action": approval_data.get("modified_action"),
+                    "safety_score": approval_gateway.get("safety", {}).get("score"),
                 }
             )
 
