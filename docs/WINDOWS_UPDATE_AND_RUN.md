@@ -50,9 +50,11 @@ Run:
 Or manually check:
 
 ```powershell
-Select-String -Path .\services\ui\app.py -Pattern "Run payment latency workflow"
-Select-String -Path .\services\ui\app.py -Pattern "Gateway Trace & Safety"
+Select-String -Path .\services\ui\app.py -Pattern "Run Flow"
+Select-String -Path .\services\ui\app.py -Pattern "Gateway & Safety"
+Select-String -Path .\services\ui\app.py -Pattern "Closed Incidents"
 Select-String -Path .\services\api-gateway\app.py -Pattern "/security/check"
+Select-String -Path .\services\api-gateway\app.py -Pattern "/sample/flows"
 Select-String -Path .\services\monitoring-adapter\app.py -Pattern "payment-latency/workflow"
 Select-String -Path .\docker-compose.yml -Pattern "healthcheck"
 ```
@@ -90,28 +92,32 @@ Open the UI:
 http://localhost:8501
 ```
 
-The sidebar button should say:
+The sidebar should let you choose one of 10 incident flows and the run button
+should say:
 
 ```text
-Run payment latency workflow
+Run Flow
 ```
 
-The UI should also contain this tab:
+The UI should also contain these tabs:
 
 ```text
-Gateway Trace & Safety
+Incident Summary
+Agent Trace
+Gateway & Safety
+Closed Incidents
 ```
 
 After running a workflow, the UI should show readable cards and tables, not raw
 JSON:
 
-- `Overview` shows severity, RCA confidence, gateway safety, latency, handoffs,
+- `Incident Summary` shows severity, RCA confidence, gateway safety, latency, handoffs,
   dependencies, changes, and recommendation.
-- `RCA` shows root cause, context, dependencies, changes, and observability
-  signals.
 - `Agent Trace` shows every agent handoff, input, decision, output, and metrics.
-- `Gateway Trace & Safety` shows trace ID, policy decision, policy reasons,
+- `Gateway & Safety` shows trace ID, policy decision, policy reasons,
   route, recent audit events, and gateway summary.
+- `Closed Incidents` shows the final closure report, validation checks,
+  knowledge-base update, and lessons learned.
 
 ## 5. Test the workflows
 
@@ -121,10 +127,16 @@ Kafka publishing path:
 Invoke-RestMethod -Method Post -Uri "http://localhost:8010/sample/payment-latency"
 ```
 
+List the 10 sample flows:
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8010/sample/flows" | ConvertTo-Json -Depth 10
+```
+
 Local in-process demo path:
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri "http://localhost:8010/sample/payment-latency/workflow" | ConvertTo-Json -Depth 10
+Invoke-RestMethod -Method Post -Uri "http://localhost:8010/sample/database-replica-lag/workflow" | ConvertTo-Json -Depth 10
 ```
 
 Jailbreak/prompt-injection safety check:

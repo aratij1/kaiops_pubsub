@@ -200,6 +200,37 @@ async def sample_payment_latency_workflow(
     )
 
 
+@app.get("/sample/flows")
+async def sample_flows(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/sample/flows",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/sample/{flow_id}/workflow")
+async def sample_flow_workflow(
+    flow_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/sample/{flow_id}/workflow",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.post("/approval/{action}")
 async def approval_action(
     action: str,

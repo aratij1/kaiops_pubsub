@@ -9,338 +9,274 @@ import streamlit as st
 GATEWAY_BASE = os.getenv("API_GATEWAY_URL", "http://localhost:8010")
 
 
-def request_json(method: str, url: str, **kwargs) -> dict:
+def request_json(method: str, url: str, **kwargs) -> dict[str, Any]:
     try:
-        with httpx.Client(timeout=10.0) as client:
+        with httpx.Client(timeout=15.0) as client:
             response = client.request(method, url, **kwargs)
             response.raise_for_status()
             return response.json()
     except httpx.HTTPError as exc:
-        st.error(f"Unable to reach {url}. Is the target FastAPI service running? {exc}")
+        st.error(f"Unable to reach {url}. Is the target service running? {exc}")
         return {}
 
 
-def nested(data: dict[str, Any], *keys: str, default: Any = "") -> Any:
-    current: Any = data
-    for key in keys:
-        if not isinstance(current, dict):
-            return default
-        current = current.get(key, default)
-    return current
+def data_from_gateway(response: dict[str, Any]) -> dict[str, Any]:
+    return response.get("data", response)
 
 
-def render_kv(title: str, values: dict[str, Any]) -> None:
-    st.subheader(title)
-    for key, value in values.items():
-        label = key.replace("_", " ").title()
-        st.markdown(f"**{label}:** {value if value not in (None, '') else 'N/A'}")
+def get_flows() -> list[dict[str, Any]]:
+    if "flows" not in st.session_state:
+        response = request_json("GET", f"{GATEWAY_BASE}/sample/flows")
+        st.session_state["flows"] = data_from_gateway(response).get("flows", [])
+    return st.session_state.get("flows", [])
 
 
-def render_list(title: str, values: list[Any]) -> None:
-    st.markdown(f"**{title}**")
+def metric_row(items: list[tuple[str, Any]]) -> None:
+    columns = st.columns(len(items))
+    for column, (label, value) in zip(columns, items, strict=True):
+        column.metric(label, value)
+
+
+def status_badge(label: str, value: str) -> None:
+    st.markdown(f"**{label}:** `{value}`")
+
+
+def table_from_dict(values: dict[str, Any], key_label: str = "Metric", value_label: str = "Value") -> None:
     if not values:
-        st.caption("None found.")
+        st.caption("No data.")
         return
-    for item in values:
-        if isinstance(item, dict):
-            text = ", ".join(f"{key}: {value}" for key, value in item.items())
-        else:
-            text = str(item)
-        st.markdown(f"- {text}")
+    st.dataframe(
+        [{key_label: key.replace("_", " ").title(), value_label: value} for key, value in values.items()],
+        hide_index=True,
+        use_container_width=True,
+    )
 
 
-def render_workflow_metrics(metrics: dict[str, Any], gateway: dict[str, Any]) -> None:
-    safety = gateway.get("safety", {})
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Severity", str(metrics.get("severity", "unknown")).upper())
-    col2.metric("RCA Confidence", f"{float(metrics.get('recommendation_confidence', 0.0)):.0%}")
-    col3.metric("Gateway Safety", str(safety.get("decision", "unknown")).upper())
-    col4.metric("Gateway Latency", f"{gateway.get('latency_ms', 0)} ms")
-
-    col5, col6, col7, col8 = st.columns(4)
-    col5.metric("Agent Handoffs", metrics.get("agent_handoffs", 0))
-    col6.metric("Dependencies", metrics.get("dependency_services", 0))
-    col7.metric("Recent Changes", metrics.get("recent_changes", 0))
-    col8.metric("Deduplicated Alerts", metrics.get("deduplicated_count", 0))
-
-
-def render_event_timeline(events: list[dict[str, Any]]) -> None:
-    if not events:
-        st.info("No agent events captured yet.")
-        return
+def render_event_trace(events: list[dict[str, Any]]) -> None:
+    rows = [
+        {
+            "Step": event.get("sequence"),
+            "Agent": event.get("agent"),
+            "Decision": event.get("decision"),
+            "Communicates To": event.get("communicates_to"),
+        }
+        for event in sorted(events, key=lambda item: item.get("sequence", 0))
+    ]
+    st.dataframe(rows, hide_index=True, use_container_width=True)
 
     for event in sorted(events, key=lambda item: item.get("sequence", 0)):
-        title = f"{event.get('sequence')}. {event.get('agent')} - {event.get('action')}"
-        with st.expander(title, expanded=True):
-            st.markdown(f"**Input:** {event.get('input', 'N/A')}")
-            st.markdown(f"**Decision:** {event.get('decision', 'N/A')}")
-            st.markdown(f"**Output:** {event.get('output', 'N/A')}")
-            st.markdown(f"**Communicates To:** {event.get('communicates_to', 'N/A')}")
-            metrics = event.get("metrics", {})
-            if metrics:
-                st.table([{"Metric": key.replace("_", " ").title(), "Value": value} for key, value in metrics.items()])
+        with st.expander(f"{event.get('sequence')}. {event.get('agent')}"):
+            st.write(event.get("action"))
+            status_badge("Input", event.get("input", "N/A"))
+            status_badge("Output", event.get("output", "N/A"))
+            table_from_dict(event.get("metrics", {}))
 
 
-def render_gateway_event_table(events: list[dict[str, Any]]) -> None:
+def render_gateway_events(events: list[dict[str, Any]]) -> None:
     rows = []
     for event in events:
         safety = event.get("safety", {})
         rows.append(
             {
-                "Trace ID": event.get("trace_id", ""),
-                "Path": event.get("path", ""),
-                "Status": event.get("status_code", ""),
-                "Decision": safety.get("decision", ""),
-                "Score": safety.get("score", ""),
-                "Latency ms": round(float(event.get("latency_ms", 0.0)), 2),
+                "Trace ID": event.get("trace_id"),
+                "Path": event.get("path"),
+                "Status": event.get("status_code"),
+                "Decision": safety.get("decision"),
+                "Score": safety.get("score"),
+                "Latency ms": round(float(event.get("latency_ms", 0)), 2),
                 "Reasons": "; ".join(safety.get("reasons", [])),
             }
         )
     if rows:
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, hide_index=True, use_container_width=True)
     else:
-        st.caption("No gateway events recorded yet.")
+        st.caption("No gateway events yet.")
 
 
-st.set_page_config(page_title="KaiOps Incident Resolution", layout="wide")
-st.title("KaiOps Agentic Incident Resolution Platform")
+st.set_page_config(page_title="KaiOps", page_icon="⚡", layout="wide")
+
+st.markdown(
+    """
+    <style>
+      .block-container {padding-top: 1.5rem; max-width: 1280px;}
+      div[data-testid="stMetric"] {
+        background: #0f172a;
+        border: 1px solid #1e293b;
+        border-radius: 14px;
+        padding: 14px;
+      }
+      div[data-testid="stMetric"] label, div[data-testid="stMetric"] div {
+        color: #f8fafc !important;
+      }
+      .kaiops-card {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 16px;
+        padding: 18px;
+        margin-bottom: 12px;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("⚡ KaiOps Incident Command")
+st.caption("Simple incident simulation, gateway safety, agent trace, remediation, and closure validation.")
+
+flows = get_flows()
+flow_options = {f"{flow['title']} · {flow['service']} · {flow['severity']}": flow["id"] for flow in flows}
 
 with st.sidebar:
-    st.header("Sample Flow")
-    st.caption("Requests go through the API Gateway for safety checks and trace IDs.")
-    if st.button("Run payment latency workflow"):
-        gateway_response = request_json("POST", f"{GATEWAY_BASE}/sample/payment-latency/workflow")
-        workflow = gateway_response.get("data", {})
+    st.header("Run a Scenario")
+    selected_label = st.selectbox("Incident flow", list(flow_options) or ["payment-latency"])
+    selected_flow = flow_options.get(selected_label, "payment-latency")
+    st.caption("All requests route through the API Gateway for safety checks and traceability.")
+    if st.button("Run Flow", type="primary", use_container_width=True):
+        gateway_response = request_json("POST", f"{GATEWAY_BASE}/sample/{selected_flow}/workflow")
         if gateway_response:
             st.session_state["gateway_response"] = gateway_response
-            st.session_state["workflow"] = workflow
-            st.success("Workflow completed through recommendation generation.")
+            st.session_state["workflow"] = gateway_response.get("data", {})
+            st.success("Flow completed.")
+
+    st.divider()
+    if st.button("Refresh Gateway Events", use_container_width=True):
+        st.session_state["gateway_summary"] = request_json("GET", f"{GATEWAY_BASE}/observability/summary")
+        st.session_state["gateway_recent"] = request_json("GET", f"{GATEWAY_BASE}/observability/recent")
 
 workflow = st.session_state.get("workflow", {})
 gateway_response = st.session_state.get("gateway_response", {})
 gateway = gateway_response.get("gateway", {})
 metrics = workflow.get("metrics", {})
+scenario = workflow.get("scenario", {})
+alert = workflow.get("alert", {})
+incident = workflow.get("incident", {})
+context = workflow.get("context", {})
+recommendation = workflow.get("recommendation", {})
+remediation = workflow.get("remediation_action", {})
+closure = workflow.get("closure_report", {})
 
-tab_overview, tab_alerts, tab_incidents, tab_rca, tab_approval, tab_trace, tab_gateway, tab_closed = st.tabs(
-    [
-        "Overview",
-        "Live Alerts",
-        "Incident Queue",
-        "RCA",
-        "Recommendations",
-        "Agent Trace",
-        "Gateway Trace & Safety",
-        "Closed Incidents",
-    ]
+if not workflow:
+    st.info("Choose one of the 10 incident flows in the sidebar and click Run Flow.")
+else:
+    st.subheader(scenario.get("title", "Incident Flow"))
+    metric_row(
+        [
+            ("Severity", str(metrics.get("severity", "unknown")).upper()),
+            ("Confidence", f"{float(metrics.get('recommendation_confidence', 0)):.0%}"),
+            ("Gateway", str(gateway.get("safety", {}).get("decision", "unknown")).upper()),
+            ("Health Restored", "YES" if metrics.get("health_restored") else "NO"),
+        ]
+    )
+
+tab_summary, tab_trace, tab_gateway, tab_closed = st.tabs(
+    ["Incident Summary", "Agent Trace", "Gateway & Safety", "Closed Incidents"]
 )
 
-with tab_overview:
-    st.subheader("Workflow Health & Test Metrics")
+with tab_summary:
     if workflow:
-        render_workflow_metrics(metrics, gateway)
-        recommendation = workflow.get("recommendation", {})
-        st.markdown("### Current Recommendation")
-        st.success(
-            f"{recommendation.get('recommended_action', 'No action generated')} "
-            f"for {recommendation.get('impact', 'unknown impact')}."
-        )
-        st.markdown(f"**Rationale:** {recommendation.get('rationale', 'N/A')}")
-        st.markdown(f"**Next Step:** {workflow.get('next_step', 'N/A')}")
-    else:
-        st.info("Run the sample workflow from the sidebar to populate metrics and traceability.")
-
-with tab_alerts:
-    st.info("Live alert stream is available from Kafka topic raw-alerts and service metrics.")
-    alert = workflow.get("alert", {})
-    if alert:
-        render_kv(
-            "Latest Alert",
-            {
-                "name": alert.get("name"),
-                "source": alert.get("source"),
-                "service": alert.get("service"),
-                "environment": alert.get("environment"),
-                "severity": str(alert.get("severity", "")).upper(),
-                "description": alert.get("description"),
-                "trace_id": alert.get("trace_id"),
-                "correlation_id": alert.get("correlation_id"),
-                "deduplicated_count": alert.get("deduplicated_count"),
-            },
-        )
-        st.markdown("**Labels**")
-        st.table([{"Key": key, "Value": value} for key, value in alert.get("labels", {}).items()])
-
-with tab_incidents:
-    incident = workflow.get("incident", {})
-    if incident:
-        render_kv(
-            "Latest Incident",
-            {
-                "id": incident.get("id"),
-                "title": incident.get("title"),
-                "service": incident.get("service"),
-                "environment": incident.get("environment"),
-                "severity": str(incident.get("severity", "")).upper(),
-                "status": incident.get("status"),
-                "owner_team": incident.get("owner_team"),
-                "trace_id": incident.get("trace_id"),
-            },
-        )
-        st.caption("Copy this incident ID if you want to query it from a running approval service.")
-    incident_id = st.text_input("Incident ID")
-    if incident_id:
-        incident_response = request_json("GET", f"{GATEWAY_BASE}/approval/incident/{incident_id}")
-        st.session_state["incident_lookup"] = incident_response
-    if st.session_state.get("incident_lookup"):
-        data = st.session_state["incident_lookup"].get("data", st.session_state["incident_lookup"])
-        render_kv("Incident Lookup Result", data if isinstance(data, dict) else {"result": data})
-
-with tab_rca:
-    st.write("Resolution reports include root cause, impact, recommended action, and confidence score.")
-    context = workflow.get("context", {})
-    recommendation = workflow.get("recommendation", {})
-    if recommendation:
-        render_kv(
-            "RCA Recommendation",
-            {
-                "root_cause": recommendation.get("root_cause"),
-                "confidence": f"{float(recommendation.get('confidence', 0.0)):.0%}",
-                "impact": recommendation.get("impact"),
-                "recommended_action": recommendation.get("recommended_action"),
-                "risk": recommendation.get("risk"),
-                "trace_id": recommendation.get("trace_id"),
-            },
-        )
-        st.markdown(f"**Rationale:** {recommendation.get('rationale', 'N/A')}")
-        render_list("Commands", recommendation.get("commands", []))
-    if context:
-        render_kv(
-            "Collected Context",
-            {
-                "deployment": context.get("deployment"),
-                "runbook": context.get("runbook"),
-                "trace_id": context.get("trace_id"),
-            },
-        )
-        render_list("Related Incidents", context.get("related_incidents", []))
-        render_list("Dependency Services", context.get("dependency_services", []))
-        render_list("Recent Changes", context.get("recent_changes", []))
-        if context.get("observability"):
-            st.markdown("**Observability Signals**")
-            st.table(
-                [
-                    {"Signal": key.replace("_", " ").title(), "Value": value}
-                    for key, value in context.get("observability", {}).items()
-                ]
+        left, right = st.columns([1.2, 1])
+        with left:
+            st.markdown("### What happened")
+            st.markdown(
+                f"""
+                <div class="kaiops-card">
+                <b>{alert.get("name")}</b> from <b>{alert.get("source")}</b><br/>
+                Service <b>{alert.get("service")}</b> in <b>{alert.get("environment")}</b><br/>
+                {alert.get("description")}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.markdown("### Agent recommendation")
+            st.success(f"{recommendation.get('recommended_action')} - {recommendation.get('impact')}")
+            st.write(recommendation.get("rationale"))
+        with right:
+            st.markdown("### Key metrics")
+            table_from_dict(
+                {
+                    "deduplicated_count": metrics.get("deduplicated_count"),
+                    "agent_handoffs": metrics.get("agent_handoffs"),
+                    "dependencies": metrics.get("dependency_services"),
+                    "recent_changes": metrics.get("recent_changes"),
+                    "remediation_status": metrics.get("remediation_status"),
+                    "alerts_cleared": metrics.get("alerts_cleared"),
+                }
+            )
+            st.markdown("### Context")
+            table_from_dict(
+                {
+                    "deployment": context.get("deployment"),
+                    "runbook_found": bool(context.get("runbook")),
+                    "dependencies": ", ".join(context.get("dependency_services", [])),
+                    "trace_id": gateway_response.get("trace_id"),
+                }
             )
 
-with tab_approval:
-    st.subheader("Human Approval Workflow")
-    approval_incident_id = st.text_input(
-        "Approval incident ID",
-        value=workflow.get("incident", {}).get("id", ""),
-    )
-    recommendation_id = st.text_input(
-        "Recommendation ID",
-        value=workflow.get("recommendation", {}).get("id", ""),
-    )
-    approver = st.text_input("Approver", value="sre@example.com")
-    channel = st.selectbox("Channel", ["web", "slack", "teams", "email"])
-    action = st.text_input("Modified action", value="Rollback deployment")
-    col1, col2, col3 = st.columns(3)
-    payload = {
-        "incident_id": approval_incident_id,
-        "recommendation_id": recommendation_id,
-        "approver": approver,
-        "channel": channel,
-        "comment": action,
-    }
-    if col1.button("Approve", disabled=not approval_incident_id or not recommendation_id):
-        st.session_state["approval_response"] = request_json("POST", f"{GATEWAY_BASE}/approval/approve", json=payload)
-    if col2.button("Reject", disabled=not approval_incident_id or not recommendation_id):
-        st.session_state["approval_response"] = request_json("POST", f"{GATEWAY_BASE}/approval/reject", json=payload)
-    if col3.button("Modify", disabled=not approval_incident_id or not recommendation_id):
-        payload["modified_action"] = action
-        st.session_state["approval_response"] = request_json("POST", f"{GATEWAY_BASE}/approval/modify", json=payload)
-
-    approval_response = st.session_state.get("approval_response", {})
-    if approval_response:
-        st.subheader("Latest Approval Gateway Result")
-        approval_data = approval_response.get("data", {})
-        gateway_data = approval_response.get("gateway", {})
-        render_kv(
-            "Approval Decision",
-            {
-                "decision": approval_data.get("decision"),
-                "approver": approval_data.get("approver"),
-                "channel": approval_data.get("channel"),
-                "comment": approval_data.get("comment"),
-                "trace_id": approval_response.get("trace_id"),
-            },
-        )
-        render_kv(
-            "Gateway Result",
-            {
-                "safety_decision": nested(gateway_data, "safety", "decision"),
-                "safety_score": nested(gateway_data, "safety", "score"),
-                "latency_ms": gateway_data.get("latency_ms"),
-            },
-        )
-
 with tab_trace:
-    st.subheader("Full Agent Trace")
-    render_event_timeline(workflow.get("events", []))
-    if workflow.get("decision"):
-        decision = workflow["decision"]
-        render_kv(
-            "Orchestrator Decision",
-            {
-                "workflow": decision.get("workflow"),
-                "next_action": decision.get("next_action"),
-                "downstream_agents": ", ".join(decision.get("downstream_agents", [])),
-                "requires_approval": decision.get("requires_approval"),
-            },
-        )
+    st.markdown("### How agents decided and communicated")
+    render_event_trace(workflow.get("events", []))
 
 with tab_gateway:
-    st.subheader("Latest Gateway Decision")
+    st.markdown("### Gateway safety and observability")
     if gateway_response:
-        safety = nested(gateway_response, "gateway", "safety", default={})
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Trace ID", gateway_response.get("trace_id", ""))
-        col2.metric("Decision", str(safety.get("decision", "unknown")).upper())
-        col3.metric("Safety Score", safety.get("score", 0))
-        col4.metric("Latency", f"{nested(gateway_response, 'gateway', 'latency_ms', default=0)} ms")
-        render_list("Safety Reasons", safety.get("reasons", []))
-        render_list("Safety Categories", safety.get("categories", []))
-        render_kv(
-            "Gateway Routing",
-            {
-                "path": nested(gateway_response, "gateway", "path"),
-                "target_url": nested(gateway_response, "gateway", "target_url"),
-            },
+        safety = gateway.get("safety", {})
+        metric_row(
+            [
+                ("Trace ID", gateway_response.get("trace_id", "")),
+                ("Decision", str(safety.get("decision", "unknown")).upper()),
+                ("Safety Score", safety.get("score", 0)),
+                ("Latency", f"{gateway.get('latency_ms', 0)} ms"),
+            ]
         )
-    else:
-        st.info("Run a workflow to see gateway safety and trace metadata.")
+        st.markdown("#### Policy reasons")
+        if safety.get("reasons"):
+            for reason in safety["reasons"]:
+                st.write(f"- {reason}")
+        else:
+            st.write("- Request allowed; no policy issues detected.")
+        table_from_dict({"path": gateway.get("path"), "target_url": gateway.get("target_url")}, "Field", "Value")
 
-    col_summary, col_recent = st.columns(2)
-    if col_summary.button("Refresh Gateway Summary"):
-        st.session_state["gateway_summary"] = request_json("GET", f"{GATEWAY_BASE}/observability/summary")
-    if col_recent.button("Refresh Recent Gateway Events"):
-        st.session_state["gateway_recent"] = request_json("GET", f"{GATEWAY_BASE}/observability/recent")
-
-    if st.session_state.get("gateway_summary"):
-        st.subheader("Gateway Summary")
-        summary = st.session_state["gateway_summary"]
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Events", summary.get("total_events", 0))
-        col2.metric("Allowed", summary.get("allowed", 0))
-        col3.metric("Review", summary.get("review", 0))
-        col4.metric("Blocked", summary.get("blocked", 0))
-        st.markdown(f"**Latest Trace ID:** {summary.get('latest_trace_id', 'N/A')}")
-    if st.session_state.get("gateway_recent"):
-        st.subheader("Recent Gateway Events")
-        render_gateway_event_table(st.session_state["gateway_recent"].get("events", []))
+    summary = st.session_state.get("gateway_summary") or request_json("GET", f"{GATEWAY_BASE}/observability/summary")
+    recent = st.session_state.get("gateway_recent") or request_json("GET", f"{GATEWAY_BASE}/observability/recent")
+    st.markdown("#### Gateway totals")
+    metric_row(
+        [
+            ("Events", summary.get("total_events", 0)),
+            ("Allowed", summary.get("allowed", 0)),
+            ("Review", summary.get("review", 0)),
+            ("Blocked", summary.get("blocked", 0)),
+        ]
+    )
+    st.markdown("#### Recent gateway events")
+    render_gateway_events(recent.get("events", []))
 
 with tab_closed:
-    st.write("Closed incident RCA reports are persisted in rca_reports and knowledge_base.")
+    st.markdown("### Closure report")
+    if not closure:
+        st.info("Run a flow to generate a closed incident report.")
+    else:
+        metric_row(
+            [
+                ("Health Restored", "YES" if closure.get("health_restored") else "NO"),
+                ("Alerts Cleared", "YES" if closure.get("alerts_cleared") else "NO"),
+                ("Action", remediation.get("action_type", "N/A")),
+                ("Status", remediation.get("status", "N/A")),
+            ]
+        )
+        st.markdown("#### Final RCA")
+        table_from_dict(
+            {
+                "incident_id": closure.get("incident_id"),
+                "root_cause": closure.get("root_cause"),
+                "impact": closure.get("impact"),
+                "action_taken": closure.get("action_taken"),
+                "trace_id": closure.get("trace_id"),
+            }
+        )
+        st.markdown("#### Validation checks")
+        table_from_dict(closure.get("validation", {}), "Check", "Passed")
+        st.markdown("#### Knowledge base update")
+        st.write(closure.get("knowledge_base_entry"))
+        st.markdown("#### Lessons learned")
+        for lesson in closure.get("lessons_learned", []):
+            st.write(f"- {lesson}")

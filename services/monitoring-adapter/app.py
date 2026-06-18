@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from common.config import get_settings
-from common.models import Alert, AlertSeverity
+from common.models import Alert, AlertSeverity, Approval, ApprovalDecision
 from common.service import create_app
 from common.topics import RAW_ALERTS
 from fastapi import Body, Header
@@ -14,28 +14,192 @@ settings = get_settings()
 settings.service_name = "monitoring-adapter"
 app = create_app(title="KaiOps Monitoring Adapter", settings=settings)
 
+SCENARIOS: dict[str, dict[str, Any]] = {
+    "payment-latency": {
+        "title": "Payment latency after deployment",
+        "source": "prometheus",
+        "name": "PaymentLatencyHigh",
+        "service": "payments",
+        "severity": AlertSeverity.CRITICAL,
+        "description": "p95 latency above 1200ms for payments checkout path after Deployment 2.5",
+        "labels": {"cluster": "prod-us-east-1", "deployment": "payments-api", "team": "payments-sre"},
+        "annotations": {"summary": "Payment latency regression"},
+        "root_cause": "Deployment 2.5",
+        "impact": "Payment latency",
+        "recommended_action": "Rollback deployment",
+        "remediation_comment": "Rollback deployment",
+    },
+    "checkout-pod-crash": {
+        "title": "Checkout pod crash loop",
+        "source": "kubernetes",
+        "name": "CheckoutPodCrashLoop",
+        "service": "checkout",
+        "severity": AlertSeverity.HIGH,
+        "description": "checkout-api pods are crash looping after config reload",
+        "labels": {"cluster": "prod-us-east-1", "deployment": "checkout-api", "team": "checkout-sre"},
+        "annotations": {"summary": "Checkout pods restarting"},
+        "root_cause": "Bad runtime config reload",
+        "impact": "Checkout availability degradation",
+        "recommended_action": "Restart pod",
+        "remediation_comment": "Restart pod",
+    },
+    "inventory-cpu": {
+        "title": "Inventory CPU saturation",
+        "source": "datadog",
+        "name": "InventoryCpuSaturation",
+        "service": "inventory",
+        "severity": AlertSeverity.HIGH,
+        "description": "inventory service CPU above 92 percent during catalog sync",
+        "labels": {"cluster": "prod-us-east-1", "deployment": "inventory-api", "team": "commerce-sre"},
+        "annotations": {"summary": "Inventory CPU saturation"},
+        "root_cause": "Catalog sync traffic spike",
+        "impact": "Inventory lookup latency",
+        "recommended_action": "Scale deployment",
+        "remediation_comment": "Scale deployment",
+    },
+    "redis-cache": {
+        "title": "Redis cache saturation",
+        "source": "grafana",
+        "name": "RedisCacheSaturation",
+        "service": "cache",
+        "severity": AlertSeverity.WARNING,
+        "description": "redis cache memory pressure causing elevated misses",
+        "labels": {"cluster": "prod-us-east-1", "deployment": "redis-cache", "team": "platform-sre"},
+        "annotations": {"summary": "Cache memory pressure"},
+        "root_cause": "Hot keys and stale cache entries",
+        "impact": "API latency from cache misses",
+        "recommended_action": "Clear cache",
+        "remediation_comment": "Clear cache",
+    },
+    "database-replica-lag": {
+        "title": "Database replica lag",
+        "source": "azure monitor",
+        "name": "DatabaseReplicaLag",
+        "service": "orders-db",
+        "severity": AlertSeverity.CRITICAL,
+        "description": "orders database replica lag above 180 seconds",
+        "labels": {"cluster": "prod-us-east-1", "deployment": "orders-postgres", "team": "database-sre"},
+        "annotations": {"summary": "Replica lag impacting reads"},
+        "root_cause": "Primary database write saturation",
+        "impact": "Stale order reads",
+        "recommended_action": "Failover database",
+        "remediation_comment": "Failover database",
+    },
+    "auth-errors": {
+        "title": "Authentication error spike",
+        "source": "splunk",
+        "name": "AuthErrorRateHigh",
+        "service": "auth",
+        "severity": AlertSeverity.HIGH,
+        "description": "auth 5xx errors increased after secret rotation",
+        "labels": {"cluster": "prod-us-east-1", "deployment": "auth-api", "team": "identity-sre"},
+        "annotations": {"summary": "Auth failures after rotation"},
+        "root_cause": "Secret rotation mismatch",
+        "impact": "Login failures",
+        "recommended_action": "Restart service",
+        "remediation_comment": "Restart service",
+    },
+    "search-memory": {
+        "title": "Search memory leak",
+        "source": "prometheus",
+        "name": "SearchMemoryHigh",
+        "service": "search",
+        "severity": AlertSeverity.HIGH,
+        "description": "search service memory increasing steadily after index refresh",
+        "labels": {"cluster": "prod-us-east-1", "deployment": "search-api", "team": "search-sre"},
+        "annotations": {"summary": "Memory leak suspected"},
+        "root_cause": "Index refresh memory leak",
+        "impact": "Search latency and OOM risk",
+        "recommended_action": "Restart service",
+        "remediation_comment": "Restart service",
+    },
+    "billing-terraform": {
+        "title": "Billing infrastructure regression",
+        "source": "terraform",
+        "name": "BillingInfraRegression",
+        "service": "billing",
+        "severity": AlertSeverity.CRITICAL,
+        "description": "billing private endpoint unreachable after terraform apply",
+        "labels": {"cluster": "prod-us-east-1", "deployment": "billing-network", "team": "finops-sre"},
+        "annotations": {"summary": "Terraform network regression"},
+        "root_cause": "Terraform security group change",
+        "impact": "Billing job failures",
+        "recommended_action": "Terraform rollback",
+        "remediation_comment": "Terraform rollback",
+    },
+    "fraud-api": {
+        "title": "Fraud API dependency timeout",
+        "source": "datadog",
+        "name": "FraudApiTimeouts",
+        "service": "fraud",
+        "severity": AlertSeverity.HIGH,
+        "description": "fraud scoring API timeout rate above threshold",
+        "labels": {"cluster": "prod-us-east-1", "deployment": "fraud-api", "team": "risk-sre"},
+        "annotations": {"summary": "Fraud scoring timeouts"},
+        "root_cause": "Dependency pool exhaustion",
+        "impact": "Checkout risk checks delayed",
+        "recommended_action": "API execution",
+        "remediation_comment": "API execution",
+    },
+    "cdn-errors": {
+        "title": "CDN error rate increase",
+        "source": "grafana",
+        "name": "CdnErrorRateHigh",
+        "service": "cdn",
+        "severity": AlertSeverity.WARNING,
+        "description": "cdn 5xx error rate elevated in edge region",
+        "labels": {"cluster": "global-edge", "deployment": "cdn-rules", "team": "edge-sre"},
+        "annotations": {"summary": "Edge errors elevated"},
+        "root_cause": "Bad edge rule propagation",
+        "impact": "Static asset failures",
+        "recommended_action": "API execution",
+        "remediation_comment": "API execution",
+    },
+}
 
-def build_payment_latency_alert(trace_id: str | None = None) -> Alert:
+
+def list_scenarios() -> list[dict[str, str]]:
+    return [
+        {
+            "id": scenario_id,
+            "title": scenario["title"],
+            "service": scenario["service"],
+            "severity": scenario["severity"].value,
+            "recommended_action": scenario["recommended_action"],
+        }
+        for scenario_id, scenario in SCENARIOS.items()
+    ]
+
+
+def build_sample_alert(flow_id: str = "payment-latency", trace_id: str | None = None) -> Alert:
+    scenario = SCENARIOS.get(flow_id, SCENARIOS["payment-latency"])
     return Alert(
-        source="prometheus",
-        name="PaymentLatencyHigh",
-        service="payments",
-        severity=AlertSeverity.CRITICAL,
-        description="p95 latency above 1200ms for payments checkout path",
-        labels={"cluster": "prod-us-east-1", "deployment": "payments-api"},
-        annotations={"summary": "Payment latency regression"},
+        source=scenario["source"],
+        name=scenario["name"],
+        service=scenario["service"],
+        severity=scenario["severity"],
+        description=scenario["description"],
+        labels=scenario["labels"],
+        annotations=scenario["annotations"],
         trace_id=trace_id,
     )
 
 
-async def run_local_payment_workflow(trace_id: str | None = None) -> dict[str, Any]:
+def build_payment_latency_alert(trace_id: str | None = None) -> Alert:
+    return build_sample_alert("payment-latency", trace_id)
+
+
+async def run_local_payment_workflow(trace_id: str | None = None, flow_id: str = "payment-latency") -> dict[str, Any]:
     """Run the agent workflow in-process for local demos with Kafka disabled."""
     from alert_intelligence import AlertIntelligenceAgent
+    from closure_service import ClosureValidationAgent
     from context_agent import ContextIntelligenceAgent
     from orchestrator import OrchestratorAgent
+    from remediation_engine import RemediationEngine
     from resolution_agent import ResolutionIntelligenceAgent
 
-    alert = build_payment_latency_alert(trace_id=trace_id)
+    scenario = SCENARIOS.get(flow_id, SCENARIOS["payment-latency"])
+    alert = build_sample_alert(flow_id, trace_id=trace_id)
     enriched_alert, incident = AlertIntelligenceAgent().process(alert)
     incident.trace_id = trace_id
     alert_event = {
@@ -83,6 +247,13 @@ async def run_local_payment_workflow(trace_id: str | None = None) -> dict[str, A
         },
     }
     recommendation = await ResolutionIntelligenceAgent().resolve(context)
+    recommendation.root_cause = scenario["root_cause"]
+    recommendation.impact = scenario["impact"]
+    recommendation.recommended_action = scenario["recommended_action"]
+    recommendation.rationale = (
+        f"Scenario evidence links {scenario['root_cause']} to {scenario['impact']}; "
+        f"recommended action is {scenario['recommended_action']}."
+    )
     recommendation.trace_id = trace_id
     resolution_event = {
         "sequence": 4,
@@ -98,6 +269,55 @@ async def run_local_payment_workflow(trace_id: str | None = None) -> dict[str, A
             "risk": recommendation.risk,
         },
     }
+    approval = Approval(
+        incident_id=incident.id,
+        recommendation_id=recommendation.id,
+        decision=ApprovalDecision.APPROVED,
+        approver="kaiops-demo",
+        channel="web",
+        comment=scenario["remediation_comment"],
+        trace_id=trace_id,
+    )
+    approval_event = {
+        "sequence": 5,
+        "agent": "Human Approval Layer",
+        "action": "Auto-approved demo recommendation",
+        "input": recommendation.recommended_action,
+        "decision": approval.decision.value,
+        "output": f"Approved by {approval.approver} on {approval.channel}",
+        "communicates_to": "Remediation Automation Engine via approval-events",
+        "metrics": {"approval_required": decision.requires_approval, "channel": approval.channel},
+    }
+    engine = RemediationEngine()
+    action = engine.build_action(approval)
+    action.parameters.update({"root_cause": recommendation.root_cause, "impact": recommendation.impact})
+    action = await engine.execute(action)
+    action.trace_id = trace_id
+    remediation_event = {
+        "sequence": 6,
+        "agent": "Remediation Automation Engine",
+        "action": "Executed remediation strategy plugin",
+        "input": approval.comment,
+        "decision": f"Selected plugin action {action.action_type}",
+        "output": action.output,
+        "communicates_to": "Closure & Validation via remediation-events",
+        "metrics": {"status": action.status.value, "target": action.target},
+    }
+    closure_report = await ClosureValidationAgent().validate(action)
+    closure_report.trace_id = trace_id
+    closure_event = {
+        "sequence": 7,
+        "agent": "Closure & Validation",
+        "action": "Validated health and generated closure report",
+        "input": action.output,
+        "decision": "Health restored" if closure_report.health_restored else "Health not restored",
+        "output": closure_report.knowledge_base_entry,
+        "communicates_to": "Knowledge Base and audit log",
+        "metrics": {
+            "alerts_cleared": closure_report.alerts_cleared,
+            "health_restored": closure_report.health_restored,
+        },
+    }
     metrics = {
         "alerts_processed": 1,
         "deduplicated_count": enriched_alert.deduplicated_count,
@@ -106,20 +326,39 @@ async def run_local_payment_workflow(trace_id: str | None = None) -> dict[str, A
         "dependency_services": len(context.dependency_services),
         "recent_changes": len(context.recent_changes),
         "recommendation_confidence": recommendation.confidence,
-        "agent_handoffs": 3,
+        "agent_handoffs": 6,
         "approval_required": decision.requires_approval,
+        "remediation_status": action.status.value,
+        "health_restored": closure_report.health_restored,
+        "alerts_cleared": closure_report.alerts_cleared,
     }
 
     return {
         "mode": "local-no-kafka",
+        "scenario": {
+            "id": flow_id,
+            "title": scenario["title"],
+            "recommended_action": scenario["recommended_action"],
+        },
         "alert": enriched_alert,
         "incident": incident,
         "decision": decision.__dict__,
         "context": context,
         "recommendation": recommendation,
+        "approval": approval,
+        "remediation_action": action,
+        "closure_report": closure_report,
         "metrics": metrics,
-        "events": [alert_event, orchestrator_event, context_event, resolution_event],
-        "next_step": "Approve, reject, or modify the recommendation in the Approval Workflow tab.",
+        "events": [
+            alert_event,
+            orchestrator_event,
+            context_event,
+            resolution_event,
+            approval_event,
+            remediation_event,
+            closure_event,
+        ],
+        "next_step": "Incident closed in local demo. Review closure report and lessons learned.",
     }
 
 
@@ -147,6 +386,16 @@ async def sample_payment_latency(x_trace_id: str | None = Header(default=None)) 
     return alert
 
 
+@app.get("/sample/flows")
+async def sample_flows() -> dict[str, Any]:
+    return {"flows": list_scenarios()}
+
+
 @app.post("/sample/payment-latency/workflow")
 async def sample_payment_latency_workflow(x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
     return await run_local_payment_workflow(trace_id=x_trace_id)
+
+
+@app.post("/sample/{flow_id}/workflow")
+async def sample_flow_workflow(flow_id: str, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await run_local_payment_workflow(trace_id=x_trace_id, flow_id=flow_id)
