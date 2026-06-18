@@ -28,3 +28,11 @@ async def test_local_payment_workflow_generates_recommendation() -> None:
     assert workflow["decision"]["workflow"] == "critical-auto-remediation"
     assert workflow["context"].deployment == "Deployment 2.5"
     assert workflow["recommendation"].recommended_action == "Rollback deployment"
+    assert workflow["metrics"]["agent_handoffs"] == 3
+    assert workflow["metrics"]["recommendation_confidence"] >= 0.9
+    assert [event["agent"] for event in workflow["events"]] == [
+        "Alert Intelligence Agent",
+        "Orchestrator Agent",
+        "Context Intelligence Agent",
+        "Resolution Intelligence Agent",
+    ]

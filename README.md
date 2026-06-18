@@ -157,9 +157,13 @@ Invoke-RestMethod -Method Post http://localhost:8010/sample/payment-latency/work
 ```
 
 The gateway checks for jailbreak/prompt-injection patterns, assigns a trace ID,
-proxies to the monitoring adapter, and records an audit event. The Streamlit
-**Gateway Trace & Safety** tab shows the latest safety decision, trace ID,
-latency, and recent gateway events.
+proxies to the monitoring adapter, and records an audit event. The Streamlit UI
+renders operational data as readable text, metrics, and tables:
+
+- **Overview**: severity, confidence, gateway safety, latency, handoffs, and recommendation.
+- **RCA**: root cause, impact, recommended action, context, dependencies, changes, and observability signals.
+- **Agent Trace**: full agent-by-agent event timeline showing inputs, decisions, outputs, and handoffs.
+- **Gateway Trace & Safety**: latest trace ID, safety decision, policy reasons, gateway route, summary, and recent audit events.
 
 Example gateway safety check:
 

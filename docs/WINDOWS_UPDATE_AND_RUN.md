@@ -102,6 +102,17 @@ The UI should also contain this tab:
 Gateway Trace & Safety
 ```
 
+After running a workflow, the UI should show readable cards and tables, not raw
+JSON:
+
+- `Overview` shows severity, RCA confidence, gateway safety, latency, handoffs,
+  dependencies, changes, and recommendation.
+- `RCA` shows root cause, context, dependencies, changes, and observability
+  signals.
+- `Agent Trace` shows every agent handoff, input, decision, output, and metrics.
+- `Gateway Trace & Safety` shows trace ID, policy decision, policy reasons,
+  route, recent audit events, and gateway summary.
+
 ## 5. Test the workflows
 
 Kafka publishing path:
