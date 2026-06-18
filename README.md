@@ -41,6 +41,7 @@ services/
   closure-service/         Health validation, ticket closure, KB/RCA storage
   common/                  Models, Kafka, SQLAlchemy, telemetry, resilience
   ui/                      Streamlit incident operations dashboard
+rag/                       Markdown RAG corpus for runbooks, incidents, changes, dependencies
 database/schema.sql        PostgreSQL DDL
 k8s/                       Namespace, ConfigMap, Secret, Deployments, Services, Ingress, HPA
 .github/workflows/ci.yml   Lint, test, Docker build, Kubernetes validation
@@ -294,6 +295,7 @@ Replace the sample image names in `k8s/services.yaml` with your registry images.
 - AsyncIO-first Kafka, HTTP, and agent workflows
 - SQLAlchemy async PostgreSQL persistence
 - Redis-ready configuration
+- File-backed RAG corpus in `rag/` loaded by the Context Intelligence Agent
 - Prometheus client metrics
 - OpenTelemetry FastAPI tracing with optional OTLP exporter
 - Structured JSON logging
@@ -304,3 +306,34 @@ Replace the sample image names in `k8s/services.yaml` with your registry images.
 - Docker Compose local stack
 - Kubernetes production manifests
 - Unit and integration-style tests
+
+## RAG Knowledge Corpus
+
+Context retrieval loads Markdown documents from `rag/` at startup:
+
+```text
+rag/
+  runbooks/
+  incidents/
+  deployments/
+  changes/
+  dependencies/
+```
+
+Each document starts with simple metadata:
+
+```text
+kind: runbook
+title: Payments latency rollback
+services: payments, checkout
+deployment: Deployment 2.5
+```
+
+The Context Intelligence Agent embeds and ranks these documents for each alert.
+Retrieved RAG documents populate:
+
+- `runbook`
+- `related_incidents`
+- `dependency_services`
+- `recent_changes`
+- `metadata.rag_matches`

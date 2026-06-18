@@ -1,6 +1,7 @@
 import pytest
 from common.models import Alert, AlertSeverity, Incident
 from context_agent import ContextIntelligenceAgent
+from context_agent.connectors import VectorDBConnector
 from model_router import ModelRouter
 from model_router.router import ModelProvider
 from resolution_agent import ResolutionIntelligenceAgent
@@ -25,6 +26,15 @@ def static_router() -> ModelRouter:
     )
 
 
+def test_vector_db_connector_loads_rag_documents() -> None:
+    connector = VectorDBConnector()
+
+    assert connector.documents
+    assert any(doc["kind"] == "runbook" for doc in connector.documents)
+    assert any(doc["kind"] == "incident" for doc in connector.documents)
+    assert any(doc["kind"] == "dependency" for doc in connector.documents)
+
+
 @pytest.mark.asyncio
 async def test_context_agent_returns_requested_shape() -> None:
     alert = Alert(
@@ -41,8 +51,10 @@ async def test_context_agent_returns_requested_shape() -> None:
 
     assert context.deployment == "Deployment 2.5"
     assert context.runbook
-    assert context.dependency_services == ["checkout", "ledger", "fraud"]
+    assert set(context.dependency_services) >= {"checkout", "ledger", "fraud", "postgres-primary"}
     assert context.recent_changes
+    assert context.metadata["rag_documents"] >= 1
+    assert any(match["kind"] == "runbook" for match in context.metadata["rag_matches"])
 
 
 @pytest.mark.asyncio
