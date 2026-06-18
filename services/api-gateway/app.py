@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from time import perf_counter
 from typing import Any
@@ -57,10 +58,22 @@ async def proxy(
 ) -> tuple[int, dict[str, Any]]:
     target_url = f"{target_base.rstrip('/')}/{path.lstrip('/')}"
     headers = {"x-trace-id": trace_id}
+    last_error: Exception | None = None
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.request(method, target_url, json=payload or None, headers=headers)
-        response.raise_for_status()
-        return response.status_code, response.json()
+        for attempt in range(1, 6):
+            try:
+                response = await client.request(method, target_url, json=payload or None, headers=headers)
+                response.raise_for_status()
+                return response.status_code, response.json()
+            except httpx.HTTPStatusError:
+                raise
+            except httpx.HTTPError as exc:
+                last_error = exc
+                if attempt == 5:
+                    break
+                await asyncio.sleep(0.5 * attempt)
+    assert last_error is not None
+    raise last_error
 
 
 async def guarded_proxy(
@@ -120,7 +133,12 @@ async def guarded_proxy(
             status = "ok"
         except httpx.HTTPError as exc:
             status_code = 502
-            response_payload = {"error": str(exc), "trace_id": trace_id}
+            response_payload = {
+                "error": str(exc),
+                "trace_id": trace_id,
+                "target_url": target_url,
+                "hint": "Confirm the downstream service is running and has the requested route.",
+            }
             status = "error"
 
         latency_ms = (perf_counter() - start) * 1000

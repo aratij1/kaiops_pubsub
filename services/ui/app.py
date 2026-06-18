@@ -52,9 +52,9 @@ def table_from_dict(values: dict[str, Any], key_label: str = "Metric", value_lab
         st.caption("No data.")
         return
     st.dataframe(
-        [{key_label: key.replace("_", " ").title(), value_label: value} for key, value in values.items()],
+        [{key_label: key.replace("_", " ").title(), value_label: str(value)} for key, value in values.items()],
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -63,12 +63,12 @@ def render_event_trace(events: list[dict[str, Any]]) -> None:
         {
             "Step": event.get("sequence"),
             "Agent": event.get("agent"),
-            "Decision": event.get("decision"),
-            "Communicates To": event.get("communicates_to"),
+            "Decision": str(event.get("decision")),
+            "Communicates To": str(event.get("communicates_to")),
         }
         for event in sorted(events, key=lambda item: item.get("sequence", 0))
     ]
-    st.dataframe(rows, hide_index=True, use_container_width=True)
+    st.dataframe(rows, hide_index=True, width="stretch")
 
     for event in sorted(events, key=lambda item: item.get("sequence", 0)):
         with st.expander(f"{event.get('sequence')}. {event.get('agent')}"):
@@ -86,15 +86,15 @@ def render_gateway_events(events: list[dict[str, Any]]) -> None:
             {
                 "Trace ID": event.get("trace_id"),
                 "Path": event.get("path"),
-                "Status": event.get("status_code"),
+                "Status": str(event.get("status_code")),
                 "Decision": safety.get("decision"),
-                "Score": safety.get("score"),
-                "Latency ms": round(float(event.get("latency_ms", 0)), 2),
+                "Score": str(safety.get("score")),
+                "Latency ms": str(round(float(event.get("latency_ms", 0)), 2)),
                 "Reasons": "; ".join(safety.get("reasons", [])),
             }
         )
     if rows:
-        st.dataframe(rows, hide_index=True, use_container_width=True)
+        st.dataframe(rows, hide_index=True, width="stretch")
         for event in events:
             with st.expander(f"Full trace for {event.get('path')} · {event.get('status_code')}"):
                 render_copyable_id("Trace ID", event.get("trace_id"))
@@ -151,7 +151,7 @@ with st.sidebar:
     selected_label = st.selectbox("Incident flow", list(flow_options) or ["payment-latency"])
     selected_flow = flow_options.get(selected_label, "payment-latency")
     st.caption("All requests route through the API Gateway for safety checks and traceability.")
-    if st.button("Run Flow", type="primary", use_container_width=True):
+    if st.button("Run Flow", type="primary", width="stretch"):
         gateway_response = request_json("POST", f"{GATEWAY_BASE}/sample/{selected_flow}/workflow")
         if gateway_response:
             st.session_state["gateway_response"] = gateway_response
@@ -159,7 +159,7 @@ with st.sidebar:
             st.success("Flow completed.")
 
     st.divider()
-    if st.button("Refresh Gateway Events", use_container_width=True):
+    if st.button("Refresh Gateway Events", width="stretch"):
         st.session_state["gateway_summary"] = request_json("GET", f"{GATEWAY_BASE}/observability/summary")
         st.session_state["gateway_recent"] = request_json("GET", f"{GATEWAY_BASE}/observability/recent")
 
@@ -260,15 +260,15 @@ with tab_approval:
         }
 
         col_approve, col_reject, col_modify = st.columns(3)
-        if col_approve.button("Approve", type="primary", use_container_width=True):
+        if col_approve.button("Approve", type="primary", width="stretch"):
             st.session_state["approval_response"] = request_json(
                 "POST", f"{GATEWAY_BASE}/approval/approve", json=payload
             )
-        if col_reject.button("Reject", use_container_width=True):
+        if col_reject.button("Reject", width="stretch"):
             st.session_state["approval_response"] = request_json(
                 "POST", f"{GATEWAY_BASE}/approval/reject", json=payload
             )
-        if col_modify.button("Modify", use_container_width=True):
+        if col_modify.button("Modify", width="stretch"):
             payload["modified_action"] = comment
             st.session_state["approval_response"] = request_json(
                 "POST", f"{GATEWAY_BASE}/approval/modify", json=payload
