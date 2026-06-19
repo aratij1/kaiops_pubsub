@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from common.config import get_settings
@@ -263,25 +264,39 @@ async def run_local_payment_workflow(
     recommendation.trace_id = trace_id
     model_usage = list(recommendation.metadata.get("model_usage", []))
     model_errors: list[dict[str, str]] = []
-    for task, prompt in [
-        (ModelTask.SUMMARIZATION, "Summarize the incident for an executive FinOps and SRE audience"),
-        (ModelTask.GENERAL, "Generate a fast triage communication note"),
-    ]:
-        try:
-            response = await router.route(
-                severity=enriched_alert.severity,
+    comparison_calls = [
+        (
+            "gemini",
+            ModelTask.SUMMARIZATION,
+            "Summarize the incident for an executive FinOps and SRE audience",
+        ),
+        ("groq", ModelTask.GENERAL, "Generate a fast triage communication note"),
+    ]
+    comparison_payload = {
+        "service": enriched_alert.service,
+        "incident": incident.title,
+        "root_cause": scenario["root_cause"],
+        "recommended_action": scenario["recommended_action"],
+    }
+    comparison_results = await asyncio.gather(
+        *[
+            router.route_provider(
+                provider_name=provider_name,
                 task=task,
                 prompt=prompt,
-                payload={
-                    "service": enriched_alert.service,
-                    "incident": incident.title,
-                    "root_cause": scenario["root_cause"],
-                    "recommended_action": scenario["recommended_action"],
-                },
+                payload=comparison_payload,
             )
-            model_usage.append(response["usage"])
+            for provider_name, task, prompt in comparison_calls
+        ],
+        return_exceptions=True,
+    )
+    for (provider_name, task, _), result in zip(comparison_calls, comparison_results, strict=True):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            model_usage.append(result["usage"])
         except Exception as exc:
-            model_errors.append({"task": task.value, "error": str(exc)})
+            model_errors.append({"provider": provider_name, "task": task.value, "error": str(exc)})
     resolution_event = {
         "sequence": 4,
         "agent": "Resolution Intelligence Agent",

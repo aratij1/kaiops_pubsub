@@ -68,6 +68,8 @@ async def test_local_payment_workflow_generates_recommendation() -> None:
     assert workflow["finops"]["totals"]["calls"] >= 4
     assert workflow["finops"]["totals"]["total_tokens"] > 0
     assert workflow["finops"]["totals"]["total_cost_usd"] > 0
+    providers = {row["provider"] for row in workflow["finops"]["by_provider"]}
+    assert {"gemini", "groq"}.issubset(providers)
     assert [event["agent"] for event in workflow["events"]] == [
         "Alert Intelligence Agent",
         "Orchestrator Agent",

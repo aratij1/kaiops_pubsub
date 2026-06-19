@@ -319,6 +319,7 @@ with tab_finops:
             ]
         )
         st.markdown("#### Provider cost breakdown")
+        st.caption("Gemini and Groq comparison calls run in parallel for FinOps visibility when configured.")
         provider_rows = [
             {
                 "Provider": row.get("provider"),

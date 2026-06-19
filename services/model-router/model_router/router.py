@@ -368,6 +368,22 @@ class ModelRouter:
                 errors.append(f"{name}: {exc}")
         raise RuntimeError("; ".join(errors))
 
+    async def route_provider(
+        self,
+        *,
+        provider_name: str,
+        task: ModelTask,
+        prompt: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        provider = self.providers.get(provider_name)
+        if provider is None:
+            raise RuntimeError(f"{provider_name} provider is not registered")
+        response = await provider.generate(prompt, payload)
+        usage = response.usage.as_dict()
+        usage["task"] = task.value
+        return {"model": provider_name, "content": response.content, "usage": usage}
+
 
 def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
     local_llama_provider: ModelProvider

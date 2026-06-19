@@ -112,6 +112,10 @@ defaults to a 180 second downstream timeout and the Streamlit UI defaults to a
 240 second request timeout. Local Llama/Ollama fallback is disabled by default;
 enable it only when Ollama is running:
 
+For FinOps comparison, local demo workflows call Gemini and Groq directly in
+parallel when `GEMINI_API_KEY` and `GROQ_API_KEY` are configured. Their token
+usage, cost, and errors are shown side by side in the Streamlit **FinOps** tab.
+
 ```powershell
 $env:LOCAL_LLM_ENABLED = "true"
 $env:LOCAL_LLM_ENDPOINT = "http://localhost:11434"
