@@ -3,15 +3,25 @@ from common.models import Alert, AlertSeverity, Incident
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import VectorDBConnector
 from model_router import ModelRouter
-from model_router.router import ModelProvider
+from model_router.router import ModelProvider, ModelResponse, build_usage
 from resolution_agent import ResolutionIntelligenceAgent
 
 
 class StaticProvider(ModelProvider):
-    async def generate(self, prompt: str, payload: dict) -> str:
+    async def generate(self, prompt: str, payload: dict) -> ModelResponse:
         self._ensure_available()
         self.breaker.record_success()
-        return f"{self.name}:{prompt}:{payload.get('summary', payload.get('service', 'incident'))}"
+        return ModelResponse(
+            content=f"{self.name}:{prompt}:{payload.get('summary', payload.get('service', 'incident'))}",
+            usage=build_usage(
+                provider=self.name,
+                model=f"{self.name}-model",
+                input_tokens=100,
+                output_tokens=50,
+                input_cost_per_million=1.0,
+                output_cost_per_million=2.0,
+            ),
+        )
 
 
 def static_router() -> ModelRouter:
@@ -21,6 +31,7 @@ def static_router() -> ModelRouter:
             "gpt-4o": StaticProvider("gpt-4o"),
             "claude": StaticProvider("claude"),
             "gemini": StaticProvider("gemini"),
+            "groq": StaticProvider("groq"),
             "local-llama": StaticProvider("local-llama"),
         }
     )

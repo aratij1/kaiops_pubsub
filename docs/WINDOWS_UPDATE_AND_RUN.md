@@ -85,6 +85,8 @@ $env:PYTHONPATH = "$PWD\services\common;$PWD\services\api-gateway;$PWD\services\
 $env:KAFKA_ENABLED = "false"
 $env:DATABASE_ENABLED = "false"
 $env:OPENAI_API_KEY = "your-rotated-key"
+$env:GEMINI_API_KEY = "your-gemini-key"
+$env:GROQ_API_KEY = "your-groq-key"
 $env:LLM_REQUEST_TIMEOUT_SECONDS = "120"
 $env:GATEWAY_REQUEST_TIMEOUT_SECONDS = "180"
 ```
@@ -138,6 +140,7 @@ The UI should also contain these tabs:
 Incident Summary
 Approval
 Agent Trace
+FinOps
 Gateway & Safety
 Closed Incidents
 ```
@@ -150,6 +153,7 @@ JSON:
 - `Approval` shows full incident and recommendation IDs plus approve, reject,
   and modify actions.
 - `Agent Trace` shows every agent handoff, input, decision, output, and metrics.
+- `FinOps` shows tokens and cost by provider, model, and task.
 - `Gateway & Safety` shows trace ID, policy decision, policy reasons,
   route, recent audit events, and gateway summary.
 - `Closed Incidents` shows the final closure report, validation checks,

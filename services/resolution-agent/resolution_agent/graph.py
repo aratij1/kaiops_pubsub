@@ -15,6 +15,7 @@ class ResolutionState(TypedDict, total=False):
     recommended_action: str
     confidence: float
     rationale: str
+    model_usage: list[dict[str, Any]]
 
 
 class ResolutionIntelligenceAgent:
@@ -59,6 +60,7 @@ class ResolutionIntelligenceAgent:
         deployment = context.deployment or "unknown change"
         state["root_cause"] = deployment if "Deployment" in deployment else response["content"]
         state["rationale"] = f"Model {response['model']} linked symptoms to {state['root_cause']}"
+        state.setdefault("model_usage", []).append(response["usage"])
         return state
 
     async def impact_analysis(self, state: ResolutionState) -> ResolutionState:
@@ -73,6 +75,7 @@ class ResolutionIntelligenceAgent:
             state["impact"] = f"{context.alert.service.title()} latency"
         else:
             state["impact"] = response["content"]
+        state.setdefault("model_usage", []).append(response["usage"])
         return state
 
     async def generate_fix(self, state: ResolutionState) -> ResolutionState:
@@ -93,6 +96,7 @@ class ResolutionIntelligenceAgent:
             )
             action = response["content"]
             commands = []
+            state.setdefault("model_usage", []).append(response["usage"])
         state["recommended_action"] = action
         state["commands"] = commands
         return state
@@ -113,7 +117,7 @@ class ResolutionIntelligenceAgent:
 
     async def resolve(self, context: Context) -> Recommendation:
         state = await self.graph.ainvoke({"context": context})
-        return Recommendation(
+        recommendation = Recommendation(
             incident_id=context.incident_id,
             root_cause=state["root_cause"],
             confidence=state["confidence"],
@@ -124,3 +128,5 @@ class ResolutionIntelligenceAgent:
             commands=state.get("commands", []),
             risk="high" if context.alert.severity == AlertSeverity.CRITICAL else "medium",
         )
+        recommendation.metadata["model_usage"] = state.get("model_usage", [])
+        return recommendation

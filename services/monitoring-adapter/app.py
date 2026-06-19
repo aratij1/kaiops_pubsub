@@ -198,11 +198,13 @@ async def run_local_payment_workflow(
     from alert_intelligence import AlertIntelligenceAgent
     from closure_service import ClosureValidationAgent
     from context_agent import ContextIntelligenceAgent
+    from model_router import ModelRouter, ModelTask
     from orchestrator import OrchestratorAgent
     from remediation_engine import RemediationEngine
     from resolution_agent import ResolutionIntelligenceAgent
 
     scenario = SCENARIOS.get(flow_id, SCENARIOS["payment-latency"])
+    router = model_router or ModelRouter()
     alert = build_sample_alert(flow_id, trace_id=trace_id)
     enriched_alert, incident = AlertIntelligenceAgent().process(alert)
     incident.trace_id = trace_id
@@ -250,7 +252,7 @@ async def run_local_payment_workflow(
             "runbook_found": bool(context.runbook),
         },
     }
-    recommendation = await ResolutionIntelligenceAgent(model_router=model_router).resolve(context)
+    recommendation = await ResolutionIntelligenceAgent(model_router=router).resolve(context)
     recommendation.root_cause = scenario["root_cause"]
     recommendation.impact = scenario["impact"]
     recommendation.recommended_action = scenario["recommended_action"]
@@ -259,6 +261,27 @@ async def run_local_payment_workflow(
         f"recommended action is {scenario['recommended_action']}."
     )
     recommendation.trace_id = trace_id
+    model_usage = list(recommendation.metadata.get("model_usage", []))
+    model_errors: list[dict[str, str]] = []
+    for task, prompt in [
+        (ModelTask.SUMMARIZATION, "Summarize the incident for an executive FinOps and SRE audience"),
+        (ModelTask.GENERAL, "Generate a fast triage communication note"),
+    ]:
+        try:
+            response = await router.route(
+                severity=enriched_alert.severity,
+                task=task,
+                prompt=prompt,
+                payload={
+                    "service": enriched_alert.service,
+                    "incident": incident.title,
+                    "root_cause": scenario["root_cause"],
+                    "recommended_action": scenario["recommended_action"],
+                },
+            )
+            model_usage.append(response["usage"])
+        except Exception as exc:
+            model_errors.append({"task": task.value, "error": str(exc)})
     resolution_event = {
         "sequence": 4,
         "agent": "Resolution Intelligence Agent",
@@ -336,6 +359,7 @@ async def run_local_payment_workflow(
         "health_restored": closure_report.health_restored,
         "alerts_cleared": closure_report.alerts_cleared,
     }
+    finops = build_finops_summary(model_usage, model_errors)
 
     return {
         "mode": "local-no-kafka",
@@ -353,6 +377,7 @@ async def run_local_payment_workflow(
         "remediation_action": action,
         "closure_report": closure_report,
         "metrics": metrics,
+        "finops": finops,
         "events": [
             alert_event,
             orchestrator_event,
@@ -363,6 +388,34 @@ async def run_local_payment_workflow(
             closure_event,
         ],
         "next_step": "Incident closed in local demo. Review closure report and lessons learned.",
+    }
+
+
+def build_finops_summary(model_usage: list[dict[str, Any]], model_errors: list[dict[str, str]]) -> dict[str, Any]:
+    totals = {
+        "input_tokens": sum(int(item.get("input_tokens", 0)) for item in model_usage),
+        "output_tokens": sum(int(item.get("output_tokens", 0)) for item in model_usage),
+        "total_tokens": sum(int(item.get("total_tokens", 0)) for item in model_usage),
+        "total_cost_usd": round(sum(float(item.get("total_cost_usd", 0.0)) for item in model_usage), 8),
+        "calls": len(model_usage),
+        "failed_calls": len(model_errors),
+    }
+    by_provider: dict[str, dict[str, Any]] = {}
+    for item in model_usage:
+        provider = str(item.get("provider", "unknown"))
+        row = by_provider.setdefault(
+            provider,
+            {"provider": provider, "calls": 0, "total_tokens": 0, "total_cost_usd": 0.0},
+        )
+        row["calls"] += 1
+        row["total_tokens"] += int(item.get("total_tokens", 0))
+        row["total_cost_usd"] = round(float(row["total_cost_usd"]) + float(item.get("total_cost_usd", 0.0)), 8)
+    return {
+        "totals": totals,
+        "by_provider": list(by_provider.values()),
+        "calls": model_usage,
+        "errors": model_errors,
+        "currency": "USD",
     }
 
 

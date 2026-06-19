@@ -4,14 +4,24 @@ from pathlib import Path
 import pytest
 from common.models import RemediationStatus
 from model_router import ModelRouter
-from model_router.router import ModelProvider
+from model_router.router import ModelProvider, ModelResponse, build_usage
 
 
 class StaticProvider(ModelProvider):
-    async def generate(self, prompt: str, payload: dict) -> str:
+    async def generate(self, prompt: str, payload: dict) -> ModelResponse:
         self._ensure_available()
         self.breaker.record_success()
-        return f"{self.name}:{prompt}:{payload.get('summary', payload.get('service', 'incident'))}"
+        return ModelResponse(
+            content=f"{self.name}:{prompt}:{payload.get('summary', payload.get('service', 'incident'))}",
+            usage=build_usage(
+                provider=self.name,
+                model=f"{self.name}-model",
+                input_tokens=100,
+                output_tokens=50,
+                input_cost_per_million=1.0,
+                output_cost_per_million=2.0,
+            ),
+        )
 
 
 def static_router() -> ModelRouter:
@@ -21,6 +31,7 @@ def static_router() -> ModelRouter:
             "gpt-4o": StaticProvider("gpt-4o"),
             "claude": StaticProvider("claude"),
             "gemini": StaticProvider("gemini"),
+            "groq": StaticProvider("groq"),
             "local-llama": StaticProvider("local-llama"),
         }
     )
@@ -54,6 +65,9 @@ async def test_local_payment_workflow_generates_recommendation() -> None:
     assert workflow["metrics"]["recommendation_confidence"] >= 0.9
     assert workflow["closure_report"].health_restored is True
     assert workflow["remediation_action"].status == RemediationStatus.SUCCEEDED
+    assert workflow["finops"]["totals"]["calls"] >= 4
+    assert workflow["finops"]["totals"]["total_tokens"] > 0
+    assert workflow["finops"]["totals"]["total_cost_usd"] > 0
     assert [event["agent"] for event in workflow["events"]] == [
         "Alert Intelligence Agent",
         "Orchestrator Agent",

@@ -100,6 +100,10 @@ PowerShell:
 $env:OPENAI_API_KEY = "your-rotated-key"
 $env:OPENAI_GPT5_MODEL = "gpt-5"
 $env:OPENAI_GPT4O_MODEL = "gpt-4o"
+$env:GEMINI_API_KEY = "your-gemini-key"
+$env:GEMINI_MODEL = "gemini-1.5-flash"
+$env:GROQ_API_KEY = "your-groq-key"
+$env:GROQ_MODEL = "llama-3.1-70b-versatile"
 $env:LLM_REQUEST_TIMEOUT_SECONDS = "120"
 ```
 
@@ -198,6 +202,7 @@ database failover, service restart, Terraform rollback, and API remediation:
 - **Incident Summary**: what happened, recommendation, context, and key test metrics.
 - **Approval**: prefilled human approval form with full incident/recommendation IDs and approve/reject/modify actions.
 - **Agent Trace**: full agent-by-agent event timeline showing inputs, decisions, outputs, and handoffs.
+- **FinOps**: LLM token usage and estimated/actual cost by provider, model, and task.
 - **Gateway & Safety**: latest trace ID, safety decision, policy reasons, gateway route, summary, and recent audit events.
 - **Closed Incidents**: closure report, validation checks, knowledge-base entry, and lessons learned.
 

@@ -175,6 +175,7 @@ context = workflow.get("context", {})
 recommendation = workflow.get("recommendation", {})
 remediation = workflow.get("remediation_action", {})
 closure = workflow.get("closure_report", {})
+finops = workflow.get("finops", {})
 
 if not workflow:
     st.info("Choose one of the 10 incident flows in the sidebar and click Run Flow.")
@@ -191,8 +192,8 @@ else:
         ]
     )
 
-tab_summary, tab_approval, tab_trace, tab_gateway, tab_closed = st.tabs(
-    ["Incident Summary", "Approval", "Agent Trace", "Gateway & Safety", "Closed Incidents"]
+tab_summary, tab_approval, tab_trace, tab_finops, tab_gateway, tab_closed = st.tabs(
+    ["Incident Summary", "Approval", "Agent Trace", "FinOps", "Gateway & Safety", "Closed Incidents"]
 )
 
 with tab_summary:
@@ -302,6 +303,61 @@ with tab_approval:
 with tab_trace:
     st.markdown("### How agents decided and communicated")
     render_event_trace(workflow.get("events", []))
+
+with tab_finops:
+    st.markdown("### LLM FinOps")
+    if not finops:
+        st.info("Run a flow to see token usage and model costs.")
+    else:
+        totals = finops.get("totals", {})
+        metric_row(
+            [
+                ("LLM Calls", totals.get("calls", 0)),
+                ("Total Tokens", totals.get("total_tokens", 0)),
+                ("Total Cost", f"${float(totals.get('total_cost_usd', 0.0)):.6f}"),
+                ("Failed Calls", totals.get("failed_calls", 0)),
+            ]
+        )
+        st.markdown("#### Provider cost breakdown")
+        provider_rows = [
+            {
+                "Provider": row.get("provider"),
+                "Calls": str(row.get("calls", 0)),
+                "Tokens": str(row.get("total_tokens", 0)),
+                "Cost USD": f"${float(row.get('total_cost_usd', 0.0)):.6f}",
+            }
+            for row in finops.get("by_provider", [])
+        ]
+        if provider_rows:
+            st.dataframe(provider_rows, hide_index=True, width="stretch")
+        else:
+            st.caption("No successful model calls recorded.")
+
+        st.markdown("#### Per-call model usage")
+        call_rows = [
+            {
+                "Task": call.get("task"),
+                "Provider": call.get("provider"),
+                "Model": call.get("model"),
+                "Input Tokens": str(call.get("input_tokens", 0)),
+                "Output Tokens": str(call.get("output_tokens", 0)),
+                "Total Tokens": str(call.get("total_tokens", 0)),
+                "Cost USD": f"${float(call.get('total_cost_usd', 0.0)):.6f}",
+                "Estimated": str(call.get("estimated", False)),
+            }
+            for call in finops.get("calls", [])
+        ]
+        if call_rows:
+            st.dataframe(call_rows, hide_index=True, width="stretch")
+
+        errors = finops.get("errors", [])
+        if errors:
+            st.markdown("#### Provider failover/errors")
+            st.dataframe(
+                [{"Task": item.get("task"), "Error": item.get("error")} for item in errors],
+                hide_index=True,
+                width="stretch",
+            )
 
 with tab_gateway:
     st.markdown("### Gateway safety and observability")
