@@ -13,8 +13,8 @@ data:
   API_GATEWAY_URL: http://api-gateway:8000
   OPENAI_GPT5_MODEL: gpt-5
   OPENAI_GPT4O_MODEL: gpt-4o
-  GEMINI_MODEL: gemini-1.5-flash
-  GROQ_MODEL: llama-3.1-70b-versatile
+  GEMINI_MODEL: gemini-2.0-flash
+  GROQ_MODEL: llama-3.3-70b-versatile
   LOCAL_LLM_ENABLED: "false"
   LLM_REQUEST_TIMEOUT_SECONDS: "120"
   GATEWAY_REQUEST_TIMEOUT_SECONDS: "180"

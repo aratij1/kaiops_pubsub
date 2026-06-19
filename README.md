@@ -101,9 +101,9 @@ $env:OPENAI_API_KEY = "your-rotated-key"
 $env:OPENAI_GPT5_MODEL = "gpt-5"
 $env:OPENAI_GPT4O_MODEL = "gpt-4o"
 $env:GEMINI_API_KEY = "your-gemini-key"
-$env:GEMINI_MODEL = "gemini-1.5-flash"
+$env:GEMINI_MODEL = "gemini-2.0-flash"
 $env:GROQ_API_KEY = "your-groq-key"
-$env:GROQ_MODEL = "llama-3.1-70b-versatile"
+$env:GROQ_MODEL = "llama-3.3-70b-versatile"
 $env:LLM_REQUEST_TIMEOUT_SECONDS = "120"
 ```
 
@@ -115,6 +115,8 @@ enable it only when Ollama is running:
 For FinOps comparison, local demo workflows call Gemini and Groq directly in
 parallel when `GEMINI_API_KEY` and `GROQ_API_KEY` are configured. Their token
 usage, cost, and errors are shown side by side in the Streamlit **FinOps** tab.
+If a provider key is ever pasted into chat or appears in logs, rotate it in the
+provider console before continuing.
 
 ```powershell
 $env:LOCAL_LLM_ENABLED = "true"

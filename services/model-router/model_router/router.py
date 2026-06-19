@@ -86,6 +86,12 @@ def build_usage(
     )
 
 
+def provider_error_message(provider: str, model: str, response: httpx.Response) -> str:
+    url_without_query = str(response.request.url).split("?", 1)[0]
+    body = response.text[:500]
+    return f"{provider} model {model} returned HTTP {response.status_code} for {url_without_query}. Response: {body}"
+
+
 @dataclass
 class ModelProvider:
     name: str
@@ -151,6 +157,9 @@ class OpenAIModelProvider(ModelProvider):
                 )
                 response.raise_for_status()
                 data = response.json()
+        except httpx.HTTPStatusError as exc:
+            self.breaker.record_failure()
+            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
         except Exception:
             self.breaker.record_failure()
             raise
@@ -198,6 +207,9 @@ class OllamaModelProvider(ModelProvider):
                 response = await client.post(f"{self.endpoint.rstrip('/')}/api/generate", json=request_payload)
                 response.raise_for_status()
                 data = response.json()
+        except httpx.HTTPStatusError as exc:
+            self.breaker.record_failure()
+            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
         except Exception:
             self.breaker.record_failure()
             raise
@@ -221,7 +233,7 @@ class OllamaModelProvider(ModelProvider):
 
 @dataclass
 class GeminiModelProvider(ModelProvider):
-    model: str = "gemini-1.5-flash"
+    model: str = "gemini-2.0-flash"
     api_key: str | None = None
     base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     timeout_seconds: float = 45.0
@@ -236,15 +248,19 @@ class GeminiModelProvider(ModelProvider):
 
         text_payload = json.dumps({"task": prompt, "payload": payload}, default=str)
         request_payload = {"contents": [{"parts": [{"text": text_payload}]}]}
+        headers = {"x-goog-api-key": self.api_key}
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 response = await client.post(
                     f"{self.base_url.rstrip('/')}/models/{self.model}:generateContent",
-                    params={"key": self.api_key},
+                    headers=headers,
                     json=request_payload,
                 )
                 response.raise_for_status()
                 data = response.json()
+        except httpx.HTTPStatusError as exc:
+            self.breaker.record_failure()
+            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
         except Exception:
             self.breaker.record_failure()
             raise
@@ -274,7 +290,7 @@ class GeminiModelProvider(ModelProvider):
 
 @dataclass
 class GroqModelProvider(ModelProvider):
-    model: str = "llama-3.1-70b-versatile"
+    model: str = "llama-3.3-70b-versatile"
     api_key: str | None = None
     base_url: str = "https://api.groq.com/openai/v1"
     timeout_seconds: float = 45.0
@@ -305,6 +321,9 @@ class GroqModelProvider(ModelProvider):
                 )
                 response.raise_for_status()
                 data = response.json()
+        except httpx.HTTPStatusError as exc:
+            self.breaker.record_failure()
+            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
         except Exception:
             self.breaker.record_failure()
             raise
