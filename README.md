@@ -59,6 +59,10 @@ k8s/                       Namespace, ConfigMap, Secret, Deployments, Services, 
 | api-gateway | `POST /security/check` | Run jailbreak/prompt-injection checks |
 | api-gateway | `GET /observability/recent` | Recent gateway safety/trace audit events |
 | api-gateway | `GET /observability/summary` | Gateway request/safety summary |
+| api-gateway | `POST /rag/documents` | Ingest a new RAG document through gateway safety checks |
+| api-gateway | `GET /rag/documents` | List loaded RAG documents |
+| api-gateway | `POST /rag/reload` | Reload the RAG document index |
+| api-gateway | `GET /rag/search` | Search RAG documents |
 | monitoring-adapter | `POST /alerts` | Ingest monitoring alerts |
 | monitoring-adapter | `POST /sample/payment-latency` | Trigger a sample alert |
 | alert-intelligence | `POST /process` | Deduplicate, correlate, classify, enrich |
@@ -209,6 +213,7 @@ database failover, service restart, Terraform rollback, and API remediation:
 - **Approval**: prefilled human approval form with full incident/recommendation IDs and approve/reject/modify actions.
 - **Agent Trace**: full agent-by-agent event timeline showing inputs, decisions, outputs, and handoffs.
 - **FinOps**: LLM token usage and estimated/actual cost by provider, model, and task.
+- **RAG Ingestion**: add new runbooks/incidents/deployments/changes/dependencies, reload index, search docs.
 - **Gateway & Safety**: latest trace ID, safety decision, policy reasons, gateway route, summary, and recent audit events.
 - **Closed Incidents**: closure report, validation checks, knowledge-base entry, and lessons learned.
 
@@ -359,3 +364,24 @@ Retrieved RAG documents populate:
 - `dependency_services`
 - `recent_changes`
 - `metadata.rag_matches`
+
+### Ingesting RAG documents
+
+Use the Streamlit **RAG Ingestion** tab, or call the API Gateway:
+
+```powershell
+$body = @{
+  kind = "runbook"
+  title = "Payments cache warmup"
+  services = @("payments", "cache")
+  dependencies = @("redis")
+  content = "Use this runbook when payments cache warmup fails after deployment."
+  metadata = @{ source = "manual" }
+} | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8010/rag/documents" -ContentType "application/json" -Body $body
+Invoke-RestMethod -Uri "http://localhost:8010/rag/search?query=payments%20cache%20warmup" | ConvertTo-Json -Depth 10
+```
+
+Docker Compose mounts `./rag` into the context and monitoring services, so new
+documents are persisted on the host and picked up by subsequent retrieval.

@@ -192,8 +192,8 @@ else:
         ]
     )
 
-tab_summary, tab_approval, tab_trace, tab_finops, tab_gateway, tab_closed = st.tabs(
-    ["Incident Summary", "Approval", "Agent Trace", "FinOps", "Gateway & Safety", "Closed Incidents"]
+tab_summary, tab_approval, tab_trace, tab_finops, tab_rag, tab_gateway, tab_closed = st.tabs(
+    ["Incident Summary", "Approval", "Agent Trace", "FinOps", "RAG Ingestion", "Gateway & Safety", "Closed Incidents"]
 )
 
 with tab_summary:
@@ -359,6 +359,111 @@ with tab_finops:
                 hide_index=True,
                 width="stretch",
             )
+
+with tab_rag:
+    st.markdown("### Ingest a new RAG document")
+    st.caption("Documents are safety-checked by the API Gateway, stored under `rag/`, and reloaded into retrieval.")
+    with st.form("rag_ingest_form"):
+        kind = st.selectbox("Document type", ["runbook", "incident", "deployment", "change", "dependency"])
+        title = st.text_input("Title", placeholder="Payments rollback runbook")
+        services_text = st.text_input("Services", placeholder="payments, checkout")
+        deployment = st.text_input("Deployment / release", placeholder="Deployment 2.5")
+        dependencies_text = st.text_input("Dependencies", placeholder="checkout, ledger, fraud")
+        change_id = st.text_input("Change ID", placeholder="CHG-1234")
+        content = st.text_area(
+            "Document content",
+            height=220,
+            placeholder="Paste runbook, incident, deployment, dependency graph, or change-record content...",
+        )
+        submitted = st.form_submit_button("Ingest document", type="primary")
+
+    if submitted:
+        payload = {
+            "kind": kind,
+            "title": title,
+            "content": content,
+            "services": [item.strip() for item in services_text.split(",") if item.strip()],
+            "deployment": deployment or None,
+            "dependencies": [item.strip() for item in dependencies_text.split(",") if item.strip()],
+            "change_id": change_id or None,
+            "metadata": {"source": "ui"},
+        }
+        result = request_json("POST", f"{GATEWAY_BASE}/rag/documents", json=payload)
+        if result:
+            st.session_state["rag_ingest_result"] = result
+            st.success("Document ingested and RAG index reloaded.")
+
+    if st.session_state.get("rag_ingest_result"):
+        data = data_from_gateway(st.session_state["rag_ingest_result"])
+        table_from_dict(
+            {
+                "status": data.get("status"),
+                "path": data.get("path"),
+                "document_count": data.get("document_count"),
+                "trace_id": st.session_state["rag_ingest_result"].get("trace_id"),
+            },
+            "Field",
+            "Value",
+        )
+
+    col_reload, col_list = st.columns(2)
+    if col_reload.button("Reload RAG index", width="stretch"):
+        st.session_state["rag_reload"] = request_json("POST", f"{GATEWAY_BASE}/rag/reload")
+    if col_list.button("List RAG documents", width="stretch"):
+        st.session_state["rag_documents"] = request_json("GET", f"{GATEWAY_BASE}/rag/documents")
+
+    if st.session_state.get("rag_reload"):
+        reloaded_count = data_from_gateway(st.session_state["rag_reload"]).get("document_count")
+        st.success(f"RAG index reloaded: {reloaded_count} docs")
+
+    search_query = st.text_input("Search RAG", placeholder="payments latency rollback")
+    if st.button("Search documents", width="stretch", disabled=not search_query):
+        st.session_state["rag_search"] = request_json(
+            "GET", f"{GATEWAY_BASE}/rag/search", params={"query": search_query, "limit": 8}
+        )
+
+    if st.session_state.get("rag_search"):
+        st.markdown("#### Search results")
+        matches = data_from_gateway(st.session_state["rag_search"]).get("matches", [])
+        if matches:
+            st.dataframe(
+                [
+                    {
+                        "Kind": match.get("kind"),
+                        "Title": match.get("title"),
+                        "Services": ", ".join(match.get("services", []))
+                        if isinstance(match.get("services"), list)
+                        else str(match.get("services", "")),
+                        "Deployment": str(match.get("deployment", "")),
+                        "Preview": str(match.get("preview", "")),
+                    }
+                    for match in matches
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            st.caption("No matches found.")
+
+    if st.session_state.get("rag_documents"):
+        st.markdown("#### Current RAG documents")
+        documents = data_from_gateway(st.session_state["rag_documents"]).get("documents", [])
+        st.caption(f"{data_from_gateway(st.session_state['rag_documents']).get('document_count', 0)} documents loaded")
+        st.dataframe(
+            [
+                {
+                    "Kind": doc.get("kind"),
+                    "Title": doc.get("title"),
+                    "Services": ", ".join(doc.get("services", []))
+                    if isinstance(doc.get("services"), list)
+                    else str(doc.get("services", "")),
+                    "Path": doc.get("path"),
+                }
+                for doc in documents
+            ],
+            hide_index=True,
+            width="stretch",
+        )
 
 with tab_gateway:
     st.markdown("### Gateway safety and observability")

@@ -96,6 +96,25 @@ class VectorDBConnector(BaseConnector):
             return []
         return [self._parse_document(path) for path in sorted(root.rglob("*.md"))]
 
+    def reload(self) -> int:
+        self.documents = self.load_documents()
+        return len(self.documents)
+
+    def search(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
+        query_vector = self.embedding_model.embed(query)
+        return sorted(
+            self.documents,
+            key=lambda doc: cosine_similarity(query_vector, self.embedding_model.embed(self._document_text(doc))),
+            reverse=True,
+        )[:limit]
+
+    def root_path(self) -> Path:
+        root = self.rag_root or self._discover_rag_root()
+        if root is None:
+            root = Path.cwd() / "rag"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
     def _discover_rag_root(self) -> Path | None:
         candidates = [Path.cwd(), *Path.cwd().parents, Path("/app")]
         for candidate in candidates:

@@ -78,6 +78,8 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/services/monitoring-adapter
     ports: ["8001:8000"]
+    volumes:
+      - ./rag:/app/rag
     depends_on:
       kafka: { condition: service_healthy }
       postgres: { condition: service_healthy }
@@ -121,6 +123,8 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/services/context-agent
     ports: ["8004:8000"]
+    volumes:
+      - ./rag:/app/rag
     depends_on:
       kafka: { condition: service_healthy }
       postgres: { condition: service_healthy }

@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlencode
 from uuid import uuid4
 
 import httpx
@@ -265,6 +266,70 @@ async def approval_action(
         path=f"/{action}",
         target_base=settings.approval_service_url,
         payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/rag/documents")
+async def ingest_rag_document(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/rag/documents",
+        target_base=settings.context_agent_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/rag/documents")
+async def list_rag_documents(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/rag/documents",
+        target_base=settings.context_agent_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/rag/reload")
+async def reload_rag(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/rag/reload",
+        target_base=settings.context_agent_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/rag/search")
+async def search_rag(
+    query: str,
+    request: Request,
+    limit: int = 8,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    query_string = urlencode({"query": query, "limit": limit})
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/rag/search?{query_string}",
+        target_base=settings.context_agent_url,
+        payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
 

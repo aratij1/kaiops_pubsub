@@ -19,6 +19,11 @@ $Checks = @(
         Description = "Streamlit approval screen"
     },
     @{
+        Path = "services\ui\app.py"
+        Pattern = "RAG Ingestion"
+        Description = "Streamlit RAG ingestion tab"
+    },
+    @{
         Path = "services\api-gateway\app.py"
         Pattern = "/security/check"
         Description = "API Gateway safety endpoint"
@@ -27,6 +32,11 @@ $Checks = @(
         Path = "services\api-gateway\app.py"
         Pattern = "/sample/flows"
         Description = "API Gateway sample flow catalog endpoint"
+    },
+    @{
+        Path = "services\api-gateway\app.py"
+        Pattern = "/rag/documents"
+        Description = "API Gateway RAG ingestion endpoint"
     },
     @{
         Path = "services\monitoring-adapter\app.py"

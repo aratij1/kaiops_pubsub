@@ -54,7 +54,9 @@ Select-String -Path .\services\ui\app.py -Pattern "Run Flow"
 Select-String -Path .\services\ui\app.py -Pattern "Gateway & Safety"
 Select-String -Path .\services\ui\app.py -Pattern "Closed Incidents"
 Select-String -Path .\services\ui\app.py -Pattern "Human approval"
+Select-String -Path .\services\ui\app.py -Pattern "RAG Ingestion"
 Select-String -Path .\services\api-gateway\app.py -Pattern "/security/check"
+Select-String -Path .\services\api-gateway\app.py -Pattern "/rag/documents"
 Select-String -Path .\services\api-gateway\app.py -Pattern "/sample/flows"
 Select-String -Path .\services\monitoring-adapter\app.py -Pattern "payment-latency/workflow"
 Select-String -Path .\docker-compose.yml -Pattern "healthcheck"
@@ -143,6 +145,7 @@ Incident Summary
 Approval
 Agent Trace
 FinOps
+RAG Ingestion
 Gateway & Safety
 Closed Incidents
 ```
@@ -156,6 +159,7 @@ JSON:
   and modify actions.
 - `Agent Trace` shows every agent handoff, input, decision, output, and metrics.
 - `FinOps` shows tokens and cost by provider, model, and task.
+- `RAG Ingestion` lets you add, reload, list, and search RAG documents.
 - `Gateway & Safety` shows trace ID, policy decision, policy reasons,
   route, recent audit events, and gateway summary.
 - `Closed Incidents` shows the final closure report, validation checks,
