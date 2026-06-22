@@ -37,6 +37,14 @@ def static_router() -> ModelRouter:
     )
 
 
+class FailingRouter(ModelRouter):
+    async def route(self, **kwargs):
+        raise RuntimeError("all providers failed")
+
+    async def route_provider(self, **kwargs):
+        raise RuntimeError(f"{kwargs['provider_name']} failed")
+
+
 def load_monitoring_app_module():
     module_path = Path("services/monitoring-adapter/app.py")
     spec = importlib.util.spec_from_file_location("monitoring_adapter_app", module_path)
@@ -88,3 +96,18 @@ def test_sample_flow_catalog_has_ten_scenarios() -> None:
 
     assert len(flows) == 10
     assert {flow["id"] for flow in flows} >= {"payment-latency", "database-replica-lag"}
+
+
+@pytest.mark.asyncio
+async def test_local_workflow_returns_finops_errors_when_models_fail() -> None:
+    module = load_monitoring_app_module()
+
+    workflow = await module.run_local_payment_workflow(
+        trace_id="trace-fail",
+        flow_id="checkout-pod-crash",
+        model_router=FailingRouter(),
+    )
+
+    assert workflow["recommendation"].recommended_action == "Restart pod"
+    assert workflow["finops"]["totals"]["failed_calls"] >= 3
+    assert workflow["closure_report"].health_restored is True

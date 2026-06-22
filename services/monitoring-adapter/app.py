@@ -4,7 +4,7 @@ import asyncio
 from typing import Any
 
 from common.config import get_settings
-from common.models import Alert, AlertSeverity, Approval, ApprovalDecision
+from common.models import Alert, AlertSeverity, Approval, ApprovalDecision, Recommendation
 from common.service import create_app
 from common.topics import RAW_ALERTS
 from fastapi import Body, Header
@@ -253,7 +253,25 @@ async def run_local_payment_workflow(
             "runbook_found": bool(context.runbook),
         },
     }
-    recommendation = await ResolutionIntelligenceAgent(model_router=router).resolve(context)
+    model_errors: list[dict[str, str]] = []
+    try:
+        recommendation = await ResolutionIntelligenceAgent(model_router=router).resolve(context)
+    except Exception as exc:
+        recommendation = Recommendation(
+            incident_id=incident.id,
+            root_cause=scenario["root_cause"],
+            confidence=0.72,
+            impact=scenario["impact"],
+            recommended_action=scenario["recommended_action"],
+            severity=enriched_alert.severity,
+            rationale=(
+                "RCA model route failed; recommendation is based on retrieved RAG context "
+                "and scenario evidence. See FinOps errors for provider details."
+            ),
+            commands=[],
+            risk="high" if enriched_alert.severity == AlertSeverity.CRITICAL else "medium",
+        )
+        model_errors.append({"provider": "router", "task": "resolution", "error": str(exc)})
     recommendation.root_cause = scenario["root_cause"]
     recommendation.impact = scenario["impact"]
     recommendation.recommended_action = scenario["recommended_action"]
@@ -263,7 +281,6 @@ async def run_local_payment_workflow(
     )
     recommendation.trace_id = trace_id
     model_usage = list(recommendation.metadata.get("model_usage", []))
-    model_errors: list[dict[str, str]] = []
     comparison_calls = [
         (
             "gemini",
