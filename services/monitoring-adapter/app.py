@@ -271,7 +271,15 @@ async def run_local_payment_workflow(
             commands=[],
             risk="high" if enriched_alert.severity == AlertSeverity.CRITICAL else "medium",
         )
-        model_errors.append({"provider": "router", "task": "resolution", "error": str(exc)})
+        model_errors.append(
+            {
+                "provider": "router",
+                "task": "resolution",
+                "prompt": "Resolution Intelligence Agent LangGraph workflow",
+                "payload": str({"alert": enriched_alert.description, "context": context.metadata}),
+                "error": str(exc),
+            }
+        )
     recommendation.root_cause = scenario["root_cause"]
     recommendation.impact = scenario["impact"]
     recommendation.recommended_action = scenario["recommended_action"]
@@ -281,6 +289,7 @@ async def run_local_payment_workflow(
     )
     recommendation.trace_id = trace_id
     model_usage = list(recommendation.metadata.get("model_usage", []))
+    model_calls = list(recommendation.metadata.get("model_calls", []))
     comparison_calls = [
         (
             "gemini",
@@ -312,8 +321,27 @@ async def run_local_payment_workflow(
             if isinstance(result, Exception):
                 raise result
             model_usage.append(result["usage"])
+            model_calls.append(
+                {
+                    "task": task.value,
+                    "provider": provider_name,
+                    "model": result["usage"].get("model"),
+                    "prompt": next(prompt for name, _, prompt in comparison_calls if name == provider_name),
+                    "payload": comparison_payload,
+                    "response": result["content"],
+                    "usage": result["usage"],
+                }
+            )
         except Exception as exc:
-            model_errors.append({"provider": provider_name, "task": task.value, "error": str(exc)})
+            model_errors.append(
+                {
+                    "provider": provider_name,
+                    "task": task.value,
+                    "prompt": next(prompt for name, _, prompt in comparison_calls if name == provider_name),
+                    "payload": str(comparison_payload),
+                    "error": str(exc),
+                }
+            )
     resolution_event = {
         "sequence": 4,
         "agent": "Resolution Intelligence Agent",
@@ -327,6 +355,8 @@ async def run_local_payment_workflow(
             "commands": len(recommendation.commands),
             "risk": recommendation.risk,
         },
+        "llm_calls": model_calls,
+        "llm_errors": model_errors,
     }
     approval = Approval(
         incident_id=incident.id,

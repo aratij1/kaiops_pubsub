@@ -16,6 +16,7 @@ class ResolutionState(TypedDict, total=False):
     confidence: float
     rationale: str
     model_usage: list[dict[str, Any]]
+    model_calls: list[dict[str, Any]]
 
 
 class ResolutionIntelligenceAgent:
@@ -51,31 +52,57 @@ class ResolutionIntelligenceAgent:
 
     async def generate_rca(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
+        prompt = "Identify root cause"
+        payload = {"summary": context.alert.description, **state["gathered_context"]}
         response = await self.model_router.route(
             severity=context.alert.severity,
             task=ModelTask.RCA,
-            prompt="Identify root cause",
-            payload={"summary": context.alert.description, **state["gathered_context"]},
+            prompt=prompt,
+            payload=payload,
         )
         deployment = context.deployment or "unknown change"
         state["root_cause"] = deployment if "Deployment" in deployment else response["content"]
         state["rationale"] = f"Model {response['model']} linked symptoms to {state['root_cause']}"
         state.setdefault("model_usage", []).append(response["usage"])
+        state.setdefault("model_calls", []).append(
+            {
+                "task": ModelTask.RCA.value,
+                "provider": response["model"],
+                "model": response["usage"].get("model"),
+                "prompt": prompt,
+                "payload": payload,
+                "response": response["content"],
+                "usage": response["usage"],
+            }
+        )
         return state
 
     async def impact_analysis(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
+        prompt = "Assess customer and dependency impact"
+        payload = {"service": context.alert.service, "metrics": context.observability}
         response = await self.model_router.route(
             severity=context.alert.severity,
             task=ModelTask.IMPACT,
-            prompt="Assess customer and dependency impact",
-            payload={"service": context.alert.service, "metrics": context.observability},
+            prompt=prompt,
+            payload=payload,
         )
         if "latency" in context.alert.description.lower():
             state["impact"] = f"{context.alert.service.title()} latency"
         else:
             state["impact"] = response["content"]
         state.setdefault("model_usage", []).append(response["usage"])
+        state.setdefault("model_calls", []).append(
+            {
+                "task": ModelTask.IMPACT.value,
+                "provider": response["model"],
+                "model": response["usage"].get("model"),
+                "prompt": prompt,
+                "payload": payload,
+                "response": response["content"],
+                "usage": response["usage"],
+            }
+        )
         return state
 
     async def generate_fix(self, state: ResolutionState) -> ResolutionState:
@@ -88,15 +115,28 @@ class ResolutionIntelligenceAgent:
             action = "Restart pod"
             commands = [f"restart-pod:{context.alert.service}"]
         else:
+            prompt = "Recommend safest remediation"
+            payload = {"service": context.alert.service, "runbook": context.runbook}
             response = await self.model_router.route(
                 severity=context.alert.severity,
                 task=ModelTask.FIX,
-                prompt="Recommend safest remediation",
-                payload={"service": context.alert.service, "runbook": context.runbook},
+                prompt=prompt,
+                payload=payload,
             )
             action = response["content"]
             commands = []
             state.setdefault("model_usage", []).append(response["usage"])
+            state.setdefault("model_calls", []).append(
+                {
+                    "task": ModelTask.FIX.value,
+                    "provider": response["model"],
+                    "model": response["usage"].get("model"),
+                    "prompt": prompt,
+                    "payload": payload,
+                    "response": response["content"],
+                    "usage": response["usage"],
+                }
+            )
         state["recommended_action"] = action
         state["commands"] = commands
         return state
@@ -129,4 +169,5 @@ class ResolutionIntelligenceAgent:
             risk="high" if context.alert.severity == AlertSeverity.CRITICAL else "medium",
         )
         recommendation.metadata["model_usage"] = state.get("model_usage", [])
+        recommendation.metadata["model_calls"] = state.get("model_calls", [])
         return recommendation

@@ -77,6 +77,34 @@ def render_event_trace(events: list[dict[str, Any]]) -> None:
             status_badge("Input", event.get("input", "N/A"))
             status_badge("Output", event.get("output", "N/A"))
             table_from_dict(event.get("metrics", {}))
+            llm_calls = event.get("llm_calls", [])
+            if llm_calls:
+                st.markdown("#### LLM prompt and response details")
+                for index, call in enumerate(llm_calls, start=1):
+                    title = (
+                        f"LLM Call {index}: {call.get('task')} "
+                        f"via {call.get('provider')} / {call.get('model')}"
+                    )
+                    with st.expander(title):
+                        st.markdown("**Input prompt**")
+                        st.code(str(call.get("prompt", "")), language="text")
+                        st.markdown("**Input payload sent to LLM**")
+                        st.json(call.get("payload", {}))
+                        st.markdown("**Response received from LLM**")
+                        st.code(str(call.get("response", "")), language="text")
+                        st.markdown("**Token and cost metadata**")
+                        table_from_dict(call.get("usage", {}))
+            llm_errors = event.get("llm_errors", [])
+            if llm_errors:
+                st.markdown("#### LLM errors")
+                for error in llm_errors:
+                    with st.expander(f"{error.get('provider')} / {error.get('task')} error"):
+                        st.markdown("**Input prompt**")
+                        st.code(str(error.get("prompt", "")), language="text")
+                        st.markdown("**Input payload**")
+                        st.code(str(error.get("payload", "")), language="text")
+                        st.markdown("**Error**")
+                        st.error(str(error.get("error", "")))
 
 
 def render_gateway_events(events: list[dict[str, Any]]) -> None:
