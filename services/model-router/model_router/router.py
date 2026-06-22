@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -9,6 +10,9 @@ import httpx
 from common.config import Settings, get_settings
 from common.models import AlertSeverity
 from common.resilience import CircuitBreaker
+
+
+logger = logging.getLogger(__name__)
 
 
 class ModelTask(StrEnum):
@@ -233,12 +237,13 @@ class OllamaModelProvider(ModelProvider):
 
 @dataclass
 class GeminiModelProvider(ModelProvider):
-    model: str = "gemini-2.0-flash"
+    model: str = "gemini-2.5-flash"
     api_key: str | None = None
     base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     timeout_seconds: float = 45.0
     input_cost_per_million: float = 0.0
     output_cost_per_million: float = 0.0
+    retired_model_fallback: str = "gemini-2.5-flash"
 
     async def generate(self, prompt: str, payload: dict[str, Any]) -> ModelResponse:
         self._ensure_available()
@@ -250,14 +255,10 @@ class GeminiModelProvider(ModelProvider):
         request_payload = {"contents": [{"parts": [{"text": text_payload}]}]}
         headers = {"x-goog-api-key": self.api_key}
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                response = await client.post(
-                    f"{self.base_url.rstrip('/')}/models/{self.model}:generateContent",
-                    headers=headers,
-                    json=request_payload,
-                )
-                response.raise_for_status()
-                data = response.json()
+            data, model_used = await self._generate_with_retry(
+                request_payload=request_payload,
+                headers=headers,
+            )
         except httpx.HTTPStatusError as exc:
             self.breaker.record_failure()
             raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
@@ -270,7 +271,7 @@ class GeminiModelProvider(ModelProvider):
         usage_metadata = data.get("usageMetadata", {})
         usage = build_usage(
             provider=self.name,
-            model=self.model,
+            model=model_used,
             input_tokens=int(usage_metadata.get("promptTokenCount", estimate_tokens(text_payload))),
             output_tokens=int(usage_metadata.get("candidatesTokenCount", estimate_tokens(content_text))),
             input_cost_per_million=self.input_cost_per_million,
@@ -278,6 +279,58 @@ class GeminiModelProvider(ModelProvider):
             estimated=not bool(usage_metadata),
         )
         return ModelResponse(content=content_text, usage=usage)
+
+    async def _generate_with_retry(
+        self,
+        *,
+        request_payload: dict[str, Any],
+        headers: dict[str, str],
+    ) -> tuple[dict[str, Any], str]:
+        try:
+            data = await self._call_generate(model=self.model, request_payload=request_payload, headers=headers)
+            return data, self.model
+        except httpx.HTTPStatusError as exc:
+            if not self._should_retry_retired_model(exc):
+                raise
+
+            logger.warning(
+                "Gemini model '%s' appears retired; retrying once with '%s'.",
+                self.model,
+                self.retired_model_fallback,
+            )
+            data = await self._call_generate(
+                model=self.retired_model_fallback,
+                request_payload=request_payload,
+                headers=headers,
+            )
+            return data, self.retired_model_fallback
+
+    async def _call_generate(
+        self,
+        *,
+        model: str,
+        request_payload: dict[str, Any],
+        headers: dict[str, str],
+    ) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(
+                f"{self.base_url.rstrip('/')}/models/{model}:generateContent",
+                headers=headers,
+                json=request_payload,
+            )
+            response.raise_for_status()
+            return response.json()
+
+    def _should_retry_retired_model(self, exc: httpx.HTTPStatusError) -> bool:
+        if exc.response.status_code != 404:
+            return False
+        if not self.model.startswith("gemini-2.0"):
+            return False
+        if self.model == self.retired_model_fallback:
+            return False
+
+        body = exc.response.text.lower()
+        return "no longer available" in body or "not_found" in body
 
     def _extract_gemini_text(self, data: dict[str, Any]) -> str:
         candidates = data.get("candidates", [])
@@ -405,6 +458,13 @@ class ModelRouter:
 
 
 def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
+    if settings.gemini_model.startswith("gemini-2.0"):
+        logger.warning(
+            "Configured GEMINI_MODEL '%s' may be retired and can return HTTP 404. "
+            "Use GEMINI_MODEL='gemini-2.5-flash' or another currently available Gemini model.",
+            settings.gemini_model,
+        )
+
     local_llama_provider: ModelProvider
     if settings.local_llm_enabled:
         local_llama_provider = OllamaModelProvider(
