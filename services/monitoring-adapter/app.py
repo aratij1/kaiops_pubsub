@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
+from pathlib import Path
 from typing import Any
 
 from common.config import get_settings
@@ -158,25 +161,136 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     },
 }
 
+FLOW_CATALOG_FILE = "flows.json"
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    return slug or "flow"
+
+
+def rag_root_path() -> Path:
+    here = Path(__file__).resolve()
+    candidates = [here.parents[2] / "rag", Path.cwd() / "rag", Path("/app/rag")]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    fallback = candidates[0]
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+def flow_catalog_path() -> Path:
+    return rag_root_path() / FLOW_CATALOG_FILE
+
+
+def default_flow_catalog_entries() -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for scenario_id, scenario in SCENARIOS.items():
+        entries.append(
+            {
+                "id": scenario_id,
+                "alert_id": str(scenario.get("alert_id", "")).upper() or scenario_id.upper(),
+                "alert_name": str(scenario.get("alert_name", scenario["title"])),
+                "alert_type": str(scenario.get("alert_type", "")),
+                "title": str(scenario["title"]),
+                "service": str(scenario["service"]),
+                "severity": str(scenario["severity"].value).upper(),
+                "recommended_action": str(scenario["recommended_action"]),
+                "description": str(scenario["description"]),
+                "root_cause": str(scenario["root_cause"]),
+                "impact": str(scenario["impact"]),
+            }
+        )
+    return entries
+
+
+def ensure_flow_catalog_exists() -> list[dict[str, str]]:
+    path = flow_catalog_path()
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [item for item in data if isinstance(item, dict)]
+        except (OSError, json.JSONDecodeError):
+            pass
+    entries = default_flow_catalog_entries()
+    path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    return entries
+
+
+def severity_from_string(value: str | None) -> AlertSeverity:
+    normalized = (value or "HIGH").strip().upper()
+    mapping = {
+        "CRITICAL": AlertSeverity.CRITICAL,
+        "HIGH": AlertSeverity.HIGH,
+        "WARNING": AlertSeverity.WARNING,
+    }
+    return mapping.get(normalized, AlertSeverity.HIGH)
+
+
+def merged_scenarios() -> dict[str, dict[str, Any]]:
+    scenarios: dict[str, dict[str, Any]] = dict(SCENARIOS)
+    for item in ensure_flow_catalog_exists():
+        title = str(item.get("title", "")).strip()
+        if not title:
+            continue
+        flow_id = slugify(str(item.get("id") or title))
+        service = str(item.get("service", "unknown")).strip() or "unknown"
+        severity = severity_from_string(str(item.get("severity", "HIGH")))
+        recommended_action = str(item.get("recommended_action", "Investigate issue")).strip() or "Investigate issue"
+        description = str(item.get("description", f"Observed issue for service {service}")).strip()
+        root_cause = str(item.get("root_cause", item.get("deployment", "Operational change"))).strip()
+        impact = str(item.get("impact", title)).strip()
+
+        scenarios[flow_id] = {
+            "alert_id": str(item.get("alert_id", flow_id)).strip() or flow_id.upper(),
+            "alert_name": title,
+            "alert_type": str(item.get("alert_type", "")).strip(),
+            "title": title,
+            "source": str(item.get("source", "rag-catalog")),
+            "name": str(item.get("name", f"{flow_id.replace('-', ' ').title().replace(' ', '')}Alert")),
+            "service": service,
+            "severity": severity,
+            "description": description,
+            "labels": {
+                "cluster": str(item.get("cluster", "prod-us-east-1")),
+                "deployment": str(item.get("deployment", service)),
+                "team": str(item.get("team", f"{service}-sre")),
+            },
+            "annotations": {"summary": str(item.get("summary", title))},
+            "root_cause": root_cause,
+            "impact": impact,
+            "recommended_action": recommended_action,
+            "remediation_comment": str(item.get("remediation_comment", recommended_action)),
+        }
+    return scenarios
+
 
 def list_scenarios() -> list[dict[str, str]]:
-    return [
+    scenarios = merged_scenarios()
+    rows = [
         {
             "id": scenario_id,
+            "alert_id": scenario.get("alert_id", scenario_id.upper()),
+            "alert_name": scenario.get("alert_name", scenario["title"]),
+            "alert_type": scenario.get("alert_type", ""),
             "title": scenario["title"],
             "service": scenario["service"],
             "severity": scenario["severity"].value,
             "recommended_action": scenario["recommended_action"],
         }
-        for scenario_id, scenario in SCENARIOS.items()
+        for scenario_id, scenario in scenarios.items()
     ]
+    return sorted(rows, key=lambda item: (str(item.get("service", "")).lower(), str(item.get("title", "")).lower()))
 
 
 def build_sample_alert(flow_id: str = "payment-latency", trace_id: str | None = None) -> Alert:
-    scenario = SCENARIOS.get(flow_id, SCENARIOS["payment-latency"])
+    scenarios = merged_scenarios()
+    scenario = scenarios.get(flow_id, scenarios["payment-latency"])
     return Alert(
         source=scenario["source"],
-        name=scenario["name"],
+        name=str(scenario.get("alert_name") or scenario["name"]),
         service=scenario["service"],
         severity=scenario["severity"],
         description=scenario["description"],
@@ -204,7 +318,8 @@ async def run_local_payment_workflow(
     from remediation_engine import RemediationEngine
     from resolution_agent import ResolutionIntelligenceAgent
 
-    scenario = SCENARIOS.get(flow_id, SCENARIOS["payment-latency"])
+    scenarios = merged_scenarios()
+    scenario = scenarios.get(flow_id, scenarios["payment-latency"])
     router = model_router or ModelRouter()
     alert = build_sample_alert(flow_id, trace_id=trace_id)
     enriched_alert, incident = AlertIntelligenceAgent().process(alert)
@@ -213,7 +328,16 @@ async def run_local_payment_workflow(
         "sequence": 1,
         "agent": "Alert Intelligence Agent",
         "action": "Deduplicated, correlated, classified, and enriched alert",
-        "input": "Prometheus sample alert",
+        "input": {
+            "flow_id": flow_id,
+            "source": alert.source,
+            "name": alert.name,
+            "service": alert.service,
+            "severity": alert.severity.value,
+            "description": alert.description,
+            "labels": alert.labels,
+            "annotations": alert.annotations,
+        },
         "decision": f"Severity classified as {enriched_alert.severity}; correlation ID {enriched_alert.correlation_id}",
         "output": "Created incident and enriched alert event",
         "communicates_to": "Orchestrator Agent via enriched-alerts",
@@ -227,7 +351,12 @@ async def run_local_payment_workflow(
         "sequence": 2,
         "agent": "Orchestrator Agent",
         "action": "Selected incident workflow and downstream agents",
-        "input": f"Incident {incident.id} for service {incident.service}",
+        "input": {
+            "incident_id": incident.id,
+            "service": incident.service,
+            "severity": incident.severity.value,
+            "title": incident.title,
+        },
         "decision": decision.workflow,
         "output": f"Next action: {decision.next_action}; approval required: {decision.requires_approval}",
         "communicates_to": ", ".join(decision.downstream_agents),
@@ -242,7 +371,13 @@ async def run_local_payment_workflow(
         "sequence": 3,
         "agent": "Context Intelligence Agent",
         "action": "Collected operational context and RAG evidence",
-        "input": "Incident, alert, service, deployment labels",
+        "input": {
+            "incident_id": incident.id,
+            "alert_service": enriched_alert.service,
+            "alert_severity": enriched_alert.severity.value,
+            "deployment_label": enriched_alert.labels.get("deployment"),
+            "trace_id": trace_id,
+        },
         "decision": f"Most relevant deployment: {context.deployment}",
         "output": "Context object with runbook, related incidents, dependencies, metrics, and changes",
         "communicates_to": "Resolution Intelligence Agent via context-events",
@@ -290,14 +425,7 @@ async def run_local_payment_workflow(
     recommendation.trace_id = trace_id
     model_usage = list(recommendation.metadata.get("model_usage", []))
     model_calls = list(recommendation.metadata.get("model_calls", []))
-    comparison_calls = [
-        (
-            "gemini",
-            ModelTask.SUMMARIZATION,
-            "Summarize the incident for an executive FinOps and SRE audience",
-        ),
-        ("groq", ModelTask.GENERAL, "Generate a fast triage communication note"),
-    ]
+    comparison_calls = []
     comparison_payload = {
         "service": enriched_alert.service,
         "incident": incident.title,
@@ -346,7 +474,12 @@ async def run_local_payment_workflow(
         "sequence": 4,
         "agent": "Resolution Intelligence Agent",
         "action": "Ran LangGraph RCA workflow",
-        "input": "Collected context and alert severity",
+        "input": {
+            "incident_id": incident.id,
+            "severity": enriched_alert.severity.value,
+            "deployment": context.deployment,
+            "related_incidents": len(context.related_incidents),
+        },
         "decision": f"Root cause: {recommendation.root_cause}; action: {recommendation.recommended_action}",
         "output": "Recommendation with impact, rationale, commands, confidence, and risk",
         "communicates_to": "Human Approval Layer via resolution-events",
@@ -371,7 +504,12 @@ async def run_local_payment_workflow(
         "sequence": 5,
         "agent": "Human Approval Layer",
         "action": "Auto-approved demo recommendation",
-        "input": recommendation.recommended_action,
+        "input": {
+            "incident_id": incident.id,
+            "recommendation_id": recommendation.id,
+            "recommended_action": recommendation.recommended_action,
+            "channel": approval.channel,
+        },
         "decision": approval.decision.value,
         "output": f"Approved by {approval.approver} on {approval.channel}",
         "communicates_to": "Remediation Automation Engine via approval-events",
@@ -386,7 +524,12 @@ async def run_local_payment_workflow(
         "sequence": 6,
         "agent": "Remediation Automation Engine",
         "action": "Executed remediation strategy plugin",
-        "input": approval.comment,
+        "input": {
+            "approval_id": approval.id,
+            "comment": approval.comment,
+            "action_type": action.action_type,
+            "target": action.target,
+        },
         "decision": f"Selected plugin action {action.action_type}",
         "output": action.output,
         "communicates_to": "Closure & Validation via remediation-events",
@@ -398,7 +541,11 @@ async def run_local_payment_workflow(
         "sequence": 7,
         "agent": "Closure & Validation",
         "action": "Validated health and generated closure report",
-        "input": action.output,
+        "input": {
+            "remediation_action_id": action.id,
+            "status": action.status.value,
+            "output": action.output,
+        },
         "decision": "Health restored" if closure_report.health_restored else "Health not restored",
         "output": closure_report.knowledge_base_entry,
         "communicates_to": "Knowledge Base and audit log",
@@ -430,14 +577,14 @@ async def run_local_payment_workflow(
             "title": scenario["title"],
             "recommended_action": scenario["recommended_action"],
         },
-        "alert": enriched_alert,
-        "incident": incident,
+        "alert": enriched_alert.model_dump(mode="json"),
+        "incident": incident.model_dump(mode="json"),
         "decision": decision.__dict__,
-        "context": context,
-        "recommendation": recommendation,
-        "approval": approval,
-        "remediation_action": action,
-        "closure_report": closure_report,
+        "context": context.model_dump(mode="json"),
+        "recommendation": recommendation.model_dump(mode="json"),
+        "approval": approval.model_dump(mode="json"),
+        "remediation_action": action.model_dump(mode="json"),
+        "closure_report": closure_report.model_dump(mode="json"),
         "metrics": metrics,
         "finops": finops,
         "events": [

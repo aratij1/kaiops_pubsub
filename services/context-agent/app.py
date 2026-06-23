@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -84,6 +85,75 @@ def write_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
     return {"path": str(target), "document_count": count}
 
 
+def _normalize_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return []
+
+
+def _first_content_line(content: str, fallback: str) -> str:
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped
+    return fallback
+
+
+def rebuild_flow_catalog_from_rag(connector: VectorDBConnector) -> None:
+    catalog_path = connector.root_path() / "flows.json"
+    entries: list[dict[str, Any]] = []
+    for doc in connector.documents:
+        if str(doc.get("kind", "")).strip().lower() != "incident":
+            continue
+        alert_id = str(doc.get("alert_id") or doc.get("id") or "").strip()
+        alert_name = str(doc.get("alert_name") or doc.get("title") or "Incident").strip() or "Incident"
+        flow_id = slugify(alert_id or alert_name)
+        services = _normalize_list(doc.get("services", []))
+        service = services[0] if services else str(doc.get("service", "unknown")).strip() or "unknown"
+        severity = str(doc.get("severity", "HIGH")).upper().strip()
+        if severity not in {"CRITICAL", "HIGH", "WARNING"}:
+            severity = "HIGH"
+        recommended_action = str(doc.get("recommended_action") or doc.get("remediation_comment") or "Investigate issue")
+        content = str(doc.get("content", "")).strip()
+        description = _first_content_line(content, alert_name)[:220]
+        alert_type = str(doc.get("alert_type", "")).strip()
+        entry = {
+            "id": flow_id,
+            "alert_id": alert_id or flow_id.upper(),
+            "alert_name": alert_name,
+            "alert_type": alert_type,
+            "title": alert_name,
+            "service": service,
+            "severity": severity,
+            "recommended_action": recommended_action,
+            "description": description,
+            "deployment": str(doc.get("deployment", "")).strip() or None,
+            "change_id": str(doc.get("change_id", "")).strip() or None,
+            "source": "rag-incident",
+        }
+        entries.append({k: v for k, v in entry.items() if v not in (None, "")})
+
+    by_id = {str(item.get("id")): item for item in entries if item.get("id")}
+    merged = list(by_id.values())
+    merged.sort(key=lambda item: str(item.get("title", "")).lower())
+    catalog_path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+
+
+def read_flow_catalog(connector: VectorDBConnector) -> list[dict[str, Any]]:
+    catalog_path = connector.root_path() / "flows.json"
+    if not catalog_path.exists():
+        return []
+    try:
+        data = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
 @app.post("/collect", response_model=Context)
 async def collect(payload: dict) -> Context:
     alert = Alert.model_validate(payload["alert"])
@@ -96,6 +166,8 @@ async def collect(payload: dict) -> Context:
 @app.post("/rag/documents")
 async def ingest_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
     result = write_rag_document(request)
+    if request.kind == "incident":
+        rebuild_flow_catalog_from_rag(vector_connector())
     return {"status": "ingested", **result}
 
 
@@ -118,7 +190,9 @@ async def list_rag_documents() -> dict[str, Any]:
 
 @app.post("/rag/reload")
 async def reload_rag() -> dict[str, Any]:
-    count = vector_connector().reload()
+    connector = vector_connector()
+    count = connector.reload()
+    rebuild_flow_catalog_from_rag(connector)
     return {"status": "reloaded", "document_count": count}
 
 
@@ -138,4 +212,15 @@ async def search_rag(query: str, limit: int = 8) -> dict[str, Any]:
             }
             for match in matches
         ],
+    }
+
+
+@app.get("/rag/flow-catalog")
+async def flow_catalog() -> dict[str, Any]:
+    connector = vector_connector()
+    entries = read_flow_catalog(connector)
+    return {
+        "count": len(entries),
+        "entries": entries,
+        "path": str(connector.root_path() / "flows.json"),
     }

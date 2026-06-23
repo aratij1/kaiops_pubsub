@@ -30,8 +30,6 @@ def static_router() -> ModelRouter:
             "gpt-5": StaticProvider("gpt-5"),
             "gpt-4o": StaticProvider("gpt-4o"),
             "claude": StaticProvider("claude"),
-            "gemini": StaticProvider("gemini"),
-            "groq": StaticProvider("groq"),
             "local-llama": StaticProvider("local-llama"),
         }
     )

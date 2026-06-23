@@ -236,177 +236,14 @@ class OllamaModelProvider(ModelProvider):
 
 
 @dataclass
-class GeminiModelProvider(ModelProvider):
-    model: str = "gemini-2.5-flash"
-    api_key: str | None = None
-    base_url: str = "https://generativelanguage.googleapis.com/v1beta"
-    timeout_seconds: float = 45.0
-    input_cost_per_million: float = 0.0
-    output_cost_per_million: float = 0.0
-    retired_model_fallback: str = "gemini-2.5-flash"
-
-    async def generate(self, prompt: str, payload: dict[str, Any]) -> ModelResponse:
-        self._ensure_available()
-        if not self.api_key:
-            self.breaker.record_failure()
-            raise RuntimeError(f"{self.name} unavailable: GEMINI_API_KEY is not configured")
-
-        text_payload = json.dumps({"task": prompt, "payload": payload}, default=str)
-        request_payload = {"contents": [{"parts": [{"text": text_payload}]}]}
-        headers = {"x-goog-api-key": self.api_key}
-        try:
-            data, model_used = await self._generate_with_retry(
-                request_payload=request_payload,
-                headers=headers,
-            )
-        except httpx.HTTPStatusError as exc:
-            self.breaker.record_failure()
-            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
-        except Exception:
-            self.breaker.record_failure()
-            raise
-
-        self.breaker.record_success()
-        content_text = self._extract_gemini_text(data)
-        usage_metadata = data.get("usageMetadata", {})
-        usage = build_usage(
-            provider=self.name,
-            model=model_used,
-            input_tokens=int(usage_metadata.get("promptTokenCount", estimate_tokens(text_payload))),
-            output_tokens=int(usage_metadata.get("candidatesTokenCount", estimate_tokens(content_text))),
-            input_cost_per_million=self.input_cost_per_million,
-            output_cost_per_million=self.output_cost_per_million,
-            estimated=not bool(usage_metadata),
-        )
-        return ModelResponse(content=content_text, usage=usage)
-
-    async def _generate_with_retry(
-        self,
-        *,
-        request_payload: dict[str, Any],
-        headers: dict[str, str],
-    ) -> tuple[dict[str, Any], str]:
-        try:
-            data = await self._call_generate(model=self.model, request_payload=request_payload, headers=headers)
-            return data, self.model
-        except httpx.HTTPStatusError as exc:
-            if not self._should_retry_retired_model(exc):
-                raise
-
-            logger.warning(
-                "Gemini model '%s' appears retired; retrying once with '%s'.",
-                self.model,
-                self.retired_model_fallback,
-            )
-            data = await self._call_generate(
-                model=self.retired_model_fallback,
-                request_payload=request_payload,
-                headers=headers,
-            )
-            return data, self.retired_model_fallback
-
-    async def _call_generate(
-        self,
-        *,
-        model: str,
-        request_payload: dict[str, Any],
-        headers: dict[str, str],
-    ) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.post(
-                f"{self.base_url.rstrip('/')}/models/{model}:generateContent",
-                headers=headers,
-                json=request_payload,
-            )
-            response.raise_for_status()
-            return response.json()
-
-    def _should_retry_retired_model(self, exc: httpx.HTTPStatusError) -> bool:
-        if exc.response.status_code != 404:
-            return False
-        if not self.model.startswith("gemini-2.0"):
-            return False
-        if self.model == self.retired_model_fallback:
-            return False
-
-        body = exc.response.text.lower()
-        return "no longer available" in body or "not_found" in body
-
-    def _extract_gemini_text(self, data: dict[str, Any]) -> str:
-        candidates = data.get("candidates", [])
-        for candidate in candidates:
-            for part in candidate.get("content", {}).get("parts", []):
-                if part.get("text"):
-                    return str(part["text"])
-        raise RuntimeError(f"{self.name} returned no text")
-
-
-@dataclass
-class GroqModelProvider(ModelProvider):
-    model: str = "llama-3.3-70b-versatile"
-    api_key: str | None = None
-    base_url: str = "https://api.groq.com/openai/v1"
-    timeout_seconds: float = 45.0
-    input_cost_per_million: float = 0.0
-    output_cost_per_million: float = 0.0
-
-    async def generate(self, prompt: str, payload: dict[str, Any]) -> ModelResponse:
-        self._ensure_available()
-        if not self.api_key:
-            self.breaker.record_failure()
-            raise RuntimeError(f"{self.name} unavailable: GROQ_API_KEY is not configured")
-
-        text_payload = json.dumps({"task": prompt, "payload": payload}, default=str)
-        request_payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": "You are a concise SRE incident triage model."},
-                {"role": "user", "content": text_payload},
-            ],
-        }
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                response = await client.post(
-                    f"{self.base_url.rstrip('/')}/chat/completions",
-                    headers=headers,
-                    json=request_payload,
-                )
-                response.raise_for_status()
-                data = response.json()
-        except httpx.HTTPStatusError as exc:
-            self.breaker.record_failure()
-            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
-        except Exception:
-            self.breaker.record_failure()
-            raise
-
-        self.breaker.record_success()
-        content_text = str(data["choices"][0]["message"]["content"])
-        usage_data = data.get("usage", {})
-        usage = build_usage(
-            provider=self.name,
-            model=self.model,
-            input_tokens=int(usage_data.get("prompt_tokens", estimate_tokens(text_payload))),
-            output_tokens=int(usage_data.get("completion_tokens", estimate_tokens(content_text))),
-            input_cost_per_million=self.input_cost_per_million,
-            output_cost_per_million=self.output_cost_per_million,
-            estimated=not bool(usage_data),
-        )
-        return ModelResponse(content=content_text, usage=usage)
-
-
-@dataclass
 class ModelRouter:
     providers: dict[str, ModelProvider] = field(default_factory=lambda: build_default_providers(get_settings()))
     failover_chain: dict[str, list[str]] = field(
         default_factory=lambda: {
-            "gpt-5": ["gpt-4o", "gemini", "groq", "local-llama", "claude"],
-            "claude": ["gpt-5", "gpt-4o", "gemini", "groq", "local-llama"],
-            "gemini": ["gpt-4o", "gpt-5", "groq", "local-llama"],
-            "groq": ["gpt-4o", "gemini", "gpt-5", "local-llama"],
-            "local-llama": ["groq", "gpt-4o"],
-            "gpt-4o": ["gpt-5", "gemini", "groq", "local-llama"],
+            "gpt-5": ["gpt-4o", "local-llama", "claude"],
+            "claude": ["gpt-5", "gpt-4o", "local-llama"],
+            "local-llama": ["gpt-4o"],
+            "gpt-4o": ["gpt-5", "local-llama"],
         }
     )
 
@@ -415,9 +252,7 @@ class ModelRouter:
             return "gpt-5"
         if task == ModelTask.RCA:
             return "claude"
-        if task == ModelTask.SUMMARIZATION:
-            return "gemini"
-        return "groq"
+        return "gpt-4o"
 
     async def route(
         self,
@@ -458,13 +293,6 @@ class ModelRouter:
 
 
 def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
-    if settings.gemini_model.startswith("gemini-2.0"):
-        logger.warning(
-            "Configured GEMINI_MODEL '%s' may be retired and can return HTTP 404. "
-            "Use GEMINI_MODEL='gemini-2.5-flash' or another currently available Gemini model.",
-            settings.gemini_model,
-        )
-
     local_llama_provider: ModelProvider
     if settings.local_llm_enabled:
         local_llama_provider = OllamaModelProvider(
@@ -500,24 +328,6 @@ def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
         "claude": UnconfiguredModelProvider(
             name="claude",
             reason="set ANTHROPIC_API_KEY and add a Claude provider implementation",
-        ),
-        "gemini": GeminiModelProvider(
-            name="gemini",
-            model=settings.gemini_model,
-            api_key=settings.gemini_api_key,
-            base_url=settings.gemini_base_url,
-            timeout_seconds=settings.llm_request_timeout_seconds,
-            input_cost_per_million=settings.gemini_input_cost_per_million,
-            output_cost_per_million=settings.gemini_output_cost_per_million,
-        ),
-        "groq": GroqModelProvider(
-            name="groq",
-            model=settings.groq_model,
-            api_key=settings.groq_api_key,
-            base_url=settings.groq_base_url,
-            timeout_seconds=settings.llm_request_timeout_seconds,
-            input_cost_per_million=settings.groq_input_cost_per_million,
-            output_cost_per_million=settings.groq_output_cost_per_million,
         ),
         "local-llama": local_llama_provider,
     }

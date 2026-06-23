@@ -334,6 +334,21 @@ async def search_rag(
     )
 
 
+@app.get("/rag/flow-catalog")
+async def flow_catalog(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/rag/flow-catalog",
+        target_base=settings.context_agent_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/approval/incident/{incident_id}")
 async def get_incident(
     incident_id: str,

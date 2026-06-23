@@ -113,14 +113,7 @@ $env:LLM_REQUEST_TIMEOUT_SECONDS = "120"
 
 Real LLM-backed workflows can take longer than mock flows. The API Gateway
 defaults to a 180 second downstream timeout and the Streamlit UI defaults to a
-240 second request timeout. Local Llama/Ollama fallback is disabled by default;
-enable it only when Ollama is running:
-
-For FinOps comparison, local demo workflows call Gemini and Groq directly in
-parallel when `GEMINI_API_KEY` and `GROQ_API_KEY` are configured. Their token
-usage, cost, and errors are shown side by side in the Streamlit **FinOps** tab.
-If a provider key is ever pasted into chat or appears in logs, rotate it in the
-provider console before continuing.
+240 second request timeout.
 
 ```powershell
 $env:LOCAL_LLM_ENABLED = "true"

@@ -87,10 +87,6 @@ $env:PYTHONPATH = "$PWD\services\common;$PWD\services\api-gateway;$PWD\services\
 $env:KAFKA_ENABLED = "false"
 $env:DATABASE_ENABLED = "false"
 $env:OPENAI_API_KEY = "your-rotated-key"
-$env:GEMINI_API_KEY = "your-gemini-key"
-$env:GEMINI_MODEL = "gemini-2.5-flash"
-$env:GROQ_API_KEY = "your-groq-key"
-$env:GROQ_MODEL = "llama-3.3-70b-versatile"
 $env:LLM_REQUEST_TIMEOUT_SECONDS = "120"
 $env:GATEWAY_REQUEST_TIMEOUT_SECONDS = "180"
 ```

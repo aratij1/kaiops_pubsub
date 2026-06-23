@@ -61,8 +61,12 @@ Start-KaiOpsWindow `
     -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8007 --app-dir services/approval-service"
 
 Start-KaiOpsWindow `
+    -Title "KaiOps context-agent :8004" `
+    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8004 --app-dir services/context-agent"
+
+Start-KaiOpsWindow `
     -Title "KaiOps api-gateway :8010" `
-    -Command "`$env:MONITORING_ADAPTER_URL = 'http://localhost:8001'; `$env:APPROVAL_SERVICE_URL = 'http://localhost:8007'; & '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8010 --app-dir services/api-gateway"
+    -Command "`$env:MONITORING_ADAPTER_URL = 'http://localhost:8001'; `$env:APPROVAL_SERVICE_URL = 'http://localhost:8007'; `$env:CONTEXT_AGENT_URL = 'http://localhost:8004'; & '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8010 --app-dir services/api-gateway"
 
 if (-not $NoUi) {
     $UiCommand = @"
@@ -78,6 +82,7 @@ if (-not $NoUi) {
 Write-Host "Started KaiOps local services."
 Write-Host "Monitoring adapter: http://localhost:8001"
 Write-Host "Approval service:   http://localhost:8007"
+Write-Host "Context agent:      http://localhost:8004"
 Write-Host "API Gateway:        http://localhost:8010"
 if (-not $NoUi) {
     Write-Host "Streamlit UI:       http://localhost:8501"
