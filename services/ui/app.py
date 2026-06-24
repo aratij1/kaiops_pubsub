@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import os
+import re
 import time
 from typing import Any
 
@@ -75,6 +76,95 @@ def uploaded_file_to_text(uploaded_file: Any) -> str | None:
 
 def data_from_gateway(response: dict[str, Any]) -> dict[str, Any]:
     return response.get("data", response)
+
+
+def infer_rag_kind(file_name: str, content: str) -> str:
+    corpus = f"{file_name} {content[:2000]}".lower()
+    if any(token in corpus for token in ("runbook", "playbook", "sop", "procedure")):
+        return "runbook"
+    if any(token in corpus for token in ("deployment", "release", "rollout", "helm")):
+        return "deployment"
+    if any(token in corpus for token in ("change", "chg-", "cab", "rfc")):
+        return "change"
+    if any(token in corpus for token in ("dependency", "topology", "upstream", "downstream", "graph")):
+        return "dependency"
+    return "incident"
+
+
+def infer_linked_incident_ids(file_name: str, content: str, entries: list[dict[str, Any]]) -> list[str]:
+    doc = f"{file_name} {content[:5000]}".lower()
+    scored: list[tuple[int, str]] = []
+
+    for item in entries:
+        flow_id = str(item.get("id", "")).strip()
+        if not flow_id:
+            continue
+
+        score = 0
+        service = str(item.get("service", "")).strip().lower()
+        title = str(item.get("title", "")).strip().lower()
+        alert_name = str(item.get("alert_name", "")).strip().lower()
+        alert_id = str(item.get("alert_id", "")).strip().lower()
+        action = str(item.get("recommended_action", "")).strip().lower()
+
+        if service and service in doc:
+            score += 4
+        if flow_id.lower() in doc:
+            score += 4
+        if alert_id and alert_id in doc:
+            score += 3
+
+        title_tokens = [token for token in re.split(r"\W+", title) if len(token) > 4]
+        alert_tokens = [token for token in re.split(r"\W+", alert_name) if len(token) > 4]
+        action_tokens = [token for token in re.split(r"\W+", action) if len(token) > 5]
+
+        score += sum(1 for token in title_tokens[:6] if token in doc)
+        score += sum(1 for token in alert_tokens[:6] if token in doc)
+        score += sum(1 for token in action_tokens[:4] if token in doc)
+
+        if score > 0:
+            scored.append((score, flow_id))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    linked_ids: list[str] = []
+    for _, flow_id in scored:
+        if flow_id not in linked_ids:
+            linked_ids.append(flow_id)
+        if len(linked_ids) >= 3:
+            break
+    return linked_ids
+
+
+def infer_services_from_links(content: str, entries: list[dict[str, Any]], linked_ids: list[str]) -> list[str]:
+    text = content.lower()
+    services: list[str] = []
+
+    for entry in entries:
+        service = str(entry.get("service", "")).strip()
+        if service and service.lower() in text and service not in services:
+            services.append(service)
+
+    if not services:
+        by_id = {str(entry.get("id", "")): str(entry.get("service", "")).strip() for entry in entries}
+        for flow_id in linked_ids:
+            service = by_id.get(flow_id, "")
+            if service and service not in services:
+                services.append(service)
+
+    return services[:5]
+
+
+def infer_change_id(content: str) -> str | None:
+    match = re.search(r"\bCHG-\d+\b", content, flags=re.IGNORECASE)
+    return match.group(0).upper() if match else None
+
+
+def infer_deployment_tag(content: str) -> str | None:
+    match = re.search(r"\b(?:deployment|release)\s*[:#-]?\s*([0-9]+(?:\.[0-9]+){1,2})\b", content, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+    fallback = re.search(r"\b[0-9]+\.[0-9]+(?:\.[0-9]+)?\b", content)
+    return fallback.group(0) if fallback else None
 
 
 def get_flows() -> list[dict[str, Any]]:
@@ -462,6 +552,30 @@ def build_complete_webpage_html(
 """.strip()
 
 
+def _alert_stream_status(severity: str, recommended_action: str, alert_name: str) -> tuple[str, str]:
+    """Return (badge_class, badge_label) for an alert stream entry."""
+    sev = severity.upper()
+    action = recommended_action.lower()
+    name_lower = alert_name.lower()
+    # Duplicate indicators
+    if "duplicate" in name_lower or "duplicate" in action:
+        return "kaiops-badge-duplicate", "DUPLICATE"
+    # No-action-required patterns
+    no_action_actions = {"api execution", "no action", "monitor", "ignore", "auto-resolved"}
+    if action in no_action_actions or sev == "INFO":
+        return "kaiops-badge-ignore", "NO ACTION"
+    # Low-priority warning with generic action
+    if sev == "WARNING" and action in {"clear cache", "scale deployment"}:
+        return "kaiops-badge-warning", "LOW"
+    if sev == "WARNING":
+        return "kaiops-badge-warning", "WARN"
+    if sev == "HIGH":
+        return "kaiops-badge-high", "HIGH"
+    if sev == "CRITICAL":
+        return "kaiops-badge-critical", "CRITICAL"
+    return "kaiops-badge-info", sev or "UNKNOWN"
+
+
 def render_alert_stream(entries: list[dict[str, Any]]) -> str | None:
     if not entries:
         st.caption("No alert stream entries available yet.")
@@ -472,16 +586,38 @@ def render_alert_stream(entries: list[dict[str, Any]]) -> str | None:
         alert_name = str(item.get("alert_name") or item.get("title") or "Alert")
         service = str(item.get("service") or "unknown")
         severity = str(item.get("severity") or "unknown").upper()
-        alert_type = str(item.get("alert_type") or "").strip()
+        recommended_action = str(item.get("recommended_action") or "").strip()
         flow_id = str(item.get("id") or "").strip()
-        button_label = f"{alert_id} | {alert_name}"
-        if flow_id and st.button(
-            button_label,
-            key=f"kaiops_alert_stream_{flow_id}",
-            width="stretch",
-        ):
-            selected_flow_id = flow_id
-        st.caption(f"{service} · {severity}{(' · ' + alert_type) if alert_type else ''}")
+
+        badge_class, badge_label = _alert_stream_status(severity, recommended_action, alert_name)
+        is_suppressed = badge_label in ("DUPLICATE", "NO ACTION")
+
+        # Suppress interactive button for no-action/duplicate entries; still render as info
+        if is_suppressed:
+            st.markdown(
+                f'<div style="opacity:0.52; padding:3px 0;">'
+                f'<span class="kaiops-alert-badge {badge_class}">{badge_label}</span>'
+                f' <span style="font-size:0.78rem; color:#64748b;">{alert_id} | {alert_name}</span>'
+                f'</div>'
+                f'<div style="font-size:0.7rem; color:#475569; margin-bottom:4px; padding-left:4px;">'
+                f'{service} · {severity}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            button_label = f"{alert_id} | {alert_name}"
+            clicked = flow_id and st.button(
+                button_label,
+                key=f"kaiops_alert_stream_{flow_id}",
+                width="stretch",
+            )
+            if clicked:
+                selected_flow_id = flow_id
+            st.markdown(
+                f'<span class="kaiops-alert-badge {badge_class}">{badge_label}</span>'
+                f' <span style="font-size:0.7rem; color:#94a3b8; margin-bottom:4px;">'
+                f'{service} · {severity}</span>',
+                unsafe_allow_html=True,
+            )
     return selected_flow_id
 
 
@@ -830,40 +966,305 @@ st.markdown(
       .kaiops-tone-signal { border-top: 4px solid #eab308; }
       .kaiops-tone-default { border-top: 4px solid #64748b; }
             section[data-testid="stSidebar"] {
-                background: linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%);
+                background: linear-gradient(180deg, #0c1524 0%, #0f172a 60%, #131d2e 100%) !important;
             }
             section[data-testid="stSidebar"] .block-container {
                 padding-top: 0.8rem;
             }
             .kaiops-sidebar-hero {
-                background: linear-gradient(135deg, #0f172a 0%, #1d4ed8 60%, #0ea5e9 100%);
+                background: linear-gradient(135deg, #1d4ed8 0%, #0ea5e9 60%, #06b6d4 100%);
                 border-radius: 14px;
-                padding: 12px 12px 10px;
+                padding: 14px 14px 12px;
                 color: #e2e8f0;
-                margin-bottom: 10px;
-                box-shadow: 0 10px 18px rgba(15, 23, 42, 0.18);
+                margin-bottom: 12px;
+                box-shadow: 0 10px 28px rgba(14, 165, 233, 0.35);
             }
             .kaiops-sidebar-hero h3 {
                 margin: 0;
-                font-size: 0.98rem;
+                font-size: 1.08rem;
+                font-weight: 800;
+                letter-spacing: 0.02em;
                 color: #ffffff;
             }
             .kaiops-sidebar-hero p {
                 margin: 4px 0 0;
-                font-size: 0.76rem;
+                font-size: 0.78rem;
                 color: #dbeafe;
             }
             .kaiops-sidebar-section {
                 margin: 0.35rem 0 0.5rem;
-                font-size: 0.75rem;
+                font-size: 0.72rem;
                 letter-spacing: 0.04em;
                 text-transform: uppercase;
-                color: #334155;
+                color: #94a3b8;
                 font-weight: 700;
+            }
+            section[data-testid="stSidebar"] .stButton > button {
+                background: rgba(30, 41, 59, 0.7) !important;
+                color: #e2e8f0 !important;
+                border: 1px solid rgba(148, 163, 184, 0.2) !important;
+                border-radius: 8px !important;
+            }
+            section[data-testid="stSidebar"] .stButton > button:hover {
+                background: rgba(29, 78, 216, 0.5) !important;
+                border-color: #60a5fa !important;
+                color: #ffffff !important;
+            }
+            section[data-testid="stSidebar"] label,
+            section[data-testid="stSidebar"] p,
+            section[data-testid="stSidebar"] .stCaption > *,
+            section[data-testid="stSidebar"] small { color: #cbd5e1 !important; }
+            .kaiops-alert-badge {
+                display: inline-block;
+                font-size: 0.58rem;
+                font-weight: 700;
+                letter-spacing: 0.04em;
+                padding: 1px 6px;
+                border-radius: 999px;
+                vertical-align: middle;
+                white-space: nowrap;
+            }
+            .kaiops-badge-critical { background: #dc2626; color: #fff; }
+            .kaiops-badge-high { background: #ea580c; color: #fff; }
+            .kaiops-badge-warning { background: #d97706; color: #fff; }
+            .kaiops-badge-duplicate { background: rgba(100,116,139,0.2); color: #94a3b8; border: 1px solid #475569; }
+            .kaiops-badge-ignore { background: rgba(71,85,105,0.15); color: #64748b; border: 1px dashed #475569; }
+            .kaiops-badge-info { background: rgba(14,165,233,0.15); color: #38bdf8; border: 1px solid #0ea5e9; }
+            .kaiops-hero-wrap {
+                background: linear-gradient(118deg, #0f172a 0%, #1e1b4b 30%, #1d4ed8 65%, #0ea5e9 100%);
+                border-radius: 22px;
+                padding: 28px 32px 24px;
+                color: #e2e8f0;
+                margin-bottom: 20px;
+                box-shadow: 0 28px 56px rgba(15,23,42,0.32), inset 0 1px 0 rgba(255,255,255,0.07);
+                position: relative;
+                overflow: hidden;
+            }
+            .kaiops-hero-wrap::before {
+                content: "";
+                position: absolute;
+                top: -80px; right: -80px;
+                width: 320px; height: 320px;
+                background: radial-gradient(circle, rgba(14,165,233,0.15) 0%, transparent 70%);
+                pointer-events: none;
+            }
+            .kaiops-hero-wrap::after {
+                content: "";
+                position: absolute;
+                bottom: -40px; left: 20%;
+                width: 200px; height: 200px;
+                background: radial-gradient(circle, rgba(99,102,241,0.12) 0%, transparent 70%);
+                pointer-events: none;
+            }
+            .kaiops-hero-label {
+                font-size: 0.72rem;
+                font-weight: 700;
+                letter-spacing: 0.1em;
+                text-transform: uppercase;
+                color: #60a5fa;
+                margin: 0 0 8px;
+            }
+            .kaiops-hero-title {
+                font-size: 1.9rem;
+                font-weight: 800;
+                color: #ffffff;
+                letter-spacing: -0.02em;
+                margin: 0 0 8px;
+                line-height: 1.15;
+            }
+            .kaiops-hero-sub {
+                font-size: 0.96rem;
+                color: #93c5fd;
+                margin: 0 0 18px;
+                max-width: 580px;
+                line-height: 1.5;
+            }
+            .kaiops-hero-pills {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            .kaiops-hero-pill {
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+                background: rgba(255,255,255,0.08);
+                border: 1px solid rgba(255,255,255,0.14);
+                border-radius: 999px;
+                padding: 4px 13px;
+                font-size: 0.75rem;
+                font-weight: 600;
+                color: #e0f2fe;
+                backdrop-filter: blur(4px);
+            }
+            .kaiops-hero-pill-dot {
+                width: 7px; height: 7px;
+                border-radius: 50%;
+                background: #4ade80;
+                display: inline-block;
+                animation: kaiops-pulse 2.2s ease-in-out infinite;
+            }
+            .kaiops-hero-pill-dot-amber { background: #fbbf24; }
+            .kaiops-hero-pill-dot-blue { background: #38bdf8; }
+            @keyframes kaiops-pulse {
+                0%, 100% { opacity: 1; transform: scale(1); }
+                50% { opacity: 0.45; transform: scale(0.8); }
+            }
+            .kaiops-summary-hero {
+                background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+                border-radius: 16px;
+                padding: 20px 22px 16px;
+                margin-bottom: 16px;
+                border: 1px solid rgba(30,58,95,0.8);
+                box-shadow: 0 8px 24px rgba(15,23,42,0.18);
+            }
+            .kaiops-summary-hero-alert {
+                font-size: 1.18rem;
+                font-weight: 700;
+                color: #f1f5f9;
+                margin: 0 0 5px;
+            }
+            .kaiops-summary-hero-meta {
+                font-size: 0.83rem;
+                color: #94a3b8;
+                margin: 0 0 12px;
+            }
+            .kaiops-summary-badge {
+                display: inline-block;
+                padding: 3px 10px;
+                border-radius: 999px;
+                font-size: 0.72rem;
+                font-weight: 700;
+                letter-spacing: 0.04em;
+                margin-right: 6px;
+                vertical-align: middle;
+            }
+            .kaiops-sev-critical { background: #dc2626; color: #fff; }
+            .kaiops-sev-high { background: #ea580c; color: #fff; }
+            .kaiops-sev-warning { background: #d97706; color: #fff; }
+            .kaiops-sev-info { background: #0ea5e9; color: #fff; }
+            .kaiops-rc-pill {
+                display: inline-block;
+                background: rgba(250,204,21,0.1);
+                border: 1px solid #ca8a04;
+                color: #fde047;
+                padding: 3px 10px;
+                border-radius: 8px;
+                font-size: 0.75rem;
+                font-weight: 600;
+            }
+            .kaiops-info-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 10px;
+                margin-top: 12px;
+            }
+            .kaiops-info-cell {
+                background: rgba(30,41,59,0.5);
+                border: 1px solid rgba(51,65,85,0.6);
+                border-radius: 10px;
+                padding: 10px 14px;
+            }
+            .kaiops-info-cell-label {
+                font-size: 0.68rem;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                color: #64748b;
+                margin-bottom: 3px;
+            }
+            .kaiops-info-cell-value {
+                font-size: 0.88rem;
+                font-weight: 600;
+                color: #e2e8f0;
+            }
+            .kaiops-recommendation-card {
+                background: rgba(22,163,74,0.07);
+                border: 1px solid rgba(22,163,74,0.3);
+                border-radius: 14px;
+                padding: 16px 18px;
+                margin-top: 14px;
+            }
+            .kaiops-recommendation-action {
+                font-size: 1.05rem;
+                font-weight: 700;
+                color: #4ade80;
+                margin: 0 0 5px;
+            }
+            .kaiops-recommendation-rationale {
+                font-size: 0.84rem;
+                color: #94a3b8;
+                margin: 0;
+                line-height: 1.5;
+            }
+            .kaiops-approval-card {
+                background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+                border-radius: 18px;
+                padding: 22px 24px 20px;
+                border: 1px solid rgba(30,58,95,0.8);
+                box-shadow: 0 10px 32px rgba(15,23,42,0.22);
+                margin-bottom: 16px;
+            }
+            .kaiops-approval-title {
+                font-size: 1.08rem;
+                font-weight: 700;
+                color: #e2e8f0;
+                margin: 0 0 14px;
+                padding-bottom: 12px;
+                border-bottom: 1px solid rgba(30,58,95,0.8);
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .kaiops-approval-kv-row {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+                gap: 8px;
+                margin-bottom: 14px;
+            }
+            .kaiops-approval-kv {
+                background: rgba(15,23,42,0.6);
+                border: 1px solid rgba(51,65,85,0.5);
+                border-radius: 10px;
+                padding: 10px 14px;
+            }
+            .kaiops-approval-kv-label {
+                font-size: 0.68rem;
+                color: #475569;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                font-weight: 700;
+            }
+            .kaiops-approval-kv-value {
+                font-size: 0.85rem;
+                font-weight: 600;
+                color: #cbd5e1;
+                margin-top: 3px;
+                word-break: break-all;
+            }
+            .kaiops-approval-result {
+                border-radius: 12px;
+                padding: 14px 18px;
+                margin-top: 14px;
+            }
+            .kaiops-approval-result-approved {
+                background: rgba(22,163,74,0.1);
+                border: 1px solid rgba(22,163,74,0.35);
+                color: #4ade80;
+            }
+            .kaiops-approval-result-rejected {
+                background: rgba(220,38,38,0.08);
+                border: 1px solid rgba(220,38,38,0.35);
+                color: #f87171;
+            }
+            .kaiops-approval-result-modified {
+                background: rgba(234,179,8,0.08);
+                border: 1px solid rgba(234,179,8,0.35);
+                color: #fde047;
             }
 
       @media (max-width: 920px) {
-        .kaiops-hero h2 { font-size: 1.25rem; }
+        .kaiops-hero-title { font-size: 1.4rem; }
         .kaiops-agent-grid { grid-template-columns: 1fr; }
       }
     </style>
@@ -873,9 +1274,20 @@ st.markdown(
 
 st.markdown(
     """
-    <div class="kaiops-hero">
-      <h2>KaiOps Autonomous Operations</h2>
-      <p>Interactive operations cockpit for agent handoffs, approvals, remediation, and FinOps visibility.</p>
+    <div class="kaiops-hero-wrap">
+      <div class="kaiops-hero-label">&#9679; AI-Powered SRE Platform</div>
+      <div class="kaiops-hero-title">KaiOps Autonomous Operations</div>
+      <div class="kaiops-hero-sub">
+        End-to-end incident intelligence — from alert detection and root-cause analysis
+        to automated remediation, human approval gates, and FinOps cost visibility.
+      </div>
+      <div class="kaiops-hero-pills">
+        <span class="kaiops-hero-pill"><span class="kaiops-hero-pill-dot"></span> Agents Online</span>
+        <span class="kaiops-hero-pill"><span class="kaiops-hero-pill-dot kaiops-hero-pill-dot-blue"></span> RAG Grounded</span>
+        <span class="kaiops-hero-pill"><span class="kaiops-hero-pill-dot kaiops-hero-pill-dot-amber"></span> Gateway Active</span>
+        <span class="kaiops-hero-pill">7-Step Workflow</span>
+        <span class="kaiops-hero-pill">GPT-Powered RCA</span>
+      </div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -897,8 +1309,25 @@ with st.sidebar:
     st.markdown(
         """
         <div class="kaiops-sidebar-hero">
-          <h3>Mission Control</h3>
-          <p>Operate flow execution, monitoring, and RAG intelligence from one panel.</p>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+            <span style="font-size:1.15rem;">&#9881;</span>
+            <h3 style="margin:0;">Mission Control</h3>
+            <span style="margin-left:auto;display:inline-flex;align-items:center;gap:4px;
+                         background:rgba(255,255,255,0.15);border-radius:999px;padding:2px 8px;
+                         font-size:0.62rem;font-weight:700;letter-spacing:0.05em;color:#e0f2fe;">
+              <span style="width:6px;height:6px;border-radius:50%;background:#4ade80;
+                           display:inline-block;animation:kaiops-pulse 2.2s ease-in-out infinite;"></span>
+              LIVE
+            </span>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;">
+            <span style="background:rgba(255,255,255,0.12);border-radius:6px;padding:2px 8px;
+                         font-size:0.65rem;font-weight:600;color:#bfdbfe;">&#9632; Alert Stream</span>
+            <span style="background:rgba(255,255,255,0.12);border-radius:6px;padding:2px 8px;
+                         font-size:0.65rem;font-weight:600;color:#bfdbfe;">&#9654; Flow Control</span>
+            <span style="background:rgba(255,255,255,0.12);border-radius:6px;padding:2px 8px;
+                         font-size:0.65rem;font-weight:600;color:#bfdbfe;">&#9679; RAG Knowledge Base</span>
+          </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1041,17 +1470,66 @@ with st.sidebar:
             st.session_state["gateway_recent"] = request_json("GET", f"{GATEWAY_BASE}/observability/recent")
             st.session_state["last_gateway_refresh_ts"] = time.time()
 
-    st.markdown('<div class="kaiops-sidebar-section">RAG Workspace</div>', unsafe_allow_html=True)
+    # ── RAG Workspace — placed after Live Monitoring as a knowledge-base admin section ──
+    st.markdown(
+        """
+        <div style="margin: 12px 0 2px;">
+          <div style="height:1px;background:rgba(148,163,184,0.12);margin-bottom:10px;"></div>
+          <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+            <span style="font-size:0.72rem;letter-spacing:0.04em;text-transform:uppercase;
+                         color:#94a3b8;font-weight:700;">&#128209; RAG Knowledge Base</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     with st.container(border=True):
+        st.markdown(
+            '<p style="font-size:0.72rem;color:#64748b;margin:0 0 8px;">'
+            "Index operational docs that ground agent recommendations."
+            "</p>",
+            unsafe_allow_html=True,
+        )
         col_reload, col_list = st.columns(2)
         if col_reload.button("Reload Index", width="stretch"):
             st.session_state["rag_reload"] = request_json("POST", f"{GATEWAY_BASE}/rag/reload")
+            if st.session_state.get("rag_reload"):
+                st.session_state["rag_last_indexed_at"] = time.time()
         if col_list.button("List Docs", width="stretch"):
             st.session_state["rag_documents"] = request_json("GET", f"{GATEWAY_BASE}/rag/documents")
+            if st.session_state.get("rag_documents"):
+                st.session_state["rag_last_indexed_at"] = time.time()
+
+        last_indexed_at = st.session_state.get("rag_last_indexed_at")
+        if last_indexed_at:
+            st.caption(f"Last indexed at {time.strftime('%H:%M:%S', time.localtime(last_indexed_at))}")
 
         if st.session_state.get("rag_reload"):
             reloaded_count = data_from_gateway(st.session_state["rag_reload"]).get("document_count")
-            st.success(f"RAG reloaded: {reloaded_count} docs")
+            st.success(f"RAG reloaded — {reloaded_count} docs in index")
+
+        if st.session_state.get("rag_documents"):
+            docs_payload = data_from_gateway(st.session_state["rag_documents"])
+            docs_count = int(docs_payload.get("document_count", 0) or 0)
+            documents = docs_payload.get("documents", []) if isinstance(docs_payload.get("documents", []), list) else []
+            st.caption(f"Indexed docs: {docs_count}")
+            if documents:
+                st.dataframe(
+                    [
+                        {
+                            "Kind": doc.get("kind"),
+                            "Title": doc.get("title"),
+                            "Services": ", ".join(doc.get("services", []))
+                            if isinstance(doc.get("services"), list)
+                            else str(doc.get("services", "")),
+                        }
+                        for doc in documents[:20]
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
+            else:
+                st.info("RAG index is reachable but currently has no documents.")
 
         search_query = st.text_input("Search RAG", placeholder="payments latency rollback", key="sidebar_rag_search")
         if st.button("Search", width="stretch", disabled=not search_query):
@@ -1059,113 +1537,98 @@ with st.sidebar:
                 "GET", f"{GATEWAY_BASE}/rag/search", params={"query": search_query, "limit": 8}
             )
 
-    with st.expander("Ingest document"):
-        with st.form("rag_ingest_form"):
-            kind = st.selectbox("Type", ["runbook", "incident", "deployment", "change", "dependency"])
-            title = st.text_input("Title", placeholder="Payments rollback")
-            uploaded_docs = st.file_uploader(
-                "Upload document files",
-                accept_multiple_files=True,
-                help="Select one or more document files to ingest.",
-            )
-            services_text = st.text_input("Services", placeholder="payments, checkout")
-            deployment = st.text_input("Deployment", placeholder="2.5")
-            dependencies_text = st.text_input("Dependencies", placeholder="checkout, ledger")
-            change_id = st.text_input("Change ID", placeholder="CHG-1234")
-            issue_severity = st.selectbox("Issue severity", ["CRITICAL", "HIGH", "WARNING"], index=1)
-            suggested_action = st.text_input("Suggested action", placeholder="Rollback deployment")
-            content = st.text_area(
-                "Content",
-                height=100,
-                placeholder="Paste runbook, incident, deployment, dependency graph, or change-record...",
-            )
-            submitted = st.form_submit_button("Ingest", type="primary")
+    with st.expander("&#8593; Ingest document"):
+        st.caption("Upload docs only. KaiOps auto-detects type, extracts metadata, and links to likely incidents.")
+        uploaded_docs = st.file_uploader(
+            "Upload one or more documents",
+            accept_multiple_files=True,
+            help="Supported text formats include .md, .txt, .log, .yaml, and similar text files.",
+            key="rag_upload_auto_files",
+        )
+        submitted = st.button("Upload & Auto-Link", type="primary", width="stretch")
 
         if submitted:
-            docs_to_ingest: list[dict[str, Any]] = []
-            upload_failures: list[str] = []
-            base_title = (title or "").strip()
-
-            for uploaded_doc in uploaded_docs or []:
-                uploaded_text = uploaded_file_to_text(uploaded_doc)
-                if uploaded_text is None:
-                    upload_failures.append(str(getattr(uploaded_doc, "name", "unknown-file")))
-                    continue
-                file_name = str(getattr(uploaded_doc, "name", "uploaded-document"))
-                file_title = file_name.rsplit(".", 1)[0]
-                docs_to_ingest.append(
-                    {
-                        "title": file_title,
-                        "content": uploaded_text.strip(),
-                        "metadata": {
-                            "source": "ui-upload",
-                            "uploaded_filename": file_name,
-                        },
-                    }
-                )
-
-            typed_content = (content or "").strip()
-            if typed_content:
-                docs_to_ingest.append(
-                    {
-                        "title": base_title or "manual-entry",
-                        "content": typed_content,
-                        "metadata": {
-                            "source": "ui",
-                            "uploaded_filename": None,
-                        },
-                    }
-                )
-
-            if not docs_to_ingest:
-                st.warning("Provide document content or upload one or more files before ingesting.")
+            if not uploaded_docs:
+                st.warning("Upload at least one document to continue.")
             else:
+                upload_failures: list[str] = []
+                linked_summary: list[dict[str, Any]] = []
                 successes = 0
                 last_result: dict[str, Any] = {}
-                for doc in docs_to_ingest:
-                    doc_title = str(doc["title"]).strip() or "uploaded-document"
-                    doc_content = str(doc["content"]).strip()
+
+                for uploaded_doc in uploaded_docs:
+                    file_name = str(getattr(uploaded_doc, "name", "uploaded-document"))
+                    uploaded_text = uploaded_file_to_text(uploaded_doc)
+                    if uploaded_text is None:
+                        upload_failures.append(f"{file_name} (non-text or unreadable)")
+                        continue
+
+                    doc_content = uploaded_text.strip()
+                    doc_title = file_name.rsplit(".", 1)[0].strip() or "uploaded-document"
                     if len(doc_title) < 3:
                         doc_title = f"{doc_title}-doc"
                     if len(doc_content) < 20:
                         upload_failures.append(f"{doc_title} (content too short; minimum 20 characters)")
                         continue
-                    raw_metadata = doc.get("metadata", {}) if isinstance(doc.get("metadata", {}), dict) else {}
-                    metadata = {
-                        str(key): str(value)
-                        for key, value in raw_metadata.items()
-                        if value is not None and str(value).strip()
-                    }
+
+                    auto_kind = infer_rag_kind(file_name, doc_content)
+                    linked_ids = infer_linked_incident_ids(file_name, doc_content, catalog_entries)
+                    inferred_services = infer_services_from_links(doc_content, catalog_entries, linked_ids)
+                    inferred_change_id = infer_change_id(doc_content)
+                    inferred_deployment = infer_deployment_tag(doc_content)
+
                     payload = {
-                        "kind": kind,
+                        "kind": auto_kind,
                         "title": doc_title,
                         "content": doc_content,
-                        "services": [item.strip() for item in services_text.split(",") if item.strip()],
-                        "deployment": deployment or None,
-                        "dependencies": [item.strip() for item in dependencies_text.split(",") if item.strip()],
-                        "change_id": change_id or None,
-                        "metadata": metadata,
+                        "services": inferred_services,
+                        "deployment": inferred_deployment,
+                        "dependencies": [],
+                        "change_id": inferred_change_id,
+                        "metadata": {
+                            "source": "ui-upload-auto",
+                            "uploaded_filename": file_name,
+                            "auto_linked_incidents": ", ".join(linked_ids),
+                            "auto_link_status": "linked" if linked_ids else "unmatched",
+                        },
                     }
-                    payload["metadata"]["severity"] = issue_severity
-                    if suggested_action.strip():
-                        payload["metadata"]["recommended_action"] = suggested_action.strip()
+
+                    if linked_ids:
+                        matched_entry = next((item for item in catalog_entries if str(item.get("id")) == linked_ids[0]), {})
+                        recommended_action = str(matched_entry.get("recommended_action", "")).strip()
+                        severity = str(matched_entry.get("severity", "")).strip().upper()
+                        if recommended_action:
+                            payload["metadata"]["recommended_action"] = recommended_action
+                        if severity in {"CRITICAL", "HIGH", "WARNING"}:
+                            payload["metadata"]["severity"] = severity
+
                     result = request_json("POST", f"{GATEWAY_BASE}/rag/documents", json=payload)
                     if result:
                         last_result = result
                         successes += 1
+                        linked_summary.append(
+                            {
+                                "Document": doc_title,
+                                "Detected Type": auto_kind,
+                                "Linked Incident": ", ".join(linked_ids) if linked_ids else "No confident match",
+                            }
+                        )
 
                 if last_result:
                     st.session_state["rag_ingest_result"] = last_result
+                    st.session_state["rag_last_indexed_at"] = time.time()
+                    st.session_state["rag_documents"] = request_json("GET", f"{GATEWAY_BASE}/rag/documents")
                     st.session_state.pop("flows", None)
                     refreshed_flows = request_json("GET", f"{GATEWAY_BASE}/sample/flows")
                     st.session_state["flows"] = data_from_gateway(refreshed_flows).get("flows", [])
                     st.session_state["flow_catalog_preview"] = request_json("GET", f"{GATEWAY_BASE}/rag/flow-catalog")
+
                 if successes:
-                    st.success(f"Ingested {successes} document(s).")
+                    st.success(f"Uploaded and indexed {successes} document(s).")
+                if linked_summary:
+                    st.dataframe(linked_summary, hide_index=True, width="stretch")
                 if upload_failures:
-                    st.warning(
-                        "Skipped non-text or unreadable files: " + ", ".join(upload_failures)
-                    )
+                    st.warning("Skipped files: " + ", ".join(upload_failures))
 
         if st.session_state.get("rag_ingest_result"):
             data = data_from_gateway(st.session_state["rag_ingest_result"])
@@ -1263,21 +1726,35 @@ homepage_html = build_complete_webpage_html(
 )
 
 homepage_export_name = f"kaiops-homepage-{time.strftime('%Y%m%d-%H%M%S')}.html"
-st.download_button(
-    "Save complete webpage as HTML",
-    data=homepage_html,
-    file_name=homepage_export_name,
-    mime="text/html",
-    width="stretch",
-    key="kaiops_homepage_save_html",
-)
+_export_left, _export_right = st.columns([12, 1])
+with _export_right:
+    st.download_button(
+        "⬇",
+        data=homepage_html,
+        file_name=homepage_export_name,
+        mime="text/html",
+        width="content",
+        help="Download complete webpage as HTML",
+        key="kaiops_homepage_save_html",
+    )
 
 if not workflow:
     st.info("Choose an incident flow in Mission Control and click Run Flow.")
 else:
     st.subheader(scenario.get("title", "Incident Flow"))
-    render_copyable_id("Incident ID", incident.get("id"))
-    render_copyable_id("Trace ID", gateway_response.get("trace_id"))
+    _h_inc = str(incident.get("id", "—"))
+    _h_trace = str(gateway_response.get("trace_id", "—"))
+    st.markdown(
+        f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin:-4px 0 12px;">'
+        f'<span style="font-family:monospace;font-size:0.72rem;color:#64748b;background:rgba(15,23,42,0.06);'
+        f'border:1px solid #e2e8f0;border-radius:6px;padding:3px 10px;">'
+        f'<b style="color:#94a3b8;">INC</b> {html.escape(_h_inc)}</span>'
+        f'<span style="font-family:monospace;font-size:0.72rem;color:#64748b;background:rgba(15,23,42,0.06);'
+        f'border:1px solid #e2e8f0;border-radius:6px;padding:3px 10px;">'
+        f'<b style="color:#94a3b8;">TRACE</b> {html.escape(_h_trace)}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
     metric_row(
         [
             ("Severity", str(metrics.get("severity", "unknown")).upper()),
@@ -1293,101 +1770,258 @@ tab_summary, tab_approval, tab_trace, tab_finops, tab_closed = st.tabs(
 
 with tab_summary:
     if workflow:
-        left, right = st.columns([1.2, 1])
+        # Severity badge class
+        _sev = str(metrics.get("severity", alert.get("severity", "unknown"))).lower()
+        _sev_class = {"critical": "kaiops-sev-critical", "high": "kaiops-sev-high",
+                      "warning": "kaiops-sev-warning", "info": "kaiops-sev-info"}.get(_sev, "kaiops-sev-info")
+        _confidence_pct = f"{float(metrics.get('recommendation_confidence', 0)):.0%}"
+        _health = "✓ Restored" if metrics.get("health_restored") else "✗ Not Restored"
+        _gw_decision = str(gateway.get("safety", {}).get("decision", "unknown")).upper()
+
+        # ── Hero incident header ──
+        st.markdown(
+            f"""
+            <div class="kaiops-summary-hero">
+              <div class="kaiops-summary-hero-alert">
+                <span class="kaiops-summary-badge {_sev_class}">{_sev.upper()}</span>
+                {html.escape(str(alert.get('name', 'N/A')))}
+              </div>
+              <div class="kaiops-summary-hero-meta">
+                Service <b style="color:#cbd5e1">{html.escape(str(alert.get('service','N/A')))}</b>
+                &nbsp;·&nbsp; Environment <b style="color:#cbd5e1">{html.escape(str(alert.get('environment','N/A')))}</b>
+                &nbsp;·&nbsp; Source <b style="color:#cbd5e1">{html.escape(str(alert.get('source','N/A')))}</b>
+              </div>
+              <div style="font-size:0.86rem; color:#94a3b8; line-height:1.5;">
+                {html.escape(str(alert.get('description', 'No description available.')))}
+              </div>
+              <div class="kaiops-info-grid" style="margin-top:14px;">
+                <div class="kaiops-info-cell">
+                  <div class="kaiops-info-cell-label">Deployment</div>
+                  <div class="kaiops-info-cell-value">{html.escape(str(context.get('deployment') or 'N/A'))}</div>
+                </div>
+                <div class="kaiops-info-cell">
+                  <div class="kaiops-info-cell-label">Confidence</div>
+                  <div class="kaiops-info-cell-value">{_confidence_pct}</div>
+                </div>
+                <div class="kaiops-info-cell">
+                  <div class="kaiops-info-cell-label">Health</div>
+                  <div class="kaiops-info-cell-value">{_health}</div>
+                </div>
+                <div class="kaiops-info-cell">
+                  <div class="kaiops-info-cell-label">Gateway</div>
+                  <div class="kaiops-info-cell-value">{_gw_decision}</div>
+                </div>
+                <div class="kaiops-info-cell">
+                  <div class="kaiops-info-cell-label">Dedup Count</div>
+                  <div class="kaiops-info-cell-value">{metrics.get('deduplicated_count', 1)}</div>
+                </div>
+                <div class="kaiops-info-cell">
+                  <div class="kaiops-info-cell-label">Agent Handoffs</div>
+                  <div class="kaiops-info-cell-value">{metrics.get('agent_handoffs', 'N/A')}</div>
+                </div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        left, right = st.columns([1.3, 1])
         with left:
-            st.markdown("### What happened")
-            render_copyable_id("Incident ID", incident.get("id"))
+            st.markdown("#### Root Cause & Recommendation")
+            _rc = str(recommendation.get("root_cause") or closure.get("root_cause") or "Pending analysis")
             st.markdown(
                 f"""
-                <div class=\"kaiops-card\">
-                <b>{alert.get('name')}</b> from <b>{alert.get('source')}</b><br/>
-                Service <b>{alert.get('service')}</b> in <b>{alert.get('environment')}</b><br/>
-                {alert.get('description')}
+                <div class="kaiops-recommendation-card">
+                  <div class="kaiops-recommendation-action">
+                    &#9654; {html.escape(str(recommendation.get('recommended_action','N/A')))}
+                  </div>
+                  <div style="font-size:0.78rem; color:#475569; font-weight:600; margin: 4px 0 6px;">
+                    ROOT CAUSE
+                  </div>
+                  <div style="font-size:0.84rem; color:#cbd5e1; line-height:1.5; margin-bottom:8px;">
+                    {html.escape(_rc)}
+                  </div>
+                  <div class="kaiops-recommendation-rationale">
+                    {html.escape(str(recommendation.get('rationale','N/A')))}
+                  </div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
-            st.markdown("### Agent recommendation")
-            st.success(f"{recommendation.get('recommended_action')} - {recommendation.get('impact')}")
-            st.write(recommendation.get("rationale"))
-        with right:
-            st.markdown("### Key metrics")
-            table_from_dict(
-                {
-                    "deduplicated_count": metrics.get("deduplicated_count"),
-                    "agent_handoffs": metrics.get("agent_handoffs"),
-                    "dependencies": metrics.get("dependency_services"),
-                    "recent_changes": metrics.get("recent_changes"),
-                    "remediation_status": metrics.get("remediation_status"),
-                    "alerts_cleared": metrics.get("alerts_cleared"),
-                }
-            )
-            st.markdown("### Context")
-            render_copyable_id("Trace ID", gateway_response.get("trace_id"))
-            table_from_dict(
-                {
-                    "deployment": context.get("deployment"),
-                    "runbook_found": bool(context.get("runbook")),
-                    "dependencies": ", ".join(context.get("dependency_services", [])),
-                }
+
+            _impact = str(recommendation.get("impact") or closure.get("impact") or "N/A")
+            _risk = str(recommendation.get("risk", "medium")).upper()
+            _risk_color = "#dc2626" if _risk == "HIGH" else ("#d97706" if _risk == "MEDIUM" else "#16a34a")
+            st.markdown(
+                f"""
+                <div style="display:flex; gap:10px; margin-top:10px;">
+                  <div class="kaiops-info-cell" style="flex:1">
+                    <div class="kaiops-info-cell-label">Impact</div>
+                    <div class="kaiops-info-cell-value" style="font-size:0.82rem">{html.escape(_impact)}</div>
+                  </div>
+                  <div class="kaiops-info-cell" style="flex:0 0 100px">
+                    <div class="kaiops-info-cell-label">Risk</div>
+                    <div class="kaiops-info-cell-value" style="color:{_risk_color}">{_risk}</div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
+        with right:
+            st.markdown("#### Operational Context")
+            _deps = context.get("dependency_services", [])
+            _deps_str = ", ".join(_deps) if _deps else "None"
+            _changes = context.get("recent_changes", [])
+            _runbook = bool(context.get("runbook"))
+            table_from_dict({
+                "root_cause": recommendation.get("root_cause") or closure.get("root_cause"),
+                "remediation_status": metrics.get("remediation_status"),
+                "runbook_found": "Yes" if _runbook else "No",
+                "dependencies": _deps_str,
+                "recent_changes": len(_changes),
+                "alerts_cleared": "Yes" if metrics.get("alerts_cleared") else "No",
+            })
+            _inc_id = str(incident.get("id", "—"))
+            _trace_id = str(gateway_response.get("trace_id", "—"))
+            st.markdown(
+                f"""
+                <div style="margin-top:10px;display:flex;flex-direction:column;gap:6px;">
+                  <div style="background:rgba(15,23,42,0.5);border:1px solid rgba(51,65,85,0.5);
+                               border-radius:8px;padding:8px 12px;">
+                    <span style="font-size:0.65rem;font-weight:700;text-transform:uppercase;
+                                 letter-spacing:0.05em;color:#475569;">Incident ID</span>
+                    <div style="font-family:monospace;font-size:0.75rem;color:#94a3b8;
+                                margin-top:2px;word-break:break-all;">{html.escape(_inc_id)}</div>
+                  </div>
+                  <div style="background:rgba(15,23,42,0.5);border:1px solid rgba(51,65,85,0.5);
+                               border-radius:8px;padding:8px 12px;">
+                    <span style="font-size:0.65rem;font-weight:700;text-transform:uppercase;
+                                 letter-spacing:0.05em;color:#475569;">Trace ID</span>
+                    <div style="font-family:monospace;font-size:0.75rem;color:#94a3b8;
+                                margin-top:2px;word-break:break-all;">{html.escape(_trace_id)}</div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    else:
+        st.info("Run a flow to populate the Incident Summary.")
+
 with tab_approval:
-    st.markdown("### Human approval")
     if not workflow:
         st.info("Run a flow first. The approval form will be prefilled with incident and recommendation IDs.")
     else:
-        render_copyable_id("Incident ID", incident.get("id"))
-        render_copyable_id("Recommendation ID", recommendation.get("id"))
-        render_copyable_id("Trace ID", gateway_response.get("trace_id"))
+        _rec_action = str(recommendation.get("recommended_action", "Rollback deployment"))
+        _rec_risk = str(recommendation.get("risk", "medium")).upper()
+        _rec_impact = str(recommendation.get("impact", "N/A"))
+        _inc_id_val = str(incident.get("id", ""))
+        _rec_id_val = str(recommendation.get("id", ""))
+        _trace_val = str(gateway_response.get("trace_id", ""))
 
-        default_action = recommendation.get("recommended_action", "Rollback deployment")
-        approval_incident_id = st.text_input("Incident ID for approval", value=incident.get("id", ""))
-        recommendation_id = st.text_input("Recommendation ID for approval", value=recommendation.get("id", ""))
-        approver = st.text_input("Approver", value="sre@example.com")
-        channel = st.selectbox("Channel", ["web", "slack", "teams", "email"])
-        comment = st.text_input("Approval comment / action", value=default_action)
+        # ── Incident context card ──
+        st.markdown(
+            f"""
+            <div class="kaiops-approval-card">
+              <div class="kaiops-approval-title">&#9888; Incident Requiring Approval</div>
+              <div class="kaiops-approval-kv-row">
+                <div class="kaiops-approval-kv">
+                  <div class="kaiops-approval-kv-label">Alert</div>
+                  <div class="kaiops-approval-kv-value">{html.escape(str(alert.get('name','N/A')))}</div>
+                </div>
+                <div class="kaiops-approval-kv">
+                  <div class="kaiops-approval-kv-label">Service</div>
+                  <div class="kaiops-approval-kv-value">{html.escape(str(alert.get('service','N/A')))}</div>
+                </div>
+                <div class="kaiops-approval-kv">
+                  <div class="kaiops-approval-kv-label">Severity</div>
+                  <div class="kaiops-approval-kv-value">{html.escape(str(metrics.get('severity','N/A')).upper())}</div>
+                </div>
+                <div class="kaiops-approval-kv">
+                  <div class="kaiops-approval-kv-label">Recommended Action</div>
+                  <div class="kaiops-approval-kv-value">{html.escape(_rec_action)}</div>
+                </div>
+                <div class="kaiops-approval-kv">
+                  <div class="kaiops-approval-kv-label">Impact</div>
+                  <div class="kaiops-approval-kv-value">{html.escape(_rec_impact)}</div>
+                </div>
+                <div class="kaiops-approval-kv">
+                  <div class="kaiops-approval-kv-label">Risk Level</div>
+                  <div class="kaiops-approval-kv-value">{html.escape(_rec_risk)}</div>
+                </div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        payload = {
-            "incident_id": approval_incident_id,
-            "recommendation_id": recommendation_id,
-            "approver": approver,
-            "channel": channel,
-            "comment": comment,
-        }
+        # ── Approval form ──
+        st.markdown("#### Submit Approval Decision")
+        with st.container(border=True):
+            col_l, col_r = st.columns(2)
+            with col_l:
+                approval_incident_id = st.text_input(
+                    "Incident ID", value=_inc_id_val, key="approval_inc_id"
+                )
+                approver = st.text_input("Approver email", value="sre@example.com")
+                comment = st.text_input(
+                    "Action / Comment", value=_rec_action, help="Override action here if modifying"
+                )
+            with col_r:
+                recommendation_id = st.text_input(
+                    "Recommendation ID", value=_rec_id_val, key="approval_rec_id"
+                )
+                channel = st.selectbox("Notification channel", ["web", "slack", "teams", "email"])
 
-        col_approve, col_reject, col_modify = st.columns(3)
-        if col_approve.button("Approve", type="primary", width="stretch"):
-            st.session_state["approval_response"] = request_json("POST", f"{GATEWAY_BASE}/approval/approve", json=payload)
-        if col_reject.button("Reject", width="stretch"):
-            st.session_state["approval_response"] = request_json("POST", f"{GATEWAY_BASE}/approval/reject", json=payload)
-        if col_modify.button("Modify", width="stretch"):
-            payload["modified_action"] = comment
-            st.session_state["approval_response"] = request_json("POST", f"{GATEWAY_BASE}/approval/modify", json=payload)
+            payload = {
+                "incident_id": approval_incident_id,
+                "recommendation_id": recommendation_id,
+                "approver": approver,
+                "channel": channel,
+                "comment": comment,
+            }
 
+            st.markdown("")
+            col_approve, col_reject, col_modify = st.columns(3)
+            if col_approve.button("✓ Approve", type="primary", width="stretch"):
+                st.session_state["approval_response"] = request_json(
+                    "POST", f"{GATEWAY_BASE}/approval/approve", json=payload
+                )
+            if col_reject.button("✗ Reject", width="stretch"):
+                st.session_state["approval_response"] = request_json(
+                    "POST", f"{GATEWAY_BASE}/approval/reject", json=payload
+                )
+            if col_modify.button("⟳ Modify", width="stretch"):
+                payload["modified_action"] = comment
+                st.session_state["approval_response"] = request_json(
+                    "POST", f"{GATEWAY_BASE}/approval/modify", json=payload
+                )
+
+        # ── Result ──
         approval_response = st.session_state.get("approval_response", {})
         if approval_response:
             approval_data = approval_response.get("data", {})
             approval_gateway = approval_response.get("gateway", {})
-            st.markdown("### Latest approval result")
-            metric_row(
-                [
-                    ("Decision", str(approval_data.get("decision", "unknown")).upper()),
-                    ("Channel", approval_data.get("channel", "N/A")),
-                    ("Gateway", str(approval_gateway.get("safety", {}).get("decision", "unknown")).upper()),
-                    ("Latency", f"{approval_gateway.get('latency_ms', 0)} ms"),
-                ]
+            _decision = str(approval_data.get("decision", "unknown")).upper()
+            _result_class = (
+                "kaiops-approval-result-approved" if _decision == "APPROVED"
+                else "kaiops-approval-result-rejected" if _decision == "REJECTED"
+                else "kaiops-approval-result-modified"
+            )
+            _icon = "✓" if _decision == "APPROVED" else ("✗" if _decision == "REJECTED" else "⟳")
+            st.markdown(
+                f"""
+                <div class="kaiops-approval-result {_result_class}">
+                  <b>{_icon} Decision: {_decision}</b>
+                  &nbsp;·&nbsp; Channel: {html.escape(str(approval_data.get('channel','N/A')))}
+                  &nbsp;·&nbsp; Approver: {html.escape(str(approval_data.get('approver','N/A')))}
+                  &nbsp;·&nbsp; Gateway: {html.escape(str(approval_gateway.get('safety',{{}}).get('decision','N/A')).upper())}
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
             render_copyable_id("Approval ID", approval_data.get("id"))
             render_copyable_id("Approval Trace ID", approval_response.get("trace_id"))
-            table_from_dict(
-                {
-                    "approver": approval_data.get("approver"),
-                    "comment": approval_data.get("comment"),
-                    "modified_action": approval_data.get("modified_action"),
-                    "safety_score": approval_gateway.get("safety", {}).get("score"),
-                }
-            )
 
 with tab_trace:
     st.markdown("### Agent Operations Board")
