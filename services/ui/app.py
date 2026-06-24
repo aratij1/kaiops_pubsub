@@ -691,31 +691,34 @@ def agent_kpis(event: dict[str, Any]) -> dict[str, int]:
 def render_agent_role_overview(events: list[dict[str, Any]]) -> None:
     events_by_agent = {str(event.get("agent", "")): event for event in events}
     st.markdown("#### Agent Command Roles")
-    cards: list[str] = []
-    for index, (agent_name, profile) in enumerate(AGENT_PROFILES.items(), start=1):
-        event = events_by_agent.get(agent_name, {})
-        status = "completed" if event else "standby"
-        decision = str(event.get("decision", "Awaiting workflow execution"))
-        kpis = agent_kpis(event) if event else {"calls": 0, "errors": 0, "signals": 0}
-        cards.append(
-            f"""
-            <div class="kaiops-agent-card">
-              <div class="kaiops-agent-top">
-                <span class="kaiops-agent-icon">{html.escape(profile.get("icon", "[AGENT]"))}</span>
-                <span class="kaiops-agent-step">Step {index} · {status.upper()}</span>
-              </div>
-              <div class="kaiops-agent-name">{html.escape(agent_name)}</div>
-              <div class="kaiops-agent-mission">{html.escape(profile.get("mission", ""))}</div>
-              <div class="kaiops-agent-kpis">
-                <span class="kaiops-kpi-pill">signals {kpis["signals"]}</span>
-                <span class="kaiops-kpi-pill">llm {kpis["calls"]}</span>
-                <span class="kaiops-kpi-pill">errors {kpis["errors"]}</span>
-              </div>
-              <div class="kaiops-agent-decision">{html.escape(decision[:160])}</div>
-            </div>
-            """
-        )
-    st.markdown(f'<div class="kaiops-agent-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+    agent_items = list(AGENT_PROFILES.items())
+    for start in range(0, len(agent_items), 3):
+        columns = st.columns(3)
+        for offset, column in enumerate(columns):
+            index = start + offset
+            if index >= len(agent_items):
+                continue
+
+            agent_name, profile = agent_items[index]
+            event = events_by_agent.get(agent_name, {})
+            status = "COMPLETED" if event else "STANDBY"
+            decision = str(event.get("decision", "Awaiting workflow execution"))
+            kpis = agent_kpis(event) if event else {"calls": 0, "errors": 0, "signals": 0}
+
+            with column:
+                with st.container(border=True):
+                    top_left, top_right = st.columns([1.2, 1])
+                    top_left.markdown(f"**{profile.get('icon', '[AGENT]')} {agent_name}**")
+                    top_right.caption(f"Step {index + 1} · {status}")
+                    st.caption(profile.get("mission", "Coordinates incident-resolution logic."))
+                    metric_cols = st.columns(3)
+                    metric_cols[0].metric("Signals", kpis["signals"])
+                    metric_cols[1].metric("LLM", kpis["calls"])
+                    metric_cols[2].metric("Errors", kpis["errors"])
+                    if event:
+                        st.success(decision[:220])
+                    else:
+                        st.info("Awaiting workflow execution")
 
 
 def render_agent_event_details(event: dict[str, Any]) -> None:
