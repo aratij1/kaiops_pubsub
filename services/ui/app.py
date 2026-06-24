@@ -595,11 +595,11 @@ def render_alert_stream(entries: list[dict[str, Any]]) -> str | None:
         # Suppress interactive button for no-action/duplicate entries; still render as info
         if is_suppressed:
             st.markdown(
-                f'<div style="opacity:0.52; padding:3px 0;">'
+                f'<div style="opacity:0.9; padding:3px 0;">'
                 f'<span class="kaiops-alert-badge {badge_class}">{badge_label}</span>'
-                f' <span style="font-size:0.78rem; color:#64748b;">{alert_id} | {alert_name}</span>'
+                f' <span style="font-size:0.78rem; color:#cbd5e1;">{alert_id} | {alert_name}</span>'
                 f'</div>'
-                f'<div style="font-size:0.7rem; color:#475569; margin-bottom:4px; padding-left:4px;">'
+                f'<div style="font-size:0.7rem; color:#94a3b8; margin-bottom:4px; padding-left:4px;">'
                 f'{service} · {severity}</div>',
                 unsafe_allow_html=True,
             )
@@ -996,7 +996,7 @@ st.markdown(
                 font-size: 0.72rem;
                 letter-spacing: 0.04em;
                 text-transform: uppercase;
-                color: #94a3b8;
+                color: #e2e8f0;
                 font-weight: 700;
             }
             section[data-testid="stSidebar"] .stButton > button {
@@ -1013,7 +1013,23 @@ st.markdown(
             section[data-testid="stSidebar"] label,
             section[data-testid="stSidebar"] p,
             section[data-testid="stSidebar"] .stCaption > *,
-            section[data-testid="stSidebar"] small { color: #cbd5e1 !important; }
+            section[data-testid="stSidebar"] small,
+            section[data-testid="stSidebar"] span,
+            section[data-testid="stSidebar"] div {
+                color: #e2e8f0 !important;
+            }
+            section[data-testid="stSidebar"] div[data-testid="stVerticalBlockBorderWrapper"] {
+                background: rgba(15, 23, 42, 0.42) !important;
+                border-color: rgba(148, 163, 184, 0.35) !important;
+                border-radius: 12px !important;
+            }
+            section[data-testid="stSidebar"] input,
+            section[data-testid="stSidebar"] textarea,
+            section[data-testid="stSidebar"] select {
+                background: rgba(15, 23, 42, 0.78) !important;
+                color: #f8fafc !important;
+                border: 1px solid rgba(148, 163, 184, 0.35) !important;
+            }
             .kaiops-alert-badge {
                 display: inline-block;
                 font-size: 0.58rem;
@@ -1028,7 +1044,7 @@ st.markdown(
             .kaiops-badge-high { background: #ea580c; color: #fff; }
             .kaiops-badge-warning { background: #d97706; color: #fff; }
             .kaiops-badge-duplicate { background: rgba(100,116,139,0.2); color: #94a3b8; border: 1px solid #475569; }
-            .kaiops-badge-ignore { background: rgba(71,85,105,0.15); color: #64748b; border: 1px dashed #475569; }
+            .kaiops-badge-ignore { background: rgba(71,85,105,0.25); color: #cbd5e1; border: 1px dashed #94a3b8; }
             .kaiops-badge-info { background: rgba(14,165,233,0.15); color: #38bdf8; border: 1px solid #0ea5e9; }
             .kaiops-hero-wrap {
                 background: linear-gradient(118deg, #0f172a 0%, #1e1b4b 30%, #1d4ed8 65%, #0ea5e9 100%);
@@ -1477,7 +1493,7 @@ with st.sidebar:
           <div style="height:1px;background:rgba(148,163,184,0.12);margin-bottom:10px;"></div>
           <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
             <span style="font-size:0.72rem;letter-spacing:0.04em;text-transform:uppercase;
-                         color:#94a3b8;font-weight:700;">&#128209; RAG Knowledge Base</span>
+                                                 color:#e2e8f0;font-weight:700;">&#128209; RAG Knowledge Base</span>
           </div>
         </div>
         """,
@@ -1485,7 +1501,7 @@ with st.sidebar:
     )
     with st.container(border=True):
         st.markdown(
-            '<p style="font-size:0.72rem;color:#64748b;margin:0 0 8px;">'
+                        '<p style="font-size:0.72rem;color:#cbd5e1;margin:0 0 8px;">'
             "Index operational docs that ground agent recommendations."
             "</p>",
             unsafe_allow_html=True,
