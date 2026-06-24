@@ -1,10 +1,9 @@
 import httpx
 import pytest
-from common.config import Settings, get_settings
+from common.config import get_settings
 from common.models import AlertSeverity
 from model_router import ModelRouter, ModelTask
 from model_router.router import (
-    GeminiModelProvider,
     ModelProvider,
     ModelResponse,
     build_default_providers,
@@ -42,15 +41,17 @@ def test_model_router_selection_rules() -> None:
 
     assert router.select_model(severity=AlertSeverity.CRITICAL, task=ModelTask.RCA) == "gpt-5"
     assert router.select_model(severity=AlertSeverity.HIGH, task=ModelTask.RCA) == "claude"
-    assert router.select_model(severity=AlertSeverity.WARNING, task=ModelTask.SUMMARIZATION) == "gemini"
-    assert router.select_model(severity=AlertSeverity.WARNING, task=ModelTask.GENERAL) == "groq"
+    assert router.select_model(severity=AlertSeverity.WARNING, task=ModelTask.SUMMARIZATION) == "gpt-4o"
+    assert router.select_model(severity=AlertSeverity.WARNING, task=ModelTask.GENERAL) == "gpt-4o"
 
 
-def test_default_multi_provider_model_names() -> None:
+def test_default_gpt_provider_model_names() -> None:
     providers = build_default_providers(get_settings())
 
-    assert providers["gemini"].model == "gemini-2.5-flash"
-    assert providers["groq"].model == "llama-3.3-70b-versatile"
+    assert providers["gpt-5"].model == "gpt-5"
+    assert providers["gpt-4o"].model == "gpt-4o"
+    assert "gemini" not in providers
+    assert "groq" not in providers
 
 
 def test_provider_error_message_redacts_query_string() -> None:
@@ -63,61 +64,6 @@ def test_provider_error_message_redacts_query_string() -> None:
     assert "?" not in message
 
 
-def test_warns_for_deprecated_gemini_model(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level("WARNING"):
-        build_default_providers(Settings(GEMINI_MODEL="gemini-2.0-flash"))
-
-    assert "GEMINI_MODEL 'gemini-2.0-flash' may be retired" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_gemini_retires_model_retries_once_with_fallback(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    class FakeAsyncClient:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, headers: dict, json: dict) -> httpx.Response:
-            request = httpx.Request("POST", url)
-            if "gemini-2.0-flash" in url:
-                return httpx.Response(
-                    404,
-                    request=request,
-                    json={
-                        "error": {
-                            "code": 404,
-                            "message": "This model models/gemini-2.0-flash is no longer available.",
-                            "status": "NOT_FOUND",
-                        }
-                    },
-                )
-            return httpx.Response(
-                200,
-                request=request,
-                json={
-                    "candidates": [{"content": {"parts": [{"text": "fallback-success"}]}}],
-                    "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 7},
-                },
-            )
-
-    monkeypatch.setattr("model_router.router.httpx.AsyncClient", FakeAsyncClient)
-
-    provider = GeminiModelProvider(name="gemini", model="gemini-2.0-flash", api_key="test-key")
-    with caplog.at_level("WARNING"):
-        response = await provider.generate("summarize", {"service": "payments"})
-
-    assert response.content == "fallback-success"
-    assert response.usage.model == "gemini-2.5-flash"
-    assert "appears retired; retrying once" in caplog.text
-
-
 @pytest.mark.asyncio
 async def test_model_router_failover() -> None:
     router = ModelRouter(
@@ -125,8 +71,6 @@ async def test_model_router_failover() -> None:
             "gpt-5": FailingProvider("gpt-5"),
             "gpt-4o": StaticProvider("gpt-4o"),
             "claude": StaticProvider("claude"),
-            "gemini": StaticProvider("gemini"),
-            "groq": StaticProvider("groq"),
             "local-llama": StaticProvider("local-llama"),
         }
     )

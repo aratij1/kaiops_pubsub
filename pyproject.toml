@@ -84,3 +84,6 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 ignore = ["ASYNC110", "UP047"]
+
+[tool.ruff.lint.per-file-ignores]
+"services/ui/app.py" = ["E501"]
