@@ -313,7 +313,7 @@ async def run_local_payment_workflow(
     from alert_intelligence import AlertIntelligenceAgent
     from closure_service import ClosureValidationAgent
     from context_agent import ContextIntelligenceAgent
-    from model_router import ModelRouter, ModelTask
+    from model_router import ModelRouter
     from orchestrator import OrchestratorAgent
     from remediation_engine import RemediationEngine
     from resolution_agent import ResolutionIntelligenceAgent
