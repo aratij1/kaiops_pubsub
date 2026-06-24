@@ -692,8 +692,8 @@ def render_agent_role_overview(events: list[dict[str, Any]]) -> None:
     events_by_agent = {str(event.get("agent", "")): event for event in events}
     st.markdown("#### Agent Command Roles")
     agent_items = list(AGENT_PROFILES.items())
-    for start in range(0, len(agent_items), 3):
-        columns = st.columns(3)
+    for start in range(0, len(agent_items), 4):
+        columns = st.columns(4)
         for offset, column in enumerate(columns):
             index = start + offset
             if index >= len(agent_items):
@@ -707,14 +707,12 @@ def render_agent_role_overview(events: list[dict[str, Any]]) -> None:
 
             with column:
                 with st.container(border=True):
-                    top_left, top_right = st.columns([1.2, 1])
-                    top_left.markdown(f"**{profile.get('icon', '[AGENT]')} {agent_name}**")
-                    top_right.caption(f"Step {index + 1} · {status}")
+                    st.caption(f"Step {index + 1} · {status}")
+                    st.markdown(f"**{profile.get('icon', '[AGENT]')} {agent_name}**")
                     st.caption(profile.get("mission", "Coordinates incident-resolution logic."))
-                    metric_cols = st.columns(3)
-                    metric_cols[0].metric("Signals", kpis["signals"])
-                    metric_cols[1].metric("LLM", kpis["calls"])
-                    metric_cols[2].metric("Errors", kpis["errors"])
+                    st.markdown(
+                        f"Signals `{kpis['signals']}` · LLM `{kpis['calls']}` · Errors `{kpis['errors']}`"
+                    )
                     if event:
                         st.success(decision[:220])
                     else:
@@ -886,65 +884,6 @@ st.markdown(
         margin-bottom: 0;
         color: #dbeafe;
         font-size: 0.98rem;
-      }
-      .kaiops-agent-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-        gap: 12px;
-        margin: 0.4rem 0 0.9rem 0;
-      }
-      .kaiops-agent-card {
-        border-radius: 16px;
-        padding: 14px 14px 12px;
-        border: 1px solid #dbe4ef;
-        background: #ffffff;
-        box-shadow: 0 10px 18px rgba(15, 23, 42, 0.06);
-      }
-      .kaiops-agent-top {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-      }
-      .kaiops-agent-icon { font-size: 0.75rem; font-weight: 700; }
-      .kaiops-agent-step {
-        font-size: 0.73rem;
-        background: rgba(15, 23, 42, 0.08);
-        padding: 3px 8px;
-        border-radius: 999px;
-      }
-      .kaiops-agent-name {
-        font-size: 0.95rem;
-        font-weight: 700;
-        margin-top: 8px;
-        color: #0f172a;
-      }
-      .kaiops-agent-mission {
-        font-size: 0.8rem;
-        color: #334155;
-        margin-top: 4px;
-        min-height: 2.2rem;
-      }
-      .kaiops-agent-kpis {
-        margin-top: 8px;
-        display: flex;
-        gap: 6px;
-        flex-wrap: wrap;
-      }
-      .kaiops-kpi-pill {
-        font-size: 0.67rem;
-        font-weight: 600;
-        background: #e2e8f0;
-        color: #0f172a;
-        border-radius: 999px;
-        padding: 3px 8px;
-      }
-      .kaiops-agent-decision {
-        margin-top: 8px;
-        font-size: 0.76rem;
-        color: #1e293b;
-        background: #f8fafc;
-        border-radius: 10px;
-        padding: 8px;
       }
       .kaiops-flow-wrap {
         display: flex;
@@ -1318,7 +1257,6 @@ st.markdown(
 
       @media (max-width: 920px) {
         .kaiops-hero-title { font-size: 1.4rem; }
-        .kaiops-agent-grid { grid-template-columns: 1fr; }
       }
     </style>
     """,
