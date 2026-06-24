@@ -560,9 +560,13 @@ def _alert_stream_status(severity: str, recommended_action: str, alert_name: str
     # Duplicate indicators
     if "duplicate" in name_lower or "duplicate" in action:
         return "kaiops-badge-duplicate", "DUPLICATE"
+    if any(token in name_lower for token in ("ignore", "ignored", "suppressed", "maintenance", "test alert")):
+        return "kaiops-badge-ignore", "IGNORE"
+    if any(token in action for token in ("ignore", "ignored", "suppress", "suppressed", "no remediation")):
+        return "kaiops-badge-ignore", "IGNORE"
     # No-action-required patterns
-    no_action_actions = {"api execution", "no action", "monitor", "ignore", "auto-resolved"}
-    if action in no_action_actions or sev == "INFO":
+    no_action_actions = {"api execution", "no action", "monitor", "auto-resolved", "observe", "informational"}
+    if action in no_action_actions or "no action" in action or sev == "INFO":
         return "kaiops-badge-ignore", "NO ACTION"
     # Low-priority warning with generic action
     if sev == "WARNING" and action in {"clear cache", "scale deployment"}:
@@ -590,17 +594,17 @@ def render_alert_stream(entries: list[dict[str, Any]]) -> str | None:
         flow_id = str(item.get("id") or "").strip()
 
         badge_class, badge_label = _alert_stream_status(severity, recommended_action, alert_name)
-        is_suppressed = badge_label in ("DUPLICATE", "NO ACTION")
+        is_suppressed = badge_label in ("DUPLICATE", "NO ACTION", "IGNORE")
 
-        # Suppress interactive button for no-action/duplicate entries; still render as info
+        # Suppress interactive button for no-action/duplicate/ignored entries; still render as evidence.
         if is_suppressed:
             st.markdown(
-                f'<div style="opacity:0.9; padding:3px 0;">'
+                f'<div style="opacity:0.92; padding:6px 8px; border:1px dashed rgba(148,163,184,0.28);'
+                f'border-radius:10px; margin-bottom:6px; background:rgba(15,23,42,0.26);">'
                 f'<span class="kaiops-alert-badge {badge_class}">{badge_label}</span>'
                 f' <span style="font-size:0.78rem; color:#cbd5e1;">{alert_id} | {alert_name}</span>'
-                f'</div>'
                 f'<div style="font-size:0.7rem; color:#94a3b8; margin-bottom:4px; padding-left:4px;">'
-                f'{service} · {severity}</div>',
+                f'{service} · {severity} · excluded from auto-run</div></div>',
                 unsafe_allow_html=True,
             )
         else:
@@ -682,6 +686,36 @@ def agent_kpis(event: dict[str, Any]) -> dict[str, int]:
         "errors": len(event.get("llm_errors", [])),
         "signals": len(event.get("metrics", {})),
     }
+
+
+def render_agent_role_overview(events: list[dict[str, Any]]) -> None:
+    events_by_agent = {str(event.get("agent", "")): event for event in events}
+    st.markdown("#### Agent Command Roles")
+    cards: list[str] = []
+    for index, (agent_name, profile) in enumerate(AGENT_PROFILES.items(), start=1):
+        event = events_by_agent.get(agent_name, {})
+        status = "completed" if event else "standby"
+        decision = str(event.get("decision", "Awaiting workflow execution"))
+        kpis = agent_kpis(event) if event else {"calls": 0, "errors": 0, "signals": 0}
+        cards.append(
+            f"""
+            <div class="kaiops-agent-card">
+              <div class="kaiops-agent-top">
+                <span class="kaiops-agent-icon">{html.escape(profile.get("icon", "[AGENT]"))}</span>
+                <span class="kaiops-agent-step">Step {index} · {status.upper()}</span>
+              </div>
+              <div class="kaiops-agent-name">{html.escape(agent_name)}</div>
+              <div class="kaiops-agent-mission">{html.escape(profile.get("mission", ""))}</div>
+              <div class="kaiops-agent-kpis">
+                <span class="kaiops-kpi-pill">signals {kpis["signals"]}</span>
+                <span class="kaiops-kpi-pill">llm {kpis["calls"]}</span>
+                <span class="kaiops-kpi-pill">errors {kpis["errors"]}</span>
+              </div>
+              <div class="kaiops-agent-decision">{html.escape(decision[:160])}</div>
+            </div>
+            """
+        )
+    st.markdown(f'<div class="kaiops-agent-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
 
 def render_agent_event_details(event: dict[str, Any]) -> None:
@@ -1294,8 +1328,8 @@ st.markdown(
       <div class="kaiops-hero-label">&#9679; AI-Powered SRE Platform</div>
       <div class="kaiops-hero-title">KaiOps Autonomous Operations</div>
       <div class="kaiops-hero-sub">
-        End-to-end incident intelligence — from alert detection and root-cause analysis
-        to automated remediation, human approval gates, and FinOps cost visibility.
+        A mission-ready operations cockpit for agent handoffs, human approvals,
+        remediation decisions, RAG-grounded evidence, and FinOps visibility.
       </div>
       <div class="kaiops-hero-pills">
         <span class="kaiops-hero-pill"><span class="kaiops-hero-pill-dot"></span> Agents Online</span>
@@ -1312,6 +1346,7 @@ st.markdown(
 flows = get_flows()
 severity_levels = sorted({str(flow.get("severity", "unknown")).upper() for flow in flows})
 workflow = st.session_state.get("workflow", {})
+render_agent_role_overview(sorted(workflow.get("events", []), key=lambda item: item.get("sequence", 0)))
 if "kaiops_selected_severities" not in st.session_state:
     st.session_state["kaiops_selected_severities"] = severity_levels
 if "flow_catalog_preview" not in st.session_state:
@@ -1324,10 +1359,12 @@ catalog_entries = data_from_gateway(catalog_preview).get("entries", []) if catal
 with st.sidebar:
     st.markdown(
         """
-        <div class="kaiops-sidebar-hero">
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-            <span style="font-size:1.15rem;">&#9881;</span>
-            <h3 style="margin:0;">Mission Control</h3>
+        <div class="kaiops-sidebar-hero" style="position:relative;overflow:hidden;">
+          <div style="position:absolute;right:-35px;top:-35px;width:110px;height:110px;border-radius:999px;
+                      background:rgba(56,189,248,0.16);filter:blur(2px);"></div>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;position:relative;">
+            <span style="font-size:1.28rem;">&#128640;</span>
+            <h3 style="margin:0;font-size:1.12rem;letter-spacing:-0.01em;">Mission Control</h3>
             <span style="margin-left:auto;display:inline-flex;align-items:center;gap:4px;
                          background:rgba(255,255,255,0.15);border-radius:999px;padding:2px 8px;
                          font-size:0.62rem;font-weight:700;letter-spacing:0.05em;color:#e0f2fe;">
@@ -1336,13 +1373,18 @@ with st.sidebar:
               LIVE
             </span>
           </div>
-          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;">
+          <p style="margin:0 0 10px;color:#bfdbfe;font-size:0.78rem;line-height:1.35;position:relative;">
+            Launch, triage, approve, remediate, and validate incidents from one command surface.
+          </p>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px;position:relative;">
             <span style="background:rgba(255,255,255,0.12);border-radius:6px;padding:2px 8px;
                          font-size:0.65rem;font-weight:600;color:#bfdbfe;">&#9632; Alert Stream</span>
             <span style="background:rgba(255,255,255,0.12);border-radius:6px;padding:2px 8px;
                          font-size:0.65rem;font-weight:600;color:#bfdbfe;">&#9654; Flow Control</span>
             <span style="background:rgba(255,255,255,0.12);border-radius:6px;padding:2px 8px;
                          font-size:0.65rem;font-weight:600;color:#bfdbfe;">&#9679; RAG Knowledge Base</span>
+            <span style="background:rgba(255,255,255,0.12);border-radius:6px;padding:2px 8px;
+                         font-size:0.65rem;font-weight:600;color:#bfdbfe;">&#10003; Human Approval</span>
           </div>
         </div>
         """,
@@ -1793,6 +1835,26 @@ with tab_summary:
         _confidence_pct = f"{float(metrics.get('recommendation_confidence', 0)):.0%}"
         _health = "✓ Restored" if metrics.get("health_restored") else "✗ Not Restored"
         _gw_decision = str(gateway.get("safety", {}).get("decision", "unknown")).upper()
+        _active_flow = next(
+            (flow for flow in catalog_entries if str(flow.get("id")) == str(scenario.get("id", selected_flow))),
+            {},
+        )
+        _alert_display_id = str(_active_flow.get("alert_id") or scenario.get("id") or alert.get("id", "N/A"))
+        _alert_display_name = str(
+            _active_flow.get("alert_name")
+            or _active_flow.get("title")
+            or alert.get("name")
+            or scenario.get("title")
+            or "Incident"
+        )
+        _alert_type = str(_active_flow.get("alert_type") or alert.get("source") or "monitoring")
+        _summary_service = str(_active_flow.get("service") or alert.get("service") or "N/A")
+        _summary_description = str(
+            _active_flow.get("description")
+            or alert.get("description")
+            or scenario.get("title")
+            or "No incident description available."
+        )
 
         # ── Hero incident header ──
         st.markdown(
@@ -1800,15 +1862,16 @@ with tab_summary:
             <div class="kaiops-summary-hero">
               <div class="kaiops-summary-hero-alert">
                 <span class="kaiops-summary-badge {_sev_class}">{_sev.upper()}</span>
-                {html.escape(str(alert.get('name', 'N/A')))}
+                {html.escape(_alert_display_name)}
               </div>
               <div class="kaiops-summary-hero-meta">
-                Service <b style="color:#cbd5e1">{html.escape(str(alert.get('service','N/A')))}</b>
+                Alert <b style="color:#cbd5e1">{html.escape(_alert_display_id)}</b>
+                &nbsp;·&nbsp; Service <b style="color:#cbd5e1">{html.escape(_summary_service)}</b>
                 &nbsp;·&nbsp; Environment <b style="color:#cbd5e1">{html.escape(str(alert.get('environment','N/A')))}</b>
-                &nbsp;·&nbsp; Source <b style="color:#cbd5e1">{html.escape(str(alert.get('source','N/A')))}</b>
+                &nbsp;·&nbsp; Type <b style="color:#cbd5e1">{html.escape(_alert_type)}</b>
               </div>
               <div style="font-size:0.86rem; color:#94a3b8; line-height:1.5;">
-                {html.escape(str(alert.get('description', 'No description available.')))}
+                {html.escape(_summary_description)}
               </div>
               <div class="kaiops-info-grid" style="margin-top:14px;">
                 <div class="kaiops-info-cell">
@@ -1939,7 +2002,10 @@ with tab_approval:
         st.markdown(
             f"""
             <div class="kaiops-approval-card">
-              <div class="kaiops-approval-title">&#9888; Incident Requiring Approval</div>
+              <div class="kaiops-approval-title">&#128274; Approval Workbench</div>
+              <div style="color:#94a3b8;font-size:0.82rem;line-height:1.45;margin:-6px 0 14px;">
+                Review the agent recommendation, confirm blast radius, and submit a policy-aware decision.
+              </div>
               <div class="kaiops-approval-kv-row">
                 <div class="kaiops-approval-kv">
                   <div class="kaiops-approval-kv-label">Alert</div>
@@ -1965,6 +2031,12 @@ with tab_approval:
                   <div class="kaiops-approval-kv-label">Risk Level</div>
                   <div class="kaiops-approval-kv-value">{html.escape(_rec_risk)}</div>
                 </div>
+                <div class="kaiops-approval-kv">
+                  <div class="kaiops-approval-kv-label">Policy Gate</div>
+                  <div class="kaiops-approval-kv-value">
+                    {'Human approval required' if metrics.get('approval_required') else 'Auto-approval allowed'}
+                  </div>
+                </div>
               </div>
             </div>
             """,
@@ -1974,6 +2046,7 @@ with tab_approval:
         # ── Approval form ──
         st.markdown("#### Submit Approval Decision")
         with st.container(border=True):
+            st.caption("The decision is routed through the API Gateway and captured in the audit/trace stream.")
             col_l, col_r = st.columns(2)
             with col_l:
                 approval_incident_id = st.text_input(
