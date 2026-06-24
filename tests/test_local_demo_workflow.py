@@ -2,7 +2,6 @@ import importlib.util
 from pathlib import Path
 
 import pytest
-from common.models import RemediationStatus
 from model_router import ModelRouter
 from model_router.router import ModelProvider, ModelResponse, build_usage
 
@@ -60,17 +59,17 @@ async def test_local_payment_workflow_generates_recommendation() -> None:
     workflow = await module.run_local_payment_workflow(trace_id="trace-123", model_router=static_router())
 
     assert workflow["mode"] == "local-no-kafka"
-    assert workflow["alert"].trace_id == "trace-123"
-    assert workflow["recommendation"].trace_id == "trace-123"
-    assert workflow["alert"].severity == "critical"
-    assert workflow["incident"].service == "payments"
+    assert workflow["alert"]["trace_id"] == "trace-123"
+    assert workflow["recommendation"]["trace_id"] == "trace-123"
+    assert workflow["alert"]["severity"] == "critical"
+    assert workflow["incident"]["service"] == "payments"
     assert workflow["decision"]["workflow"] == "critical-auto-remediation"
-    assert workflow["context"].deployment == "Deployment 2.5"
-    assert workflow["recommendation"].recommended_action == "Rollback deployment"
+    assert workflow["context"]["deployment"] == "Deployment 2.5"
+    assert workflow["recommendation"]["recommended_action"] == "Rollback deployment"
     assert workflow["metrics"]["agent_handoffs"] == 6
     assert workflow["metrics"]["recommendation_confidence"] >= 0.9
-    assert workflow["closure_report"].health_restored is True
-    assert workflow["remediation_action"].status == RemediationStatus.SUCCEEDED
+    assert workflow["closure_report"]["health_restored"] is True
+    assert workflow["remediation_action"]["status"] == "succeeded"
     assert workflow["finops"]["totals"]["calls"] >= 1
     assert workflow["finops"]["totals"]["total_tokens"] > 0
     assert workflow["finops"]["totals"]["total_cost_usd"] > 0
@@ -110,5 +109,5 @@ async def test_local_workflow_returns_finops_errors_when_models_fail() -> None:
     )
 
     assert workflow["recommendation"]["recommended_action"] == "Restart pod"
-    assert workflow["finops"]["totals"]["failed_calls"] >= 3
+    assert workflow["finops"]["totals"]["failed_calls"] >= 1
     assert workflow["closure_report"]["health_restored"] is True

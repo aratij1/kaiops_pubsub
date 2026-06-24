@@ -11,7 +11,6 @@ from common.config import Settings, get_settings
 from common.models import AlertSeverity
 from common.resilience import CircuitBreaker
 
-
 logger = logging.getLogger(__name__)
 
 
