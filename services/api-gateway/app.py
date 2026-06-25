@@ -208,12 +208,16 @@ async def sample_payment_latency(
 @app.post("/sample/payment-latency/workflow")
 async def sample_payment_latency_workflow(
     request: Request,
+    fast_mode: bool = False,
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    path = "/sample/payment-latency/workflow"
+    if fast_mode:
+        path = f"{path}?{urlencode({'fast_mode': 'true'})}"
     return await guarded_proxy(
         request=request,
         method="POST",
-        path="/sample/payment-latency/workflow",
+        path=path,
         target_base=settings.monitoring_adapter_url,
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
@@ -235,16 +239,83 @@ async def sample_flows(
     )
 
 
-@app.post("/sample/{flow_id}/workflow")
-async def sample_flow_workflow(
-    flow_id: str,
+@app.get("/onboarding/connectivity")
+async def get_onboarding_connectivity(
     request: Request,
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
+        method="GET",
+        path="/onboarding/connectivity",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/onboarding/state")
+async def get_onboarding_state(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/onboarding/state",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/agent-work/items")
+async def get_agent_work_items(
+    request: Request,
+    limit: int = 100,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/agent-work/items?{urlencode({'limit': str(limit)})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/onboarding/connectivity")
+async def post_onboarding_connectivity(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
         method="POST",
-        path=f"/sample/{flow_id}/workflow",
+        path="/onboarding/connectivity",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/sample/{flow_id}/workflow")
+async def sample_flow_workflow(
+    flow_id: str,
+    request: Request,
+    fast_mode: bool = False,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/sample/{flow_id}/workflow"
+    if fast_mode:
+        path = f"{path}?{urlencode({'fast_mode': 'true'})}"
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=path,
         target_base=settings.monitoring_adapter_url,
         payload={},
         trace_id=trace_id_from_header(x_trace_id),

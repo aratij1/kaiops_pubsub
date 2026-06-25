@@ -15,7 +15,13 @@ from pydantic import BaseModel, Field
 settings = get_settings()
 settings.service_name = "context-agent"
 agent = ContextIntelligenceAgent()
-app = create_app(title="KaiOps Context Intelligence Agent", settings=settings)
+
+
+async def startup(_: Any) -> None:
+    vector_connector().reload()
+
+
+app = create_app(title="KaiOps Context Intelligence Agent", settings=settings, startup=startup)
 
 
 class RagDocumentRequest(BaseModel):

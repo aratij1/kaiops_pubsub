@@ -5,61 +5,108 @@ import os
 import re
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import streamlit as st
 
 GATEWAY_BASE = os.getenv("API_GATEWAY_URL", "http://localhost:8010")
+MONITORING_ADAPTER_BASE = os.getenv("MONITORING_ADAPTER_URL", "http://localhost:8001")
 UI_REQUEST_TIMEOUT_SECONDS = float(os.getenv("UI_REQUEST_TIMEOUT_SECONDS", "240"))
+
+def _agent_icon_data_uri(glyph: str, background: str) -> str:
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' width='44' height='44' viewBox='0 0 44 44'>"
+        f"<rect width='44' height='44' rx='10' fill='{background}'/>"
+        f"<text x='22' y='28' text-anchor='middle' font-size='16' font-family='Segoe UI, Arial' "
+        "font-weight='700' fill='#ffffff'>"
+        f"{html.escape(glyph)}"
+        "</text></svg>"
+    )
+    return f"data:image/svg+xml;utf8,{quote(svg)}"
+
 
 AGENT_PROFILES: dict[str, dict[str, str]] = {
     "Alert Intelligence Agent": {
-        "icon": "[ALERT]",
+        "icon_image": _agent_icon_data_uri("AI", "#ef4444"),
         "mission": "Detects and enriches incoming alert signals.",
         "tone": "signal",
     },
     "Orchestrator Agent": {
-        "icon": "[ORCH]",
+        "icon_image": _agent_icon_data_uri("OR", "#2563eb"),
         "mission": "Selects workflow path and delegates downstream tasks.",
         "tone": "orchestrator",
     },
     "Context Intelligence Agent": {
-        "icon": "[CTX]",
+        "icon_image": _agent_icon_data_uri("CX", "#0ea5e9"),
         "mission": "Collects dependencies, runbooks, and change evidence.",
         "tone": "context",
     },
     "Resolution Intelligence Agent": {
-        "icon": "[RCA]",
+        "icon_image": _agent_icon_data_uri("RC", "#f97316"),
         "mission": "Produces root cause analysis and remediation recommendation.",
         "tone": "resolution",
     },
     "Human Approval Layer": {
-        "icon": "[APPROVAL]",
+        "icon_image": _agent_icon_data_uri("HA", "#14b8a6"),
         "mission": "Applies policy-aware human gate decisions.",
         "tone": "approval",
     },
     "Remediation Automation Engine": {
-        "icon": "[AUTO]",
+        "icon_image": _agent_icon_data_uri("RM", "#16a34a"),
         "mission": "Executes remediation strategy with auditable output.",
         "tone": "automation",
     },
     "Closure & Validation": {
-        "icon": "[CLOSE]",
+        "icon_image": _agent_icon_data_uri("CL", "#7c3aed"),
         "mission": "Validates recovery and records lessons learned.",
         "tone": "closure",
     },
 }
 
 
-def request_json(method: str, url: str, **kwargs) -> dict[str, Any]:
+def request_json(method: str, url: str, show_error: bool = True, **kwargs) -> dict[str, Any]:
     try:
         with httpx.Client(timeout=UI_REQUEST_TIMEOUT_SECONDS) as client:
             response = client.request(method, url, **kwargs)
             response.raise_for_status()
             return response.json()
     except httpx.HTTPError as exc:
-        st.error(f"Unable to reach {url}. Is the target service running? {exc}")
+        if show_error:
+            st.error(f"Unable to reach {url}. Is the target service running? {exc}")
         return {}
+
+
+def request_json_with_fallback(
+    method: str,
+    paths: list[str],
+    *,
+    suppress_last_error: bool = False,
+    **kwargs,
+) -> dict[str, Any]:
+    last_path = paths[-1] if paths else ""
+    for path in paths[:-1]:
+        response = request_json(method, path, show_error=False, **kwargs)
+        if response:
+            return response
+    if last_path:
+        return request_json(method, last_path, show_error=not suppress_last_error, **kwargs)
+    return {}
+
+
+def test_connectivity(url: str, headers: dict[str, str] | None = None) -> tuple[bool, str]:
+    endpoint = (url or "").strip()
+    if not endpoint:
+        return False, "Endpoint URL is required."
+    try:
+        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+            response = client.get(endpoint, headers=headers or {})
+        if response.status_code < 400:
+            return True, f"Connected (HTTP {response.status_code})"
+        preview = response.text[:180].replace("\n", " ").strip()
+        return False, f"HTTP {response.status_code}: {preview or 'Request failed'}"
+    except Exception as exc:
+        return False, f"Connection failed: {exc}"
 
 
 def uploaded_file_to_text(uploaded_file: Any) -> str | None:
@@ -167,11 +214,67 @@ def infer_deployment_tag(content: str) -> str | None:
     return fallback.group(0) if fallback else None
 
 
+@st.cache_data(ttl=300, show_spinner="Loading alert catalog…")
+def _fetch_flows_cached() -> list[dict[str, Any]]:
+    """Cross-session cached flow catalog fetch (TTL 5 min)."""
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            resp = client.get(f"{GATEWAY_BASE}/sample/flows")
+            resp.raise_for_status()
+            data = resp.json()
+        inner = data.get("data", data)
+        return inner.get("flows", [])
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _check_service_health() -> dict[str, bool]:
+    """Cached health check for homepage status pills (TTL 20 s)."""
+    checks: dict[str, bool] = {"gateway": False, "monitoring_adapter": False, "rag": False}
+    try:
+        with httpx.Client(timeout=4.0) as client:
+            r = client.get(f"{GATEWAY_BASE}/healthz")
+            checks["gateway"] = r.status_code < 400
+    except Exception:
+        pass
+    adapter_base = GATEWAY_BASE.replace(":8010", ":8001")
+    try:
+        with httpx.Client(timeout=4.0) as client:
+            r = client.get(f"{adapter_base}/healthz")
+            checks["monitoring_adapter"] = r.status_code < 400
+    except Exception:
+        pass
+    checks["rag"] = bool(_fetch_flows_cached())
+    return checks
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _fetch_observability_summary_cached() -> dict[str, Any]:
+    """Cached gateway observability summary (TTL 15 s)."""
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(f"{GATEWAY_BASE}/observability/summary")
+            resp.raise_for_status()
+            return resp.json()
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _fetch_observability_recent_cached() -> dict[str, Any]:
+    """Cached gateway recent events (TTL 10 s)."""
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(f"{GATEWAY_BASE}/observability/recent")
+            resp.raise_for_status()
+            return resp.json()
+    except Exception:
+        return {}
+
+
 def get_flows() -> list[dict[str, Any]]:
-    if "flows" not in st.session_state:
-        response = request_json("GET", f"{GATEWAY_BASE}/sample/flows")
-        st.session_state["flows"] = data_from_gateway(response).get("flows", [])
-    return st.session_state.get("flows", [])
+    return _fetch_flows_cached()
 
 
 def metric_row(items: list[tuple[str, Any]]) -> None:
@@ -625,6 +728,20 @@ def render_alert_stream(entries: list[dict[str, Any]]) -> str | None:
     return selected_flow_id
 
 
+def first_actionable_flow(entries: list[dict[str, Any]]) -> str | None:
+    for item in entries:
+        severity = str(item.get("severity") or "unknown").upper()
+        recommended_action = str(item.get("recommended_action") or "").strip()
+        alert_name = str(item.get("alert_name") or item.get("title") or "")
+        flow_id = str(item.get("id") or "").strip()
+        if not flow_id:
+            continue
+        _, badge_label = _alert_stream_status(severity, recommended_action, alert_name)
+        if badge_label not in ("DUPLICATE", "NO ACTION", "IGNORE"):
+            return flow_id
+    return None
+
+
 def render_event_trace(events: list[dict[str, Any]]) -> None:
     rows = [
         {
@@ -676,16 +793,43 @@ def render_event_trace(events: list[dict[str, Any]]) -> None:
 def get_agent_profile(agent_name: str) -> dict[str, str]:
     return AGENT_PROFILES.get(
         agent_name,
-        {"icon": "[AGENT]", "mission": "Coordinates incident-resolution logic.", "tone": "default"},
+        {
+            "icon_image": _agent_icon_data_uri("AG", "#64748b"),
+            "mission": "Coordinates incident-resolution logic.",
+            "tone": "default",
+        },
     )
 
 
-def agent_kpis(event: dict[str, Any]) -> dict[str, int]:
-    return {
-        "calls": len(event.get("llm_calls", [])),
-        "errors": len(event.get("llm_errors", [])),
-        "signals": len(event.get("metrics", {})),
-    }
+@st.cache_data(ttl=10, show_spinner=False)
+def _fetch_agent_work_items_cached(limit: int = 100) -> list[dict[str, Any]]:
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            response = client.get(f"{GATEWAY_BASE}/agent-work/items", params={"limit": max(1, int(limit))})
+            response.raise_for_status()
+            payload = response.json()
+        return data_from_gateway(payload).get("rows", [])
+    except Exception:
+        return []
+
+
+def _signal_score(value: Any) -> int:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        if 0.0 <= value <= 1.0:
+            return int(round(value * 100))
+        return max(0, int(round(value)))
+    if isinstance(value, str):
+        return 1 if value.strip() else 0
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    if isinstance(value, dict):
+        score = sum(_signal_score(item) for item in value.values())
+        return score if score > 0 else len(value)
+    return 0
 
 
 def render_agent_role_overview(events: list[dict[str, Any]]) -> None:
@@ -703,25 +847,59 @@ def render_agent_role_overview(events: list[dict[str, Any]]) -> None:
             event = events_by_agent.get(agent_name, {})
             status = "COMPLETED" if event else "STANDBY"
             decision = str(event.get("decision", "Awaiting workflow execution"))
-            kpis = agent_kpis(event) if event else {"calls": 0, "errors": 0, "signals": 0}
+            decision_text = decision.strip()
+            if len(decision_text) > 88:
+                decision_text = f"{decision_text[:85].rstrip()}..."
+
+            mission_text = str(profile.get("mission", "Coordinates incident-resolution logic.")).strip()
+            icon_image = str(profile.get("icon_image", "")).strip() or _agent_icon_data_uri("AG", "#64748b")
+
+            decision_class = "kaiops-role-decision-complete" if event else "kaiops-role-decision-standby"
 
             with column:
-                with st.container(border=True):
-                    st.caption(f"Step {index + 1} · {status}")
-                    st.markdown(f"**{profile.get('icon', '[AGENT]')} {agent_name}**")
-                    st.caption(profile.get("mission", "Coordinates incident-resolution logic."))
-                    st.markdown(
-                        f"Signals `{kpis['signals']}` · LLM `{kpis['calls']}` · Errors `{kpis['errors']}`"
-                    )
-                    if event:
-                        st.success(decision[:220])
-                    else:
-                        st.info("Awaiting workflow execution")
+                st.markdown(
+                    f"""
+                    <div class="kaiops-role-card">
+                      <p class="kaiops-role-step">Step {index + 1} · {html.escape(status)}</p>
+                      <div class="kaiops-role-title-row" title="{html.escape(mission_text, quote=True)}">
+                        <img class="kaiops-role-icon" src="{html.escape(icon_image, quote=True)}" alt="{html.escape(agent_name)} icon" />
+                        <p class="kaiops-role-title">{html.escape(agent_name)}</p>
+                        <span class="kaiops-role-help" title="{html.escape(mission_text, quote=True)}">&#9432;</span>
+                      </div>
+                      <div class="kaiops-role-decision {decision_class}">{html.escape(decision_text)}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+
+def render_agent_work_tracker(limit: int = 56) -> None:
+    rows = _fetch_agent_work_items_cached(limit=limit)
+    st.markdown("#### Agent Work Status")
+    if not rows:
+        st.caption("No agent work items tracked yet. Run a workflow to populate status records.")
+        return
+
+    st.dataframe(
+        [
+            {
+                "Incident": row.get("incident_id", ""),
+                "Agent": row.get("agent_name", ""),
+                "Work": row.get("work_item", ""),
+                "Status": str(row.get("status", "")).upper(),
+                "Trace": row.get("trace_id", ""),
+                "Updated": row.get("updated_at", ""),
+            }
+            for row in rows
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
 
 
 def render_agent_event_details(event: dict[str, Any]) -> None:
     profile = get_agent_profile(str(event.get("agent", "")))
-    st.markdown(f"### {profile.get('icon', '[AGENT]')} {event.get('agent', 'Agent')} | Deep Dive")
+    st.markdown(f"### {event.get('agent', 'Agent')} | Deep Dive")
     st.caption(profile.get("mission", "Coordinates incident-resolution logic."))
     left, right = st.columns([1.5, 1])
     with left:
@@ -835,7 +1013,234 @@ def render_gateway_events(events: list[dict[str, Any]]) -> None:
         st.caption("No gateway events yet.")
 
 
-st.set_page_config(page_title="KaiOps", page_icon="K", layout="wide")
+def render_project_onboarding_section() -> None:
+    st.markdown("## Project Onboarding")
+    st.caption("Create a project and configure observability integrations.")
+
+    if "onboarding_project" not in st.session_state:
+        st.session_state["onboarding_project"] = {}
+    if "onboarding_connectivity" not in st.session_state:
+        st.session_state["onboarding_connectivity"] = {}
+    if "onboarding_status" not in st.session_state:
+        st.session_state["onboarding_status"] = {}
+    if "onboarding_loaded" not in st.session_state:
+        st.session_state["onboarding_loaded"] = False
+    if "onboarding_rows" not in st.session_state:
+        st.session_state["onboarding_rows"] = []
+
+    provider_defaults = {
+        "Prometheus": {
+            "url": "http://localhost:9090/-/ready",
+            "key_label": None,
+            "key_type": None,
+            "header_name": None,
+        },
+        "New Relic": {
+            "url": "https://api.newrelic.com/v2/applications.json",
+            "key_label": "New Relic API key",
+            "key_type": "password",
+            "header_name": "Api-Key",
+        },
+        "Datadog": {
+            "url": "https://api.datadoghq.com/api/v1/validate",
+            "key_label": "Datadog API key",
+            "key_type": "password",
+            "header_name": "DD-API-KEY",
+        },
+    }
+
+    if not st.session_state["onboarding_loaded"]:
+        persisted_response = request_json_with_fallback(
+            "GET",
+            [
+                f"{GATEWAY_BASE}/onboarding/connectivity",
+                f"{MONITORING_ADAPTER_BASE}/onboarding/connectivity",
+            ],
+        )
+        persisted = data_from_gateway(persisted_response).get("connectivity", {}) if persisted_response else {}
+        if isinstance(persisted, dict) and persisted:
+            st.session_state["onboarding_project"] = persisted.get("project", {})
+            st.session_state["onboarding_connectivity"] = {
+                "prometheus_url": str(persisted.get("prometheus_url", "")).strip(),
+                "new_relic_url": str(persisted.get("new_relic_url", "")).strip(),
+                "datadog_url": str(persisted.get("datadog_url", "")).strip(),
+                "updated_at": persisted.get("updated_at"),
+            }
+        state_response = request_json_with_fallback(
+            "GET",
+            [f"{GATEWAY_BASE}/onboarding/state", f"{MONITORING_ADAPTER_BASE}/onboarding/state"],
+            suppress_last_error=True,
+        )
+        state_rows = data_from_gateway(state_response).get("rows", []) if state_response else []
+        if isinstance(state_rows, list):
+            st.session_state["onboarding_rows"] = [row for row in state_rows if isinstance(row, dict)]
+        st.session_state["onboarding_loaded"] = True
+
+    def refresh_onboarding_rows() -> None:
+        state_response = request_json_with_fallback(
+            "GET",
+            [f"{GATEWAY_BASE}/onboarding/state", f"{MONITORING_ADAPTER_BASE}/onboarding/state"],
+            suppress_last_error=True,
+        )
+        state_rows = data_from_gateway(state_response).get("rows", []) if state_response else []
+        if isinstance(state_rows, list):
+            st.session_state["onboarding_rows"] = [row for row in state_rows if isinstance(row, dict)]
+
+    with st.container(border=True):
+        st.markdown("### Project Setup")
+        with st.form("project_onboarding_form"):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                project_name = st.text_input("Project name", value=st.session_state["onboarding_project"].get("name", ""))
+                owner_team = st.text_input("Owner team", value=st.session_state["onboarding_project"].get("owner_team", "platform-ops"))
+            with col_b:
+                env_options = ["dev", "staging", "prod"]
+                current_env = st.session_state["onboarding_project"].get("environment", "prod")
+                env_index = env_options.index(current_env) if current_env in env_options else 2
+                environment = st.selectbox("Environment", env_options, index=env_index)
+                region = st.text_input("Region", value=st.session_state["onboarding_project"].get("region", "us-east-1"))
+
+            save_project = st.form_submit_button("Save Project", type="primary", use_container_width=True)
+            if save_project:
+                st.session_state["onboarding_project"] = {
+                    "name": project_name.strip(),
+                    "owner_team": owner_team.strip(),
+                    "environment": environment,
+                    "region": region.strip(),
+                }
+                payload = {
+                    "project": st.session_state["onboarding_project"],
+                    "prometheus_url": st.session_state["onboarding_connectivity"].get("prometheus_url", provider_defaults["Prometheus"]["url"]),
+                    "new_relic_url": st.session_state["onboarding_connectivity"].get("new_relic_url", provider_defaults["New Relic"]["url"]),
+                    "datadog_url": st.session_state["onboarding_connectivity"].get("datadog_url", provider_defaults["Datadog"]["url"]),
+                    "provider_statuses": st.session_state.get("onboarding_status", {}),
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                save_response = request_json_with_fallback(
+                    "POST",
+                    [f"{GATEWAY_BASE}/onboarding/connectivity", f"{MONITORING_ADAPTER_BASE}/onboarding/connectivity"],
+                    json=payload,
+                )
+                persisted = data_from_gateway(save_response).get("connectivity", {}) if save_response else {}
+                if persisted:
+                    st.session_state["onboarding_connectivity"] = persisted
+                    refresh_onboarding_rows()
+                    st.success("Project details saved and persisted to MySQL.")
+                else:
+                    st.success("Project details saved.")
+
+        st.markdown("#### Configure Connectivity")
+        provider_options = ["Prometheus", "New Relic", "Datadog"]
+        selected_provider = st.selectbox(
+            "Connectivity provider",
+            provider_options,
+            key="onboarding_provider_selector",
+        )
+
+        provider_key_map = {
+            "Prometheus": "prometheus_url",
+            "New Relic": "new_relic_url",
+            "Datadog": "datadog_url",
+        }
+        selected_key = provider_key_map[selected_provider]
+        provider_config = provider_defaults[selected_provider]
+        provider_values = st.session_state["onboarding_connectivity"]
+        connectivity_url = st.text_input(
+            f"{selected_provider} endpoint",
+            value=provider_values.get(selected_key, provider_config["url"]),
+            key=f"onboard_{selected_key}",
+        )
+        secret_value = None
+        if provider_config["key_label"]:
+            secret_value = st.text_input(
+                provider_config["key_label"],
+                value="",
+                type=provider_config["key_type"],
+                key=f"onboard_{selected_key}_secret",
+            )
+
+        if st.button(f"Test {selected_provider}", key="test_selected_provider", use_container_width=True):
+            headers: dict[str, str] = {}
+            if provider_config["header_name"] and secret_value:
+                headers[provider_config["header_name"]] = secret_value
+            ok, message = test_connectivity(connectivity_url, headers=headers)
+            provider_key = selected_provider.lower().replace(" ", "_")
+            st.session_state["onboarding_connectivity"][selected_key] = connectivity_url.strip()
+            st.session_state["onboarding_status"][provider_key] = {"ok": ok, "message": message}
+            payload = {
+                "project": st.session_state.get("onboarding_project", {}),
+                "prometheus_url": st.session_state["onboarding_connectivity"].get("prometheus_url", provider_defaults["Prometheus"]["url"]),
+                "new_relic_url": st.session_state["onboarding_connectivity"].get("new_relic_url", provider_defaults["New Relic"]["url"]),
+                "datadog_url": st.session_state["onboarding_connectivity"].get("datadog_url", provider_defaults["Datadog"]["url"]),
+                "provider_statuses": st.session_state["onboarding_status"],
+                "active_provider": provider_key,
+                "test_status": ok,
+                "test_message": message,
+                "tested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            request_json_with_fallback(
+                "POST",
+                [f"{GATEWAY_BASE}/onboarding/connectivity", f"{MONITORING_ADAPTER_BASE}/onboarding/connectivity"],
+                json=payload,
+            )
+            refresh_onboarding_rows()
+            st.success(message) if ok else st.error(message)
+
+        if st.button("Save Connectivity Configuration", key="save_connectivity", use_container_width=True):
+            st.session_state["onboarding_connectivity"][selected_key] = connectivity_url.strip()
+            payload = {
+                "project": st.session_state.get("onboarding_project", {}),
+                "prometheus_url": st.session_state["onboarding_connectivity"].get("prometheus_url", provider_defaults["Prometheus"]["url"]),
+                "new_relic_url": st.session_state["onboarding_connectivity"].get("new_relic_url", provider_defaults["New Relic"]["url"]),
+                "datadog_url": st.session_state["onboarding_connectivity"].get("datadog_url", provider_defaults["Datadog"]["url"]),
+                "provider_statuses": st.session_state.get("onboarding_status", {}),
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            save_response = request_json_with_fallback(
+                "POST",
+                [f"{GATEWAY_BASE}/onboarding/connectivity", f"{MONITORING_ADAPTER_BASE}/onboarding/connectivity"],
+                json=payload,
+            )
+            persisted = data_from_gateway(save_response).get("connectivity", {}) if save_response else {}
+            if persisted:
+                st.session_state["onboarding_connectivity"] = persisted
+                refresh_onboarding_rows()
+                st.success("Connectivity configuration persisted.")
+
+        if st.session_state.get("onboarding_status"):
+            st.markdown("#### Connectivity Status")
+            for provider in ("prometheus", "new_relic", "datadog"):
+                if provider in st.session_state["onboarding_status"]:
+                    state = st.session_state["onboarding_status"][provider]
+                    label = provider.replace("_", " ").title()
+                    if state.get("ok"):
+                        st.success(f"{label}: {state.get('message', 'Connected')}")
+                    else:
+                        st.error(f"{label}: {state.get('message', 'Not connected')}")
+
+        st.markdown("#### Saved onboarding rows")
+        onboarding_rows = st.session_state.get("onboarding_rows", [])
+        if onboarding_rows:
+            table_rows = []
+            for row in onboarding_rows:
+                table_rows.append(
+                    {
+                        "Project": row.get("project_name", ""),
+                        "Provider": str(row.get("provider_name", "")).replace("_", " ").title(),
+                        "Environment": row.get("environment", ""),
+                        "Region": row.get("region", ""),
+                        "Endpoint": row.get("endpoint_url", ""),
+                        "Status": row.get("test_status", ""),
+                        "Last Tested": row.get("last_tested_at") or row.get("updated_at"),
+                    }
+                )
+            st.dataframe(table_rows, hide_index=True, use_container_width=True)
+        else:
+            st.caption("No onboarding rows have been saved to MySQL yet.")
+
+
+st.set_page_config(page_title="KaiOps", page_icon="K", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown(
     """
@@ -1022,6 +1427,66 @@ st.markdown(
             .kaiops-badge-duplicate { background: rgba(100,116,139,0.2); color: #94a3b8; border: 1px solid #475569; }
             .kaiops-badge-ignore { background: rgba(71,85,105,0.25); color: #cbd5e1; border: 1px dashed #94a3b8; }
             .kaiops-badge-info { background: rgba(14,165,233,0.15); color: #38bdf8; border: 1px solid #0ea5e9; }
+            .kaiops-role-card {
+                background: linear-gradient(180deg, #ffffff, #f8fafc);
+                border: 1px solid #dbe4ef;
+                border-radius: 10px;
+                min-height: 290px;
+                padding: 12px 14px;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+            .kaiops-role-step {
+                font-size: 0.78rem;
+                color: #6b7280;
+                margin: 0;
+            }
+            .kaiops-role-title-row {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                min-height: 48px;
+            }
+            .kaiops-role-icon {
+                width: 28px;
+                height: 28px;
+                border-radius: 8px;
+                border: 1px solid #dbe4ef;
+                flex-shrink: 0;
+            }
+            .kaiops-role-title {
+                margin: 0;
+                color: #0f172a;
+                font-size: 1.03rem;
+                font-weight: 700;
+                line-height: 1.35;
+                flex: 1;
+            }
+            .kaiops-role-help {
+                color: #64748b;
+                font-size: 0.9rem;
+                cursor: help;
+                user-select: none;
+            }
+            .kaiops-role-decision {
+                margin-top: auto;
+                border-radius: 8px;
+                padding: 10px 12px;
+                min-height: 56px;
+                font-size: 0.95rem;
+                line-height: 1.45;
+                display: flex;
+                align-items: center;
+            }
+            .kaiops-role-decision-complete {
+                background: rgba(16,185,129,0.15);
+                color: #047857;
+            }
+            .kaiops-role-decision-standby {
+                background: rgba(59,130,246,0.12);
+                color: #1d4ed8;
+            }
             .kaiops-hero-wrap {
                 background: linear-gradient(118deg, #0f172a 0%, #1e1b4b 30%, #1d4ed8 65%, #0ea5e9 100%);
                 border-radius: 22px;
@@ -1263,172 +1728,127 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown(
-    """
-    <div class="kaiops-hero-wrap">
-      <div class="kaiops-hero-label">&#9679; AI-Powered SRE Platform</div>
-      <div class="kaiops-hero-title">KaiOps Autonomous Operations</div>
-      <div class="kaiops-hero-sub">
-        A mission-ready operations cockpit for agent handoffs, human approvals,
-        remediation decisions, RAG-grounded evidence, and FinOps visibility.
-      </div>
-      <div class="kaiops-hero-pills">
-        <span class="kaiops-hero-pill"><span class="kaiops-hero-pill-dot"></span> Agents Online</span>
-        <span class="kaiops-hero-pill"><span class="kaiops-hero-pill-dot kaiops-hero-pill-dot-blue"></span> RAG Grounded</span>
-        <span class="kaiops-hero-pill"><span class="kaiops-hero-pill-dot kaiops-hero-pill-dot-amber"></span> Gateway Active</span>
-        <span class="kaiops-hero-pill">7-Step Workflow</span>
-        <span class="kaiops-hero-pill">GPT-Powered RCA</span>
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
+_health = _check_service_health()
+_dot_gw = "kaiops-hero-pill-dot-amber" if _health.get("gateway") else "kaiops-hero-pill-dot-offline"
+_dot_rag = "kaiops-hero-pill-dot-blue" if _health.get("rag") else "kaiops-hero-pill-dot-offline"
+_dot_agents = "" if _health.get("monitoring_adapter") else "kaiops-hero-pill-dot-offline"
+_gw_label = "Gateway Active" if _health.get("gateway") else "Gateway Offline"
+_rag_label = "RAG Grounded" if _health.get("rag") else "RAG Not Ready"
+_agents_label = "Agents Online" if _health.get("monitoring_adapter") else "Agents Offline"
 flows = get_flows()
-severity_levels = sorted({str(flow.get("severity", "unknown")).upper() for flow in flows})
 workflow = st.session_state.get("workflow", {})
-render_agent_role_overview(sorted(workflow.get("events", []), key=lambda item: item.get("sequence", 0)))
-if "kaiops_selected_severities" not in st.session_state:
-    st.session_state["kaiops_selected_severities"] = severity_levels
 if "flow_catalog_preview" not in st.session_state:
     st.session_state["flow_catalog_preview"] = {
         "data": {"entries": flows, "count": len(flows), "path": "rag/flows.json"}
     }
+if "selected_flow" not in st.session_state:
+    st.session_state["selected_flow"] = "payment-latency"
 catalog_preview = st.session_state.get("flow_catalog_preview")
 catalog_entries = data_from_gateway(catalog_preview).get("entries", []) if catalog_preview else flows
+if "initial_flow_loaded" not in st.session_state:
+    st.session_state["initial_flow_loaded"] = False
+if "nav_section" not in st.session_state:
+    st.session_state["nav_section"] = "home"
+if "kaiops_nav_section" in st.session_state:
+        st.session_state["nav_section"] = (
+                "onboarding" if st.session_state.get("kaiops_nav_section") == "Project Onboarding" else "home"
+        )
+current_nav_section = st.session_state.get("nav_section", "home")
 
-with st.sidebar:
+if current_nav_section != "onboarding":
+    sorted_events = sorted(workflow.get("events", []), key=lambda item: item.get("sequence", 0))
     st.markdown(
-        """
-        <div class="kaiops-sidebar-hero" style="position:relative;overflow:hidden;">
-          <div style="position:absolute;right:-35px;top:-35px;width:110px;height:110px;border-radius:999px;
-                      background:rgba(56,189,248,0.16);filter:blur(2px);"></div>
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;position:relative;">
-            <span style="font-size:1.28rem;">&#128640;</span>
-            <h3 style="margin:0;font-size:1.12rem;letter-spacing:-0.01em;">Mission Control</h3>
-            <span style="margin-left:auto;display:inline-flex;align-items:center;gap:4px;
-                         background:rgba(255,255,255,0.15);border-radius:999px;padding:2px 8px;
-                         font-size:0.62rem;font-weight:700;letter-spacing:0.05em;color:#e0f2fe;">
-              <span style="width:6px;height:6px;border-radius:50%;background:#4ade80;
-                           display:inline-block;animation:kaiops-pulse 2.2s ease-in-out infinite;"></span>
-              LIVE
-            </span>
-          </div>
-          <p style="margin:0 0 10px;color:#bfdbfe;font-size:0.78rem;line-height:1.35;position:relative;">
-            Launch, triage, approve, remediate, and validate incidents from one command surface.
-          </p>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px;position:relative;">
-            <span style="background:rgba(255,255,255,0.12);border-radius:6px;padding:2px 8px;
-                         font-size:0.65rem;font-weight:600;color:#bfdbfe;">&#9632; Alert Stream</span>
-            <span style="background:rgba(255,255,255,0.12);border-radius:6px;padding:2px 8px;
-                         font-size:0.65rem;font-weight:600;color:#bfdbfe;">&#9654; Flow Control</span>
-            <span style="background:rgba(255,255,255,0.12);border-radius:6px;padding:2px 8px;
-                         font-size:0.65rem;font-weight:600;color:#bfdbfe;">&#9679; RAG Knowledge Base</span>
-            <span style="background:rgba(255,255,255,0.12);border-radius:6px;padding:2px 8px;
-                         font-size:0.65rem;font-weight:600;color:#bfdbfe;">&#10003; Human Approval</span>
-          </div>
+        f"""
+        <style>
+            .kaiops-hero-pill-dot-offline {{ background: #64748b !important; }}
+        </style>
+        <div class="kaiops-hero-wrap">
+            <div class="kaiops-hero-label">&#9679; AI-Powered SRE Platform</div>
+            <div class="kaiops-hero-title">KaiOps Autonomous Operations</div>            
+            <div class="kaiops-hero-pills">
+                <span class="kaiops-hero-pill"><span class="kaiops-hero-pill-dot {_dot_agents}"></span> {_agents_label}</span>
+                <span class="kaiops-hero-pill"><span class="kaiops-hero-pill-dot {_dot_rag}"></span> {_rag_label}</span>
+                <span class="kaiops-hero-pill"><span class="kaiops-hero-pill-dot {_dot_gw}"></span> {_gw_label}</span>
+                <span class="kaiops-hero-pill">7-Step Workflow</span>
+                <span class="kaiops-hero-pill">GPT-Powered RCA</span>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    render_agent_role_overview(sorted_events)
+    render_agent_work_tracker()
+
+if current_nav_section != "onboarding" and not st.session_state.get("workflow") and not st.session_state.get("initial_flow_loaded"):
+    default_flow_id = first_actionable_flow(catalog_entries)
+    if default_flow_id:
+        st.session_state["selected_flow"] = default_flow_id
+        st.session_state["initial_flow_loaded"] = True
+
+with st.sidebar:
+    if current_nav_section != "onboarding":
+        st.markdown(
+            """
+            <div class="kaiops-sidebar-hero" style="position:relative;overflow:hidden;">
+                <div style="position:absolute;right:-35px;top:-35px;width:110px;height:110px;border-radius:999px;
+                                background:rgba(56,189,248,0.16);filter:blur(2px);"></div>
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;position:relative;">
+                    <span style="font-size:1.28rem;">&#128640;</span>
+                    <h3 style="margin:0;font-size:1.12rem;letter-spacing:-0.01em;">Mission Control</h3>
+                    <span style="margin-left:auto;display:inline-flex;align-items:center;gap:4px;
+                                     background:rgba(255,255,255,0.15);border-radius:999px;padding:2px 8px;
+                                     font-size:0.62rem;font-weight:700;letter-spacing:0.05em;color:#e0f2fe;">
+                        <span style="width:6px;height:6px;border-radius:50%;background:#4ade80;
+                                         display:inline-block;animation:kaiops-pulse 2.2s ease-in-out infinite;"></span>
+                        LIVE
+                    </span>
+                </div>
+                
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    menu_choice = st.radio(
+        "Menu",
+        ["Home", "Project Onboarding"],
+        index=0 if current_nav_section != "onboarding" else 1,
+        key="kaiops_nav_section",
+        horizontal=False,
+    )
+    st.session_state["nav_section"] = "onboarding" if menu_choice == "Project Onboarding" else "home"
 
     st.markdown('<div class="kaiops-sidebar-section">Alert Stream</div>', unsafe_allow_html=True)
     with st.container(border=True):
         if catalog_entries:
             selected_from_stream = render_alert_stream(catalog_entries)
             if selected_from_stream:
-                st.session_state["selected_flow_from_stream"] = selected_from_stream
-                st.session_state["run_flow_from_stream_click"] = True
+                st.session_state["selected_flow"] = selected_from_stream
+                gateway_response = request_json(
+                    "POST",
+                    f"{GATEWAY_BASE}/sample/{selected_from_stream}/workflow",
+                    params={"fast_mode": str(st.session_state.get("fast_mode_enabled", True)).lower()},
+                )
+                if gateway_response:
+                    st.session_state["gateway_response"] = gateway_response
+                    st.session_state["workflow"] = gateway_response.get("data", {})
+                    st.session_state["last_flow_refresh_ts"] = time.time()
+                    st.success(f"Flow {selected_from_stream} executed from alert stream.")
+                    st.rerun()
         else:
             st.caption("Load the catalog or ingest incident documents to populate the live alert stream.")
 
-    st.markdown('<div class="kaiops-sidebar-section">Flow Control</div>', unsafe_allow_html=True)
-    with st.container(border=True):
-        pending_flow = st.session_state.pop("selected_flow_from_stream", None)
-        run_from_stream = bool(st.session_state.pop("run_flow_from_stream_click", False))
-        if pending_flow:
-            st.session_state["selected_flow"] = pending_flow
-            matched = next((flow for flow in flows if str(flow.get("id")) == pending_flow), None)
-            if matched:
-                st.session_state["kaiops_selected_severities"] = [str(matched.get("severity", "")).upper()]
-
-        selected_severities = st.multiselect(
-            "Severity",
-            options=severity_levels,
-            key="kaiops_selected_severities",
-        )
-
-        filtered_flows = [
-            flow
-            for flow in flows
-            if (not selected_severities or str(flow.get("severity", "")).upper() in selected_severities)
-        ]
-
-        if not filtered_flows:
-            filtered_flows = flows
-
-        flow_options = {
-            f"{flow.get('alert_id', flow['id']).upper()} | {flow.get('alert_name', flow['title'])} | {flow['service']} | {str(flow['severity']).upper()}": flow["id"]
-            for flow in filtered_flows
-        }
-
-        selected_flow_id = st.session_state.get("selected_flow", "payment-latency")
-        flow_labels = list(flow_options)
-        default_label = next(
-            (label for label, flow_id in flow_options.items() if flow_id == selected_flow_id), flow_labels[0]
-        )
-        if (
-            "kaiops_selected_flow_label" not in st.session_state
-            or st.session_state["kaiops_selected_flow_label"] not in flow_labels
-            or pending_flow
-        ):
-            st.session_state["kaiops_selected_flow_label"] = default_label
-
-        selected_label = st.selectbox("Search flow", flow_labels, key="kaiops_selected_flow_label")
-        selected_flow = flow_options.get(selected_label, "payment-latency")
-        st.session_state["selected_flow"] = selected_flow
-
-        if pending_flow:
-            st.success(f"Selected {selected_flow} from alert stream")
-
-        if run_from_stream and pending_flow:
-            gateway_response = request_json("POST", f"{GATEWAY_BASE}/sample/{selected_flow}/workflow")
-            if gateway_response:
-                st.session_state["gateway_response"] = gateway_response
-                st.session_state["workflow"] = gateway_response.get("data", {})
-                st.session_state["last_flow_refresh_ts"] = time.time()
-                st.success("Flow executed from alert stream click.")
-
-        if st.button("Run Selected Flow", type="primary", width="stretch"):
-            gateway_response = request_json("POST", f"{GATEWAY_BASE}/sample/{selected_flow}/workflow")
-            if gateway_response:
-                st.session_state["gateway_response"] = gateway_response
-                st.session_state["workflow"] = gateway_response.get("data", {})
-                st.session_state["last_flow_refresh_ts"] = time.time()
-                st.success("Flow completed.")
-
-    st.markdown('<div class="kaiops-sidebar-section">Agent Trace</div>', unsafe_allow_html=True)
-    with st.container(border=True):
-        events_for_sidebar = sorted(workflow.get("events", []), key=lambda item: item.get("sequence", 0))
-        if events_for_sidebar:
-            trace_step_options = [
-                f"Step {event.get('sequence', '-')}: {event.get('agent', 'Agent')}" for event in events_for_sidebar
-            ]
-            default_trace_step = st.session_state.get("selected_trace_step", trace_step_options[-1])
-            if default_trace_step not in trace_step_options:
-                default_trace_step = trace_step_options[-1]
-            selected_trace_step = st.selectbox(
-                "Flow step",
-                options=trace_step_options,
-                index=trace_step_options.index(default_trace_step),
-            )
-            st.session_state["selected_trace_step"] = selected_trace_step
-        else:
-            st.caption("Run Flow to enable step drill-down.")
-            st.session_state.pop("selected_trace_step", None)
+    st.session_state.pop("selected_trace_step", None)
 
     st.markdown('<div class="kaiops-sidebar-section">Live Monitoring</div>', unsafe_allow_html=True)
     with st.container(border=True):
+        fast_mode_enabled = st.toggle(
+            "Fast mode (skip model comparisons)",
+            value=st.session_state.get("fast_mode_enabled", True),
+            help="Runs flows faster by skipping side-by-side model comparison calls.",
+        )
+        st.session_state["fast_mode_enabled"] = fast_mode_enabled
+
         auto_refresh_enabled = st.toggle(
             "Auto-refresh observability",
             value=st.session_state.get("auto_refresh_enabled", False),
@@ -1468,6 +1888,10 @@ with st.sidebar:
             st.session_state["gateway_summary"] = request_json("GET", f"{GATEWAY_BASE}/observability/summary")
             st.session_state["gateway_recent"] = request_json("GET", f"{GATEWAY_BASE}/observability/recent")
             st.session_state["last_gateway_refresh_ts"] = time.time()
+
+if st.session_state.get("nav_section") == "onboarding":
+    render_project_onboarding_section()
+    st.stop()
 
     # ── RAG Workspace — placed after Live Monitoring as a knowledge-base admin section ──
     st.markdown(
@@ -1679,7 +2103,9 @@ if st.session_state.get("auto_refresh_enabled"):
     if st.session_state.get("flow_rerun_enabled") and st.session_state.get("selected_flow"):
         if now - last_flow_refresh >= flow_interval:
             auto_flow_response = request_json(
-                "POST", f"{GATEWAY_BASE}/sample/{st.session_state['selected_flow']}/workflow"
+                "POST",
+                f"{GATEWAY_BASE}/sample/{st.session_state['selected_flow']}/workflow",
+                params={"fast_mode": str(st.session_state.get("fast_mode_enabled", True)).lower()},
             )
             if auto_flow_response:
                 st.session_state["gateway_response"] = auto_flow_response
@@ -1698,49 +2124,66 @@ recommendation = workflow.get("recommendation", {})
 remediation = workflow.get("remediation_action", {})
 closure = workflow.get("closure_report", {})
 finops = workflow.get("finops", {})
-grounded_rag_response = get_grounded_rag_search(
-    scenario=scenario,
-    alert=alert,
-    context=context,
-    recommendation=recommendation,
-    closure=closure,
-)
-
-homepage_html = build_complete_webpage_html(
-    scenario=scenario,
-    incident=incident,
-    alert=alert,
-    context=context,
-    recommendation=recommendation,
-    remediation=remediation,
-    closure=closure,
-    metrics=metrics,
-    finops=finops,
-    events=workflow.get("events", []),
-    gateway_response=gateway_response,
-    gateway_summary=st.session_state.get("gateway_summary", {}),
-    gateway_recent=st.session_state.get("gateway_recent", {}),
-    catalog_entries=catalog_entries,
-    rag_search_response=grounded_rag_response,
-)
-
-homepage_export_name = f"kaiops-homepage-{time.strftime('%Y%m%d-%H%M%S')}.html"
-_export_left, _export_right = st.columns([12, 1])
-with _export_right:
-    st.download_button(
-        "⬇",
-        data=homepage_html,
-        file_name=homepage_export_name,
-        mime="text/html",
-        width="content",
-        help="Download complete webpage as HTML",
-        key="kaiops_homepage_save_html",
+grounded_rag_response: dict[str, Any] = {}
+if workflow:
+    grounded_rag_response = get_grounded_rag_search(
+        scenario=scenario,
+        alert=alert,
+        context=context,
+        recommendation=recommendation,
+        closure=closure,
     )
 
+    homepage_html = build_complete_webpage_html(
+        scenario=scenario,
+        incident=incident,
+        alert=alert,
+        context=context,
+        recommendation=recommendation,
+        remediation=remediation,
+        closure=closure,
+        metrics=metrics,
+        finops=finops,
+        events=workflow.get("events", []),
+        gateway_response=gateway_response,
+        gateway_summary=st.session_state.get("gateway_summary", {}),
+        gateway_recent=st.session_state.get("gateway_recent", {}),
+        catalog_entries=catalog_entries,
+        rag_search_response=grounded_rag_response,
+    )
+
+    homepage_export_name = f"kaiops-homepage-{time.strftime('%Y%m%d-%H%M%S')}.html"
+    _export_left, _export_right = st.columns([12, 1])
+    with _export_right:
+        st.download_button(
+            "⬇",
+            data=homepage_html,
+            file_name=homepage_export_name,
+            mime="text/html",
+            width="content",
+            help="Download complete webpage as HTML",
+            key="kaiops_homepage_save_html",
+        )
+
 if not workflow:
-    st.info("Choose an incident flow in Mission Control and click Run Flow.")
+    st.info("Select an incident from Alert Stream to run a flow.")
 else:
-    st.subheader(scenario.get("title", "Incident Flow"))
+    _incident_top_name = str(scenario.get("title") or alert.get("name") or "Incident")
+    st.markdown(
+        f"""
+        <div style="margin-bottom:10px;">
+            <div style="font-size:1.45rem;font-weight:800;color:#0f172a;line-height:1.2;">
+                {html.escape(_incident_top_name)}
+            </div>
+            <div style="font-size:0.82rem;color:#64748b;margin-top:4px;">
+                Incident <b style="color:#334155;">{html.escape(str(incident.get('id', '—')))}</b>
+                &nbsp;·&nbsp; Service <b style="color:#334155;">{html.escape(str(alert.get('service', 'N/A')))}</b>
+                &nbsp;·&nbsp; Severity <b style="color:#334155;">{html.escape(str(metrics.get('severity', 'unknown')).upper())}</b>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     _h_inc = str(incident.get("id", "—"))
     _h_trace = str(gateway_response.get("trace_id", "—"))
     st.markdown(
@@ -1776,8 +2219,9 @@ with tab_summary:
         _confidence_pct = f"{float(metrics.get('recommendation_confidence', 0)):.0%}"
         _health = "✓ Restored" if metrics.get("health_restored") else "✗ Not Restored"
         _gw_decision = str(gateway.get("safety", {}).get("decision", "unknown")).upper()
+        _selected_flow_id = st.session_state.get("selected_flow", "payment-latency")
         _active_flow = next(
-            (flow for flow in catalog_entries if str(flow.get("id")) == str(scenario.get("id", selected_flow))),
+            (flow for flow in catalog_entries if str(flow.get("id")) == str(scenario.get("id", _selected_flow_id))),
             {},
         )
         _alert_display_id = str(_active_flow.get("alert_id") or scenario.get("id") or alert.get("id", "N/A"))
@@ -1902,29 +2346,6 @@ with tab_summary:
                 "recent_changes": len(_changes),
                 "alerts_cleared": "Yes" if metrics.get("alerts_cleared") else "No",
             })
-            _inc_id = str(incident.get("id", "—"))
-            _trace_id = str(gateway_response.get("trace_id", "—"))
-            st.markdown(
-                f"""
-                <div style="margin-top:10px;display:flex;flex-direction:column;gap:6px;">
-                  <div style="background:rgba(15,23,42,0.5);border:1px solid rgba(51,65,85,0.5);
-                               border-radius:8px;padding:8px 12px;">
-                    <span style="font-size:0.65rem;font-weight:700;text-transform:uppercase;
-                                 letter-spacing:0.05em;color:#475569;">Incident ID</span>
-                    <div style="font-family:monospace;font-size:0.75rem;color:#94a3b8;
-                                margin-top:2px;word-break:break-all;">{html.escape(_inc_id)}</div>
-                  </div>
-                  <div style="background:rgba(15,23,42,0.5);border:1px solid rgba(51,65,85,0.5);
-                               border-radius:8px;padding:8px 12px;">
-                    <span style="font-size:0.65rem;font-weight:700;text-transform:uppercase;
-                                 letter-spacing:0.05em;color:#475569;">Trace ID</span>
-                    <div style="font-family:monospace;font-size:0.75rem;color:#94a3b8;
-                                margin-top:2px;word-break:break-all;">{html.escape(_trace_id)}</div>
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
     else:
         st.info("Run a flow to populate the Incident Summary.")
 
@@ -2094,29 +2515,15 @@ with tab_trace:
             unsafe_allow_html=True,
         )
 
-    trace_tab1, trace_tab2, trace_tab3 = st.tabs(["Handoff Flow", "Raw Trace", "Gateway & Safety"])
+    trace_tab1, trace_tab2 = st.tabs(["Raw Trace", "Gateway & Safety"])
 
     with trace_tab1:
-        if workflow.get("events"):
-            ordered_events = sorted(workflow.get("events", []), key=lambda item: item.get("sequence", 0))
-            render_handoff_path(ordered_events)
-            handoff_options = [f"Step {event.get('sequence', '-')}: {event.get('agent', 'Agent')}" for event in ordered_events]
-            selected_handoff = st.session_state.get("selected_trace_step", handoff_options[-1])
-            if selected_handoff not in handoff_options:
-                selected_handoff = handoff_options[-1]
-            selected_handoff_index = handoff_options.index(selected_handoff)
-            st.caption(f"Drill-down selection: {selected_handoff}")
-            render_agent_event_details(ordered_events[selected_handoff_index])
-        else:
-            st.info("Run a flow to view the handoff path.")
-
-    with trace_tab2:
         if workflow.get("events"):
             render_event_trace(workflow.get("events", []))
         else:
             st.info("Run a flow to view the raw trace.")
 
-    with trace_tab3:
+    with trace_tab2:
         if gateway_response:
             safety = gateway.get("safety", {})
             render_copyable_id("Full Trace ID", gateway_response.get("trace_id"))
@@ -2135,8 +2542,8 @@ with tab_trace:
                 st.write("- Request allowed; no policy issues detected.")
             table_from_dict({"path": gateway.get("path"), "target_url": gateway.get("target_url")}, "Field", "Value")
 
-        summary = st.session_state.get("gateway_summary") or request_json("GET", f"{GATEWAY_BASE}/observability/summary")
-        recent = st.session_state.get("gateway_recent") or request_json("GET", f"{GATEWAY_BASE}/observability/recent")
+        summary = st.session_state.get("gateway_summary") or _fetch_observability_summary_cached()
+        recent = st.session_state.get("gateway_recent") or _fetch_observability_recent_cached()
         st.markdown("#### Gateway totals")
         metric_row(
             [
@@ -2253,3 +2660,4 @@ with tab_closed:
         st.markdown("#### Lessons learned")
         for lesson in closure.get("lessons_learned", []):
             st.write(f"- {lesson}")
+

@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time as _time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from common.config import get_settings
+from common.database import create_engine, create_schema, create_session_factory
 from common.models import Alert, AlertSeverity, Approval, ApprovalDecision, Recommendation
+from common.repository import IncidentRepository
 from common.service import create_app
 from common.topics import RAW_ALERTS
 from fastapi import Body, Header
@@ -162,6 +166,17 @@ SCENARIOS: dict[str, dict[str, Any]] = {
 }
 
 FLOW_CATALOG_FILE = "flows.json"
+ONBOARDING_CONNECTIVITY_FILE = "onboarding/connectivity.json"
+
+# ---------------------------------------------------------------------------
+# In-process TTL caches
+# ---------------------------------------------------------------------------
+_SCENARIOS_CACHE_TTL: float = 60.0
+_ONBOARDING_CACHE_TTL: float = 30.0
+_scenarios_cache: dict[str, Any] = {}
+_scenarios_cache_ts: float = 0.0
+_onboarding_cache: dict[str, Any] = {}
+_onboarding_cache_ts: float = 0.0
 
 
 def slugify(value: str) -> str:
@@ -182,6 +197,122 @@ def rag_root_path() -> Path:
 
 def flow_catalog_path() -> Path:
     return rag_root_path() / FLOW_CATALOG_FILE
+
+
+def onboarding_connectivity_path() -> Path:
+    return rag_root_path() / ONBOARDING_CONNECTIVITY_FILE
+
+
+def load_onboarding_connectivity() -> dict[str, Any]:
+    global _onboarding_cache, _onboarding_cache_ts
+    now = _time.monotonic()
+    if _onboarding_cache and now - _onboarding_cache_ts < _ONBOARDING_CACHE_TTL:
+        return dict(_onboarding_cache)
+    path = onboarding_connectivity_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            _onboarding_cache = dict(payload)
+            _onboarding_cache_ts = now
+            return dict(payload)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {}
+
+
+def save_onboarding_connectivity(payload: dict[str, Any]) -> dict[str, Any]:
+    global _onboarding_cache, _onboarding_cache_ts
+    path = onboarding_connectivity_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sanitized = {
+        "project": payload.get("project", {}),
+        "prometheus_url": payload.get("prometheus_url", ""),
+        "new_relic_url": payload.get("new_relic_url", ""),
+        "datadog_url": payload.get("datadog_url", ""),
+        "updated_at": payload.get("updated_at"),
+    }
+    path.write_text(json.dumps(sanitized, indent=2), encoding="utf-8")
+    _onboarding_cache = dict(sanitized)
+    _onboarding_cache_ts = _time.monotonic()
+    return sanitized
+
+
+def _normalize_project_name(project: dict[str, Any]) -> str:
+    project_name = str(project.get("name", "")).strip()
+    return project_name or "untitled-project"
+
+
+def _normalize_provider_name(provider_name: str) -> str:
+    return provider_name.strip().lower().replace(" ", "_")
+
+
+async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        return
+
+    project = payload.get("project", {}) if isinstance(payload.get("project"), dict) else {}
+    if not isinstance(project, dict):
+        project = {}
+
+    project_name = _normalize_project_name(project)
+    provider_statuses = payload.get("provider_statuses", {}) if isinstance(payload.get("provider_statuses"), dict) else {}
+    connectivity_payload = {
+        "prometheus_url": str(payload.get("prometheus_url", "")).strip(),
+        "new_relic_url": str(payload.get("new_relic_url", "")).strip(),
+        "datadog_url": str(payload.get("datadog_url", "")).strip(),
+        "updated_at": payload.get("updated_at"),
+        "active_provider": _normalize_provider_name(str(payload.get("active_provider", ""))) if payload.get("active_provider") else None,
+    }
+    selected_provider = _normalize_provider_name(str(payload.get("active_provider", "project")))
+    now = datetime.now(timezone.utc)
+
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_onboarding_state(
+            project_name=project_name,
+            provider_name="project",
+            owner_team=str(project.get("owner_team", "")).strip() or None,
+            environment=str(project.get("environment", "")).strip() or None,
+            region=str(project.get("region", "")).strip() or None,
+            endpoint_url=None,
+            test_status="saved",
+            test_message="Project configuration saved",
+            project_payload=project,
+            connectivity_payload=connectivity_payload,
+            last_tested_at=None,
+        )
+
+        for provider_name, endpoint_key in (("prometheus", "prometheus_url"), ("new_relic", "new_relic_url"), ("datadog", "datadog_url")):
+            provider_state = provider_statuses.get(provider_name, {}) if isinstance(provider_statuses, dict) else {}
+            has_test_result = isinstance(provider_state, dict) and ("ok" in provider_state or "message" in provider_state)
+            ok = bool(provider_state.get("ok", False)) if has_test_result else False
+            message = None
+            if has_test_result:
+                message = str(provider_state.get("message", "")).strip() or None
+            await repo.save_onboarding_state(
+                project_name=project_name,
+                provider_name=provider_name,
+                owner_team=str(project.get("owner_team", "")).strip() or None,
+                environment=str(project.get("environment", "")).strip() or None,
+                region=str(project.get("region", "")).strip() or None,
+                endpoint_url=str(payload.get(endpoint_key, "")).strip() or None,
+                test_status="connected" if ok else ("failed" if has_test_result else None),
+                test_message=message,
+                project_payload=project,
+                connectivity_payload={
+                    "provider": provider_name,
+                    "endpoint_url": str(payload.get(endpoint_key, "")).strip(),
+                    "state": provider_state,
+                    "selected_provider": selected_provider,
+                    "updated_at": payload.get("updated_at"),
+                },
+                last_tested_at=now if has_test_result else None,
+            )
+
+        await session.commit()
 
 
 def default_flow_catalog_entries() -> list[dict[str, str]]:
@@ -230,6 +361,10 @@ def severity_from_string(value: str | None) -> AlertSeverity:
 
 
 def merged_scenarios() -> dict[str, dict[str, Any]]:
+    global _scenarios_cache, _scenarios_cache_ts
+    now = _time.monotonic()
+    if _scenarios_cache and now - _scenarios_cache_ts < _SCENARIOS_CACHE_TTL:
+        return dict(_scenarios_cache)
     scenarios: dict[str, dict[str, Any]] = dict(SCENARIOS)
     for item in ensure_flow_catalog_exists():
         title = str(item.get("title", "")).strip()
@@ -264,7 +399,10 @@ def merged_scenarios() -> dict[str, dict[str, Any]]:
             "recommended_action": recommended_action,
             "remediation_comment": str(item.get("remediation_comment", recommended_action)),
         }
-    return scenarios
+    _scenarios_cache.clear()
+    _scenarios_cache.update(scenarios)
+    _scenarios_cache_ts = _time.monotonic()
+    return dict(scenarios)
 
 
 def list_scenarios() -> list[dict[str, str]]:
@@ -308,15 +446,74 @@ async def run_local_payment_workflow(
     trace_id: str | None = None,
     flow_id: str = "payment-latency",
     model_router: Any | None = None,
+    run_comparison: bool = True,
 ) -> dict[str, Any]:
     """Run the agent workflow in-process for local demos with Kafka disabled."""
     from alert_intelligence import AlertIntelligenceAgent
     from closure_service import ClosureValidationAgent
     from context_agent import ContextIntelligenceAgent
-    from model_router import ModelRouter
+    from model_router import ModelRouter, ModelTask
     from orchestrator import OrchestratorAgent
     from remediation_engine import RemediationEngine
     from resolution_agent import ResolutionIntelligenceAgent
+
+    agent_order = [
+        "Alert Intelligence Agent",
+        "Orchestrator Agent",
+        "Context Intelligence Agent",
+        "Resolution Intelligence Agent",
+        "Human Approval Layer",
+        "Remediation Automation Engine",
+        "Closure & Validation",
+    ]
+
+    async def persist_step(*operations: Any) -> None:
+        session_factory = getattr(app.state, "session_factory", None)
+        engine = None
+        if not settings.database_enabled:
+            return
+        if session_factory is None:
+            engine = create_engine(settings)
+            session_factory = create_session_factory(engine)
+            await create_schema(engine)
+        try:
+            async with session_factory() as session:
+                repo = IncidentRepository(session)
+                for operation in operations:
+                    await operation(repo)
+                await session.commit()
+        finally:
+            if engine is not None:
+                await engine.dispose()
+
+    def track_agent_work_operation(
+        *,
+        incident_id: Any,
+        agent_name: str,
+        work_item: str,
+        status: str,
+        sequence: int,
+        trace_id: str | None,
+        ticket_id: str | None,
+        details: dict[str, Any] | None = None,
+        started_at: datetime | None = None,
+        completed_at: datetime | None = None,
+    ):
+        async def _operation(repo: IncidentRepository) -> None:
+            await repo.save_agent_work_item(
+                incident_id=incident_id,
+                agent_name=agent_name,
+                work_item=work_item,
+                status=status,
+                sequence=sequence,
+                trace_id=trace_id,
+                ticket_id=ticket_id,
+                details=details or {},
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+
+        return _operation
 
     scenarios = merged_scenarios()
     scenario = scenarios.get(flow_id, scenarios["payment-latency"])
@@ -324,6 +521,25 @@ async def run_local_payment_workflow(
     alert = build_sample_alert(flow_id, trace_id=trace_id)
     enriched_alert, incident = AlertIntelligenceAgent().process(alert)
     incident.trace_id = trace_id
+    await persist_step(lambda repo: repo.save_alert(enriched_alert), lambda repo: repo.save_incident(incident))
+    now = datetime.now(timezone.utc)
+    await persist_step(
+        *[
+            track_agent_work_operation(
+                incident_id=incident.id,
+                agent_name=agent_name,
+                work_item="Assigned to incident workflow",
+                status="pending",
+                sequence=index,
+                trace_id=trace_id,
+                ticket_id=incident.ticket_id,
+                details={"assigned_by": "orchestrator", "flow_id": flow_id},
+                started_at=now,
+                completed_at=None,
+            )
+            for index, agent_name in enumerate(agent_order, start=1)
+        ]
+    )
     alert_event = {
         "sequence": 1,
         "agent": "Alert Intelligence Agent",
@@ -346,7 +562,24 @@ async def run_local_payment_workflow(
             "metadata_fields": len(enriched_alert.metadata),
         },
     }
-    decision = OrchestratorAgent().decide_workflow(enriched_alert, incident)
+    await persist_step(
+        track_agent_work_operation(
+            incident_id=incident.id,
+            agent_name="Alert Intelligence Agent",
+            work_item="Deduplicate, correlate, classify, and enrich alert",
+            status="completed",
+            sequence=1,
+            trace_id=trace_id,
+            ticket_id=incident.ticket_id,
+            details={"decision": alert_event["decision"], "metrics": alert_event["metrics"]},
+            started_at=now,
+            completed_at=datetime.now(timezone.utc),
+        )
+    )
+    context_task = asyncio.create_task(ContextIntelligenceAgent().collect(enriched_alert, incident))
+    decision_task = asyncio.to_thread(OrchestratorAgent().decide_workflow, enriched_alert, incident)
+    context, decision = await asyncio.gather(context_task, decision_task)
+    context.trace_id = trace_id
     orchestrator_event = {
         "sequence": 2,
         "agent": "Orchestrator Agent",
@@ -365,8 +598,20 @@ async def run_local_payment_workflow(
             "requires_approval": decision.requires_approval,
         },
     }
-    context = await ContextIntelligenceAgent().collect(enriched_alert, incident)
-    context.trace_id = trace_id
+    await persist_step(
+        track_agent_work_operation(
+            incident_id=incident.id,
+            agent_name="Orchestrator Agent",
+            work_item="Select workflow and downstream agents",
+            status="completed",
+            sequence=2,
+            trace_id=trace_id,
+            ticket_id=incident.ticket_id,
+            details={"decision": orchestrator_event["decision"], "metrics": orchestrator_event["metrics"]},
+            started_at=now,
+            completed_at=datetime.now(timezone.utc),
+        )
+    )
     context_event = {
         "sequence": 3,
         "agent": "Context Intelligence Agent",
@@ -388,6 +633,20 @@ async def run_local_payment_workflow(
             "runbook_found": bool(context.runbook),
         },
     }
+    await persist_step(
+        track_agent_work_operation(
+            incident_id=incident.id,
+            agent_name="Context Intelligence Agent",
+            work_item="Collect context and RAG evidence",
+            status="completed",
+            sequence=3,
+            trace_id=trace_id,
+            ticket_id=incident.ticket_id,
+            details={"decision": context_event["decision"], "metrics": context_event["metrics"]},
+            started_at=now,
+            completed_at=datetime.now(timezone.utc),
+        )
+    )
     model_errors: list[dict[str, str]] = []
     try:
         recommendation = await ResolutionIntelligenceAgent(model_router=router).resolve(context)
@@ -423,53 +682,64 @@ async def run_local_payment_workflow(
         f"recommended action is {scenario['recommended_action']}."
     )
     recommendation.trace_id = trace_id
+    await persist_step(lambda repo: repo.save_recommendation_as_audit(recommendation))
     model_usage = list(recommendation.metadata.get("model_usage", []))
     model_calls = list(recommendation.metadata.get("model_calls", []))
-    comparison_calls = []
-    comparison_payload = {
-        "service": enriched_alert.service,
-        "incident": incident.title,
-        "root_cause": scenario["root_cause"],
-        "recommended_action": scenario["recommended_action"],
-    }
-    comparison_results = await asyncio.gather(
-        *[
-            router.route_provider(
-                provider_name=provider_name,
-                task=task,
-                prompt=prompt,
-                payload=comparison_payload,
-            )
-            for provider_name, task, prompt in comparison_calls
-        ],
-        return_exceptions=True,
-    )
-    for (provider_name, task, _), result in zip(comparison_calls, comparison_results, strict=True):
-        try:
-            if isinstance(result, Exception):
-                raise result
-            model_usage.append(result["usage"])
-            model_calls.append(
-                {
-                    "task": task.value,
-                    "provider": provider_name,
-                    "model": result["usage"].get("model"),
-                    "prompt": next(prompt for name, _, prompt in comparison_calls if name == provider_name),
-                    "payload": comparison_payload,
-                    "response": result["content"],
-                    "usage": result["usage"],
-                }
-            )
-        except Exception as exc:
-            model_errors.append(
-                {
-                    "provider": provider_name,
-                    "task": task.value,
-                    "prompt": next(prompt for name, _, prompt in comparison_calls if name == provider_name),
-                    "payload": str(comparison_payload),
-                    "error": str(exc),
-                }
-            )
+    if run_comparison:
+        comparison_payload = {
+            "service": enriched_alert.service,
+            "incident": incident.title,
+            "root_cause": scenario["root_cause"],
+            "recommended_action": scenario["recommended_action"],
+        }
+        comparison_prompt = "Summarize root cause, impact, and next action in 2 concise operational sentences."
+        comparison_candidates = ["gpt-5", "gpt-4o"]
+        if settings.local_llm_enabled:
+            comparison_candidates.append("local-llama")
+
+        comparison_calls = [
+            (provider_name, ModelTask.SUMMARIZATION, comparison_prompt)
+            for provider_name in comparison_candidates
+            if provider_name in router.providers
+        ]
+        comparison_results = await asyncio.gather(
+            *[
+                router.route_provider(
+                    provider_name=provider_name,
+                    task=task,
+                    prompt=prompt,
+                    payload=comparison_payload,
+                )
+                for provider_name, task, prompt in comparison_calls
+            ],
+            return_exceptions=True,
+        )
+        for (provider_name, task, _), result in zip(comparison_calls, comparison_results, strict=True):
+            try:
+                if isinstance(result, Exception):
+                    raise result
+                model_usage.append(result["usage"])
+                model_calls.append(
+                    {
+                        "task": task.value,
+                        "provider": provider_name,
+                        "model": result["usage"].get("model"),
+                        "prompt": next(prompt for name, _, prompt in comparison_calls if name == provider_name),
+                        "payload": comparison_payload,
+                        "response": result["content"],
+                        "usage": result["usage"],
+                    }
+                )
+            except Exception as exc:
+                model_errors.append(
+                    {
+                        "provider": provider_name,
+                        "task": task.value,
+                        "prompt": next(prompt for name, _, prompt in comparison_calls if name == provider_name),
+                        "payload": str(comparison_payload),
+                        "error": str(exc),
+                    }
+                )
     resolution_event = {
         "sequence": 4,
         "agent": "Resolution Intelligence Agent",
@@ -491,6 +761,20 @@ async def run_local_payment_workflow(
         "llm_calls": model_calls,
         "llm_errors": model_errors,
     }
+    await persist_step(
+        track_agent_work_operation(
+            incident_id=incident.id,
+            agent_name="Resolution Intelligence Agent",
+            work_item="Run RCA and produce recommendation",
+            status="completed",
+            sequence=4,
+            trace_id=trace_id,
+            ticket_id=incident.ticket_id,
+            details={"decision": resolution_event["decision"], "metrics": resolution_event["metrics"]},
+            started_at=now,
+            completed_at=datetime.now(timezone.utc),
+        )
+    )
     approval = Approval(
         incident_id=incident.id,
         recommendation_id=recommendation.id,
@@ -500,6 +784,7 @@ async def run_local_payment_workflow(
         comment=scenario["remediation_comment"],
         trace_id=trace_id,
     )
+    await persist_step(lambda repo: repo.save_approval(approval))
     approval_event = {
         "sequence": 5,
         "agent": "Human Approval Layer",
@@ -515,11 +800,26 @@ async def run_local_payment_workflow(
         "communicates_to": "Remediation Automation Engine via approval-events",
         "metrics": {"approval_required": decision.requires_approval, "channel": approval.channel},
     }
+    await persist_step(
+        track_agent_work_operation(
+            incident_id=incident.id,
+            agent_name="Human Approval Layer",
+            work_item="Review and approve recommendation",
+            status="completed",
+            sequence=5,
+            trace_id=trace_id,
+            ticket_id=incident.ticket_id,
+            details={"decision": approval_event["decision"], "metrics": approval_event["metrics"]},
+            started_at=now,
+            completed_at=datetime.now(timezone.utc),
+        )
+    )
     engine = RemediationEngine()
     action = engine.build_action(approval)
     action.parameters.update({"root_cause": recommendation.root_cause, "impact": recommendation.impact})
     action = await engine.execute(action)
     action.trace_id = trace_id
+    await persist_step(lambda repo: repo.save_action(action))
     remediation_event = {
         "sequence": 6,
         "agent": "Remediation Automation Engine",
@@ -535,8 +835,26 @@ async def run_local_payment_workflow(
         "communicates_to": "Closure & Validation via remediation-events",
         "metrics": {"status": action.status.value, "target": action.target},
     }
+    await persist_step(
+        track_agent_work_operation(
+            incident_id=incident.id,
+            agent_name="Remediation Automation Engine",
+            work_item="Execute remediation strategy",
+            status="completed" if action.status.value == "succeeded" else action.status.value,
+            sequence=6,
+            trace_id=trace_id,
+            ticket_id=incident.ticket_id,
+            details={"decision": remediation_event["decision"], "metrics": remediation_event["metrics"]},
+            started_at=now,
+            completed_at=datetime.now(timezone.utc),
+        )
+    )
     closure_report = await ClosureValidationAgent().validate(action)
     closure_report.trace_id = trace_id
+    await persist_step(
+        lambda repo: repo.save_report(closure_report),
+        lambda repo: repo.save_knowledge_base(closure_report, service=incident.service),
+    )
     closure_event = {
         "sequence": 7,
         "agent": "Closure & Validation",
@@ -554,6 +872,20 @@ async def run_local_payment_workflow(
             "health_restored": closure_report.health_restored,
         },
     }
+    await persist_step(
+        track_agent_work_operation(
+            incident_id=incident.id,
+            agent_name="Closure & Validation",
+            work_item="Validate recovery and close incident",
+            status="completed" if closure_report.health_restored else "failed",
+            sequence=7,
+            trace_id=trace_id,
+            ticket_id=incident.ticket_id,
+            details={"decision": closure_event["decision"], "metrics": closure_event["metrics"]},
+            started_at=now,
+            completed_at=datetime.now(timezone.utc),
+        )
+    )
     metrics = {
         "alerts_processed": 1,
         "deduplicated_count": enriched_alert.deduplicated_count,
@@ -657,11 +989,54 @@ async def sample_flows() -> dict[str, Any]:
     return {"flows": list_scenarios()}
 
 
+@app.get("/onboarding/connectivity")
+async def get_onboarding_connectivity() -> dict[str, Any]:
+    return {"connectivity": load_onboarding_connectivity()}
+
+
+@app.get("/onboarding/state")
+async def get_onboarding_state() -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        return {"rows": []}
+
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        rows = await repo.list_onboarding_state()
+    return {"rows": rows}
+
+
+@app.get("/agent-work/items")
+async def get_agent_work_items(limit: int = 100) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        return {"rows": []}
+
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        rows = await repo.list_agent_work_items(limit=limit)
+    return {"rows": rows}
+
+
+@app.post("/onboarding/connectivity")
+async def post_onboarding_connectivity(payload: dict[str, Any] = ALERT_BODY) -> dict[str, Any]:
+    sanitized = save_onboarding_connectivity(payload)
+    await persist_onboarding_connectivity(payload)
+    return {"connectivity": sanitized}
+
+
 @app.post("/sample/payment-latency/workflow")
-async def sample_payment_latency_workflow(x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
-    return await run_local_payment_workflow(trace_id=x_trace_id)
+async def sample_payment_latency_workflow(
+    fast_mode: bool = False,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await run_local_payment_workflow(trace_id=x_trace_id, run_comparison=not fast_mode)
 
 
 @app.post("/sample/{flow_id}/workflow")
-async def sample_flow_workflow(flow_id: str, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
-    return await run_local_payment_workflow(trace_id=x_trace_id, flow_id=flow_id)
+async def sample_flow_workflow(
+    flow_id: str,
+    fast_mode: bool = False,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await run_local_payment_workflow(trace_id=x_trace_id, flow_id=flow_id, run_comparison=not fast_mode)

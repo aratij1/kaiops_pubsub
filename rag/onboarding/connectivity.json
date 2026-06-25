@@ -1,0 +1,12 @@
+{
+  "project": {
+    "owner_team": "platform-ops",
+    "environment": "prod",
+    "region": "us-east-1",
+    "name": "demo-proj"
+  },
+  "prometheus_url": "http://localhost:9090/-/ready",
+  "new_relic_url": "https://api.newrelic.com/v2/applications.json",
+  "datadog_url": "https://api.datadoghq.com/api/v1/validate",
+  "updated_at": "2026-06-24 12:00:00"
+}

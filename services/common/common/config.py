@@ -1,6 +1,7 @@
 from functools import lru_cache
+from urllib.parse import quote_plus
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +17,12 @@ class Settings(BaseSettings):
         default="postgresql+asyncpg://kaiops:kaiops@localhost:5432/kaiops",
         alias="DATABASE_URL",
     )
+    db: str = Field(default="postgres", alias="DB")
+    db_host: str = Field(default="localhost", alias="DB_HOST")
+    db_port: int = Field(default=5432, alias="DB_PORT")
+    db_user: str = Field(default="kaiops", alias="DB_USER")
+    db_password: str = Field(default="kaiops", alias="DB_PASSWORD")
+    db_database: str = Field(default="kaiops", alias="DB_DATABASE")
     otlp_endpoint: str | None = Field(default=None, alias="OTEL_EXPORTER_OTLP_ENDPOINT")
     model_router_url: str = Field(default="http://model-router:8000", alias="MODEL_ROUTER_URL")
     context_agent_url: str = Field(default="http://context-agent:8000", alias="CONTEXT_AGENT_URL")
@@ -51,6 +58,19 @@ class Settings(BaseSettings):
     gemini_output_cost_per_million: float = Field(default=0.30, alias="GEMINI_OUTPUT_COST_PER_MILLION")
     groq_input_cost_per_million: float = Field(default=0.59, alias="GROQ_INPUT_COST_PER_MILLION")
     groq_output_cost_per_million: float = Field(default=0.79, alias="GROQ_OUTPUT_COST_PER_MILLION")
+
+    @model_validator(mode="after")
+    def configure_database_url(self) -> "Settings":
+        if self.database_url and not self.database_url.startswith("postgresql+asyncpg://kaiops:kaiops@localhost:5432/kaiops"):
+            return self
+
+        if self.db.lower() == "mysql":
+            self.database_url = (
+                f"mysql+aiomysql://{quote_plus(self.db_user)}:{quote_plus(self.db_password)}"
+                f"@{self.db_host}:{self.db_port}/{self.db_database}"
+            )
+
+        return self
 
 
 @lru_cache

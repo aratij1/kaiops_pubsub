@@ -40,7 +40,7 @@ function Start-KaiOpsWindow {
 Set-Location -LiteralPath '$EscapedRepoRoot'
 `$env:PYTHONPATH = '$EscapedPythonPath'
 `$env:KAFKA_ENABLED = 'false'
-`$env:DATABASE_ENABLED = 'false'
+`$env:DATABASE_ENABLED = 'true'
 `$env:OPENAI_API_KEY = '$($env:OPENAI_API_KEY)'
 `$env:OPENAI_GPT5_MODEL = '$($env:OPENAI_GPT5_MODEL)'
 `$env:OPENAI_GPT4O_MODEL = '$($env:OPENAI_GPT4O_MODEL)'
