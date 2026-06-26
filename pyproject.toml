@@ -75,6 +75,7 @@ pythonpath = [
     "services/remediation-engine",
     "services/closure-service",
     "services/monitoring-adapter",
+    "services/mysql-monitor",
 ]
 testpaths = ["tests"]
 

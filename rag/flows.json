@@ -120,6 +120,17 @@
     "source": "rag-incident"
   },
   {
+    "id": "inc-9102-mysql-unavailable",
+    "alert_id": "INC-9102-MYSQL-UNAVAILABLE",
+    "alert_name": "inc 9102 mysql unavailable",
+    "title": "inc 9102 mysql unavailable",
+    "service": "unknown",
+    "severity": "HIGH",
+    "recommended_action": "Investigate issue",
+    "description": "The MySQL monitor raises `MySQLUnavailable` alerts when it cannot authenticate or connect to the configured MySQL endpoint.",
+    "source": "rag-incident"
+  },
+  {
     "id": "inc-8842-payment-latency-after-deployment-2-5",
     "alert_id": "INC-8842-PAYMENT-LATENCY-AFTER-DEPLOYMENT-2-5",
     "alert_name": "INC-8842 payment latency after Deployment 2.5",

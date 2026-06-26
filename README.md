@@ -146,6 +146,7 @@ Service ports:
 - Approval service: <http://localhost:8007>
 - Remediation engine: <http://localhost:8008>
 - Closure service: <http://localhost:8009>
+- MySQL monitor: <http://localhost:8011>
 
 For local non-Docker UI runs, start the backing API services in separate
 terminals before using the dashboard buttons. For example:

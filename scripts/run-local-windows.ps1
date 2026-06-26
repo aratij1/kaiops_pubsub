@@ -22,7 +22,8 @@ $ServicePaths = @(
     "services\approval-service",
     "services\remediation-engine",
     "services\closure-service",
-    "services\monitoring-adapter"
+    "services\monitoring-adapter",
+    "services\mysql-monitor"
 ) | ForEach-Object { Join-Path $RepoRoot $_ }
 
 $PythonPath = $ServicePaths -join ";"
@@ -68,6 +69,10 @@ Start-KaiOpsWindow `
     -Title "KaiOps api-gateway :8010" `
     -Command "`$env:MONITORING_ADAPTER_URL = 'http://localhost:8001'; `$env:APPROVAL_SERVICE_URL = 'http://localhost:8007'; `$env:CONTEXT_AGENT_URL = 'http://localhost:8004'; & '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8010 --app-dir services/api-gateway"
 
+Start-KaiOpsWindow `
+    -Title "KaiOps mysql-monitor :8011" `
+    -Command "`$env:KAIOPS_ALERT_ENDPOINT = 'http://localhost:8010/alerts'; `$env:MYSQL_ALERTS_ENABLED = 'true'; `$env:MYSQL_HOST = if (`$env:DB_HOST) { `$env:DB_HOST } else { '127.0.0.1' }; `$env:MYSQL_PORT = if (`$env:DB_PORT) { `$env:DB_PORT } else { '3306' }; `$env:MYSQL_USER = if (`$env:DB_USER) { `$env:DB_USER } else { 'root' }; `$env:MYSQL_PASSWORD = `$env:DB_PASSWORD; `$env:MYSQL_DATABASE = if (`$env:DB_DATABASE) { `$env:DB_DATABASE } else { '' }; & '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8011 --app-dir services/mysql-monitor"
+
 if (-not $NoUi) {
     $UiCommand = @"
 `$env:MONITORING_ADAPTER_URL="http://localhost:8001"
@@ -84,6 +89,7 @@ Write-Host "Monitoring adapter: http://localhost:8001"
 Write-Host "Approval service:   http://localhost:8007"
 Write-Host "Context agent:      http://localhost:8004"
 Write-Host "API Gateway:        http://localhost:8010"
+Write-Host "MySQL monitor:      http://localhost:8011"
 if (-not $NoUi) {
     Write-Host "Streamlit UI:       http://localhost:8501"
 }

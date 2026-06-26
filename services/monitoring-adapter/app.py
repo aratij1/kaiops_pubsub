@@ -1,26 +1,40 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
 import re
 import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from common.config import get_settings
 from common.database import create_engine, create_schema, create_session_factory
-from common.models import Alert, AlertSeverity, Approval, ApprovalDecision, Recommendation
+from common.models import (
+    Alert,
+    AlertSeverity,
+    Approval,
+    ApprovalDecision,
+    Recommendation,
+    RemediationAction,
+    RemediationStatus,
+    ResolutionReport,
+)
 from common.repository import IncidentRepository
 from common.service import create_app
 from common.topics import RAW_ALERTS
-from fastapi import Body, Header
+from fastapi import Body, Header, HTTPException
 
 ALERT_BODY = Body(...)
 
 settings = get_settings()
 settings.service_name = "monitoring-adapter"
 app = create_app(title="KaiOps Monitoring Adapter", settings=settings)
+RECENT_ALERTS: deque[dict[str, Any]] = deque(maxlen=200)
+PENDING_WORKFLOWS: dict[str, dict[str, Any]] = {}
+CLOSED_INCIDENTS: deque[dict[str, Any]] = deque(maxlen=500)
 
 SCENARIOS: dict[str, dict[str, Any]] = {
     "payment-latency": {
@@ -775,6 +789,116 @@ async def run_local_payment_workflow(
             completed_at=datetime.now(timezone.utc),
         )
     )
+    requires_human_approval = bool(decision.requires_approval) or str(recommendation.risk).strip().lower() == "high"
+    finops = build_finops_summary(model_usage, model_errors)
+
+    if requires_human_approval:
+        pending_approval = Approval(
+            incident_id=incident.id,
+            recommendation_id=recommendation.id,
+            decision=ApprovalDecision.PENDING,
+            approver=None,
+            channel="web",
+            comment=scenario["remediation_comment"],
+            trace_id=trace_id,
+        )
+        approval_event = {
+            "sequence": 5,
+            "agent": "Human Approval Layer",
+            "action": "Paused workflow for user approval",
+            "input": {
+                "incident_id": incident.id,
+                "recommendation_id": recommendation.id,
+                "recommended_action": recommendation.recommended_action,
+                "channel": pending_approval.channel,
+            },
+            "decision": pending_approval.decision.value,
+            "output": "Awaiting explicit user decision in Approval Workbench",
+            "communicates_to": "Approval Workbench",
+            "metrics": {"approval_required": True, "channel": pending_approval.channel},
+        }
+        await persist_step(
+            lambda repo: repo.save_approval(pending_approval),
+            track_agent_work_operation(
+                incident_id=incident.id,
+                agent_name="Human Approval Layer",
+                work_item="Await user approval decision",
+                status="pending",
+                sequence=5,
+                trace_id=trace_id,
+                ticket_id=incident.ticket_id,
+                details={"decision": approval_event["decision"], "metrics": approval_event["metrics"]},
+                started_at=now,
+                completed_at=None,
+            ),
+        )
+
+        metrics = {
+            "alerts_processed": 1,
+            "deduplicated_count": enriched_alert.deduplicated_count,
+            "severity": enriched_alert.severity.value,
+            "related_incidents": len(context.related_incidents),
+            "dependency_services": len(context.dependency_services),
+            "recent_changes": len(context.recent_changes),
+            "recommendation_confidence": recommendation.confidence,
+            "agent_handoffs": 4,
+            "approval_required": True,
+            "remediation_status": "pending_approval",
+            "health_restored": False,
+            "alerts_cleared": False,
+        }
+
+        base_events = [alert_event, orchestrator_event, context_event, resolution_event]
+        PENDING_WORKFLOWS[str(incident.id)] = {
+            "flow_id": flow_id,
+            "trace_id": trace_id,
+            "scenario": {
+                "id": flow_id,
+                "title": scenario["title"],
+                "recommended_action": scenario["recommended_action"],
+            },
+            "alert": enriched_alert.model_dump(mode="json"),
+            "incident": incident.model_dump(mode="json"),
+            "decision": decision.__dict__,
+            "context": context.model_dump(mode="json"),
+            "recommendation": recommendation.model_dump(mode="json"),
+            "events_base": base_events,
+            "metrics_base": {
+                "alerts_processed": 1,
+                "deduplicated_count": enriched_alert.deduplicated_count,
+                "severity": enriched_alert.severity.value,
+                "related_incidents": len(context.related_incidents),
+                "dependency_services": len(context.dependency_services),
+                "recent_changes": len(context.recent_changes),
+                "recommendation_confidence": recommendation.confidence,
+                "approval_required": True,
+            },
+            "finops": finops,
+            "ticket_id": incident.ticket_id,
+            "service": incident.service,
+        }
+
+        return {
+            "mode": "local-no-kafka",
+            "scenario": {
+                "id": flow_id,
+                "title": scenario["title"],
+                "recommended_action": scenario["recommended_action"],
+            },
+            "alert": enriched_alert.model_dump(mode="json"),
+            "incident": incident.model_dump(mode="json"),
+            "decision": decision.__dict__,
+            "context": context.model_dump(mode="json"),
+            "recommendation": recommendation.model_dump(mode="json"),
+            "approval": pending_approval.model_dump(mode="json"),
+            "remediation_action": {},
+            "closure_report": {},
+            "metrics": metrics,
+            "finops": finops,
+            "events": base_events + [approval_event],
+            "next_step": "Awaiting user approval for high-risk action. Approve in Approval tab to continue workflow.",
+        }
+
     approval = Approval(
         incident_id=incident.id,
         recommendation_id=recommendation.id,
@@ -788,7 +912,7 @@ async def run_local_payment_workflow(
     approval_event = {
         "sequence": 5,
         "agent": "Human Approval Layer",
-        "action": "Auto-approved demo recommendation",
+        "action": "Auto-approved low-risk recommendation",
         "input": {
             "incident_id": incident.id,
             "recommendation_id": recommendation.id,
@@ -798,7 +922,7 @@ async def run_local_payment_workflow(
         "decision": approval.decision.value,
         "output": f"Approved by {approval.approver} on {approval.channel}",
         "communicates_to": "Remediation Automation Engine via approval-events",
-        "metrics": {"approval_required": decision.requires_approval, "channel": approval.channel},
+        "metrics": {"approval_required": False, "channel": approval.channel},
     }
     await persist_step(
         track_agent_work_operation(
@@ -895,14 +1019,13 @@ async def run_local_payment_workflow(
         "recent_changes": len(context.recent_changes),
         "recommendation_confidence": recommendation.confidence,
         "agent_handoffs": 6,
-        "approval_required": decision.requires_approval,
+        "approval_required": False,
         "remediation_status": action.status.value,
         "health_restored": closure_report.health_restored,
         "alerts_cleared": closure_report.alerts_cleared,
     }
-    finops = build_finops_summary(model_usage, model_errors)
 
-    return {
+    final_payload = {
         "mode": "local-no-kafka",
         "scenario": {
             "id": flow_id,
@@ -930,6 +1053,303 @@ async def run_local_payment_workflow(
         ],
         "next_step": "Incident closed in local demo. Review closure report and lessons learned.",
     }
+    _record_closed_incident(
+        scenario=final_payload.get("scenario", {}),
+        incident=final_payload.get("incident", {}),
+        recommendation=final_payload.get("recommendation", {}),
+        remediation_action=final_payload.get("remediation_action", {}),
+        closure_report=final_payload.get("closure_report", {}),
+        metrics=final_payload.get("metrics", {}),
+        trace_id=trace_id,
+    )
+    return final_payload
+
+
+async def continue_pending_workflow(
+    *,
+    flow_id: str,
+    incident_id: str,
+    recommendation_id: str,
+    decision_token: str,
+    approver: str | None,
+    channel: str | None,
+    comment: str | None,
+    modified_action: str | None,
+    trace_id: str | None,
+) -> dict[str, Any]:
+    from closure_service import ClosureValidationAgent
+    from remediation_engine import RemediationEngine
+
+    pending = PENDING_WORKFLOWS.get(str(incident_id))
+    if not pending:
+        raise HTTPException(status_code=404, detail="No pending workflow found for incident")
+
+    if str(pending.get("flow_id")) != str(flow_id):
+        raise HTTPException(status_code=400, detail="Flow ID does not match pending workflow")
+
+    recommendation_data = pending.get("recommendation", {})
+    if str(recommendation_data.get("id", "")) != str(recommendation_id):
+        raise HTTPException(status_code=400, detail="Recommendation ID does not match pending workflow")
+
+    token = str(decision_token or "").strip().lower()
+    decision_map = {
+        "approve": ApprovalDecision.APPROVED,
+        "approved": ApprovalDecision.APPROVED,
+        "reject": ApprovalDecision.REJECTED,
+        "rejected": ApprovalDecision.REJECTED,
+        "modify": ApprovalDecision.MODIFIED,
+        "modified": ApprovalDecision.MODIFIED,
+    }
+    approval_decision = decision_map.get(token)
+    if approval_decision is None:
+        raise HTTPException(status_code=400, detail="Invalid approval decision")
+
+    approval_trace_id = trace_id or str(pending.get("trace_id") or "") or None
+    incident_uuid = UUID(str(incident_id))
+    recommendation_uuid = UUID(str(recommendation_id))
+
+    async def persist_step(*operations: Any) -> None:
+        session_factory = getattr(app.state, "session_factory", None)
+        engine = None
+        if not settings.database_enabled:
+            return
+        if session_factory is None:
+            engine = create_engine(settings)
+            session_factory = create_session_factory(engine)
+            await create_schema(engine)
+        try:
+            async with session_factory() as session:
+                repo = IncidentRepository(session)
+                for operation in operations:
+                    await operation(repo)
+                await session.commit()
+        finally:
+            if engine is not None:
+                await engine.dispose()
+
+    def track_agent_work_operation(
+        *,
+        incident_id_value: Any,
+        agent_name: str,
+        work_item: str,
+        status: str,
+        sequence: int,
+        trace_id_value: str | None,
+        ticket_id: str | None,
+        details: dict[str, Any] | None = None,
+        started_at: datetime | None = None,
+        completed_at: datetime | None = None,
+    ):
+        async def _operation(repo: IncidentRepository) -> None:
+            await repo.save_agent_work_item(
+                incident_id=incident_id_value,
+                agent_name=agent_name,
+                work_item=work_item,
+                status=status,
+                sequence=sequence,
+                trace_id=trace_id_value,
+                ticket_id=ticket_id,
+                details=details or {},
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+
+        return _operation
+
+    approval = Approval(
+        incident_id=incident_uuid,
+        recommendation_id=recommendation_uuid,
+        decision=approval_decision,
+        approver=(approver or "sre@example.com").strip() or "sre@example.com",
+        channel=(channel or "web").strip() or "web",
+        comment=(comment or "").strip() or None,
+        modified_action=(modified_action or "").strip() or None,
+        trace_id=approval_trace_id,
+    )
+
+    now = datetime.now(timezone.utc)
+    await persist_step(
+        lambda repo: repo.save_approval(approval),
+        track_agent_work_operation(
+            incident_id_value=incident_uuid,
+            agent_name="Human Approval Layer",
+            work_item="Review and approve recommendation",
+            status="completed",
+            sequence=5,
+            trace_id_value=approval_trace_id,
+            ticket_id=str(pending.get("ticket_id") or "") or None,
+            details={"decision": approval.decision.value, "channel": approval.channel},
+            started_at=now,
+            completed_at=datetime.now(timezone.utc),
+        ),
+    )
+
+    incident_data = pending.get("incident", {}) if isinstance(pending.get("incident"), dict) else {}
+    service_name = str(incident_data.get("service") or pending.get("service") or "unknown")
+
+    if approval.decision == ApprovalDecision.REJECTED:
+        action = RemediationAction(
+            incident_id=incident_uuid,
+            approval_id=approval.id,
+            action_type="manual-review",
+            target=service_name,
+            status=RemediationStatus.SKIPPED,
+            output="Remediation skipped because approval was rejected.",
+            trace_id=approval_trace_id,
+        )
+        closure_report = ResolutionReport(
+            incident_id=incident_uuid,
+            recommendation_id=recommendation_uuid,
+            remediation_action_id=action.id,
+            root_cause=str(recommendation_data.get("root_cause", "N/A")),
+            impact=str(recommendation_data.get("impact", "N/A")),
+            action_taken="Approval rejected",
+            validation={"approval_rejected": True},
+            alerts_cleared=False,
+            health_restored=False,
+            knowledge_base_entry="Workflow halted: recommendation rejected during approval.",
+            lessons_learned=["High-risk action requires explicit approval before remediation."],
+            trace_id=approval_trace_id,
+        )
+    else:
+        engine = RemediationEngine()
+        action = engine.build_action(approval)
+        action.parameters.update(
+            {
+                "root_cause": str(recommendation_data.get("root_cause", "N/A")),
+                "impact": str(recommendation_data.get("impact", "N/A")),
+            }
+        )
+        if approval.decision == ApprovalDecision.MODIFIED and approval.modified_action:
+            action.action_type = approval.modified_action
+        action = await engine.execute(action)
+        action.trace_id = approval_trace_id
+
+        closure_report = await ClosureValidationAgent().validate(action)
+        closure_report.trace_id = approval_trace_id
+
+    await persist_step(
+        lambda repo: repo.save_action(action),
+        lambda repo: repo.save_report(closure_report),
+        lambda repo: repo.save_knowledge_base(closure_report, service=service_name),
+    )
+
+    remediation_status = "completed" if action.status.value == "succeeded" else action.status.value
+    await persist_step(
+        track_agent_work_operation(
+            incident_id_value=incident_uuid,
+            agent_name="Remediation Automation Engine",
+            work_item="Execute remediation strategy",
+            status=remediation_status,
+            sequence=6,
+            trace_id_value=approval_trace_id,
+            ticket_id=str(pending.get("ticket_id") or "") or None,
+            details={"status": action.status.value, "target": action.target},
+            started_at=now,
+            completed_at=datetime.now(timezone.utc),
+        ),
+        track_agent_work_operation(
+            incident_id_value=incident_uuid,
+            agent_name="Closure & Validation",
+            work_item="Validate recovery and close incident",
+            status="completed" if closure_report.health_restored else "failed",
+            sequence=7,
+            trace_id_value=approval_trace_id,
+            ticket_id=str(pending.get("ticket_id") or "") or None,
+            details={
+                "health_restored": closure_report.health_restored,
+                "alerts_cleared": closure_report.alerts_cleared,
+            },
+            started_at=now,
+            completed_at=datetime.now(timezone.utc),
+        ),
+    )
+
+    approval_event = {
+        "sequence": 5,
+        "agent": "Human Approval Layer",
+        "action": "User decision submitted from Approval Workbench",
+        "input": {
+            "incident_id": incident_id,
+            "recommendation_id": recommendation_id,
+            "channel": approval.channel,
+            "comment": approval.comment,
+        },
+        "decision": approval.decision.value,
+        "output": f"Decision by {approval.approver}",
+        "communicates_to": "Remediation Automation Engine",
+        "metrics": {"approval_required": True, "channel": approval.channel},
+    }
+    remediation_event = {
+        "sequence": 6,
+        "agent": "Remediation Automation Engine",
+        "action": "Executed remediation strategy plugin",
+        "input": {
+            "approval_id": str(approval.id),
+            "action_type": action.action_type,
+            "target": action.target,
+        },
+        "decision": f"Selected plugin action {action.action_type}",
+        "output": action.output,
+        "communicates_to": "Closure & Validation via remediation-events",
+        "metrics": {"status": action.status.value, "target": action.target},
+    }
+    closure_event = {
+        "sequence": 7,
+        "agent": "Closure & Validation",
+        "action": "Validated health and generated closure report",
+        "input": {
+            "remediation_action_id": str(action.id),
+            "status": action.status.value,
+            "output": action.output,
+        },
+        "decision": "Health restored" if closure_report.health_restored else "Health not restored",
+        "output": closure_report.knowledge_base_entry,
+        "communicates_to": "Knowledge Base and audit log",
+        "metrics": {
+            "alerts_cleared": closure_report.alerts_cleared,
+            "health_restored": closure_report.health_restored,
+        },
+    }
+
+    metrics_base = pending.get("metrics_base", {}) if isinstance(pending.get("metrics_base"), dict) else {}
+    metrics = {
+        **metrics_base,
+        "agent_handoffs": 6,
+        "approval_required": True,
+        "remediation_status": action.status.value,
+        "health_restored": closure_report.health_restored,
+        "alerts_cleared": closure_report.alerts_cleared,
+    }
+
+    events_base = pending.get("events_base", []) if isinstance(pending.get("events_base"), list) else []
+    final_payload = {
+        "mode": "local-no-kafka",
+        "scenario": pending.get("scenario", {}),
+        "alert": pending.get("alert", {}),
+        "incident": pending.get("incident", {}),
+        "decision": pending.get("decision", {}),
+        "context": pending.get("context", {}),
+        "recommendation": recommendation_data,
+        "approval": approval.model_dump(mode="json"),
+        "remediation_action": action.model_dump(mode="json"),
+        "closure_report": closure_report.model_dump(mode="json"),
+        "metrics": metrics,
+        "finops": pending.get("finops", {}),
+        "events": events_base + [approval_event, remediation_event, closure_event],
+        "next_step": "Incident closed after user approval.",
+    }
+    _record_closed_incident(
+        scenario=final_payload.get("scenario", {}),
+        incident=final_payload.get("incident", {}),
+        recommendation=final_payload.get("recommendation", {}),
+        remediation_action=final_payload.get("remediation_action", {}),
+        closure_report=final_payload.get("closure_report", {}),
+        metrics=final_payload.get("metrics", {}),
+        trace_id=approval_trace_id,
+    )
+    PENDING_WORKFLOWS.pop(str(incident_id), None)
+    return final_payload
 
 
 def build_finops_summary(model_usage: list[dict[str, Any]], model_errors: list[dict[str, str]]) -> dict[str, Any]:
@@ -960,6 +1380,37 @@ def build_finops_summary(model_usage: list[dict[str, Any]], model_errors: list[d
     }
 
 
+def _record_closed_incident(
+    *,
+    scenario: dict[str, Any],
+    incident: dict[str, Any],
+    recommendation: dict[str, Any],
+    remediation_action: dict[str, Any],
+    closure_report: dict[str, Any],
+    metrics: dict[str, Any],
+    trace_id: str | None,
+) -> None:
+    CLOSED_INCIDENTS.appendleft(
+        {
+            "incident_id": str(closure_report.get("incident_id") or incident.get("id") or ""),
+            "flow_id": str(scenario.get("id") or ""),
+            "title": str(scenario.get("title") or incident.get("title") or "Incident"),
+            "service": str(incident.get("service") or "unknown"),
+            "severity": str(metrics.get("severity") or incident.get("severity") or "unknown").upper(),
+            "risk": str(recommendation.get("risk") or "unknown").upper(),
+            "decision": str(recommendation.get("recommended_action") or "N/A"),
+            "action_type": str(remediation_action.get("action_type") or "N/A"),
+            "action_status": str(remediation_action.get("status") or "N/A"),
+            "health_restored": bool(closure_report.get("health_restored")),
+            "alerts_cleared": bool(closure_report.get("alerts_cleared")),
+            "root_cause": str(closure_report.get("root_cause") or "N/A"),
+            "impact": str(closure_report.get("impact") or "N/A"),
+            "trace_id": str(trace_id or closure_report.get("trace_id") or ""),
+            "closed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+
 @app.post("/alerts", response_model=Alert)
 async def ingest_alert(payload: dict = ALERT_BODY, x_trace_id: str | None = Header(default=None)) -> Alert:
     alert = Alert(
@@ -974,7 +1425,54 @@ async def ingest_alert(payload: dict = ALERT_BODY, x_trace_id: str | None = Head
         trace_id=x_trace_id,
     )
     await app.state.producer.publish(RAW_ALERTS, alert, key=alert.service)
+    RECENT_ALERTS.appendleft(
+        {
+            "id": str(alert.id),
+            "trace_id": alert.trace_id,
+            "source": alert.source,
+            "name": alert.name,
+            "service": alert.service,
+            "environment": alert.environment,
+            "severity": alert.severity.value,
+            "description": alert.description,
+            "labels": alert.labels,
+            "annotations": alert.annotations,
+            "created_at": alert.created_at.isoformat(),
+        }
+    )
     return alert
+
+
+@app.get("/alerts")
+async def alerts_help() -> dict[str, Any]:
+    return {
+        "message": "Use POST /alerts to submit alerts. GET /alerts is informational.",
+        "example": {
+            "method": "POST",
+            "path": "/alerts",
+            "payload": {
+                "source": "mysql-monitor",
+                "name": "MySQLUnavailable",
+                "service": "mysql",
+                "severity": "critical",
+                "description": "MySQL monitor cannot reach database",
+            },
+        },
+    }
+
+
+@app.get("/alerts/recent")
+async def get_recent_alerts(limit: int = 50) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit), 200))
+    rows = list(RECENT_ALERTS)[:safe_limit]
+    return {"rows": rows, "count": len(rows)}
+
+
+@app.get("/alerts/all")
+async def get_all_alerts(limit: int = 500) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit), 5000))
+    rows = list(RECENT_ALERTS)[:safe_limit]
+    return {"rows": rows, "count": len(rows)}
 
 
 @app.post("/sample/payment-latency", response_model=Alert)
@@ -1018,6 +1516,13 @@ async def get_agent_work_items(limit: int = 100) -> dict[str, Any]:
     return {"rows": rows}
 
 
+@app.get("/incidents/closed")
+async def get_closed_incidents(limit: int = 100) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit), 500))
+    rows = list(CLOSED_INCIDENTS)[:safe_limit]
+    return {"rows": rows, "count": len(rows)}
+
+
 @app.post("/onboarding/connectivity")
 async def post_onboarding_connectivity(payload: dict[str, Any] = ALERT_BODY) -> dict[str, Any]:
     sanitized = save_onboarding_connectivity(payload)
@@ -1040,3 +1545,22 @@ async def sample_flow_workflow(
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
     return await run_local_payment_workflow(trace_id=x_trace_id, flow_id=flow_id, run_comparison=not fast_mode)
+
+
+@app.post("/sample/{flow_id}/workflow/continue")
+async def continue_flow_workflow(
+    flow_id: str,
+    payload: dict[str, Any] = ALERT_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await continue_pending_workflow(
+        flow_id=flow_id,
+        incident_id=str(payload.get("incident_id") or ""),
+        recommendation_id=str(payload.get("recommendation_id") or ""),
+        decision_token=str(payload.get("decision") or ""),
+        approver=str(payload.get("approver") or "").strip() or None,
+        channel=str(payload.get("channel") or "").strip() or None,
+        comment=str(payload.get("comment") or "").strip() or None,
+        modified_action=str(payload.get("modified_action") or "").strip() or None,
+        trace_id=x_trace_id,
+    )

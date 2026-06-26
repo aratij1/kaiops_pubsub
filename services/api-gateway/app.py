@@ -190,6 +190,60 @@ async def ingest_alert(
     )
 
 
+@app.get("/alerts")
+async def alerts_help() -> dict[str, Any]:
+    return {
+        "message": "Use POST /alerts to ingest alerts. GET /alerts is informational.",
+        "example": {
+            "method": "POST",
+            "path": "/alerts",
+            "payload": {
+                "source": "mysql-monitor",
+                "name": "MySQLThreadsRunningHigh",
+                "service": "mysql",
+                "severity": "high",
+                "description": "MySQL threads running is above threshold.",
+                "labels": {"component": "mysql"},
+                "annotations": {"summary": "MySQL load spike"},
+            },
+        },
+    }
+
+
+@app.get("/alerts/recent")
+async def get_recent_alerts(
+    request: Request,
+    limit: int = 50,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/alerts/recent?{urlencode({'limit': str(limit)})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/alerts/all")
+async def get_all_alerts(
+    request: Request,
+    limit: int = 500,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/alerts/all?{urlencode({'limit': str(limit)})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.post("/sample/payment-latency")
 async def sample_payment_latency(
     request: Request,
@@ -286,6 +340,23 @@ async def get_agent_work_items(
     )
 
 
+@app.get("/incidents/closed")
+async def get_closed_incidents(
+    request: Request,
+    limit: int = 100,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/incidents/closed?{urlencode({'limit': str(limit)})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.post("/onboarding/connectivity")
 async def post_onboarding_connectivity(
     request: Request,
@@ -318,6 +389,23 @@ async def sample_flow_workflow(
         path=path,
         target_base=settings.monitoring_adapter_url,
         payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/sample/{flow_id}/workflow/continue")
+async def continue_sample_flow_workflow(
+    flow_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/sample/{flow_id}/workflow/continue",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
         trace_id=trace_id_from_header(x_trace_id),
     )
 

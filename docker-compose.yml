@@ -176,6 +176,20 @@ services:
       kafka: { condition: service_healthy }
       postgres: { condition: service_healthy }
 
+  mysql-monitor:
+    build: *service-build
+    environment:
+      MYSQL_HOST: ${MYSQL_HOST:-host.docker.internal}
+      MYSQL_PORT: ${MYSQL_PORT:-3306}
+      MYSQL_USER: ${MYSQL_USER:-root}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-}
+      MYSQL_POLL_SECONDS: ${MYSQL_POLL_SECONDS:-15}
+      MYSQL_CONNECT_TIMEOUT: ${MYSQL_CONNECT_TIMEOUT:-5}
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/services/mysql-monitor
+    ports: ["8011:8000"]
+
   ui:
     build: *service-build
     environment:

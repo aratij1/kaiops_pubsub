@@ -9,9 +9,13 @@ from urllib.parse import quote
 
 import httpx
 import streamlit as st
+from agent_center import render_agent_command_center
+from session_controller import apply_guidance_selection, apply_workflow_payload, ensure_ui_defaults
+from workflow_actions import fetch_guidance_matches, run_selected_flow
 
 GATEWAY_BASE = os.getenv("API_GATEWAY_URL", "http://localhost:8010")
 MONITORING_ADAPTER_BASE = os.getenv("MONITORING_ADAPTER_URL", "http://localhost:8001")
+MYSQL_MONITOR_BASE = os.getenv("MYSQL_MONITOR_URL", "http://localhost:8011")
 UI_REQUEST_TIMEOUT_SECONDS = float(os.getenv("UI_REQUEST_TIMEOUT_SECONDS", "240"))
 
 def _agent_icon_data_uri(glyph: str, background: str) -> str:
@@ -228,6 +232,153 @@ def _fetch_flows_cached() -> list[dict[str, Any]]:
         return []
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def _fetch_recent_alerts_cached(limit: int = 50) -> list[dict[str, Any]]:
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(f"{GATEWAY_BASE}/alerts/recent", params={"limit": max(1, int(limit))})
+            resp.raise_for_status()
+            payload = resp.json()
+        inner = payload.get("data", payload)
+        rows = inner.get("rows", []) if isinstance(inner, dict) else []
+        return [row for row in rows if isinstance(row, dict)]
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=8, show_spinner=False)
+def _fetch_all_alerts_cached(limit: int = 500) -> list[dict[str, Any]]:
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(f"{GATEWAY_BASE}/alerts/all", params={"limit": max(1, int(limit))})
+            resp.raise_for_status()
+            payload = resp.json()
+        inner = payload.get("data", payload)
+        rows = inner.get("rows", []) if isinstance(inner, dict) else []
+        return [row for row in rows if isinstance(row, dict)]
+    except Exception:
+        return []
+
+
+def fetch_monitoring_alert_config() -> dict[str, Any]:
+    response = request_json("GET", f"{MYSQL_MONITOR_BASE}/alerts/config", show_error=False)
+    return response if isinstance(response, dict) else {}
+
+
+def save_monitoring_alert_config(payload: dict[str, Any]) -> tuple[bool, str]:
+    response = request_json("POST", f"{MYSQL_MONITOR_BASE}/alerts/config", json=payload, show_error=False)
+    if response and isinstance(response, dict):
+        return True, "Monitoring alert config saved."
+    return False, "Unable to save config. Check mysql-monitor availability."
+
+
+def _build_live_alert_stream_entries(recent_alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for row in recent_alerts:
+        alert_name = str(row.get("name") or "Live Alert").strip()
+        alert_id = str(row.get("id") or row.get("trace_id") or "LIVE").strip()
+        service = str(row.get("service") or "unknown").strip() or "unknown"
+        severity = str(row.get("severity") or "warning").strip().upper()
+        description = str(row.get("description") or "").strip()
+        entries.append(
+            {
+                "id": f"live-{alert_id}",
+                "alert_id": alert_id,
+                "alert_name": alert_name,
+                "title": alert_name,
+                "service": service,
+                "severity": severity,
+                "recommended_action": "Investigate",
+                "description": description,
+                "is_live_alert": True,
+            }
+        )
+    return entries
+
+
+def _match_live_alert_to_flow_id(alert_row: dict[str, Any], flow_entries: list[dict[str, Any]]) -> str | None:
+    if not flow_entries:
+        return None
+
+    source = str(alert_row.get("source") or "").strip().lower()
+    service = str(alert_row.get("service") or "").strip().lower()
+    alert_name = str(alert_row.get("name") or "").strip().lower()
+    description = str(alert_row.get("description") or "").strip().lower()
+    blob = f"{service} {alert_name} {description} {source}".strip()
+
+    best_flow_id: str | None = None
+    best_score = -1
+    for flow in flow_entries:
+        if not isinstance(flow, dict):
+            continue
+        flow_id = str(flow.get("id") or "").strip()
+        if not flow_id:
+            continue
+
+        flow_service = str(flow.get("service") or "").strip().lower()
+        flow_name = str(flow.get("alert_name") or flow.get("title") or "").strip().lower()
+        flow_source = str(flow.get("source") or "").strip().lower()
+        flow_blob = f"{flow_service} {flow_name} {flow_source}".strip()
+
+        score = 0
+        if service and flow_service and service == flow_service:
+            score += 6
+        if service and flow_service and service in flow_service:
+            score += 2
+        if "mysql" in blob and "mysql" in flow_blob:
+            score += 8
+        if "unavailable" in blob and "unavailable" in flow_blob:
+            score += 4
+
+        shared_tokens = [token for token in ("mysql", "replica", "lag", "latency", "timeout", "unavailable") if token in blob and token in flow_blob]
+        score += len(shared_tokens)
+
+        if score > best_score:
+            best_score = score
+            best_flow_id = flow_id
+
+    return best_flow_id if best_score > 0 else None
+
+
+def _build_alert_stream_entries_from_all_alerts(
+    all_alerts: list[dict[str, Any]],
+    *,
+    flow_entries: list[dict[str, Any]] | None = None,
+    limit: int = 120,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    known_flows = flow_entries or []
+    ordered_alerts = sorted(
+        [row for row in all_alerts if isinstance(row, dict)],
+        key=lambda row: str(row.get("created_at") or ""),
+        reverse=True,
+    )
+    for row in ordered_alerts[: max(1, int(limit))]:
+        alert_name = str(row.get("name") or "Live Alert").strip()
+        alert_id = str(row.get("id") or row.get("trace_id") or "LIVE").strip()
+        service = str(row.get("service") or "unknown").strip() or "unknown"
+        severity = str(row.get("severity") or "warning").strip().upper()
+        description = str(row.get("description") or "").strip()
+        source = str(row.get("source") or "monitoring").strip()
+        mapped_flow_id = _match_live_alert_to_flow_id(row, known_flows)
+        entries.append(
+            {
+                "id": f"live-{alert_id}",
+                "alert_id": alert_id,
+                "alert_name": alert_name,
+                "title": alert_name,
+                "service": service,
+                "severity": severity,
+                "recommended_action": "Investigate",
+                "description": description,
+                "source": source,
+                "flow_id": mapped_flow_id,
+                "is_live_alert": True,
+            }
+        )
+    return entries
+
+
 @st.cache_data(ttl=20, show_spinner=False)
 def _check_service_health() -> dict[str, bool]:
     """Cached health check for homepage status pills (TTL 20 s)."""
@@ -273,8 +424,52 @@ def _fetch_observability_recent_cached() -> dict[str, Any]:
         return {}
 
 
-def get_flows() -> list[dict[str, Any]]:
-    return _fetch_flows_cached()
+@st.cache_data(ttl=6, show_spinner=False)
+def _fetch_closed_incidents_cached(limit: int = 120) -> list[dict[str, Any]]:
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(f"{GATEWAY_BASE}/incidents/closed", params={"limit": max(1, int(limit))})
+            resp.raise_for_status()
+            payload = resp.json()
+        inner = payload.get("data", payload)
+        rows = inner.get("rows", []) if isinstance(inner, dict) else []
+        return [row for row in rows if isinstance(row, dict)]
+    except Exception:
+        return []
+
+
+def get_flows(recent_alerts: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    flow_entries = _fetch_flows_cached()
+    live_source = recent_alerts if recent_alerts is not None else _fetch_recent_alerts_cached(limit=50)
+    live_entries = _build_live_alert_stream_entries(live_source)
+    combined = live_entries + flow_entries
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for item in combined:
+        key = str(item.get("id") or item.get("alert_id") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def get_alert_stream_entries(all_alerts: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    flow_entries = _fetch_flows_cached()
+    live_entries = _build_alert_stream_entries_from_all_alerts(
+        all_alerts or _fetch_all_alerts_cached(limit=500),
+        flow_entries=flow_entries,
+    )
+    combined = live_entries + flow_entries
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for item in combined:
+        key = str(item.get("id") or item.get("alert_id") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
 
 
 def metric_row(items: list[tuple[str, Any]]) -> None:
@@ -683,18 +878,127 @@ def _alert_stream_status(severity: str, recommended_action: str, alert_name: str
     return "kaiops-badge-info", sev or "UNKNOWN"
 
 
+def _normalize_alert_source(value: Any) -> str:
+    source = str(value or "").strip().lower()
+    return source or "unknown"
+
+
+def _derive_alert_runtime_state(item: dict[str, Any]) -> tuple[str, str]:
+    """Return (state_label, color_hex) from alert payload fields and known failure indicators."""
+    explicit = str(item.get("status") or item.get("state") or item.get("health") or "").strip().lower()
+    if explicit:
+        if explicit in {"failed", "failure", "error", "down", "unhealthy", "stopped", "offline", "critical"}:
+            return "FAILED", "#dc2626"
+        if explicit in {"running", "ok", "healthy", "up", "online", "success", "active"}:
+            return "RUNNING", "#16a34a"
+
+    source = _normalize_alert_source(item.get("source"))
+    name = str(item.get("alert_name") or item.get("title") or item.get("name") or "").lower()
+    description = str(item.get("description") or "").lower()
+    severity = str(item.get("severity") or "").strip().upper()
+    failure_terms = ("fail", "failed", "failure", "unavailable", "down", "timeout", "error", "lag")
+    has_failure_terms = any(term in name or term in description for term in failure_terms)
+
+    if "mysql" in source and (severity in {"CRITICAL", "HIGH"} or has_failure_terms):
+        return "FAILED", "#dc2626"
+    if severity == "CRITICAL" or has_failure_terms:
+        return "FAILED", "#dc2626"
+    return "RUNNING", "#16a34a"
+
+
 def render_alert_stream(entries: list[dict[str, Any]]) -> str | None:
     if not entries:
         st.caption("No alert stream entries available yet.")
         return None
+
+    enriched_entries: list[dict[str, Any]] = []
+    for item in entries:
+        source = _normalize_alert_source(item.get("source"))
+        source_label = "mysql" if "mysql" in source else source
+        runtime_state, runtime_color = _derive_alert_runtime_state(item)
+        enriched_entries.append(
+            {
+                "item": item,
+                "source_label": source_label,
+                "runtime_state": runtime_state,
+                "runtime_color": runtime_color,
+            }
+        )
+
+    mysql_total = 0
+    mysql_failed = 0
+    other_total = 0
+    other_failed = 0
+    for entry in enriched_entries:
+        source_label = str(entry["source_label"])
+        state_label = str(entry["runtime_state"])
+        is_mysql = source_label == "mysql"
+        if is_mysql:
+            mysql_total += 1
+            if state_label == "FAILED":
+                mysql_failed += 1
+        else:
+            other_total += 1
+            if state_label == "FAILED":
+                other_failed += 1
+
+    st.caption(
+        "MySQL alerts: "
+        f"{mysql_total} (FAILED {mysql_failed}, RUNNING {max(0, mysql_total - mysql_failed)}) | "
+        "Other alerts: "
+        f"{other_total} (FAILED {other_failed}, RUNNING {max(0, other_total - other_failed)})"
+    )
+
+    source_filter_col, state_filter_col = st.columns(2)
+    with source_filter_col:
+        source_filter = st.selectbox(
+            "Source",
+            ["All", "MySQL", "Others"],
+            index=0,
+            key="kaiops_alert_stream_source_filter",
+        )
+    with state_filter_col:
+        state_filter = st.selectbox(
+            "State",
+            ["All", "Failed", "Running"],
+            index=0,
+            key="kaiops_alert_stream_state_filter",
+        )
+
+    filtered_entries = enriched_entries
+    if source_filter == "MySQL":
+        filtered_entries = [entry for entry in filtered_entries if str(entry["source_label"]) == "mysql"]
+    elif source_filter == "Others":
+        filtered_entries = [entry for entry in filtered_entries if str(entry["source_label"]) != "mysql"]
+
+    if state_filter == "Failed":
+        filtered_entries = [entry for entry in filtered_entries if str(entry["runtime_state"]) == "FAILED"]
+    elif state_filter == "Running":
+        filtered_entries = [entry for entry in filtered_entries if str(entry["runtime_state"]) == "RUNNING"]
+
+    if not filtered_entries:
+        st.caption("No alerts match the selected filters.")
+        return None
+
     selected_flow_id: str | None = None
-    for item in entries[:12]:
+    for entry in filtered_entries[:20]:
+        item = entry["item"]
         alert_id = str(item.get("alert_id") or item.get("id") or "N/A")
         alert_name = str(item.get("alert_name") or item.get("title") or "Alert")
         service = str(item.get("service") or "unknown")
+        source_label = str(entry["source_label"])
         severity = str(item.get("severity") or "unknown").upper()
         recommended_action = str(item.get("recommended_action") or "").strip()
         flow_id = str(item.get("id") or "").strip()
+        mapped_flow_id = str(item.get("flow_id") or "").strip()
+        executable_flow_id = mapped_flow_id or (flow_id if not bool(item.get("is_live_alert", False)) else "")
+        mapping_label = (
+            f"Mapped Flow: {executable_flow_id}"
+            if executable_flow_id
+            else "Mapped Flow: none (guidance fallback)"
+        )
+        runtime_state = str(entry["runtime_state"])
+        runtime_color = str(entry["runtime_color"])
 
         badge_class, badge_label = _alert_stream_status(severity, recommended_action, alert_name)
         is_suppressed = badge_label in ("DUPLICATE", "NO ACTION", "IGNORE")
@@ -707,29 +1011,55 @@ def render_alert_stream(entries: list[dict[str, Any]]) -> str | None:
                 f'<span class="kaiops-alert-badge {badge_class}">{badge_label}</span>'
                 f' <span style="font-size:0.78rem; color:#cbd5e1;">{alert_id} | {alert_name}</span>'
                 f'<div style="font-size:0.7rem; color:#94a3b8; margin-bottom:4px; padding-left:4px;">'
-                f'{service} · {severity} · excluded from auto-run</div></div>',
+                f'{service} · {severity} · {source_label} · '
+                f'<span style="color:{runtime_color};font-weight:700;">{runtime_state}</span> · excluded from auto-run</div></div>',
                 unsafe_allow_html=True,
             )
+            st.caption(mapping_label)
         else:
             button_label = f"{alert_id} | {alert_name}"
-            clicked = flow_id and st.button(
-                button_label,
-                key=f"kaiops_alert_stream_{flow_id}",
-                width="stretch",
-            )
+            clicked = False
+            if executable_flow_id:
+                clicked = bool(
+                    st.button(
+                        button_label,
+                        key=f"kaiops_alert_stream_{alert_id}_{executable_flow_id}",
+                        width="stretch",
+                    )
+                )
+            else:
+                clicked = bool(
+                    st.button(
+                        f"{alert_id} | {alert_name} (Open Guidance)",
+                        key=f"kaiops_alert_guidance_{alert_id}",
+                        width="stretch",
+                    )
+                )
             if clicked:
-                selected_flow_id = flow_id
+                if executable_flow_id:
+                    selected_flow_id = executable_flow_id
+                else:
+                    guidance_query = " ".join(
+                        part
+                        for part in [service, alert_name, str(item.get("description", "")), "issue troubleshooting resolution"]
+                        if part
+                    ).strip()
+                    selected_flow_id = f"__guidance__::{guidance_query}"
             st.markdown(
                 f'<span class="kaiops-alert-badge {badge_class}">{badge_label}</span>'
                 f' <span style="font-size:0.7rem; color:#94a3b8; margin-bottom:4px;">'
-                f'{service} · {severity}</span>',
+                f'{service} · {severity} · {source_label} · '
+                f'<span style="color:{runtime_color};font-weight:700;">{runtime_state}</span></span>',
                 unsafe_allow_html=True,
             )
+            st.caption(mapping_label)
     return selected_flow_id
 
 
 def first_actionable_flow(entries: list[dict[str, Any]]) -> str | None:
     for item in entries:
+        if bool(item.get("is_live_alert", False)):
+            continue
         severity = str(item.get("severity") or "unknown").upper()
         recommended_action = str(item.get("recommended_action") or "").strip()
         alert_name = str(item.get("alert_name") or item.get("title") or "")
@@ -798,102 +1128,6 @@ def get_agent_profile(agent_name: str) -> dict[str, str]:
             "mission": "Coordinates incident-resolution logic.",
             "tone": "default",
         },
-    )
-
-
-@st.cache_data(ttl=10, show_spinner=False)
-def _fetch_agent_work_items_cached(limit: int = 100) -> list[dict[str, Any]]:
-    try:
-        with httpx.Client(timeout=8.0) as client:
-            response = client.get(f"{GATEWAY_BASE}/agent-work/items", params={"limit": max(1, int(limit))})
-            response.raise_for_status()
-            payload = response.json()
-        return data_from_gateway(payload).get("rows", [])
-    except Exception:
-        return []
-
-
-def _signal_score(value: Any) -> int:
-    if isinstance(value, bool):
-        return 1 if value else 0
-    if isinstance(value, int):
-        return max(0, value)
-    if isinstance(value, float):
-        if 0.0 <= value <= 1.0:
-            return int(round(value * 100))
-        return max(0, int(round(value)))
-    if isinstance(value, str):
-        return 1 if value.strip() else 0
-    if isinstance(value, (list, tuple, set)):
-        return len(value)
-    if isinstance(value, dict):
-        score = sum(_signal_score(item) for item in value.values())
-        return score if score > 0 else len(value)
-    return 0
-
-
-def render_agent_role_overview(events: list[dict[str, Any]]) -> None:
-    events_by_agent = {str(event.get("agent", "")): event for event in events}
-    st.markdown("#### Agent Command Roles")
-    agent_items = list(AGENT_PROFILES.items())
-    for start in range(0, len(agent_items), 4):
-        columns = st.columns(4)
-        for offset, column in enumerate(columns):
-            index = start + offset
-            if index >= len(agent_items):
-                continue
-
-            agent_name, profile = agent_items[index]
-            event = events_by_agent.get(agent_name, {})
-            status = "COMPLETED" if event else "STANDBY"
-            decision = str(event.get("decision", "Awaiting workflow execution"))
-            decision_text = decision.strip()
-            if len(decision_text) > 88:
-                decision_text = f"{decision_text[:85].rstrip()}..."
-
-            mission_text = str(profile.get("mission", "Coordinates incident-resolution logic.")).strip()
-            icon_image = str(profile.get("icon_image", "")).strip() or _agent_icon_data_uri("AG", "#64748b")
-
-            decision_class = "kaiops-role-decision-complete" if event else "kaiops-role-decision-standby"
-
-            with column:
-                st.markdown(
-                    f"""
-                    <div class="kaiops-role-card">
-                      <p class="kaiops-role-step">Step {index + 1} · {html.escape(status)}</p>
-                      <div class="kaiops-role-title-row" title="{html.escape(mission_text, quote=True)}">
-                        <img class="kaiops-role-icon" src="{html.escape(icon_image, quote=True)}" alt="{html.escape(agent_name)} icon" />
-                        <p class="kaiops-role-title">{html.escape(agent_name)}</p>
-                        <span class="kaiops-role-help" title="{html.escape(mission_text, quote=True)}">&#9432;</span>
-                      </div>
-                      <div class="kaiops-role-decision {decision_class}">{html.escape(decision_text)}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-
-def render_agent_work_tracker(limit: int = 56) -> None:
-    rows = _fetch_agent_work_items_cached(limit=limit)
-    st.markdown("#### Agent Work Status")
-    if not rows:
-        st.caption("No agent work items tracked yet. Run a workflow to populate status records.")
-        return
-
-    st.dataframe(
-        [
-            {
-                "Incident": row.get("incident_id", ""),
-                "Agent": row.get("agent_name", ""),
-                "Work": row.get("work_item", ""),
-                "Status": str(row.get("status", "")).upper(),
-                "Trace": row.get("trace_id", ""),
-                "Updated": row.get("updated_at", ""),
-            }
-            for row in rows
-        ],
-        hide_index=True,
-        use_container_width=True,
     )
 
 
@@ -1102,11 +1336,14 @@ def render_project_onboarding_section() -> None:
 
             save_project = st.form_submit_button("Save Project", type="primary", use_container_width=True)
             if save_project:
+                project_name_value = str(project_name or "").strip()
+                owner_team_value = str(owner_team or "").strip()
+                region_value = str(region or "").strip()
                 st.session_state["onboarding_project"] = {
-                    "name": project_name.strip(),
-                    "owner_team": owner_team.strip(),
+                    "name": project_name_value,
+                    "owner_team": owner_team_value,
                     "environment": environment,
-                    "region": region.strip(),
+                    "region": region_value,
                 }
                 payload = {
                     "project": st.session_state["onboarding_project"],
@@ -1160,12 +1397,13 @@ def render_project_onboarding_section() -> None:
             )
 
         if st.button(f"Test {selected_provider}", key="test_selected_provider", use_container_width=True):
+            connectivity_endpoint = str(connectivity_url or "").strip()
             headers: dict[str, str] = {}
             if provider_config["header_name"] and secret_value:
                 headers[provider_config["header_name"]] = secret_value
-            ok, message = test_connectivity(connectivity_url, headers=headers)
+            ok, message = test_connectivity(connectivity_endpoint, headers=headers)
             provider_key = selected_provider.lower().replace(" ", "_")
-            st.session_state["onboarding_connectivity"][selected_key] = connectivity_url.strip()
+            st.session_state["onboarding_connectivity"][selected_key] = connectivity_endpoint
             st.session_state["onboarding_status"][provider_key] = {"ok": ok, "message": message}
             payload = {
                 "project": st.session_state.get("onboarding_project", {}),
@@ -1188,7 +1426,7 @@ def render_project_onboarding_section() -> None:
             st.success(message) if ok else st.error(message)
 
         if st.button("Save Connectivity Configuration", key="save_connectivity", use_container_width=True):
-            st.session_state["onboarding_connectivity"][selected_key] = connectivity_url.strip()
+            st.session_state["onboarding_connectivity"][selected_key] = str(connectivity_url or "").strip()
             payload = {
                 "project": st.session_state.get("onboarding_project", {}),
                 "prometheus_url": st.session_state["onboarding_connectivity"].get("prometheus_url", provider_defaults["Prometheus"]["url"]),
@@ -1431,7 +1669,7 @@ st.markdown(
                 background: linear-gradient(180deg, #ffffff, #f8fafc);
                 border: 1px solid #dbe4ef;
                 border-radius: 10px;
-                min-height: 290px;
+                min-height: 245px;
                 padding: 12px 14px;
                 display: flex;
                 flex-direction: column;
@@ -1444,7 +1682,7 @@ st.markdown(
             }
             .kaiops-role-title-row {
                 display: flex;
-                align-items: center;
+                align-items: flex-start;
                 gap: 8px;
                 min-height: 48px;
             }
@@ -1486,6 +1724,52 @@ st.markdown(
             .kaiops-role-decision-standby {
                 background: rgba(59,130,246,0.12);
                 color: #1d4ed8;
+            }
+            .kaiops-agent-pipeline-wrap {
+                margin: 6px 0 14px;
+                padding: 12px;
+                border-radius: 12px;
+                background: linear-gradient(180deg, #ffffff, #f8fafc);
+                border: 1px solid #dbe4ef;
+            }
+            .kaiops-agent-pipeline-track {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                overflow-x: auto;
+                padding-bottom: 4px;
+            }
+            .kaiops-agent-pipeline-line {
+                width: 18px;
+                height: 2px;
+                background: #cbd5e1;
+                flex: 0 0 18px;
+            }
+            .kaiops-agent-pipeline-node {
+                min-width: 170px;
+                border: 1px solid #dbe4ef;
+                border-radius: 10px;
+                background: #f8fafc;
+                padding: 8px 10px;
+            }
+            .kaiops-agent-pipeline-step {
+                font-size: 0.65rem;
+                color: #64748b;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 0.03em;
+            }
+            .kaiops-agent-pipeline-name {
+                margin-top: 2px;
+                font-size: 0.82rem;
+                color: #0f172a;
+                font-weight: 700;
+                line-height: 1.25;
+            }
+            .kaiops-agent-pipeline-status {
+                margin-top: 6px;
+                font-size: 0.74rem;
+                font-weight: 700;
             }
             .kaiops-hero-wrap {
                 background: linear-gradient(118deg, #0f172a 0%, #1e1b4b 30%, #1d4ed8 65%, #0ea5e9 100%);
@@ -1735,14 +2019,16 @@ _dot_agents = "" if _health.get("monitoring_adapter") else "kaiops-hero-pill-dot
 _gw_label = "Gateway Active" if _health.get("gateway") else "Gateway Offline"
 _rag_label = "RAG Grounded" if _health.get("rag") else "RAG Not Ready"
 _agents_label = "Agents Online" if _health.get("monitoring_adapter") else "Agents Offline"
-flows = get_flows()
+recent_alerts_snapshot = _fetch_recent_alerts_cached(limit=50)
+all_alerts_snapshot = _fetch_all_alerts_cached(limit=500)
+flows = _fetch_flows_cached()
+alert_stream_entries = get_alert_stream_entries(all_alerts=all_alerts_snapshot)
+ensure_ui_defaults(st.session_state)
 workflow = st.session_state.get("workflow", {})
 if "flow_catalog_preview" not in st.session_state:
     st.session_state["flow_catalog_preview"] = {
         "data": {"entries": flows, "count": len(flows), "path": "rag/flows.json"}
     }
-if "selected_flow" not in st.session_state:
-    st.session_state["selected_flow"] = "payment-latency"
 catalog_preview = st.session_state.get("flow_catalog_preview")
 catalog_entries = data_from_gateway(catalog_preview).get("entries", []) if catalog_preview else flows
 if "initial_flow_loaded" not in st.session_state:
@@ -1776,14 +2062,27 @@ if current_nav_section != "onboarding":
         """,
         unsafe_allow_html=True,
     )
-    render_agent_role_overview(sorted_events)
-    render_agent_work_tracker()
-
 if current_nav_section != "onboarding" and not st.session_state.get("workflow") and not st.session_state.get("initial_flow_loaded"):
     default_flow_id = first_actionable_flow(catalog_entries)
     if default_flow_id:
         st.session_state["selected_flow"] = default_flow_id
         st.session_state["initial_flow_loaded"] = True
+
+if (
+    current_nav_section != "onboarding"
+    and not st.session_state.get("workflow")
+    and not st.session_state.get("alerts_guidance_open")
+    and st.session_state.get("selected_flow")
+):
+    if run_selected_flow(
+        str(st.session_state.get("selected_flow", "")),
+        gateway_base=GATEWAY_BASE,
+        request_json=request_json,
+        state=st.session_state,
+        fast_mode_enabled=bool(st.session_state.get("fast_mode_enabled", True)),
+    ):
+        st.session_state["last_flow_refresh_ts"] = time.time()
+        st.rerun()
 
 with st.sidebar:
     if current_nav_section != "onboarding":
@@ -1820,23 +2119,94 @@ with st.sidebar:
 
     st.markdown('<div class="kaiops-sidebar-section">Alert Stream</div>', unsafe_allow_html=True)
     with st.container(border=True):
-        if catalog_entries:
-            selected_from_stream = render_alert_stream(catalog_entries)
+        if alert_stream_entries:
+            selected_from_stream = render_alert_stream(alert_stream_entries)
             if selected_from_stream:
-                st.session_state["selected_flow"] = selected_from_stream
-                gateway_response = request_json(
-                    "POST",
-                    f"{GATEWAY_BASE}/sample/{selected_from_stream}/workflow",
-                    params={"fast_mode": str(st.session_state.get("fast_mode_enabled", True)).lower()},
-                )
-                if gateway_response:
-                    st.session_state["gateway_response"] = gateway_response
-                    st.session_state["workflow"] = gateway_response.get("data", {})
-                    st.session_state["last_flow_refresh_ts"] = time.time()
-                    st.success(f"Flow {selected_from_stream} executed from alert stream.")
+                if selected_from_stream.startswith("__guidance__::"):
+                    apply_guidance_selection(st.session_state, selected_from_stream.split("::", 1)[1])
+                    st.success("Opened RAG guidance for selected live alert.")
                     st.rerun()
+                else:
+                    if run_selected_flow(
+                        selected_from_stream,
+                        gateway_base=GATEWAY_BASE,
+                        request_json=request_json,
+                        state=st.session_state,
+                        fast_mode_enabled=bool(st.session_state.get("fast_mode_enabled", True)),
+                    ):
+                        _fetch_closed_incidents_cached.clear()
+                        st.session_state["last_flow_refresh_ts"] = time.time()
+                        st.success(f"Flow {selected_from_stream} executed from alert stream.")
+                        st.rerun()
         else:
             st.caption("Load the catalog or ingest incident documents to populate the live alert stream.")
+
+    st.markdown('<div class="kaiops-sidebar-section">Monitoring Alert Config</div>', unsafe_allow_html=True)
+    with st.container(border=True):
+        current_config = fetch_monitoring_alert_config()
+        if not current_config:
+            st.caption("mysql-monitor config endpoint is not reachable.")
+        with st.form("monitoring_alert_config_form"):
+            alerts_enabled = st.toggle(
+                "Enable MySQL alert ingestion",
+                value=bool(current_config.get("alerts_enabled", True)),
+            )
+            cooldown = st.number_input(
+                "Alert cooldown seconds",
+                min_value=30,
+                max_value=3600,
+                value=int(current_config.get("alert_cooldown_seconds", 300) or 300),
+                step=10,
+            )
+            threads_threshold = st.number_input(
+                "Threads running threshold",
+                min_value=1,
+                max_value=100000,
+                value=int(current_config.get("threads_running_threshold", 40) or 40),
+                step=1,
+            )
+            slow_queries_threshold = st.number_input(
+                "Slow queries delta threshold",
+                min_value=1,
+                max_value=100000,
+                value=int(current_config.get("slow_queries_delta_threshold", 5) or 5),
+                step=1,
+            )
+            aborted_threshold = st.number_input(
+                "Aborted connects delta threshold",
+                min_value=1,
+                max_value=100000,
+                value=int(current_config.get("aborted_connects_delta_threshold", 3) or 3),
+                step=1,
+            )
+            alert_endpoint = st.text_input(
+                "KaiOps alert endpoint",
+                value=str(current_config.get("kaiops_alert_endpoint", f"{GATEWAY_BASE}/alerts")),
+            )
+            alert_timeout = st.number_input(
+                "Alert endpoint timeout seconds",
+                min_value=1.0,
+                max_value=120.0,
+                value=float(current_config.get("kaiops_alert_timeout_seconds", 8.0) or 8.0),
+                step=0.5,
+            )
+
+            if st.form_submit_button("Save Monitoring Alert Config", use_container_width=True):
+                ok, message = save_monitoring_alert_config(
+                    {
+                        "alerts_enabled": alerts_enabled,
+                        "alert_cooldown_seconds": int(cooldown),
+                        "threads_running_threshold": int(threads_threshold),
+                        "slow_queries_delta_threshold": int(slow_queries_threshold),
+                        "aborted_connects_delta_threshold": int(aborted_threshold),
+                        "kaiops_alert_endpoint": alert_endpoint.strip(),
+                        "kaiops_alert_timeout_seconds": float(alert_timeout),
+                    }
+                )
+                if ok:
+                    st.success(message)
+                else:
+                    st.error(message)
 
     st.session_state.pop("selected_trace_step", None)
 
@@ -1885,9 +2255,12 @@ with st.sidebar:
                 st.caption(f"Gateway: {gateway_interval}s | Flow: {flow_interval}s")
 
         if st.button("Refresh Gateway Events", width="stretch"):
+            _fetch_recent_alerts_cached.clear()
+            _fetch_all_alerts_cached.clear()
             st.session_state["gateway_summary"] = request_json("GET", f"{GATEWAY_BASE}/observability/summary")
             st.session_state["gateway_recent"] = request_json("GET", f"{GATEWAY_BASE}/observability/recent")
             st.session_state["last_gateway_refresh_ts"] = time.time()
+            st.rerun()
 
 if st.session_state.get("nav_section") == "onboarding":
     render_project_onboarding_section()
@@ -2096,20 +2469,22 @@ if st.session_state.get("auto_refresh_enabled"):
     flow_interval = int(st.session_state.get("flow_rerun_interval", 60))
 
     if now - last_gateway_refresh >= gateway_interval:
+        _fetch_recent_alerts_cached.clear()
+        _fetch_all_alerts_cached.clear()
         st.session_state["gateway_summary"] = request_json("GET", f"{GATEWAY_BASE}/observability/summary")
         st.session_state["gateway_recent"] = request_json("GET", f"{GATEWAY_BASE}/observability/recent")
         st.session_state["last_gateway_refresh_ts"] = now
 
     if st.session_state.get("flow_rerun_enabled") and st.session_state.get("selected_flow"):
         if now - last_flow_refresh >= flow_interval:
-            auto_flow_response = request_json(
-                "POST",
-                f"{GATEWAY_BASE}/sample/{st.session_state['selected_flow']}/workflow",
-                params={"fast_mode": str(st.session_state.get("fast_mode_enabled", True)).lower()},
-            )
-            if auto_flow_response:
-                st.session_state["gateway_response"] = auto_flow_response
-                st.session_state["workflow"] = auto_flow_response.get("data", {})
+            if run_selected_flow(
+                str(st.session_state.get("selected_flow", "")),
+                gateway_base=GATEWAY_BASE,
+                request_json=request_json,
+                state=st.session_state,
+                fast_mode_enabled=bool(st.session_state.get("fast_mode_enabled", True)),
+            ):
+                st.session_state["last_flow_refresh_ts"] = now
             st.session_state["last_flow_refresh_ts"] = now
 
 workflow = st.session_state.get("workflow", {})
@@ -2124,6 +2499,24 @@ recommendation = workflow.get("recommendation", {})
 remediation = workflow.get("remediation_action", {})
 closure = workflow.get("closure_report", {})
 finops = workflow.get("finops", {})
+guidance_query = str(st.session_state.get("alerts_guidance_query", "")).strip()
+guidance_open = bool(st.session_state.get("alerts_guidance_open"))
+guidance_matches = (
+    fetch_guidance_matches(
+        guidance_query,
+        gateway_base=GATEWAY_BASE,
+        request_json=request_json,
+        data_from_gateway=data_from_gateway,
+        limit=5,
+    )
+    if guidance_open and guidance_query
+    else []
+)
+render_agent_command_center(
+    workflow=workflow,
+    agent_profiles=AGENT_PROFILES,
+    fallback_icon_data_uri=_agent_icon_data_uri("AG", "#64748b"),
+)
 grounded_rag_response: dict[str, Any] = {}
 if workflow:
     grounded_rag_response = get_grounded_rag_search(
@@ -2166,7 +2559,8 @@ if workflow:
         )
 
 if not workflow:
-    st.info("Select an incident from Alert Stream to run a flow.")
+    if not (guidance_open and guidance_query):
+        st.info("Select an incident from Alert Stream to run a flow.")
 else:
     _incident_top_name = str(scenario.get("title") or alert.get("name") or "Incident")
     st.markdown(
@@ -2206,8 +2600,8 @@ else:
         ]
     )
 
-tab_summary, tab_approval, tab_trace, tab_finops, tab_closed = st.tabs(
-    ["Incident Summary", "Approval", "Agent Trace", "FinOps", "Closed Incidents"]
+tab_summary, tab_alerts, tab_approval, tab_trace, tab_finops, tab_closed = st.tabs(
+    ["Incident Summary", "Alerts Raised", "Approval", "Agent Trace", "FinOps", "Closed Incidents"]
 )
 
 with tab_summary:
@@ -2349,6 +2743,94 @@ with tab_summary:
     else:
         st.info("Run a flow to populate the Incident Summary.")
 
+with tab_alerts:
+    st.markdown("### Alerts Raised")
+    all_alerts = all_alerts_snapshot
+    if not all_alerts:
+        st.info("No alerts available yet. Ingest alerts via /alerts or wait for mysql-monitor threshold triggers.")
+    else:
+        severity_options = ["ALL", "CRITICAL", "HIGH", "WARNING", "INFO"]
+        selected_severity = st.selectbox("Severity filter", severity_options, index=0, key="alerts_tab_severity")
+        filtered = all_alerts
+        if selected_severity != "ALL":
+            filtered = [
+                row for row in all_alerts if str(row.get("severity", "")).upper() == selected_severity
+            ]
+
+        st.metric("Total Alerts", len(all_alerts))
+        st.metric("Visible Alerts", len(filtered))
+        st.dataframe(
+            [
+                {
+                    "Created": row.get("created_at", ""),
+                    "Alert": row.get("name", ""),
+                    "Source": row.get("source", ""),
+                    "Service": row.get("service", ""),
+                    "Severity": str(row.get("severity", "")).upper(),
+                    "Description": row.get("description", ""),
+                    "Trace": row.get("trace_id", ""),
+                }
+                for row in filtered
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+
+        st.markdown("#### Quick Doc Links")
+        link_rows = filtered[:20]
+        if link_rows:
+            for index, row in enumerate(link_rows, start=1):
+                alert_name = str(row.get("name", "")).strip()
+                service_name = str(row.get("service", "")).strip()
+                description = str(row.get("description", "")).strip()
+                base_terms = " ".join(part for part in [alert_name, service_name, description] if part).strip()
+                runbook_query = f"{base_terms} runbook troubleshooting resolution".strip()
+                incident_query = f"{base_terms} incident issue resolution".strip()
+                runbook_url = f"{GATEWAY_BASE}/rag/search?query={quote(runbook_query)}&limit=5"
+                incident_url = f"{GATEWAY_BASE}/rag/search?query={quote(incident_query)}&limit=5"
+
+                col_name, col_runbook, col_incident = st.columns([2.2, 1, 1])
+                with col_name:
+                    st.caption(f"{index}. {alert_name or 'Alert'}")
+                with col_runbook:
+                    st.link_button(
+                        "View Runbook",
+                        runbook_url,
+                        use_container_width=True,
+                    )
+                with col_incident:
+                    st.link_button(
+                        "View Incident",
+                        incident_url,
+                        use_container_width=True,
+                    )
+        else:
+            st.caption("No alert rows available for quick links.")
+
+        st.markdown("#### RAG Guidance (Issue / Troubleshooting / Resolution)")
+        default_query = st.session_state.get("alerts_guidance_query", "mysql unavailable issue troubleshooting resolution")
+        guidance_query = st.text_input("Guidance query", value=default_query, key="alerts_guidance_query_input")
+        if st.button("Search Guidance", key="alerts_guidance_search", use_container_width=True):
+            apply_guidance_selection(st.session_state, str(guidance_query or ""))
+
+        if st.session_state.get("alerts_guidance_open") and st.session_state.get("alerts_guidance_query"):
+            matches = fetch_guidance_matches(
+                str(st.session_state.get("alerts_guidance_query", "")),
+                gateway_base=GATEWAY_BASE,
+                request_json=request_json,
+                data_from_gateway=data_from_gateway,
+                limit=5,
+            )
+            if matches:
+                for index, match in enumerate(matches, start=1):
+                    title = str(match.get("title") or f"Guidance {index}")
+                    kind = str(match.get("kind") or "document").title()
+                    preview = str(match.get("preview") or "No preview available.")
+                    with st.expander(f"{index}. {title} ({kind})", expanded=(index == 1)):
+                        st.markdown(preview)
+            else:
+                st.caption("No guidance matches found. Try broader keywords like mysql, unavailable, runbook, resolution.")
+
 with tab_approval:
     if not workflow:
         st.info("Run a flow first. The approval form will be prefilled with incident and recommendation IDs.")
@@ -2359,6 +2841,11 @@ with tab_approval:
         _inc_id_val = str(incident.get("id", ""))
         _rec_id_val = str(recommendation.get("id", ""))
         _trace_val = str(gateway_response.get("trace_id", ""))
+        _approval_pending = str(workflow.get("approval", {}).get("decision", "")).strip().upper() == "PENDING"
+        _active_flow_id = str(scenario.get("id") or st.session_state.get("selected_flow", "")).strip()
+
+        if _approval_pending:
+            st.warning("High-risk workflow is paused. Submit an approval decision to continue remediation and closure.")
 
         # ── Incident context card ──
         st.markdown(
@@ -2438,15 +2925,48 @@ with tab_approval:
                 st.session_state["approval_response"] = request_json(
                     "POST", f"{GATEWAY_BASE}/approval/approve", json=payload
                 )
+                if _approval_pending and _active_flow_id:
+                    resume_payload = {**payload, "decision": "approve"}
+                    resume_response = request_json(
+                        "POST",
+                        f"{GATEWAY_BASE}/sample/{_active_flow_id}/workflow/continue",
+                        json=resume_payload,
+                    )
+                    if apply_workflow_payload(st.session_state, _active_flow_id, resume_response):
+                        _fetch_closed_incidents_cached.clear()
+                        st.success("Approval recorded and workflow completed.")
+                        st.rerun()
             if col_reject.button("✗ Reject", width="stretch"):
                 st.session_state["approval_response"] = request_json(
                     "POST", f"{GATEWAY_BASE}/approval/reject", json=payload
                 )
+                if _approval_pending and _active_flow_id:
+                    resume_payload = {**payload, "decision": "reject"}
+                    resume_response = request_json(
+                        "POST",
+                        f"{GATEWAY_BASE}/sample/{_active_flow_id}/workflow/continue",
+                        json=resume_payload,
+                    )
+                    if apply_workflow_payload(st.session_state, _active_flow_id, resume_response):
+                        _fetch_closed_incidents_cached.clear()
+                        st.warning("Approval rejected and workflow closed without remediation.")
+                        st.rerun()
             if col_modify.button("⟳ Modify", width="stretch"):
                 payload["modified_action"] = comment
                 st.session_state["approval_response"] = request_json(
                     "POST", f"{GATEWAY_BASE}/approval/modify", json=payload
                 )
+                if _approval_pending and _active_flow_id:
+                    resume_payload = {**payload, "decision": "modify", "modified_action": comment}
+                    resume_response = request_json(
+                        "POST",
+                        f"{GATEWAY_BASE}/sample/{_active_flow_id}/workflow/continue",
+                        json=resume_payload,
+                    )
+                    if apply_workflow_payload(st.session_state, _active_flow_id, resume_response):
+                        _fetch_closed_incidents_cached.clear()
+                        st.success("Modified approval recorded and workflow completed.")
+                        st.rerun()
 
         # ── Result ──
         approval_response = st.session_state.get("approval_response", {})
@@ -2466,7 +2986,7 @@ with tab_approval:
                   <b>{_icon} Decision: {_decision}</b>
                   &nbsp;·&nbsp; Channel: {html.escape(str(approval_data.get('channel','N/A')))}
                   &nbsp;·&nbsp; Approver: {html.escape(str(approval_data.get('approver','N/A')))}
-                  &nbsp;·&nbsp; Gateway: {html.escape(str(approval_gateway.get('safety',{{}}).get('decision','N/A')).upper())}
+                                    &nbsp;·&nbsp; Gateway: {html.escape(str(approval_gateway.get('safety', {}).get('decision', 'N/A')).upper())}
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -2612,7 +3132,38 @@ with tab_finops:
             )
 
 with tab_closed:
-    st.markdown("### Closure report")
+    st.markdown("### Closed Incidents")
+    col_closed_refresh, col_closed_spacer = st.columns([1, 3])
+    with col_closed_refresh:
+        if st.button("Refresh Closed Incidents", key="closed_incidents_refresh", width="stretch"):
+            _fetch_closed_incidents_cached.clear()
+            st.rerun()
+
+    closed_rows = _fetch_closed_incidents_cached(limit=120)
+    if closed_rows:
+        st.metric("Closed Incidents", len(closed_rows))
+        st.dataframe(
+            [
+                {
+                    "Closed At": row.get("closed_at", ""),
+                    "Incident": row.get("incident_id", ""),
+                    "Title": row.get("title", ""),
+                    "Service": row.get("service", ""),
+                    "Severity": row.get("severity", ""),
+                    "Risk": row.get("risk", ""),
+                    "Action": row.get("action_type", ""),
+                    "Status": row.get("action_status", ""),
+                    "Health Restored": "YES" if bool(row.get("health_restored")) else "NO",
+                    "Alerts Cleared": "YES" if bool(row.get("alerts_cleared")) else "NO",
+                    "Trace": row.get("trace_id", ""),
+                }
+                for row in closed_rows
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+
+    st.markdown("### Current Closure Report")
     if not closure:
         st.info("Run a flow to generate a closed incident report.")
     else:
