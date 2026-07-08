@@ -1,27 +1,135 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any
 
 from common.config import get_settings
+from common.event_publishers import EventPublisher, RabbitMQPublisher
+from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Alert, Context, Incident
+from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.service import create_app
-from common.topics import CONTEXT_EVENTS
+from common.telemetry import EVENTS_PROCESSED
+from common.topics import CONTEXT_EVENTS, ORCHESTRATION_EVENTS
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import VectorDBConnector
+from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 settings = get_settings()
 settings.service_name = "context-agent"
 agent = ContextIntelligenceAgent()
+tasks: list[asyncio.Task] = []
 
 
-async def startup(_: Any) -> None:
+def _extract_message_bus_provider(payload: dict[str, Any]) -> str:
+    decision = payload.get("decision")
+    if isinstance(decision, dict):
+        provider = str(decision.get("message_bus_provider", "rabbitmq")).strip().lower()
+        if provider in {"kafka", "rabbitmq"}:
+            return provider
+    transport = str(payload.get("transport", "")).strip().lower()
+    if transport in {"kafka", "rabbitmq"}:
+        return transport
+    return "rabbitmq"
+
+
+async def _publish_context_event(
+    *,
+    app: FastAPI,
+    provider: str,
+    alert: Alert,
+    incident: Incident,
+    context: Context,
+    decision: dict[str, Any] | None,
+) -> str:
+    publishers: dict[str, EventPublisher] = getattr(app.state, "message_bus_publishers", {})
+    selected = publishers.get(provider)
+    provider_used = provider
+    if selected is None:
+        provider_used = "rabbitmq"
+        selected = publishers.get("rabbitmq", app.state.producer)
+
+    await selected.publish(
+        CONTEXT_EVENTS,
+        {
+            "context": context,
+            "incident": incident,
+            "decision": decision,
+            "transport": provider_used,
+        },
+        key=alert.service,
+    )
+    return provider_used
+
+
+def _build_ingress_consumers() -> list[tuple[str, object, object]]:
+    workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
+    consumers: list[tuple[str, object, object]] = []
+    for worker in range(workers):
+        consumers.append(
+            (f"rabbitmq-w{worker + 1}", RabbitMQConsumer(settings, ORCHESTRATION_EVENTS), consume_rabbitmq_forever)
+        )
+    if settings.kafka_enabled:
+        for worker in range(workers):
+            consumers.insert(
+                worker,
+                (f"kafka-w{worker + 1}", KafkaConsumer(settings, ORCHESTRATION_EVENTS), consume_kafka_forever),
+            )
+    return consumers
+
+
+async def startup(app: FastAPI) -> None:
     vector_connector().reload()
 
+    app.state.message_bus_publishers = {"rabbitmq": app.state.producer}
 
-app = create_app(title="KaiOps Context Intelligence Agent", settings=settings, startup=startup)
+    if settings.kafka_enabled:
+        app.state.message_bus_publishers["kafka"] = app.state.producer
+
+    if settings.kafka_enabled:
+        rabbitmq_publisher = RabbitMQPublisher(settings)
+        try:
+            await rabbitmq_publisher.start()
+            app.state.message_bus_publishers["rabbitmq"] = rabbitmq_publisher
+        except Exception:
+            app.state.rabbitmq_publisher = None
+        else:
+            app.state.rabbitmq_publisher = rabbitmq_publisher
+    else:
+        app.state.rabbitmq_publisher = None
+
+    async def handle(payload: dict) -> None:
+        alert = Alert.model_validate(payload["alert"])
+        incident = Incident.model_validate(payload["incident"])
+        context = await agent.collect(alert, incident)
+        provider = _extract_message_bus_provider(payload)
+        provider_used = await _publish_context_event(
+            app=app,
+            provider=provider,
+            alert=alert,
+            incident=incident,
+            context=context,
+            decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
+        )
+        EVENTS_PROCESSED.labels(settings.service_name, f"{ORCHESTRATION_EVENTS}:{provider_used}", "ok").inc()
+
+    for source, consumer, consume_forever in _build_ingress_consumers():
+        task = asyncio.create_task(consume_forever(consumer, handle), name=f"context-agent-{source}-consumer")
+        tasks.append(task)
+
+
+async def shutdown(app: FastAPI) -> None:
+    for task in tasks:
+        task.cancel()
+    rabbitmq_publisher = getattr(app.state, "rabbitmq_publisher", None)
+    if rabbitmq_publisher is not None:
+        await rabbitmq_publisher.stop()
+
+
+app = create_app(title="KaiMS Context Intelligence Agent", settings=settings, startup=startup, shutdown=shutdown)
 
 
 class RagDocumentRequest(BaseModel):
@@ -165,7 +273,15 @@ async def collect(payload: dict) -> Context:
     alert = Alert.model_validate(payload["alert"])
     incident = Incident.model_validate(payload["incident"])
     context = await agent.collect(alert, incident)
-    await app.state.producer.publish(CONTEXT_EVENTS, {"context": context, "incident": incident}, key=alert.service)
+    await app.state.producer.publish(
+        CONTEXT_EVENTS,
+        {
+            "context": context,
+            "incident": incident,
+            "decision": payload.get("decision"),
+        },
+        key=alert.service,
+    )
     return context
 
 

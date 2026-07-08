@@ -3,6 +3,8 @@ alert_name: Query Performance Degradation
 service: data-warehouse
 severity: high
 alert_type: performance
+source_system: internal
+source_ref: DW-1008
 
 # Query Performance Degradation (DW-1008)
 

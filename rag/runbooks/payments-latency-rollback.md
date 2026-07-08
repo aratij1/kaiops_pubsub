@@ -1,6 +1,10 @@
 kind: runbook
 title: Payments latency rollback
 services: payments, checkout
+owner_team: platform-ops
+last_reviewed: 2026-07-08
+source_system: internal
+source_ref: RUNBOOK-PAYMENTS-LATENCY-ROLLBACK
 deployment: Deployment 2.5
 
 # Payments latency rollback

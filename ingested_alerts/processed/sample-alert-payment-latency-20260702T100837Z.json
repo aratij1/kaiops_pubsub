@@ -1,0 +1,17 @@
+{
+  "source": "folder-ingest",
+  "name": "Payment latency spike",
+  "service": "payments",
+  "environment": "prod",
+  "severity": "high",
+  "description": "Checkout API p95 latency crossed 900ms for 10 minutes.",
+  "labels": {
+    "env": "prod",
+    "service": "payments",
+    "flow_id": "payment-latency"
+  },
+  "annotations": {
+    "summary": "Customer checkout requests are slow",
+    "runbook": "payments-latency-rollback"
+  }
+}

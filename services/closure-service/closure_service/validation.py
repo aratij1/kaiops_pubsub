@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+from common.agentic import AgentContext, BaseAgent
 from common.models import RemediationAction, RemediationStatus, ResolutionReport
 
 
-class ClosureValidationAgent:
+class ClosureValidationAgent(BaseAgent):
+    name = "validation-agent"
+
+    async def can_execute(self, context: AgentContext) -> bool:
+        return "remediation-action" in context.previous_agent_results
+
+    async def execute(self, context: AgentContext) -> ResolutionReport:
+        action_payload = context.previous_agent_results.get("remediation-action")
+        if not isinstance(action_payload, dict):
+            raise ValueError("AgentContext.previous_agent_results['remediation-action'] is required")
+        report = await self.validate(RemediationAction.model_validate(action_payload))
+        context.set_result(self.name, report.model_dump(mode="json"))
+        return report
+
     async def validate(self, action: RemediationAction) -> ResolutionReport:
         validation = {
             "latency_recovered": action.status == RemediationStatus.SUCCEEDED,

@@ -1,8 +1,10 @@
-alert_id: DW-RUNBOOK
-alert_name: Data Warehouse Incident Response Runbook
-service: data-warehouse
-severity: informational
-alert_type: runbook
+kind: runbook
+title: Data Warehouse Incident Response Runbook
+services: data-warehouse
+owner_team: platform-ops
+last_reviewed: 2026-07-08
+source_system: internal
+source_ref: RUNBOOK-DATA-WAREHOUSE-INCIDENT-RESPONSE
 
 # Data Warehouse Incident Response Runbook
 

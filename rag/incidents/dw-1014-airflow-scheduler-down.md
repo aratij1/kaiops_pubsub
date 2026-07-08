@@ -3,6 +3,8 @@ alert_name: Airflow Scheduler Down
 service: airflow
 severity: critical
 alert_type: scheduler
+source_system: internal
+source_ref: DW-1014
 
 # Airflow Scheduler Down (DW-1014)
 

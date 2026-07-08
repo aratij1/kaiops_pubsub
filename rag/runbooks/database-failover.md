@@ -1,6 +1,10 @@
 kind: runbook
 title: Orders database failover
 services: orders-db, orders
+owner_team: platform-ops
+last_reviewed: 2026-07-08
+source_system: internal
+source_ref: RUNBOOK-DATABASE-FAILOVER
 
 # Orders database failover
 

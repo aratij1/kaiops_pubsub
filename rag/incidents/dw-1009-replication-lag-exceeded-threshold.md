@@ -3,6 +3,8 @@ alert_name: Replication Lag Exceeded Threshold
 service: replication-service
 severity: high
 alert_type: replication
+source_system: internal
+source_ref: DW-1009
 
 # Replication Lag Exceeded Threshold (DW-1009)
 

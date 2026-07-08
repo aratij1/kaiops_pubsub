@@ -1,6 +1,10 @@
-kind: incident
-title: INC-9011 orders database replica lag
-services: orders-db, orders
+alert_id: INC-9011
+alert_name: INC-9011 orders database replica lag
+service: orders-db
+severity: high
+alert_type: replication
+source_system: internal
+source_ref: INC-9011
 
 # INC-9011 orders database replica lag
 

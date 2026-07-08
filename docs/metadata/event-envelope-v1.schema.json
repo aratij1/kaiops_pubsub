@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaiops.local/schemas/event-envelope-v1.schema.json",
+  "title": "KaiMS Event Envelope v1",
+  "type": "object",
+  "required": [
+    "event_id",
+    "event_type",
+    "schema_version",
+    "produced_at",
+    "identity",
+    "scope",
+    "state",
+    "policy",
+    "transport",
+    "idempotency",
+    "payload"
+  ],
+  "properties": {
+    "event_id": { "type": "string", "minLength": 1 },
+    "event_type": { "type": "string", "minLength": 1 },
+    "schema_version": { "type": "string", "const": "1.0" },
+    "produced_at": { "type": "string", "format": "date-time" },
+    "identity": {
+      "type": "object",
+      "required": ["incident_id", "trace_id"],
+      "properties": {
+        "incident_id": { "type": "string", "minLength": 1 },
+        "alert_id": { "type": ["string", "null"] },
+        "trace_id": { "type": "string", "minLength": 1 },
+        "correlation_id": { "type": ["string", "null"] },
+        "causation_id": { "type": ["string", "null"] },
+        "parent_event_id": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "scope": {
+      "type": "object",
+      "required": ["tenant_id", "service", "environment"],
+      "properties": {
+        "tenant_id": { "type": "string", "minLength": 1 },
+        "service": { "type": "string", "minLength": 1 },
+        "environment": { "type": "string", "minLength": 1 },
+        "region": { "type": ["string", "null"] },
+        "team": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "state": {
+      "type": "object",
+      "required": ["severity", "status"],
+      "properties": {
+        "severity": { "type": "string" },
+        "status": { "type": "string" },
+        "owner": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "policy": {
+      "type": "object",
+      "required": ["risk_tier", "execution_mode", "requires_approval", "policy_version"],
+      "properties": {
+        "risk_tier": { "type": "string" },
+        "execution_mode": {
+          "type": "string",
+          "enum": ["human-approval", "guided-auto", "auto-execute", "unknown"]
+        },
+        "requires_approval": { "type": "boolean" },
+        "policy_version": { "type": "string" },
+        "policy_reason": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "ai": {
+      "type": "object",
+      "properties": {
+        "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "model_provider": { "type": ["string", "null"] },
+        "model_name": { "type": ["string", "null"] },
+        "fallback_reason": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "transport": {
+      "type": "object",
+      "required": ["provider", "channel"],
+      "properties": {
+        "provider": { "type": "string", "enum": ["kafka", "rabbitmq", "rest", "noop"] },
+        "channel": { "type": "string", "minLength": 1 },
+        "partition": { "type": ["integer", "null"] },
+        "offset": { "type": ["integer", "null"] },
+        "delivery_tag": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "idempotency": {
+      "type": "object",
+      "required": ["idempotency_key"],
+      "properties": {
+        "idempotency_key": { "type": "string", "minLength": 1 },
+        "fingerprint": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": true
+}

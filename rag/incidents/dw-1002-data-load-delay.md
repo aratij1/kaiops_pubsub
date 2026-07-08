@@ -3,6 +3,8 @@ alert_name: Data Load Delay
 service: data-ingestion
 severity: high
 alert_type: sla_breach
+source_system: internal
+source_ref: DW-1002
 
 # Data Load Delay (DW-1002)
 

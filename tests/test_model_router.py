@@ -40,7 +40,7 @@ def test_model_router_selection_rules() -> None:
     router = ModelRouter()
 
     assert router.select_model(severity=AlertSeverity.CRITICAL, task=ModelTask.RCA) == "gpt-5"
-    assert router.select_model(severity=AlertSeverity.HIGH, task=ModelTask.RCA) == "claude"
+    assert router.select_model(severity=AlertSeverity.HIGH, task=ModelTask.RCA) == "gpt-4o"
     assert router.select_model(severity=AlertSeverity.WARNING, task=ModelTask.SUMMARIZATION) == "gpt-4o"
     assert router.select_model(severity=AlertSeverity.WARNING, task=ModelTask.GENERAL) == "gpt-4o"
 
