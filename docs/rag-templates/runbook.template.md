@@ -26,6 +26,12 @@ Explain what this runbook solves and when to use it.
 2. Step two
 3. Step three
 
+## Troubleshooting Steps
+1. Run top diagnostics for this alert type
+2. Compare telemetry against baseline
+3. Confirm probable fault domain
+4. Decide remediate, escalate, or monitor
+
 ## Remediation Steps
 1. Action one
 2. Action two
