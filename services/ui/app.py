@@ -2726,8 +2726,8 @@ def render_alert_details_page() -> None:
         with right:
             status_badge("Planner", "ENABLED" if planner_used else "FALLBACK")
 
-    tab_summary, tab_events, tab_finops, tab_api, tab_topics, tab_raw = st.tabs(
-        ["Summary", "Agent Events", "FinOps", "API Gateway", "Message Bus Topics", "Raw Payload"]
+    tab_summary, tab_events, tab_finops, tab_api, tab_topics, tab_execution, tab_raw = st.tabs(
+        ["Summary", "Agent Events", "FinOps", "API Gateway", "Message Bus Topics", "Execution Plan", "Raw Payload"]
     )
 
     with tab_summary:
@@ -3172,6 +3172,102 @@ def render_alert_details_page() -> None:
                     st.json(params)
         else:
             st.caption("No parameter payloads found in event inputs.")
+
+    with tab_execution:
+        st.markdown("### Execution Plan")
+        execution_plan = decision.get("execution_plan", {}) if isinstance(decision.get("execution_plan"), dict) else {}
+        if not execution_plan:
+            st.caption("Execution plan details are not available in the decision payload for this workflow.")
+        else:
+            connection = execution_plan.get("connection", {}) if isinstance(execution_plan.get("connection"), dict) else {}
+            connector = connection.get("connector", {}) if isinstance(connection.get("connector"), dict) else {}
+            project = connection.get("project", {}) if isinstance(connection.get("project"), dict) else {}
+            checks = connection.get("connectivity_checks", {}) if isinstance(connection.get("connectivity_checks"), dict) else {}
+            playbook = execution_plan.get("playbook", {}) if isinstance(execution_plan.get("playbook"), dict) else {}
+            preflight = playbook.get("preflight_checks", []) if isinstance(playbook.get("preflight_checks"), list) else []
+            steps = playbook.get("steps", []) if isinstance(playbook.get("steps"), list) else []
+
+            metric_row(
+                [
+                    ("Workflow", str(execution_plan.get("workflow") or "N/A")),
+                    ("Risk Tier", str(execution_plan.get("risk_tier") or "unknown").upper()),
+                    ("Execution Mode", str(execution_plan.get("execution_mode") or "unknown").upper()),
+                    ("Approval Required", "YES" if bool(execution_plan.get("approval_required", False)) else "NO"),
+                ]
+            )
+
+            st.markdown("#### How KaiOPS Connects")
+            st.write(
+                f"- Project: {str(project.get('name') or 'unknown')} | "
+                f"Environment: {str(project.get('environment') or 'unknown')} | "
+                f"Region: {str(project.get('region') or 'unknown')}"
+            )
+            st.write(
+                f"- Connector: {str(connector.get('connector_id') or 'N/A')} "
+                f"({str(connector.get('type') or 'unknown')})"
+            )
+            st.write(f"- Auth Method: {str(connector.get('auth_method') or 'unknown')}")
+            st.write(f"- Secret Ref: {str(connector.get('secret_ref') or 'unknown')}")
+            if connector.get("endpoint"):
+                st.write(f"- Endpoint: {str(connector.get('endpoint'))}")
+            if connector.get("cluster"):
+                st.write(
+                    f"- Cluster: {str(connector.get('cluster'))} | Namespace: {str(connector.get('namespace') or 'N/A')}"
+                )
+
+            if checks:
+                st.markdown("#### Connectivity Checks")
+                st.dataframe(
+                    [
+                        {"System": "Prometheus", "URL": str(checks.get("prometheus_url") or "")},
+                        {"System": "New Relic", "URL": str(checks.get("new_relic_url") or "")},
+                        {"System": "Datadog", "URL": str(checks.get("datadog_url") or "")},
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
+
+            st.markdown("#### Preflight Checks")
+            if preflight:
+                for item in preflight:
+                    st.write(f"- {str(item)}")
+            else:
+                st.caption("No preflight checks were provided.")
+
+            st.markdown("#### Steps and Commands")
+            if steps:
+                for step in steps:
+                    if not isinstance(step, dict):
+                        continue
+                    order = int(step.get("order", 0) or 0)
+                    step_name = str(step.get("name") or f"Step {order}")
+                    step_type = str(step.get("type") or "task")
+                    approval_gate = bool(step.get("approval_gate", False))
+                    commands = step.get("commands", []) if isinstance(step.get("commands"), list) else []
+                    with st.expander(f"Step {order} | {step_name}"):
+                        st.write(f"- Type: {step_type}")
+                        st.write(f"- Approval Gate: {'YES' if approval_gate else 'NO'}")
+                        if commands:
+                            st.dataframe(
+                                [
+                                    {
+                                        "Command ID": str(command.get("id") or ""),
+                                        "Operation": str(command.get("operation") or ""),
+                                        "Allowed": "YES" if bool(command.get("allowed", False)) else "NO",
+                                        "Safety": str(command.get("safety") or "unknown"),
+                                        "Command": str(command.get("command") or ""),
+                                        "Rollback": str(command.get("rollback") or ""),
+                                    }
+                                    for command in commands
+                                    if isinstance(command, dict)
+                                ],
+                                hide_index=True,
+                                width="stretch",
+                            )
+                        else:
+                            st.caption("No executable commands were mapped for this step.")
+            else:
+                st.caption("No execution steps were provided in the plan.")
 
         detected_topics: set[str] = set()
         for event in events:
