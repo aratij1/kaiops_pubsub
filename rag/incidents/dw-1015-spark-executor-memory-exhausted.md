@@ -3,6 +3,8 @@ alert_name: Spark Executor Memory Exhausted
 service: spark-cluster
 severity: high
 alert_type: resource_utilization
+source_system: internal
+source_ref: DW-1015
 
 # Spark Executor Memory Exhausted (DW-1015)
 

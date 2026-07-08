@@ -1,5 +1,6 @@
 RAW_ALERTS = "raw-alerts"
 ENRICHED_ALERTS = "enriched-alerts"
+ORCHESTRATION_EVENTS = "orchestration-events"
 CONTEXT_EVENTS = "context-events"
 RESOLUTION_EVENTS = "resolution-events"
 APPROVAL_EVENTS = "approval-events"
@@ -9,6 +10,7 @@ CLOSURE_EVENTS = "closure-events"
 ALL_TOPICS = [
     RAW_ALERTS,
     ENRICHED_ALERTS,
+    ORCHESTRATION_EVENTS,
     CONTEXT_EVENTS,
     RESOLUTION_EVENTS,
     APPROVAL_EVENTS,

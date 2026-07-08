@@ -3,6 +3,8 @@ alert_name: Fact Table Record Count Mismatch
 service: sales-fact
 severity: critical
 alert_type: reconciliation
+source_system: internal
+source_ref: DW-1013
 
 # Fact Table Record Count Mismatch (DW-1013)
 

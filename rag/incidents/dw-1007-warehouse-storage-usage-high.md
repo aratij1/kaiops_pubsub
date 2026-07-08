@@ -1,8 +1,10 @@
 alert_id: DW-1007
 alert_name: Warehouse Storage Usage High
 service: snowflake
-severity: medium
+severity: high
 alert_type: capacity
+source_system: internal
+source_ref: DW-1007
 
 # Warehouse Storage Usage High (DW-1007)
 

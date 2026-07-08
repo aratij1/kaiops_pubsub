@@ -1,0 +1,14 @@
+# Pipe-delimited scenarios for Monitoring Adapter
+# id|title|source|service|severity|description|root_cause|impact|recommended_action
+payment-latency|Payment latency after deployment|prometheus|payments|CRITICAL|p95 latency above 1200ms for payments checkout path after Deployment 2.5|Deployment 2.5|Payment latency|Rollback deployment
+checkout-pod-crash|Checkout pod crash loop|kubernetes|checkout|HIGH|checkout-api pods are crash looping after config reload|Bad runtime config reload|Checkout availability degradation|Restart pod
+inventory-cpu|Inventory CPU saturation|datadog|inventory|HIGH|inventory service CPU above 92 percent during catalog sync|Catalog sync traffic spike|Inventory lookup latency|Scale deployment
+redis-cache|Redis cache saturation|grafana|cache|HIGH|redis cache memory pressure causing elevated misses|Hot keys and stale cache entries|API latency from cache misses|Clear cache
+database-replica-lag|Database replica lag|azure monitor|orders-db|CRITICAL|orders database replica lag above 180 seconds|Primary database write saturation|Stale order reads|Failover database
+auth-errors|Authentication error spike|splunk|auth|HIGH|auth 5xx errors increased after secret rotation|Secret rotation mismatch|Login failures|Restart service
+search-memory|Search memory leak|prometheus|search|HIGH|search service memory increasing steadily after index refresh|Index refresh memory leak|Search latency and OOM risk|Restart service
+billing-terraform|Billing infrastructure regression|terraform|billing|CRITICAL|billing private endpoint unreachable after terraform apply|Terraform security group change|Billing job failures|Terraform rollback
+fraud-api|Fraud API dependency timeout|datadog|fraud|HIGH|fraud scoring API timeout rate above threshold|Dependency pool exhaustion|Checkout risk checks delayed|API execution
+cdn-errors|CDN error rate increase|grafana|cdn|WARNING|cdn 5xx error rate elevated in edge region|Bad edge rule propagation|Static asset failures|API execution
+
+orders-replica-lag|Orders database replica lag|prometheus|orders-db|CRITICAL|Replica lag above threshold for 10 minutes|Primary write saturation|Stale reads on order queries|Failover database

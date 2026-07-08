@@ -3,6 +3,8 @@ alert_name: Data Pipeline Backlog Growing
 service: data-pipeline
 severity: high
 alert_type: backlog
+source_system: internal
+source_ref: DW-1018
 
 # Data Pipeline Backlog Growing (DW-1018)
 

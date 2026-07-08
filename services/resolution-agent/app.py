@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable, Coroutine
+from typing import Any
 
 from common.config import get_settings
-from common.kafka import KafkaConsumer, consume_forever
+from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Context, Incident, Recommendation
+from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
@@ -17,14 +20,40 @@ settings.service_name = "resolution-agent"
 agent = ResolutionIntelligenceAgent()
 tasks: list[asyncio.Task] = []
 
+ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any, Any, None]]
+
 
 async def startup(app: FastAPI) -> None:
-    consumer = KafkaConsumer(settings, CONTEXT_EVENTS)
+    workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
+    consumers: list[tuple[str, Any, ConsumeRunner]] = []
+    for worker in range(workers):
+        consumers.append((f"rabbitmq-w{worker + 1}", RabbitMQConsumer(settings, CONTEXT_EVENTS), consume_rabbitmq_forever))
+    if settings.kafka_enabled:
+        for worker in range(workers):
+            consumers.insert(
+                worker,
+                (f"kafka-w{worker + 1}", KafkaConsumer(settings, CONTEXT_EVENTS), consume_kafka_forever),
+            )
 
     async def handle(payload: dict) -> None:
         context = Context.model_validate(payload["context"])
         incident = Incident.model_validate(payload["incident"])
+        decision_payload = payload.get("decision", {}) if isinstance(payload.get("decision"), dict) else {}
         recommendation = await agent.resolve(context)
+        policy_version = str(decision_payload.get("policy_version") or "").strip()
+        policy_reason = str(decision_payload.get("policy_reason") or "").strip()
+        if policy_version:
+            recommendation.metadata["policy_version"] = policy_version
+        if policy_reason:
+            recommendation.metadata["policy_reason"] = policy_reason
+        if decision_payload:
+            recommendation.metadata["orchestration_decision"] = {
+                "workflow": decision_payload.get("workflow"),
+                "requires_approval": decision_payload.get("requires_approval"),
+                "message_bus_provider": decision_payload.get("message_bus_provider"),
+                "stream_count": decision_payload.get("stream_count"),
+                "stream_threshold": decision_payload.get("stream_threshold"),
+            }
         if settings.database_enabled:
             async with app.state.session_factory() as session:
                 repo = IncidentRepository(session)
@@ -32,12 +61,14 @@ async def startup(app: FastAPI) -> None:
                 await session.commit()
         await app.state.producer.publish(
             RESOLUTION_EVENTS,
-            {"recommendation": recommendation, "context": context, "incident": incident},
+            {"recommendation": recommendation, "context": context, "incident": incident, "decision": decision_payload},
             key=str(context.incident_id),
         )
         EVENTS_PROCESSED.labels(settings.service_name, CONTEXT_EVENTS, "ok").inc()
 
-    tasks.append(asyncio.create_task(consume_forever(consumer, handle)))
+    for source, consumer, consume_forever in consumers:
+        task = asyncio.create_task(consume_forever(consumer, handle), name=f"resolution-agent-{source}-consumer")
+        tasks.append(task)
 
 
 async def shutdown(_: FastAPI) -> None:
@@ -45,7 +76,7 @@ async def shutdown(_: FastAPI) -> None:
         task.cancel()
 
 
-app = create_app(title="KaiOps Resolution Intelligence Agent", settings=settings, startup=startup, shutdown=shutdown)
+app = create_app(title="KaiMS Resolution Intelligence Agent", settings=settings, startup=startup, shutdown=shutdown)
 
 
 @app.post("/resolve", response_model=Recommendation)

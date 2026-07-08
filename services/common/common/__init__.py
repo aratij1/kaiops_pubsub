@@ -1,5 +1,6 @@
-"""Shared contracts and infrastructure for the KaiOps platform."""
+"""Shared contracts and infrastructure for the KaiMS platform."""
 
+from common.agentic import AgentContext, BaseAgent
 from common.models import (
     Alert,
     AlertSeverity,
@@ -18,10 +19,12 @@ from common.models import (
 )
 
 __all__ = [
+    "AgentContext",
     "Alert",
     "AlertSeverity",
     "Approval",
     "ApprovalDecision",
+    "BaseAgent",
     "Context",
     "GatewayAuditEvent",
     "Incident",

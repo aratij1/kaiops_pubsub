@@ -39,3 +39,10 @@ async def test_closure_validation_generates_report() -> None:
     assert report.health_restored is True
     assert report.alerts_cleared is True
     assert all(report.validation.values())
+
+
+def test_remediation_allowlist_blocks_unknown_action_type() -> None:
+    engine = RemediationEngine()
+
+    assert engine.is_action_allowed("rollback_deployment") is True
+    assert engine.is_action_allowed("shell_exec") is False

@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -17,6 +19,13 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Lint
         run: ruff check .
+      - name: Validate RAG metadata
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            python scripts/validate-rag-metadata-delta.py --rag-root rag --base-ref origin/${{ github.base_ref }}
+          else
+            python scripts/validate-rag-metadata.py --rag-root rag
+          fi
       - name: Test
         run: pytest
 

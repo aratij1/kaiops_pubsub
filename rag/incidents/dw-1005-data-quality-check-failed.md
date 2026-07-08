@@ -3,6 +3,8 @@ alert_name: Data Quality Check Failed
 service: dq-framework
 severity: critical
 alert_type: data_quality
+source_system: internal
+source_ref: DW-1005
 
 # Data Quality Check Failed (DW-1005)
 

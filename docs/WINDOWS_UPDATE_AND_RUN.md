@@ -9,7 +9,7 @@ Use this guide when your local UI still shows old behavior such as
 From the repository root:
 
 ```powershell
-cd C:\Users\LENOVO\Documents\KaiOps\kaiops
+cd C:\Users\LENOVO\Documents\KaiMS\kaiops
 ```
 
 If `git` is available:
@@ -198,4 +198,5 @@ Kafka topic check:
 
 ```powershell
 docker compose exec kafka kafka-console-consumer --bootstrap-server kafka:9092 --topic raw-alerts --from-beginning --max-messages 1
+docker compose exec kafka kafka-console-consumer --bootstrap-server kafka:9092 --topic orchestration-events --from-beginning --max-messages 1
 ```

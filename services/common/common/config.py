@@ -1,7 +1,20 @@
 from functools import lru_cache
+from urllib.parse import quote_plus
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_LOCAL_AUTH_PLACEHOLDER_VALUES = {
+    "JWT_SECRET_KEY": "change-me-in-prod",
+    "ADMIN_USER_PASSWORD": "Admin@123456",
+    "EXECUTIVE_USER_PASSWORD": "Executive@123456",
+    "L3_USER_PASSWORD": "L3Engineer@123456",
+    "L2_USER_PASSWORD": "L2Engineer@123456",
+    "L1_USER_PASSWORD": "L1Operator@123456",
+}
+
+_LOCAL_MYSQL_DEFAULT_URL = "mysql+aiomysql://kaiops:kaiops@localhost:3306/kaiops"
 
 
 class Settings(BaseSettings):
@@ -11,11 +24,24 @@ class Settings(BaseSettings):
     environment: str = Field(default="local", alias="ENVIRONMENT")
     kafka_bootstrap_servers: str = Field(default="localhost:9092", alias="KAFKA_BOOTSTRAP_SERVERS")
     kafka_group_id: str = Field(default="kaiops", alias="KAFKA_GROUP_ID")
+    kafka_consumer_max_retries: int = Field(default=3, alias="KAFKA_CONSUMER_MAX_RETRIES")
+    kafka_dlq_suffix: str = Field(default=".dlq", alias="KAFKA_DLQ_SUFFIX")
+    rabbitmq_url: str = Field(default="amqp://guest:guest@localhost/", alias="RABBITMQ_URL")
+    rabbitmq_exchange: str = Field(default="kaiops.events", alias="RABBITMQ_EXCHANGE")
+    rabbitmq_queue_prefix: str = Field(default="kaiops", alias="RABBITMQ_QUEUE_PREFIX")
+    rabbitmq_consumer_max_retries: int = Field(default=3, alias="RABBITMQ_CONSUMER_MAX_RETRIES")
+    rabbitmq_dlq_suffix: str = Field(default=".dlq", alias="RABBITMQ_DLQ_SUFFIX")
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     database_url: str = Field(
-        default="postgresql+asyncpg://kaiops:kaiops@localhost:5432/kaiops",
+        default=_LOCAL_MYSQL_DEFAULT_URL,
         alias="DATABASE_URL",
     )
+    db: str = Field(default="mysql", alias="DB")
+    db_host: str = Field(default="localhost", alias="DB_HOST")
+    db_port: int = Field(default=3306, alias="DB_PORT")
+    db_user: str = Field(default="kaiops", alias="DB_USER")
+    db_password: str = Field(default="kaiops", alias="DB_PASSWORD")
+    db_database: str = Field(default="kaiops", alias="DB_DATABASE")
     otlp_endpoint: str | None = Field(default=None, alias="OTEL_EXPORTER_OTLP_ENDPOINT")
     model_router_url: str = Field(default="http://model-router:8000", alias="MODEL_ROUTER_URL")
     context_agent_url: str = Field(default="http://context-agent:8000", alias="CONTEXT_AGENT_URL")
@@ -23,9 +49,24 @@ class Settings(BaseSettings):
     monitoring_adapter_url: str = Field(default="http://monitoring-adapter:8000", alias="MONITORING_ADAPTER_URL")
     api_gateway_url: str = Field(default="http://api-gateway:8000", alias="API_GATEWAY_URL")
     kafka_enabled: bool = Field(default=True, alias="KAFKA_ENABLED")
+    event_bus_provider: str = Field(default="kafka", alias="EVENT_BUS_PROVIDER")
+    message_bus_dynamic_routing: bool = Field(default=True, alias="MESSAGE_BUS_DYNAMIC_ROUTING")
+    message_bus_stream_threshold: int = Field(default=500, alias="MESSAGE_BUS_STREAM_THRESHOLD")
+    message_bus_default_provider: str = Field(default="rabbitmq", alias="MESSAGE_BUS_DEFAULT_PROVIDER")
+    message_bus_worker_count: int = Field(default=1, alias="MESSAGE_BUS_WORKER_COUNT")
+    orchestration_llm_planner_enabled: bool = Field(default=False, alias="ORCHESTRATION_LLM_PLANNER_ENABLED")
     kafka_startup_attempts: int = Field(default=30, alias="KAFKA_STARTUP_ATTEMPTS")
     kafka_startup_retry_seconds: float = Field(default=2.0, alias="KAFKA_STARTUP_RETRY_SECONDS")
     database_enabled: bool = Field(default=True, alias="DATABASE_ENABLED")
+    model_gateway_provider: str = Field(default="router", alias="MODEL_GATEWAY_PROVIDER")
+    alert_correlation_threshold: float = Field(default=0.72, alias="ALERT_CORRELATION_THRESHOLD")
+    alert_retention_minutes: int = Field(default=30, alias="ALERT_RETENTION_MINUTES")
+    confidence_auto_execute_threshold: float = Field(default=0.9, alias="CONFIDENCE_AUTO_EXECUTE_THRESHOLD")
+    confidence_guided_execute_threshold: float = Field(default=0.75, alias="CONFIDENCE_GUIDED_EXECUTE_THRESHOLD")
+    orchestration_approval_severities: str = Field(
+        default="high,critical",
+        alias="ORCHESTRATION_APPROVAL_SEVERITIES",
+    )
     local_llm_endpoint: str = Field(default="http://ollama:11434", alias="LOCAL_LLM_ENDPOINT")
     local_llm_enabled: bool = Field(default=False, alias="LOCAL_LLM_ENABLED")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
@@ -51,6 +92,46 @@ class Settings(BaseSettings):
     gemini_output_cost_per_million: float = Field(default=0.30, alias="GEMINI_OUTPUT_COST_PER_MILLION")
     groq_input_cost_per_million: float = Field(default=0.59, alias="GROQ_INPUT_COST_PER_MILLION")
     groq_output_cost_per_million: float = Field(default=0.79, alias="GROQ_OUTPUT_COST_PER_MILLION")
+    jwt_secret_key: str = Field(default="change-me-in-prod", alias="JWT_SECRET_KEY")
+    jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
+    jwt_access_token_minutes: int = Field(default=30, alias="JWT_ACCESS_TOKEN_MINUTES")
+    jwt_refresh_token_minutes: int = Field(default=1440, alias="JWT_REFRESH_TOKEN_MINUTES")
+    auth_failed_login_attempts: int = Field(default=5, alias="AUTH_FAILED_LOGIN_ATTEMPTS")
+    auth_lock_minutes: int = Field(default=15, alias="AUTH_LOCK_MINUTES")
+    auth_password_expiry_days: int = Field(default=90, alias="AUTH_PASSWORD_EXPIRY_DAYS")
+    admin_user_password: str = Field(default="Admin@123456", alias="ADMIN_USER_PASSWORD")
+    executive_user_password: str = Field(default="Executive@123456", alias="EXECUTIVE_USER_PASSWORD")
+    l3_user_password: str = Field(default="L3Engineer@123456", alias="L3_USER_PASSWORD")
+    l2_user_password: str = Field(default="L2Engineer@123456", alias="L2_USER_PASSWORD")
+    l1_user_password: str = Field(default="L1Operator@123456", alias="L1_USER_PASSWORD")
+
+    @model_validator(mode="after")
+    def configure_database_url(self) -> "Settings":
+        if self.database_url and self.database_url != _LOCAL_MYSQL_DEFAULT_URL:
+            self._validate_auth_secrets()
+            return self
+
+        if self.db.lower() == "mysql":
+            self.database_url = (
+                f"mysql+aiomysql://{quote_plus(self.db_user)}:{quote_plus(self.db_password)}"
+                f"@{self.db_host}:{self.db_port}/{self.db_database}"
+            )
+
+        self._validate_auth_secrets()
+        return self
+
+    def _validate_auth_secrets(self) -> None:
+        if self.environment.strip().lower() in {"local", "demo", "test"}:
+            return
+
+        placeholder_fields = [
+            field_name
+            for field_name, placeholder in _LOCAL_AUTH_PLACEHOLDER_VALUES.items()
+            if getattr(self, field_name.lower()) == placeholder
+        ]
+        if placeholder_fields:
+            fields = ", ".join(sorted(placeholder_fields))
+            raise ValueError(f"Missing production auth secrets: {fields}")
 
 
 @lru_cache

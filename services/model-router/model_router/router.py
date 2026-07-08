@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
+import time as _time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -9,9 +13,52 @@ from typing import Any
 import httpx
 from common.config import Settings, get_settings
 from common.models import AlertSeverity
+from common.prompts import SYSTEM_PROMPT_SRE, render_task_payload_prompt
 from common.resilience import CircuitBreaker
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# In-process prompt response cache (client-side prompt caching)
+# ---------------------------------------------------------------------------
+_PROMPT_CACHE_MAX: int = 512
+_PROMPT_CACHE_TTL: float = 300.0  # 5 minutes
+_prompt_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+_SYSTEM_PROMPT_HASH = hashlib.sha256(SYSTEM_PROMPT_SRE.encode("utf-8")).hexdigest()[:16]
+
+
+def _normalize_prompt(prompt: str) -> str:
+    return " ".join(prompt.split()).strip()
+
+
+def _provider_cache_identity(provider: str, model: str = "", base_url: str = "") -> str:
+    normalized_base_url = base_url.rstrip("/")
+    return f"{provider}|{model}|{normalized_base_url}|{_SYSTEM_PROMPT_HASH}"
+
+
+def _make_prompt_cache_key(provider: str, task: str, prompt: str, payload: dict[str, Any]) -> str:
+    """Stable SHA-256 key from provider+task+prompt+sorted payload."""
+    payload_repr = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    raw = f"{provider}|{task}|{_normalize_prompt(prompt)}|{payload_repr}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:40]
+
+
+def _prompt_cache_get(key: str) -> dict[str, Any] | None:
+    if key not in _prompt_cache:
+        return None
+    ts, value = _prompt_cache[key]
+    if _time.monotonic() - ts > _PROMPT_CACHE_TTL:
+        del _prompt_cache[key]
+        return None
+    _prompt_cache.move_to_end(key)
+    return value
+
+
+def _prompt_cache_set(key: str, value: dict[str, Any]) -> None:
+    _prompt_cache[key] = (_time.monotonic(), value)
+    _prompt_cache.move_to_end(key)
+    while len(_prompt_cache) > _PROMPT_CACHE_MAX:
+        _prompt_cache.popitem(last=False)
 
 
 class ModelTask(StrEnum):
@@ -139,14 +186,11 @@ class OpenAIModelProvider(ModelProvider):
             "input": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are an enterprise SRE incident-resolution model. "
-                        "Use only the provided incident payload and return concise, actionable operational analysis."
-                    ),
+                    "content": SYSTEM_PROMPT_SRE,
                 },
                 {
                     "role": "user",
-                    "content": json.dumps({"task": prompt, "payload": payload}, default=str),
+                    "content": render_task_payload_prompt(prompt, payload),
                 },
             ],
         }
@@ -202,7 +246,7 @@ class OllamaModelProvider(ModelProvider):
         self._ensure_available()
         request_payload = {
             "model": self.model,
-            "prompt": json.dumps({"task": prompt, "payload": payload}, default=str),
+            "prompt": render_task_payload_prompt(prompt, payload),
             "stream": False,
         }
         try:
@@ -239,8 +283,7 @@ class ModelRouter:
     providers: dict[str, ModelProvider] = field(default_factory=lambda: build_default_providers(get_settings()))
     failover_chain: dict[str, list[str]] = field(
         default_factory=lambda: {
-            "gpt-5": ["gpt-4o", "local-llama", "claude"],
-            "claude": ["gpt-5", "gpt-4o", "local-llama"],
+            "gpt-5": ["gpt-4o", "local-llama"],
             "local-llama": ["gpt-4o"],
             "gpt-4o": ["gpt-5", "local-llama"],
         }
@@ -250,7 +293,7 @@ class ModelRouter:
         if severity == AlertSeverity.CRITICAL:
             return "gpt-5"
         if task == ModelTask.RCA:
-            return "claude"
+            return "gpt-4o"
         return "gpt-4o"
 
     async def route(
@@ -262,16 +305,34 @@ class ModelRouter:
         payload: dict[str, Any],
     ) -> dict[str, Any]:
         primary = self.select_model(severity=severity, task=task)
-        candidates = [primary, *self.failover_chain.get(primary, [])]
+        primary_provider = self.providers.get(primary)
+        provider_identity = _provider_cache_identity(
+            primary,
+            getattr(primary_provider, "model", primary) if primary_provider is not None else primary,
+            getattr(primary_provider, "base_url", getattr(primary_provider, "endpoint", "")) if primary_provider is not None else "",
+        )
+        cache_key = _make_prompt_cache_key(provider_identity, task.value, prompt, payload)
+        cached = _prompt_cache_get(cache_key)
+        if cached is not None:
+            logger.debug("Prompt cache hit: %s", cache_key[:12])
+            return {**cached, "cached": True}
+        candidates = list(dict.fromkeys([primary, *self.failover_chain.get(primary, [])]))
         errors: list[str] = []
-        for name in candidates:
+        for provider_name in candidates:
+            provider = self.providers.get(provider_name)
+            if provider is None:
+                errors.append(f"{provider_name}: provider is not registered")
+                continue
             try:
-                response = await self.providers[name].generate(prompt, payload)
+                response = await provider.generate(prompt, payload)
                 usage = response.usage.as_dict()
                 usage["task"] = task.value
-                return {"model": name, "content": response.content, "usage": usage}
+                result = {"model": provider_name, "content": response.content, "usage": usage}
+                _prompt_cache_set(cache_key, result)
+                return result
             except Exception as exc:
-                errors.append(f"{name}: {exc}")
+                errors.append(f"{provider_name}: {exc}")
+
         raise RuntimeError("; ".join(errors))
 
     async def route_provider(
@@ -282,13 +343,30 @@ class ModelRouter:
         prompt: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        cache_key = _make_prompt_cache_key(provider_name, task.value, prompt, payload)
+        cached = _prompt_cache_get(cache_key)
+        if cached is not None:
+            logger.debug("Prompt cache hit (provider): %s", cache_key[:12])
+            return {**cached, "cached": True}
         provider = self.providers.get(provider_name)
         if provider is None:
             raise RuntimeError(f"{provider_name} provider is not registered")
+        provider_identity = _provider_cache_identity(
+            provider.name,
+            getattr(provider, "model", provider.name),
+            getattr(provider, "base_url", getattr(provider, "endpoint", "")),
+        )
+        cache_key = _make_prompt_cache_key(provider_identity, task.value, prompt, payload)
+        cached = _prompt_cache_get(cache_key)
+        if cached is not None:
+            logger.debug("Prompt cache hit (provider): %s", cache_key[:12])
+            return {**cached, "cached": True}
         response = await provider.generate(prompt, payload)
         usage = response.usage.as_dict()
         usage["task"] = task.value
-        return {"model": provider_name, "content": response.content, "usage": usage}
+        result = {"model": provider_name, "content": response.content, "usage": usage}
+        _prompt_cache_set(cache_key, result)
+        return result
 
 
 def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
