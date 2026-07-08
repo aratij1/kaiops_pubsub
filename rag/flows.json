@@ -120,21 +120,22 @@
     "source": "rag-incident"
   },
   {
-    "id": "inc-8842-payment-latency-after-deployment-2-5",
-    "alert_id": "INC-8842-PAYMENT-LATENCY-AFTER-DEPLOYMENT-2-5",
+    "id": "inc-8842",
+    "alert_id": "INC-8842",
     "alert_name": "INC-8842 payment latency after Deployment 2.5",
+    "alert_type": "latency",
     "title": "INC-8842 payment latency after Deployment 2.5",
     "service": "payments",
     "severity": "HIGH",
     "recommended_action": "Investigate issue",
     "description": "Deployment 2.5 increased checkout p95 latency for payments. Rollback restored",
-    "deployment": "Deployment 2.5",
     "source": "rag-incident"
   },
   {
-    "id": "inc-9011-orders-database-replica-lag",
-    "alert_id": "INC-9011-ORDERS-DATABASE-REPLICA-LAG",
+    "id": "inc-9011",
+    "alert_id": "INC-9011",
     "alert_name": "INC-9011 orders database replica lag",
+    "alert_type": "replication",
     "title": "INC-9011 orders database replica lag",
     "service": "orders-db",
     "severity": "HIGH",
@@ -179,6 +180,18 @@
     "source": "rag-incident"
   },
   {
+    "id": "orders-replica-lag",
+    "alert_id": "ORDERS-REPLICA-LAG",
+    "alert_name": "Orders database replica lag",
+    "alert_type": "incident",
+    "title": "Orders database replica lag",
+    "service": "orders-db",
+    "severity": "CRITICAL",
+    "recommended_action": "Investigate issue",
+    "description": "Replica lag above threshold for 10 minutes",
+    "source": "rag-incident"
+  },
+  {
     "id": "dw-1008",
     "alert_id": "DW-1008",
     "alert_name": "Query Performance Degradation",
@@ -194,6 +207,7 @@
     "id": "rag-doc",
     "alert_id": "RAG-DOC",
     "alert_name": "RAG_doc",
+    "alert_type": "incident",
     "title": "RAG_doc",
     "service": "unknown",
     "severity": "HIGH",

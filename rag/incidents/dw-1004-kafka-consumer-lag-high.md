@@ -3,6 +3,8 @@ alert_name: Kafka Consumer Lag High
 service: kafka-ingestion
 severity: high
 alert_type: streaming
+source_system: internal
+source_ref: DW-1004
 
 # Kafka Consumer Lag High (DW-1004)
 

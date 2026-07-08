@@ -1,8 +1,10 @@
-alert_id: DW-SOPS
-alert_name: Data Warehouse Standard Operating Procedures
-service: data-warehouse
-severity: informational
-alert_type: sops
+kind: sop
+title: Data Warehouse Standard Operating Procedures
+services: data-warehouse
+owner_team: platform-ops
+last_reviewed: 2026-07-08
+source_system: internal
+source_ref: DW-SOPS
 
 # Data Warehouse Standard Operating Procedures
 

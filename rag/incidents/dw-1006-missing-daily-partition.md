@@ -3,6 +3,8 @@ alert_name: Missing Daily Partition
 service: sales-fact-table
 severity: high
 alert_type: partition_missing
+source_system: internal
+source_ref: DW-1006
 
 # Missing Daily Partition (DW-1006)
 

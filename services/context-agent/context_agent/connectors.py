@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from common.agentic import AgentContext, BaseAgent
 from common.embeddings import HashingEmbeddingModel, cosine_similarity
 from common.models import Alert, Context, Incident
 from common.resilience import retry_async
@@ -168,7 +169,7 @@ class VectorDBConnector(BaseConnector):
 
 
 @dataclass
-class ContextIntelligenceAgent:
+class ContextIntelligenceAgent(BaseAgent):
     connectors: list[BaseConnector] = field(
         default_factory=lambda: [
             ServiceNowConnector(),
@@ -180,6 +181,10 @@ class ContextIntelligenceAgent:
             VectorDBConnector(),
         ]
     )
+    name: str = "context-agent"
+
+    async def can_execute(self, context: AgentContext) -> bool:
+        return context.alert is not None and context.incident is not None
 
     async def collect(self, alert: Alert, incident: Incident) -> Context:
         results = await asyncio.gather(
@@ -237,3 +242,13 @@ class ContextIntelligenceAgent:
                 ],
             },
         )
+
+    async def execute(self, context: AgentContext) -> Context:
+        if context.alert is None or context.incident is None:
+            raise ValueError("AgentContext must include alert and incident")
+        result = await self.collect(context.alert, context.incident)
+        context.set_result(self.name, result.model_dump(mode="json"))
+        return result
+
+    async def validate(self, result: Any) -> bool:
+        return isinstance(result, Context)

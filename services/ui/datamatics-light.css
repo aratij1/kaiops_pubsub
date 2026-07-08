@@ -1,0 +1,287 @@
+/* Datamatics Light Theme Overrides */
+
+:root {
+  --kaiops-bg: #f3f6fb;
+  --kaiops-bg-elev: #ffffff;
+  --kaiops-bg-panel: #f8fafc;
+  --kaiops-border: #d5deea;
+  --kaiops-text: #0f172a;
+  --kaiops-text-soft: #475569;
+  --kaiops-blue: #2563eb;
+  --kaiops-blue-hover: #1d4ed8;
+  --kaiops-radius-sm: 10px;
+  --kaiops-radius-md: 14px;
+  --kaiops-radius-lg: 18px;
+  --kaiops-shadow-soft: 0 10px 24px rgba(15, 23, 42, 0.08);
+  --kaiops-shadow-strong: 0 16px 30px rgba(15, 23, 42, 0.12);
+}
+
+.stApp {
+  background: linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%) !important;
+  color: var(--kaiops-text) !important;
+}
+
+section[data-testid="stSidebar"] {
+  background: #ffffff !important;
+  border-right: 1px solid var(--kaiops-border) !important;
+}
+
+.kaiops-sidebar-hero {
+  background: linear-gradient(140deg, #edf5ff 0%, #dcecff 62%, #cae3ff 100%) !important;
+  border: 1px solid #bfdbfe !important;
+  box-shadow: 0 8px 18px rgba(30, 64, 175, 0.12) !important;
+}
+
+.kaiops-sidebar-hero h3,
+.kaiops-sidebar-hero p,
+.kaiops-sidebar-live,
+.kaiops-sidebar-section,
+.kaiops-nav-active-label,
+.kaiops-nav-active-value {
+  color: #0f172a !important;
+}
+
+.kaiops-sidebar-live {
+  background: rgba(255, 255, 255, 0.82) !important;
+  border: 1px solid rgba(59, 130, 246, 0.4) !important;
+}
+
+.kaiops-sidebar-live-dot {
+  background: #22c55e !important;
+}
+
+.kaiops-nav-active-card,
+.kaiops-demo-links,
+section[data-testid="stSidebar"] div[data-testid="stVerticalBlockBorderWrapper"] {
+  background: #f8fafc !important;
+  border-color: #dbe4ef !important;
+}
+
+section[data-testid="stSidebar"] .stButton > button {
+  background: #ffffff !important;
+  color: #0f172a !important;
+  border-color: #cbd5e1 !important;
+}
+
+section[data-testid="stSidebar"] .stButton > button:hover {
+  background: #eff6ff !important;
+  color: #1d4ed8 !important;
+  border-color: #93c5fd !important;
+}
+
+section[data-testid="stSidebar"] .stRadio > div[role="radiogroup"] > label {
+  background: #f8fafc !important;
+  border: 1px solid #d5deea !important;
+}
+
+section[data-testid="stSidebar"] .stRadio > div[role="radiogroup"] > label[data-selected="true"] {
+  background: #dbeafe !important;
+  border-color: #60a5fa !important;
+  box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.3) !important;
+}
+
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span,
+section[data-testid="stSidebar"] div {
+  color: #1f2937 !important;
+}
+
+.kaiops-card,
+.kaiops-role-card,
+.kaiops-summary-hero,
+.kaiops-approval-card,
+.kaiops-hero-wrap,
+.kaiops-hero,
+.kaiops-sidebar-hero,
+div[data-testid="stVerticalBlockBorderWrapper"],
+div[data-testid="stMetric"] {
+  background: #ffffff !important;
+  border: 1px solid #d5deea !important;
+  box-shadow: var(--kaiops-shadow-soft) !important;
+}
+
+.kaiops-info-cell,
+.kaiops-approval-kv,
+.kaiops-recommendation-card,
+details[data-testid="stExpander"] {
+  background: #f8fafc !important;
+  border: 1px solid #dbe4ef !important;
+}
+
+.kaiops-hero-title,
+.kaiops-summary-hero-alert,
+.kaiops-approval-title,
+.kaiops-info-cell-value,
+.kaiops-role-title,
+.kaiops-role-decision,
+.stMarkdown,
+.stCaption,
+label,
+p,
+span,
+div[data-testid="stMetric"] label,
+div[data-testid="stMetric"] div {
+  color: #0f172a !important;
+}
+
+.kaiops-summary-hero-meta,
+.kaiops-role-step,
+.kaiops-approval-kv-label,
+.kaiops-info-cell-label,
+.kaiops-hero-sub,
+.kaiops-recommendation-rationale,
+.kaiops-sidebar-section {
+  color: #475569 !important;
+}
+
+.stTabs [data-baseweb="tab-list"] button,
+.stTabs [data-baseweb="tab-list"] button * {
+  color: #64748b !important;
+}
+
+.stTabs [data-baseweb="tab-list"] button[aria-selected="true"],
+.stTabs [data-baseweb="tab-list"] button[aria-selected="true"] * {
+  color: #1d4ed8 !important;
+  border-bottom: 2px solid #2563eb !important;
+}
+
+.stButton > button,
+.stDownloadButton > button {
+  background: #2563eb !important;
+  border-color: #60a5fa !important;
+  color: #eff6ff !important;
+}
+
+.stMarkdown a,
+a {
+  color: #1d4ed8 !important;
+  text-decoration-color: rgba(29, 78, 216, 0.45) !important;
+}
+
+.stButton > button:hover,
+.stDownloadButton > button:hover {
+  background: #1d4ed8 !important;
+}
+
+div[data-testid="stDataFrame"] [role="columnheader"] {
+  background: #eef2f7 !important;
+  color: #0f172a !important;
+  border-bottom: 1px solid #d5deea !important;
+}
+
+div[data-testid="stDataFrame"] [role="gridcell"] {
+  background: #ffffff !important;
+  color: #1f2937 !important;
+  border-color: #e2e8f0 !important;
+}
+
+details[data-testid="stExpander"] summary {
+  background: #f8fafc !important;
+  color: #0f172a !important;
+}
+
+div[data-baseweb="input"],
+div[data-baseweb="select"],
+textarea,
+input {
+  background: #ffffff !important;
+  color: #0f172a !important;
+  border-color: #cbd5e1 !important;
+}
+
+/* Force readable light-mode text surfaces that are dark-overridden in base styles */
+.stApp,
+.stApp *,
+.stMarkdown,
+.stText,
+.stCaption,
+[data-testid="stMarkdownContainer"],
+[data-testid="stMarkdownContainer"] *,
+.st-emotion-cache-1wivap2 {
+  color: #0f172a !important;
+}
+
+.stCaption,
+.stCaption *,
+.kaiops-alert-row-meta,
+.kaiops-summary-hero-meta,
+.kaiops-recommendation-rationale,
+.kaiops-sidebar-section,
+.kaiops-role-step,
+.kaiops-info-cell-label,
+.kaiops-approval-kv-label {
+  color: #475569 !important;
+}
+
+[data-testid="stMetricLabel"],
+[data-testid="stMetricLabel"] *,
+[data-testid="stMetricValue"],
+[data-testid="stMetricValue"] * {
+  color: #0f172a !important;
+}
+
+.stApp div[data-baseweb="select"] > div,
+.stApp div[data-baseweb="input"] > div,
+.stApp textarea,
+.stApp input,
+.stTextInput input,
+.stNumberInput input,
+.stTextArea textarea,
+.stDateInput input,
+.stTimeInput input,
+.stSelectbox div[data-baseweb="select"] > div,
+.stMultiSelect div[data-baseweb="select"] > div,
+.stSelectbox [data-baseweb="select"] > div,
+.stMultiSelect [data-baseweb="select"] > div {
+  background: #ffffff !important;
+  color: #0f172a !important;
+  border: 1px solid #cbd5e1 !important;
+  -webkit-text-fill-color: #0f172a !important;
+  opacity: 1 !important;
+}
+
+.stApp div[data-baseweb="select"] [role="button"],
+.stApp div[data-baseweb="select"] [role="button"] *,
+.stApp div[data-baseweb="input"] input,
+.stApp div[data-baseweb="input"] input *,
+.stApp textarea,
+.stApp textarea *,
+.stApp input,
+.stApp input * {
+  color: #0f172a !important;
+  -webkit-text-fill-color: #0f172a !important;
+}
+
+.stApp div[data-baseweb="select"] svg,
+.stApp div[data-baseweb="select"] [aria-hidden="true"] {
+  color: #334155 !important;
+  fill: #334155 !important;
+}
+
+div[role="listbox"],
+div[role="listbox"] *,
+div[role="option"],
+div[role="option"] * {
+  background: #ffffff !important;
+  color: #0f172a !important;
+  -webkit-text-fill-color: #0f172a !important;
+}
+
+div[role="option"][aria-selected="true"] {
+  background: rgba(59, 130, 246, 0.12) !important;
+}
+
+.stExpander details summary,
+details[data-testid="stExpander"] summary,
+details[data-testid="stExpander"] summary * {
+  color: #0f172a !important;
+  background: #f8fafc !important;
+}
+
+input::placeholder,
+textarea::placeholder,
+[data-baseweb="input"] input::placeholder {
+  color: #64748b !important;
+  opacity: 1 !important;
+}

@@ -20,8 +20,8 @@ $Checks = @(
     },
     @{
         Path = "services\ui\app.py"
-        Pattern = "RAG Ingestion"
-        Description = "Streamlit RAG ingestion tab"
+        Pattern = "Ingestion Pipeline"
+        Description = "Streamlit ingestion pipeline tab"
     },
     @{
         Path = "services\api-gateway\app.py"

@@ -3,6 +3,8 @@ alert_name: ETL Job Failure
 service: airflow
 severity: critical
 alert_type: etl_failure
+source_system: internal
+source_ref: DW-1001
 
 # ETL Job Failure (DW-1001)
 

@@ -9,6 +9,8 @@ from uuid import uuid4
 
 import httpx
 from api_gateway import SafetyAnalyzer
+from api_gateway.modules.users.router import router as user_management_router
+from api_gateway.modules.users.service import UserService
 from common.config import get_settings
 from common.kafka import normalize_payload
 from common.models import GatewayAuditEvent, SafetyDecision
@@ -22,9 +24,20 @@ REQUEST_BODY = Body(default={})
 
 settings = get_settings()
 settings.service_name = "api-gateway"
-app = create_app(title="KaiOps API Gateway", settings=settings)
 analyzer = SafetyAnalyzer()
 AUDIT_EVENTS: deque[GatewayAuditEvent] = deque(maxlen=200)
+
+
+async def startup(app: FastAPI) -> None:
+    if settings.database_enabled:
+        app.state.user_service = UserService(settings=settings, session_factory=app.state.session_factory)
+        await app.state.user_service.bootstrap_defaults()
+    else:
+        app.state.user_service = UserService(settings=settings, session_factory=None)
+
+
+app = create_app(title="KaiMS API Gateway", settings=settings, startup=startup)
+app.include_router(user_management_router)
 
 GATEWAY_REQUESTS = Counter(
     "kaiops_gateway_requests_total",
@@ -190,6 +203,60 @@ async def ingest_alert(
     )
 
 
+@app.get("/alerts")
+async def alerts_help() -> dict[str, Any]:
+    return {
+        "message": "Use POST /alerts to ingest alerts. GET /alerts is informational.",
+        "example": {
+            "method": "POST",
+            "path": "/alerts",
+            "payload": {
+                "source": "monitoring-adapter",
+                "name": "DatabaseReplicaLag",
+                "service": "orders-db",
+                "severity": "high",
+                "description": "Replica lag is above threshold.",
+                "labels": {"component": "database"},
+                "annotations": {"summary": "Database replica lag spike"},
+            },
+        },
+    }
+
+
+@app.get("/alerts/recent")
+async def get_recent_alerts(
+    request: Request,
+    limit: int = 50,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/alerts/recent?{urlencode({'limit': str(limit)})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/alerts/all")
+async def get_all_alerts(
+    request: Request,
+    limit: int = 500,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/alerts/all?{urlencode({'limit': str(limit)})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.post("/sample/payment-latency")
 async def sample_payment_latency(
     request: Request,
@@ -208,12 +275,16 @@ async def sample_payment_latency(
 @app.post("/sample/payment-latency/workflow")
 async def sample_payment_latency_workflow(
     request: Request,
+    fast_mode: bool = False,
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    path = "/sample/payment-latency/workflow"
+    if fast_mode:
+        path = f"{path}?{urlencode({'fast_mode': 'true'})}"
     return await guarded_proxy(
         request=request,
         method="POST",
-        path="/sample/payment-latency/workflow",
+        path=path,
         target_base=settings.monitoring_adapter_url,
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
@@ -235,18 +306,152 @@ async def sample_flows(
     )
 
 
-@app.post("/sample/{flow_id}/workflow")
-async def sample_flow_workflow(
-    flow_id: str,
+@app.get("/onboarding/connectivity")
+async def get_onboarding_connectivity(
     request: Request,
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
-        method="POST",
-        path=f"/sample/{flow_id}/workflow",
+        method="GET",
+        path="/onboarding/connectivity",
         target_base=settings.monitoring_adapter_url,
         payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/onboarding/state")
+async def get_onboarding_state(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/onboarding/state",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/agent-work/items")
+async def get_agent_work_items(
+    request: Request,
+    limit: int = 100,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/agent-work/items?{urlencode({'limit': str(limit)})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/incidents/closed")
+async def get_closed_incidents(
+    request: Request,
+    limit: int = 100,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/incidents/closed?{urlencode({'limit': str(limit)})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/incidents/metadata")
+async def get_incident_metadata(
+    request: Request,
+    limit: int = 100,
+    risk_tier: str | None = None,
+    execution_mode: str | None = None,
+    transport_provider: str | None = None,
+    status: str | None = None,
+    service: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    params: dict[str, str] = {"limit": str(limit)}
+    if risk_tier:
+        params["risk_tier"] = str(risk_tier)
+    if execution_mode:
+        params["execution_mode"] = str(execution_mode)
+    if transport_provider:
+        params["transport_provider"] = str(transport_provider)
+    if status:
+        params["status"] = str(status)
+    if service:
+        params["service"] = str(service)
+    path = f"/incidents/metadata?{urlencode(params)}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/onboarding/connectivity")
+async def post_onboarding_connectivity(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/onboarding/connectivity",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/sample/{flow_id}/workflow")
+async def sample_flow_workflow(
+    flow_id: str,
+    request: Request,
+    fast_mode: bool = False,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/sample/{flow_id}/workflow"
+    if fast_mode:
+        path = f"{path}?{urlencode({'fast_mode': 'true'})}"
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/sample/{flow_id}/workflow/continue")
+async def continue_sample_flow_workflow(
+    flow_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/sample/{flow_id}/workflow/continue",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
         trace_id=trace_id_from_header(x_trace_id),
     )
 

@@ -1,7 +1,10 @@
-kind: incident
-title: INC-8842 payment latency after Deployment 2.5
-services: payments, checkout
-deployment: Deployment 2.5
+alert_id: INC-8842
+alert_name: INC-8842 payment latency after Deployment 2.5
+service: payments
+severity: high
+alert_type: latency
+source_system: internal
+source_ref: INC-8842
 
 # INC-8842 payment latency after Deployment 2.5
 

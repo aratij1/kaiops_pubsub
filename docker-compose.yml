@@ -1,7 +1,19 @@
 x-service-env: &service-env
   KAFKA_BOOTSTRAP_SERVERS: kafka:9092
   REDIS_URL: redis://redis:6379/0
-  DATABASE_URL: postgresql+asyncpg://kaiops:kaiops@postgres:5432/kaiops
+  DATABASE_URL: mysql+aiomysql://kaiops:kaiops@mysql:3306/kaiops
+  DB: mysql
+  DB_HOST: mysql
+  DB_PORT: 3306
+  DB_USER: kaiops
+  DB_PASSWORD: kaiops
+  DB_DATABASE: kaiops
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY:-kaiops-local-demo-secret-key-change-me}
+  ADMIN_USER_PASSWORD: ${ADMIN_USER_PASSWORD:-Admin@123456}
+  EXECUTIVE_USER_PASSWORD: ${EXECUTIVE_USER_PASSWORD:-Executive@123456}
+  L3_USER_PASSWORD: ${L3_USER_PASSWORD:-L3Engineer@123456}
+  L2_USER_PASSWORD: ${L2_USER_PASSWORD:-L2Engineer@123456}
+  L1_USER_PASSWORD: ${L1_USER_PASSWORD:-L1Operator@123456}
   CONTEXT_AGENT_URL: http://context-agent:8000
   APPROVAL_SERVICE_URL: http://approval-service:8000
   MODEL_ROUTER_URL: http://model-router:8000
@@ -14,6 +26,18 @@ x-service-env: &service-env
   LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-120}
   GATEWAY_REQUEST_TIMEOUT_SECONDS: ${GATEWAY_REQUEST_TIMEOUT_SECONDS:-180}
   KAFKA_ENABLED: "true"
+  EVENT_BUS_PROVIDER: rabbitmq
+  MESSAGE_BUS_DYNAMIC_ROUTING: "true"
+  MESSAGE_BUS_STREAM_THRESHOLD: "500"
+  MESSAGE_BUS_DEFAULT_PROVIDER: rabbitmq
+  MESSAGE_BUS_WORKER_COUNT: "1"
+  KAFKA_CONSUMER_MAX_RETRIES: "3"
+  KAFKA_DLQ_SUFFIX: .dlq
+  RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+  RABBITMQ_EXCHANGE: kaiops.events
+  RABBITMQ_QUEUE_PREFIX: kaiops
+  RABBITMQ_CONSUMER_MAX_RETRIES: "3"
+  RABBITMQ_DLQ_SUFFIX: .dlq
   DATABASE_ENABLED: "true"
 
 x-service-build: &service-build
@@ -21,17 +45,19 @@ x-service-build: &service-build
   dockerfile: Dockerfile.service
 
 services:
-  postgres:
-    image: postgres:16
+  mysql:
+    image: mysql:8.4
+    command: --default-authentication-plugin=mysql_native_password
     environment:
-      POSTGRES_USER: kaiops
-      POSTGRES_PASSWORD: kaiops
-      POSTGRES_DB: kaiops
-    ports: ["5432:5432"]
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: kaiops
+      MYSQL_USER: kaiops
+      MYSQL_PASSWORD: kaiops
+    ports: ["3306:3306"]
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U kaiops -d kaiops"]
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -ukaiops -pkaiops"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -68,6 +94,15 @@ services:
       retries: 30
       start_period: 30s
 
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports: ["5672:5672", "15672:15672"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
   monitoring-adapter:
     build: *service-build
     environment: { <<: *service-env, SERVICE_NAME: monitoring-adapter }
@@ -78,7 +113,7 @@ services:
       - ./rag:/app/rag
     depends_on:
       kafka: { condition: service_healthy }
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
 
   api-gateway:
@@ -99,7 +134,7 @@ services:
     ports: ["8002:8000"]
     depends_on:
       kafka: { condition: service_healthy }
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
 
   orchestrator:
@@ -110,7 +145,8 @@ services:
     ports: ["8003:8000"]
     depends_on:
       kafka: { condition: service_healthy }
-      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
       context-agent: { condition: service_started }
 
   context-agent:
@@ -123,7 +159,8 @@ services:
       - ./rag:/app/rag
     depends_on:
       kafka: { condition: service_healthy }
-      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
 
   model-router:
     build: *service-build
@@ -133,7 +170,7 @@ services:
     ports: ["8005:8000"]
     depends_on:
       kafka: { condition: service_healthy }
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
 
   resolution-agent:
     build: *service-build
@@ -143,7 +180,7 @@ services:
     ports: ["8006:8000"]
     depends_on:
       kafka: { condition: service_healthy }
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
       model-router: { condition: service_started }
 
   approval-service:
@@ -154,7 +191,7 @@ services:
     ports: ["8007:8000"]
     depends_on:
       kafka: { condition: service_healthy }
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
 
   remediation-engine:
     build: *service-build
@@ -164,7 +201,7 @@ services:
     ports: ["8008:8000"]
     depends_on:
       kafka: { condition: service_healthy }
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
 
   closure-service:
     build: *service-build
@@ -174,7 +211,7 @@ services:
     ports: ["8009:8000"]
     depends_on:
       kafka: { condition: service_healthy }
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
 
   ui:
     build: *service-build
@@ -192,4 +229,4 @@ services:
       monitoring-adapter: { condition: service_started }
 
 volumes:
-  postgres-data:
+  mysql-data:
