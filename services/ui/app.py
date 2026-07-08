@@ -2751,13 +2751,83 @@ def render_alert_details_page() -> None:
             if planner_used_raw is not None or planner_model or planner_reason:
                 planner_status = "ENABLED" if bool(planner_used_raw) else "FALLBACK"
 
+            placeholder_tokens = {"", "-", "n/a", "na", "none", "null", "unknown"}
+
+            def _display_text(value: Any) -> str:
+                text = str(value or "").strip()
+                if text.lower() in placeholder_tokens:
+                    return "N/A"
+                return text
+
+            def _fallback_event_fields(event: dict[str, Any]) -> tuple[str, str, str, str]:
+                agent_name = str(event.get("agent") or "").strip()
+                action = _display_text(event.get("action"))
+                decision_text = _display_text(event.get("decision"))
+                output_text = _display_text(event.get("output"))
+                communicates_to = _display_text(event.get("communicates_to"))
+
+                if agent_name == "Alert Intelligence Agent":
+                    if action == "N/A":
+                        action = "Assigned to incident workflow"
+                    if decision_text == "N/A":
+                        correlation_id = (
+                            str(
+                                event.get("correlation_id")
+                                or alert.get("correlation_id")
+                                or incident.get("correlation_id")
+                                or ""
+                            )
+                            .strip()
+                        )
+                        if correlation_id:
+                            decision_text = f"Severity classified as {severity.lower()}; correlation ID {correlation_id}"
+                        else:
+                            decision_text = f"Severity classified as {severity.lower()}"
+                    if output_text in {"N/A", "pending", "Pending"}:
+                        output_text = "Created incident and enriched alert event" if incident.get("id") else "Awaiting enrichment output"
+                    if communicates_to == "N/A":
+                        communicates_to = "Orchestrator Agent"
+
+                elif agent_name == "Orchestrator Agent":
+                    workflow_name = str(decision.get("workflow") or scenario.get("id") or "").strip()
+                    next_action = str(decision.get("next_action") or "collect-context").strip() or "collect-context"
+                    provider = str(decision.get("message_bus_provider") or "rabbitmq").strip().lower() or "rabbitmq"
+                    if action == "N/A":
+                        action = "Routing incident through policy-aware workflow"
+                    if decision_text in {"N/A", "pending", "Pending"}:
+                        decision_text = workflow_name or "Workflow selected"
+                    if output_text in {"N/A", "pending", "Pending"}:
+                        output_text = (
+                            f"Next action: {next_action}; approval required: {requires_approval}; "
+                            f"message bus: {provider}"
+                        )
+                    if communicates_to == "N/A":
+                        communicates_to = "Context Intelligence Agent"
+
+                elif agent_name == "Human Approval Layer":
+                    approval_payload = workflow.get("approval", {}) if isinstance(workflow.get("approval"), dict) else {}
+                    approval_decision = str(approval_payload.get("decision") or "").strip().lower()
+                    if action == "N/A":
+                        action = "Applying policy-aware human gate"
+                    if decision_text in {"N/A", "pending", "Pending"}:
+                        if approval_decision in {"approved", "rejected"}:
+                            decision_text = approval_decision
+                        else:
+                            decision_text = "pending"
+                    if output_text in {"N/A", "pending", "Pending"}:
+                        output_text = "Awaiting explicit user decision in Approval Workbench"
+                    if communicates_to == "N/A":
+                        communicates_to = "Remediation Automation Engine"
+
+                return action, decision_text, output_text, communicates_to
+
             st.dataframe(
                 [
                     {
                         "Step": event.get("sequence"),
                         "Agent": event.get("agent"),
-                        "Decision": str(event.get("decision") or ""),
-                        "Output": str(event.get("output") or ""),
+                        "Decision": _fallback_event_fields(event)[1],
+                        "Output": _fallback_event_fields(event)[2],
                         "Planner": planner_status if str(event.get("agent") or "") == "Orchestrator Agent" else "-",
                         "Planner Model": planner_model if str(event.get("agent") or "") == "Orchestrator Agent" else "-",
                     }
@@ -2772,11 +2842,12 @@ def render_alert_details_page() -> None:
             for event in ordered_events:
                 step = int(event.get("sequence", 0) or 0)
                 agent_name = str(event.get("agent") or "Agent")
+                action, decision_text, output_text, communicates_to = _fallback_event_fields(event)
                 with st.expander(f"Step {step} | {agent_name}"):
-                    st.write(f"- Action: {str(event.get('action') or 'N/A')}")
-                    st.write(f"- Decision: {str(event.get('decision') or 'N/A')}")
-                    st.write(f"- Output: {str(event.get('output') or 'N/A')}")
-                    st.write(f"- Communicates To: {str(event.get('communicates_to') or 'N/A')}")
+                    st.write(f"- Action: {action}")
+                    st.write(f"- Decision: {decision_text}")
+                    st.write(f"- Output: {output_text}")
+                    st.write(f"- Communicates To: {communicates_to}")
                     input_payload = event.get("input") if isinstance(event.get("input"), dict) else {}
                     if input_payload:
                         st.markdown("**Input Parameters**")
