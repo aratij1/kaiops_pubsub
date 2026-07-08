@@ -1,0 +1,59 @@
+{
+  "policy_version": "policy-v1",
+  "approval_severities": ["high", "critical"],
+  "confidence_guided_execute_threshold": 0.75,
+  "confidence_auto_execute_threshold": 0.9,
+  "default_correlation_threshold": 0.72,
+  "risk_tiers_by_severity": {
+    "critical": "high",
+    "high": "high",
+    "warning": "medium",
+    "info": "low"
+  },
+  "message_bus": {
+    "dynamic_routing": true,
+    "default_provider": "rabbitmq",
+    "stream_threshold": 500
+  },
+  "workflow_definitions": {
+    "critical-auto-remediation": {
+      "steps": [
+        "alert-intelligence-agent",
+        "context-agent",
+        "knowledge-agent",
+        "rca-agent",
+        "impact-agent",
+        "approval-agent",
+        "automation-agent",
+        "validation-agent",
+        "notification-agent",
+        "closure-agent"
+      ],
+      "next_action": "collect-context"
+    },
+    "guided-remediation": {
+      "steps": [
+        "alert-intelligence-agent",
+        "context-agent",
+        "knowledge-agent",
+        "rca-agent",
+        "impact-agent",
+        "approval-agent",
+        "automation-agent",
+        "validation-agent",
+        "closure-agent"
+      ],
+      "next_action": "collect-context"
+    },
+    "triage-only": {
+      "steps": [
+        "alert-intelligence-agent",
+        "context-agent",
+        "knowledge-agent",
+        "rca-agent",
+        "notification-agent"
+      ],
+      "next_action": "collect-context"
+    }
+  }
+}

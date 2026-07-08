@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     message_bus_dynamic_routing: bool = Field(default=True, alias="MESSAGE_BUS_DYNAMIC_ROUTING")
     message_bus_stream_threshold: int = Field(default=500, alias="MESSAGE_BUS_STREAM_THRESHOLD")
     message_bus_default_provider: str = Field(default="rabbitmq", alias="MESSAGE_BUS_DEFAULT_PROVIDER")
+    orchestration_config_path: str = Field(default="", alias="ORCHESTRATION_CONFIG_PATH")
     message_bus_worker_count: int = Field(default=1, alias="MESSAGE_BUS_WORKER_COUNT")
     orchestration_llm_planner_enabled: bool = Field(default=False, alias="ORCHESTRATION_LLM_PLANNER_ENABLED")
     kafka_startup_attempts: int = Field(default=30, alias="KAFKA_STARTUP_ATTEMPTS")
