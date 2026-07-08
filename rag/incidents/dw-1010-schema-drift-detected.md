@@ -3,6 +3,8 @@ alert_name: Schema Drift Detected
 service: customer-ingestion
 severity: critical
 alert_type: schema_change
+source_system: internal
+source_ref: DW-1010
 
 # Schema Drift Detected (DW-1010)
 

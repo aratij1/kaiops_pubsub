@@ -13,3 +13,4 @@ dist/
 build/
 *.egg-info/
 data/
+logs/local/*.log

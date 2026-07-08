@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from common.agentic import AgentContext, BaseAgent
 from common.models import Approval, RemediationAction, RemediationStatus, utc_now
 from common.resilience import CircuitBreaker, circuit_breaker
 
@@ -69,7 +70,7 @@ class ApiExecutionPlugin(BasePlugin):
 
 
 @dataclass
-class RemediationEngine:
+class RemediationEngine(BaseAgent):
     plugins: dict[str, RemediationPlugin] = field(
         default_factory=lambda: {
             "rollback_deployment": JenkinsRollbackPlugin(),
@@ -82,6 +83,16 @@ class RemediationEngine:
             "terraform_rollback": TerraformRollbackPlugin(),
         }
     )
+    name: str = "automation-agent"
+
+    async def can_execute(self, context: AgentContext) -> bool:
+        return "approval" in context.previous_agent_results
+
+    def is_action_allowed(self, action_type: str) -> bool:
+        normalized = str(action_type or "").strip().lower()
+        if not normalized:
+            return False
+        return normalized in set(self.plugins.keys())
 
     def build_action(self, approval: Approval) -> RemediationAction:
         action_text = (approval.modified_action or approval.comment or "rollback deployment").lower()
@@ -99,12 +110,19 @@ class RemediationEngine:
             action_type = "terraform_rollback"
         else:
             action_type = "rollback_deployment"
+        policy_version = str(approval.metadata.get("policy_version", "")).strip()
+        policy_reason = str(approval.metadata.get("policy_reason", "")).strip()
         return RemediationAction(
             incident_id=approval.incident_id,
             approval_id=approval.id,
             action_type=action_type,
             target=str(approval.incident_id),
-            parameters={"approved_by": approval.approver, "channel": approval.channel},
+            parameters={
+                "approved_by": approval.approver,
+                "channel": approval.channel,
+                "policy_version": policy_version,
+                "policy_reason": policy_reason,
+            },
             started_at=utc_now(),
             status=RemediationStatus.RUNNING,
         )
@@ -120,3 +138,15 @@ class RemediationEngine:
             action.error = str(exc)
             action.completed_at = utc_now()
             return action
+
+    async def execute_from_context(self, context: AgentContext) -> RemediationAction:
+        approval_payload = context.previous_agent_results.get("approval")
+        if not isinstance(approval_payload, dict):
+            raise ValueError("AgentContext.previous_agent_results['approval'] is required")
+        action = self.build_action(Approval.model_validate(approval_payload))
+        result = await self.execute(action)
+        context.set_result("remediation-action", result.model_dump(mode="json"))
+        return result
+
+    async def validate(self, result: Any) -> bool:
+        return isinstance(result, RemediationAction)

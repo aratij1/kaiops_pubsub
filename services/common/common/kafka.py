@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import datetime, timezone
 from typing import Any, TypeVar
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -94,7 +95,7 @@ class KafkaConsumer:
                 bootstrap_servers=self._settings.kafka_bootstrap_servers,
                 group_id=self._settings.kafka_group_id,
                 value_deserializer=lambda value: json.loads(value.decode("utf-8")),
-                enable_auto_commit=True,
+                enable_auto_commit=False,
             )
             try:
                 await consumer.start()
@@ -131,7 +132,9 @@ class KafkaConsumer:
                 await asyncio.sleep(3600)
         else:
             async for message in self._consumer:
-                yield message.value
+                payload = message.value
+                if isinstance(payload, dict):
+                    yield payload
 
 
 async def consume_forever(
@@ -139,8 +142,53 @@ async def consume_forever(
     handler: Callable[[dict[str, Any]], Awaitable[None]],
 ) -> None:
     await consumer.start()
-    async for message in consumer.messages():
-        try:
-            await handler(message)
-        except Exception:
-            logger.exception("failed to process kafka message", extra={"topic": consumer._topic})
+    if consumer._consumer is None:
+        while True:
+            await asyncio.sleep(3600)
+
+    dlq_producer = KafkaProducer(consumer._settings)
+    try:
+        await dlq_producer.start()
+    except Exception:
+        logger.exception("failed to initialize kafka dlq producer", extra={"topic": consumer._topic})
+
+    try:
+        async for record in consumer._consumer:
+            payload = record.value if isinstance(record.value, dict) else {}
+            attempts = 0
+            max_retries = max(0, int(consumer._settings.kafka_consumer_max_retries or 0))
+            try:
+                while attempts <= max_retries:
+                    try:
+                        await handler(payload)
+                        break
+                    except Exception:
+                        attempts += 1
+                        if attempts > max_retries:
+                            raise
+                        await asyncio.sleep(min(2**attempts, 5))
+            except Exception as exc:
+                logger.exception(
+                    "failed to process kafka message",
+                    extra={"topic": consumer._topic, "attempts": attempts, "max_retries": max_retries},
+                )
+                if dlq_producer._producer is not None:
+                    dlq_topic = f"{consumer._topic}{consumer._settings.kafka_dlq_suffix}"
+                    try:
+                        await dlq_producer.publish(
+                            dlq_topic,
+                            {
+                                "failed_topic": consumer._topic,
+                                "payload": payload,
+                                "error": str(exc),
+                                "attempts": attempts,
+                                "failed_at": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                    except Exception:
+                        logger.exception("failed to publish kafka dlq message", extra={"topic": dlq_topic})
+            finally:
+                if consumer._consumer is not None:
+                    await consumer._consumer.commit()
+    finally:
+        await dlq_producer.stop()

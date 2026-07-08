@@ -1,0 +1,198 @@
+/* Datamatics Standard Stylesheet (UI overrides)
+   This file is loaded by services/ui/app.py via apply_datamatics_stylesheet().
+   Brand tokens are mapped here for fonts, colors, spacing, and button spec. */
+
+:root {
+  /* Typography tokens */
+  --dm-font-heading: "Space Grotesk", "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
+  --dm-font-body: "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
+  --dm-font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* Color tokens */
+  --dm-color-primary-700: #004a8c;
+  --dm-color-primary-600: #005baa;
+  --dm-color-primary-500: #2f7cc5;
+  --dm-color-primary-300: #8fc0ea;
+  --dm-color-accent-500: #f28c28;
+  --dm-color-accent-200: #ffd8b1;
+  --dm-color-surface-900: #102840;
+  --dm-color-surface-800: #17314f;
+  --dm-color-surface-700: #204267;
+  --dm-color-panel-900: #0f2238;
+  --dm-color-panel-800: #17314f;
+  --dm-color-text-inverse: #eaf3ff;
+  --dm-color-text-inverse-soft: #bfd4ea;
+  --dm-color-text-default: #0f172a;
+  --dm-color-border-strong: rgba(180, 207, 236, 0.42);
+  --dm-color-border-soft: rgba(180, 207, 236, 0.32);
+
+  /* Spacing scale */
+  --dm-space-1: 4px;
+  --dm-space-2: 8px;
+  --dm-space-3: 12px;
+  --dm-space-4: 16px;
+  --dm-space-5: 20px;
+  --dm-space-6: 24px;
+  --dm-space-8: 32px;
+
+  /* Radius and elevation */
+  --dm-radius-sm: 10px;
+  --dm-radius-md: 12px;
+  --dm-radius-lg: 16px;
+  --dm-shadow-sm: 0 8px 16px rgba(5, 20, 36, 0.18);
+  --dm-shadow-md: 0 12px 24px rgba(5, 20, 36, 0.24);
+  --dm-shadow-lg: 0 14px 30px rgba(5, 20, 36, 0.28);
+
+  /* Button spec */
+  --dm-btn-font-size: 0.9rem;
+  --dm-btn-font-weight: 600;
+  --dm-btn-radius: var(--dm-radius-sm);
+  --dm-btn-padding-y: 0.46rem;
+  --dm-btn-padding-x: 0.88rem;
+  --dm-btn-border: 1px solid #5ea4e5;
+  --dm-btn-bg: linear-gradient(180deg, var(--dm-color-primary-600), var(--dm-color-primary-700));
+  --dm-btn-bg-hover: linear-gradient(180deg, #0068bf, #00539e);
+  --dm-btn-text: #f7fbff;
+}
+
+.stApp {
+  background: linear-gradient(180deg, var(--dm-color-surface-900) 0%, #19395d 54%, var(--dm-color-surface-700) 100%) !important;
+  color: var(--dm-color-text-inverse) !important;
+  font-family: var(--dm-font-body) !important;
+}
+
+.block-container {
+  max-width: 1360px !important;
+  padding-top: var(--dm-space-4) !important;
+  padding-bottom: var(--dm-space-6) !important;
+}
+
+h1,
+h2,
+h3,
+h4,
+.kaiops-hero-title,
+.kaiops-summary-hero-alert {
+  font-family: var(--dm-font-heading) !important;
+  letter-spacing: 0.015em !important;
+}
+
+.stApp,
+.stApp p,
+.stApp label,
+.stApp li,
+.stApp button,
+.stApp input,
+.stApp textarea,
+.stApp select {
+  font-family: var(--dm-font-body) !important;
+}
+
+.stApp code,
+.stApp pre,
+.stApp .stCodeBlock,
+.stApp .stCodeBlock * {
+  font-family: var(--dm-font-mono) !important;
+}
+
+.kaiops-hero-wrap,
+.kaiops-hero,
+.kaiops-summary-hero,
+.kaiops-card,
+.kaiops-role-card,
+div[data-testid="stMetric"],
+div[data-testid="stVerticalBlockBorderWrapper"] {
+  border-radius: var(--dm-radius-md) !important;
+  border: 1px solid var(--dm-color-border-soft) !important;
+  box-shadow: var(--dm-shadow-lg) !important;
+}
+
+.kaiops-hero,
+.kaiops-hero-wrap,
+.kaiops-summary-hero {
+  background: linear-gradient(122deg, #123457 0%, var(--dm-color-primary-600) 46%, var(--dm-color-primary-500) 100%) !important;
+}
+
+section[data-testid="stSidebar"] {
+  background:
+    radial-gradient(560px 280px at 8% -10%, rgba(242, 140, 40, 0.18), transparent 72%),
+    linear-gradient(180deg, var(--dm-color-surface-900) 0%, var(--dm-color-surface-800) 56%, var(--dm-color-surface-700) 100%) !important;
+}
+
+.kaiops-sidebar-hero {
+  background: linear-gradient(138deg, #123457 0%, var(--dm-color-primary-600) 62%, var(--dm-color-primary-500) 100%) !important;
+  border: 1px solid var(--dm-color-border-strong) !important;
+  border-radius: var(--dm-radius-md) !important;
+}
+
+.kaiops-sidebar-live {
+  background: rgba(7, 18, 33, 0.42) !important;
+  border: 1px solid rgba(242, 140, 40, 0.5) !important;
+  color: #ffe6cc !important;
+}
+
+.kaiops-sidebar-live-dot {
+  background: var(--dm-color-accent-500) !important;
+}
+
+.stButton > button,
+.stDownloadButton > button {
+  background: var(--dm-btn-bg) !important;
+  border: var(--dm-btn-border) !important;
+  border-radius: var(--dm-btn-radius) !important;
+  color: var(--dm-btn-text) !important;
+  font-size: var(--dm-btn-font-size) !important;
+  font-weight: var(--dm-btn-font-weight) !important;
+  padding: var(--dm-btn-padding-y) var(--dm-btn-padding-x) !important;
+  box-shadow: var(--dm-shadow-sm) !important;
+}
+
+.stButton > button:hover,
+.stDownloadButton > button:hover {
+  background: var(--dm-btn-bg-hover) !important;
+  filter: brightness(1.05);
+  box-shadow: var(--dm-shadow-md) !important;
+}
+
+div[data-baseweb="select"] > div,
+.stTextInput input,
+.stNumberInput input,
+.stTextArea textarea {
+  border-radius: var(--dm-radius-sm) !important;
+  border-color: var(--dm-color-border-soft) !important;
+}
+
+section[data-testid="stSidebar"] .stRadio > div[role="radiogroup"] > label[data-selected="true"] {
+  background: linear-gradient(135deg, rgba(0, 91, 170, 0.85), rgba(47, 124, 197, 0.85)) !important;
+  border-color: rgba(242, 140, 40, 0.72) !important;
+}
+
+.kaiops-nav-active-card {
+  border-color: rgba(242, 140, 40, 0.5) !important;
+}
+
+.kaiops-nav-active-label {
+  color: var(--dm-color-accent-200) !important;
+}
+
+/* Light mode adjustments while preserving Datamatics palette */
+html[data-theme="light"] .stApp,
+[data-theme="light"] .stApp {
+  background: linear-gradient(180deg, #f5f9ff 0%, #ebf3ff 100%) !important;
+  color: var(--dm-color-text-default) !important;
+}
+
+html[data-theme="light"] .kaiops-hero,
+html[data-theme="light"] .kaiops-hero-wrap,
+html[data-theme="light"] .kaiops-summary-hero,
+[data-theme="light"] .kaiops-hero,
+[data-theme="light"] .kaiops-hero-wrap,
+[data-theme="light"] .kaiops-summary-hero {
+  background: linear-gradient(125deg, #e9f3ff 0%, #cfe6ff 48%, #bddcff 100%) !important;
+  color: #0f172a !important;
+}
+
+html[data-theme="light"] .kaiops-sidebar-hero,
+[data-theme="light"] .kaiops-sidebar-hero {
+  background: linear-gradient(140deg, #edf5ff 0%, #dcecff 62%, #cae3ff 100%) !important;
+}

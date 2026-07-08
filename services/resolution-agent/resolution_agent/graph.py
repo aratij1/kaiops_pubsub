@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from typing import Any, TypedDict
 
+from common.agentic import AgentContext, BaseAgent
+from common.model_gateway import GenerationRequest, ModelGateway, RouterModelGateway
 from common.models import AlertSeverity, Context, Recommendation
+from common.prompts import (
+    PROMPT_ASSESS_IMPACT,
+    PROMPT_IDENTIFY_ROOT_CAUSE,
+    PROMPT_RECOMMEND_REMEDIATION,
+)
 from langgraph.graph import END, StateGraph
 from model_router import ModelRouter, ModelTask
 
@@ -19,10 +26,16 @@ class ResolutionState(TypedDict, total=False):
     model_calls: list[dict[str, Any]]
 
 
-class ResolutionIntelligenceAgent:
-    def __init__(self, model_router: ModelRouter | None = None) -> None:
+class ResolutionIntelligenceAgent(BaseAgent):
+    name = "resolution-agent"
+
+    def __init__(self, model_router: ModelRouter | None = None, model_gateway: ModelGateway | None = None) -> None:
         self.model_router = model_router or ModelRouter()
+        self.model_gateway = model_gateway or RouterModelGateway(self.model_router)
         self.graph = self._build_graph()
+
+    async def can_execute(self, context: AgentContext) -> bool:
+        return "context-agent" in context.previous_agent_results or "context" in context.previous_agent_results
 
     def _build_graph(self):
         workflow = StateGraph(ResolutionState)
@@ -41,24 +54,44 @@ class ResolutionIntelligenceAgent:
 
     async def collect_context(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
+
+        runbook_preview = (context.runbook or "")[:800]
+        related_incident_preview = [
+            {
+                "title": str(item.get("title", ""))[:120],
+                "service": item.get("service"),
+                "severity": item.get("severity"),
+            }
+            for item in context.related_incidents[:3]
+        ]
+        recent_change_preview = [
+            {
+                "id": item.get("id"),
+                "message": str(item.get("message") or item.get("title") or "")[:160],
+            }
+            for item in context.recent_changes[:5]
+        ]
+
         state["gathered_context"] = {
             "deployment": context.deployment,
-            "related_incidents": context.related_incidents,
-            "runbook": context.runbook,
-            "dependency_services": context.dependency_services,
-            "recent_changes": context.recent_changes,
+            "related_incidents": related_incident_preview,
+            "runbook": runbook_preview,
+            "dependency_services": context.dependency_services[:8],
+            "recent_changes": recent_change_preview,
         }
         return state
 
     async def generate_rca(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
-        prompt = "Identify root cause"
+        prompt = PROMPT_IDENTIFY_ROOT_CAUSE
         payload = {"summary": context.alert.description, **state["gathered_context"]}
-        response = await self.model_router.route(
-            severity=context.alert.severity,
-            task=ModelTask.RCA,
-            prompt=prompt,
-            payload=payload,
+        response = await self.model_gateway.generate(
+            GenerationRequest(
+                severity=context.alert.severity,
+                task=ModelTask.RCA.value,
+                prompt=prompt,
+                payload=payload,
+            )
         )
         deployment = context.deployment or "unknown change"
         state["root_cause"] = deployment if "Deployment" in deployment else response["content"]
@@ -71,7 +104,14 @@ class ResolutionIntelligenceAgent:
                 "model": response["usage"].get("model"),
                 "prompt": prompt,
                 "payload": payload,
-                "response": response["content"],
+                "response": {
+                    "text": response["content"],
+                    "parameters": {
+                        "provider": response["model"],
+                        "model": response["usage"].get("model"),
+                        "task": ModelTask.RCA.value,
+                    },
+                },
                 "usage": response["usage"],
             }
         )
@@ -79,13 +119,15 @@ class ResolutionIntelligenceAgent:
 
     async def impact_analysis(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
-        prompt = "Assess customer and dependency impact"
+        prompt = PROMPT_ASSESS_IMPACT
         payload = {"service": context.alert.service, "metrics": context.observability}
-        response = await self.model_router.route(
-            severity=context.alert.severity,
-            task=ModelTask.IMPACT,
-            prompt=prompt,
-            payload=payload,
+        response = await self.model_gateway.generate(
+            GenerationRequest(
+                severity=context.alert.severity,
+                task=ModelTask.IMPACT.value,
+                prompt=prompt,
+                payload=payload,
+            )
         )
         if "latency" in context.alert.description.lower():
             state["impact"] = f"{context.alert.service.title()} latency"
@@ -99,7 +141,14 @@ class ResolutionIntelligenceAgent:
                 "model": response["usage"].get("model"),
                 "prompt": prompt,
                 "payload": payload,
-                "response": response["content"],
+                "response": {
+                    "text": response["content"],
+                    "parameters": {
+                        "provider": response["model"],
+                        "model": response["usage"].get("model"),
+                        "task": ModelTask.IMPACT.value,
+                    },
+                },
                 "usage": response["usage"],
             }
         )
@@ -115,13 +164,15 @@ class ResolutionIntelligenceAgent:
             action = "Restart pod"
             commands = [f"restart-pod:{context.alert.service}"]
         else:
-            prompt = "Recommend safest remediation"
+            prompt = PROMPT_RECOMMEND_REMEDIATION
             payload = {"service": context.alert.service, "runbook": context.runbook}
-            response = await self.model_router.route(
-                severity=context.alert.severity,
-                task=ModelTask.FIX,
-                prompt=prompt,
-                payload=payload,
+            response = await self.model_gateway.generate(
+                GenerationRequest(
+                    severity=context.alert.severity,
+                    task=ModelTask.FIX.value,
+                    prompt=prompt,
+                    payload=payload,
+                )
             )
             action = response["content"]
             commands = []
@@ -133,7 +184,14 @@ class ResolutionIntelligenceAgent:
                     "model": response["usage"].get("model"),
                     "prompt": prompt,
                     "payload": payload,
-                    "response": response["content"],
+                    "response": {
+                        "text": response["content"],
+                        "parameters": {
+                            "provider": response["model"],
+                            "model": response["usage"].get("model"),
+                            "task": ModelTask.FIX.value,
+                        },
+                    },
                     "usage": response["usage"],
                 }
             )
@@ -171,3 +229,14 @@ class ResolutionIntelligenceAgent:
         recommendation.metadata["model_usage"] = state.get("model_usage", [])
         recommendation.metadata["model_calls"] = state.get("model_calls", [])
         return recommendation
+
+    async def execute(self, context: AgentContext) -> Recommendation:
+        context_payload = context.previous_agent_results.get("context-agent") or context.previous_agent_results.get("context")
+        if not isinstance(context_payload, dict):
+            raise ValueError("AgentContext.previous_agent_results must include serialized context")
+        recommendation = await self.resolve(Context.model_validate(context_payload))
+        context.set_result(self.name, recommendation.model_dump(mode="json"))
+        return recommendation
+
+    async def validate(self, result: Any) -> bool:
+        return isinstance(result, Recommendation)

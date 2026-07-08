@@ -1,15 +1,71 @@
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from time import perf_counter
+from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from common.config import Settings
 from common.database import create_engine, create_schema, create_session_factory
-from common.kafka import KafkaProducer
+from common.event_publishers import build_event_publisher
 from common.logging import configure_logging
 from common.telemetry import metrics_response, setup_tracing
+
+_MAX_HTTP_BODY_LOG_BYTES = 4096
+_SKIP_HTTP_LOG_PATHS = {"/healthz", "/readyz", "/metrics"}
+_MASKED_VALUE = "***"
+_SENSITIVE_KEYS = {
+    "password",
+    "token",
+    "secret",
+    "authorization",
+    "api_key",
+    "access_token",
+    "refresh_token",
+    "jwt",
+}
+
+
+def _mask_sensitive_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        masked: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key).strip().lower()
+            if key_text in _SENSITIVE_KEYS:
+                masked[key] = _MASKED_VALUE
+            else:
+                masked[key] = _mask_sensitive_fields(item)
+        return masked
+    if isinstance(value, list):
+        return [_mask_sensitive_fields(item) for item in value]
+    return value
+
+
+def _sanitize_http_payload(body: bytes, content_type: str | None) -> Any:
+    if not body:
+        return None
+    if len(body) > _MAX_HTTP_BODY_LOG_BYTES:
+        return f"<omitted: body size {len(body)} bytes exceeds {_MAX_HTTP_BODY_LOG_BYTES}>"
+
+    lowered_type = (content_type or "").lower()
+    if "application/json" in lowered_type:
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+            return _mask_sensitive_fields(parsed)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return "<invalid-json-body>"
+
+    if lowered_type.startswith("text/") or "application/x-www-form-urlencoded" in lowered_type:
+        try:
+            return body.decode("utf-8")
+        except UnicodeDecodeError:
+            return "<non-utf8-text-body>"
+
+    return f"<omitted: unsupported content-type {content_type or 'unknown'}>"
 
 
 def create_app(
@@ -20,11 +76,12 @@ def create_app(
     shutdown: Callable[[FastAPI], Awaitable[None]] | None = None,
 ) -> FastAPI:
     configure_logging(settings.service_name)
+    logger = logging.getLogger(settings.service_name)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.settings = settings
-        app.state.producer = KafkaProducer(settings)
+        app.state.producer = build_event_publisher(settings)
         try:
             await app.state.producer.start()
             if settings.database_enabled:
@@ -49,6 +106,51 @@ def create_app(
 
     app = FastAPI(title=title, lifespan=lifespan)
     setup_tracing(app, settings)
+
+    @app.middleware("http")
+    async def log_http_io(request: Request, call_next):
+        path = request.url.path
+        if path in _SKIP_HTTP_LOG_PATHS:
+            return await call_next(request)
+
+        started = perf_counter()
+        request_body = await request.body()
+        request_payload = _sanitize_http_payload(request_body, request.headers.get("content-type"))
+
+        async def receive() -> dict[str, Any]:
+            return {"type": "http.request", "body": request_body, "more_body": False}
+
+        request_for_handler = Request(request.scope, receive)
+
+        try:
+            response = await call_next(request_for_handler)
+        except Exception:
+            logger.exception(
+                "http_request_failed",
+                extra={
+                    "method": request.method,
+                    "path": path,
+                    "request": request_payload,
+                    "latency_ms": int((perf_counter() - started) * 1000),
+                },
+            )
+            raise
+
+        response_payload = "<omitted: response body logging disabled>"
+
+        logger.info(
+            "http_io",
+            extra={
+                "method": request.method,
+                "path": path,
+                "status_code": response.status_code,
+                "latency_ms": int((perf_counter() - started) * 1000),
+                "request": request_payload,
+                "response": response_payload,
+            },
+        )
+
+        return response
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

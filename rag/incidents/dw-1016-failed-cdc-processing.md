@@ -3,6 +3,8 @@ alert_name: Failed CDC Processing
 service: cdc-pipeline
 severity: critical
 alert_type: change_data_capture
+source_system: internal
+source_ref: DW-1016
 
 # Failed CDC Processing (DW-1016)
 

@@ -1,8 +1,21 @@
-# KaiOps: Agentic Incident Resolution Platform
+# KaiMS: Agentic Incident Resolution Platform
 
-KaiOps is an end-to-end Python 3.12 microservice platform for agentic incident
+KaiMS is an end-to-end Python 3.12 microservice platform for agentic incident
 triage, root-cause analysis, human approval, automated remediation, closure
 validation, and knowledge capture.
+
+## Demo Guide
+
+- End user and executive demo script: [docs/DEMO_EXECUTIVE_AND_END_USER.md](docs/DEMO_EXECUTIVE_AND_END_USER.md)
+- Hybrid orchestrator policy (rules + AI): [docs/ORCHESTRATION_POLICY.md](docs/ORCHESTRATION_POLICY.md)
+- One-page orchestration decision matrix: [docs/ORCHESTRATION_DECISION_MATRIX.md](docs/ORCHESTRATION_DECISION_MATRIX.md)
+- Incident/alert metadata layer spec (Kafka or RabbitMQ): [docs/INCIDENT_ALERT_METADATA_LAYER.md](docs/INCIDENT_ALERT_METADATA_LAYER.md)
+- Event envelope schema v1: [docs/metadata/event-envelope-v1.schema.json](docs/metadata/event-envelope-v1.schema.json)
+- Docs index and standards overview: [docs/README.md](docs/README.md)
+- RAG content governance and templates: [docs/RAG_CONTENT_STANDARD.md](docs/RAG_CONTENT_STANDARD.md)
+- RAG templates: [docs/rag-templates/runbook.template.md](docs/rag-templates/runbook.template.md), [docs/rag-templates/incident.template.md](docs/rag-templates/incident.template.md), [docs/rag-templates/change.template.md](docs/rag-templates/change.template.md), [docs/rag-templates/dependency.template.md](docs/rag-templates/dependency.template.md), [docs/rag-templates/deployment.template.md](docs/rag-templates/deployment.template.md), [docs/rag-templates/sop.template.md](docs/rag-templates/sop.template.md), [docs/rag-templates/onboarding.template.md](docs/rag-templates/onboarding.template.md)
+- RAG metadata validator: [scripts/validate-rag-metadata.py](scripts/validate-rag-metadata.py)
+- RAG metadata delta validator (PR-focused): [scripts/validate-rag-metadata-delta.py](scripts/validate-rag-metadata-delta.py)
 
 ## Workflow
 
@@ -13,17 +26,63 @@ Monitoring Tools
         -> Alert Intelligence Agent
         -> Kafka enriched-alerts
         -> Orchestrator Agent
+  -> Kafka orchestration-events
         -> Context Intelligence Agent
         -> Kafka context-events
         -> Resolution Intelligence Agent (LangGraph)
         -> Kafka resolution-events
-        -> Human Approval Layer
-        -> Kafka approval-events
         -> Remediation Automation Engine
         -> Kafka remediation-events
         -> Closure & Validation
         -> Kafka closure-events
 ```
+
+## Agentic Orchestration Architecture
+
+KaiMS now includes additive enterprise orchestration seams without breaking the existing APIs:
+
+- `BaseAgent` and `AgentContext` for standard agent execution contracts
+- `EventPublisher` abstraction with `KafkaPublisher` and `NoOpPublisher`
+- `ModelGateway` abstraction for pluggable AI providers
+- `PolicyEngine` for approval and confidence rules
+- `WorkflowEngine` for workflow selection by severity and policy
+- `WorkflowStateMachine` for configurable execution states
+- `AgentOrchestrator` as the control plane for agent execution
+
+Current refactoring path is intentionally incremental:
+
+1. Preserve current endpoints and payloads
+2. Wrap existing agent logic behind shared interfaces
+3. Move routing decisions into orchestration components
+4. Keep Kafka and current persistence working behind abstractions
+
+## Adding a New Agent
+
+To add a new enterprise agent:
+
+1. Implement `BaseAgent`
+2. Accept `AgentContext` as execution input
+3. Return structured results and store them in `context.previous_agent_results`
+4. Register the agent in the relevant workflow definition
+5. Add tests for `can_execute`, `execute`, and `validate`
+
+## Kafka Handoff Matrix
+
+| Step | Producer Service | Topic | Consumer Service | Output Topic |
+| --- | --- | --- | --- | --- |
+| 1 | monitoring-adapter (`POST /alerts`) | `raw-alerts` | alert-intelligence | `enriched-alerts` |
+| 2 | alert-intelligence | `enriched-alerts` | orchestrator | `orchestration-events` |
+| 3 | orchestrator | `orchestration-events` | context-agent | `context-events` |
+| 4 | context-agent | `context-events` | resolution-agent | `resolution-events` |
+| 5a | resolution-agent | `resolution-events` | approval-service | `approval-events` |
+| 5b | resolution-agent | `resolution-events` | remediation-engine (auto-approval branch) | `remediation-events` |
+| 6 | approval-service | `approval-events` | remediation-engine | `remediation-events` |
+| 7 | remediation-engine | `remediation-events` | closure-service | `closure-events` |
+
+Notes:
+
+- Canonical topic names are defined in `services/common/common/topics.py`.
+- With `KAFKA_ENABLED=false`, the local in-process workflow path bypasses Kafka topics and runs directly via gateway/monitoring-adapter workflow endpoints.
 
 ## Folder Structure
 
@@ -42,7 +101,8 @@ services/
   common/                  Models, Kafka, SQLAlchemy, telemetry, resilience
   ui/                      Streamlit incident operations dashboard
 rag/                       Markdown RAG corpus for runbooks, incidents, changes, dependencies
-database/schema.sql        PostgreSQL DDL
+database/schema.sql        MySQL DDL and canonical schema for the platform
+database/migrations/       Schema migrations and backfills for metadata/RBAC
 k8s/                       Namespace, ConfigMap, Secret, Deployments, Services, Ingress, HPA
 .github/workflows/ci.yml   Lint, test, Docker build, Kubernetes validation
 ```
@@ -78,6 +138,57 @@ k8s/                       Namespace, ConfigMap, Secret, Deployments, Services, 
 | closure-service | `POST /validate` | Validate health and generate final RCA |
 
 Every FastAPI service also exposes `/healthz`, `/readyz`, and `/metrics`.
+
+## User Management and RBAC
+
+API Gateway now includes user authentication, role-based access control, and audit logging APIs.
+
+Auth endpoints:
+
+- `POST /auth/login`
+- `POST /auth/refresh`
+- `POST /auth/logout`
+- `GET /auth/me`
+
+Admin endpoints:
+
+- `GET /roles`
+- `GET /users`
+- `GET /users/{user_id}`
+- `POST /users`
+- `PUT /users/{user_id}`
+- `PATCH /users/{user_id}/status`
+- `PATCH /users/{user_id}/reset-password`
+- `PATCH /users/{user_id}/unlock`
+- `DELETE /users/{user_id}`
+- `GET /audit-logs`
+
+Required environment variables:
+
+- `JWT_SECRET_KEY` (use a strong key, at least 32 bytes)
+- `JWT_ALGORITHM` (default: `HS256`)
+- `JWT_ACCESS_TOKEN_MINUTES` (default: `30`)
+- `JWT_REFRESH_TOKEN_MINUTES` (default: `1440`)
+- `AUTH_FAILED_LOGIN_ATTEMPTS` (default: `5`)
+- `AUTH_LOCK_MINUTES` (default: `15`)
+- `AUTH_PASSWORD_EXPIRY_DAYS` (default: `90`)
+
+Default seeded users (override these in non-demo environments):
+
+- `ADMIN_USER_PASSWORD`
+- `EXECUTIVE_USER_PASSWORD`
+- `L3_USER_PASSWORD`
+- `L2_USER_PASSWORD`
+- `L1_USER_PASSWORD`
+
+Database objects are defined in:
+
+- `database/schema.sql`
+- `database/migrations/20260701_user_rbac.sql`
+- `database/migrations/20260708_incident_metadata_layer.sql`
+- `database/migrations/20260708_incident_projection_backfill.sql`
+
+Apply migration manually for existing DBs before starting services.
 
 ## Local Development
 
@@ -146,7 +257,6 @@ Service ports:
 - Approval service: <http://localhost:8007>
 - Remediation engine: <http://localhost:8008>
 - Closure service: <http://localhost:8009>
-- MySQL monitor: <http://localhost:8011>
 
 For local non-Docker UI runs, start the backing API services in separate
 terminals before using the dashboard buttons. For example:
@@ -255,10 +365,10 @@ Replace the sample image names in `k8s/services.yaml` with your registry images.
    owner/runbook metadata, persists `alerts` and `incidents`, and emits
    `enriched-alerts`.
 
-3. `orchestrator` selects the `critical-auto-remediation` workflow and invokes
-   `context-agent`.
+3. `orchestrator` selects the `critical-auto-remediation` workflow and emits
+  `orchestration-events` to Kafka.
 
-4. `context-agent` collects:
+4. `context-agent` consumes `orchestration-events` and collects:
 
    ```json
    {
@@ -291,15 +401,8 @@ Replace the sample image names in `k8s/services.yaml` with your registry images.
    }
    ```
 
-6. A human approves, rejects, or modifies using Slack, Teams, email, or Web UI:
-
-   ```bash
-   curl -X POST http://localhost:8007/approve \
-     -H 'content-type: application/json' \
-     -d '{"incident_id":"...","recommendation_id":"...","approver":"sre@example.com","channel":"web","comment":"Rollback deployment"}'
-   ```
-
-7. `remediation-engine` maps the decision to a Strategy plugin:
+6. `remediation-engine` consumes `resolution-events` for direct RCA-driven
+  automation and maps the decision to a Strategy plugin:
 
    - `JenkinsRollbackPlugin`
    - `KubernetesRestartPlugin`
@@ -307,8 +410,11 @@ Replace the sample image names in `k8s/services.yaml` with your registry images.
    - `TerraformRollbackPlugin`
    - `ApiExecutionPlugin`
 
-8. `closure-service` validates latency, CPU, error rate, and alert clearance,
+7. `closure-service` validates latency, CPU, error rate, and alert clearance,
    stores the RCA report, updates the knowledge base, and emits `closure-events`.
+
+Human approval endpoints in `approval-service` remain available for governed
+override flows.
 
 ## Enterprise Engineering Features
 

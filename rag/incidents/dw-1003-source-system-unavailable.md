@@ -3,6 +3,8 @@ alert_name: Source System Unavailable
 service: oracle-source
 severity: critical
 alert_type: source_connectivity
+source_system: internal
+source_ref: DW-1003
 
 # Source System Unavailable (DW-1003)
 

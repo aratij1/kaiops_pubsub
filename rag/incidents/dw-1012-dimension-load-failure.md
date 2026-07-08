@@ -3,6 +3,8 @@ alert_name: Dimension Load Failure
 service: customer-dimension
 severity: high
 alert_type: etl_failure
+source_system: internal
+source_ref: DW-1012
 
 # Dimension Load Failure (DW-1012)
 

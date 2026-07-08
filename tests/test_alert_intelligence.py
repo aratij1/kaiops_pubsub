@@ -1,5 +1,6 @@
 from alert_intelligence import AlertIntelligenceAgent
 from common.models import Alert, AlertSeverity
+import pytest
 
 
 def make_alert(description: str = "payment latency above threshold") -> Alert:
@@ -13,10 +14,11 @@ def make_alert(description: str = "payment latency above threshold") -> Alert:
     )
 
 
-def test_alert_intelligence_deduplicates_and_classifies() -> None:
+@pytest.mark.asyncio
+async def test_alert_intelligence_deduplicates_and_classifies() -> None:
     agent = AlertIntelligenceAgent()
-    first, first_incident = agent.process(make_alert())
-    second, _ = agent.process(make_alert())
+    first, first_incident = await agent.process(make_alert())
+    second, _ = await agent.process(make_alert())
 
     assert first.severity == AlertSeverity.CRITICAL
     assert second.deduplicated_count == 2
@@ -24,9 +26,10 @@ def test_alert_intelligence_deduplicates_and_classifies() -> None:
     assert first_incident.owner_team == "payments-sre"
 
 
-def test_alert_intelligence_uses_embedding_correlation() -> None:
+@pytest.mark.asyncio
+async def test_alert_intelligence_uses_embedding_correlation() -> None:
     agent = AlertIntelligenceAgent(correlation_threshold=0.2)
-    first, _ = agent.process(make_alert("checkout payment latency high"))
-    correlated, _ = agent.process(make_alert("payment checkout latency degraded"))
+    first, _ = await agent.process(make_alert("checkout payment latency high"))
+    correlated, _ = await agent.process(make_alert("payment checkout latency degraded"))
 
     assert correlated.correlation_id == first.correlation_id

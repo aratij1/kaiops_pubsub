@@ -1,6 +1,10 @@
 kind: runbook
 title: Checkout pod crash loop restart
 services: checkout
+owner_team: platform-ops
+last_reviewed: 2026-07-08
+source_system: internal
+source_ref: RUNBOOK-CHECKOUT-POD-RESTART
 
 # Checkout pod crash loop restart
 

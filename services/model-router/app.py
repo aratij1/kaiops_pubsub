@@ -9,7 +9,7 @@ from pydantic import BaseModel
 settings = get_settings()
 settings.service_name = "model-router"
 router = ModelRouter()
-app = create_app(title="KaiOps Model Router", settings=settings)
+app = create_app(title="KaiMS Model Router", settings=settings)
 
 
 class RouteRequest(BaseModel):

@@ -64,8 +64,13 @@ async def test_local_payment_workflow_generates_recommendation() -> None:
     assert workflow["alert"]["severity"] == "critical"
     assert workflow["incident"]["service"] == "payments"
     assert workflow["decision"]["workflow"] == "critical-auto-remediation"
+    assert workflow["decision"]["policy_version"] == "policy-v1"
+    assert workflow["decision"]["policy_reason"]
     assert workflow["context"]["deployment"] == "Deployment 2.5"
     assert workflow["recommendation"]["recommended_action"] == "Rollback deployment"
+    assert workflow["recommendation"]["metadata"]["policy_version"] == workflow["decision"]["policy_version"]
+    assert workflow["approval"]["metadata"]["policy_version"] == workflow["decision"]["policy_version"]
+    assert workflow["remediation_action"]["parameters"]["policy_version"] == workflow["decision"]["policy_version"]
     assert workflow["metrics"]["agent_handoffs"] == 6
     assert workflow["metrics"]["recommendation_confidence"] >= 0.9
     assert workflow["closure_report"]["health_restored"] is True

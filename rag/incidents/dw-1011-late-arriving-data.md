@@ -1,8 +1,10 @@
 alert_id: DW-1011
 alert_name: Late Arriving Data
 service: transaction-feed
-severity: medium
+severity: high
 alert_type: data_latency
+source_system: internal
+source_ref: DW-1011
 
 # Late Arriving Data (DW-1011)
 

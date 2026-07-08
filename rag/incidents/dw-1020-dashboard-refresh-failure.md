@@ -3,6 +3,8 @@ alert_name: Dashboard Refresh Failure
 service: powerbi-reporting
 severity: high
 alert_type: reporting
+source_system: internal
+source_ref: DW-1020
 
 # Dashboard Refresh Failure (DW-1020)
 

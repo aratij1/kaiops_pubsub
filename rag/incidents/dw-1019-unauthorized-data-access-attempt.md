@@ -3,6 +3,8 @@ alert_name: Unauthorized Data Access Attempt
 service: data-warehouse
 severity: critical
 alert_type: security
+source_system: internal
+source_ref: DW-1019
 
 # Unauthorized Data Access Attempt (DW-1019)
 

@@ -3,6 +3,8 @@ alert_name: Business SLA Missed
 service: daily-sales-report
 severity: critical
 alert_type: sla_breach
+source_system: internal
+source_ref: DW-1017
 
 # Business SLA Missed (DW-1017)
 

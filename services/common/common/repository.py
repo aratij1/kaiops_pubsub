@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,10 +13,13 @@ from common.database import (
     AlertRecord,
     ApprovalRecord,
     AuditLogRecord,
+    IncidentEventRecord,
     IncidentRecord,
+    IncidentProjectionRecord,
     KnowledgeBaseRecord,
     RcaReportRecord,
     OnboardingStateRecord,
+    PendingWorkflowRecord,
 )
 from common.models import (
     Alert,
@@ -53,6 +57,207 @@ class IncidentRepository:
                 payload=alert.model_dump(mode="json"),
             )
         )
+
+    async def list_alerts(self, limit: int = 500) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 5000))
+        result = await self.session.execute(
+            select(AlertRecord)
+            .order_by(AlertRecord.created_at.desc(), AlertRecord.updated_at.desc())
+            .limit(safe_limit)
+        )
+        rows = result.scalars().all()
+        return [row.payload for row in rows]
+
+    async def get_processed_result_by_alert_id(self, alert_id: str) -> dict[str, Any] | None:
+        normalized_alert_id = str(alert_id or "").strip()
+        if not normalized_alert_id:
+            return None
+
+        try:
+            alert_uuid = UUID(normalized_alert_id)
+        except ValueError:
+            return None
+
+        alert_result = await self.session.execute(select(AlertRecord).where(AlertRecord.id == alert_uuid))
+        alert_record = alert_result.scalar_one_or_none()
+        if alert_record is None:
+            return None
+
+        alert_payload = alert_record.payload if isinstance(alert_record.payload, dict) else {}
+
+        incident_rows = await self.session.execute(
+            select(IncidentRecord).order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc()).limit(300)
+        )
+        incident_record = None
+        for record in incident_rows.scalars().all():
+            payload = record.payload if isinstance(record.payload, dict) else {}
+            linked_alert_ids = payload.get("alert_ids", []) if isinstance(payload.get("alert_ids"), list) else []
+            linked_as_strings = {str(item) for item in linked_alert_ids}
+            if normalized_alert_id in linked_as_strings:
+                incident_record = record
+                break
+
+        if incident_record is None:
+            # Fallback: match by service and severity for latest likely incident.
+            service = str(alert_payload.get("service") or "").strip()
+            severity = str(alert_payload.get("severity") or "").strip()
+            if service:
+                fallback_stmt = select(IncidentRecord).where(IncidentRecord.service == service)
+                if severity:
+                    fallback_stmt = fallback_stmt.where(IncidentRecord.severity == severity)
+                fallback_result = await self.session.execute(
+                    fallback_stmt.order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc()).limit(1)
+                )
+                incident_record = fallback_result.scalar_one_or_none()
+
+        if incident_record is None:
+            return None
+
+        incident_payload = incident_record.payload if isinstance(incident_record.payload, dict) else {}
+        incident_id_str = str(incident_record.id)
+
+        recommendation = {}
+        audit_stmt = (
+            select(AuditLogRecord)
+            .where(AuditLogRecord.resource_type == "incident")
+            .where(AuditLogRecord.resource_id == incident_id_str)
+            .where(AuditLogRecord.action == "recommendation.generated")
+            .order_by(AuditLogRecord.updated_at.desc(), AuditLogRecord.created_at.desc())
+            .limit(1)
+        )
+        audit_result = await self.session.execute(audit_stmt)
+        audit_record = audit_result.scalar_one_or_none()
+        if audit_record is not None and isinstance(audit_record.payload, dict):
+            recommendation = audit_record.payload
+
+        approval = {}
+        approval_result = await self.session.execute(
+            select(ApprovalRecord)
+            .where(ApprovalRecord.incident_id == UUID(incident_id_str))
+            .order_by(ApprovalRecord.updated_at.desc(), ApprovalRecord.created_at.desc())
+            .limit(1)
+        )
+        approval_record = approval_result.scalar_one_or_none()
+        if approval_record is not None and isinstance(approval_record.payload, dict):
+            approval = approval_record.payload
+
+        remediation_action = {}
+        action_result = await self.session.execute(
+            select(ActionRecord)
+            .where(ActionRecord.incident_id == UUID(incident_id_str))
+            .order_by(ActionRecord.updated_at.desc(), ActionRecord.created_at.desc())
+            .limit(1)
+        )
+        action_record = action_result.scalar_one_or_none()
+        if action_record is not None and isinstance(action_record.payload, dict):
+            remediation_action = action_record.payload
+
+        closure_report = {}
+        report_result = await self.session.execute(
+            select(RcaReportRecord)
+            .where(RcaReportRecord.incident_id == UUID(incident_id_str))
+            .order_by(RcaReportRecord.updated_at.desc(), RcaReportRecord.created_at.desc())
+            .limit(1)
+        )
+        report_record = report_result.scalar_one_or_none()
+        if report_record is not None and isinstance(report_record.payload, dict):
+            closure_report = report_record.payload
+
+        work_rows_result = await self.session.execute(
+            select(AgentWorkItemRecord)
+            .where(AgentWorkItemRecord.incident_id == UUID(incident_id_str))
+            .order_by(AgentWorkItemRecord.sequence.asc(), AgentWorkItemRecord.updated_at.asc())
+        )
+        work_rows = work_rows_result.scalars().all()
+        events = [
+            {
+                "sequence": row.sequence,
+                "agent": row.agent_name,
+                "action": (row.details or {}).get("action") or row.work_item,
+                "input": (row.details or {}).get("input", {}),
+                "decision": (row.details or {}).get("decision"),
+                "metrics": (row.details or {}).get("metrics", {}),
+                "output": (row.details or {}).get("output") or row.status,
+                "communicates_to": (row.details or {}).get("communicates_to", ""),
+                "llm_calls": (row.details or {}).get("llm_calls", []),
+                "llm_errors": (row.details or {}).get("llm_errors", []),
+            }
+            for row in work_rows
+        ]
+
+        recommendation_metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
+        orchestration_decision = (
+            recommendation_metadata.get("orchestration_decision", {})
+            if isinstance(recommendation_metadata.get("orchestration_decision"), dict)
+            else {}
+        )
+        model_usage = recommendation_metadata.get("model_usage", []) if isinstance(recommendation_metadata.get("model_usage"), list) else []
+        finops_totals = {
+            "input_tokens": sum(int(item.get("input_tokens", 0) or 0) for item in model_usage if isinstance(item, dict)),
+            "output_tokens": sum(int(item.get("output_tokens", 0) or 0) for item in model_usage if isinstance(item, dict)),
+            "total_tokens": sum(int(item.get("total_tokens", 0) or 0) for item in model_usage if isinstance(item, dict)),
+            "total_cost_usd": round(sum(float(item.get("total_cost_usd", 0.0) or 0.0) for item in model_usage if isinstance(item, dict)), 8),
+            "calls": len([item for item in model_usage if isinstance(item, dict)]),
+            "failed_calls": 0,
+        }
+        by_provider: dict[str, dict[str, Any]] = {}
+        for item in model_usage:
+            if not isinstance(item, dict):
+                continue
+            provider = str(item.get("provider") or "unknown")
+            row = by_provider.setdefault(
+                provider,
+                {"provider": provider, "calls": 0, "total_tokens": 0, "total_cost_usd": 0.0},
+            )
+            row["calls"] += 1
+            row["total_tokens"] += int(item.get("total_tokens", 0) or 0)
+            row["total_cost_usd"] = round(float(row["total_cost_usd"]) + float(item.get("total_cost_usd", 0.0) or 0.0), 8)
+
+        metrics = {
+            "severity": str(incident_payload.get("severity") or alert_payload.get("severity") or "unknown").upper(),
+            "remediation_status": str(remediation_action.get("status") or "unknown"),
+            "health_restored": bool(closure_report.get("health_restored", False)),
+            "alerts_cleared": bool(closure_report.get("alerts_cleared", False)),
+            "recommendation_confidence": float(recommendation.get("confidence", 0.0) or 0.0),
+            "agent_handoffs": len(events),
+        }
+
+        scenario = {
+            "id": "db-processed",
+            "title": str(incident_payload.get("title") or alert_payload.get("name") or "Incident"),
+            "recommended_action": str(recommendation.get("recommended_action") or ""),
+        }
+
+        return {
+            "mode": "db-processed",
+            "scenario": scenario,
+            "alert": alert_payload,
+            "incident": incident_payload,
+            "decision": {
+                "workflow": str(orchestration_decision.get("workflow") or "db-processed"),
+                "requires_approval": bool(orchestration_decision.get("requires_approval", False)),
+                "message_bus_provider": str(orchestration_decision.get("message_bus_provider") or "unknown"),
+                "stream_count": int(orchestration_decision.get("stream_count", 0) or 0),
+                "stream_threshold": int(orchestration_decision.get("stream_threshold", 0) or 0),
+                "planner_used": False,
+                "planner_model": None,
+                "planner_reason": "db-processed historical result",
+            },
+            "recommendation": recommendation,
+            "approval": approval,
+            "remediation_action": remediation_action,
+            "closure_report": closure_report,
+            "metrics": metrics,
+            "finops": {
+                "totals": finops_totals,
+                "by_provider": list(by_provider.values()),
+                "calls": model_usage,
+                "errors": [],
+                "currency": "USD",
+            },
+            "events": events,
+            "next_step": "Loaded processed incident summary from database.",
+        }
 
     async def save_incident(self, incident: Incident) -> None:
         await self.session.merge(
@@ -94,6 +299,26 @@ class IncidentRepository:
                 target=self._require("action.target", action.target),
                 status=self._require("action.status", action.status.value),
                 payload=action.model_dump(mode="json"),
+            )
+        )
+
+    async def save_action_audit(self, action: RemediationAction, actor: str = "remediation-engine") -> None:
+        payload = action.model_dump(mode="json")
+        policy_version = str(action.parameters.get("policy_version", "")).strip()
+        policy_reason = str(action.parameters.get("policy_reason", "")).strip()
+        if policy_version:
+            payload["policy_version"] = policy_version
+        if policy_reason:
+            payload["policy_reason"] = policy_reason
+
+        await self.session.merge(
+            AuditLogRecord(
+                id=uuid4(),
+                actor=self._require("audit.actor", actor),
+                action=self._require("audit.action", "remediation.executed"),
+                resource_type="incident",
+                resource_id=self._require("audit.resource_id", str(action.incident_id)),
+                payload=payload,
             )
         )
 
@@ -178,6 +403,8 @@ class IncidentRepository:
                 "endpoint_url": row.endpoint_url,
                 "test_status": row.test_status,
                 "test_message": row.test_message,
+                "project_payload": row.project_payload,
+                "connectivity_payload": row.connectivity_payload,
                 "updated_at": row.updated_at,
                 "last_tested_at": row.last_tested_at,
             }
@@ -198,7 +425,7 @@ class IncidentRepository:
         started_at: datetime | None = None,
         completed_at: datetime | None = None,
     ) -> None:
-        await self.session.merge(
+        self.session.add(
             AgentWorkItemRecord(
                 incident_id=self._require("agent_work.incident_id", incident_id),
                 agent_name=self._require("agent_work.agent_name", agent_name),
@@ -212,6 +439,96 @@ class IncidentRepository:
                 completed_at=completed_at,
             )
         )
+
+    async def save_pending_workflow(
+        self,
+        *,
+        incident_id: Any,
+        recommendation_id: Any,
+        flow_id: str,
+        trace_id: str | None,
+        payload: dict[str, Any],
+    ) -> None:
+        incident_uuid = self._parse_uuid(incident_id)
+        if incident_uuid is None:
+            raise ValueError("pending_workflow.incident_id is required")
+        recommendation_uuid = self._parse_uuid(recommendation_id)
+        if recommendation_uuid is None:
+            raise ValueError("pending_workflow.recommendation_id is required")
+
+        result = await self.session.execute(
+            select(PendingWorkflowRecord).where(PendingWorkflowRecord.incident_id == incident_uuid)
+        )
+        record = result.scalar_one_or_none()
+        if record is None:
+            record = PendingWorkflowRecord(
+                incident_id=incident_uuid,
+                recommendation_id=recommendation_uuid,
+                flow_id=self._require("pending_workflow.flow_id", flow_id),
+                trace_id=trace_id,
+                status="pending",
+                payload=payload,
+                completed_payload=None,
+                completed_at=None,
+            )
+            self.session.add(record)
+            return
+
+        record.recommendation_id = recommendation_uuid
+        record.flow_id = self._require("pending_workflow.flow_id", flow_id)
+        record.trace_id = trace_id
+        record.status = "pending"
+        record.payload = payload
+        record.completed_payload = None
+        record.completed_at = None
+        await self.session.merge(record)
+
+    async def get_pending_workflow(self, incident_id: Any) -> dict[str, Any] | None:
+        incident_uuid = self._parse_uuid(incident_id)
+        if incident_uuid is None:
+            return None
+        result = await self.session.execute(
+            select(PendingWorkflowRecord).where(PendingWorkflowRecord.incident_id == incident_uuid)
+        )
+        record = result.scalar_one_or_none()
+        if record is None:
+            return None
+        return {
+            "incident_id": str(record.incident_id),
+            "recommendation_id": str(record.recommendation_id),
+            "flow_id": record.flow_id,
+            "trace_id": record.trace_id,
+            "status": record.status,
+            "payload": record.payload if isinstance(record.payload, dict) else {},
+            "completed_payload": record.completed_payload if isinstance(record.completed_payload, dict) else None,
+            "completed_at": record.completed_at,
+        }
+
+    async def mark_pending_workflow_completed(self, incident_id: Any, completed_payload: dict[str, Any]) -> None:
+        incident_uuid = self._parse_uuid(incident_id)
+        if incident_uuid is None:
+            return
+        result = await self.session.execute(
+            select(PendingWorkflowRecord).where(PendingWorkflowRecord.incident_id == incident_uuid)
+        )
+        record = result.scalar_one_or_none()
+        if record is None:
+            return
+        record.status = "completed"
+        record.completed_payload = completed_payload
+        record.completed_at = datetime.utcnow()
+        await self.session.merge(record)
+
+    async def clear_pending_workflow(self, incident_id: Any) -> None:
+        incident_uuid = self._parse_uuid(incident_id)
+        if incident_uuid is None:
+            return
+        result = await self.session.execute(
+            select(PendingWorkflowRecord).where(PendingWorkflowRecord.incident_id == incident_uuid)
+        )
+        record = result.scalar_one_or_none()
+        if record is not None:
+            await self.session.delete(record)
 
     async def list_agent_work_items(self, limit: int = 100) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 500))
@@ -234,6 +551,180 @@ class IncidentRepository:
                 "started_at": row.started_at,
                 "completed_at": row.completed_at,
                 "updated_at": row.updated_at,
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _parse_uuid(value: Any) -> UUID | None:
+        token = str(value or "").strip()
+        if not token:
+            return None
+        try:
+            return UUID(token)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> datetime | None:
+        token = str(value or "").strip()
+        if not token:
+            return None
+        try:
+            return datetime.fromisoformat(token.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    async def _upsert_projection_from_record(self, event_record: IncidentEventRecord) -> None:
+        result = await self.session.execute(
+            select(IncidentProjectionRecord).where(IncidentProjectionRecord.incident_id == event_record.incident_id)
+        )
+        projection = result.scalar_one_or_none()
+        if projection is None:
+            projection = IncidentProjectionRecord(
+                incident_id=event_record.incident_id,
+                first_seen_at=event_record.created_at,
+                projection_payload={},
+                service=event_record.service,
+                environment=event_record.environment,
+                status=event_record.status or "open",
+            )
+
+        projection.alert_id = event_record.alert_id
+        projection.trace_id = event_record.trace_id
+        projection.tenant_id = event_record.tenant_id or "default"
+        projection.service = event_record.service
+        projection.environment = event_record.environment
+        projection.severity = event_record.severity
+        projection.status = event_record.status or projection.status or "open"
+        projection.risk_tier = event_record.risk_tier
+        projection.execution_mode = event_record.execution_mode
+        projection.requires_approval = event_record.requires_approval
+        projection.policy_version = event_record.policy_version
+        projection.policy_reason = event_record.policy_reason
+        projection.transport_provider = event_record.transport_provider
+        projection.latest_event_id = event_record.id
+        projection.latest_event_type = event_record.event_type
+        projection.latest_event_at = event_record.created_at
+        projection.projection_payload = {
+            "event_stage": event_record.event_stage,
+            "event_type": event_record.event_type,
+            "transport_channel": event_record.transport_channel,
+            "event_payload": event_record.payload,
+        }
+        await self.session.merge(projection)
+
+    async def save_incident_event(self, envelope: dict[str, Any]) -> None:
+        identity = envelope.get("identity", {}) if isinstance(envelope.get("identity"), dict) else {}
+        scope = envelope.get("scope", {}) if isinstance(envelope.get("scope"), dict) else {}
+        state = envelope.get("state", {}) if isinstance(envelope.get("state"), dict) else {}
+        policy = envelope.get("policy", {}) if isinstance(envelope.get("policy"), dict) else {}
+        ai = envelope.get("ai", {}) if isinstance(envelope.get("ai"), dict) else {}
+        transport = envelope.get("transport", {}) if isinstance(envelope.get("transport"), dict) else {}
+        idempotency = envelope.get("idempotency", {}) if isinstance(envelope.get("idempotency"), dict) else {}
+
+        incident_uuid = self._parse_uuid(identity.get("incident_id"))
+        if incident_uuid is None:
+            raise ValueError("identity.incident_id is required")
+
+        record = IncidentEventRecord(
+            id=self._parse_uuid(envelope.get("event_id")) or uuid4(),
+            incident_id=incident_uuid,
+            alert_id=self._parse_uuid(identity.get("alert_id")),
+            trace_id=str(identity.get("trace_id") or "").strip() or None,
+            correlation_id=str(identity.get("correlation_id") or "").strip() or None,
+            causation_id=str(identity.get("causation_id") or "").strip() or None,
+            parent_event_id=self._parse_uuid(identity.get("parent_event_id")),
+            tenant_id=str(scope.get("tenant_id") or "default").strip() or "default",
+            service=str(scope.get("service") or "unknown").strip() or "unknown",
+            environment=str(scope.get("environment") or "prod").strip() or "prod",
+            region=str(scope.get("region") or "").strip() or None,
+            team=str(scope.get("team") or "").strip() or None,
+            severity=str(state.get("severity") or "").strip() or None,
+            status=str(state.get("status") or "").strip() or None,
+            event_type=str(envelope.get("event_type") or "incident.event").strip(),
+            event_stage=str(state.get("status") or "unknown").strip() or "unknown",
+            risk_tier=str(policy.get("risk_tier") or "").strip() or None,
+            execution_mode=str(policy.get("execution_mode") or "").strip() or None,
+            requires_approval=bool(policy.get("requires_approval")) if "requires_approval" in policy else None,
+            policy_version=str(policy.get("policy_version") or "").strip() or None,
+            policy_reason=str(policy.get("policy_reason") or "").strip() or None,
+            confidence=float(ai.get("confidence")) if ai.get("confidence") is not None else None,
+            model_provider=str(ai.get("model_provider") or "").strip() or None,
+            model_name=str(ai.get("model_name") or "").strip() or None,
+            transport_provider=str(transport.get("provider") or "unknown").strip() or "unknown",
+            transport_channel=str(transport.get("channel") or "unknown").strip() or "unknown",
+            transport_partition=int(transport.get("partition")) if transport.get("partition") is not None else None,
+            transport_offset=int(transport.get("offset")) if transport.get("offset") is not None else None,
+            transport_delivery_tag=str(transport.get("delivery_tag") or "").strip() or None,
+            idempotency_key=str(idempotency.get("idempotency_key") or "").strip() or None,
+            fingerprint=str(idempotency.get("fingerprint") or "").strip() or None,
+            payload=envelope.get("payload") if isinstance(envelope.get("payload"), dict) else {},
+            created_at=self._parse_datetime(envelope.get("produced_at")) or datetime.utcnow(),
+        )
+        await self.session.merge(record)
+        await self._upsert_projection_from_record(record)
+
+    async def project_recent_incident_events(self, limit: int = 500) -> int:
+        safe_limit = max(1, min(int(limit), 5000))
+        result = await self.session.execute(
+            select(IncidentEventRecord)
+            .order_by(IncidentEventRecord.created_at.desc())
+            .limit(safe_limit)
+        )
+        rows = list(result.scalars().all())
+        rows.sort(key=lambda row: row.created_at)
+        for row in rows:
+            await self._upsert_projection_from_record(row)
+        return len(rows)
+
+    async def list_incident_projections(
+        self,
+        *,
+        limit: int = 100,
+        risk_tier: str | None = None,
+        execution_mode: str | None = None,
+        transport_provider: str | None = None,
+        status: str | None = None,
+        service: str | None = None,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 1000))
+        stmt = select(IncidentProjectionRecord)
+        if risk_tier:
+            stmt = stmt.where(IncidentProjectionRecord.risk_tier == str(risk_tier).strip().lower())
+        if execution_mode:
+            stmt = stmt.where(IncidentProjectionRecord.execution_mode == str(execution_mode).strip().lower())
+        if transport_provider:
+            stmt = stmt.where(IncidentProjectionRecord.transport_provider == str(transport_provider).strip().lower())
+        if status:
+            stmt = stmt.where(IncidentProjectionRecord.status == str(status).strip().lower())
+        if service:
+            stmt = stmt.where(IncidentProjectionRecord.service == str(service).strip())
+        stmt = stmt.order_by(IncidentProjectionRecord.updated_at.desc()).limit(safe_limit)
+        result = await self.session.execute(stmt)
+        rows = result.scalars().all()
+        return [
+            {
+                "incident_id": str(row.incident_id),
+                "alert_id": str(row.alert_id) if row.alert_id else None,
+                "trace_id": row.trace_id,
+                "tenant_id": row.tenant_id,
+                "service": row.service,
+                "environment": row.environment,
+                "severity": row.severity,
+                "status": row.status,
+                "owner": row.owner,
+                "risk_tier": row.risk_tier,
+                "execution_mode": row.execution_mode,
+                "requires_approval": row.requires_approval,
+                "policy_version": row.policy_version,
+                "policy_reason": row.policy_reason,
+                "transport_provider": row.transport_provider,
+                "latest_event_id": str(row.latest_event_id) if row.latest_event_id else None,
+                "latest_event_type": row.latest_event_type,
+                "latest_event_at": row.latest_event_at,
+                "updated_at": row.updated_at,
+                "projection_payload": row.projection_payload,
             }
             for row in rows
         ]
