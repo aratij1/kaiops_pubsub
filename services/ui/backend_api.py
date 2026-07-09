@@ -139,26 +139,6 @@ def refresh_alert_snapshots(*, force: bool = False) -> None:
     st.session_state["alerts_snapshot_refreshed_at"] = now
 
 
-def fetch_ingestion_status() -> dict[str, Any]:
-    response = request_json_with_fallback(
-        "GET",
-        [f"{GATEWAY_BASE}/ingestion/status", f"{MONITORING_ADAPTER_BASE}/ingestion/status"],
-        suppress_last_error=True,
-    )
-    return response if isinstance(response, dict) else {}
-
-
-def run_ingestion_manual() -> tuple[bool, dict[str, Any]]:
-    response = request_json_with_fallback(
-        "POST",
-        [f"{GATEWAY_BASE}/ingestion/run", f"{MONITORING_ADAPTER_BASE}/ingestion/run"],
-        suppress_last_error=True,
-    )
-    if response and isinstance(response, dict):
-        return True, response
-    return False, {}
-
-
 def fetch_processed_result_for_alert(alert_id: str) -> dict[str, Any]:
     normalized = str(alert_id or "").strip()
     if not normalized:

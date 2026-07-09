@@ -127,10 +127,6 @@ $Config = @{
     OPENAI_API_KEY = Resolve-ConfigValue -Name "OPENAI_API_KEY" -Default "" -DotEnv $DotEnv
     OPENAI_GPT5_MODEL = Resolve-ConfigValue -Name "OPENAI_GPT5_MODEL" -Default "gpt-5" -DotEnv $DotEnv
     OPENAI_GPT4O_MODEL = Resolve-ConfigValue -Name "OPENAI_GPT4O_MODEL" -Default "gpt-4o" -DotEnv $DotEnv
-    ALERT_INGEST_INTERVAL_SECONDS = Resolve-ConfigValue -Name "ALERT_INGEST_INTERVAL_SECONDS" -Default "60" -DotEnv $DotEnv
-    ALERT_INGEST_WATCH_ENABLED = Resolve-ConfigValue -Name "ALERT_INGEST_WATCH_ENABLED" -Default "true" -DotEnv $DotEnv
-    ALERT_INGEST_WATCH_INTERVAL_SECONDS = Resolve-ConfigValue -Name "ALERT_INGEST_WATCH_INTERVAL_SECONDS" -Default "2" -DotEnv $DotEnv
-    ALERT_INGEST_WATCH_DEBOUNCE_SECONDS = Resolve-ConfigValue -Name "ALERT_INGEST_WATCH_DEBOUNCE_SECONDS" -Default "1" -DotEnv $DotEnv
 }
 
 $RunId = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -179,10 +175,6 @@ function Start-KaiMSWindow {
     $EscapedOpenAiApiKey = $Config.OPENAI_API_KEY.Replace("'", "''")
     $EscapedOpenAiGpt5Model = $Config.OPENAI_GPT5_MODEL.Replace("'", "''")
     $EscapedOpenAiGpt4oModel = $Config.OPENAI_GPT4O_MODEL.Replace("'", "''")
-    $EscapedAlertIngestIntervalSeconds = $Config.ALERT_INGEST_INTERVAL_SECONDS.Replace("'", "''")
-    $EscapedAlertIngestWatchEnabled = $Config.ALERT_INGEST_WATCH_ENABLED.Replace("'", "''")
-    $EscapedAlertIngestWatchIntervalSeconds = $Config.ALERT_INGEST_WATCH_INTERVAL_SECONDS.Replace("'", "''")
-    $EscapedAlertIngestWatchDebounceSeconds = $Config.ALERT_INGEST_WATCH_DEBOUNCE_SECONDS.Replace("'", "''")
     $Bootstrap = @"
 Set-Location -LiteralPath '$EscapedRepoRoot'
     `$ErrorActionPreference = 'Continue'
@@ -212,10 +204,6 @@ Set-Location -LiteralPath '$EscapedRepoRoot'
 `$env:OPENAI_API_KEY = '$EscapedOpenAiApiKey'
 `$env:OPENAI_GPT5_MODEL = '$EscapedOpenAiGpt5Model'
 `$env:OPENAI_GPT4O_MODEL = '$EscapedOpenAiGpt4oModel'
-`$env:ALERT_INGEST_INTERVAL_SECONDS = '$EscapedAlertIngestIntervalSeconds'
-`$env:ALERT_INGEST_WATCH_ENABLED = '$EscapedAlertIngestWatchEnabled'
-`$env:ALERT_INGEST_WATCH_INTERVAL_SECONDS = '$EscapedAlertIngestWatchIntervalSeconds'
-`$env:ALERT_INGEST_WATCH_DEBOUNCE_SECONDS = '$EscapedAlertIngestWatchDebounceSeconds'
 `$LogFile = '$EscapedLogFile'
 `$env:KAIMS_LOG_FILE = `$LogFile
 `$Host.UI.RawUI.WindowTitle = '$EscapedTitle'
