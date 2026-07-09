@@ -62,6 +62,44 @@ def render_trace_output_with_kv(response_value: Any) -> None:
             table_from_dict(parsed, "Field", "Value")
 
 
+def format_event_decision(value: Any) -> str:
+    if isinstance(value, dict):
+        parts: list[str] = []
+        workflow = str(value.get("workflow") or "").strip()
+        next_action = str(value.get("next_action") or "").strip()
+        provider = str(value.get("message_bus_provider") or "").strip().lower()
+        risk_tier = str(value.get("risk_tier") or "").strip().lower()
+        execution_mode = str(value.get("execution_mode") or "").strip().lower()
+        requires_approval = value.get("requires_approval")
+
+        if workflow:
+            parts.append(workflow)
+        if next_action:
+            parts.append(f"next={next_action}")
+        if provider:
+            parts.append(f"bus={provider}")
+        if risk_tier:
+            parts.append(f"risk={risk_tier}")
+        if execution_mode:
+            parts.append(f"mode={execution_mode}")
+        if requires_approval is not None:
+            parts.append(f"approval={'yes' if bool(requires_approval) else 'no'}")
+
+        if parts:
+            return "; ".join(parts)
+
+        try:
+            return json.dumps(value, default=str)
+        except Exception:
+            return str(value)
+
+    if isinstance(value, (list, tuple, set)):
+        return json.dumps(list(value), default=str)
+
+    text = str(value or "").strip()
+    return text or "N/A"
+
+
 def render_gateway_events(events: list[dict[str, Any]]) -> None:
     rows = []
     for event in events:

@@ -7,8 +7,27 @@
     "title": "Airflow Scheduler Down",
     "service": "airflow",
     "severity": "CRITICAL",
+    "summary": "Service: airflow",
     "recommended_action": "Investigate issue",
     "description": "Service: airflow",
+    "execution_plan": "systemctl restart airflow-scheduler",
+    "deployment": "Not explicitly documented.",
+    "source": "rag-incident"
+  },
+  {
+    "id": "auth-session-store-hotspot",
+    "alert_id": "AUTH-SESSION-STORE-HOTSPOT",
+    "alert_name": "Auth session store hotspot",
+    "alert_type": "datastore_hotspot",
+    "title": "Auth session store hotspot",
+    "service": "auth-session",
+    "severity": "CRITICAL",
+    "summary": "Authentication sessions concentrated on a hot shard and increased login latency.",
+    "recommended_action": "Investigate issue",
+    "description": "Authentication sessions concentrated on a hot shard and increased login latency.",
+    "execution_plan": "1. Identify hot shard",
+    "root_cause": "Uneven shard key distribution in session persistence layer",
+    "impact": "Intermittent login slowdowns and token refresh failures",
     "source": "rag-incident"
   },
   {
@@ -19,8 +38,27 @@
     "title": "Business SLA Missed",
     "service": "daily-sales-report",
     "severity": "CRITICAL",
+    "summary": "Service: daily-sales-report",
     "recommended_action": "Investigate issue",
     "description": "Service: daily-sales-report",
+    "execution_plan": "Trigger delayed pipeline job; Scale workers if backlog continues",
+    "deployment": "Not explicitly documented.",
+    "source": "rag-incident"
+  },
+  {
+    "id": "catalog-cache-stale",
+    "alert_id": "CATALOG-CACHE-STALE",
+    "alert_name": "Catalog cache stale reads",
+    "alert_type": "cache",
+    "title": "Catalog cache stale reads",
+    "service": "catalog-api",
+    "severity": "CRITICAL",
+    "summary": "Catalog API served stale cache entries after invalidation lag.",
+    "recommended_action": "Investigate issue",
+    "description": "Catalog API served stale cache entries after invalidation lag.",
+    "execution_plan": "1. Check Redis consumer lag",
+    "root_cause": "Redis invalidation consumer lag",
+    "impact": "Customers saw outdated product availability",
     "source": "rag-incident"
   },
   {
@@ -31,8 +69,11 @@
     "title": "Dashboard Refresh Failure",
     "service": "powerbi-reporting",
     "severity": "HIGH",
+    "summary": "Service: powerbi-reporting",
     "recommended_action": "Investigate issue",
     "description": "Service: powerbi-reporting",
+    "execution_plan": "Restart refresh job",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -43,8 +84,11 @@
     "title": "Data Load Delay",
     "service": "data-ingestion",
     "severity": "HIGH",
+    "summary": "Service: data-ingestion",
     "recommended_action": "Investigate issue",
     "description": "Service: data-ingestion",
+    "execution_plan": "Trigger delayed pipeline job; Scale workers if backlog continues",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -55,8 +99,11 @@
     "title": "Data Pipeline Backlog Growing",
     "service": "data-pipeline",
     "severity": "HIGH",
+    "summary": "Service: data-pipeline",
     "recommended_action": "Investigate issue",
     "description": "Service: data-pipeline",
+    "execution_plan": "Scale processing cluster",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -67,8 +114,11 @@
     "title": "Data Quality Check Failed",
     "service": "dq-framework",
     "severity": "CRITICAL",
+    "summary": "Service: dq-framework",
     "recommended_action": "Investigate issue",
     "description": "Service: dq-framework",
+    "execution_plan": "Run dq validation job",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -79,8 +129,11 @@
     "title": "Dimension Load Failure",
     "service": "customer-dimension",
     "severity": "HIGH",
+    "summary": "Service: customer-dimension",
     "recommended_action": "Investigate issue",
     "description": "Service: customer-dimension",
+    "execution_plan": "airflow dags trigger sales_etl",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -91,8 +144,11 @@
     "title": "ETL Job Failure",
     "service": "airflow",
     "severity": "CRITICAL",
+    "summary": "Service: airflow",
     "recommended_action": "Investigate issue",
     "description": "Service: airflow",
+    "execution_plan": "airflow dags trigger sales_etl; validate DAG logs; re-run workflow if safe",
+    "deployment": "ETL workflow / DAG changes for sales_etl",
     "source": "rag-incident"
   },
   {
@@ -103,8 +159,11 @@
     "title": "Fact Table Record Count Mismatch",
     "service": "sales-fact",
     "severity": "CRITICAL",
+    "summary": "Service: sales-fact",
     "recommended_action": "Investigate issue",
     "description": "Service: sales-fact",
+    "execution_plan": "Reload affected partition",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -115,8 +174,11 @@
     "title": "Failed CDC Processing",
     "service": "cdc-pipeline",
     "severity": "CRITICAL",
+    "summary": "Service: cdc-pipeline",
     "recommended_action": "Investigate issue",
     "description": "Service: cdc-pipeline",
+    "execution_plan": "Restart CDC connector",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -127,8 +189,11 @@
     "title": "INC-8842 payment latency after Deployment 2.5",
     "service": "payments",
     "severity": "HIGH",
+    "summary": "Service: payments",
     "recommended_action": "Investigate issue",
-    "description": "Deployment 2.5 increased checkout p95 latency for payments. Rollback restored",
+    "description": "Service: payments",
+    "execution_plan": "Confirm checkout latency regression; Roll back deployment; Validate SLO recovery",
+    "deployment": "Deployment 2.5",
     "source": "rag-incident"
   },
   {
@@ -139,8 +204,11 @@
     "title": "INC-9011 orders database replica lag",
     "service": "orders-db",
     "severity": "HIGH",
+    "summary": "Service: orders-db",
     "recommended_action": "Investigate issue",
-    "description": "Orders read replicas lagged behind the primary after a write-heavy campaign.",
+    "description": "Service: orders-db",
+    "execution_plan": "Not explicitly documented.",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -151,8 +219,11 @@
     "title": "Kafka Consumer Lag High",
     "service": "kafka-ingestion",
     "severity": "HIGH",
+    "summary": "Service: kafka-ingestion",
     "recommended_action": "Investigate issue",
     "description": "Service: kafka-ingestion",
+    "execution_plan": "kubectl scale deployment kafka-consumer --replicas=5",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -163,8 +234,11 @@
     "title": "Late Arriving Data",
     "service": "transaction-feed",
     "severity": "HIGH",
+    "summary": "Service: transaction-feed",
     "recommended_action": "Investigate issue",
     "description": "Service: transaction-feed",
+    "execution_plan": "Execute incremental load",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -175,8 +249,11 @@
     "title": "Missing Daily Partition",
     "service": "sales-fact-table",
     "severity": "HIGH",
+    "summary": "Service: sales-fact-table",
     "recommended_action": "Investigate issue",
     "description": "Service: sales-fact-table",
+    "execution_plan": "Backfill partition script",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -187,8 +264,27 @@
     "title": "Orders database replica lag",
     "service": "orders-db",
     "severity": "CRITICAL",
+    "summary": "Service: orders-db",
     "recommended_action": "Investigate issue",
-    "description": "Replica lag above threshold for 10 minutes",
+    "description": "Service: orders-db",
+    "execution_plan": "Failover database",
+    "deployment": "Not explicitly documented.",
+    "source": "rag-incident"
+  },
+  {
+    "id": "payments-webhook-retry-storm",
+    "alert_id": "PAYMENTS-WEBHOOK-RETRY-STORM",
+    "alert_name": "Payments webhook retry storm",
+    "alert_type": "retry_storm",
+    "title": "Payments webhook retry storm",
+    "service": "payments-webhook",
+    "severity": "CRITICAL",
+    "summary": "Payments webhooks retried aggressively after downstream 429 responses.",
+    "recommended_action": "Investigate issue",
+    "description": "Payments webhooks retried aggressively after downstream 429 responses.",
+    "execution_plan": "1. Inspect retry queue depth",
+    "root_cause": "Missing exponential backoff on webhook dispatcher",
+    "impact": "Delayed merchant notifications and elevated queue depth",
     "source": "rag-incident"
   },
   {
@@ -199,8 +295,11 @@
     "title": "Query Performance Degradation",
     "service": "data-warehouse",
     "severity": "HIGH",
+    "summary": "Service: data-warehouse",
     "recommended_action": "Investigate issue",
     "description": "Service: data-warehouse",
+    "execution_plan": "Refresh warehouse stats",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -211,6 +310,7 @@
     "title": "RAG_doc",
     "service": "unknown",
     "severity": "HIGH",
+    "summary": "PK\u0003\u0004\u0014\u0000\u0006\u0000\b\u0000\u0000\u0000!\u0000\u00df\u00a4\u00d2lZ\u0001\u0000\u0000 \u0005\u0000\u0000\u0013\u0000\b\u0002[Content_Types].xml \u00a2\u0004\u0002(\u00a0\u0000\u0002\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000",
     "recommended_action": "Investigate issue",
     "description": "PK\u0003\u0004\u0014\u0000\u0006\u0000\b\u0000\u0000\u0000!\u0000\u00df\u00a4\u00d2lZ\u0001\u0000\u0000 \u0005\u0000\u0000\u0013\u0000\b\u0002[Content_Types].xml \u00a2\u0004\u0002(\u00a0\u0000\u0002\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000",
     "source": "rag-incident"
@@ -223,8 +323,11 @@
     "title": "Replication Lag Exceeded Threshold",
     "service": "replication-service",
     "severity": "HIGH",
+    "summary": "Service: replication-service",
     "recommended_action": "Investigate issue",
     "description": "Service: replication-service",
+    "execution_plan": "Restart replication service",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -235,8 +338,11 @@
     "title": "Schema Drift Detected",
     "service": "customer-ingestion",
     "severity": "CRITICAL",
+    "summary": "Service: customer-ingestion",
     "recommended_action": "Investigate issue",
     "description": "Service: customer-ingestion",
+    "execution_plan": "Regenerate ingestion schemas",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -247,8 +353,11 @@
     "title": "Source System Unavailable",
     "service": "oracle-source",
     "severity": "CRITICAL",
+    "summary": "Service: oracle-source",
     "recommended_action": "Investigate issue",
     "description": "Service: oracle-source",
+    "execution_plan": "Run source connectivity probe",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -259,8 +368,11 @@
     "title": "Spark Executor Memory Exhausted",
     "service": "spark-cluster",
     "severity": "HIGH",
+    "summary": "Service: spark-cluster",
     "recommended_action": "Investigate issue",
     "description": "Service: spark-cluster",
+    "execution_plan": "Increase executor memory",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -271,8 +383,11 @@
     "title": "Unauthorized Data Access Attempt",
     "service": "data-warehouse",
     "severity": "CRITICAL",
+    "summary": "Service: data-warehouse",
     "recommended_action": "Investigate issue",
     "description": "Service: data-warehouse",
+    "execution_plan": "Disable affected user immediately",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   },
   {
@@ -283,8 +398,11 @@
     "title": "Warehouse Storage Usage High",
     "service": "snowflake",
     "severity": "HIGH",
+    "summary": "Service: snowflake",
     "recommended_action": "Investigate issue",
     "description": "Service: snowflake",
+    "execution_plan": "Archive old partitions job",
+    "deployment": "Not explicitly documented.",
     "source": "rag-incident"
   }
 ]

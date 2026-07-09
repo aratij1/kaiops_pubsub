@@ -7,6 +7,7 @@ This folder is the canonical home for platform documentation, architecture stand
 - [RAG content standard](RAG_CONTENT_STANDARD.md)
 - [Incident/alert metadata layer](INCIDENT_ALERT_METADATA_LAYER.md)
 - [Orchestration policy](ORCHESTRATION_POLICY.md)
+- [Policy, workflow, and AI orchestrator flow](POLICY_WORKFLOW_AI_ORCHESTRATOR_FLOW.md)
 - [Enterprise hardening plan](ENTERPRISE_HARDENING_PLAN.md)
 - [Windows update and run guide](WINDOWS_UPDATE_AND_RUN.md)
 

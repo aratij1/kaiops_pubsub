@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 from common.config import Settings, get_settings
 from common.models import AlertSeverity
+from common.orchestration.config_loader import load_orchestration_config
 from common.orchestration.policy_engine import PolicyEngine
 
 logger = logging.getLogger(__name__)
@@ -38,14 +40,31 @@ class WorkflowEngine:
     policy_engine: PolicyEngine = field(default_factory=PolicyEngine)
     settings: Settings = field(default_factory=get_settings)
     stream_threshold: int = 500
+    orchestration_config: dict[str, Any] = field(default_factory=dict)
+    workflow_definitions: dict[str, WorkflowDefinition] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.stream_threshold = int(getattr(self.settings, "message_bus_stream_threshold", self.stream_threshold) or 500)
+        self.orchestration_config = load_orchestration_config(self.settings)
+        message_bus = self.orchestration_config.get("message_bus", {})
+        self.stream_threshold = int(message_bus.get("stream_threshold", self.stream_threshold) or 500)
+
+        definitions = self.orchestration_config.get("workflow_definitions", {})
+        if isinstance(definitions, dict):
+            self.workflow_definitions = {
+                name: WorkflowDefinition(
+                    name=name,
+                    steps=list(raw_definition.get("steps", [])),
+                    next_action=str(raw_definition.get("next_action") or "collect-context"),
+                )
+                for name, raw_definition in definitions.items()
+                if isinstance(name, str) and isinstance(raw_definition, dict)
+            }
 
     def route_message_bus(self, *, stream_count: int | None) -> tuple[str, int, int]:
         normalized_count = max(0, int(stream_count or 0))
-        dynamic_enabled = bool(getattr(self.settings, "message_bus_dynamic_routing", True))
-        default_provider = str(getattr(self.settings, "message_bus_default_provider", "rabbitmq")).strip().lower()
+        message_bus = self.orchestration_config.get("message_bus", {})
+        dynamic_enabled = bool(message_bus.get("dynamic_routing", True))
+        default_provider = str(message_bus.get("default_provider", "rabbitmq")).strip().lower()
         if default_provider not in {"kafka", "rabbitmq"}:
             default_provider = "rabbitmq"
         provider = default_provider
@@ -53,53 +72,8 @@ class WorkflowEngine:
             provider = "kafka" if normalized_count > self.stream_threshold else "rabbitmq"
         return provider, normalized_count, self.stream_threshold
 
-    @staticmethod
-    def _definition_for_name(workflow_name: str) -> WorkflowDefinition | None:
-        definitions = {
-            "critical-auto-remediation": WorkflowDefinition(
-                name="critical-auto-remediation",
-                steps=[
-                    "alert-intelligence-agent",
-                    "context-agent",
-                    "knowledge-agent",
-                    "rca-agent",
-                    "impact-agent",
-                    "approval-agent",
-                    "automation-agent",
-                    "validation-agent",
-                    "notification-agent",
-                    "closure-agent",
-                ],
-                next_action="collect-context",
-            ),
-            "guided-remediation": WorkflowDefinition(
-                name="guided-remediation",
-                steps=[
-                    "alert-intelligence-agent",
-                    "context-agent",
-                    "knowledge-agent",
-                    "rca-agent",
-                    "impact-agent",
-                    "approval-agent",
-                    "automation-agent",
-                    "validation-agent",
-                    "closure-agent",
-                ],
-                next_action="collect-context",
-            ),
-            "triage-only": WorkflowDefinition(
-                name="triage-only",
-                steps=[
-                    "alert-intelligence-agent",
-                    "context-agent",
-                    "knowledge-agent",
-                    "rca-agent",
-                    "notification-agent",
-                ],
-                next_action="collect-context",
-            ),
-        }
-        return definitions.get(workflow_name)
+    def _definition_for_name(self, workflow_name: str) -> WorkflowDefinition | None:
+        return self.workflow_definitions.get(workflow_name)
 
     def _deterministic_definition(self, severity: AlertSeverity) -> WorkflowDefinition:
         if severity == AlertSeverity.CRITICAL:
@@ -182,7 +156,7 @@ class WorkflowEngine:
         }
 
         try:
-            router = ModelRouter(settings=self.settings)
+            router = ModelRouter()
             response = await router.route(
                 severity=severity,
                 task=ModelTask.GENERAL,

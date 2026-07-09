@@ -5,6 +5,9 @@ severity: critical
 alert_type: data_quality
 source_system: internal
 source_ref: DW-1005
+dependencies: Not explicitly documented.
+deployment: Not explicitly documented.
+execution_plan: Run dq validation job
 
 # Data Quality Check Failed (DW-1005)
 
@@ -12,7 +15,7 @@ Service: dq-framework
 Severity: CRITICAL
 Alert type: data_quality
 
-## Description
+## Summary
 Data quality rules failed on the latest batch or ingestion pass.
 
 ## Symptoms
@@ -20,23 +23,35 @@ Data quality rules failed on the latest batch or ingestion pass.
 - Unexpected nulls or duplicates
 - Transformation mismatches
 
-## Probable Root Causes
+## Root Cause
 - Null values
 - Duplicate records
 - Invalid transformations
 
-## Investigation
+## Impact
+- Service: dq-framework Severity: CRITICAL Alert type: data_quality
+
+## Dependencies
+- Not explicitly documented.
+
+## Deployment Context
+- Not explicitly documented.
+
+## Execution Plan
+- Run dq validation job
+
+## Investigation Timeline
 1. Identify bad records
-1. Run validation scripts
-1. Trace transformation outputs
+2. Run validation scripts
+3. Trace transformation outputs
 
 ## Remediation
 - Identify bad records
 - Run validation scripts
 - Reprocess dataset
 
-## Automation
-- Run dq validation job
+## Prevention
+- Review the incident pattern and update the runbook or automation as needed.
 
-## RAG/SOP Notes
+## SOP Notes
 - This document was derived from RAG_doc.docx and is intended for retrieval, SOPs, and runbook-driven operations.

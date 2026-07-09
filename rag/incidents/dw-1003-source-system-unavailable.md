@@ -5,6 +5,9 @@ severity: critical
 alert_type: source_connectivity
 source_system: internal
 source_ref: DW-1003
+dependencies: Not explicitly documented.
+deployment: Not explicitly documented.
+execution_plan: Run source connectivity probe
 
 # Source System Unavailable (DW-1003)
 
@@ -12,7 +15,7 @@ Service: oracle-source
 Severity: CRITICAL
 Alert type: source_connectivity
 
-## Description
+## Summary
 Source system is unavailable or cannot be reached from the ingestion layer.
 
 ## Symptoms
@@ -20,23 +23,35 @@ Source system is unavailable or cannot be reached from the ingestion layer.
 - No new source records
 - Repeated retry failures
 
-## Probable Root Causes
+## Root Cause
 - Oracle outage
 - Network issue
 - Firewall blockage
 
-## Investigation
+## Impact
+- Service: oracle-source Severity: CRITICAL Alert type: source_connectivity
+
+## Dependencies
+- Not explicitly documented.
+
+## Deployment Context
+- Not explicitly documented.
+
+## Execution Plan
+- Run source connectivity probe
+
+## Investigation Timeline
 1. Verify source status page
-1. Check listener/service health
-1. Confirm firewall and routing rules
+2. Check listener/service health
+3. Confirm firewall and routing rules
 
 ## Remediation
 - Verify database status
 - Restart listener
 - Restore connectivity
 
-## Automation
-- Run source connectivity probe
+## Prevention
+- Review the incident pattern and update the runbook or automation as needed.
 
-## RAG/SOP Notes
+## SOP Notes
 - This document was derived from RAG_doc.docx and is intended for retrieval, SOPs, and runbook-driven operations.

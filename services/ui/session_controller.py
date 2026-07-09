@@ -14,6 +14,96 @@ GUIDANCE_KIND_KEY = "alerts_guidance_kind"
 GUIDANCE_ACTION_KEY = "alerts_guidance_action"
 PANEL_MODE_KEY = "active_panel_mode"
 
+_PLACEHOLDER_TOKENS = {"", "-", "n/a", "na", "none", "null", "unknown"}
+_PENDING_DECISIONS = {"PENDING", "QUEUED", "AWAITING_APPROVAL", "AWAITING USER APPROVAL", "STANDBY"}
+
+
+def _is_meaningful_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in _PLACEHOLDER_TOKENS
+    if isinstance(value, (list, dict, tuple, set)):
+        return len(value) > 0
+    return True
+
+
+def _event_quality_score(event: dict[str, Any]) -> int:
+    score = 0
+    decision = str(event.get("decision") or "").strip()
+    decision_token = decision.upper()
+    if _is_meaningful_value(decision):
+        score += 2
+    if decision_token and decision_token not in _PENDING_DECISIONS:
+        score += 8
+    if _is_meaningful_value(event.get("output")):
+        score += 3
+    if _is_meaningful_value(event.get("action")):
+        score += 2
+    if isinstance(event.get("input"), dict) and event.get("input"):
+        score += 1
+    if isinstance(event.get("metrics"), dict) and event.get("metrics"):
+        score += 1
+    return score
+
+
+def _merged_event(group: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(group) == 1:
+        return dict(group[0])
+
+    # Prefer the most informative event for the same step/agent pair.
+    best = max(group, key=_event_quality_score)
+    merged = dict(best)
+
+    for item in group:
+        for field in ("action", "decision", "output", "communicates_to"):
+            if not _is_meaningful_value(merged.get(field)) and _is_meaningful_value(item.get(field)):
+                merged[field] = item.get(field)
+
+        for object_field in ("input", "metrics"):
+            existing = merged.get(object_field)
+            incoming = item.get(object_field)
+            if isinstance(existing, dict) and isinstance(incoming, dict):
+                for key, value in incoming.items():
+                    if key not in existing and _is_meaningful_value(value):
+                        existing[key] = value
+            elif (not isinstance(existing, dict) or not existing) and isinstance(incoming, dict) and incoming:
+                merged[object_field] = dict(incoming)
+
+    llm_calls: list[Any] = []
+    llm_errors: list[Any] = []
+    for item in group:
+        if isinstance(item.get("llm_calls"), list):
+            llm_calls.extend(item.get("llm_calls") or [])
+        if isinstance(item.get("llm_errors"), list):
+            llm_errors.extend(item.get("llm_errors") or [])
+    if llm_calls:
+        merged["llm_calls"] = llm_calls
+    if llm_errors:
+        merged["llm_errors"] = llm_errors
+
+    return merged
+
+
+def _deduplicate_workflow_events(events: Any) -> list[dict[str, Any]]:
+    if not isinstance(events, list):
+        return []
+
+    grouped: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    first_index: dict[tuple[int, str], int] = {}
+
+    for index, raw in enumerate(events):
+        if not isinstance(raw, dict):
+            continue
+        sequence = int(raw.get("sequence", 0) or 0)
+        agent = str(raw.get("agent") or "").strip()
+        key = (sequence, agent)
+        grouped.setdefault(key, []).append(raw)
+        first_index.setdefault(key, index)
+
+    ordered_keys = sorted(grouped.keys(), key=lambda key: (key[0], first_index.get(key, 0)))
+    return [_merged_event(grouped[key]) for key in ordered_keys]
+
 
 def ensure_ui_defaults(state: Any) -> None:
     state.setdefault(SELECTED_FLOW_KEY, "payment-latency")
@@ -61,6 +151,9 @@ def apply_workflow_payload(
             workflow_payload = gateway_response
     if not isinstance(workflow_payload, dict) or not workflow_payload:
         return False
+
+    if "events" in workflow_payload:
+        workflow_payload["events"] = _deduplicate_workflow_events(workflow_payload.get("events"))
 
     state[SELECTED_FLOW_KEY] = selected_flow.strip()
     state[GATEWAY_RESPONSE_KEY] = gateway_response
