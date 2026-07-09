@@ -134,12 +134,24 @@ app = create_app(title="KaiMS Context Intelligence Agent", settings=settings, st
 
 class RagDocumentRequest(BaseModel):
     kind: str = Field(pattern="^(runbook|incident|deployment|change|dependency)$")
+    alert_id: str | None = Field(default=None, max_length=80)
+    alert_type: str | None = Field(default=None, max_length=80)
+    severity: str | None = Field(default=None, max_length=32)
     title: str = Field(min_length=3, max_length=160)
+    summary: str | None = Field(default=None, min_length=0)
     content: str = Field(min_length=20)
     services: list[str] = Field(default_factory=list)
     deployment: str | None = None
     dependencies: list[str] = Field(default_factory=list)
     change_id: str | None = None
+    root_cause: str | None = None
+    impact: str | None = None
+    execution_plan: str | None = None
+    recommended_action: str | None = None
+    source_system: str | None = None
+    source_ref: str | None = None
+    resolved_by: str | None = None
+    closed_at: str | None = None
     metadata: dict[str, str] = Field(default_factory=dict)
 
 
@@ -170,6 +182,12 @@ def render_document(request: RagDocumentRequest) -> str:
         "kind": request.kind,
         "title": request.title,
     }
+    if request.alert_id:
+        metadata["alert_id"] = request.alert_id
+    if request.alert_type:
+        metadata["alert_type"] = request.alert_type
+    if request.severity:
+        metadata["severity"] = request.severity.lower()
     if request.services:
         metadata["services"] = ", ".join(request.services)
     if request.deployment:
@@ -178,9 +196,36 @@ def render_document(request: RagDocumentRequest) -> str:
         metadata["dependencies"] = ", ".join(request.dependencies)
     if request.change_id:
         metadata["change_id"] = request.change_id
+    if request.source_system:
+        metadata["source_system"] = request.source_system
+    if request.source_ref:
+        metadata["source_ref"] = request.source_ref
+    if request.resolved_by:
+        metadata["resolved_by"] = request.resolved_by
+    if request.closed_at:
+        metadata["closed_at"] = request.closed_at
+    if request.root_cause:
+        metadata["root_cause"] = request.root_cause
+    if request.impact:
+        metadata["impact"] = request.impact
+    if request.execution_plan:
+        metadata["execution_plan"] = request.execution_plan
+    if request.recommended_action:
+        metadata["recommended_action"] = request.recommended_action
     metadata.update(request.metadata)
     header = "\n".join(f"{key}: {value}" for key, value in metadata.items())
-    return f"{header}\n\n# {request.title}\n\n{request.content.strip()}\n"
+    body_lines = [f"# {request.title}"]
+    if request.summary:
+        body_lines.extend(["", "## Summary", request.summary.strip()])
+    if request.content.strip():
+        body_lines.extend(["", "## Description", request.content.strip()])
+    if request.root_cause:
+        body_lines.extend(["", "## Root Cause", request.root_cause.strip()])
+    if request.impact:
+        body_lines.extend(["", "## Impact", request.impact.strip()])
+    if request.execution_plan:
+        body_lines.extend(["", "## Execution Plan", request.execution_plan.strip()])
+    return f"{header}\n\n" + "\n".join(body_lines).rstrip() + "\n"
 
 
 def write_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
@@ -188,12 +233,13 @@ def write_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
     root = connector.root_path()
     target_dir = root / kind_directory(request.kind)
     target_dir.mkdir(parents=True, exist_ok=True)
-    base_name = slugify(request.title)
+    base_name = slugify(request.alert_id or request.title)
     target = target_dir / f"{base_name}.md"
-    counter = 2
-    while target.exists():
-        target = target_dir / f"{base_name}-{counter}.md"
-        counter += 1
+    if not request.alert_id:
+        counter = 2
+        while target.exists():
+            target = target_dir / f"{base_name}-{counter}.md"
+            counter += 1
     target.write_text(render_document(request), encoding="utf-8")
     count = connector.reload()
     return {"path": str(target), "document_count": count}
@@ -221,18 +267,20 @@ def rebuild_flow_catalog_from_rag(connector: VectorDBConnector) -> None:
     for doc in connector.documents:
         if str(doc.get("kind", "")).strip().lower() != "incident":
             continue
-        alert_id = str(doc.get("alert_id") or doc.get("id") or "").strip()
-        alert_name = str(doc.get("alert_name") or doc.get("title") or "Incident").strip() or "Incident"
+        full_doc = connector._load_full_document(str(doc.get("path", "")))
+        alert_id = str(full_doc.get("alert_id") or full_doc.get("id") or "").strip()
+        alert_name = str(full_doc.get("alert_name") or full_doc.get("title") or "Incident").strip() or "Incident"
         flow_id = slugify(alert_id or alert_name)
-        services = _normalize_list(doc.get("services", []))
-        service = services[0] if services else str(doc.get("service", "unknown")).strip() or "unknown"
-        severity = str(doc.get("severity", "HIGH")).upper().strip()
+        services = _normalize_list(full_doc.get("services", []))
+        service = services[0] if services else str(full_doc.get("service", "unknown")).strip() or "unknown"
+        severity = str(full_doc.get("severity", "HIGH")).upper().strip()
         if severity not in {"CRITICAL", "HIGH", "WARNING"}:
             severity = "HIGH"
-        recommended_action = str(doc.get("recommended_action") or doc.get("remediation_comment") or "Investigate issue")
-        content = str(doc.get("content", "")).strip()
-        description = _first_content_line(content, alert_name)[:220]
-        alert_type = str(doc.get("alert_type", "")).strip()
+        recommended_action = str(full_doc.get("recommended_action") or full_doc.get("remediation_comment") or "Investigate issue")
+        content = str(full_doc.get("content", "")).strip()
+        summary = str(full_doc.get("summary") or _first_content_line(content, alert_name)).strip()
+        execution_plan = str(full_doc.get("execution_plan") or "").strip()
+        alert_type = str(full_doc.get("alert_type", "")).strip()
         entry = {
             "id": flow_id,
             "alert_id": alert_id or flow_id.upper(),
@@ -241,10 +289,14 @@ def rebuild_flow_catalog_from_rag(connector: VectorDBConnector) -> None:
             "title": alert_name,
             "service": service,
             "severity": severity,
+            "summary": summary[:220],
             "recommended_action": recommended_action,
-            "description": description,
-            "deployment": str(doc.get("deployment", "")).strip() or None,
-            "change_id": str(doc.get("change_id", "")).strip() or None,
+            "description": summary[:220],
+            "execution_plan": execution_plan[:220] or None,
+            "deployment": str(full_doc.get("deployment", "")).strip() or None,
+            "change_id": str(full_doc.get("change_id", "")).strip() or None,
+            "root_cause": str(full_doc.get("root_cause", "")).strip() or None,
+            "impact": str(full_doc.get("impact", "")).strip() or None,
             "source": "rag-incident",
         }
         entries.append({k: v for k, v in entry.items() if v not in (None, "")})
@@ -296,16 +348,20 @@ async def ingest_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
 @app.get("/rag/documents")
 async def list_rag_documents() -> dict[str, Any]:
     connector = vector_connector()
+    documents = [doc for doc in connector.documents if not doc.get("_synthetic")]
     return {
-        "document_count": len(connector.documents),
+        "document_count": len(documents),
         "documents": [
             {
                 "kind": doc.get("kind"),
                 "title": doc.get("title"),
+                "alert_id": doc.get("alert_id"),
+                "alert_type": doc.get("alert_type"),
+                "severity": doc.get("severity"),
                 "services": doc.get("services", []),
                 "path": doc.get("path"),
             }
-            for doc in connector.documents
+            for doc in documents
         ],
     }
 
@@ -319,8 +375,12 @@ async def reload_rag() -> dict[str, Any]:
 
 
 @app.get("/rag/search")
-async def search_rag(query: str, limit: int = 8) -> dict[str, Any]:
-    matches = vector_connector().search(query, limit=max(1, min(limit, 20)))
+async def search_rag(query: str, limit: int = 8, kind: str | None = None) -> dict[str, Any]:
+    matches = vector_connector().search(
+        query,
+        limit=max(1, min(limit, 20)),
+        preferred_kind=kind,
+    )
     return {
         "query": query,
         "matches": [

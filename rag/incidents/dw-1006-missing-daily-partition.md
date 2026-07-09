@@ -5,6 +5,9 @@ severity: high
 alert_type: partition_missing
 source_system: internal
 source_ref: DW-1006
+dependencies: Not explicitly documented.
+deployment: Not explicitly documented.
+execution_plan: Backfill partition script
 
 # Missing Daily Partition (DW-1006)
 
@@ -12,7 +15,7 @@ Service: sales-fact-table
 Severity: HIGH
 Alert type: partition_missing
 
-## Description
+## Summary
 Expected daily partition is missing from the warehouse table.
 
 ## Symptoms
@@ -20,21 +23,33 @@ Expected daily partition is missing from the warehouse table.
 - Queries missing latest day
 - Fresh load not visible
 
-## Probable Root Causes
+## Root Cause
 - ETL failure
 - Partition creation job failed
 
-## Investigation
+## Impact
+- Service: sales-fact-table Severity: HIGH Alert type: partition_missing
+
+## Dependencies
+- Not explicitly documented.
+
+## Deployment Context
+- Not explicitly documented.
+
+## Execution Plan
+- Backfill partition script
+
+## Investigation Timeline
 1. Check partition creation workflow
-1. Verify ingest completion
-1. Inspect orchestration logs
+2. Verify ingest completion
+3. Inspect orchestration logs
 
 ## Remediation
 - Backfill partition
 - Re-run ingestion workflow
 
-## Automation
-- Backfill partition script
+## Prevention
+- Review the incident pattern and update the runbook or automation as needed.
 
-## RAG/SOP Notes
+## SOP Notes
 - This document was derived from RAG_doc.docx and is intended for retrieval, SOPs, and runbook-driven operations.

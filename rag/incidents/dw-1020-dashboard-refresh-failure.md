@@ -5,6 +5,9 @@ severity: high
 alert_type: reporting
 source_system: internal
 source_ref: DW-1020
+dependencies: Not explicitly documented.
+deployment: Not explicitly documented.
+execution_plan: Restart refresh job
 
 # Dashboard Refresh Failure (DW-1020)
 
@@ -12,7 +15,7 @@ Service: powerbi-reporting
 Severity: HIGH
 Alert type: reporting
 
-## Description
+## Summary
 Dashboard refresh failed and reporting data is stale.
 
 ## Symptoms
@@ -20,22 +23,34 @@ Dashboard refresh failed and reporting data is stale.
 - Stale dashboard visuals
 - Dataset timeout errors
 
-## Probable Root Causes
+## Root Cause
 - Warehouse unavailable
 - Dataset refresh timeout
 
-## Investigation
+## Impact
+- Service: powerbi-reporting Severity: HIGH Alert type: reporting
+
+## Dependencies
+- Not explicitly documented.
+
+## Deployment Context
+- Not explicitly documented.
+
+## Execution Plan
+- Restart refresh job
+
+## Investigation Timeline
 1. Check refresh job logs
-1. Validate source connectivity
-1. Review dataset timeout settings
+2. Validate source connectivity
+3. Review dataset timeout settings
 
 ## Remediation
 - Restart refresh job
 - Validate data source connectivity
 - Re-run dashboard refresh
 
-## Automation
-- Restart refresh job
+## Prevention
+- Review the incident pattern and update the runbook or automation as needed.
 
-## RAG/SOP Notes
+## SOP Notes
 - This document was derived from RAG_doc.docx and is intended for retrieval, SOPs, and runbook-driven operations.

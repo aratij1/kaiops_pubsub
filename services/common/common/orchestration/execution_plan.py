@@ -35,6 +35,8 @@ def _execution_catalogs() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any
 def _match_playbook(*, alert: Alert, playbooks: dict[str, Any]) -> dict[str, Any]:
     candidates = playbooks.get("playbooks", []) if isinstance(playbooks.get("playbooks"), list) else []
     service = str(alert.service or "").strip().lower()
+    alert_id = str(getattr(alert, "id", "") or getattr(alert, "alert_id", "") or getattr(alert, "source_ref", "")).strip().lower()
+    alert_type = str(getattr(alert, "type", "") or getattr(alert, "alert_type", "") or "").strip().lower()
     text = " ".join(
         [
             str(alert.name or "").strip().lower(),
@@ -47,11 +49,15 @@ def _match_playbook(*, alert: Alert, playbooks: dict[str, Any]) -> dict[str, Any
         if not isinstance(candidate, dict):
             continue
         match = candidate.get("match", {}) if isinstance(candidate.get("match"), dict) else {}
+        alert_ids = [str(item).strip().lower() for item in match.get("alert_ids", []) if str(item).strip()]
         services = [str(item).strip().lower() for item in match.get("services", []) if str(item).strip()]
+        alert_types = [str(item).strip().lower() for item in match.get("alert_types", []) if str(item).strip()]
         keywords = [str(item).strip().lower() for item in match.get("alert_keywords", []) if str(item).strip()]
+        alert_id_match = not alert_ids or alert_id in alert_ids
         service_match = not services or service in services
+        alert_type_match = not alert_types or alert_type in alert_types
         keyword_match = not keywords or any(keyword in text for keyword in keywords)
-        if service_match and keyword_match:
+        if alert_id_match and service_match and alert_type_match and keyword_match:
             return candidate
 
     return {
@@ -146,6 +152,13 @@ def resolve_execution_plan(
     return {
         "version": "execution-plan-v1",
         "workflow": workflow_name,
+        "alert": {
+            "service": str(alert.service or "").strip(),
+            "name": str(alert.name or "").strip(),
+            "source": str(alert.source or "").strip(),
+            "id": str(getattr(alert, "id", "") or getattr(alert, "alert_id", "") or getattr(alert, "source_ref", "")).strip(),
+            "type": str(getattr(alert, "type", "") or getattr(alert, "alert_type", "") or "").strip(),
+        },
         "risk_tier": str(risk_tier or "unknown").lower(),
         "execution_mode": str(execution_mode or "unknown").lower(),
         "approval_required": bool(requires_approval),
@@ -166,6 +179,7 @@ def resolve_execution_plan(
         "playbook": {
             "id": str(playbook.get("id") or "generic-triage-playbook"),
             "name": str(playbook.get("name") or "Generic triage playbook"),
+            "match": playbook.get("match", {}) if isinstance(playbook.get("match"), dict) else {},
             "preflight_checks": [
                 str(item) for item in playbook.get("preflight_checks", []) if str(item).strip()
             ],

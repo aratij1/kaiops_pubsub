@@ -5,6 +5,9 @@ severity: high
 alert_type: performance
 source_system: internal
 source_ref: DW-1008
+dependencies: Not explicitly documented.
+deployment: Not explicitly documented.
+execution_plan: Refresh warehouse stats
 
 # Query Performance Degradation (DW-1008)
 
@@ -12,7 +15,7 @@ Service: data-warehouse
 Severity: HIGH
 Alert type: performance
 
-## Description
+## Summary
 Query execution time has degraded in the warehouse or reporting layer.
 
 ## Symptoms
@@ -20,23 +23,35 @@ Query execution time has degraded in the warehouse or reporting layer.
 - Slow query execution
 - Higher CPU/IO usage
 
-## Probable Root Causes
+## Root Cause
 - Missing indexes
 - Poor execution plan
 - Large table scans
 
-## Investigation
+## Impact
+- Service: data-warehouse Severity: HIGH Alert type: performance
+
+## Dependencies
+- Not explicitly documented.
+
+## Deployment Context
+- Not explicitly documented.
+
+## Execution Plan
+- Refresh warehouse stats
+
+## Investigation Timeline
 1. Analyze query plan
-1. Refresh statistics
-1. Identify scans and joins
+2. Refresh statistics
+3. Identify scans and joins
 
 ## Remediation
 - Analyze query plan
 - Refresh statistics
 - Optimize SQL
 
-## Automation
-- Refresh warehouse stats
+## Prevention
+- Review the incident pattern and update the runbook or automation as needed.
 
-## RAG/SOP Notes
+## SOP Notes
 - This document was derived from RAG_doc.docx and is intended for retrieval, SOPs, and runbook-driven operations.
