@@ -131,6 +131,8 @@ def render_message_bus_view(*, workflow: dict[str, Any] | None = None) -> None:
     observed_provider = observed_metrics.get("message_bus_provider")
     observed_stream_count = observed_metrics.get("stream_count")
     observed_threshold = observed_metrics.get("stream_threshold")
+    observed_workflow = observed_metrics.get("workflow")
+    observed_next_action = observed_metrics.get("next_action")
 
     if observed_provider is None:
         st.caption("No workflow observation yet. Run a workflow to capture real routing decisions.")
@@ -140,6 +142,8 @@ def render_message_bus_view(*, workflow: dict[str, Any] | None = None) -> None:
                 ("Observed Provider", str(observed_provider).upper()),
                 ("Observed Stream Count", observed_stream_count),
                 ("Observed Threshold", observed_threshold),
+                ("Observed Workflow", str(observed_workflow or "N/A")),
+                ("Observed Next Action", str(observed_next_action or "N/A")),
             ]
         )
 

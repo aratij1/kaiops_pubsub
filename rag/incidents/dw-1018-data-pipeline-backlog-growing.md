@@ -5,6 +5,9 @@ severity: high
 alert_type: backlog
 source_system: internal
 source_ref: DW-1018
+dependencies: Not explicitly documented.
+deployment: Not explicitly documented.
+execution_plan: Scale processing cluster
 
 # Data Pipeline Backlog Growing (DW-1018)
 
@@ -12,7 +15,7 @@ Service: data-pipeline
 Severity: HIGH
 Alert type: backlog
 
-## Description
+## Summary
 Data pipeline backlog is growing and records are not being processed quickly enough.
 
 ## Symptoms
@@ -20,21 +23,33 @@ Data pipeline backlog is growing and records are not being processed quickly eno
 - Lagging freshness
 - Worker saturation
 
-## Probable Root Causes
+## Root Cause
 - Slow processing
 - Increased ingestion volume
 
-## Investigation
+## Impact
+- Service: data-pipeline Severity: HIGH Alert type: backlog
+
+## Dependencies
+- Not explicitly documented.
+
+## Deployment Context
+- Not explicitly documented.
+
+## Execution Plan
+- Scale processing cluster
+
+## Investigation Timeline
 1. Check backlog growth rate
-1. Inspect worker throughput
-1. Review ingestion spikes
+2. Inspect worker throughput
+3. Review ingestion spikes
 
 ## Remediation
 - Scale processing cluster
 - Increase worker nodes
 
-## Automation
-- Scale processing cluster
+## Prevention
+- Review the incident pattern and update the runbook or automation as needed.
 
-## RAG/SOP Notes
+## SOP Notes
 - This document was derived from RAG_doc.docx and is intended for retrieval, SOPs, and runbook-driven operations.

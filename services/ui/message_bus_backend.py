@@ -111,4 +111,14 @@ def extract_observed_routing_metrics(workflow: dict[str, Any] | None) -> dict[st
     if not isinstance(orchestrator_event, dict):
         return {}
     metrics = orchestrator_event.get("metrics", {})
-    return metrics if isinstance(metrics, dict) else {}
+    extracted = dict(metrics) if isinstance(metrics, dict) else {}
+    decision = orchestrator_event.get("decision", {})
+    if isinstance(decision, dict):
+        extracted.setdefault("workflow", decision.get("workflow"))
+        extracted.setdefault("next_action", decision.get("next_action"))
+        extracted.setdefault("requires_approval", decision.get("requires_approval"))
+        extracted.setdefault("risk_tier", decision.get("risk_tier"))
+        extracted.setdefault("execution_mode", decision.get("execution_mode"))
+        extracted.setdefault("policy_version", decision.get("policy_version"))
+        extracted.setdefault("message_bus_provider", decision.get("message_bus_provider"))
+    return extracted

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -29,6 +29,113 @@ from common.models import (
     RemediationAction,
     ResolutionReport,
 )
+
+
+_PLACEHOLDER_TOKENS = {"", "-", "n/a", "na", "none", "null", "unknown"}
+_PENDING_DECISIONS = {"PENDING", "QUEUED", "AWAITING_APPROVAL", "AWAITING USER APPROVAL", "STANDBY"}
+_STATUS_PRECEDENCE = {
+    "unknown": 0,
+    "open": 1,
+    "investigating": 2,
+    "awaiting_approval": 3,
+    "remediating": 4,
+    "validating": 5,
+    "failed": 6,
+    "closed": 7,
+}
+
+
+def _is_meaningful_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in _PLACEHOLDER_TOKENS
+    if isinstance(value, (list, dict, tuple, set)):
+        return len(value) > 0
+    return True
+
+
+def _event_quality_score(event: dict[str, Any]) -> int:
+    score = 0
+    decision = str(event.get("decision") or "").strip()
+    decision_token = decision.upper()
+    if _is_meaningful_value(decision):
+        score += 2
+    if decision_token and decision_token not in _PENDING_DECISIONS:
+        score += 8
+    if _is_meaningful_value(event.get("output")):
+        score += 3
+    if _is_meaningful_value(event.get("action")):
+        score += 2
+    if isinstance(event.get("input"), dict) and event.get("input"):
+        score += 1
+    if isinstance(event.get("metrics"), dict) and event.get("metrics"):
+        score += 1
+    return score
+
+
+def _merge_events(group: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(group) == 1:
+        return dict(group[0])
+
+    merged = dict(max(group, key=_event_quality_score))
+
+    for item in group:
+        for field in ("action", "decision", "output", "communicates_to"):
+            if not _is_meaningful_value(merged.get(field)) and _is_meaningful_value(item.get(field)):
+                merged[field] = item.get(field)
+
+        for object_field in ("input", "metrics"):
+            existing = merged.get(object_field)
+            incoming = item.get(object_field)
+            if isinstance(existing, dict) and isinstance(incoming, dict):
+                for key, value in incoming.items():
+                    if key not in existing and _is_meaningful_value(value):
+                        existing[key] = value
+            elif (not isinstance(existing, dict) or not existing) and isinstance(incoming, dict) and incoming:
+                merged[object_field] = dict(incoming)
+
+    llm_calls: list[Any] = []
+    llm_errors: list[Any] = []
+    for item in group:
+        if isinstance(item.get("llm_calls"), list):
+            llm_calls.extend(item.get("llm_calls") or [])
+        if isinstance(item.get("llm_errors"), list):
+            llm_errors.extend(item.get("llm_errors") or [])
+    if llm_calls:
+        merged["llm_calls"] = llm_calls
+    if llm_errors:
+        merged["llm_errors"] = llm_errors
+
+    return merged
+
+
+def _deduplicate_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    first_index: dict[tuple[int, str], int] = {}
+
+    for index, event in enumerate(events):
+        sequence = int(event.get("sequence", 0) or 0)
+        agent = str(event.get("agent") or "").strip()
+        key = (sequence, agent)
+        grouped.setdefault(key, []).append(event)
+        first_index.setdefault(key, index)
+
+    ordered_keys = sorted(grouped.keys(), key=lambda key: (key[0], first_index.get(key, 0)))
+    return [_merge_events(grouped[key]) for key in ordered_keys]
+
+
+def _status_rank(status: str | None) -> int:
+    token = str(status or "").strip().lower()
+    return _STATUS_PRECEDENCE.get(token, 0)
+
+
+def _utc_dt(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class IncidentRepository:
@@ -184,6 +291,7 @@ class IncidentRepository:
             }
             for row in work_rows
         ]
+        events = _deduplicate_events(events)
 
         recommendation_metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
         orchestration_decision = (
@@ -236,6 +344,10 @@ class IncidentRepository:
             "decision": {
                 "workflow": str(orchestration_decision.get("workflow") or "db-processed"),
                 "requires_approval": bool(orchestration_decision.get("requires_approval", False)),
+                "risk_tier": str(orchestration_decision.get("risk_tier") or "unknown"),
+                "execution_mode": str(orchestration_decision.get("execution_mode") or "unknown"),
+                "policy_version": str(orchestration_decision.get("policy_version") or "policy-v1"),
+                "policy_reason": str(orchestration_decision.get("policy_reason") or ""),
                 "message_bus_provider": str(orchestration_decision.get("message_bus_provider") or "unknown"),
                 "stream_count": int(orchestration_decision.get("stream_count", 0) or 0),
                 "stream_threshold": int(orchestration_decision.get("stream_threshold", 0) or 0),
@@ -589,6 +701,19 @@ class IncidentRepository:
                 environment=event_record.environment,
                 status=event_record.status or "open",
             )
+
+        # Do not regress projection lifecycle when two events share the same timestamp.
+        # In local/demo runs, recommendation and closed can be written within the same second.
+        existing_latest = _utc_dt(projection.latest_event_at)
+        incoming_latest = _utc_dt(event_record.created_at)
+        if existing_latest is not None and incoming_latest is not None:
+            if incoming_latest < existing_latest:
+                return
+            if incoming_latest == existing_latest:
+                existing_rank = _status_rank(projection.status)
+                incoming_rank = _status_rank(event_record.status)
+                if incoming_rank < existing_rank:
+                    return
 
         projection.alert_id = event_record.alert_id
         projection.trace_id = event_record.trace_id

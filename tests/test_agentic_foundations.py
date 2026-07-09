@@ -146,6 +146,11 @@ def test_orchestrator_agent_preserves_legacy_decision_shape() -> None:
     assert isinstance(decision.policy_reason, str)
     assert decision.risk_tier in {"high", "medium", "low"}
     assert decision.execution_mode in {"human-approval", "guided-auto", "auto-execute"}
+    assert isinstance(decision.execution_plan, dict)
+    assert isinstance(decision.execution_plan.get("connection"), dict)
+    assert isinstance(decision.execution_plan.get("playbook"), dict)
+    playbook_steps = decision.execution_plan.get("playbook", {}).get("steps", [])
+    assert isinstance(playbook_steps, list)
 
 
 def test_workflow_engine_llm_planner_can_override_workflow() -> None:

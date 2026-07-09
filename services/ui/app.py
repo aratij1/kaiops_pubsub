@@ -14,7 +14,7 @@ import httpx
 import streamlit as st
 from agent_center import render_agent_command_center
 import backend_api
-from components import metric_row, render_trace_output_with_kv, status_badge, table_from_dict
+from components import format_event_decision, metric_row, render_trace_output_with_kv, status_badge, table_from_dict
 from home_views import (
     render_agent_flow_view,
     render_alerts_quick_docs_view,
@@ -805,7 +805,7 @@ def build_incident_html_report(
         event_rows = "".join(
                 f"<tr><td>{html.escape(str(event.get('sequence', '')))}</td>"
                 f"<td>{html.escape(str(event.get('agent', '')))}</td>"
-                f"<td>{html.escape(str(event.get('decision', '')))}</td></tr>"
+            f"<td>{html.escape(format_event_decision(event.get('decision')))}</td></tr>"
                 for event in events
         )
 
@@ -971,7 +971,7 @@ def build_complete_webpage_html(
                         "<tr>"
                         f"<td>{html.escape(str(event.get('sequence', '')))}</td>"
                         f"<td>{html.escape(str(event.get('agent', '')))}</td>"
-                        f"<td>{html.escape(str(event.get('decision', '')))}</td>"
+                    f"<td>{html.escape(format_event_decision(event.get('decision')))}</td>"
                         f"<td>{html.escape(str(event.get('communicates_to', '')))}</td>"
                         "</tr>"
                         for event in sorted(events, key=lambda item: item.get("sequence", 0))
@@ -1470,7 +1470,11 @@ def render_agent_event_details(event: dict[str, Any]) -> None:
         else:
             st.code(str(event_input), language="text")
         st.markdown("#### Decision")
-        st.info(str(event.get("decision", "N/A")))
+        decision_value = event.get("decision", "N/A")
+        if isinstance(decision_value, (dict, list)):
+            st.json(decision_value)
+        else:
+            st.info(format_event_decision(decision_value))
         st.markdown("#### Output")
         event_output = event.get("output", "N/A")
         if isinstance(event_output, (dict, list)):
@@ -1564,14 +1568,21 @@ def render_alert_onboarding_pack_section() -> None:
         with col_left:
             alert_id_raw = st.text_input("Alert ID", value="orders-replica-lag")
             title = st.text_input("Title", value="Orders database replica lag")
+            alert_type = st.text_input("Alert Type", value="replication")
             source = st.text_input("Source", value="prometheus")
             service = st.text_input("Service", value="orders-db")
             severity = st.selectbox("Severity", options=["CRITICAL", "HIGH", "WARNING", "INFO"], index=0)
         with col_right:
             description = st.text_area("Description", value="Replica lag above threshold for 10 minutes", height=90)
+            summary = st.text_area("Summary", value="Orders database replica lag exceeded the threshold.", height=80)
             root_cause = st.text_input("Root Cause", value="Primary write saturation")
             impact = st.text_input("Impact", value="Stale reads on order queries")
             recommended_action = st.text_input("Recommended Action", value="Failover database")
+            execution_plan = st.text_area(
+                "Execution Plan",
+                value="1. Review replication diagnostics\n2. Execute controlled failover\n3. Validate recovery",
+                height=100,
+            )
 
         st.markdown("### Ownership and Environment")
         env_col_left, env_col_right = st.columns(2)
@@ -1716,69 +1727,33 @@ def render_alert_onboarding_pack_section() -> None:
             f"3. Confirm closure criteria and document evidence.\n"
         ),
         rag_root / "incidents" / f"{flow_id}-incident.md": (
-            f"alert_id: {flow_id.upper()}\n"
+            f"alert_id: {alert_id_raw.strip().upper()}\n"
             f"alert_name: {alert_name}\n"
+            f"alert_type: {alert_type.strip()}\n"
             f"service: {service.strip()}\n"
             f"severity: {severity.lower()}\n"
-            f"alert_type: incident\n"
             f"source_system: internal\n"
             f"source_ref: {normalized_source_ref}\n"
+            f"summary: {summary.strip() or description.strip()}\n"
+            f"root_cause: {root_cause.strip()}\n"
+            f"impact: {impact.strip()}\n"
+            f"execution_plan: {execution_plan.strip()}\n"
+            f"recommended_action: {recommended_action.strip()}\n"
             f"resolved_by: {owner_team.strip()}\n"
             f"closed_at: {now_iso}\n\n"
             f"# {alert_name}\n\n"
             f"## Summary\n"
+            f"{summary.strip() or description.strip()}\n\n"
+            f"## Description\n"
             f"{description.strip()}\n\n"
             f"## Root Cause\n"
             f"{root_cause.strip()}\n\n"
             f"## Impact\n"
             f"{impact.strip()}\n\n"
+            f"## Execution Plan\n"
+            f"{execution_plan.strip()}\n\n"
             f"## Remediation\n"
             f"{recommended_action.strip()}\n"
-        ),
-        rag_root / "changes" / f"{flow_id}-change.md": (
-            f"kind: change\n"
-            f"title: {flow_id.upper()} change context\n"
-            f"services: {service.strip()}\n"
-            f"deployment: incident-driven\n"
-            f"change_id: CHG-{flow_id.upper()}\n"
-            f"source_system: internal\n"
-            f"source_ref: {normalized_source_ref}\n\n"
-            f"# {alert_name} change context\n\n"
-            f"## Summary\n"
-            f"- Service: {service.strip()}\n"
-            f"- Severity: {severity}\n"
-            f"- Alert: {flow_id}\n\n"
-            f"## Operational Guidance\n"
-            f"1. Check release and change windows around incident start.\n"
-            f"2. Validate rollback possibility before irreversible remediation.\n"
-        ),
-        rag_root / "dependencies" / f"{flow_id}-dependency.md": (
-            f"kind: dependency\n"
-            f"title: {flow_id.upper()} dependency context\n"
-            f"services: {service.strip()}\n"
-            f"dependencies: cmdb, observability, message-bus\n"
-            f"source_system: internal\n"
-            f"source_ref: {normalized_source_ref}\n"
-            f"last_reviewed: {now_iso}\n\n"
-            f"# {alert_name} dependency context\n\n"
-            f"## Expected Dependency Checks\n"
-            f"- Upstream availability\n"
-            f"- Downstream consumer health\n"
-            f"- Network and broker path status\n"
-        ),
-        rag_root / "deployments" / f"{flow_id}-deployment.md": (
-            f"kind: deployment\n"
-            f"title: {flow_id.upper()} deployment context\n"
-            f"services: {service.strip()}\n"
-            f"deployment: incident-driven\n"
-            f"source_system: internal\n"
-            f"source_ref: {normalized_source_ref}\n"
-            f"last_reviewed: {now_iso}\n\n"
-            f"# {alert_name} deployment context\n\n"
-            f"## Checks\n"
-            f"1. Verify recent deployment version and rollout window.\n"
-            f"2. Correlate deployment timeline with alert start.\n"
-            f"3. Validate rollback criteria before executing changes.\n"
         ),
         rag_root / "onboarding" / f"{flow_id}-onboarding.md": (
             f"kind: onboarding\n"
@@ -2726,8 +2701,8 @@ def render_alert_details_page() -> None:
         with right:
             status_badge("Planner", "ENABLED" if planner_used else "FALLBACK")
 
-    tab_summary, tab_events, tab_finops, tab_api, tab_topics, tab_raw = st.tabs(
-        ["Summary", "Agent Events", "FinOps", "API Gateway", "Message Bus Topics", "Raw Payload"]
+    tab_summary, tab_events, tab_finops, tab_api, tab_topics, tab_execution, tab_raw = st.tabs(
+        ["Summary", "Agent Events", "FinOps", "API Gateway", "Message Bus Topics", "Execution Plan", "Raw Payload"]
     )
 
     with tab_summary:
@@ -2751,13 +2726,89 @@ def render_alert_details_page() -> None:
             if planner_used_raw is not None or planner_model or planner_reason:
                 planner_status = "ENABLED" if bool(planner_used_raw) else "FALLBACK"
 
+            placeholder_tokens = {"", "-", "n/a", "na", "none", "null", "unknown"}
+
+            def _display_text(value: Any) -> str:
+                text = str(value or "").strip()
+                if text.lower() in placeholder_tokens:
+                    return "N/A"
+                return text
+
+            def _decision_text(value: Any) -> str:
+                if isinstance(value, (dict, list)):
+                    return format_event_decision(value)
+                return _display_text(value)
+
+            def _fallback_event_fields(event: dict[str, Any]) -> tuple[str, str, str, str]:
+                agent_name = str(event.get("agent") or "").strip()
+                action = _display_text(event.get("action"))
+                decision_text = _decision_text(event.get("decision"))
+                output_text = _display_text(event.get("output"))
+                communicates_to = _display_text(event.get("communicates_to"))
+
+                if agent_name == "Alert Intelligence Agent":
+                    if action == "N/A":
+                        action = "Assigned to incident workflow"
+                    if decision_text == "N/A":
+                        correlation_id = (
+                            str(
+                                event.get("correlation_id")
+                                or alert.get("correlation_id")
+                                or incident.get("correlation_id")
+                                or ""
+                            )
+                            .strip()
+                        )
+                        if correlation_id:
+                            decision_text = f"Severity classified as {severity.lower()}; correlation ID {correlation_id}"
+                        else:
+                            decision_text = f"Severity classified as {severity.lower()}"
+                    if output_text in {"N/A", "pending", "Pending"}:
+                        output_text = "Created incident and enriched alert event" if incident.get("id") else "Awaiting enrichment output"
+                    if communicates_to == "N/A":
+                        communicates_to = "Orchestrator Agent"
+
+                elif agent_name == "Orchestrator Agent":
+                    workflow_name = str(decision.get("workflow") or scenario.get("id") or "").strip()
+                    next_action = str(decision.get("next_action") or "collect-context").strip() or "collect-context"
+                    provider = str(decision.get("message_bus_provider") or "rabbitmq").strip().lower() or "rabbitmq"
+                    if action == "N/A":
+                        action = "Routing incident through policy-aware workflow"
+                    if not decision_text or decision_text in {"N/A", "pending", "Pending"}:
+                        decision_text = format_event_decision(decision)
+                    if output_text in {"N/A", "pending", "Pending"}:
+                        output_text = (
+                            f"Next action: {next_action}; approval required: {requires_approval}; "
+                            f"message bus: {provider}"
+                        )
+                    if communicates_to == "N/A":
+                        communicates_to = "Context Intelligence Agent"
+
+                elif agent_name == "Human Approval Layer":
+                    approval_payload = workflow.get("approval", {}) if isinstance(workflow.get("approval"), dict) else {}
+                    approval_decision = str(approval_payload.get("decision") or "").strip().lower()
+                    if action == "N/A":
+                        action = "Applying policy-aware human gate"
+                    if decision_text in {"N/A", "pending", "Pending"}:
+                        if approval_decision in {"approved", "rejected"}:
+                            decision_text = approval_decision
+                        else:
+                            decision_text = "pending"
+                    if output_text in {"N/A", "pending", "Pending"}:
+                        output_text = "Awaiting explicit user decision in Approval Workbench"
+                    if communicates_to == "N/A":
+                        communicates_to = "Remediation Automation Engine"
+
+                return action, decision_text, output_text, communicates_to
+
             st.dataframe(
                 [
                     {
                         "Step": event.get("sequence"),
                         "Agent": event.get("agent"),
-                        "Decision": str(event.get("decision") or ""),
-                        "Output": str(event.get("output") or ""),
+                        "Workflow": str(event.get("workflow") or (decision.get("workflow") if str(event.get("agent") or "") == "Orchestrator Agent" else "-") or "-"),
+                        "Decision": _fallback_event_fields(event)[1],
+                        "Output": _fallback_event_fields(event)[2],
                         "Planner": planner_status if str(event.get("agent") or "") == "Orchestrator Agent" else "-",
                         "Planner Model": planner_model if str(event.get("agent") or "") == "Orchestrator Agent" else "-",
                     }
@@ -2772,11 +2823,12 @@ def render_alert_details_page() -> None:
             for event in ordered_events:
                 step = int(event.get("sequence", 0) or 0)
                 agent_name = str(event.get("agent") or "Agent")
+                action, decision_text, output_text, communicates_to = _fallback_event_fields(event)
                 with st.expander(f"Step {step} | {agent_name}"):
-                    st.write(f"- Action: {str(event.get('action') or 'N/A')}")
-                    st.write(f"- Decision: {str(event.get('decision') or 'N/A')}")
-                    st.write(f"- Output: {str(event.get('output') or 'N/A')}")
-                    st.write(f"- Communicates To: {str(event.get('communicates_to') or 'N/A')}")
+                    st.write(f"- Action: {action}")
+                    st.write(f"- Decision: {decision_text}")
+                    st.write(f"- Output: {output_text}")
+                    st.write(f"- Communicates To: {communicates_to}")
                     input_payload = event.get("input") if isinstance(event.get("input"), dict) else {}
                     if input_payload:
                         st.markdown("**Input Parameters**")
@@ -3101,6 +3153,102 @@ def render_alert_details_page() -> None:
                     st.json(params)
         else:
             st.caption("No parameter payloads found in event inputs.")
+
+    with tab_execution:
+        st.markdown("### Execution Plan")
+        execution_plan = decision.get("execution_plan", {}) if isinstance(decision.get("execution_plan"), dict) else {}
+        if not execution_plan:
+            st.caption("Execution plan details are not available in the decision payload for this workflow.")
+        else:
+            connection = execution_plan.get("connection", {}) if isinstance(execution_plan.get("connection"), dict) else {}
+            connector = connection.get("connector", {}) if isinstance(connection.get("connector"), dict) else {}
+            project = connection.get("project", {}) if isinstance(connection.get("project"), dict) else {}
+            checks = connection.get("connectivity_checks", {}) if isinstance(connection.get("connectivity_checks"), dict) else {}
+            playbook = execution_plan.get("playbook", {}) if isinstance(execution_plan.get("playbook"), dict) else {}
+            preflight = playbook.get("preflight_checks", []) if isinstance(playbook.get("preflight_checks"), list) else []
+            steps = playbook.get("steps", []) if isinstance(playbook.get("steps"), list) else []
+
+            metric_row(
+                [
+                    ("Workflow", str(execution_plan.get("workflow") or "N/A")),
+                    ("Risk Tier", str(execution_plan.get("risk_tier") or "unknown").upper()),
+                    ("Execution Mode", str(execution_plan.get("execution_mode") or "unknown").upper()),
+                    ("Approval Required", "YES" if bool(execution_plan.get("approval_required", False)) else "NO"),
+                ]
+            )
+
+            st.markdown("#### How KaiOPS Connects")
+            st.write(
+                f"- Project: {str(project.get('name') or 'unknown')} | "
+                f"Environment: {str(project.get('environment') or 'unknown')} | "
+                f"Region: {str(project.get('region') or 'unknown')}"
+            )
+            st.write(
+                f"- Connector: {str(connector.get('connector_id') or 'N/A')} "
+                f"({str(connector.get('type') or 'unknown')})"
+            )
+            st.write(f"- Auth Method: {str(connector.get('auth_method') or 'unknown')}")
+            st.write(f"- Secret Ref: {str(connector.get('secret_ref') or 'unknown')}")
+            if connector.get("endpoint"):
+                st.write(f"- Endpoint: {str(connector.get('endpoint'))}")
+            if connector.get("cluster"):
+                st.write(
+                    f"- Cluster: {str(connector.get('cluster'))} | Namespace: {str(connector.get('namespace') or 'N/A')}"
+                )
+
+            if checks:
+                st.markdown("#### Connectivity Checks")
+                st.dataframe(
+                    [
+                        {"System": "Prometheus", "URL": str(checks.get("prometheus_url") or "")},
+                        {"System": "New Relic", "URL": str(checks.get("new_relic_url") or "")},
+                        {"System": "Datadog", "URL": str(checks.get("datadog_url") or "")},
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
+
+            st.markdown("#### Preflight Checks")
+            if preflight:
+                for item in preflight:
+                    st.write(f"- {str(item)}")
+            else:
+                st.caption("No preflight checks were provided.")
+
+            st.markdown("#### Steps and Commands")
+            if steps:
+                for step in steps:
+                    if not isinstance(step, dict):
+                        continue
+                    order = int(step.get("order", 0) or 0)
+                    step_name = str(step.get("name") or f"Step {order}")
+                    step_type = str(step.get("type") or "task")
+                    approval_gate = bool(step.get("approval_gate", False))
+                    commands = step.get("commands", []) if isinstance(step.get("commands"), list) else []
+                    with st.expander(f"Step {order} | {step_name}"):
+                        st.write(f"- Type: {step_type}")
+                        st.write(f"- Approval Gate: {'YES' if approval_gate else 'NO'}")
+                        if commands:
+                            st.dataframe(
+                                [
+                                    {
+                                        "Command ID": str(command.get("id") or ""),
+                                        "Operation": str(command.get("operation") or ""),
+                                        "Allowed": "YES" if bool(command.get("allowed", False)) else "NO",
+                                        "Safety": str(command.get("safety") or "unknown"),
+                                        "Command": str(command.get("command") or ""),
+                                        "Rollback": str(command.get("rollback") or ""),
+                                    }
+                                    for command in commands
+                                    if isinstance(command, dict)
+                                ],
+                                hide_index=True,
+                                width="stretch",
+                            )
+                        else:
+                            st.caption("No executable commands were mapped for this step.")
+            else:
+                st.caption("No execution steps were provided in the plan.")
 
         detected_topics: set[str] = set()
         for event in events:

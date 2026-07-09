@@ -1,0 +1,71 @@
+{
+  "version": "playbooks-v1",
+  "playbooks": [
+    {
+      "id": "orders-db-failover-playbook",
+      "name": "Orders DB failover",
+      "match": {
+        "alert_ids": ["INC-9011", "ORDERS-REPLICA-LAG"],
+        "services": ["orders-db"],
+        "alert_types": ["replication", "database_lag", "replica_lag"],
+        "alert_keywords": ["replica lag", "database lag", "replication"]
+      },
+      "preflight_checks": [
+        "Connector health check passes",
+        "Current incident still open and critical",
+        "Approval is present for high-risk failover"
+      ],
+      "steps": [
+        {
+          "name": "Collect replication diagnostics",
+          "type": "diagnostic",
+          "commands": ["check_replication_lag", "check_primary_cpu"]
+        },
+        {
+          "name": "Execute controlled failover",
+          "type": "remediation",
+          "approval_gate": true,
+          "commands": ["failover_database"]
+        },
+        {
+          "name": "Validate replication recovery",
+          "type": "validation",
+          "commands": ["validate_replication_recovery"]
+        }
+      ]
+    },
+    {
+      "id": "payments-rollback-playbook",
+      "name": "Payments deployment rollback",
+      "match": {
+        "alert_ids": ["INC-8842"],
+        "services": ["payments", "checkout"],
+        "alert_types": ["latency"],
+        "alert_keywords": ["latency", "deployment", "checkout"]
+      },
+      "preflight_checks": [
+        "Connector health check passes",
+        "Deployment correlation confirmed",
+        "Approval is present for high-risk rollback"
+      ],
+      "steps": [
+        {
+          "name": "Confirm checkout latency regression",
+          "type": "diagnostic",
+          "commands": ["check_checkout_latency"]
+        },
+        {
+          "name": "Rollback payments deployment",
+          "type": "remediation",
+          "approval_gate": true,
+          "commands": ["rollback_deployment"]
+        },
+        {
+          "name": "Validate SLO recovery",
+          "type": "validation",
+          "commands": ["validate_checkout_slo"]
+        }
+      ]
+    }
+  ]
+}

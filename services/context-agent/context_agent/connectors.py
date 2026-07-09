@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,7 @@ class VectorDBConnector(BaseConnector):
     embedding_model: HashingEmbeddingModel = field(default_factory=HashingEmbeddingModel)
     rag_root: Path | None = None
     documents: list[dict[str, Any]] = field(default_factory=list)
+    _document_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.documents:
@@ -84,30 +86,92 @@ class VectorDBConnector(BaseConnector):
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
         query_vector = self.embedding_model.embed(f"{alert.service} {alert.name} {alert.description}")
-        ranked = sorted(
-            self.documents,
-            key=lambda doc: cosine_similarity(query_vector, self.embedding_model.embed(self._document_text(doc))),
-            reverse=True,
+        ranked = self._rank_documents(
+            query_vector=query_vector,
+            limit=8,
+            preferred_kinds={"runbook", "incident", "deployment", "dependency", "change"},
+            service=str(alert.service or "").strip(),
         )
-        return {"matches": ranked[:8], "document_count": len(self.documents)}
+        return {"matches": ranked, "document_count": len(self.documents)}
 
     def load_documents(self) -> list[dict[str, Any]]:
         root = self.rag_root or self._discover_rag_root()
         if root is None or not root.exists():
             return []
-        return [self._parse_document(path) for path in sorted(root.rglob("*.md"))]
+        self._document_cache.clear()
+        documents = [self._parse_metadata_document(path) for path in sorted(root.rglob("*.md"))]
+        derived_documents: list[dict[str, Any]] = []
+        for doc in documents:
+            if str(doc.get("kind", "")).strip().lower() != "incident":
+                continue
+            dependencies = doc.get("dependencies", [])
+            if isinstance(dependencies, str):
+                dependencies = [item.strip() for item in dependencies.split(",") if item.strip()]
+            if isinstance(dependencies, list) and dependencies:
+                filtered_dependencies = [str(item).strip() for item in dependencies if str(item).strip().lower() != "not explicitly documented."]
+                if filtered_dependencies:
+                    dependency_doc = {
+                        **doc,
+                        "kind": "dependency",
+                        "title": f"{doc.get('title', 'Incident')} dependency context",
+                        "content": "Dependency context derived from incident metadata.",
+                        "dependencies": filtered_dependencies,
+                        "_synthetic": True,
+                    }
+                    dependency_doc["_metadata_embedding"] = self.embedding_model.embed(self._metadata_text(dependency_doc))
+                    dependency_doc["_embedding"] = self.embedding_model.embed(self._document_text(dependency_doc))
+                    derived_documents.append(dependency_doc)
+
+            deployment = str(doc.get("deployment") or "").strip()
+            if deployment and deployment.lower() != "not explicitly documented.":
+                deployment_doc = {
+                    **doc,
+                    "kind": "deployment",
+                    "title": f"{doc.get('title', 'Incident')} deployment context",
+                    "content": "Deployment context derived from incident metadata.",
+                    "deployment": deployment,
+                    "_synthetic": True,
+                }
+                deployment_doc["_metadata_embedding"] = self.embedding_model.embed(self._metadata_text(deployment_doc))
+                deployment_doc["_embedding"] = self.embedding_model.embed(self._document_text(deployment_doc))
+                derived_documents.append(deployment_doc)
+
+            change_id = str(doc.get("change_id") or "").strip()
+            if change_id:
+                change_doc = {
+                    **doc,
+                    "kind": "change",
+                    "title": f"{doc.get('title', 'Incident')} change context",
+                    "content": "Change context derived from incident metadata.",
+                    "change_id": change_id,
+                    "_synthetic": True,
+                }
+                change_doc["_metadata_embedding"] = self.embedding_model.embed(self._metadata_text(change_doc))
+                change_doc["_embedding"] = self.embedding_model.embed(self._document_text(change_doc))
+                derived_documents.append(change_doc)
+
+        return documents + derived_documents
 
     def reload(self) -> int:
         self.documents = self.load_documents()
         return len(self.documents)
 
-    def search(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        limit: int = 8,
+        *,
+        preferred_kind: str | None = None,
+        service: str | None = None,
+    ) -> list[dict[str, Any]]:
         query_vector = self.embedding_model.embed(query)
-        return sorted(
-            self.documents,
-            key=lambda doc: cosine_similarity(query_vector, self.embedding_model.embed(self._document_text(doc))),
-            reverse=True,
-        )[:limit]
+        preferred_kinds = {preferred_kind.strip().lower()} if preferred_kind and preferred_kind.strip() else None
+        return self._rank_documents(
+            query_vector=query_vector,
+            limit=limit,
+            preferred_kinds=preferred_kinds,
+            service=service,
+        )
 
     def root_path(self) -> Path:
         root = self.rag_root or self._discover_rag_root()
@@ -124,9 +188,24 @@ class VectorDBConnector(BaseConnector):
                 return rag_root
         return None
 
-    def _parse_document(self, path: Path) -> dict[str, Any]:
-        raw = path.read_text(encoding="utf-8")
-        metadata: dict[str, Any] = {"path": str(path), "kind": path.parent.name.rstrip("s")}
+    def _parse_metadata_document(self, path: Path) -> dict[str, Any]:
+        metadata = self._read_metadata(path)
+        metadata["_metadata_embedding"] = self.embedding_model.embed(self._metadata_text(metadata))
+        return metadata
+
+    def _load_full_document(self, path: str) -> dict[str, Any]:
+        cached = self._document_cache.get(path)
+        if cached is not None:
+            return dict(cached)
+
+        if not path:
+            return {}
+
+        file_path = Path(path)
+        if not file_path.exists():
+            return {}
+        raw = file_path.read_text(encoding="utf-8")
+        metadata: dict[str, Any] = {"path": path, "kind": file_path.parent.name.rstrip("s")}
         body_lines: list[str] = []
         in_metadata = True
         for line in raw.splitlines():
@@ -140,9 +219,41 @@ class VectorDBConnector(BaseConnector):
                 in_metadata = False
                 body_lines.append(line)
 
-        title = str(metadata.get("title") or path.stem.replace("-", " "))
+        title = str(metadata.get("title") or file_path.stem.replace("-", " "))
         content = "\n".join(body_lines).strip()
-        return {**metadata, "title": title, "content": content}
+        services = metadata.get("services", [])
+        if isinstance(services, str):
+            services = [item.strip() for item in services.split(",") if item.strip()]
+        elif not isinstance(services, list):
+            services = []
+        document = {**metadata, "title": title, "content": content, "services": services}
+        document["_embedding"] = self.embedding_model.embed(self._document_text(document))
+        self._document_cache[path] = document
+        return dict(document)
+
+    def _read_metadata(self, path: Path) -> dict[str, Any]:
+        metadata: dict[str, Any] = {"path": str(path), "kind": path.parent.name.rstrip("s")}
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if not stripped:
+                        break
+                    if ":" in line:
+                        key, value = line.split(":", 1)
+                        metadata[key.strip()] = self._parse_metadata_value(value.strip())
+        except OSError:
+            return metadata
+
+        title = str(metadata.get("title") or path.stem.replace("-", " "))
+        services = metadata.get("services", [])
+        if isinstance(services, str):
+            services = [item.strip() for item in services.split(",") if item.strip()]
+        elif not isinstance(services, list):
+            services = []
+        metadata["title"] = title
+        metadata["services"] = services
+        return metadata
 
     def _parse_metadata_value(self, value: str) -> Any:
         if "," in value:
@@ -165,6 +276,82 @@ class VectorDBConnector(BaseConnector):
                 str(doc.get("deployment", "")),
                 str(doc.get("content", "")),
             ]
+        )
+
+    def _metadata_text(self, doc: dict[str, Any]) -> str:
+        services = doc.get("services", [])
+        dependencies = doc.get("dependencies", [])
+        if isinstance(services, list):
+            services = " ".join(services)
+        if isinstance(dependencies, list):
+            dependencies = " ".join(dependencies)
+        return " ".join(
+            [
+                str(doc.get("kind", "")),
+                str(doc.get("title", "")),
+                str(services),
+                str(dependencies),
+                str(doc.get("deployment", "")),
+                str(doc.get("change_id", "")),
+            ]
+        )
+
+    def _service_matches(self, doc: dict[str, Any], service: str | None) -> bool:
+        normalized_service = str(service or "").strip().lower()
+        if not normalized_service:
+            return True
+        doc_services = doc.get("services", [])
+        if isinstance(doc_services, str):
+            doc_services = [doc_services]
+        if not isinstance(doc_services, list) or not doc_services:
+            return True
+        normalized_doc_services = {str(item).strip().lower() for item in doc_services if str(item).strip()}
+        return normalized_service in normalized_doc_services or any(
+            normalized_service in item or item in normalized_service for item in normalized_doc_services
+        )
+
+    def _kind_matches(self, doc: dict[str, Any], preferred_kinds: set[str] | None) -> bool:
+        if not preferred_kinds:
+            return True
+        return str(doc.get("kind", "")).strip().lower() in preferred_kinds
+
+    def _metadata_rank_score(self, query_vector: list[float], doc: dict[str, Any]) -> float:
+        embedding = doc.get("_metadata_embedding")
+        if not isinstance(embedding, list):
+            embedding = self.embedding_model.embed(self._metadata_text(doc))
+            doc["_metadata_embedding"] = embedding
+        return cosine_similarity(query_vector, embedding)
+
+    def _rank_documents(
+        self,
+        *,
+        query_vector: list[float],
+        limit: int,
+        preferred_kinds: set[str] | None = None,
+        service: str | None = None,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 20))
+        candidates = [
+            doc
+            for doc in self.documents
+            if self._kind_matches(doc, preferred_kinds) and self._service_matches(doc, service)
+        ]
+        if not candidates and preferred_kinds:
+            candidates = [doc for doc in self.documents if self._service_matches(doc, service)]
+        if not candidates:
+            candidates = list(self.documents)
+
+        shortlist_size = min(max(limit * 4, 12), len(candidates))
+        shortlisted = heapq.nlargest(
+            shortlist_size,
+            candidates,
+            key=lambda doc: self._metadata_rank_score(query_vector, doc),
+        )
+        hydrated = [dict(doc) if doc.get("_synthetic") else self._load_full_document(str(doc.get("path", ""))) for doc in shortlisted]
+        return heapq.nlargest(
+            limit,
+            hydrated,
+            key=lambda doc: cosine_similarity(query_vector, doc.get("_embedding") or self.embedding_model.embed(self._document_text(doc))),
         )
 
 

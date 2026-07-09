@@ -41,10 +41,13 @@ def fetch_guidance_matches(
     query_candidates = [candidate for candidate in query_candidates if candidate]
 
     for candidate in query_candidates:
+        params: dict[str, Any] = {"query": candidate, "limit": max(1, int(limit))}
+        if preferred_kind.strip():
+            params["kind"] = preferred_kind.strip().lower()
         response = request_json(
             "GET",
             f"{gateway_base}/rag/search",
-            params={"query": candidate, "limit": max(1, int(limit))},
+            params=params,
             show_error=False,
         )
         matches = data_from_gateway(response).get("matches", []) if response else []
@@ -54,10 +57,13 @@ def fetch_guidance_matches(
 
     # Fallback path: query context-agent directly when gateway route is unavailable.
     for candidate in query_candidates:
+        params = {"query": candidate, "limit": max(1, int(limit))}
+        if preferred_kind.strip():
+            params["kind"] = preferred_kind.strip().lower()
         fallback = request_json(
             "GET",
             f"{CONTEXT_AGENT_BASE}/rag/search",
-            params={"query": candidate, "limit": max(1, int(limit))},
+            params=params,
             show_error=False,
         )
         fallback_matches = data_from_gateway(fallback).get("matches", []) if fallback else []
