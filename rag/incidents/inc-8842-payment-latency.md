@@ -5,25 +5,54 @@ severity: high
 alert_type: latency
 source_system: internal
 source_ref: INC-8842
+dependencies: checkout, ledger, fraud, postgres-primary
+deployment: Deployment 2.5
+execution_plan: Confirm checkout latency regression; Roll back deployment; Validate SLO recovery
 
-# INC-8842 payment latency after Deployment 2.5
+# INC-8842 payment latency after Deployment 2.5 (INC-8842)
 
-Deployment 2.5 increased checkout p95 latency for payments. Rollback restored
-service health within minutes. The incident impacted payment authorization and
-checkout completion latency.
+Service: payments
+Severity: HIGH
+Alert type: latency
 
-## Decision Snapshot
-- Description: p95 latency above 1200ms for payments checkout path after Deployment 2.5.
-- Recommended Action: Roll back deployment.
-- Root Cause: Deployment 2.5.
-- Impact: Payment latency.
-- Risk Tier: HIGH.
-- Execution Mode: HUMAN-APPROVAL.
-- Approval Required: YES.
-- Policy Reason: Severity in mandatory approval set; rollback requires approver confirmation.
+## Summary
+Deployment 2.5 increased checkout p95 latency for payments. Rollback restored service health within minutes. The incident impacted payment authorization and checkout completion latency.
 
-Lessons learned:
+## Symptoms
+- Deployment 2.5 increased checkout p95 latency for payments. Rollback restored service health within minutes. The incident impacted payment authorization and checkout completion latency.
 
-- Tie alert onset to deployment windows.
-- Use reversible remediation first for high-confidence deployment regressions.
-- Keep payments-api rollback automation warm.
+## Root Cause
+- Deployment 2.5.
+
+## Impact
+- Payment latency.
+
+## Dependencies
+- checkout
+- ledger
+- fraud
+- postgres-primary
+
+## Deployment Context
+- Deployment 2.5 changed payment timeout handling and checkout retry behavior.
+- The deployment touched `payments-api`, downstream `checkout`, and ledger authorization paths.
+
+## Execution Plan
+1. Confirm checkout latency regression.
+2. Roll back deployment.
+3. Validate SLO recovery.
+
+## Investigation Timeline
+1. Tie the alert onset to the Deployment 2.5 window.
+2. Compare checkout p95 latency against the SLO threshold.
+3. Confirm rollback restored service health.
+
+## Remediation
+- Roll back deployment.
+- Restore payment service health.
+
+## Prevention
+- Review the incident pattern and update the runbook or automation as needed.
+
+## SOP Notes
+- This document was derived from inc-8842-payment-latency.md and is intended for retrieval, SOPs, and runbook-driven operations.

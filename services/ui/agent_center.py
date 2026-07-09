@@ -7,6 +7,8 @@ from typing import Any
 import httpx
 import streamlit as st
 
+from components import format_event_decision
+
 GATEWAY_BASE = os.getenv("API_GATEWAY_URL", "http://localhost:8010")
 
 
@@ -93,6 +95,10 @@ def _response_source(event: dict[str, Any]) -> tuple[str, list[str]]:
         value = event.get(key)
         if isinstance(value, (dict, list)):
             lowered_parts.append(json.dumps(value, default=str).lower())
+
+    decision_value = event.get("decision")
+    if isinstance(decision_value, dict):
+        lowered_parts.append(json.dumps(decision_value, default=str).lower())
 
     evidence_text = " ".join(lowered_parts)
     doc_terms = (
@@ -189,7 +195,7 @@ def render_agent_command_center(
     for index, (agent_name, profile) in enumerate(agent_profiles.items(), start=1):
         event = event_by_agent.get(agent_name, {})
         _, status_label = _status_style(statuses_by_agent.get(agent_name, "STANDBY"))
-        decision = str(event.get("decision") or "Awaiting workflow execution").strip()
+        decision = format_event_decision(event.get("decision"))
         action = str(event.get("action") or profile.get("mission") or "")
         if len(decision) > 86:
             decision = f"{decision[:83].rstrip()}..."
@@ -231,6 +237,13 @@ def render_agent_command_center(
             if source_notes:
                 for note in source_notes:
                     st.caption(f"- {note}")
+
+            st.markdown("**Decision**")
+            decision_payload = selected_event.get("decision", "N/A")
+            if isinstance(decision_payload, (dict, list)):
+                st.json(decision_payload)
+            else:
+                st.code(format_event_decision(decision_payload), language="text")
 
             left_col, right_col = st.columns(2)
             with left_col:

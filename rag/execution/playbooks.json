@@ -5,7 +5,9 @@
       "id": "orders-db-failover-playbook",
       "name": "Orders DB failover",
       "match": {
+        "alert_ids": ["INC-9011", "ORDERS-REPLICA-LAG"],
         "services": ["orders-db"],
+        "alert_types": ["replication", "database_lag", "replica_lag"],
         "alert_keywords": ["replica lag", "database lag", "replication"]
       },
       "preflight_checks": [
@@ -36,7 +38,9 @@
       "id": "payments-rollback-playbook",
       "name": "Payments deployment rollback",
       "match": {
+        "alert_ids": ["INC-8842"],
         "services": ["payments", "checkout"],
+        "alert_types": ["latency"],
         "alert_keywords": ["latency", "deployment", "checkout"]
       },
       "preflight_checks": [

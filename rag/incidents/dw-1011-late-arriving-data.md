@@ -5,14 +5,17 @@ severity: high
 alert_type: data_latency
 source_system: internal
 source_ref: DW-1011
+dependencies: Not explicitly documented.
+deployment: Not explicitly documented.
+execution_plan: Execute incremental load
 
 # Late Arriving Data (DW-1011)
 
 Service: transaction-feed
-Severity: MEDIUM
+Severity: HIGH
 Alert type: data_latency
 
-## Description
+## Summary
 Data arrived later than expected from the source feed.
 
 ## Symptoms
@@ -20,21 +23,33 @@ Data arrived later than expected from the source feed.
 - Downstream jobs waiting
 - Freshness breach
 
-## Probable Root Causes
+## Root Cause
 - Delayed source feed
 - Batch scheduling issue
 
-## Investigation
+## Impact
+- Service: transaction-feed Severity: MEDIUM Alert type: data_latency
+
+## Dependencies
+- Not explicitly documented.
+
+## Deployment Context
+- Not explicitly documented.
+
+## Execution Plan
+- Execute incremental load
+
+## Investigation Timeline
 1. Check source feed schedule
-1. Review batch timing
-1. Confirm delay on upstream systems
+2. Review batch timing
+3. Confirm delay on upstream systems
 
 ## Remediation
 - Execute incremental load
 - Notify source owners
 
-## Automation
-- Execute incremental load
+## Prevention
+- Review the incident pattern and update the runbook or automation as needed.
 
-## RAG/SOP Notes
+## SOP Notes
 - This document was derived from RAG_doc.docx and is intended for retrieval, SOPs, and runbook-driven operations.

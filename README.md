@@ -7,6 +7,7 @@ validation, and knowledge capture.
 ## Demo Guide
 
 - End user and executive demo script: [docs/DEMO_EXECUTIVE_AND_END_USER.md](docs/DEMO_EXECUTIVE_AND_END_USER.md)
+- Complete application flow (end-to-end + execution planning): [docs/COMPLETE_APPLICATION_FLOW.md](docs/COMPLETE_APPLICATION_FLOW.md)
 - Hybrid orchestrator policy (rules + AI): [docs/ORCHESTRATION_POLICY.md](docs/ORCHESTRATION_POLICY.md)
 - One-page orchestration decision matrix: [docs/ORCHESTRATION_DECISION_MATRIX.md](docs/ORCHESTRATION_DECISION_MATRIX.md)
 - Incident/alert metadata layer spec (Kafka or RabbitMQ): [docs/INCIDENT_ALERT_METADATA_LAYER.md](docs/INCIDENT_ALERT_METADATA_LAYER.md)

@@ -1106,11 +1106,13 @@ async def run_local_payment_workflow(
             "service": incident.service,
             "severity": incident.severity.value,
             "title": incident.title,
+            "workflow": decision.workflow,
         },
-        "decision": decision.workflow,
+        "decision": decision.__dict__,
+        "workflow": decision.workflow,
         "output": (
-            f"Next action: {decision.next_action}; approval required: {decision.requires_approval}; "
-            f"message bus: {decision.message_bus_provider}"
+            f"Workflow {decision.workflow}; next action: {decision.next_action}; "
+            f"approval required: {decision.requires_approval}; message bus: {decision.message_bus_provider}"
         ),
         "communicates_to": ", ".join(decision.downstream_agents),
         "metrics": {
@@ -1165,6 +1167,7 @@ async def run_local_payment_workflow(
             "alert_service": enriched_alert.service,
             "alert_severity": enriched_alert.severity.value,
             "deployment_label": enriched_alert.labels.get("deployment"),
+            "workflow": decision.workflow,
             "trace_id": trace_id,
         },
         "decision": f"Most relevant deployment: {context.deployment}",
@@ -1329,6 +1332,7 @@ async def run_local_payment_workflow(
             "severity": enriched_alert.severity.value,
             "deployment": context.deployment,
             "related_incidents": len(context.related_incidents),
+            "workflow": decision.workflow,
         },
         "decision": f"Root cause: {recommendation.root_cause}; action: {recommendation.recommended_action}",
         "output": "Recommendation with impact, rationale, commands, confidence, and risk",
@@ -1410,6 +1414,7 @@ async def run_local_payment_workflow(
                 "recommendation_id": recommendation.id,
                 "recommended_action": recommendation.recommended_action,
                 "channel": pending_approval.channel,
+                "workflow": decision.workflow,
             },
             "decision": pending_approval.decision.value,
             "output": "Awaiting explicit user decision in Approval Workbench",
@@ -1540,6 +1545,7 @@ async def run_local_payment_workflow(
             "recommendation_id": recommendation.id,
             "recommended_action": recommendation.recommended_action,
             "channel": approval.channel,
+            "workflow": decision.workflow,
         },
         "decision": approval.decision.value,
         "output": f"Approved by {approval.approver} on {approval.channel}",
