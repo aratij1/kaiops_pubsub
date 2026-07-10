@@ -989,6 +989,9 @@ async def run_local_payment_workflow(
         decision=decision.__dict__,
         status="awaiting_approval" if (requires_human_approval and not auto_approve) else "remediating",
         payload={
+            "recommendation_id": str(recommendation.id),
+            "flow_id": str(getattr(decision, "flow_id", "") or ""),
+            "trace_id": str(trace_id or ""),
             "recommended_action": recommendation.recommended_action,
             "root_cause": recommendation.root_cause,
             "impact": recommendation.impact,
@@ -2021,6 +2024,13 @@ async def get_agent_work_items(limit: int = 100) -> dict[str, Any]:
 @app.get("/incidents/closed")
 async def get_closed_incidents(limit: int = 100) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 500))
+    session_factory = getattr(app.state, "session_factory", None)
+    if settings.database_enabled and session_factory is not None:
+        async with session_factory() as session:
+            repo = IncidentRepository(session)
+            rows = await repo.list_closed_incidents(limit=safe_limit)
+        return {"rows": rows, "count": len(rows)}
+
     rows = list(CLOSED_INCIDENTS)[:safe_limit]
     return {"rows": rows, "count": len(rows)}
 

@@ -36,11 +36,11 @@ const TAB_SHORTCUT_MAP = {
 const VALID_TABS = new Set(Object.values(TAB_SHORTCUT_MAP));
 
 const ROLE_ALLOWED_TABS = {
-  administrator: ["home", "approval", "executive", "admin", "trace", "safety", "rag", "finops", "closed", "summary"],
+  administrator: ["home", "copilot", "approval", "executive", "admin", "trace", "safety", "rag", "finops", "closed", "summary"],
   l1_operator: ["approval"],
-  l2_engineer: ["home", "approval", "executive", "trace", "safety", "rag", "finops", "closed", "summary"],
-  l3_engineer: ["home", "approval", "executive", "trace", "safety", "rag", "finops", "closed", "summary"],
-  executive: ["home", "approval", "executive", "trace", "safety", "rag", "finops", "closed", "summary"],
+  l2_engineer: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "finops", "closed", "summary"],
+  l3_engineer: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "finops", "closed", "summary"],
+  executive: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "finops", "closed", "summary"],
 };
 
 function normalizeRoleName(value) {
@@ -456,8 +456,32 @@ export default function App() {
     try {
       const payload = await fetchJson("/api-gateway/incidents/closed?limit=120");
       const data = unwrap(payload);
-      const rows = data?.rows || [];
-      setClosedIncidents({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
+      const rows = Array.isArray(data?.rows) ? data.rows : [];
+      if (rows.length) {
+        setClosedIncidents({ loading: false, rows, error: "" });
+        return;
+      }
+
+      const [closedPayload, resolvedPayload, failedPayload] = await Promise.all([
+        fetchJson("/api-gateway/incidents/metadata?limit=120&status=closed"),
+        fetchJson("/api-gateway/incidents/metadata?limit=120&status=resolved"),
+        fetchJson("/api-gateway/incidents/metadata?limit=120&status=failed"),
+      ]);
+      const closedRows = Array.isArray(unwrap(closedPayload)?.rows) ? unwrap(closedPayload).rows : [];
+      const resolvedRows = Array.isArray(unwrap(resolvedPayload)?.rows) ? unwrap(resolvedPayload).rows : [];
+      const failedRows = Array.isArray(unwrap(failedPayload)?.rows) ? unwrap(failedPayload).rows : [];
+      const merged = [...closedRows, ...resolvedRows, ...failedRows];
+      const deduped = [];
+      const seen = new Set();
+      merged.forEach((row) => {
+        const key = String(row?.incident_id || row?.id || "").trim();
+        if (!key || seen.has(key)) {
+          return;
+        }
+        seen.add(key);
+        deduped.push(row);
+      });
+      setClosedIncidents({ loading: false, rows: deduped, error: "" });
     } catch (error) {
       setClosedIncidents({ loading: false, rows: [], error: error.message });
     }
@@ -520,7 +544,10 @@ export default function App() {
       const projects = rows
         .map((row) => String(row?.project_name || "").trim())
         .filter(Boolean);
-      const unique = Array.from(new Set([...defaultMonitorApplications, ...projects]));
+      const alertApplications = alerts.rows
+        .map((row) => String(row?.application || row?.project_name || row?.project || row?.service || "").trim())
+        .filter(Boolean);
+      const unique = Array.from(new Set([...defaultMonitorApplications, ...projects, ...alertApplications]));
       setMonitorApplications(unique.length ? unique : defaultMonitorApplications);
     } catch (_error) {
       setMonitorApplications(defaultMonitorApplications);
@@ -1092,11 +1119,24 @@ export default function App() {
   }, [activeTab]);
 
   useEffect(() => {
+    const stressAlertPresent = alerts.rows.some((row) => {
+      return String(row?.application || row?.project || row?.project_name || row?.source || "")
+        .trim()
+        .toLowerCase() === "stress-lab"
+        || String(row?.source || "").trim().toLowerCase() === "stress-harness"
+        || String(row?.labels?.workload || "").trim().toLowerCase() === "20k-stress";
+    });
+
+    if (stressAlertPresent && applicationToMonitor !== "stress-lab") {
+      setApplicationToMonitor("stress-lab");
+      return;
+    }
+
     if (monitorApplications.includes(applicationToMonitor)) {
       return;
     }
     setApplicationToMonitor(monitorApplications[0] || "payments");
-  }, [monitorApplications, applicationToMonitor]);
+  }, [alerts.rows, monitorApplications, applicationToMonitor]);
 
   useEffect(() => {
     if (!adminSession.accessToken || activeTab !== "admin") {
@@ -1104,11 +1144,6 @@ export default function App() {
     }
     loadAdminUsersAndRoles();
   }, [adminSession.accessToken, activeTab]);
-
-  const workflowUsage = useMemo(() => {
-    const usage = workflowState?.result?.data?.recommendation?.metadata?.model_usage || [];
-    return Array.isArray(usage) ? usage : [];
-  }, [workflowState]);
 
   const latestWorkflow = useMemo(() => {
     return workflowState?.result?.data || {};
@@ -1122,22 +1157,21 @@ export default function App() {
     return String(latestWorkflow?.recommendation?.id || latestWorkflow?.recommendation_id || "").trim();
   }, [latestWorkflow]);
 
-  const workflowEvents = useMemo(() => {
-    const events = latestWorkflow?.events || [];
-    return Array.isArray(events) ? events : [];
-  }, [latestWorkflow]);
-
   const monitorScopedAlerts = useMemo(() => {
     return filterAlertsForMonitor(alerts.rows, applicationToMonitor);
   }, [alerts.rows, applicationToMonitor]);
+
+  const visibleAlerts = useMemo(() => {
+    return monitorScopedAlerts.length ? monitorScopedAlerts : alerts.rows;
+  }, [monitorScopedAlerts, alerts.rows]);
 
   const monitorScopedIncidentMetadata = useMemo(() => {
     return filterRowsForMonitor(incidentMetadata.rows, applicationToMonitor);
   }, [incidentMetadata.rows, applicationToMonitor]);
 
   const selectedAlertRow = useMemo(() => {
-    return monitorScopedAlerts.find((row) => String(row?.alert_id || row?.id || row?.incident_id || "") === selectedAlertId) || null;
-  }, [monitorScopedAlerts, selectedAlertId]);
+    return visibleAlerts.find((row) => String(row?.alert_id || row?.id || row?.incident_id || "") === selectedAlertId) || null;
+  }, [visibleAlerts, selectedAlertId]);
 
   const selectedAlertPayload = useMemo(() => {
     return selectedAlertData?.payload?.data || selectedAlertData?.payload || {};
@@ -1159,8 +1193,37 @@ export default function App() {
 
   const selectedAlertRouting = useMemo(() => extractObservedRoutingMetrics(selectedAlertWorkflow), [selectedAlertWorkflow]);
 
+  const hasSelectedWorkflowData = useMemo(() => {
+    if (!selectedAlertWorkflow || typeof selectedAlertWorkflow !== "object") {
+      return false;
+    }
+    const events = Array.isArray(selectedAlertWorkflow.events) ? selectedAlertWorkflow.events : [];
+    return Boolean(events.length || selectedAlertWorkflow.incident || selectedAlertWorkflow.recommendation);
+  }, [selectedAlertWorkflow]);
+
+  const panelWorkflow = useMemo(() => {
+    return hasSelectedWorkflowData ? selectedAlertWorkflow : latestWorkflow;
+  }, [hasSelectedWorkflowData, selectedAlertWorkflow, latestWorkflow]);
+
+  const panelWorkflowEvents = useMemo(() => {
+    const events = panelWorkflow?.events || [];
+    return Array.isArray(events) ? events : [];
+  }, [panelWorkflow]);
+
+  const panelWorkflowUsage = useMemo(() => {
+    const directUsage = panelWorkflow?.recommendation?.metadata?.model_usage;
+    if (Array.isArray(directUsage) && directUsage.length) {
+      return directUsage;
+    }
+    const finopsCalls = panelWorkflow?.finops?.calls;
+    if (Array.isArray(finopsCalls)) {
+      return finopsCalls;
+    }
+    return [];
+  }, [panelWorkflow]);
+
   const workflowEventRows = useMemo(() => {
-    return workflowEvents
+    const mapped = panelWorkflowEvents
       .filter((event) => event && typeof event === "object")
       .sort((a, b) => Number(a.sequence || 0) - Number(b.sequence || 0))
       .map((event) => {
@@ -1175,9 +1238,20 @@ export default function App() {
           communicates_to: event.communicates_to || "-",
         };
       });
-  }, [workflowEvents]);
+    if (mapped.length) {
+      return mapped;
+    }
+    return gatewayRecent.rows.slice(0, 80).map((event, index) => ({
+      sequence: index + 1,
+      agent: "API Gateway",
+      action: event.path || "gateway.event",
+      decision: event?.safety?.decision || "-",
+      output: String(event.status_code || "-") + (event.trace_id ? ` | trace ${event.trace_id}` : ""),
+      communicates_to: event.target_url || "monitoring-adapter",
+    }));
+  }, [panelWorkflowEvents, gatewayRecent.rows]);
 
-  const observedRouting = useMemo(() => extractObservedRoutingMetrics(latestWorkflow), [latestWorkflow]);
+  const observedRouting = useMemo(() => extractObservedRoutingMetrics(panelWorkflow), [panelWorkflow]);
 
   const messageBusTopicRows = useMemo(() => {
     return SERVICE_TOPIC_FLOW.map((row) => ({
@@ -1188,7 +1262,7 @@ export default function App() {
   }, []);
 
   const messageBusActual = useMemo(() => {
-    const workflow = latestWorkflow;
+    const workflow = panelWorkflow;
     const events = Array.isArray(workflow.events) ? workflow.events : [];
     const observedAgents = new Set(events.map((item) => String(item?.agent || "").trim()));
     const observedProvider = String(observedRouting?.message_bus_provider || "").trim().toUpperCase() || "N/A";
@@ -1232,11 +1306,11 @@ export default function App() {
     });
 
     return { published, consumed, rows };
-  }, [latestWorkflow, observedRouting]);
+  }, [panelWorkflow, observedRouting]);
 
   const finopsByProvider = useMemo(() => {
     const grouped = new Map();
-    workflowUsage.forEach((row) => {
+    panelWorkflowUsage.forEach((row) => {
       const key = String(row?.provider || "unknown");
       const current = grouped.get(key) || { provider: key, calls: 0, total_tokens: 0, total_cost_usd: 0 };
       current.calls += 1;
@@ -1245,7 +1319,7 @@ export default function App() {
       grouped.set(key, current);
     });
     return Array.from(grouped.values());
-  }, [workflowUsage]);
+  }, [panelWorkflowUsage]);
 
   const closedRiskOptions = useMemo(() => {
     return Array.from(
@@ -1488,6 +1562,7 @@ export default function App() {
 
   const tabs = [
     { id: "home", label: "Dashboard" },
+    { id: "copilot", label: "Copilot Studio" },
     { id: "approval", label: "Human Approval" },
     { id: "executive", label: "Executive Dashboard" },
     { id: "admin", label: "Admin Center" },
@@ -1501,6 +1576,7 @@ export default function App() {
 
   const sidebarSections = [
     { id: "home", icon: "DB", shortLabel: "Dashboard", label: "Dashboard", tone: "ops" },
+    { id: "copilot", icon: "CP", shortLabel: "Copilot", label: "Copilot Studio", tone: "meta" },
     { id: "approval", icon: "AL", shortLabel: "Approval", label: "Human Approval", tone: "risk" },
     { id: "executive", icon: "EX", shortLabel: "Executive", label: "Executive Dashboard", tone: "meta" },
     { id: "admin", icon: "AD", shortLabel: "Admin", label: "Admin Center", tone: "bus" },
@@ -1539,6 +1615,20 @@ export default function App() {
     setActiveTab(tabId);
   }
 
+  function openCopilotWorkspace(workspace) {
+    if (workspace === "users" && !isAdministrator) {
+      return;
+    }
+    if (workspace === "users") {
+      setAdminWorkspace("users");
+    } else if (workspace === "project") {
+      setAdminWorkspace("project");
+    } else if (workspace === "alerts") {
+      setAdminWorkspace("alerts");
+    }
+    setActiveTab("admin");
+  }
+
   const reportConfig = useMemo(() => {
     const config = {
       home: {
@@ -1549,6 +1639,17 @@ export default function App() {
           ["Flows", flows.rows.length],
           ["Gateway Events", gatewayRecent.rows.length],
           ["Health", health.ok ? "OK" : "CHECK"],
+        ],
+        refresh: refreshAll,
+      },
+      copilot: {
+        title: "Copilot Studio",
+        caption: "Guided workspace for project onboarding, alert docs, and user management.",
+        metrics: [
+          ["Projects", onboardingState.rows.length],
+          ["Alert Docs", ragDocs.rows.length],
+          ["Users", adminUsers.rows.length],
+          ["Ready", health.ok ? "Yes" : "Check"],
         ],
         refresh: refreshAll,
       },
@@ -1620,15 +1721,15 @@ export default function App() {
         title: "LLM FinOps",
         caption: "Token usage, provider costs, and model-level breakdown.",
         metrics: [
-          ["LLM Calls", workflowUsage.length],
+          ["LLM Calls", panelWorkflowUsage.length],
           [
             "Total Cost (USD)",
-            workflowUsage
+            panelWorkflowUsage
               .reduce((sum, row) => sum + Number(row?.total_cost_usd || 0), 0)
               .toFixed(6),
           ],
-          ["Providers", new Set(workflowUsage.map((row) => row.provider).filter(Boolean)).size],
-          ["Models", new Set(workflowUsage.map((row) => row.model).filter(Boolean)).size],
+          ["Providers", new Set(panelWorkflowUsage.map((row) => row.provider).filter(Boolean)).size],
+          ["Models", new Set(panelWorkflowUsage.map((row) => row.model).filter(Boolean)).size],
         ],
         refresh: () => runWorkflow(selectedFlow),
       },
@@ -1689,7 +1790,7 @@ export default function App() {
     approvalForm.action,
     workflowEventRows.length,
     selectedFlow,
-    workflowUsage,
+    panelWorkflowUsage,
     messageBusActual,
     observedRouting,
     gatewaySummary.data,
@@ -1760,7 +1861,7 @@ export default function App() {
       row.total_tokens,
       Number(row.total_cost_usd || 0).toFixed(6),
     ]);
-    const finopsUsageRows = workflowUsage.slice(0, 250).map((row) => [
+    const finopsUsageRows = panelWorkflowUsage.slice(0, 250).map((row) => [
       row.task || "-",
       row.provider || "-",
       row.model || "-",
@@ -1820,11 +1921,11 @@ export default function App() {
     ]);
     const selectedRoutingRows = selectedAlertRow
       ? [
-          ["Observed Provider", selectedAlertRouting?.message_bus_provider || "-"],
-          ["Workflow", selectedAlertRouting?.workflow || "-"],
-          ["Next Action", selectedAlertRouting?.next_action || "-"],
-          ["Execution Mode", selectedAlertRouting?.execution_mode || "-"],
-          ["Risk Tier", selectedAlertRouting?.risk_tier || "-"],
+          ["Observed Provider", (hasSelectedWorkflowData ? selectedAlertRouting?.message_bus_provider : observedRouting?.message_bus_provider) || "-"],
+          ["Workflow", (hasSelectedWorkflowData ? selectedAlertRouting?.workflow : observedRouting?.workflow) || "-"],
+          ["Next Action", (hasSelectedWorkflowData ? selectedAlertRouting?.next_action : observedRouting?.next_action) || "-"],
+          ["Execution Mode", (hasSelectedWorkflowData ? selectedAlertRouting?.execution_mode : observedRouting?.execution_mode) || "-"],
+          ["Risk Tier", (hasSelectedWorkflowData ? selectedAlertRouting?.risk_tier : observedRouting?.risk_tier) || "-"],
         ]
       : [];
 
@@ -2088,7 +2189,7 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {monitorScopedAlerts.map((row, index) => {
+                      {visibleAlerts.map((row, index) => {
                         const rowId = String(row.alert_id || row.id || row.incident_id || index);
                         const fullAlertId = String(row.alert_id || row.id || row.incident_id || "-");
                         const compactAlertId = fullAlertId.length > 16 ? `${fullAlertId.slice(0, 8)}...${fullAlertId.slice(-6)}` : fullAlertId;
@@ -2119,7 +2220,7 @@ export default function App() {
                           </tr>
                         );
                       })}
-                      {!monitorScopedAlerts.length && !alerts.loading ? (
+                      {!visibleAlerts.length && !alerts.loading ? (
                         <tr>
                           <td colSpan={6}>No alerts available for {applicationToMonitor}.</td>
                         </tr>
@@ -2302,6 +2403,67 @@ export default function App() {
                   <p className="subtitle">Select an alert in Alert Stream to open the detail tabs workspace.</p>
                 </article>
               )}
+            </section>
+          ) : null}
+
+          {activeTab === "copilot" ? (
+            <section className="grid single-col">
+              <article className="panel copilot-panel">
+                <div className="panel-head">
+                  <h2>Copilot Studio</h2>
+                  <p>One guided place to onboard projects, create alert documents, and manage users.</p>
+                  <button className="button-secondary" onClick={refreshAll}>Refresh</button>
+                </div>
+
+                <div className="copilot-summary-grid">
+                  <div className="copilot-summary-card copilot-tone-ops">
+                    <strong>Project Onboarding</strong>
+                    <span>Set project identity, environment, and monitoring endpoints.</span>
+                    <button type="button" className="button-primary" onClick={() => openCopilotWorkspace("project")}>Open Onboarding</button>
+                  </div>
+                  <div className="copilot-summary-card copilot-tone-bus">
+                    <strong>Alert Documents</strong>
+                    <span>Create onboarding docs and bulk alert knowledge from one place.</span>
+                    <button type="button" className="button-primary" onClick={() => openCopilotWorkspace("alerts")}>Open Docs</button>
+                  </div>
+                  <div className={`copilot-summary-card ${isAdministrator ? "copilot-tone-meta" : "copilot-tone-muted"}`}>
+                    <strong>User Management</strong>
+                    <span>{isAdministrator ? "Create, edit, and reset users." : "Administrator-only control."}</span>
+                    <button type="button" className="button-primary" onClick={() => openCopilotWorkspace("users")} disabled={!isAdministrator}>Open Users</button>
+                  </div>
+                </div>
+
+                <div className="copilot-flow-grid">
+                  <div className="copilot-flow-card">
+                    <span className="copilot-step">1</span>
+                    <div>
+                      <strong>Start from a project</strong>
+                      <p>Use the project onboarding form to register monitoring details and assignments.</p>
+                    </div>
+                  </div>
+                  <div className="copilot-flow-card">
+                    <span className="copilot-step">2</span>
+                    <div>
+                      <strong>Generate alert docs</strong>
+                      <p>Write onboarding docs or bulk import runbook-style alert guidance.</p>
+                    </div>
+                  </div>
+                  <div className="copilot-flow-card">
+                    <span className="copilot-step">3</span>
+                    <div>
+                      <strong>Manage access</strong>
+                      <p>Keep user roles, statuses, and passwords in the same workspace.</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="copilot-shortcuts">
+                  <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("project")}>Project Onboarding</button>
+                  <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("alerts")}>Alert Documents</button>
+                  <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("users")} disabled={!isAdministrator}>User Management</button>
+                  <button type="button" className="button-secondary" onClick={() => setActiveTab("summary")}>Incident Metadata</button>
+                </div>
+              </article>
             </section>
           ) : null}
 
@@ -3096,7 +3258,7 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {workflowUsage.map((row, index) => (
+                      {panelWorkflowUsage.map((row, index) => (
                         <tr key={`${row.task || "task"}-${index}`}>
                           <td>{row.task || "-"}</td>
                           <td>{row.provider || "-"}</td>
@@ -3106,9 +3268,9 @@ export default function App() {
                           <td>{row.total_cost_usd || "-"}</td>
                         </tr>
                       ))}
-                      {!workflowUsage.length ? (
+                      {!panelWorkflowUsage.length ? (
                         <tr>
-                          <td colSpan={6}>No usage yet. Run a sample workflow from Home to populate FinOps data.</td>
+                          <td colSpan={6}>No usage yet. Run a sample workflow from Home or open a processed alert to populate FinOps data.</td>
                         </tr>
                       ) : null}
                     </tbody>

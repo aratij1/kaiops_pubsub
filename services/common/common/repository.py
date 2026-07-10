@@ -138,6 +138,59 @@ def _utc_dt(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
+def _extract_recommendation_uuid(payload: dict[str, Any] | None) -> UUID | None:
+    if not isinstance(payload, dict):
+        return None
+    recommendation = payload.get("recommendation") if isinstance(payload.get("recommendation"), dict) else {}
+    approval = payload.get("approval") if isinstance(payload.get("approval"), dict) else {}
+    source_payload = payload.get("source_payload") if isinstance(payload.get("source_payload"), dict) else {}
+    source_recommendation = source_payload.get("recommendation") if isinstance(source_payload.get("recommendation"), dict) else {}
+    source_approval = source_payload.get("approval") if isinstance(source_payload.get("approval"), dict) else {}
+
+    candidates = [
+        payload.get("recommendation_id"),
+        payload.get("recommended_action_id"),
+        recommendation.get("id"),
+        approval.get("recommendation_id"),
+        source_payload.get("recommendation_id"),
+        source_recommendation.get("id"),
+        source_approval.get("recommendation_id"),
+    ]
+    for candidate in candidates:
+        token = str(candidate or "").strip()
+        if not token:
+            continue
+        try:
+            return UUID(token)
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_flow_id(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    decision = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
+    event_contract = payload.get("event_contract") if isinstance(payload.get("event_contract"), dict) else {}
+    source_payload = payload.get("source_payload") if isinstance(payload.get("source_payload"), dict) else {}
+    source_decision = source_payload.get("decision") if isinstance(source_payload.get("decision"), dict) else {}
+    source_contract = source_payload.get("event_contract") if isinstance(source_payload.get("event_contract"), dict) else {}
+
+    candidates = [
+        payload.get("flow_id"),
+        decision.get("flow_id"),
+        event_contract.get("flow_id"),
+        source_payload.get("flow_id"),
+        source_decision.get("flow_id"),
+        source_contract.get("flow_id"),
+    ]
+    for candidate in candidates:
+        token = str(candidate or "").strip()
+        if token:
+            return token
+    return None
+
+
 class IncidentRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
@@ -720,6 +773,12 @@ class IncidentRepository:
 
         projection.alert_id = event_record.alert_id
         projection.trace_id = event_record.trace_id
+        recommendation_uuid = _extract_recommendation_uuid(event_record.payload)
+        flow_id = _extract_flow_id(event_record.payload)
+        if recommendation_uuid is not None:
+            projection.recommendation_id = recommendation_uuid
+        if flow_id:
+            projection.flow_id = flow_id
         projection.tenant_id = event_record.tenant_id or "default"
         projection.service = event_record.service
         projection.environment = event_record.environment
@@ -831,28 +890,88 @@ class IncidentRepository:
         stmt = stmt.order_by(IncidentProjectionRecord.updated_at.desc()).limit(safe_limit)
         result = await self.session.execute(stmt)
         rows = result.scalars().all()
-        return [
-            {
-                "incident_id": str(row.incident_id),
-                "alert_id": str(row.alert_id) if row.alert_id else None,
-                "trace_id": row.trace_id,
-                "tenant_id": row.tenant_id,
-                "service": row.service,
-                "environment": row.environment,
-                "severity": row.severity,
-                "status": row.status,
-                "owner": row.owner,
-                "risk_tier": row.risk_tier,
-                "execution_mode": row.execution_mode,
-                "requires_approval": row.requires_approval,
-                "policy_version": row.policy_version,
-                "policy_reason": row.policy_reason,
-                "transport_provider": row.transport_provider,
-                "latest_event_id": str(row.latest_event_id) if row.latest_event_id else None,
-                "latest_event_type": row.latest_event_type,
-                "latest_event_at": row.latest_event_at,
-                "updated_at": row.updated_at,
-                "projection_payload": row.projection_payload,
-            }
+
+        pending_by_incident: dict[UUID, PendingWorkflowRecord] = {}
+        missing_context_incidents = [
+            row.incident_id
             for row in rows
+            if row.recommendation_id is None or not str(row.flow_id or "").strip()
         ]
+        if missing_context_incidents:
+            pending_result = await self.session.execute(
+                select(PendingWorkflowRecord).where(PendingWorkflowRecord.incident_id.in_(missing_context_incidents))
+            )
+            pending_rows = pending_result.scalars().all()
+            pending_by_incident = {pending.incident_id: pending for pending in pending_rows}
+
+        response_rows: list[dict[str, Any]] = []
+        for row in rows:
+            pending = pending_by_incident.get(row.incident_id)
+            merged_recommendation_id = row.recommendation_id or (pending.recommendation_id if pending is not None else None)
+            merged_flow_id = row.flow_id or (pending.flow_id if pending is not None else None)
+
+            response_rows.append(
+                {
+                    "incident_id": str(row.incident_id),
+                    "alert_id": str(row.alert_id) if row.alert_id else None,
+                    "trace_id": row.trace_id,
+                    "recommendation_id": str(merged_recommendation_id) if merged_recommendation_id else None,
+                    "flow_id": merged_flow_id,
+                    "tenant_id": row.tenant_id,
+                    "service": row.service,
+                    "environment": row.environment,
+                    "severity": row.severity,
+                    "status": row.status,
+                    "owner": row.owner,
+                    "risk_tier": row.risk_tier,
+                    "execution_mode": row.execution_mode,
+                    "requires_approval": row.requires_approval,
+                    "policy_version": row.policy_version,
+                    "policy_reason": row.policy_reason,
+                    "transport_provider": row.transport_provider,
+                    "latest_event_id": str(row.latest_event_id) if row.latest_event_id else None,
+                    "latest_event_type": row.latest_event_type,
+                    "latest_event_at": row.latest_event_at,
+                    "updated_at": row.updated_at,
+                    "projection_payload": row.projection_payload,
+                }
+            )
+        return response_rows
+
+    async def list_closed_incidents(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 1000))
+        stmt = (
+            select(IncidentProjectionRecord)
+            .where(IncidentProjectionRecord.status.in_(["closed", "resolved", "failed"]))
+            .order_by(IncidentProjectionRecord.updated_at.desc())
+            .limit(safe_limit)
+        )
+        result = await self.session.execute(stmt)
+        rows = result.scalars().all()
+
+        response_rows: list[dict[str, Any]] = []
+        for row in rows:
+            projection_payload = row.projection_payload if isinstance(row.projection_payload, dict) else {}
+            event_payload = projection_payload.get("event_payload") if isinstance(projection_payload.get("event_payload"), dict) else {}
+            response_rows.append(
+                {
+                    "incident_id": str(row.incident_id),
+                    "alert_id": str(row.alert_id) if row.alert_id else None,
+                    "trace_id": row.trace_id,
+                    "recommendation_id": str(row.recommendation_id) if row.recommendation_id else None,
+                    "flow_id": row.flow_id,
+                    "service": row.service,
+                    "environment": row.environment,
+                    "severity": row.severity,
+                    "status": row.status,
+                    "risk_tier": row.risk_tier,
+                    "execution_mode": row.execution_mode,
+                    "transport_provider": row.transport_provider,
+                    "health_restored": bool(event_payload.get("health_restored")) if "health_restored" in event_payload else None,
+                    "alerts_cleared": bool(event_payload.get("alerts_cleared")) if "alerts_cleared" in event_payload else None,
+                    "closed_at": row.latest_event_at or row.updated_at,
+                    "updated_at": row.updated_at,
+                    "projection_payload": projection_payload,
+                }
+            )
+        return response_rows
