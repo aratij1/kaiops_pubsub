@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
+import logging
 from typing import Any
 from uuid import UUID
 
 from common.config import get_settings
+from common.event_publishers import build_agent_event_contract
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Approval, ApprovalDecision
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
@@ -24,6 +26,7 @@ ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any
 PENDING_INCIDENTS: dict[str, dict] = {}
 _HIGH_RISK_SEVERITIES = {"high", "critical"}
 _NON_HUMAN_APPROVERS = {"", "system", "rca-agent", "automation-agent", "orchestrator"}
+logger = logging.getLogger("kaiops.approval_service")
 
 
 async def startup(app: FastAPI) -> None:
@@ -114,13 +117,77 @@ async def modify(request: ModifyRequest) -> Approval:
 
 @app.get("/incident/{incident_id}")
 async def get_incident(incident_id: str) -> dict:
+    normalized_incident_id = str(incident_id or "").strip()
+    if not normalized_incident_id:
+        return {"incident_id": incident_id, "status": "unknown"}
+
+    memory_payload = PENDING_INCIDENTS.get(normalized_incident_id)
+    if isinstance(memory_payload, dict):
+        memory_payload.setdefault("incident_id", normalized_incident_id)
+
     if settings.database_enabled:
-        async with app.state.session_factory() as session:
-            repo = IncidentRepository(session)
-            incident = await repo.get_incident(incident_id)
-            if incident:
-                return incident
-    return PENDING_INCIDENTS.get(incident_id, {"incident_id": incident_id, "status": "unknown"})
+        try:
+            async with app.state.session_factory() as session:
+                repo = IncidentRepository(session)
+                incident = await repo.get_incident(normalized_incident_id)
+                pending = await repo.get_pending_workflow(normalized_incident_id)
+                if isinstance(incident, dict):
+                    return _build_incident_context(incident, pending)
+                if isinstance(pending, dict):
+                    return _build_incident_context(memory_payload or {"incident_id": normalized_incident_id}, pending)
+        except Exception:
+            logger.exception("failed to load incident context", extra={"incident_id": normalized_incident_id})
+
+    if isinstance(memory_payload, dict):
+        return _build_incident_context(memory_payload, None)
+
+    return {"incident_id": normalized_incident_id, "status": "unknown"}
+
+
+def _build_incident_context(base_payload: dict[str, Any], pending_workflow: dict[str, Any] | None) -> dict[str, Any]:
+    context = dict(base_payload or {})
+    recommendation = context.get("recommendation") if isinstance(context.get("recommendation"), dict) else {}
+    decision = context.get("decision") if isinstance(context.get("decision"), dict) else {}
+
+    if isinstance(pending_workflow, dict):
+        pending_payload = pending_workflow.get("payload") if isinstance(pending_workflow.get("payload"), dict) else {}
+        pending_recommendation = pending_payload.get("recommendation") if isinstance(pending_payload.get("recommendation"), dict) else {}
+        pending_decision = pending_payload.get("decision") if isinstance(pending_payload.get("decision"), dict) else {}
+
+        if not recommendation and pending_recommendation:
+            recommendation = pending_recommendation
+            context["recommendation"] = recommendation
+        if not decision and pending_decision:
+            decision = pending_decision
+            context["decision"] = decision
+
+        context.setdefault("incident_id", str(pending_workflow.get("incident_id") or context.get("incident_id") or ""))
+        context.setdefault("flow_id", str(pending_workflow.get("flow_id") or decision.get("flow_id") or ""))
+        context.setdefault("trace_id", str(pending_workflow.get("trace_id") or recommendation.get("trace_id") or ""))
+        context.setdefault("status", str(pending_workflow.get("status") or context.get("status") or "awaiting_approval"))
+
+    recommendation_id = (
+        context.get("recommendation_id")
+        or recommendation.get("id")
+        or context.get("recommended_action_id")
+    )
+    if recommendation_id:
+        context["recommendation_id"] = str(recommendation_id)
+
+    if recommendation:
+        context.setdefault("trace_id", str(recommendation.get("trace_id") or ""))
+        correlation_id = recommendation.get("correlation_id")
+        if correlation_id:
+            context.setdefault("correlation_id", str(correlation_id))
+
+    if decision:
+        context.setdefault("flow_id", str(decision.get("flow_id") or ""))
+
+    incident_id = str(context.get("incident_id") or "").strip()
+    if incident_id:
+        context["incident_id"] = incident_id
+
+    return context
 
 
 async def _store_and_publish(approval: Approval) -> None:
@@ -132,7 +199,46 @@ async def _store_and_publish(approval: Approval) -> None:
             repo = IncidentRepository(session)
             await repo.save_approval(approval)
             await session.commit()
-    await app.state.producer.publish(APPROVAL_EVENTS, approval, key=str(approval.incident_id))
+    payload = _build_approval_event_payload(approval)
+    await app.state.producer.publish(APPROVAL_EVENTS, payload, key=str(approval.incident_id))
+
+
+def _build_approval_event_payload(approval: Approval) -> dict[str, Any]:
+    incident_id = str(approval.incident_id)
+    pending = PENDING_INCIDENTS.get(incident_id, {})
+    recommendation = pending.get("recommendation", {}) if isinstance(pending.get("recommendation"), dict) else {}
+    decision = pending.get("decision", {}) if isinstance(pending.get("decision"), dict) else {}
+    flow_id = str(decision.get("flow_id") or incident_id)
+    recommendation_id = str(approval.recommendation_id)
+
+    event_contract = build_agent_event_contract(
+        flow_id=flow_id,
+        incident_id=incident_id,
+        trace_id=str(recommendation.get("trace_id") or ""),
+        correlation_id=str(recommendation.get("correlation_id") or "") or None,
+        agent="approval-service",
+        payload={
+            "decision": approval.decision.value,
+            "approver": approval.approver,
+            "channel": approval.channel,
+            "topic": APPROVAL_EVENTS,
+        },
+        metadata={
+            "policy_version": approval.metadata.get("policy_version"),
+            "policy_reason": approval.metadata.get("policy_reason"),
+            "recommendation_id": recommendation_id,
+        },
+        confidence=1.0,
+        reasoning="approval outcome captured for gated remediation",
+        citations=[f"recommendation://{recommendation_id}"],
+        evidence_ids=[f"incident:{incident_id}"],
+    )
+    return {
+        "approval": approval,
+        "recommendation": recommendation,
+        "decision": decision,
+        "event_contract": event_contract,
+    }
 
 
 def _pending_severity_for_incident(incident_id: str) -> str:

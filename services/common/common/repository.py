@@ -386,7 +386,10 @@ class IncidentRepository:
         )
 
     async def get_incident(self, incident_id: str) -> dict[str, Any] | None:
-        result = await self.session.execute(select(IncidentRecord).where(IncidentRecord.id == incident_id))
+        incident_uuid = self._parse_uuid(incident_id)
+        if incident_uuid is None:
+            return None
+        result = await self.session.execute(select(IncidentRecord).where(IncidentRecord.id == incident_uuid))
         record = result.scalar_one_or_none()
         return record.payload if record else None
 
