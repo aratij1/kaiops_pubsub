@@ -1,0 +1,4 @@
+kind,title,summary,content,services,severity,alert_type
+incident,Payment API latency spike,Latency crossed SLO for 10 minutes,Investigate upstream dependency latency and validate autoscaling behavior before escalation.,payments,high,availability
+runbook,Checkout timeout triage,User sessions timing out during peak,Follow timeout triage runbook: check gateway latency, redis saturation, and rollout regressions.,checkout,critical,performance
+deployment,Orders DB failover validation,Post-failover sanity checklist,Validate read/write health, replication lag, and alert suppression windows after failover.,orders-db,medium,resilience

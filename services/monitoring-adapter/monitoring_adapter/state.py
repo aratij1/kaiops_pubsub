@@ -86,9 +86,16 @@ def save_onboarding_connectivity(payload: dict[str, Any]) -> dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
     sanitized = {
         "project": payload.get("project", {}),
+        "deployment_mode": payload.get("deployment_mode", "on_prem"),
         "prometheus_url": payload.get("prometheus_url", ""),
         "new_relic_url": payload.get("new_relic_url", ""),
         "datadog_url": payload.get("datadog_url", ""),
+        "gcp_project_id": payload.get("gcp_project_id", ""),
+        "gcp_region": payload.get("gcp_region", ""),
+        "pubsub_topic": payload.get("pubsub_topic", ""),
+        "pubsub_subscription": payload.get("pubsub_subscription", ""),
+        "vertex_model_armor_enabled": payload.get("vertex_model_armor_enabled", False),
+        "vertex_model_armor_template": payload.get("vertex_model_armor_template", ""),
         "user_assignments": payload.get("user_assignments", {}),
         "updated_at": payload.get("updated_at"),
     }

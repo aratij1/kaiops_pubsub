@@ -47,13 +47,12 @@ x-service-build: &service-build
 services:
   mysql:
     image: mysql:8.4
-    command: --default-authentication-plugin=mysql_native_password
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: kaiops
       MYSQL_USER: kaiops
       MYSQL_PASSWORD: kaiops
-    ports: ["3306:3306"]
+    ports: ["${MYSQL_HOST_PORT:-3306}:3306"]
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
@@ -103,6 +102,44 @@ services:
       timeout: 10s
       retries: 20
 
+  mysql-exporter:
+    image: prom/mysqld-exporter:v0.16.0
+    command:
+      - --mysqld.address=mysql:3306
+      - --mysqld.username=kaiops
+    environment:
+      MYSQLD_EXPORTER_PASSWORD: kaiops
+    ports: ["9104:9104"]
+    depends_on:
+      mysql: { condition: service_healthy }
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports: ["9093:9093"]
+    volumes:
+      - ./observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    depends_on:
+      monitoring-adapter: { condition: service_started }
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports: ["9090:9090"]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
+    depends_on:
+      api-gateway: { condition: service_healthy }
+      monitoring-adapter: { condition: service_started }
+      mysql-exporter: { condition: service_started }
+      alertmanager: { condition: service_started }
+
   monitoring-adapter:
     build: *service-build
     environment: { <<: *service-env, SERVICE_NAME: monitoring-adapter }
@@ -122,6 +159,16 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/services/api-gateway
     ports: ["8010:8000"]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)\"",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
     depends_on:
       monitoring-adapter: { condition: service_started }
       approval-service: { condition: service_started }
@@ -214,17 +261,12 @@ services:
       mysql: { condition: service_healthy }
 
   ui:
-    build: *service-build
-    environment:
-      APPROVAL_SERVICE_URL: http://approval-service:8000
-      MONITORING_ADAPTER_URL: http://monitoring-adapter:8000
-      API_GATEWAY_URL: http://api-gateway:8000
-      UI_REQUEST_TIMEOUT_SECONDS: "240"
-    command: ["streamlit", "run", "app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
-    working_dir: /app/services/ui
-    ports: ["8501:8501"]
+    build:
+      context: ./services/ui/react
+      dockerfile: Dockerfile
+    ports: ["8501:80"]
     depends_on:
-      api-gateway: { condition: service_started }
+      api-gateway: { condition: service_healthy }
       approval-service: { condition: service_started }
       monitoring-adapter: { condition: service_started }
 

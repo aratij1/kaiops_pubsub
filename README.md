@@ -11,6 +11,7 @@ validation, and knowledge capture.
 - Hybrid orchestrator policy (rules + AI): [docs/ORCHESTRATION_POLICY.md](docs/ORCHESTRATION_POLICY.md)
 - One-page orchestration decision matrix: [docs/ORCHESTRATION_DECISION_MATRIX.md](docs/ORCHESTRATION_DECISION_MATRIX.md)
 - Incident/alert metadata layer spec (Kafka or RabbitMQ): [docs/INCIDENT_ALERT_METADATA_LAYER.md](docs/INCIDENT_ALERT_METADATA_LAYER.md)
+- Prometheus + MySQL landing pad monitoring setup: [docs/PROMETHEUS_MYSQL_LANDING_PAD_SETUP.md](docs/PROMETHEUS_MYSQL_LANDING_PAD_SETUP.md)
 - Event envelope schema v1: [docs/metadata/event-envelope-v1.schema.json](docs/metadata/event-envelope-v1.schema.json)
 - Docs index and standards overview: [docs/README.md](docs/README.md)
 - RAG content governance and templates: [docs/RAG_CONTENT_STANDARD.md](docs/RAG_CONTENT_STANDARD.md)
@@ -100,7 +101,7 @@ services/
   remediation-engine/      Strategy plugins for Jenkins/K8s/Ansible/Terraform/API
   closure-service/         Health validation, ticket closure, KB/RCA storage
   common/                  Models, Kafka, SQLAlchemy, telemetry, resilience
-  ui/                      Streamlit incident operations dashboard
+  ui/                      React incident operations dashboard
 rag/                       Markdown RAG corpus for runbooks, incidents, changes, dependencies
 database/schema.sql        MySQL DDL and canonical schema for the platform
 database/migrations/       Schema migrations and backfills for metadata/RBAC
@@ -125,6 +126,7 @@ k8s/                       Namespace, ConfigMap, Secret, Deployments, Services, 
 | api-gateway | `POST /rag/reload` | Reload the RAG document index |
 | api-gateway | `GET /rag/search` | Search RAG documents |
 | monitoring-adapter | `POST /alerts` | Ingest monitoring alerts |
+| monitoring-adapter | `POST /alerts/alertmanager` | Ingest Alertmanager webhook alerts to landing pad |
 | monitoring-adapter | `POST /sample/payment-latency` | Trigger a sample alert |
 | alert-intelligence | `POST /process` | Deduplicate, correlate, classify, enrich |
 | orchestrator | `POST /decide` | Select incident workflow |
@@ -224,8 +226,7 @@ $env:LLM_REQUEST_TIMEOUT_SECONDS = "120"
 ```
 
 Real LLM-backed workflows can take longer than mock flows. The API Gateway
-defaults to a 180 second downstream timeout and the Streamlit UI defaults to a
-240 second request timeout.
+defaults to a 180 second downstream timeout.
 
 ```powershell
 $env:LOCAL_LLM_ENABLED = "true"
@@ -266,7 +267,7 @@ terminals before using the dashboard buttons. For example:
 export KAFKA_ENABLED=false
 export DATABASE_ENABLED=false
 uvicorn app:app --host 0.0.0.0 --port 8001 --app-dir services/monitoring-adapter
-streamlit run services/ui/app.py
+cd services/ui/react && npm install && npm run dev
 ```
 
 On PowerShell, use `$env:KAFKA_ENABLED="false"` and
@@ -290,16 +291,16 @@ This opens separate terminals for:
 
 - `monitoring-adapter` on <http://localhost:8001>
 - `approval-service` on <http://localhost:8007>
-- Streamlit UI on <http://localhost:8501>
+- React UI on <http://localhost:8501>
 
-If Streamlit shows `WinError 10061`, the target FastAPI service is not running
+If the React UI shows connection errors, the target FastAPI service is not running
 on the expected port. Start it with the helper script above or run the service
 manually in a separate terminal.
 
 When running locally with `KAFKA_ENABLED=false`, `POST /sample/payment-latency`
 only creates and publishes the alert through the monitoring adapter. Because
 Kafka is disabled, no downstream service will consume `raw-alerts`. For a local
-end-to-end demo without Kafka, use the Streamlit **Run payment latency
+end-to-end demo without Kafka, use the React UI **Run payment latency
 workflow** button or call the API Gateway:
 
 ```powershell
@@ -309,7 +310,7 @@ Invoke-RestMethod -Method Post http://localhost:8010/sample/database-replica-lag
 ```
 
 The gateway checks for jailbreak/prompt-injection patterns, assigns a trace ID,
-proxies to the monitoring adapter, and records an audit event. The Streamlit UI
+proxies to the monitoring adapter, and records an audit event. The React UI
 renders operational data as readable text, metrics, and tables. The sidebar
 contains 10 incident flows covering rollback, pod restart, scaling, cache clear,
 database failover, service restart, Terraform rollback, and API remediation:
@@ -468,7 +469,7 @@ Retrieved RAG documents populate:
 
 ### Ingesting RAG documents
 
-Use the Streamlit **RAG Ingestion** tab, or call the API Gateway:
+Use the React UI **RAG Ingestion** tab, or call the API Gateway:
 
 ```powershell
 $body = @{

@@ -68,6 +68,8 @@ WORKER_FAILURE_COUNTS: dict[str, int] = {
 WORKER_FAILURE_THRESHOLD = max(1, int(os.getenv("WORKER_FAILURE_THRESHOLD", "5") or 5))
 _ALLOWED_PROJECT_ENVIRONMENTS = {"dev", "staging", "prod"}
 _ALLOWED_ONBOARDING_PROVIDERS = {"prometheus", "new_relic", "datadog"}
+_ALLOWED_ACTIVE_PROVIDERS = {"prometheus", "new_relic", "datadog", "pubsub"}
+_ALLOWED_DEPLOYMENT_MODES = {"on_prem", "gcp_cloud"}
 
 
 class OnboardingProviderStatus(BaseModel):
@@ -100,9 +102,16 @@ class OnboardingProject(BaseModel):
 
 class OnboardingConnectivityPayload(BaseModel):
     project: OnboardingProject
+    deployment_mode: str = "on_prem"
     prometheus_url: str = ""
     new_relic_url: str = ""
     datadog_url: str = ""
+    gcp_project_id: str = ""
+    gcp_region: str = ""
+    pubsub_topic: str = ""
+    pubsub_subscription: str = ""
+    vertex_model_armor_enabled: bool = False
+    vertex_model_armor_template: str = ""
     user_assignments: dict[str, list[str]] = Field(default_factory=dict)
     provider_statuses: dict[str, OnboardingProviderStatus] = Field(default_factory=dict)
     active_provider: str | None = None
@@ -153,6 +162,16 @@ class OnboardingConnectivityPayload(BaseModel):
             user_assignments[normalized_user] = list(dict.fromkeys(normalized_projects))
         normalized["user_assignments"] = user_assignments
 
+        deployment_mode = str(normalized.get("deployment_mode", "on_prem")).strip().lower().replace("-", "_")
+        normalized["deployment_mode"] = deployment_mode or "on_prem"
+
+        normalized["gcp_project_id"] = str(normalized.get("gcp_project_id", "")).strip()
+        normalized["gcp_region"] = str(normalized.get("gcp_region", "")).strip()
+        normalized["pubsub_topic"] = str(normalized.get("pubsub_topic", "")).strip()
+        normalized["pubsub_subscription"] = str(normalized.get("pubsub_subscription", "")).strip()
+        normalized["vertex_model_armor_enabled"] = bool(normalized.get("vertex_model_armor_enabled", False))
+        normalized["vertex_model_armor_template"] = str(normalized.get("vertex_model_armor_template", "")).strip()
+
         active_provider = str(normalized.get("active_provider", "")).strip().lower().replace(" ", "_")
         normalized["active_provider"] = active_provider or None
         return normalized
@@ -169,13 +188,28 @@ class OnboardingConnectivityPayload(BaseModel):
 
     @model_validator(mode="after")
     def _validate_payload(self) -> "OnboardingConnectivityPayload":
+        self.deployment_mode = str(self.deployment_mode or "on_prem").strip().lower().replace("-", "_")
+        if self.deployment_mode not in _ALLOWED_DEPLOYMENT_MODES:
+            raise ValueError("deployment_mode must be one of on_prem, gcp_cloud")
+
         self.prometheus_url = self._normalize_endpoint(self.prometheus_url, "prometheus_url")
         self.new_relic_url = self._normalize_endpoint(self.new_relic_url, "new_relic_url")
         self.datadog_url = self._normalize_endpoint(self.datadog_url, "datadog_url")
-        if not any((self.prometheus_url, self.new_relic_url, self.datadog_url)):
-            raise ValueError("At least one provider endpoint must be configured")
-        if self.active_provider and self.active_provider not in _ALLOWED_ONBOARDING_PROVIDERS:
-            raise ValueError("active_provider must be one of prometheus, new_relic, datadog")
+        self.gcp_project_id = str(self.gcp_project_id or "").strip()
+        self.gcp_region = str(self.gcp_region or "").strip()
+        self.pubsub_topic = str(self.pubsub_topic or "").strip()
+        self.pubsub_subscription = str(self.pubsub_subscription or "").strip()
+        self.vertex_model_armor_template = str(self.vertex_model_armor_template or "").strip()
+
+        if self.deployment_mode == "on_prem":
+            if not any((self.prometheus_url, self.new_relic_url, self.datadog_url)):
+                raise ValueError("At least one provider endpoint must be configured for on_prem mode")
+        else:
+            if not self.gcp_project_id:
+                raise ValueError("gcp_project_id is required for gcp_cloud mode")
+
+        if self.active_provider and self.active_provider not in _ALLOWED_ACTIVE_PROVIDERS:
+            raise ValueError("active_provider must be one of prometheus, new_relic, datadog, pubsub")
         self.test_message = str(self.test_message or "").strip() or None
         self.tested_at = str(self.tested_at or "").strip() or None
         self.updated_at = str(self.updated_at or "").strip() or None
@@ -184,9 +218,16 @@ class OnboardingConnectivityPayload(BaseModel):
 
 class OnboardingConnectivitySnapshot(BaseModel):
     project: dict[str, Any] = Field(default_factory=dict)
+    deployment_mode: str = "on_prem"
     prometheus_url: str = ""
     new_relic_url: str = ""
     datadog_url: str = ""
+    gcp_project_id: str = ""
+    gcp_region: str = ""
+    pubsub_topic: str = ""
+    pubsub_subscription: str = ""
+    vertex_model_armor_enabled: bool = False
+    vertex_model_armor_template: str = ""
     user_assignments: dict[str, list[str]] = Field(default_factory=dict)
     updated_at: str | None = None
 
@@ -450,9 +491,16 @@ async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
     project_name = _normalize_project_name(project)
     provider_statuses = payload.get("provider_statuses", {}) if isinstance(payload.get("provider_statuses"), dict) else {}
     connectivity_payload = {
+        "deployment_mode": str(payload.get("deployment_mode", "on_prem")).strip().lower().replace("-", "_"),
         "prometheus_url": str(payload.get("prometheus_url", "")).strip(),
         "new_relic_url": str(payload.get("new_relic_url", "")).strip(),
         "datadog_url": str(payload.get("datadog_url", "")).strip(),
+        "gcp_project_id": str(payload.get("gcp_project_id", "")).strip(),
+        "gcp_region": str(payload.get("gcp_region", "")).strip(),
+        "pubsub_topic": str(payload.get("pubsub_topic", "")).strip(),
+        "pubsub_subscription": str(payload.get("pubsub_subscription", "")).strip(),
+        "vertex_model_armor_enabled": bool(payload.get("vertex_model_armor_enabled", False)),
+        "vertex_model_armor_template": str(payload.get("vertex_model_armor_template", "")).strip(),
         "user_assignments": payload.get("user_assignments", {}) if isinstance(payload.get("user_assignments"), dict) else {},
         "updated_at": payload.get("updated_at"),
         "active_provider": _normalize_provider_name(str(payload.get("active_provider", ""))) if payload.get("active_provider") else None,
@@ -1688,19 +1736,26 @@ def _record_closed_incident(
     )
 
 
-@app.post("/alerts", response_model=Alert)
-async def ingest_alert(payload: dict = ALERT_BODY, x_trace_id: str | None = Header(default=None)) -> Alert:
-    alert = Alert(
-        source=payload.get("source", payload.get("generatorURL", "unknown")),
-        name=payload.get("name", payload.get("alertname", "unknown-alert")),
-        service=payload.get("service", payload.get("labels", {}).get("service", "unknown")),
-        environment=payload.get("environment", payload.get("labels", {}).get("env", "prod")),
-        severity=AlertSeverity(payload.get("severity", payload.get("labels", {}).get("severity", "warning"))),
-        description=payload.get("description", payload.get("annotations", {}).get("summary", "")),
-        labels=payload.get("labels", {}),
-        annotations=payload.get("annotations", {}),
-        trace_id=x_trace_id,
+def _build_alert_from_payload(payload: dict[str, Any], trace_id: str | None = None) -> Alert:
+    labels = payload.get("labels", {}) if isinstance(payload.get("labels"), dict) else {}
+    annotations = payload.get("annotations", {}) if isinstance(payload.get("annotations"), dict) else {}
+    severity_value = severity_from_string(
+        str(payload.get("severity", labels.get("severity", "warning")))
     )
+    return Alert(
+        source=payload.get("source", payload.get("generatorURL", "unknown")),
+        name=payload.get("name", payload.get("alertname", labels.get("alertname", "unknown-alert"))),
+        service=payload.get("service", labels.get("service", labels.get("job", "unknown"))),
+        environment=payload.get("environment", labels.get("env", labels.get("environment", "prod"))),
+        severity=AlertSeverity(severity_value),
+        description=payload.get("description", annotations.get("summary", "")),
+        labels=labels,
+        annotations=annotations,
+        trace_id=trace_id,
+    )
+
+
+async def _publish_ingested_alert(alert: Alert) -> None:
     await app.state.producer.publish(RAW_ALERTS, alert, key=alert.service)
     RECENT_ALERTS.appendleft(
         {
@@ -1717,7 +1772,89 @@ async def ingest_alert(payload: dict = ALERT_BODY, x_trace_id: str | None = Head
             "created_at": alert.created_at.isoformat(),
         }
     )
+
+
+@app.post("/alerts", response_model=Alert)
+async def ingest_alert(payload: dict = ALERT_BODY, x_trace_id: str | None = Header(default=None)) -> Alert:
+    alert = _build_alert_from_payload(payload, trace_id=x_trace_id)
+    await _publish_ingested_alert(alert)
     return alert
+
+
+@app.post("/alerts/alertmanager")
+async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    alerts_payload = payload.get("alerts", []) if isinstance(payload, dict) else []
+    if not isinstance(alerts_payload, list):
+        raise HTTPException(status_code=400, detail="alertmanager payload must contain an alerts array")
+
+    common_labels = payload.get("commonLabels", {}) if isinstance(payload.get("commonLabels"), dict) else {}
+    common_annotations = payload.get("commonAnnotations", {}) if isinstance(payload.get("commonAnnotations"), dict) else {}
+
+    received = len(alerts_payload)
+    ingested_rows: list[dict[str, Any]] = []
+    skipped_rows: list[dict[str, Any]] = []
+
+    for item in alerts_payload:
+        if not isinstance(item, dict):
+            skipped_rows.append({"reason": "non-object alert item"})
+            continue
+
+        status = str(item.get("status") or payload.get("status") or "firing").strip().lower()
+        labels = item.get("labels", {}) if isinstance(item.get("labels"), dict) else {}
+        annotations = item.get("annotations", {}) if isinstance(item.get("annotations"), dict) else {}
+        merged_labels = {**common_labels, **labels}
+        merged_annotations = {**common_annotations, **annotations}
+
+        if status != "firing":
+            skipped_rows.append(
+                {
+                    "status": status,
+                    "alertname": str(merged_labels.get("alertname") or "unknown-alert"),
+                    "service": str(merged_labels.get("service") or merged_labels.get("job") or "unknown"),
+                    "reason": "Only firing alerts are sent to landing pad",
+                }
+            )
+            continue
+
+        mapped_payload = {
+            "source": "prometheus-alertmanager",
+            "name": str(merged_labels.get("alertname") or "prometheus-alert"),
+            "service": str(merged_labels.get("service") or merged_labels.get("job") or merged_labels.get("instance") or "kaiops-platform"),
+            "environment": str(merged_labels.get("environment") or merged_labels.get("env") or "prod"),
+            "severity": str(merged_labels.get("severity") or "warning").lower(),
+            "description": str(merged_annotations.get("description") or merged_annotations.get("summary") or merged_labels.get("alertname") or "Prometheus alert"),
+            "labels": {
+                **merged_labels,
+                "alert_status": status,
+                "alert_fingerprint": str(item.get("fingerprint") or ""),
+            },
+            "annotations": {
+                **merged_annotations,
+                "startsAt": str(item.get("startsAt") or ""),
+                "endsAt": str(item.get("endsAt") or ""),
+                "generatorURL": str(item.get("generatorURL") or ""),
+            },
+        }
+
+        alert = _build_alert_from_payload(mapped_payload, trace_id=x_trace_id)
+        await _publish_ingested_alert(alert)
+        ingested_rows.append(
+            {
+                "alert_id": str(alert.id),
+                "name": alert.name,
+                "service": alert.service,
+                "severity": alert.severity.value,
+                "status": status,
+            }
+        )
+
+    return {
+        "received": received,
+        "ingested": len(ingested_rows),
+        "skipped": len(skipped_rows),
+        "alerts": ingested_rows,
+        "skipped_rows": skipped_rows,
+    }
 
 
 @app.get("/alerts")
