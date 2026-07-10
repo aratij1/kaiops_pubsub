@@ -1,4 +1,5 @@
 import pytest
+from common.memory_store import InMemoryStore
 from common.models import Alert, AlertSeverity, Incident
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import VectorDBConnector
@@ -85,3 +86,26 @@ async def test_resolution_agent_generates_recommendation() -> None:
     assert recommendation.confidence >= 0.9
     assert recommendation.impact == "Payments latency"
     assert recommendation.recommended_action == "Rollback deployment"
+
+
+@pytest.mark.asyncio
+async def test_resolution_agent_runtime_persists_reflection_memory() -> None:
+    alert = Alert(
+        source="prometheus",
+        name="PaymentLatencyHigh",
+        service="payments",
+        severity=AlertSeverity.CRITICAL,
+        description="payment latency after deployment",
+        labels={"deployment": "payments-api"},
+    )
+    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+    memory = InMemoryStore()
+
+    recommendation = await ResolutionIntelligenceAgent(model_router=static_router(), memory_store=memory).resolve_with_runtime(context)
+
+    assert recommendation.metadata.get("runtime", {}).get("status") == "succeeded"
+    assert recommendation.metadata.get("runtime", {}).get("reflection", {}).get("agent") == "resolution-agent"
+    entries = await memory.recent("incident-memory", limit=5)
+    assert entries
+    assert entries[-1]["incident_id"] == str(context.incident_id)

@@ -5,6 +5,7 @@ from common.model_gateway import GenerationRequest, MockProvider
 from common.models import Alert, AlertSeverity, Incident, IncidentStatus
 from common.orchestration import AgentOrchestrator, PolicyEngine, WorkflowEngine, WorkflowState, WorkflowStateMachine
 from alert_intelligence import AlertIntelligenceAgent
+from context_agent import ContextIntelligenceAgent
 from orchestrator.workflow import OrchestratorAgent
 from unittest.mock import patch
 
@@ -185,3 +186,21 @@ def test_workflow_engine_llm_planner_falls_back_safely() -> None:
     assert selection.planner_used is False
     assert selection.planner_model == "mock-planner"
     assert "unsupported" in selection.planner_reason
+
+
+def test_orchestrator_runtime_path_produces_workflow_decision() -> None:
+    decision = __import__("asyncio").run(OrchestratorAgent().decide_workflow_async_with_runtime(make_alert(), make_incident()))
+
+    assert decision.workflow
+    assert decision.next_action
+    assert decision.message_bus_provider in {"kafka", "rabbitmq", "pubsub"}
+
+
+def test_context_agent_runtime_path_collects_context() -> None:
+    alert = make_alert()
+    incident = make_incident()
+
+    context = __import__("asyncio").run(ContextIntelligenceAgent().collect_with_runtime(alert, incident))
+
+    assert context.alert.service == "orders-db"
+    assert context.incident_id

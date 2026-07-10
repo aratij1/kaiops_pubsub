@@ -12,6 +12,7 @@ from api_gateway import SafetyAnalyzer
 from api_gateway.modules.users.router import router as user_management_router
 from api_gateway.modules.users.service import UserService
 from common.config import get_settings
+from common.event_publishers import build_agent_event_contract
 from common.kafka import normalize_payload
 from common.models import GatewayAuditEvent, SafetyDecision
 from common.service import create_app
@@ -60,6 +61,33 @@ def preview(payload: Any) -> dict[str, Any]:
     if not isinstance(normalized, dict):
         return {"value": str(normalized)[:500]}
     return {key: normalized[key] for key in list(normalized)[:10]}
+
+
+def _build_gateway_audit_contract(event: GatewayAuditEvent) -> dict[str, Any]:
+    status_code = int(event.status_code or 0)
+    confidence = 1.0 if status_code < 400 else 0.5
+    return build_agent_event_contract(
+        flow_id=str(event.trace_id or event.id),
+        incident_id=str(event.trace_id or event.id),
+        trace_id=str(event.trace_id or ""),
+        correlation_id=None,
+        agent="api-gateway",
+        payload={
+            "path": event.path,
+            "method": event.method,
+            "status_code": status_code,
+            "decision": event.safety.decision.value,
+        },
+        metadata={
+            "categories": list(event.safety.categories),
+            "latency_ms": event.latency_ms,
+            "target_url": event.target_url,
+        },
+        confidence=confidence,
+        reasoning="gateway safety and proxy audit event",
+        citations=[f"gateway://{event.path}"],
+        evidence_ids=[f"gateway-event:{event.id}"],
+    )
 
 
 async def proxy(
@@ -579,7 +607,12 @@ async def security_check(payload: dict[str, Any] = REQUEST_BODY) -> dict[str, An
 @app.get("/observability/recent")
 async def recent_events(limit: int = 25) -> dict[str, Any]:
     events = list(AUDIT_EVENTS)[: max(1, min(limit, 100))]
-    return {"events": [event.model_dump(mode="json") for event in events]}
+    response_rows: list[dict[str, Any]] = []
+    for event in events:
+        row = event.model_dump(mode="json")
+        row["event_contract"] = _build_gateway_audit_contract(event)
+        response_rows.append(row)
+    return {"events": response_rows}
 
 
 @app.get("/observability/summary")

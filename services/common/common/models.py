@@ -174,3 +174,34 @@ class GatewayAuditEvent(BaseEvent):
     safety: SafetyCheckResult = Field(default_factory=SafetyCheckResult)
     request_preview: dict[str, Any] = Field(default_factory=dict)
     response_preview: dict[str, Any] = Field(default_factory=dict)
+
+
+class Evidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    type: str
+    source: str
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    timestamp: datetime = Field(default_factory=utc_now)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    content: dict[str, Any] | str | None = None
+
+
+class AgentEventContractV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: str = Field(default_factory=lambda: str(uuid4()))
+    flow_id: str
+    incident_id: str
+    trace_id: str
+    correlation_id: str | None = None
+    timestamp: datetime = Field(default_factory=utc_now)
+    agent: str
+    version: str = "v1"
+    payload: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reasoning: str = ""
+    citations: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)

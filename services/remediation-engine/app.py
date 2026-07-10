@@ -4,7 +4,9 @@ import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
+from common.agent_runtime import PolicyViolation
 from common.config import get_settings
+from common.event_publishers import build_agent_event_contract
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
@@ -21,6 +23,54 @@ engine = RemediationEngine()
 tasks: list[asyncio.Task] = []
 
 ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any, Any, None]]
+
+
+def _extract_approval_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    approval = payload.get("approval") if isinstance(payload, dict) else None
+    if isinstance(approval, dict):
+        return approval
+    return payload
+
+
+def _build_remediation_event_payload(
+    *,
+    action: RemediationAction,
+    source_payload: dict[str, Any],
+    source: str,
+) -> dict[str, Any]:
+    incident_id = str(action.incident_id)
+    recommendation = source_payload.get("recommendation", {}) if isinstance(source_payload.get("recommendation"), dict) else {}
+    decision = source_payload.get("decision", {}) if isinstance(source_payload.get("decision"), dict) else {}
+    flow_id = str(decision.get("flow_id") or incident_id)
+    trace_id = str(recommendation.get("trace_id") or "")
+    correlation_id = str(recommendation.get("correlation_id") or "") or None
+
+    event_contract = build_agent_event_contract(
+        flow_id=flow_id,
+        incident_id=incident_id,
+        trace_id=trace_id,
+        correlation_id=correlation_id,
+        agent="remediation-engine",
+        payload={
+            "action_type": action.action_type,
+            "status": action.status.value,
+            "topic": REMEDIATION_EVENTS,
+            "source": source,
+        },
+        metadata={
+            "policy_version": action.parameters.get("policy_version"),
+            "policy_reason": action.parameters.get("policy_reason") or action.metadata.get("policy_reason"),
+        },
+        confidence=1.0 if action.status.value == "succeeded" else 0.6,
+        reasoning="remediation execution result captured for closure validation",
+        citations=[f"action://{action.id}"],
+        evidence_ids=[f"incident:{incident_id}"],
+    )
+    return {
+        "remediation_action": action,
+        "source_payload": source_payload,
+        "event_contract": event_contract,
+    }
 
 
 async def startup(app: FastAPI) -> None:
@@ -46,19 +96,37 @@ async def startup(app: FastAPI) -> None:
             )
 
     async def handle_approval(payload: dict) -> None:
-        approval = Approval.model_validate(payload)
+        approval_payload = _extract_approval_payload(payload)
+        approval = Approval.model_validate(approval_payload)
         action = await execute_approval(approval)
-        await app.state.producer.publish(REMEDIATION_EVENTS, action, key=str(action.incident_id))
+        payload_out = _build_remediation_event_payload(action=action, source_payload=payload, source=APPROVAL_EVENTS)
+        await app.state.producer.publish(REMEDIATION_EVENTS, payload_out, key=str(action.incident_id))
         EVENTS_PROCESSED.labels(settings.service_name, APPROVAL_EVENTS, "ok").inc()
 
     async def handle_resolution(payload: dict) -> None:
         if _resolution_requires_approval(payload):
             return
+        try:
+            _validate_auto_execution_policy(payload)
+        except PolicyViolation as exc:
+            blocked = _build_policy_blocked_action(payload, str(exc))
+            if blocked is None:
+                return
+            await _persist_action(app, blocked)
+            payload_out = _build_remediation_event_payload(
+                action=blocked,
+                source_payload=payload,
+                source=RESOLUTION_EVENTS,
+            )
+            await app.state.producer.publish(REMEDIATION_EVENTS, payload_out, key=str(blocked.incident_id))
+            EVENTS_PROCESSED.labels(settings.service_name, RESOLUTION_EVENTS, "policy-blocked").inc()
+            return
         approval = _build_auto_approval(payload)
         if approval is None:
             return
         action = await execute_approval(approval)
-        await app.state.producer.publish(REMEDIATION_EVENTS, action, key=str(action.incident_id))
+        payload_out = _build_remediation_event_payload(action=action, source_payload=payload, source=RESOLUTION_EVENTS)
+        await app.state.producer.publish(REMEDIATION_EVENTS, payload_out, key=str(action.incident_id))
         EVENTS_PROCESSED.labels(settings.service_name, RESOLUTION_EVENTS, "ok").inc()
 
     for source, approval_consumer, consume_forever in approval_consumers:
@@ -101,13 +169,18 @@ async def execute_approval(approval: Approval) -> RemediationAction:
         else:
             action = await engine.execute(action)
 
-    if settings.database_enabled:
-        async with app.state.session_factory() as session:
-            repo = IncidentRepository(session)
-            await repo.save_action(action)
-            await repo.save_action_audit(action)
-            await session.commit()
+    await _persist_action(app, action)
     return action
+
+
+async def _persist_action(app: FastAPI, action: RemediationAction) -> None:
+    if not settings.database_enabled:
+        return
+    async with app.state.session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_action(action)
+        await repo.save_action_audit(action)
+        await session.commit()
 
 
 def _resolution_requires_approval(payload: dict[str, Any]) -> bool:
@@ -155,4 +228,52 @@ def _build_auto_approval(payload: dict[str, Any]) -> Approval | None:
         channel="web",
         comment=str(recommendation.get("recommended_action") or "auto-approved remediation"),
         metadata=metadata,
+    )
+
+
+def _validate_auto_execution_policy(payload: dict[str, Any]) -> None:
+    recommendation = payload.get("recommendation", {}) if isinstance(payload.get("recommendation"), dict) else {}
+    metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
+    orchestration = metadata.get("orchestration_decision", {}) if isinstance(metadata.get("orchestration_decision"), dict) else {}
+    risk_tier = str(
+        payload.get("decision", {}).get("risk_tier") if isinstance(payload.get("decision"), dict) else ""
+    ).strip().lower() or str(orchestration.get("risk_tier") or "").strip().lower()
+
+    confidence = float(recommendation.get("confidence") or 0.0)
+    min_confidence = float(getattr(settings, "auto_execute_min_confidence", 0.8) or 0.8)
+    if confidence < min_confidence:
+        raise PolicyViolation(f"auto execution blocked: confidence {confidence:.2f} below threshold {min_confidence:.2f}")
+
+    evidence_ids = metadata.get("evidence_ids")
+    if not isinstance(evidence_ids, list) or not evidence_ids:
+        raise PolicyViolation("auto execution blocked: missing evidence_ids")
+
+    reasoning = str(metadata.get("reasoning") or "").strip()
+    if not reasoning:
+        raise PolicyViolation("auto execution blocked: missing reasoning")
+
+    if risk_tier == "high" and confidence < 0.95:
+        raise PolicyViolation("auto execution blocked: high-risk actions require confidence >= 0.95")
+
+
+def _build_policy_blocked_action(payload: dict[str, Any], reason: str) -> RemediationAction | None:
+    recommendation = payload.get("recommendation", {}) if isinstance(payload.get("recommendation"), dict) else {}
+    incident_id = recommendation.get("incident_id")
+    recommendation_id = recommendation.get("id")
+    if incident_id is None:
+        return None
+    return RemediationAction(
+        incident_id=incident_id,
+        approval_id=None,
+        action_type="policy-blocked",
+        target=str(incident_id),
+        status=RemediationStatus.SKIPPED,
+        output="remediation blocked by policy engine",
+        error=reason,
+        metadata={
+            "policy_blocked": True,
+            "policy_reason": reason,
+            "recommendation_id": recommendation_id,
+            "source": "resolution-events",
+        },
     )

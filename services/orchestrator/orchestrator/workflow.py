@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from common.agent_runtime import AgentRuntime, ContextFailure, ValidationError
+from common.agentic import AgentContext, BaseAgent
 from common.models import Alert, Incident
 from common.orchestration import AgentOrchestrator, PolicyEngine
 from common.orchestration.execution_plan import resolve_execution_plan
@@ -28,10 +30,13 @@ class WorkflowDecision:
     execution_plan: dict[str, Any]
 
 
-class OrchestratorAgent:
+class OrchestratorAgent(BaseAgent):
+    name = "orchestrator"
+
     def __init__(self) -> None:
         self.policy_engine = PolicyEngine()
         self.orchestrator = AgentOrchestrator(policy_engine=self.policy_engine)
+        self.runtime = AgentRuntime(max_attempts=2)
 
     def select(self, alert: Alert, incident: Incident) -> WorkflowDecision:
         selection = self.orchestrator.select(alert, incident)
@@ -80,3 +85,60 @@ class OrchestratorAgent:
 
     async def decide_workflow_async(self, alert: Alert, incident: Incident) -> WorkflowDecision:
         return await self.select_async(alert, incident)
+
+    async def decide_workflow_async_with_runtime(self, alert: Alert, incident: Incident) -> WorkflowDecision:
+        context = AgentContext(alert=alert, incident=incident)
+        runtime_result = await self.runtime.run(self, context)
+        decision = runtime_result.result
+        if not isinstance(decision, WorkflowDecision):
+            raise ValidationError("orchestrator runtime produced invalid decision output")
+        return decision
+
+    async def initialize(self, context: AgentContext, state: Any) -> None:
+        state.execution_status = "selecting"
+
+    async def plan(self, context: AgentContext, state: Any) -> dict[str, Any]:
+        if context.alert is None or context.incident is None:
+            raise ContextFailure("Orchestrator requires alert and incident in context")
+        return {
+            "workflow": "selection",
+            "routing_inputs": {
+                "severity": str(context.alert.severity),
+                "stream_count": context.alert.labels.get("stream_count") if context.alert else None,
+            },
+        }
+
+    async def execute(self, context: AgentContext) -> WorkflowDecision:
+        if context.alert is None or context.incident is None:
+            raise ContextFailure("Orchestrator requires alert and incident in context")
+        decision = await self.select_async(context.alert, context.incident)
+        context.set_result(self.name, decision.__dict__)
+        return decision
+
+    async def validate(self, result: Any) -> bool:
+        if not isinstance(result, WorkflowDecision):
+            return False
+        if not result.workflow:
+            raise ValidationError("workflow name is required")
+        if not isinstance(result.downstream_agents, list):
+            raise ValidationError("downstream_agents must be a list")
+        return True
+
+    async def reflect(
+        self,
+        context: AgentContext,
+        state: Any,
+        *,
+        result: Any | None,
+        error: Exception | None,
+    ) -> dict[str, Any]:
+        if isinstance(result, WorkflowDecision):
+            return {
+                "agent": self.name,
+                "planner_used": result.planner_used,
+                "message_bus_provider": result.message_bus_provider,
+                "risk_tier": result.risk_tier,
+                "execution_mode": result.execution_mode,
+                "error": str(error) if error else None,
+            }
+        return {"agent": self.name, "error": str(error) if error else "unknown"}

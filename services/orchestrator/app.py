@@ -71,7 +71,7 @@ async def startup(app: FastAPI) -> None:
     async def handle(payload: dict) -> None:
         alert = Alert.model_validate(payload["alert"])
         incident = Incident.model_validate(payload["incident"])
-        decision = await agent.decide_workflow_async(alert, incident)
+        decision = await agent.decide_workflow_async_with_runtime(alert, incident)
         transport_provider = str(decision.__dict__.get("message_bus_provider") or "kafka")
         event_envelope = build_orchestration_envelope(
             alert=alert,
@@ -114,4 +114,4 @@ app = create_app(title="KaiMS Orchestrator", settings=settings, startup=startup,
 async def decide(payload: dict) -> dict:
     alert = Alert.model_validate(payload["alert"])
     incident = Incident.model_validate(payload["incident"])
-    return (await agent.decide_workflow_async(alert, incident)).__dict__
+    return (await agent.decide_workflow_async_with_runtime(alert, incident)).__dict__
