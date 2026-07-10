@@ -199,6 +199,8 @@ class IncidentProjectionRecord(Base, TimestampMixin):
     incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     alert_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
     trace_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    recommendation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    flow_id: Mapped[str | None] = mapped_column(String(128), index=True)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     service: Mapped[str] = mapped_column(String(128), index=True)
     environment: Mapped[str] = mapped_column(String(64), index=True)
@@ -351,6 +353,80 @@ async def create_schema(engine: AsyncEngine) -> None:
                     if int(has_agent_seq_index or 0) == 0:
                         await connection.execute(
                             text("CREATE INDEX idx_agent_work_items_agent_seq ON agent_work_items (agent_name, sequence)")
+                        )
+
+                has_projection_table = await connection.scalar(
+                    text(
+                        """
+                        SELECT COUNT(*)
+                        FROM information_schema.tables
+                        WHERE table_schema = DATABASE() AND table_name = 'incident_projections'
+                        """
+                    )
+                )
+                if int(has_projection_table or 0) > 0:
+                    has_recommendation_column = await connection.scalar(
+                        text(
+                            """
+                            SELECT COUNT(*)
+                            FROM information_schema.columns
+                            WHERE table_schema = DATABASE()
+                              AND table_name = 'incident_projections'
+                              AND column_name = 'recommendation_id'
+                            """
+                        )
+                    )
+                    if int(has_recommendation_column or 0) == 0:
+                        await connection.execute(
+                            text("ALTER TABLE incident_projections ADD COLUMN recommendation_id CHAR(32) NULL")
+                        )
+
+                    has_flow_column = await connection.scalar(
+                        text(
+                            """
+                            SELECT COUNT(*)
+                            FROM information_schema.columns
+                            WHERE table_schema = DATABASE()
+                              AND table_name = 'incident_projections'
+                              AND column_name = 'flow_id'
+                            """
+                        )
+                    )
+                    if int(has_flow_column or 0) == 0:
+                        await connection.execute(
+                            text("ALTER TABLE incident_projections ADD COLUMN flow_id VARCHAR(128) NULL")
+                        )
+
+                    has_recommendation_index = await connection.scalar(
+                        text(
+                            """
+                            SELECT COUNT(*)
+                            FROM information_schema.statistics
+                            WHERE table_schema = DATABASE()
+                              AND table_name = 'incident_projections'
+                              AND index_name = 'idx_incident_projections_recommendation'
+                            """
+                        )
+                    )
+                    if int(has_recommendation_index or 0) == 0:
+                        await connection.execute(
+                            text("CREATE INDEX idx_incident_projections_recommendation ON incident_projections (recommendation_id)")
+                        )
+
+                    has_flow_index = await connection.scalar(
+                        text(
+                            """
+                            SELECT COUNT(*)
+                            FROM information_schema.statistics
+                            WHERE table_schema = DATABASE()
+                              AND table_name = 'incident_projections'
+                              AND index_name = 'idx_incident_projections_flow'
+                            """
+                        )
+                    )
+                    if int(has_flow_index or 0) == 0:
+                        await connection.execute(
+                            text("CREATE INDEX idx_incident_projections_flow ON incident_projections (flow_id)")
                         )
         finally:
             if engine.dialect.name == "postgresql":

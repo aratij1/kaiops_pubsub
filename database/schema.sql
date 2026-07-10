@@ -192,6 +192,8 @@ CREATE TABLE IF NOT EXISTS incident_projections (
     incident_id CHAR(32) PRIMARY KEY,
     alert_id CHAR(32),
     trace_id VARCHAR(128),
+    recommendation_id CHAR(32),
+    flow_id VARCHAR(128),
     tenant_id VARCHAR(128) NOT NULL DEFAULT 'default',
     service VARCHAR(128) NOT NULL,
     environment VARCHAR(64) NOT NULL,
@@ -211,6 +213,8 @@ CREATE TABLE IF NOT EXISTS incident_projections (
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     projection_payload JSON NOT NULL,
     KEY idx_incident_projections_status (status),
+    KEY idx_incident_projections_recommendation (recommendation_id),
+    KEY idx_incident_projections_flow (flow_id),
     KEY idx_incident_projections_service_severity (service, severity),
     KEY idx_incident_projections_risk_mode (risk_tier, execution_mode),
     KEY idx_incident_projections_updated (updated_at DESC)

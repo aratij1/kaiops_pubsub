@@ -149,6 +149,13 @@ def _build_incident_context(base_payload: dict[str, Any], pending_workflow: dict
     recommendation = context.get("recommendation") if isinstance(context.get("recommendation"), dict) else {}
     decision = context.get("decision") if isinstance(context.get("decision"), dict) else {}
 
+    def _missing(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return not value.strip()
+        return False
+
     if isinstance(pending_workflow, dict):
         pending_payload = pending_workflow.get("payload") if isinstance(pending_workflow.get("payload"), dict) else {}
         pending_recommendation = pending_payload.get("recommendation") if isinstance(pending_payload.get("recommendation"), dict) else {}
@@ -161,10 +168,14 @@ def _build_incident_context(base_payload: dict[str, Any], pending_workflow: dict
             decision = pending_decision
             context["decision"] = decision
 
-        context.setdefault("incident_id", str(pending_workflow.get("incident_id") or context.get("incident_id") or ""))
-        context.setdefault("flow_id", str(pending_workflow.get("flow_id") or decision.get("flow_id") or ""))
-        context.setdefault("trace_id", str(pending_workflow.get("trace_id") or recommendation.get("trace_id") or ""))
-        context.setdefault("status", str(pending_workflow.get("status") or context.get("status") or "awaiting_approval"))
+        if _missing(context.get("incident_id")):
+            context["incident_id"] = str(pending_workflow.get("incident_id") or "")
+        if _missing(context.get("flow_id")):
+            context["flow_id"] = str(pending_workflow.get("flow_id") or decision.get("flow_id") or "")
+        if _missing(context.get("trace_id")):
+            context["trace_id"] = str(pending_workflow.get("trace_id") or recommendation.get("trace_id") or "")
+        if _missing(context.get("status")):
+            context["status"] = str(pending_workflow.get("status") or "awaiting_approval")
 
     recommendation_id = (
         context.get("recommendation_id")
@@ -175,13 +186,15 @@ def _build_incident_context(base_payload: dict[str, Any], pending_workflow: dict
         context["recommendation_id"] = str(recommendation_id)
 
     if recommendation:
-        context.setdefault("trace_id", str(recommendation.get("trace_id") or ""))
+        if _missing(context.get("trace_id")):
+            context["trace_id"] = str(recommendation.get("trace_id") or "")
         correlation_id = recommendation.get("correlation_id")
-        if correlation_id:
-            context.setdefault("correlation_id", str(correlation_id))
+        if correlation_id and _missing(context.get("correlation_id")):
+            context["correlation_id"] = str(correlation_id)
 
     if decision:
-        context.setdefault("flow_id", str(decision.get("flow_id") or ""))
+        if _missing(context.get("flow_id")):
+            context["flow_id"] = str(decision.get("flow_id") or "")
 
     incident_id = str(context.get("incident_id") or "").strip()
     if incident_id:
