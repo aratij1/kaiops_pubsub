@@ -230,6 +230,51 @@ class RabbitMQPublisher(NoOpPublisher):
         await self._producer.publish(topic, event, key=key)
 
 
+class GooglePubSubPublisher(NoOpPublisher):
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        self._publisher_client: Any | None = None
+        self._project_id = str(getattr(settings, "gcp_project_id", "") or "").strip()
+        self._topic_prefix = str(getattr(settings, "gcp_pubsub_topic_prefix", "kaiops") or "kaiops").strip() or "kaiops"
+
+    async def start(self) -> None:
+        if not self._project_id:
+            logger.warning("gcp pubsub publisher disabled; missing GCP_PROJECT_ID")
+            return
+        try:
+            from google.cloud import pubsub_v1
+        except Exception:
+            logger.warning("gcp pubsub publisher unavailable; install google-cloud-pubsub")
+            return
+        self._publisher_client = pubsub_v1.PublisherClient()
+        logger.info("connected gcp pubsub publisher", extra={"project": self._project_id})
+
+    async def stop(self) -> None:
+        self._publisher_client = None
+
+    async def publish(self, topic: str, event: BaseModel | dict[str, Any], key: str | None = None) -> None:
+        payload = normalize_payload(event)
+        if self._publisher_client is None:
+            logger.info("gcp pubsub publisher unavailable; event logged", extra={"topic": topic, "payload": payload})
+            return
+
+        full_topic = f"{self._topic_prefix}-{topic}".replace("_", "-")
+        topic_path = self._publisher_client.topic_path(self._project_id, full_topic)
+        data = json.dumps(payload, default=str).encode("utf-8")
+
+        async def _publish() -> None:
+            def _publish_sync() -> None:
+                kwargs: dict[str, Any] = {}
+                if key:
+                    kwargs["ordering_key"] = key
+                future = self._publisher_client.publish(topic_path, data=data, **kwargs)
+                future.result(timeout=10)
+
+            await asyncio.to_thread(_publish_sync)
+
+        await retry_async(_publish)
+
+
 class AzureServiceBusPublisher(NoOpPublisher):
     pass
 
@@ -246,6 +291,8 @@ def build_event_publisher(settings: Settings) -> EventPublisher:
         return NoOpPublisher(settings)
     if provider == "rabbitmq":
         return RabbitMQPublisher(settings)
+    if provider in {"pubsub", "gcp-pubsub", "google-pubsub"}:
+        return GooglePubSubPublisher(settings)
     if provider in {"azure", "azure-service-bus", "servicebus"}:
         return AzureServiceBusPublisher(settings)
     if provider == "rest":

@@ -270,6 +270,9 @@ async def create_schema(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
         if engine.dialect.name == "postgresql":
             await connection.execute(text("SELECT pg_advisory_lock(742031991)"))
+        elif engine.dialect.name == "mysql":
+            # Serialize schema migrations across concurrently starting services.
+            await connection.execute(text("SELECT GET_LOCK('kaiops_schema_lock', 30)"))
         try:
             await connection.run_sync(Base.metadata.create_all)
             if engine.dialect.name == "mysql":
@@ -352,3 +355,5 @@ async def create_schema(engine: AsyncEngine) -> None:
         finally:
             if engine.dialect.name == "postgresql":
                 await connection.execute(text("SELECT pg_advisory_unlock(742031991)"))
+            elif engine.dialect.name == "mysql":
+                await connection.execute(text("SELECT RELEASE_LOCK('kaiops_schema_lock')"))

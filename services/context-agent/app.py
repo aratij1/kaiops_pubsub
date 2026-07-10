@@ -28,10 +28,10 @@ def _extract_message_bus_provider(payload: dict[str, Any]) -> str:
     decision = payload.get("decision")
     if isinstance(decision, dict):
         provider = str(decision.get("message_bus_provider", "rabbitmq")).strip().lower()
-        if provider in {"kafka", "rabbitmq"}:
+        if provider in {"kafka", "rabbitmq", "pubsub"}:
             return provider
     transport = str(payload.get("transport", "")).strip().lower()
-    if transport in {"kafka", "rabbitmq"}:
+    if transport in {"kafka", "rabbitmq", "pubsub"}:
         return transport
     return "rabbitmq"
 
@@ -84,7 +84,8 @@ def _build_ingress_consumers() -> list[tuple[str, object, object]]:
 async def startup(app: FastAPI) -> None:
     vector_connector().reload()
 
-    app.state.message_bus_publishers = {"rabbitmq": app.state.producer}
+    provider = str(getattr(settings, "event_bus_provider", "rabbitmq") or "rabbitmq").strip().lower()
+    app.state.message_bus_publishers = {provider: app.state.producer, "rabbitmq": app.state.producer}
 
     if settings.kafka_enabled:
         app.state.message_bus_publishers["kafka"] = app.state.producer

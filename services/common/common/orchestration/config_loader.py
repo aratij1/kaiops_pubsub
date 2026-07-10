@@ -71,6 +71,8 @@ DEFAULT_ORCHESTRATION_CONFIG: dict[str, Any] = {
     },
 }
 
+_ALLOWED_BUS_PROVIDERS = {"kafka", "rabbitmq", "pubsub"}
+
 
 def _default_config_path() -> Path:
     return Path(__file__).with_name(_DEFAULT_CONFIG_FILENAME)
@@ -122,7 +124,7 @@ def _normalize_config(config: dict[str, Any]) -> dict[str, Any]:
             normalized["message_bus"]["dynamic_routing"] = dynamic_routing
 
         provider = str(message_bus.get("default_provider") or "").strip().lower()
-        if provider in {"kafka", "rabbitmq"}:
+        if provider in _ALLOWED_BUS_PROVIDERS:
             normalized["message_bus"]["default_provider"] = provider
 
         try:
@@ -201,7 +203,7 @@ def load_orchestration_config(settings: Settings) -> dict[str, Any]:
         message_bus["dynamic_routing"] = bool(getattr(settings, "message_bus_dynamic_routing", message_bus["dynamic_routing"]))
     if "message_bus_default_provider" in explicit_fields:
         provider = str(getattr(settings, "message_bus_default_provider", message_bus["default_provider"]) or "").strip().lower()
-        message_bus["default_provider"] = provider if provider in {"kafka", "rabbitmq"} else "rabbitmq"
+        message_bus["default_provider"] = provider if provider in _ALLOWED_BUS_PROVIDERS else "rabbitmq"
     if "message_bus_stream_threshold" in explicit_fields:
         message_bus["stream_threshold"] = max(
             0,

@@ -127,10 +127,6 @@ $Config = @{
     OPENAI_API_KEY = Resolve-ConfigValue -Name "OPENAI_API_KEY" -Default "" -DotEnv $DotEnv
     OPENAI_GPT5_MODEL = Resolve-ConfigValue -Name "OPENAI_GPT5_MODEL" -Default "gpt-5" -DotEnv $DotEnv
     OPENAI_GPT4O_MODEL = Resolve-ConfigValue -Name "OPENAI_GPT4O_MODEL" -Default "gpt-4o" -DotEnv $DotEnv
-    ALERT_INGEST_INTERVAL_SECONDS = Resolve-ConfigValue -Name "ALERT_INGEST_INTERVAL_SECONDS" -Default "60" -DotEnv $DotEnv
-    ALERT_INGEST_WATCH_ENABLED = Resolve-ConfigValue -Name "ALERT_INGEST_WATCH_ENABLED" -Default "true" -DotEnv $DotEnv
-    ALERT_INGEST_WATCH_INTERVAL_SECONDS = Resolve-ConfigValue -Name "ALERT_INGEST_WATCH_INTERVAL_SECONDS" -Default "2" -DotEnv $DotEnv
-    ALERT_INGEST_WATCH_DEBOUNCE_SECONDS = Resolve-ConfigValue -Name "ALERT_INGEST_WATCH_DEBOUNCE_SECONDS" -Default "1" -DotEnv $DotEnv
 }
 
 $RunId = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -179,10 +175,6 @@ function Start-KaiMSWindow {
     $EscapedOpenAiApiKey = $Config.OPENAI_API_KEY.Replace("'", "''")
     $EscapedOpenAiGpt5Model = $Config.OPENAI_GPT5_MODEL.Replace("'", "''")
     $EscapedOpenAiGpt4oModel = $Config.OPENAI_GPT4O_MODEL.Replace("'", "''")
-    $EscapedAlertIngestIntervalSeconds = $Config.ALERT_INGEST_INTERVAL_SECONDS.Replace("'", "''")
-    $EscapedAlertIngestWatchEnabled = $Config.ALERT_INGEST_WATCH_ENABLED.Replace("'", "''")
-    $EscapedAlertIngestWatchIntervalSeconds = $Config.ALERT_INGEST_WATCH_INTERVAL_SECONDS.Replace("'", "''")
-    $EscapedAlertIngestWatchDebounceSeconds = $Config.ALERT_INGEST_WATCH_DEBOUNCE_SECONDS.Replace("'", "''")
     $Bootstrap = @"
 Set-Location -LiteralPath '$EscapedRepoRoot'
     `$ErrorActionPreference = 'Continue'
@@ -212,10 +204,6 @@ Set-Location -LiteralPath '$EscapedRepoRoot'
 `$env:OPENAI_API_KEY = '$EscapedOpenAiApiKey'
 `$env:OPENAI_GPT5_MODEL = '$EscapedOpenAiGpt5Model'
 `$env:OPENAI_GPT4O_MODEL = '$EscapedOpenAiGpt4oModel'
-`$env:ALERT_INGEST_INTERVAL_SECONDS = '$EscapedAlertIngestIntervalSeconds'
-`$env:ALERT_INGEST_WATCH_ENABLED = '$EscapedAlertIngestWatchEnabled'
-`$env:ALERT_INGEST_WATCH_INTERVAL_SECONDS = '$EscapedAlertIngestWatchIntervalSeconds'
-`$env:ALERT_INGEST_WATCH_DEBOUNCE_SECONDS = '$EscapedAlertIngestWatchDebounceSeconds'
 `$LogFile = '$EscapedLogFile'
 `$env:KAIMS_LOG_FILE = `$LogFile
 `$Host.UI.RawUI.WindowTitle = '$EscapedTitle'
@@ -268,38 +256,14 @@ Start-KaiMSWindow `
     -Command "`$env:MONITORING_ADAPTER_URL = 'http://localhost:8001'; `$env:APPROVAL_SERVICE_URL = 'http://localhost:8007'; `$env:CONTEXT_AGENT_URL = 'http://localhost:8004'; & '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8010 --app-dir services/api-gateway"
 
 if (-not $NoUi) {
-    $UiDb = $Config.DB.Replace("'", "''")
-    $UiDbHost = $Config.DB_HOST.Replace("'", "''")
-    $UiDbPort = $Config.DB_PORT.Replace("'", "''")
-    $UiDbUser = $Config.DB_USER.Replace("'", "''")
-    $UiDbPassword = $Config.DB_PASSWORD.Replace("'", "''")
-    $UiDbDatabase = $Config.DB_DATABASE.Replace("'", "''")
-    $UiJwt = $Config.JWT_SECRET_KEY.Replace("'", "''")
-    $UiAdminPassword = $Config.ADMIN_USER_PASSWORD.Replace("'", "''")
-    $UiExecutivePassword = $Config.EXECUTIVE_USER_PASSWORD.Replace("'", "''")
-    $UiL3Password = $Config.L3_USER_PASSWORD.Replace("'", "''")
-    $UiL2Password = $Config.L2_USER_PASSWORD.Replace("'", "''")
-    $UiL1Password = $Config.L1_USER_PASSWORD.Replace("'", "''")
+    $UiFolder = (Join-Path $RepoRoot "services\ui\react").Replace("'", "''")
     $UiCommand = @"
-`$env:MONITORING_ADAPTER_URL="http://localhost:8001"
-`$env:APPROVAL_SERVICE_URL="http://localhost:8007"
-`$env:API_GATEWAY_URL="http://localhost:8010"
-`$env:DB="$UiDb"
-`$env:DB_HOST="$UiDbHost"
-`$env:DB_PORT="$UiDbPort"
-`$env:DB_USER="$UiDbUser"
-`$env:DB_PASSWORD="$UiDbPassword"
-`$env:DB_DATABASE="$UiDbDatabase"
-`$env:JWT_SECRET_KEY="$UiJwt"
-`$env:ADMIN_USER_PASSWORD="$UiAdminPassword"
-`$env:EXECUTIVE_USER_PASSWORD="$UiExecutivePassword"
-`$env:L3_USER_PASSWORD="$UiL3Password"
-`$env:L2_USER_PASSWORD="$UiL2Password"
-`$env:L1_USER_PASSWORD="$UiL1Password"
-& '$Python' -m streamlit run services/ui/app.py
+Set-Location -LiteralPath '$UiFolder'
+npm install
+npm run dev
 "@
 
-    Start-KaiMSWindow -Title "KaiMS Streamlit UI :8501" -Command $UiCommand
+    Start-KaiMSWindow -Title "KaiMS React UI :8501" -Command $UiCommand
 }
 
 Write-Host "Started KaiMS local services."
@@ -308,7 +272,7 @@ Write-Host "Approval service:   http://localhost:8007"
 Write-Host "Context agent:      http://localhost:8004"
 Write-Host "API Gateway:        http://localhost:8010"
 if (-not $NoUi) {
-    Write-Host "Streamlit UI:       http://localhost:8501"
+    Write-Host "React UI:           http://localhost:8501"
 }
 Write-Host "Logs directory:     $LogRoot"
 
@@ -320,7 +284,7 @@ $ReadinessTargets = @(
 )
 
 if (-not $NoUi) {
-    $ReadinessTargets += @{ Name = "Streamlit UI"; Url = "http://localhost:8501" }
+    $ReadinessTargets += @{ Name = "React UI"; Url = "http://localhost:8501" }
 }
 
 Write-Host "Checking readiness..."

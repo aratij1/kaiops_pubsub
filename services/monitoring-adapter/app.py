@@ -5,7 +5,6 @@ import json
 import os
 import re
 import sys
-import time as _time
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -64,14 +63,13 @@ RECENT_ALERTS: deque[dict[str, Any]] = deque(maxlen=200)
 PENDING_WORKFLOWS: dict[str, dict[str, Any]] = {}
 CLOSED_INCIDENTS: deque[dict[str, Any]] = deque(maxlen=500)
 WORKER_FAILURE_COUNTS: dict[str, int] = {
-    "alert_ingest_worker": 0,
-    "alert_ingest_watch_worker": 0,
     "incident_projection_worker": 0,
 }
 WORKER_FAILURE_THRESHOLD = max(1, int(os.getenv("WORKER_FAILURE_THRESHOLD", "5") or 5))
 _ALLOWED_PROJECT_ENVIRONMENTS = {"dev", "staging", "prod"}
 _ALLOWED_ONBOARDING_PROVIDERS = {"prometheus", "new_relic", "datadog"}
-_INGEST_SUPPORTED_SUFFIXES = {".json", ".ndjson", ".txt", ".log"}
+_ALLOWED_ACTIVE_PROVIDERS = {"prometheus", "new_relic", "datadog", "pubsub"}
+_ALLOWED_DEPLOYMENT_MODES = {"on_prem", "gcp_cloud"}
 
 
 class OnboardingProviderStatus(BaseModel):
@@ -104,9 +102,16 @@ class OnboardingProject(BaseModel):
 
 class OnboardingConnectivityPayload(BaseModel):
     project: OnboardingProject
+    deployment_mode: str = "on_prem"
     prometheus_url: str = ""
     new_relic_url: str = ""
     datadog_url: str = ""
+    gcp_project_id: str = ""
+    gcp_region: str = ""
+    pubsub_topic: str = ""
+    pubsub_subscription: str = ""
+    vertex_model_armor_enabled: bool = False
+    vertex_model_armor_template: str = ""
     user_assignments: dict[str, list[str]] = Field(default_factory=dict)
     provider_statuses: dict[str, OnboardingProviderStatus] = Field(default_factory=dict)
     active_provider: str | None = None
@@ -157,6 +162,16 @@ class OnboardingConnectivityPayload(BaseModel):
             user_assignments[normalized_user] = list(dict.fromkeys(normalized_projects))
         normalized["user_assignments"] = user_assignments
 
+        deployment_mode = str(normalized.get("deployment_mode", "on_prem")).strip().lower().replace("-", "_")
+        normalized["deployment_mode"] = deployment_mode or "on_prem"
+
+        normalized["gcp_project_id"] = str(normalized.get("gcp_project_id", "")).strip()
+        normalized["gcp_region"] = str(normalized.get("gcp_region", "")).strip()
+        normalized["pubsub_topic"] = str(normalized.get("pubsub_topic", "")).strip()
+        normalized["pubsub_subscription"] = str(normalized.get("pubsub_subscription", "")).strip()
+        normalized["vertex_model_armor_enabled"] = bool(normalized.get("vertex_model_armor_enabled", False))
+        normalized["vertex_model_armor_template"] = str(normalized.get("vertex_model_armor_template", "")).strip()
+
         active_provider = str(normalized.get("active_provider", "")).strip().lower().replace(" ", "_")
         normalized["active_provider"] = active_provider or None
         return normalized
@@ -173,13 +188,28 @@ class OnboardingConnectivityPayload(BaseModel):
 
     @model_validator(mode="after")
     def _validate_payload(self) -> "OnboardingConnectivityPayload":
+        self.deployment_mode = str(self.deployment_mode or "on_prem").strip().lower().replace("-", "_")
+        if self.deployment_mode not in _ALLOWED_DEPLOYMENT_MODES:
+            raise ValueError("deployment_mode must be one of on_prem, gcp_cloud")
+
         self.prometheus_url = self._normalize_endpoint(self.prometheus_url, "prometheus_url")
         self.new_relic_url = self._normalize_endpoint(self.new_relic_url, "new_relic_url")
         self.datadog_url = self._normalize_endpoint(self.datadog_url, "datadog_url")
-        if not any((self.prometheus_url, self.new_relic_url, self.datadog_url)):
-            raise ValueError("At least one provider endpoint must be configured")
-        if self.active_provider and self.active_provider not in _ALLOWED_ONBOARDING_PROVIDERS:
-            raise ValueError("active_provider must be one of prometheus, new_relic, datadog")
+        self.gcp_project_id = str(self.gcp_project_id or "").strip()
+        self.gcp_region = str(self.gcp_region or "").strip()
+        self.pubsub_topic = str(self.pubsub_topic or "").strip()
+        self.pubsub_subscription = str(self.pubsub_subscription or "").strip()
+        self.vertex_model_armor_template = str(self.vertex_model_armor_template or "").strip()
+
+        if self.deployment_mode == "on_prem":
+            if not any((self.prometheus_url, self.new_relic_url, self.datadog_url)):
+                raise ValueError("At least one provider endpoint must be configured for on_prem mode")
+        else:
+            if not self.gcp_project_id:
+                raise ValueError("gcp_project_id is required for gcp_cloud mode")
+
+        if self.active_provider and self.active_provider not in _ALLOWED_ACTIVE_PROVIDERS:
+            raise ValueError("active_provider must be one of prometheus, new_relic, datadog, pubsub")
         self.test_message = str(self.test_message or "").strip() or None
         self.tested_at = str(self.tested_at or "").strip() or None
         self.updated_at = str(self.updated_at or "").strip() or None
@@ -188,9 +218,16 @@ class OnboardingConnectivityPayload(BaseModel):
 
 class OnboardingConnectivitySnapshot(BaseModel):
     project: dict[str, Any] = Field(default_factory=dict)
+    deployment_mode: str = "on_prem"
     prometheus_url: str = ""
     new_relic_url: str = ""
     datadog_url: str = ""
+    gcp_project_id: str = ""
+    gcp_region: str = ""
+    pubsub_topic: str = ""
+    pubsub_subscription: str = ""
+    vertex_model_armor_enabled: bool = False
+    vertex_model_armor_template: str = ""
     user_assignments: dict[str, list[str]] = Field(default_factory=dict)
     updated_at: str | None = None
 
@@ -344,28 +381,6 @@ def _build_local_metadata_envelope(
         payload=payload,
     )
 
-ALERT_INGEST_ENABLED = str(
-    os.getenv("ALERT_INGEST_ENABLED", "true")
-).strip().lower() in {"1", "true", "yes", "on"}
-ALERT_INGEST_INTERVAL_SECONDS = max(60, int(os.getenv("ALERT_INGEST_INTERVAL_SECONDS", "600") or 600))
-ALERT_INGEST_INPUT_DIR = str(os.getenv("ALERT_INGEST_INPUT_DIR", "ingested_alerts/input")).strip() or "ingested_alerts/input"
-ALERT_INGEST_AUTO_PROCESS = str(
-    os.getenv("ALERT_INGEST_AUTO_PROCESS", "true")
-).strip().lower() in {"1", "true", "yes", "on"}
-ALERT_INGEST_FAST_MODE = str(
-    os.getenv("ALERT_INGEST_FAST_MODE", "true")
-).strip().lower() in {"1", "true", "yes", "on"}
-ALERT_INGEST_WATCH_ENABLED = str(
-    os.getenv("ALERT_INGEST_WATCH_ENABLED", "true")
-).strip().lower() in {"1", "true", "yes", "on"}
-ALERT_INGEST_WATCH_INTERVAL_SECONDS = max(
-    1.0,
-    float(os.getenv("ALERT_INGEST_WATCH_INTERVAL_SECONDS", "2") or 2),
-)
-ALERT_INGEST_WATCH_DEBOUNCE_SECONDS = max(
-    0.2,
-    float(os.getenv("ALERT_INGEST_WATCH_DEBOUNCE_SECONDS", "1") or 1),
-)
 INCIDENT_PROJECTION_WORKER_ENABLED = str(
     os.getenv("INCIDENT_PROJECTION_WORKER_ENABLED", "true")
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -373,400 +388,8 @@ INCIDENT_PROJECTION_INTERVAL_SECONDS = max(
     5.0,
     float(os.getenv("INCIDENT_PROJECTION_INTERVAL_SECONDS", "15") or 15),
 )
-
-ALERT_INGEST_STATUS: dict[str, Any] = {
-    "enabled": ALERT_INGEST_ENABLED,
-    "interval_seconds": ALERT_INGEST_INTERVAL_SECONDS,
-    "input_dir": ALERT_INGEST_INPUT_DIR,
-    "auto_process": ALERT_INGEST_AUTO_PROCESS,
-    "watch_enabled": ALERT_INGEST_WATCH_ENABLED,
-    "watch_interval_seconds": ALERT_INGEST_WATCH_INTERVAL_SECONDS,
-    "watch_debounce_seconds": ALERT_INGEST_WATCH_DEBOUNCE_SECONDS,
-    "last_started_at": None,
-    "last_finished_at": None,
-    "last_reason": None,
-    "last_watch_triggered_at": None,
-    "last_watch_signature": None,
-    "last_run": None,
-    "runs": 0,
-}
-_ALERT_INGEST_LOCK = asyncio.Lock()
-
-
-def _ingest_base_path() -> Path:
-    configured = Path(ALERT_INGEST_INPUT_DIR)
-    if configured.is_absolute():
-        return configured
-    repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / configured
-
-
-def _ingest_processed_path() -> Path:
-    return _ingest_base_path().parent / "processed"
-
-
-def _ingest_failed_path() -> Path:
-    return _ingest_base_path().parent / "failed"
-
-
-def _ensure_ingest_directories() -> None:
-    _ingest_base_path().mkdir(parents=True, exist_ok=True)
-    _ingest_processed_path().mkdir(parents=True, exist_ok=True)
-    _ingest_failed_path().mkdir(parents=True, exist_ok=True)
-
-
-def _iter_ingest_files() -> list[Path]:
-    base = _ingest_base_path()
-    try:
-        files = [path for path in base.iterdir() if path.is_file() and path.suffix.lower() in _INGEST_SUPPORTED_SUFFIXES]
-    except OSError:
-        return []
-    return sorted(files, key=lambda item: item.name.lower())
-
-
-def _detect_source_from_file_name(path: Path) -> str:
-    name = path.name.lower()
-    if "prometheus" in name:
-        return "prometheus"
-    if "newrelic" in name or "new_relic" in name or "new-relic" in name:
-        return "newrelic"
-    if "datadog" in name:
-        return "datadog"
-    return "monitoring-adapter"
-
-
-def _normalize_ingest_severity(value: Any) -> str:
-    normalized = str(value or "warning").strip().lower()
-    aliases = {
-        "sev1": "critical",
-        "sev2": "high",
-        "sev3": "warning",
-        "sev4": "info",
-        "fatal": "critical",
-        "warn": "warning",
-        "err": "high",
-        "error": "high",
-    }
-    normalized = aliases.get(normalized, normalized)
-    if normalized in {"critical", "high", "warning", "info"}:
-        return normalized
-    return "warning"
-
-
-def _extract_key_values_from_text(block: str) -> dict[str, str]:
-    key_values: dict[str, str] = {}
-    for raw_line in block.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        for segment in re.split(r"[|,;]", line):
-            token = segment.strip()
-            if not token:
-                continue
-            if "=" in token:
-                key, value = token.split("=", 1)
-            elif ":" in token:
-                key, value = token.split(":", 1)
-            else:
-                continue
-            normalized_key = re.sub(r"[^a-z0-9]+", "_", key.strip().lower()).strip("_")
-            normalized_value = value.strip()
-            if normalized_key and normalized_value:
-                key_values[normalized_key] = normalized_value
-    return key_values
-
-
-def _build_payload_from_text_block(block: str, source_hint: str) -> dict[str, Any] | None:
-    key_values = _extract_key_values_from_text(block)
-    if not key_values:
-        description = block.strip()
-        if not description:
-            return None
-        return {
-            "source": source_hint,
-            "name": "TextAlert",
-            "service": "unknown",
-            "severity": "warning",
-            "description": description,
-            "labels": {},
-            "annotations": {},
-        }
-
-    name = (
-        key_values.get("name")
-        or key_values.get("alert")
-        or key_values.get("alert_name")
-        or key_values.get("alertname")
-        or key_values.get("condition_name")
-        or key_values.get("incident_title")
-        or key_values.get("title")
-        or "TextAlert"
-    )
-    service = (
-        key_values.get("service")
-        or key_values.get("entity")
-        or key_values.get("application")
-        or key_values.get("app")
-        or key_values.get("target")
-        or "unknown"
-    )
-    description = (
-        key_values.get("description")
-        or key_values.get("summary")
-        or key_values.get("message")
-        or key_values.get("details")
-        or key_values.get("condition_description")
-        or f"Alert from {source_hint}"
-    )
-
-    labels: dict[str, str] = {}
-    for key, value in key_values.items():
-        if key.startswith("label_") and value:
-            labels[key[6:]] = value
-
-    for passthrough_key in ("flow_id", "scenario_id", "workflow_id", "environment", "env"):
-        value = key_values.get(passthrough_key)
-        if value:
-            labels[passthrough_key] = value
-
-    source = key_values.get("source") or source_hint
-    severity = _normalize_ingest_severity(key_values.get("severity") or key_values.get("priority"))
-    return {
-        "source": source,
-        "name": str(name).strip(),
-        "service": str(service).strip(),
-        "severity": severity,
-        "description": str(description).strip(),
-        "labels": labels,
-        "annotations": {},
-    }
-
-
-def _parse_text_alert_payloads(raw: str, source_hint: str) -> list[dict[str, Any]]:
-    payloads: list[dict[str, Any]] = []
-    blocks = [block.strip() for block in re.split(r"\n\s*\n", raw) if block.strip()]
-    for block in blocks:
-        if block.startswith("{"):
-            try:
-                decoded = json.loads(block)
-            except json.JSONDecodeError:
-                decoded = None
-            if isinstance(decoded, dict):
-                payloads.append(decoded)
-                continue
-            if isinstance(decoded, list):
-                payloads.extend(item for item in decoded if isinstance(item, dict))
-                continue
-        payload = _build_payload_from_text_block(block, source_hint)
-        if isinstance(payload, dict):
-            payloads.append(payload)
-    return payloads
-
-
-def _read_alert_file(path: Path) -> list[dict[str, Any]]:
-    raw = path.read_text(encoding="utf-8").strip()
-    if not raw:
-        return []
-
-    suffix = path.suffix.lower()
-    source_hint = _detect_source_from_file_name(path)
-    if suffix in {".txt", ".log", ".ndjson"}:
-        return _parse_text_alert_payloads(raw, source_hint)
-
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return _parse_text_alert_payloads(raw, source_hint)
-
-    if isinstance(payload, dict):
-        return [payload]
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    return []
-
-
-def _select_flow_id_for_payload(payload: dict[str, Any]) -> str:
-    scenarios = merged_scenarios()
-    if not scenarios:
-        return "payment-latency"
-
-    for key in ("flow_id", "scenario_id", "workflow_id"):
-        candidate = str(payload.get(key, "")).strip()
-        if candidate:
-            return resolve_flow_id(candidate, scenarios)
-
-    labels = payload.get("labels", {}) if isinstance(payload.get("labels"), dict) else {}
-    for key in ("flow_id", "scenario_id", "workflow_id"):
-        candidate = str(labels.get(key, "")).strip()
-        if candidate:
-            return resolve_flow_id(candidate, scenarios)
-
-    normalized_name = slugify(str(payload.get("name") or payload.get("alertname") or ""))
-    if normalized_name and normalized_name in scenarios:
-        return normalized_name
-
-    normalized_service = str(payload.get("service") or labels.get("service") or "").strip().lower()
-    if normalized_service:
-        for flow_id, scenario in scenarios.items():
-            if str(scenario.get("service", "")).strip().lower() == normalized_service:
-                return str(flow_id)
-
-    return "payment-latency"
-
-
-def _archive_ingest_file(source: Path, target_dir: Path) -> Path:
-    target_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    candidate = target_dir / f"{source.stem}-{timestamp}{source.suffix}"
-    counter = 1
-    while candidate.exists():
-        candidate = target_dir / f"{source.stem}-{timestamp}-{counter}{source.suffix}"
-        counter += 1
-    source.rename(candidate)
-    return candidate
-
-
-def _input_files_signature() -> tuple[tuple[str, int, int], ...]:
-    files: list[tuple[str, int, int]] = []
-    for path in _iter_ingest_files():
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        files.append((path.name, int(stat.st_size), int(stat.st_mtime_ns)))
-    return tuple(files)
-
-
-async def _process_alert_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    ingested = await ingest_alert(payload=payload, x_trace_id=None)
-    flow_id = _select_flow_id_for_payload(payload)
-    workflow_summary = None
-    if ALERT_INGEST_AUTO_PROCESS:
-        workflow_summary = await run_local_payment_workflow(
-            flow_id=flow_id,
-            run_comparison=not ALERT_INGEST_FAST_MODE,
-            auto_approve=False,
-        )
-
-    return {
-        "alert_id": str(ingested.id),
-        "service": ingested.service,
-        "severity": ingested.severity.value,
-        "flow_id": flow_id,
-        "workflow_mode": (workflow_summary or {}).get("mode") if isinstance(workflow_summary, dict) else None,
-        "next_step": (workflow_summary or {}).get("next_step") if isinstance(workflow_summary, dict) else None,
-    }
-
-
-async def _run_ingestion_once(*, reason: str) -> dict[str, Any]:
-    if not ALERT_INGEST_ENABLED:
-        result = {
-            "status": "disabled",
-            "reason": reason,
-            "processed_files": 0,
-            "processed_alerts": 0,
-            "failed_files": 0,
-            "details": [],
-        }
-        ALERT_INGEST_STATUS["last_run"] = result
-        return result
-
-    async with _ALERT_INGEST_LOCK:
-        _ensure_ingest_directories()
-        start_ts = datetime.now(timezone.utc)
-        ALERT_INGEST_STATUS["last_started_at"] = start_ts.isoformat()
-        ALERT_INGEST_STATUS["last_reason"] = reason
-
-        result: dict[str, Any] = {
-            "status": "ok",
-            "reason": reason,
-            "processed_files": 0,
-            "processed_alerts": 0,
-            "failed_files": 0,
-            "details": [],
-        }
-
-        input_dir = _ingest_base_path()
-        for file_path in _iter_ingest_files():
-            try:
-                payloads = _read_alert_file(file_path)
-                file_details = []
-                for payload in payloads:
-                    file_details.append(await _process_alert_payload(payload))
-                _archive_ingest_file(file_path, _ingest_processed_path())
-                result["processed_files"] += 1
-                result["processed_alerts"] += len(file_details)
-                result["details"].append({"file": file_path.name, "status": "processed", "alerts": file_details})
-            except Exception as exc:
-                _archive_ingest_file(file_path, _ingest_failed_path())
-                result["failed_files"] += 1
-                result["details"].append({"file": file_path.name, "status": "failed", "error": str(exc)})
-
-        finished_ts = datetime.now(timezone.utc)
-        ALERT_INGEST_STATUS["last_finished_at"] = finished_ts.isoformat()
-        ALERT_INGEST_STATUS["runs"] = int(ALERT_INGEST_STATUS.get("runs", 0)) + 1
-        ALERT_INGEST_STATUS["last_run"] = result
-        return result
-
-
-async def _alert_ingest_worker() -> None:
-    stop_event = getattr(app.state, "alert_ingest_stop_event", None)
-    if stop_event is None:
-        return
-    while not stop_event.is_set():
-        try:
-            await _run_ingestion_once(reason="scheduled")
-            _record_worker_success("alert_ingest_worker")
-        except Exception as exc:
-            _record_worker_failure("alert_ingest_worker", exc)
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=float(ALERT_INGEST_INTERVAL_SECONDS))
-        except asyncio.TimeoutError:
-            continue
-
-
-async def _alert_ingest_watch_worker() -> None:
-    stop_event = getattr(app.state, "alert_ingest_stop_event", None)
-    if stop_event is None:
-        return
-
-    previous_signature: tuple[tuple[str, int, int], ...] = ()
-    last_watch_triggered = 0.0
-
-    while not stop_event.is_set():
-        try:
-            signature = _input_files_signature()
-            now = _time.monotonic()
-            has_pending = bool(signature)
-            is_changed = signature != previous_signature
-            debounce_passed = (now - last_watch_triggered) >= ALERT_INGEST_WATCH_DEBOUNCE_SECONDS
-
-            if has_pending and is_changed and debounce_passed:
-                await _run_ingestion_once(reason="watcher")
-                last_watch_triggered = now
-                ALERT_INGEST_STATUS["last_watch_triggered_at"] = datetime.now(timezone.utc).isoformat()
-                ALERT_INGEST_STATUS["last_watch_signature"] = [
-                    {
-                        "file": item[0],
-                        "size": item[1],
-                    }
-                    for item in signature
-                ]
-                previous_signature = _input_files_signature()
-                _record_worker_success("alert_ingest_watch_worker")
-            else:
-                previous_signature = signature
-        except Exception as exc:
-            _record_worker_failure("alert_ingest_watch_worker", exc)
-
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=float(ALERT_INGEST_WATCH_INTERVAL_SECONDS))
-        except asyncio.TimeoutError:
-            continue
-
-
 async def _incident_projection_worker() -> None:
-    stop_event = app.state.alert_ingest_stop_event
+    stop_event = app.state.monitoring_adapter_stop_event
     while not stop_event.is_set():
         try:
             if settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
@@ -785,34 +408,15 @@ async def _incident_projection_worker() -> None:
 
 
 async def _on_startup(_: Any) -> None:
-    _ensure_ingest_directories()
-    app.state.alert_ingest_stop_event = asyncio.Event()
-    if ALERT_INGEST_ENABLED:
-        app.state.alert_ingest_task = asyncio.create_task(_alert_ingest_worker())
-        if ALERT_INGEST_WATCH_ENABLED:
-            app.state.alert_ingest_watch_task = asyncio.create_task(_alert_ingest_watch_worker())
+    app.state.monitoring_adapter_stop_event = asyncio.Event()
     if INCIDENT_PROJECTION_WORKER_ENABLED:
         app.state.incident_projection_task = asyncio.create_task(_incident_projection_worker())
 
 
 async def _on_shutdown(_: Any) -> None:
-    stop_event = getattr(app.state, "alert_ingest_stop_event", None)
+    stop_event = getattr(app.state, "monitoring_adapter_stop_event", None)
     if stop_event is not None:
         stop_event.set()
-    task = getattr(app.state, "alert_ingest_task", None)
-    if task is not None:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    watch_task = getattr(app.state, "alert_ingest_watch_task", None)
-    if watch_task is not None:
-        watch_task.cancel()
-        try:
-            await watch_task
-        except asyncio.CancelledError:
-            pass
     projection_task = getattr(app.state, "incident_projection_task", None)
     if projection_task is not None:
         projection_task.cancel()
@@ -887,9 +491,16 @@ async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
     project_name = _normalize_project_name(project)
     provider_statuses = payload.get("provider_statuses", {}) if isinstance(payload.get("provider_statuses"), dict) else {}
     connectivity_payload = {
+        "deployment_mode": str(payload.get("deployment_mode", "on_prem")).strip().lower().replace("-", "_"),
         "prometheus_url": str(payload.get("prometheus_url", "")).strip(),
         "new_relic_url": str(payload.get("new_relic_url", "")).strip(),
         "datadog_url": str(payload.get("datadog_url", "")).strip(),
+        "gcp_project_id": str(payload.get("gcp_project_id", "")).strip(),
+        "gcp_region": str(payload.get("gcp_region", "")).strip(),
+        "pubsub_topic": str(payload.get("pubsub_topic", "")).strip(),
+        "pubsub_subscription": str(payload.get("pubsub_subscription", "")).strip(),
+        "vertex_model_armor_enabled": bool(payload.get("vertex_model_armor_enabled", False)),
+        "vertex_model_armor_template": str(payload.get("vertex_model_armor_template", "")).strip(),
         "user_assignments": payload.get("user_assignments", {}) if isinstance(payload.get("user_assignments"), dict) else {},
         "updated_at": payload.get("updated_at"),
         "active_provider": _normalize_provider_name(str(payload.get("active_provider", ""))) if payload.get("active_provider") else None,
@@ -2125,19 +1736,26 @@ def _record_closed_incident(
     )
 
 
-@app.post("/alerts", response_model=Alert)
-async def ingest_alert(payload: dict = ALERT_BODY, x_trace_id: str | None = Header(default=None)) -> Alert:
-    alert = Alert(
-        source=payload.get("source", payload.get("generatorURL", "unknown")),
-        name=payload.get("name", payload.get("alertname", "unknown-alert")),
-        service=payload.get("service", payload.get("labels", {}).get("service", "unknown")),
-        environment=payload.get("environment", payload.get("labels", {}).get("env", "prod")),
-        severity=AlertSeverity(payload.get("severity", payload.get("labels", {}).get("severity", "warning"))),
-        description=payload.get("description", payload.get("annotations", {}).get("summary", "")),
-        labels=payload.get("labels", {}),
-        annotations=payload.get("annotations", {}),
-        trace_id=x_trace_id,
+def _build_alert_from_payload(payload: dict[str, Any], trace_id: str | None = None) -> Alert:
+    labels = payload.get("labels", {}) if isinstance(payload.get("labels"), dict) else {}
+    annotations = payload.get("annotations", {}) if isinstance(payload.get("annotations"), dict) else {}
+    severity_value = severity_from_string(
+        str(payload.get("severity", labels.get("severity", "warning")))
     )
+    return Alert(
+        source=payload.get("source", payload.get("generatorURL", "unknown")),
+        name=payload.get("name", payload.get("alertname", labels.get("alertname", "unknown-alert"))),
+        service=payload.get("service", labels.get("service", labels.get("job", "unknown"))),
+        environment=payload.get("environment", labels.get("env", labels.get("environment", "prod"))),
+        severity=AlertSeverity(severity_value),
+        description=payload.get("description", annotations.get("summary", "")),
+        labels=labels,
+        annotations=annotations,
+        trace_id=trace_id,
+    )
+
+
+async def _publish_ingested_alert(alert: Alert) -> None:
     await app.state.producer.publish(RAW_ALERTS, alert, key=alert.service)
     RECENT_ALERTS.appendleft(
         {
@@ -2154,7 +1772,89 @@ async def ingest_alert(payload: dict = ALERT_BODY, x_trace_id: str | None = Head
             "created_at": alert.created_at.isoformat(),
         }
     )
+
+
+@app.post("/alerts", response_model=Alert)
+async def ingest_alert(payload: dict = ALERT_BODY, x_trace_id: str | None = Header(default=None)) -> Alert:
+    alert = _build_alert_from_payload(payload, trace_id=x_trace_id)
+    await _publish_ingested_alert(alert)
     return alert
+
+
+@app.post("/alerts/alertmanager")
+async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    alerts_payload = payload.get("alerts", []) if isinstance(payload, dict) else []
+    if not isinstance(alerts_payload, list):
+        raise HTTPException(status_code=400, detail="alertmanager payload must contain an alerts array")
+
+    common_labels = payload.get("commonLabels", {}) if isinstance(payload.get("commonLabels"), dict) else {}
+    common_annotations = payload.get("commonAnnotations", {}) if isinstance(payload.get("commonAnnotations"), dict) else {}
+
+    received = len(alerts_payload)
+    ingested_rows: list[dict[str, Any]] = []
+    skipped_rows: list[dict[str, Any]] = []
+
+    for item in alerts_payload:
+        if not isinstance(item, dict):
+            skipped_rows.append({"reason": "non-object alert item"})
+            continue
+
+        status = str(item.get("status") or payload.get("status") or "firing").strip().lower()
+        labels = item.get("labels", {}) if isinstance(item.get("labels"), dict) else {}
+        annotations = item.get("annotations", {}) if isinstance(item.get("annotations"), dict) else {}
+        merged_labels = {**common_labels, **labels}
+        merged_annotations = {**common_annotations, **annotations}
+
+        if status != "firing":
+            skipped_rows.append(
+                {
+                    "status": status,
+                    "alertname": str(merged_labels.get("alertname") or "unknown-alert"),
+                    "service": str(merged_labels.get("service") or merged_labels.get("job") or "unknown"),
+                    "reason": "Only firing alerts are sent to landing pad",
+                }
+            )
+            continue
+
+        mapped_payload = {
+            "source": "prometheus-alertmanager",
+            "name": str(merged_labels.get("alertname") or "prometheus-alert"),
+            "service": str(merged_labels.get("service") or merged_labels.get("job") or merged_labels.get("instance") or "kaiops-platform"),
+            "environment": str(merged_labels.get("environment") or merged_labels.get("env") or "prod"),
+            "severity": str(merged_labels.get("severity") or "warning").lower(),
+            "description": str(merged_annotations.get("description") or merged_annotations.get("summary") or merged_labels.get("alertname") or "Prometheus alert"),
+            "labels": {
+                **merged_labels,
+                "alert_status": status,
+                "alert_fingerprint": str(item.get("fingerprint") or ""),
+            },
+            "annotations": {
+                **merged_annotations,
+                "startsAt": str(item.get("startsAt") or ""),
+                "endsAt": str(item.get("endsAt") or ""),
+                "generatorURL": str(item.get("generatorURL") or ""),
+            },
+        }
+
+        alert = _build_alert_from_payload(mapped_payload, trace_id=x_trace_id)
+        await _publish_ingested_alert(alert)
+        ingested_rows.append(
+            {
+                "alert_id": str(alert.id),
+                "name": alert.name,
+                "service": alert.service,
+                "severity": alert.severity.value,
+                "status": status,
+            }
+        )
+
+    return {
+        "received": received,
+        "ingested": len(ingested_rows),
+        "skipped": len(skipped_rows),
+        "alerts": ingested_rows,
+        "skipped_rows": skipped_rows,
+    }
 
 
 @app.get("/alerts")
@@ -2216,48 +1916,6 @@ async def get_processed_result(alert_id: str) -> dict[str, Any]:
     if not result:
         raise HTTPException(status_code=404, detail="No processed result found for alert")
     return result
-
-
-@app.get("/ingestion/status")
-async def get_ingestion_status() -> dict[str, Any]:
-    _ensure_ingest_directories()
-    pending_files = [path.name for path in _iter_ingest_files()]
-    worker_health = {
-        name: {
-            "failure_count": int(count or 0),
-            "degraded": int(count or 0) >= WORKER_FAILURE_THRESHOLD,
-        }
-        for name, count in WORKER_FAILURE_COUNTS.items()
-    }
-    return {
-        "status": ALERT_INGEST_STATUS,
-        "config": {
-            "enabled": ALERT_INGEST_ENABLED,
-            "interval_seconds": ALERT_INGEST_INTERVAL_SECONDS,
-            "auto_process": ALERT_INGEST_AUTO_PROCESS,
-            "fast_mode": ALERT_INGEST_FAST_MODE,
-            "watch_enabled": ALERT_INGEST_WATCH_ENABLED,
-            "watch_interval_seconds": ALERT_INGEST_WATCH_INTERVAL_SECONDS,
-            "watch_debounce_seconds": ALERT_INGEST_WATCH_DEBOUNCE_SECONDS,
-            "input_dir": str(_ingest_base_path()),
-            "processed_dir": str(_ingest_processed_path()),
-            "failed_dir": str(_ingest_failed_path()),
-        },
-        "watcher": {
-            "last_triggered_at": ALERT_INGEST_STATUS.get("last_watch_triggered_at"),
-            "last_signature": ALERT_INGEST_STATUS.get("last_watch_signature") or [],
-        },
-        "worker_health": worker_health,
-        "degraded": any(item.get("degraded", False) for item in worker_health.values()),
-        "pending_files": pending_files,
-        "pending_count": len(pending_files),
-    }
-
-
-@app.post("/ingestion/run")
-async def run_ingestion_now() -> dict[str, Any]:
-    result = await _run_ingestion_once(reason="manual")
-    return {"result": result}
 
 
 @app.post("/sample/payment-latency", response_model=Alert)

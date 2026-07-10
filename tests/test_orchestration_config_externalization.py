@@ -80,3 +80,42 @@ def test_workflow_engine_reads_message_bus_and_definitions_from_external_config(
     assert critical_selection.definition.steps[-1] == "closure-agent"
     assert warning_selection.definition.name == "triage-only"
     assert warning_selection.definition.steps == ["alert-intelligence-agent", "notification-agent"]
+
+
+def test_workflow_engine_accepts_pubsub_default_provider(tmp_path) -> None:
+    config_path = tmp_path / "orchestration.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "message_bus": {
+                    "dynamic_routing": True,
+                    "default_provider": "pubsub",
+                    "stream_threshold": 50,
+                },
+                "workflow_definitions": {
+                    "critical-auto-remediation": {
+                        "steps": ["alert-intelligence-agent"],
+                        "next_action": "collect-context",
+                    },
+                    "guided-remediation": {
+                        "steps": ["alert-intelligence-agent"],
+                        "next_action": "collect-context",
+                    },
+                    "triage-only": {
+                        "steps": ["alert-intelligence-agent"],
+                        "next_action": "collect-context",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    settings = Settings(ORCHESTRATION_CONFIG_PATH=str(config_path))
+    engine = WorkflowEngine(settings=settings)
+
+    selection_low_stream = engine.select(severity=AlertSeverity.WARNING, stream_count=1)
+    selection_high_stream = engine.select(severity=AlertSeverity.CRITICAL, stream_count=5000)
+
+    assert selection_low_stream.message_bus_provider == "pubsub"
+    assert selection_high_stream.message_bus_provider == "pubsub"

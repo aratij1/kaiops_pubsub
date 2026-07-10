@@ -227,6 +227,19 @@
     "source": "rag-incident"
   },
   {
+    "id": "kaiops-service-health-baseline",
+    "alert_id": "KAIOPS-SERVICE-HEALTH-BASELINE",
+    "alert_name": "KaiOps Service Health Baseline",
+    "alert_type": "availability",
+    "title": "KaiOps Service Health Baseline",
+    "service": "api-gateway",
+    "severity": "HIGH",
+    "summary": "Real Prometheus-based service health monitoring for KaiOps microservices",
+    "recommended_action": "Investigate issue",
+    "description": "Real Prometheus-based service health monitoring for KaiOps microservices",
+    "source": "rag-incident"
+  },
+  {
     "id": "dw-1011",
     "alert_id": "DW-1011",
     "alert_name": "Late Arriving Data",
@@ -254,6 +267,19 @@
     "description": "Service: sales-fact-table",
     "execution_plan": "Backfill partition script",
     "deployment": "Not explicitly documented.",
+    "source": "rag-incident"
+  },
+  {
+    "id": "mysql-exporter-availability-baseline",
+    "alert_id": "MYSQL-EXPORTER-AVAILABILITY-BASELINE",
+    "alert_name": "MySQL Exporter Availability Baseline",
+    "alert_type": "database",
+    "title": "MySQL Exporter Availability Baseline",
+    "service": "mysql",
+    "severity": "CRITICAL",
+    "summary": "Real Prometheus-based MySQL exporter and DB signal monitoring",
+    "recommended_action": "Investigate issue",
+    "description": "Real Prometheus-based MySQL exporter and DB signal monitoring",
     "source": "rag-incident"
   },
   {

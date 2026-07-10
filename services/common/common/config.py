@@ -22,6 +22,7 @@ class Settings(BaseSettings):
 
     service_name: str = Field(default="kaiops-service", alias="SERVICE_NAME")
     environment: str = Field(default="local", alias="ENVIRONMENT")
+    deployment_profile: str = Field(default="onprem", alias="DEPLOYMENT_PROFILE")
     kafka_bootstrap_servers: str = Field(default="localhost:9092", alias="KAFKA_BOOTSTRAP_SERVERS")
     kafka_group_id: str = Field(default="kaiops", alias="KAFKA_GROUP_ID")
     kafka_consumer_max_retries: int = Field(default=3, alias="KAFKA_CONSUMER_MAX_RETRIES")
@@ -53,6 +54,14 @@ class Settings(BaseSettings):
     message_bus_dynamic_routing: bool = Field(default=True, alias="MESSAGE_BUS_DYNAMIC_ROUTING")
     message_bus_stream_threshold: int = Field(default=500, alias="MESSAGE_BUS_STREAM_THRESHOLD")
     message_bus_default_provider: str = Field(default="rabbitmq", alias="MESSAGE_BUS_DEFAULT_PROVIDER")
+    gcp_project_id: str = Field(default="", alias="GCP_PROJECT_ID")
+    gcp_region: str = Field(default="us-central1", alias="GCP_REGION")
+    gcp_pubsub_topic_prefix: str = Field(default="kaiops", alias="GCP_PUBSUB_TOPIC_PREFIX")
+    gcp_pubsub_enabled: bool = Field(default=False, alias="GCP_PUBSUB_ENABLED")
+    vertex_model_armor_enabled: bool = Field(default=False, alias="VERTEX_MODEL_ARMOR_ENABLED")
+    vertex_model_armor_template: str = Field(default="", alias="VERTEX_MODEL_ARMOR_TEMPLATE")
+    vertex_model_armor_endpoint: str = Field(default="", alias="VERTEX_MODEL_ARMOR_ENDPOINT")
+    vertex_model_armor_timeout_seconds: float = Field(default=8.0, alias="VERTEX_MODEL_ARMOR_TIMEOUT_SECONDS")
     orchestration_config_path: str = Field(default="", alias="ORCHESTRATION_CONFIG_PATH")
     message_bus_worker_count: int = Field(default=1, alias="MESSAGE_BUS_WORKER_COUNT")
     orchestration_llm_planner_enabled: bool = Field(default=False, alias="ORCHESTRATION_LLM_PLANNER_ENABLED")
@@ -108,6 +117,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def configure_database_url(self) -> "Settings":
+        profile = str(self.deployment_profile or "onprem").strip().lower()
+        if profile not in {"onprem", "gcp-cloud"}:
+            self.deployment_profile = "onprem"
+        else:
+            self.deployment_profile = profile
+
         if self.database_url and self.database_url != _LOCAL_MYSQL_DEFAULT_URL:
             self._validate_auth_secrets()
             return self
