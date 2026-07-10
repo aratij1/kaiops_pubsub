@@ -256,38 +256,14 @@ Start-KaiMSWindow `
     -Command "`$env:MONITORING_ADAPTER_URL = 'http://localhost:8001'; `$env:APPROVAL_SERVICE_URL = 'http://localhost:8007'; `$env:CONTEXT_AGENT_URL = 'http://localhost:8004'; & '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8010 --app-dir services/api-gateway"
 
 if (-not $NoUi) {
-    $UiDb = $Config.DB.Replace("'", "''")
-    $UiDbHost = $Config.DB_HOST.Replace("'", "''")
-    $UiDbPort = $Config.DB_PORT.Replace("'", "''")
-    $UiDbUser = $Config.DB_USER.Replace("'", "''")
-    $UiDbPassword = $Config.DB_PASSWORD.Replace("'", "''")
-    $UiDbDatabase = $Config.DB_DATABASE.Replace("'", "''")
-    $UiJwt = $Config.JWT_SECRET_KEY.Replace("'", "''")
-    $UiAdminPassword = $Config.ADMIN_USER_PASSWORD.Replace("'", "''")
-    $UiExecutivePassword = $Config.EXECUTIVE_USER_PASSWORD.Replace("'", "''")
-    $UiL3Password = $Config.L3_USER_PASSWORD.Replace("'", "''")
-    $UiL2Password = $Config.L2_USER_PASSWORD.Replace("'", "''")
-    $UiL1Password = $Config.L1_USER_PASSWORD.Replace("'", "''")
+    $UiFolder = (Join-Path $RepoRoot "services\ui\react").Replace("'", "''")
     $UiCommand = @"
-`$env:MONITORING_ADAPTER_URL="http://localhost:8001"
-`$env:APPROVAL_SERVICE_URL="http://localhost:8007"
-`$env:API_GATEWAY_URL="http://localhost:8010"
-`$env:DB="$UiDb"
-`$env:DB_HOST="$UiDbHost"
-`$env:DB_PORT="$UiDbPort"
-`$env:DB_USER="$UiDbUser"
-`$env:DB_PASSWORD="$UiDbPassword"
-`$env:DB_DATABASE="$UiDbDatabase"
-`$env:JWT_SECRET_KEY="$UiJwt"
-`$env:ADMIN_USER_PASSWORD="$UiAdminPassword"
-`$env:EXECUTIVE_USER_PASSWORD="$UiExecutivePassword"
-`$env:L3_USER_PASSWORD="$UiL3Password"
-`$env:L2_USER_PASSWORD="$UiL2Password"
-`$env:L1_USER_PASSWORD="$UiL1Password"
-& '$Python' -m streamlit run services/ui/app.py
+Set-Location -LiteralPath '$UiFolder'
+npm install
+npm run dev
 "@
 
-    Start-KaiMSWindow -Title "KaiMS Streamlit UI :8501" -Command $UiCommand
+    Start-KaiMSWindow -Title "KaiMS React UI :8501" -Command $UiCommand
 }
 
 Write-Host "Started KaiMS local services."
@@ -296,7 +272,7 @@ Write-Host "Approval service:   http://localhost:8007"
 Write-Host "Context agent:      http://localhost:8004"
 Write-Host "API Gateway:        http://localhost:8010"
 if (-not $NoUi) {
-    Write-Host "Streamlit UI:       http://localhost:8501"
+    Write-Host "React UI:           http://localhost:8501"
 }
 Write-Host "Logs directory:     $LogRoot"
 
@@ -308,7 +284,7 @@ $ReadinessTargets = @(
 )
 
 if (-not $NoUi) {
-    $ReadinessTargets += @{ Name = "Streamlit UI"; Url = "http://localhost:8501" }
+    $ReadinessTargets += @{ Name = "React UI"; Url = "http://localhost:8501" }
 }
 
 Write-Host "Checking readiness..."

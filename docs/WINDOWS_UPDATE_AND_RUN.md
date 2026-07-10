@@ -1,7 +1,7 @@
 # Windows Update and Run Guide
 
 Use this guide when your local UI still shows old behavior such as
-`Inject payment latency alert` or Docker logs show `services/ui/app.py` calling
+`Inject payment latency alert` or Docker logs show the React UI calling
 `/sample/payment-latency` directly.
 
 ## 1. Update your local source code

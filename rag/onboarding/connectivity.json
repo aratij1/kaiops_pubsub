@@ -1,13 +1,17 @@
 {
   "project": {
-    "name": "identity-platform",
-    "owner_team": "identity-ops",
+    "name": "kaiops-gcp-smoke",
+    "owner_team": "platform-ops",
     "environment": "prod",
-    "region": "ap-south-1"
+    "region": "us-east-1"
   },
-  "prometheus_url": "http://localhost:9090/-/ready",
-  "new_relic_url": "https://api.newrelic.com/v2/applications.json",
-  "datadog_url": "https://api.datadoghq.com/api/v1/validate",
-  "user_assignments": {},
-  "updated_at": "2026-07-08 20:15:21"
+  "prometheus_url": "http://prometheus:9090/-/ready",
+  "new_relic_url": "",
+  "datadog_url": "",
+  "user_assignments": {
+    "admin": [
+      "kaiops-gcp-smoke"
+    ]
+  },
+  "updated_at": null
 }

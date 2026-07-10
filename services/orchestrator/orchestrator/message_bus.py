@@ -16,7 +16,9 @@ def select_publisher(
     selected = publishers.get(provider)
     if selected is not None:
         return selected, provider
-    fallback = publishers.get("kafka", default_publisher)
+    if provider in {"kafka", "rabbitmq", "pubsub"}:
+        return default_publisher, provider
+    fallback = publishers.get("kafka") or publishers.get("rabbitmq") or default_publisher
     return fallback, "kafka"
 
 

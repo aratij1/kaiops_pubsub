@@ -358,6 +358,48 @@ def refresh_alert_snapshots(*, force: bool = False) -> None:
     st.session_state["alerts_snapshot_refreshed_at"] = now
 
 
+def _login_application_options() -> list[str]:
+    options: list[str] = []
+
+    connectivity_response = request_json_with_fallback(
+        "GET",
+        [f"{GATEWAY_BASE}/onboarding/connectivity", f"{MONITORING_ADAPTER_BASE}/onboarding/connectivity"],
+        suppress_last_error=True,
+    )
+    connectivity_payload = data_from_gateway(connectivity_response) if isinstance(connectivity_response, dict) else {}
+    connectivity = connectivity_payload.get("connectivity", {}) if isinstance(connectivity_payload, dict) else {}
+    project = connectivity.get("project", {}) if isinstance(connectivity.get("project"), dict) else {}
+    project_name = str(project.get("name") or "").strip()
+    if project_name:
+        options.append(project_name)
+
+    onboarding_state_response = request_json_with_fallback(
+        "GET",
+        [f"{GATEWAY_BASE}/onboarding/state", f"{MONITORING_ADAPTER_BASE}/onboarding/state"],
+        suppress_last_error=True,
+    )
+    onboarding_payload = data_from_gateway(onboarding_state_response) if isinstance(onboarding_state_response, dict) else {}
+    rows = onboarding_payload.get("rows", []) if isinstance(onboarding_payload, dict) else []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            candidate = str(row.get("project_name") or "").strip()
+            if candidate and candidate not in options:
+                options.append(candidate)
+
+    return options or ["identity-platform"]
+
+
+def _homepage_monitoring_target() -> dict[str, str]:
+    selected_application = str(st.session_state.get("selected_monitor_application") or "").strip()
+    application = selected_application or "Not configured"
+
+    return {
+        "application": application,
+    }
+
+
 def fetch_processed_result_for_alert(alert_id: str) -> dict[str, Any]:
     normalized = str(alert_id or "").strip()
     if not normalized:
@@ -470,12 +512,25 @@ def render_admin_access_panel(*, sidebar: bool = False) -> None:
 
     st.caption("Administrator sign-in reveals Project Onboarding and User Management.")
     st.caption("Seeded local credentials: admin / Admin@123456")
+
+    application_options = _login_application_options()
+    selected_application = str(st.session_state.get("selected_monitor_application") or "").strip()
+    if selected_application not in application_options:
+        st.session_state["selected_monitor_application"] = application_options[0]
+
     with st.form(f"user_mgmt_login_form_{'sidebar' if sidebar else 'panel'}"):
+        login_application = st.selectbox(
+            "Application To Monitor",
+            options=application_options,
+            index=application_options.index(str(st.session_state.get("selected_monitor_application") or application_options[0])),
+            key=f"admin_application_{'sidebar' if sidebar else 'panel'}",
+        )
         login_user = st.text_input("Username", value="admin", key=f"admin_user_{'sidebar' if sidebar else 'panel'}")
         login_password = st.text_input("Password", type="password", value="", key=f"admin_password_{'sidebar' if sidebar else 'panel'}")
         login_device = st.text_input("Device", value="Streamlit UI", key=f"admin_device_{'sidebar' if sidebar else 'panel'}")
         submitted = st.form_submit_button("Sign In", type="primary", use_container_width=True)
     if submitted:
+        st.session_state["selected_monitor_application"] = str(login_application or "").strip()
         login_payload = {"username": login_user.strip(), "password": login_password, "device": login_device.strip()}
         login_response = user_mgmt_request("POST", "/auth/login", show_error=False, json=login_payload)
         if login_response and login_response.get("access_token"):
@@ -1353,13 +1408,14 @@ def render_alert_stream(
             **selected_target,
             "selected_at": datetime.now(timezone.utc).isoformat(),
         }
-        return {
+        st.session_state["alert_stream_open_request"] = {
             "kind": "alert_stream",
             "alert_id": selected_target["alert_id"],
             "alert_name": selected_target["alert_name"],
             "service": selected_target["service"],
             "severity": selected_target["severity"],
         }
+        st.rerun()
 
     st.caption(f"Showing {len(display_entries)} of {len(scoped_entries)} alerts after filters.")
 
@@ -3278,6 +3334,14 @@ def render_alert_stream_section(entries: list[dict[str, Any]]) -> None:
     st.markdown("## Alert Stream")
     st.caption("Live incident feed with latest and historical alert views.")
 
+    target = _homepage_monitoring_target()
+    st.markdown("### Application To Monitor")
+    metric_row(
+        [
+            ("Application", target.get("application", "Not configured")),
+        ]
+    )
+
     action_left, action_right = st.columns([1, 5])
     with action_left:
         if st.button("Refresh Alerts", key="alert_stream_refresh_main", use_container_width=True):
@@ -3354,7 +3418,11 @@ def render_alert_stream_section(entries: list[dict[str, Any]]) -> None:
     else:
         st.caption(f"Showing historical alerts: up to {selected_limit} rows, window {history_window}.")
 
-    selected_from_stream = render_alert_stream(selected_entries, status_filter=status_filter, display_limit=selected_limit)
+    pending_open_request = st.session_state.pop("alert_stream_open_request", None)
+    if isinstance(pending_open_request, dict) and pending_open_request:
+        selected_from_stream = pending_open_request
+    else:
+        selected_from_stream = render_alert_stream(selected_entries, status_filter=status_filter, display_limit=selected_limit)
     if selected_from_stream and isinstance(selected_from_stream, dict):
         selected_alert_id = str(selected_from_stream.get("alert_id") or "").strip()
         processed_result = fetch_processed_result_for_alert(selected_alert_id)
