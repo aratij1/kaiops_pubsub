@@ -358,24 +358,46 @@ def refresh_alert_snapshots(*, force: bool = False) -> None:
     st.session_state["alerts_snapshot_refreshed_at"] = now
 
 
-def fetch_ingestion_status() -> dict[str, Any]:
-    response = request_json_with_fallback(
+def _login_application_options() -> list[str]:
+    options: list[str] = []
+
+    connectivity_response = request_json_with_fallback(
         "GET",
-        [f"{GATEWAY_BASE}/ingestion/status", f"{MONITORING_ADAPTER_BASE}/ingestion/status"],
+        [f"{GATEWAY_BASE}/onboarding/connectivity", f"{MONITORING_ADAPTER_BASE}/onboarding/connectivity"],
         suppress_last_error=True,
     )
-    return response if isinstance(response, dict) else {}
+    connectivity_payload = data_from_gateway(connectivity_response) if isinstance(connectivity_response, dict) else {}
+    connectivity = connectivity_payload.get("connectivity", {}) if isinstance(connectivity_payload, dict) else {}
+    project = connectivity.get("project", {}) if isinstance(connectivity.get("project"), dict) else {}
+    project_name = str(project.get("name") or "").strip()
+    if project_name:
+        options.append(project_name)
 
-
-def run_ingestion_manual() -> tuple[bool, dict[str, Any]]:
-    response = request_json_with_fallback(
-        "POST",
-        [f"{GATEWAY_BASE}/ingestion/run", f"{MONITORING_ADAPTER_BASE}/ingestion/run"],
+    onboarding_state_response = request_json_with_fallback(
+        "GET",
+        [f"{GATEWAY_BASE}/onboarding/state", f"{MONITORING_ADAPTER_BASE}/onboarding/state"],
         suppress_last_error=True,
     )
-    if response and isinstance(response, dict):
-        return True, response
-    return False, {}
+    onboarding_payload = data_from_gateway(onboarding_state_response) if isinstance(onboarding_state_response, dict) else {}
+    rows = onboarding_payload.get("rows", []) if isinstance(onboarding_payload, dict) else []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            candidate = str(row.get("project_name") or "").strip()
+            if candidate and candidate not in options:
+                options.append(candidate)
+
+    return options or ["identity-platform"]
+
+
+def _homepage_monitoring_target() -> dict[str, str]:
+    selected_application = str(st.session_state.get("selected_monitor_application") or "").strip()
+    application = selected_application or "Not configured"
+
+    return {
+        "application": application,
+    }
 
 
 def fetch_processed_result_for_alert(alert_id: str) -> dict[str, Any]:
@@ -446,8 +468,6 @@ _fetch_flows_cached = backend_api._fetch_flows_cached
 _fetch_recent_alerts_cached = backend_api._fetch_recent_alerts_cached
 _fetch_all_alerts_cached = backend_api._fetch_all_alerts_cached
 refresh_alert_snapshots = backend_api.refresh_alert_snapshots
-fetch_ingestion_status = backend_api.fetch_ingestion_status
-run_ingestion_manual = backend_api.run_ingestion_manual
 fetch_processed_result_for_alert = backend_api.fetch_processed_result_for_alert
 user_mgmt_auth_headers = backend_api.user_mgmt_auth_headers
 user_mgmt_request = backend_api.user_mgmt_request
@@ -492,12 +512,25 @@ def render_admin_access_panel(*, sidebar: bool = False) -> None:
 
     st.caption("Administrator sign-in reveals Project Onboarding and User Management.")
     st.caption("Seeded local credentials: admin / Admin@123456")
+
+    application_options = _login_application_options()
+    selected_application = str(st.session_state.get("selected_monitor_application") or "").strip()
+    if selected_application not in application_options:
+        st.session_state["selected_monitor_application"] = application_options[0]
+
     with st.form(f"user_mgmt_login_form_{'sidebar' if sidebar else 'panel'}"):
+        login_application = st.selectbox(
+            "Application To Monitor",
+            options=application_options,
+            index=application_options.index(str(st.session_state.get("selected_monitor_application") or application_options[0])),
+            key=f"admin_application_{'sidebar' if sidebar else 'panel'}",
+        )
         login_user = st.text_input("Username", value="admin", key=f"admin_user_{'sidebar' if sidebar else 'panel'}")
         login_password = st.text_input("Password", type="password", value="", key=f"admin_password_{'sidebar' if sidebar else 'panel'}")
         login_device = st.text_input("Device", value="Streamlit UI", key=f"admin_device_{'sidebar' if sidebar else 'panel'}")
         submitted = st.form_submit_button("Sign In", type="primary", use_container_width=True)
     if submitted:
+        st.session_state["selected_monitor_application"] = str(login_application or "").strip()
         login_payload = {"username": login_user.strip(), "password": login_password, "device": login_device.strip()}
         login_response = user_mgmt_request("POST", "/auth/login", show_error=False, json=login_payload)
         if login_response and login_response.get("access_token"):
@@ -1375,13 +1408,14 @@ def render_alert_stream(
             **selected_target,
             "selected_at": datetime.now(timezone.utc).isoformat(),
         }
-        return {
+        st.session_state["alert_stream_open_request"] = {
             "kind": "alert_stream",
             "alert_id": selected_target["alert_id"],
             "alert_name": selected_target["alert_name"],
             "service": selected_target["service"],
             "severity": selected_target["severity"],
         }
+        st.rerun()
 
     st.caption(f"Showing {len(display_entries)} of {len(scoped_entries)} alerts after filters.")
 
@@ -3298,18 +3332,15 @@ def render_alert_stream_section(entries: list[dict[str, Any]]) -> None:
         return
 
     st.markdown("## Alert Stream")
-    st.caption("Live incident feed with latest and historical alert views. Alerts from ingestion are auto-processed.")
+    st.caption("Live incident feed with latest and historical alert views.")
 
-    ingestion_status = fetch_ingestion_status()
-    pipeline = ingestion_status.get("status", {}) if isinstance(ingestion_status.get("status"), dict) else {}
-    pending_count = int(ingestion_status.get("pending_count", 0) or 0)
-    if pipeline:
-        st.caption(
-            "Ingestion pipeline: "
-            f"runs={pipeline.get('runs', 0)} | "
-            f"last={pipeline.get('last_finished_at') or 'n/a'} | "
-            f"pending_files={pending_count}"
-        )
+    target = _homepage_monitoring_target()
+    st.markdown("### Application To Monitor")
+    metric_row(
+        [
+            ("Application", target.get("application", "Not configured")),
+        ]
+    )
 
     action_left, action_right = st.columns([1, 5])
     with action_left:
@@ -3387,7 +3418,11 @@ def render_alert_stream_section(entries: list[dict[str, Any]]) -> None:
     else:
         st.caption(f"Showing historical alerts: up to {selected_limit} rows, window {history_window}.")
 
-    selected_from_stream = render_alert_stream(selected_entries, status_filter=status_filter, display_limit=selected_limit)
+    pending_open_request = st.session_state.pop("alert_stream_open_request", None)
+    if isinstance(pending_open_request, dict) and pending_open_request:
+        selected_from_stream = pending_open_request
+    else:
+        selected_from_stream = render_alert_stream(selected_entries, status_filter=status_filter, display_limit=selected_limit)
     if selected_from_stream and isinstance(selected_from_stream, dict):
         selected_alert_id = str(selected_from_stream.get("alert_id") or "").strip()
         processed_result = fetch_processed_result_for_alert(selected_alert_id)
@@ -3452,74 +3487,6 @@ def render_alert_stream_section(entries: list[dict[str, Any]]) -> None:
 
     if not entries:
         st.info("No alert stream entries available yet. Generate a demo event or refresh.")
-
-
-def render_ingestion_pipeline_section() -> None:
-    st.markdown("## Ingestion Pipeline")
-    st.caption("Reads alert files from the input folder every 10 minutes and auto-processes workflows.")
-
-    status_payload = fetch_ingestion_status()
-    status = status_payload.get("status", {}) if isinstance(status_payload.get("status"), dict) else {}
-    config = status_payload.get("config", {}) if isinstance(status_payload.get("config"), dict) else {}
-    pending_files = status_payload.get("pending_files", []) if isinstance(status_payload.get("pending_files"), list) else []
-
-    control_left, control_right = st.columns([1, 1])
-    with control_left:
-        if st.button("Run Ingestion Now", key="run_ingestion_now_btn", type="primary", use_container_width=True):
-            ok, response = run_ingestion_manual()
-            if ok:
-                result = response.get("result", {}) if isinstance(response.get("result"), dict) else {}
-                st.success(
-                    "Ingestion run completed. "
-                    f"processed_files={result.get('processed_files', 0)}, processed_alerts={result.get('processed_alerts', 0)}, failed_files={result.get('failed_files', 0)}"
-                )
-                refresh_alert_snapshots(force=True)
-                _fetch_closed_incidents_cached.clear()
-                st.rerun()
-            else:
-                st.error("Unable to trigger ingestion run. Ensure monitoring-adapter is available.")
-    with control_right:
-        if st.button("Refresh Pipeline Status", key="refresh_ingestion_status_btn", use_container_width=True):
-            st.rerun()
-
-    metric_row(
-        [
-            ("Enabled", "YES" if bool(config.get("enabled", status.get("enabled", False))) else "NO"),
-            ("Interval (s)", int(config.get("interval_seconds", status.get("interval_seconds", 0)) or 0)),
-            ("Pending Files", len(pending_files)),
-            ("Runs", int(status.get("runs", 0) or 0)),
-        ]
-    )
-
-    st.markdown("### Folder Wiring")
-    st.write(f"- Input folder: {config.get('input_dir', 'n/a')}")
-    st.write(f"- Processed folder: {config.get('processed_dir', 'n/a')}")
-    st.write(f"- Failed folder: {config.get('failed_dir', 'n/a')}")
-    st.write(
-        "- Processing mode: "
-        + ("Auto-process enabled" if bool(config.get("auto_process", True)) else "Ingest only")
-    )
-
-    st.markdown("### Pending Input Files")
-    if pending_files:
-        st.dataframe([{"File": str(name)} for name in pending_files], hide_index=True, width="stretch")
-    else:
-        st.caption("No pending files in input folder.")
-
-    last_run = status.get("last_run", {}) if isinstance(status.get("last_run"), dict) else {}
-    if last_run:
-        st.markdown("### Last Run Summary")
-        table_from_dict(
-            {
-                "reason": last_run.get("reason"),
-                "status": last_run.get("status"),
-                "processed_files": last_run.get("processed_files"),
-                "processed_alerts": last_run.get("processed_alerts"),
-                "failed_files": last_run.get("failed_files"),
-                "last_started_at": status.get("last_started_at"),
-                "last_finished_at": status.get("last_finished_at"),
-            }
-        )
 
 
 st.set_page_config(page_title="KaiMS", page_icon="K", layout="wide", initial_sidebar_state="expanded")
@@ -3593,7 +3560,7 @@ current_role_name = str(current_account.get("role_name") or st.session_state.get
 is_admin_user_nav = current_role_name.lower() == "administrator"
 is_executive_user_nav = current_role_name.lower() == "executive"
 
-menu_options = ["Alert Stream", "Ingestion Pipeline"]
+menu_options = ["Alert Stream"]
 if is_admin_user_nav or is_executive_user_nav:
     menu_options.append("Executive Dashboard")
 if is_admin_user_nav:
@@ -3613,7 +3580,6 @@ admin_workspace_options = ["Project Onboarding", "User Management", "Alert Onboa
 
 nav_label_to_section = {
     "Alert Stream": "alert_stream",
-    "Ingestion Pipeline": "ingestion_pipeline",
     "Executive Dashboard": "executive",
     "Admin Center": "admin",
 }
@@ -3839,10 +3805,6 @@ if st.session_state.get("nav_section") == "executive":
 
 if st.session_state.get("nav_section") == "alert_stream":
     render_alert_stream_section(alert_stream_entries)
-    st.stop()
-
-if st.session_state.get("nav_section") == "ingestion_pipeline":
-    render_ingestion_pipeline_section()
     st.stop()
 
 if st.session_state.get("nav_section") == "admin":

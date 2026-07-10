@@ -1,0 +1,15 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: kaiops-landing-pad
+  group_by: [alertname, service, severity]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 30m
+
+receivers:
+  - name: kaiops-landing-pad
+    webhook_configs:
+      - url: http://monitoring-adapter:8000/alerts/alertmanager
+        send_resolved: false

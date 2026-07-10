@@ -11,7 +11,7 @@ from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitm
 from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
-from common.topics import APPROVAL_EVENTS, REMEDIATION_EVENTS
+from common.topics import APPROVAL_EVENTS, REMEDIATION_EVENTS, RESOLUTION_EVENTS
 from fastapi import FastAPI
 from remediation_engine import RemediationEngine
 
@@ -25,16 +25,24 @@ ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any
 
 async def startup(app: FastAPI) -> None:
     workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
-    consumers: list[tuple[str, Any, ConsumeRunner]] = []
+    approval_consumers: list[tuple[str, Any, ConsumeRunner]] = []
+    resolution_consumers: list[tuple[str, Any, ConsumeRunner]] = []
     for worker in range(workers):
-        consumers.append(
+        approval_consumers.append(
             (f"rabbitmq-w{worker + 1}", RabbitMQConsumer(settings, APPROVAL_EVENTS), consume_rabbitmq_forever)
+        )
+        resolution_consumers.append(
+            (f"rabbitmq-w{worker + 1}", RabbitMQConsumer(settings, RESOLUTION_EVENTS), consume_rabbitmq_forever)
         )
     if settings.kafka_enabled:
         for worker in range(workers):
-            consumers.insert(
+            approval_consumers.insert(
                 worker,
                 (f"kafka-w{worker + 1}", KafkaConsumer(settings, APPROVAL_EVENTS), consume_kafka_forever),
+            )
+            resolution_consumers.insert(
+                worker,
+                (f"kafka-w{worker + 1}", KafkaConsumer(settings, RESOLUTION_EVENTS), consume_kafka_forever),
             )
 
     async def handle_approval(payload: dict) -> None:
@@ -43,8 +51,25 @@ async def startup(app: FastAPI) -> None:
         await app.state.producer.publish(REMEDIATION_EVENTS, action, key=str(action.incident_id))
         EVENTS_PROCESSED.labels(settings.service_name, APPROVAL_EVENTS, "ok").inc()
 
-    for source, approval_consumer, consume_forever in consumers:
+    async def handle_resolution(payload: dict) -> None:
+        if _resolution_requires_approval(payload):
+            return
+        approval = _build_auto_approval(payload)
+        if approval is None:
+            return
+        action = await execute_approval(approval)
+        await app.state.producer.publish(REMEDIATION_EVENTS, action, key=str(action.incident_id))
+        EVENTS_PROCESSED.labels(settings.service_name, RESOLUTION_EVENTS, "ok").inc()
+
+    for source, approval_consumer, consume_forever in approval_consumers:
         task = asyncio.create_task(consume_forever(approval_consumer, handle_approval), name=f"remediation-engine-{source}-consumer")
+        tasks.append(task)
+
+    for source, resolution_consumer, consume_forever in resolution_consumers:
+        task = asyncio.create_task(
+            consume_forever(resolution_consumer, handle_resolution),
+            name=f"remediation-engine-{source}-resolution-consumer",
+        )
         tasks.append(task)
 
 
@@ -83,3 +108,51 @@ async def execute_approval(approval: Approval) -> RemediationAction:
             await repo.save_action_audit(action)
             await session.commit()
     return action
+
+
+def _resolution_requires_approval(payload: dict[str, Any]) -> bool:
+    decision = payload.get("decision", {}) if isinstance(payload.get("decision"), dict) else {}
+    if "requires_approval" in decision:
+        return bool(decision.get("requires_approval"))
+
+    recommendation = payload.get("recommendation", {}) if isinstance(payload.get("recommendation"), dict) else {}
+    metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
+    orchestration = metadata.get("orchestration_decision", {}) if isinstance(metadata.get("orchestration_decision"), dict) else {}
+    if "requires_approval" in orchestration:
+        return bool(orchestration.get("requires_approval"))
+
+    return True
+
+
+def _build_auto_approval(payload: dict[str, Any]) -> Approval | None:
+    recommendation = payload.get("recommendation", {}) if isinstance(payload.get("recommendation"), dict) else {}
+    incident_id = recommendation.get("incident_id")
+    recommendation_id = recommendation.get("id")
+    if incident_id is None or recommendation_id is None:
+        return None
+
+    decision = payload.get("decision", {}) if isinstance(payload.get("decision"), dict) else {}
+    recommendation_metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
+
+    policy_version = str(
+        decision.get("policy_version") or recommendation_metadata.get("policy_version") or ""
+    ).strip()
+    policy_reason = str(
+        decision.get("policy_reason") or recommendation_metadata.get("policy_reason") or ""
+    ).strip()
+
+    metadata: dict[str, Any] = {"auto_approved": True, "approval_source": "resolution-events"}
+    if policy_version:
+        metadata["policy_version"] = policy_version
+    if policy_reason:
+        metadata["policy_reason"] = policy_reason
+
+    return Approval(
+        incident_id=incident_id,
+        recommendation_id=recommendation_id,
+        decision=ApprovalDecision.APPROVED,
+        approver="system-auto-approval",
+        channel="web",
+        comment=str(recommendation.get("recommended_action") or "auto-approved remediation"),
+        metadata=metadata,
+    )
