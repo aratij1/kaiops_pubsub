@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from typing import Any, TypedDict
 
+from common.agent_runtime import AgentRuntime, ContextFailure, ValidationError
 from common.agentic import AgentContext, BaseAgent
+from common.memory_store import InMemoryStore, MemoryStore
 from common.model_gateway import GenerationRequest, ModelGateway, RouterModelGateway
-from common.models import AlertSeverity, Context, Recommendation
+from common.models import AlertSeverity, Context, Evidence, Recommendation
 from common.prompts import (
     PROMPT_ASSESS_IMPACT,
     PROMPT_IDENTIFY_ROOT_CAUSE,
@@ -29,9 +31,17 @@ class ResolutionState(TypedDict, total=False):
 class ResolutionIntelligenceAgent(BaseAgent):
     name = "resolution-agent"
 
-    def __init__(self, model_router: ModelRouter | None = None, model_gateway: ModelGateway | None = None) -> None:
+    def __init__(
+        self,
+        model_router: ModelRouter | None = None,
+        model_gateway: ModelGateway | None = None,
+        runtime: AgentRuntime | None = None,
+        memory_store: MemoryStore | None = None,
+    ) -> None:
         self.model_router = model_router or ModelRouter()
         self.model_gateway = model_gateway or RouterModelGateway(self.model_router)
+        self.runtime = runtime or AgentRuntime(max_attempts=2)
+        self.memory_store = memory_store or InMemoryStore()
         self.graph = self._build_graph()
 
     async def can_execute(self, context: AgentContext) -> bool:
@@ -215,6 +225,25 @@ class ResolutionIntelligenceAgent(BaseAgent):
 
     async def resolve(self, context: Context) -> Recommendation:
         state = await self.graph.ainvoke({"context": context})
+        runbook_present = bool((context.runbook or "").strip())
+        evidence = [
+            Evidence(
+                id=f"ctx:{context.incident_id}",
+                type="context",
+                source="context-agent",
+                confidence=0.9,
+                metadata={"service": context.alert.service},
+                content={"related_incidents": len(context.related_incidents)},
+            ),
+            Evidence(
+                id=f"runbook:{context.incident_id}",
+                type="runbook",
+                source="knowledge-router",
+                confidence=0.85 if runbook_present else 0.25,
+                metadata={"present": runbook_present},
+                content={"preview": (context.runbook or "")[:180]},
+            ),
+        ]
         recommendation = Recommendation(
             incident_id=context.incident_id,
             root_cause=state["root_cause"],
@@ -228,15 +257,89 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
         recommendation.metadata["model_usage"] = state.get("model_usage", [])
         recommendation.metadata["model_calls"] = state.get("model_calls", [])
+        recommendation.metadata["evidence"] = [item.model_dump(mode="json") for item in evidence]
+        recommendation.metadata["evidence_ids"] = [item.id for item in evidence]
+        recommendation.metadata["reasoning"] = state.get("rationale", "")
+        recommendation.metadata["citations"] = [
+            f"runbook://{context.alert.service}",
+            f"incident://{context.incident_id}",
+        ]
         return recommendation
+
+    async def resolve_with_runtime(self, context: Context) -> Recommendation:
+        runtime_context = AgentContext.from_context(context)
+        runtime_result = await self.runtime.run(self, runtime_context)
+        recommendation = runtime_result.result
+        if not isinstance(recommendation, Recommendation):
+            raise ValidationError("resolution runtime produced non-recommendation output")
+        recommendation.metadata["runtime"] = {
+            "status": runtime_result.state.execution_status,
+            "retry_count": runtime_result.state.retries,
+            "reflection": runtime_result.reflection,
+        }
+        await self.memory_store.append(
+            "incident-memory",
+            {
+                "incident_id": str(context.incident_id),
+                "service": context.alert.service,
+                "recommended_action": recommendation.recommended_action,
+                "confidence": recommendation.confidence,
+                "reflection": runtime_result.reflection,
+            },
+        )
+        return recommendation
+
+    async def initialize(self, context: AgentContext, state: Any) -> None:
+        state.execution_status = "analyzing"
+
+    async def plan(self, context: AgentContext, state: Any) -> dict[str, Any]:
+        payload = context.previous_agent_results.get("context-agent") or context.previous_agent_results.get("context")
+        model_task_count = 3
+        if not isinstance(payload, dict):
+            raise ContextFailure("resolution agent requires serialized context payload")
+        return {
+            "phase": "resolution",
+            "steps": ["collect_context", "generate_rca", "impact_analysis", "generate_fix", "confidence_scoring"],
+            "model_task_count": model_task_count,
+        }
 
     async def execute(self, context: AgentContext) -> Recommendation:
         context_payload = context.previous_agent_results.get("context-agent") or context.previous_agent_results.get("context")
         if not isinstance(context_payload, dict):
-            raise ValueError("AgentContext.previous_agent_results must include serialized context")
+            raise ContextFailure("AgentContext.previous_agent_results must include serialized context")
         recommendation = await self.resolve(Context.model_validate(context_payload))
         context.set_result(self.name, recommendation.model_dump(mode="json"))
         return recommendation
 
     async def validate(self, result: Any) -> bool:
-        return isinstance(result, Recommendation)
+        if not isinstance(result, Recommendation):
+            return False
+        if result.confidence <= 0:
+            raise ValidationError("confidence must be greater than zero")
+        evidence_ids = result.metadata.get("evidence_ids", [])
+        if not isinstance(evidence_ids, list) or not evidence_ids:
+            raise ValidationError("recommendation must include evidence_ids")
+        return True
+
+    async def reflect(
+        self,
+        context: AgentContext,
+        state: Any,
+        *,
+        result: Any | None,
+        error: Exception | None,
+    ) -> dict[str, Any]:
+        confidence = float(result.confidence) if isinstance(result, Recommendation) else 0.0
+        quality = "high" if confidence >= 0.85 else "medium" if confidence >= 0.65 else "low"
+        return {
+            "agent": self.name,
+            "quality": quality,
+            "lessons_learned": [
+                "Preserve runbook and incident evidence links in every recommendation.",
+                "Escalate to approval path when confidence is below policy threshold.",
+            ],
+            "failed_tool_calls": [],
+            "missing_evidence": [] if confidence >= 0.5 else ["runbook", "related_incidents"],
+            "confidence_adjustment": 0.0,
+            "error": str(error) if error else None,
+        }

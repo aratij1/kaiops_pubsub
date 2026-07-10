@@ -1,6 +1,8 @@
 from importlib import util
 from pathlib import Path
 
+import pytest
+
 
 def load_remediation_app_module():
     module_path = Path("services/remediation-engine/app.py")
@@ -80,3 +82,60 @@ def test_build_auto_approval_returns_none_when_identifiers_missing() -> None:
     }
 
     assert module._build_auto_approval(payload) is None
+
+
+def test_validate_auto_execution_policy_accepts_well_formed_payload() -> None:
+    module = load_remediation_app_module()
+
+    payload = {
+        "decision": {"requires_approval": False, "risk_tier": "medium"},
+        "recommendation": {
+            "id": "22222222-2222-2222-2222-222222222222",
+            "incident_id": "11111111-1111-1111-1111-111111111111",
+            "confidence": 0.93,
+            "metadata": {
+                "evidence_ids": ["ev-1"],
+                "reasoning": "Rollback selected from runbook and deployment timeline.",
+            },
+        },
+    }
+
+    module._validate_auto_execution_policy(payload)
+
+
+def test_validate_auto_execution_policy_rejects_missing_evidence() -> None:
+    module = load_remediation_app_module()
+
+    payload = {
+        "decision": {"requires_approval": False, "risk_tier": "medium"},
+        "recommendation": {
+            "id": "22222222-2222-2222-2222-222222222222",
+            "incident_id": "11111111-1111-1111-1111-111111111111",
+            "confidence": 0.93,
+            "metadata": {
+                "reasoning": "Rollback selected from runbook and deployment timeline.",
+            },
+        },
+    }
+
+    with pytest.raises(module.PolicyViolation):
+        module._validate_auto_execution_policy(payload)
+
+
+def test_build_policy_blocked_action_returns_structured_skip() -> None:
+    module = load_remediation_app_module()
+
+    payload = {
+        "recommendation": {
+            "id": "22222222-2222-2222-2222-222222222222",
+            "incident_id": "11111111-1111-1111-1111-111111111111",
+        }
+    }
+
+    action = module._build_policy_blocked_action(payload, "auto execution blocked: confidence below threshold")
+
+    assert action is not None
+    assert str(action.incident_id) == "11111111-1111-1111-1111-111111111111"
+    assert action.action_type == "policy-blocked"
+    assert action.status.value == "skipped"
+    assert action.metadata.get("policy_blocked") is True

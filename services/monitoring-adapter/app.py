@@ -8,13 +8,14 @@ import sys
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from urllib.parse import urlparse
 from uuid import UUID
 
 from common.config import get_settings
 from common.database import create_engine, create_schema, create_session_factory
-from common.event_publishers import build_event_envelope
+from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.logging import get_logger
 from common.models import (
     Alert,
@@ -28,6 +29,7 @@ from common.models import (
 )
 from common.repository import IncidentRepository
 from common.service import create_app
+from common.telemetry import EVENT_CONTRACTS_EMITTED, EVENT_PUBLISH_LATENCY
 from common.topics import RAW_ALERTS
 from common.prompts import PROMPT_SUMMARIZE_RCA
 from fastapi import Body, Header, HTTPException
@@ -1756,7 +1758,13 @@ def _build_alert_from_payload(payload: dict[str, Any], trace_id: str | None = No
 
 
 async def _publish_ingested_alert(alert: Alert) -> None:
-    await app.state.producer.publish(RAW_ALERTS, alert, key=alert.service)
+    payload = _build_raw_alert_event_payload(alert)
+    started = perf_counter()
+    await app.state.producer.publish(RAW_ALERTS, payload, key=alert.service)
+    EVENT_PUBLISH_LATENCY.labels(settings.service_name, RAW_ALERTS, "monitoring-adapter").observe(
+        max(0.0, perf_counter() - started)
+    )
+    EVENT_CONTRACTS_EMITTED.labels(settings.service_name, RAW_ALERTS, "monitoring-adapter", "v1").inc()
     RECENT_ALERTS.appendleft(
         {
             "id": str(alert.id),
@@ -1772,6 +1780,35 @@ async def _publish_ingested_alert(alert: Alert) -> None:
             "created_at": alert.created_at.isoformat(),
         }
     )
+
+
+def _build_raw_alert_event_payload(alert: Alert) -> dict[str, Any]:
+    incident_hint = str(alert.id)
+    event_contract = build_agent_event_contract(
+        flow_id=incident_hint,
+        incident_id=incident_hint,
+        trace_id=str(alert.trace_id or ""),
+        correlation_id=str(alert.correlation_id or "") or None,
+        agent="monitoring-adapter",
+        payload={
+            "source": alert.source,
+            "name": alert.name,
+            "service": alert.service,
+            "severity": alert.severity.value,
+            "topic": RAW_ALERTS,
+        },
+        metadata={
+            "environment": alert.environment,
+        },
+        confidence=1.0,
+        reasoning="raw alert accepted by monitoring adapter ingestion endpoint",
+        citations=[f"alert://{alert.id}"],
+        evidence_ids=[f"alert:{alert.id}"],
+    )
+    return {
+        "alert": alert,
+        "event_contract": event_contract,
+    }
 
 
 @app.post("/alerts", response_model=Alert)
@@ -1921,7 +1958,13 @@ async def get_processed_result(alert_id: str) -> dict[str, Any]:
 @app.post("/sample/payment-latency", response_model=Alert)
 async def sample_payment_latency(x_trace_id: str | None = Header(default=None)) -> Alert:
     alert = build_payment_latency_alert(trace_id=x_trace_id)
-    await app.state.producer.publish(RAW_ALERTS, alert, key=alert.service)
+    payload = _build_raw_alert_event_payload(alert)
+    started = perf_counter()
+    await app.state.producer.publish(RAW_ALERTS, payload, key=alert.service)
+    EVENT_PUBLISH_LATENCY.labels(settings.service_name, RAW_ALERTS, "monitoring-adapter").observe(
+        max(0.0, perf_counter() - started)
+    )
+    EVENT_CONTRACTS_EMITTED.labels(settings.service_name, RAW_ALERTS, "monitoring-adapter", "v1").inc()
     return alert
 
 

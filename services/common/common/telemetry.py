@@ -21,6 +21,26 @@ REQUEST_LATENCY = Histogram(
     "Application request latency by service and operation",
     ["service", "operation"],
 )
+EVENT_PUBLISH_LATENCY = Histogram(
+    "kaiops_event_publish_latency_seconds",
+    "Event publish latency by service, topic, and producer agent",
+    ["service", "topic", "agent"],
+)
+EVENT_CONTRACTS_EMITTED = Counter(
+    "kaiops_event_contracts_emitted_total",
+    "Count of emitted event contracts by version",
+    ["service", "topic", "agent", "version"],
+)
+AGENT_STAGE_LATENCY = Histogram(
+    "kaiops_agent_stage_latency_seconds",
+    "Agent runtime stage latency in seconds",
+    ["agent", "stage"],
+)
+AGENT_EXECUTIONS = Counter(
+    "kaiops_agent_executions_total",
+    "Agent runtime execution outcomes",
+    ["agent", "status"],
+)
 
 
 def setup_tracing(app, settings: Settings) -> None:

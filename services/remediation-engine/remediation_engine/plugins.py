@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 from common.agentic import AgentContext, BaseAgent
 from common.models import Approval, RemediationAction, RemediationStatus, utc_now
 from common.resilience import CircuitBreaker, circuit_breaker
+from common.tool_registry import ToolRegistry, ToolSpec
 
 
 class RemediationPlugin(Protocol):
@@ -83,7 +84,33 @@ class RemediationEngine(BaseAgent):
             "terraform_rollback": TerraformRollbackPlugin(),
         }
     )
+    tool_registry: ToolRegistry = field(default_factory=ToolRegistry)
     name: str = "automation-agent"
+
+    def __post_init__(self) -> None:
+        if self.tool_registry.tools:
+            return
+
+        async def _build_tool_handler(plugin: RemediationPlugin, payload: dict[str, Any]) -> dict[str, Any]:
+            action_payload = payload.get("action")
+            if not isinstance(action_payload, dict):
+                raise ValueError("tool payload must include 'action'")
+            action = RemediationAction.model_validate(action_payload)
+            completed = await plugin.execute(action)
+            return completed.model_dump(mode="json")
+
+        for action_type, plugin in self.plugins.items():
+            async def handler(payload: dict[str, Any], _plugin: RemediationPlugin = plugin) -> dict[str, Any]:
+                return await _build_tool_handler(_plugin, payload)
+
+            self.tool_registry.register(
+                ToolSpec(
+                    name=action_type,
+                    handler=handler,
+                    timeout_seconds=12.0,
+                    permissions={"automation-agent"},
+                )
+            )
 
     async def can_execute(self, context: AgentContext) -> bool:
         return "approval" in context.previous_agent_results
@@ -128,9 +155,14 @@ class RemediationEngine(BaseAgent):
         )
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        plugin = self.plugins.get(action.action_type, self.plugins["api_execution"])
+        action_type = action.action_type if action.action_type in self.tool_registry.tools else "api_execution"
         try:
-            completed = await plugin.execute(action)
+            payload = await self.tool_registry.execute(
+                action_type,
+                {"action": action.model_dump(mode="json")},
+                role="automation-agent",
+            )
+            completed = RemediationAction.model_validate(payload)
             completed.completed_at = utc_now()
             return completed
         except Exception as exc:

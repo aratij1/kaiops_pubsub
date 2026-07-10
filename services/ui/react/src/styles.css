@@ -452,6 +452,40 @@ h1 {
   display: grid;
   gap: 8px;
 }
+.approval-steps {
+  margin: 10px 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.approval-step {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: linear-gradient(180deg, #f5fbff 0%, #edf6ff 100%);
+  padding: 8px;
+  display: grid;
+  gap: 4px;
+}
+.approval-step strong {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #1d4f82;
+}
+.approval-step span {
+  font-size: 12px;
+  color: var(--muted);
+}
+.approval-controls {
+  margin-top: 8px;
+}
+
+.approval-nav-actions {
+  margin: 8px 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 
 .filter-grid {
   display: grid;
@@ -858,6 +892,9 @@ th {
 
 @media (max-width: 900px) {
   .app-layout {
+    grid-template-columns: 1fr;
+  }
+  .approval-steps {
     grid-template-columns: 1fr;
   }
 

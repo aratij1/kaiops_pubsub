@@ -251,8 +251,16 @@ export default function App() {
   const [submitState, setSubmitState] = useState({ loading: false, result: null, error: "" });
   const [workflowState, setWorkflowState] = useState({ loading: false, result: null, error: "" });
   const [approvalState, setApprovalState] = useState({ loading: false, result: null, error: "" });
+  const [approvalFilter, setApprovalFilter] = useState("all");
+  const [approvalIncidentContext, setApprovalIncidentContext] = useState({
+    loading: false,
+    incident_id: "",
+    payload: null,
+    error: "",
+  });
   const [collapsedGroups, setCollapsedGroups] = useState({ monitor: false, context: false, view: false, sections: false });
   const [selectedAlertId, setSelectedAlertId] = useState("");
+  const [selectedApprovalIncidentId, setSelectedApprovalIncidentId] = useState("");
   const [selectedAlertData, setSelectedAlertData] = useState({ loading: false, payload: null, error: "" });
   const [homeDetailTab, setHomeDetailTab] = useState("summary");
   const [approvalForm, setApprovalForm] = useState({
@@ -1272,9 +1280,175 @@ export default function App() {
     }));
   }, [latestIncidentId, latestRecommendationId]);
 
+  function approvalIncidentId(row) {
+    return String(row?.incident_id || row?.id || row?.alert_id || "").trim();
+  }
+
+  function approvalRecommendationId(row) {
+    return String(
+      row?.recommendation_id
+      || row?.recommended_action_id
+      || row?.remediation_recommendation_id
+      || row?.recommendation?.id
+      || ""
+    ).trim();
+  }
+
+  function approvalFlowId(row) {
+    return String(row?.flow_id || row?.workflow_id || row?.flow || "").trim();
+  }
+
+  function approvalTraceId(row) {
+    return String(row?.trace_id || row?.correlation_id || "").trim();
+  }
+
+  function approvalRecommendationFromPayload(payload) {
+    const normalized = payload && typeof payload === "object" ? payload : {};
+    const recommendation = normalized.recommendation && typeof normalized.recommendation === "object"
+      ? normalized.recommendation
+      : {};
+    return String(
+      normalized.recommendation_id
+      || recommendation.id
+      || normalized.remediation_recommendation_id
+      || normalized.recommended_action_id
+      || ""
+    ).trim();
+  }
+
+  function approvalFlowFromPayload(payload) {
+    const normalized = payload && typeof payload === "object" ? payload : {};
+    const decision = normalized.decision && typeof normalized.decision === "object" ? normalized.decision : {};
+    const recommendation = normalized.recommendation && typeof normalized.recommendation === "object"
+      ? normalized.recommendation
+      : {};
+    return String(
+      normalized.flow_id
+      || decision.flow_id
+      || recommendation.flow_id
+      || normalized.trace_id
+      || recommendation.trace_id
+      || normalized.correlation_id
+      || recommendation.correlation_id
+      || ""
+    ).trim();
+  }
+
+  async function loadApprovalIncidentContext(incidentId) {
+    const normalized = String(incidentId || "").trim();
+    if (!normalized) {
+      return;
+    }
+    setApprovalIncidentContext({ loading: true, incident_id: normalized, payload: null, error: "" });
+    try {
+      const response = await fetchJson(`/api-gateway/approval/incident/${encodeURIComponent(normalized)}`);
+      const payload = unwrap(response);
+      const recommendationId = approvalRecommendationFromPayload(payload);
+      setApprovalIncidentContext({ loading: false, incident_id: normalized, payload, error: "" });
+      if (recommendationId) {
+        setApprovalForm((current) => ({
+          ...current,
+          incident_id: normalized || current.incident_id,
+          recommendation_id: recommendationId || current.recommendation_id,
+        }));
+      }
+    } catch (error) {
+      const raw = String(error?.message || "");
+      const brief = raw.includes("HTTP 502") || raw.includes("500 Internal Server Error")
+        ? "Approval context service is temporarily unavailable. You can continue using selected incident details."
+        : raw;
+      setApprovalIncidentContext({ loading: false, incident_id: normalized, payload: null, error: brief });
+    }
+  }
+
   const pendingApprovals = useMemo(() => {
-    return monitorScopedIncidentMetadata.filter((row) => String(row?.execution_mode || "").toLowerCase() === "human-approval");
+    return monitorScopedIncidentMetadata.filter((row) => {
+      const mode = String(row?.execution_mode || "").toLowerCase();
+      const status = String(row?.status || "").toLowerCase();
+      return mode === "human-approval" || status === "awaiting_approval";
+    });
   }, [monitorScopedIncidentMetadata]);
+
+  const filteredPendingApprovals = useMemo(() => {
+    return pendingApprovals.filter((row) => {
+      if (approvalFilter === "all") {
+        return true;
+      }
+      const severity = String(row?.severity || row?.risk_tier || "").toLowerCase();
+      const status = String(row?.status || "").toLowerCase();
+      if (approvalFilter === "awaiting_approval") {
+        return status === "awaiting_approval";
+      }
+      return severity === approvalFilter;
+    });
+  }, [pendingApprovals, approvalFilter]);
+
+  const selectedApprovalRow = useMemo(() => {
+    return filteredPendingApprovals.find((row) => approvalIncidentId(row) === selectedApprovalIncidentId) || null;
+  }, [filteredPendingApprovals, selectedApprovalIncidentId]);
+
+  const selectedApprovalRecommendationId = useMemo(() => {
+    if (selectedApprovalRow) {
+      const rowRecommendationId = approvalRecommendationId(selectedApprovalRow);
+      if (rowRecommendationId) {
+        return rowRecommendationId;
+      }
+    }
+    if (approvalIncidentContext.incident_id && approvalIncidentContext.incident_id === selectedApprovalIncidentId) {
+      return approvalRecommendationFromPayload(approvalIncidentContext.payload);
+    }
+    return "";
+  }, [selectedApprovalRow, approvalIncidentContext, selectedApprovalIncidentId]);
+
+  const selectedApprovalFlowContext = useMemo(() => {
+    if (selectedApprovalRow) {
+      const rowFlow = approvalFlowId(selectedApprovalRow) || approvalTraceId(selectedApprovalRow);
+      if (rowFlow) {
+        return rowFlow;
+      }
+    }
+    if (approvalIncidentContext.incident_id && approvalIncidentContext.incident_id === selectedApprovalIncidentId) {
+      return approvalFlowFromPayload(approvalIncidentContext.payload);
+    }
+    return "";
+  }, [selectedApprovalRow, approvalIncidentContext, selectedApprovalIncidentId]);
+
+  useEffect(() => {
+    if (!filteredPendingApprovals.length) {
+      if (selectedApprovalIncidentId) {
+        setSelectedApprovalIncidentId("");
+      }
+      return;
+    }
+    const selectedExists = filteredPendingApprovals.some((row) => approvalIncidentId(row) === selectedApprovalIncidentId);
+    if (selectedExists) {
+      return;
+    }
+    setSelectedApprovalIncidentId(approvalIncidentId(filteredPendingApprovals[0]));
+  }, [filteredPendingApprovals, selectedApprovalIncidentId]);
+
+  useEffect(() => {
+    if (!selectedApprovalIncidentId) {
+      return;
+    }
+    loadApprovalIncidentContext(selectedApprovalIncidentId);
+  }, [selectedApprovalIncidentId]);
+
+  function selectApprovalIncident(row) {
+    const incidentId = approvalIncidentId(row);
+    const recommendationId = approvalRecommendationId(row);
+    if (!incidentId) {
+      return;
+    }
+    setSelectedApprovalIncidentId(incidentId);
+    setApprovalForm((current) => ({
+      ...current,
+      incident_id: incidentId || current.incident_id,
+      recommendation_id: recommendationId || current.recommendation_id,
+    }));
+    setApprovalState((current) => ({ ...current, error: "" }));
+    loadApprovalIncidentContext(incidentId);
+  }
 
   const approvalReady = useMemo(() => {
     const hasBase = String(approvalForm.incident_id || "").trim() && String(approvalForm.recommendation_id || "").trim() && String(approvalForm.approver || "").trim();
@@ -1314,27 +1488,27 @@ export default function App() {
 
   const tabs = [
     { id: "home", label: "Dashboard" },
-    { id: "approval", label: "Alerts" },
+    { id: "approval", label: "Human Approval" },
     { id: "executive", label: "Executive Dashboard" },
     { id: "admin", label: "Admin Center" },
     { id: "trace", label: "Agent Flow" },
     { id: "safety", label: "Gateway Safety" },
     { id: "rag", label: "Message Bus" },
     { id: "finops", label: "FinOps" },
-    { id: "closed", label: "Closed Incidents" },
+    { id: "closed", label: "Closed Tickets" },
     { id: "summary", label: "Incident Metadata Explorer" },
   ];
 
   const sidebarSections = [
     { id: "home", icon: "DB", shortLabel: "Dashboard", label: "Dashboard", tone: "ops" },
-    { id: "approval", icon: "AL", shortLabel: "Alerts", label: "Alerts", tone: "risk" },
+    { id: "approval", icon: "AL", shortLabel: "Approval", label: "Human Approval", tone: "risk" },
     { id: "executive", icon: "EX", shortLabel: "Executive", label: "Executive Dashboard", tone: "meta" },
     { id: "admin", icon: "AD", shortLabel: "Admin", label: "Admin Center", tone: "bus" },
     { id: "trace", icon: "AG", shortLabel: "Flow", label: "Agent Flow", tone: "ops" },
     { id: "safety", icon: "GW", shortLabel: "Safety", label: "Gateway Safety", tone: "risk" },
     { id: "rag", icon: "MB", shortLabel: "Bus", label: "Message Bus", tone: "bus" },
     { id: "finops", icon: "FX", shortLabel: "FinOps", label: "FinOps", tone: "cost" },
-    { id: "closed", icon: "CL", shortLabel: "Closed", label: "Closed Incidents", tone: "ops" },
+    { id: "closed", icon: "CL", shortLabel: "Tickets", label: "Closed Tickets", tone: "ops" },
     { id: "summary", icon: "MD", shortLabel: "Metadata", label: "Incident Metadata Explorer", tone: "meta" },
   ];
 
@@ -1417,8 +1591,8 @@ export default function App() {
         refresh: loadIncidentMetadata,
       },
       approval: {
-        title: "Alerts & Quick Docs",
-        caption: "Live incident feed with latest and historical alert views.",
+        title: "Human Approval & Alerts",
+        caption: "Pending approvals, live incident feed, and quick guidance workspace.",
         metrics: [
           ["Recent Alerts", monitorScopedAlerts.length],
           ["Pending", pendingApprovals.length],
@@ -1483,8 +1657,8 @@ export default function App() {
         },
       },
       closed: {
-        title: "Closed Incidents",
-        caption: "Closed incidents plus current closure report details.",
+        title: "Closed Tickets",
+        caption: "Closed tickets plus current closure report details.",
         metrics: [
           ["Closed", closedIncidents.rows.length],
           [
@@ -1776,7 +1950,7 @@ export default function App() {
                 {workflowState.loading ? "Running Flow..." : "Run Selected Flow"}
               </button>
             </div>
-            <p className="keyboard-hint">Shortcuts: Alt+1 Dashboard, Alt+2 Alerts ... Alt+0 Metadata</p>
+            <p className="keyboard-hint">Shortcuts: Alt+1 Dashboard, Alt+2 Human Approval ... Alt+0 Metadata</p>
           </div>
 
           <div className="sidebar-group">
@@ -2574,8 +2748,8 @@ export default function App() {
             <section className="grid single-col">
               <article className="panel">
                 <div className="panel-head">
-                  <h2>Alerts & Quick Docs</h2>
-                  <p>Recent alerts and quick docs style decision workspace.</p>
+                  <h2>Human Approval & Alerts</h2>
+                  <p>Pending approvals, recent alerts, and quick docs decision workspace.</p>
                 </div>
                 <div className="table-wrap">
                   <table>
@@ -2651,12 +2825,64 @@ export default function App() {
                   </table>
                 </div>
 
+                <div className="approval-steps">
+                  <div className="approval-step">
+                    <strong>Step 1</strong>
+                    <span>Select a pending incident from the table below.</span>
+                  </div>
+                  <div className="approval-step">
+                    <strong>Step 2</strong>
+                    <span>Review flow context and action details.</span>
+                  </div>
+                  <div className="approval-step">
+                    <strong>Step 3</strong>
+                    <span>Submit approve, reject, or modify.</span>
+                  </div>
+                </div>
+
+                <div className="filter-grid sticky-controls approval-controls">
+                  <label>
+                    Pending Filter
+                    <select value={approvalFilter} onChange={(e) => setApprovalFilter(e.target.value)}>
+                      <option value="all">all</option>
+                      <option value="awaiting_approval">awaiting_approval</option>
+                      <option value="critical">critical</option>
+                      <option value="high">high</option>
+                      <option value="medium">medium</option>
+                      <option value="low">low</option>
+                    </select>
+                  </label>
+                  <label>
+                    Selected Incident
+                    <input value={selectedApprovalRow ? approvalIncidentId(selectedApprovalRow) : ""} readOnly placeholder="Select from table" />
+                  </label>
+                  <label>
+                    Selected Recommendation
+                    <input value={selectedApprovalRecommendationId} readOnly placeholder="Autofills from selected incident" />
+                  </label>
+                  <label>
+                    Flow Context
+                    <input value={selectedApprovalFlowContext} readOnly placeholder="flow_id, trace_id, or correlation_id" />
+                  </label>
+                </div>
+
+                <div className="approval-nav-actions">
+                  <button className="button-secondary" type="button" onClick={() => setActiveTab("summary")}>Open Incident Metadata</button>
+                  <button className="button-secondary" type="button" onClick={() => setActiveTab("trace")}>Open Agent Flow</button>
+                  <button className="button-secondary" type="button" onClick={() => selectedApprovalIncidentId && loadApprovalIncidentContext(selectedApprovalIncidentId)} disabled={!selectedApprovalIncidentId || approvalIncidentContext.loading}>
+                    {approvalIncidentContext.loading ? "Syncing..." : "Sync From Approval API"}
+                  </button>
+                </div>
+                {approvalIncidentContext.error ? <p className="error">{approvalIncidentContext.error}</p> : null}
+
                 <p className="subtitle">Latest workflow incident: {latestIncidentId || "not available"}</p>
                 <div className="table-wrap">
                   <table>
                     <thead>
                       <tr>
+                        <th>Select</th>
                         <th>Incident</th>
+                        <th>Recommendation</th>
                         <th>Service</th>
                         <th>Severity</th>
                         <th>Execution Mode</th>
@@ -2664,18 +2890,28 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {pendingApprovals.map((row, index) => (
-                        <tr key={row.incident_id || index}>
-                          <td>{row.incident_id || "-"}</td>
+                      {filteredPendingApprovals.map((row, index) => {
+                        const incidentId = approvalIncidentId(row);
+                        const recommendationId = approvalRecommendationId(row);
+                        const selected = incidentId && incidentId === selectedApprovalIncidentId;
+                        return (
+                        <tr key={incidentId || index} className={selected ? "row-selected" : ""}>
+                          <td>
+                            <button className="button-secondary" type="button" onClick={() => selectApprovalIncident(row)}>
+                              {selected ? "Selected" : "Use"}
+                            </button>
+                          </td>
+                          <td>{incidentId || "-"}</td>
+                          <td>{recommendationId || "-"}</td>
                           <td>{row.service || "-"}</td>
                           <td>{row.severity || row.risk_tier || "-"}</td>
                           <td>{row.execution_mode || "-"}</td>
                           <td>{row.status || "pending"}</td>
                         </tr>
-                      ))}
-                      {!pendingApprovals.length ? (
+                      )})}
+                      {!filteredPendingApprovals.length ? (
                         <tr>
-                          <td colSpan={5}>No pending approvals right now.</td>
+                          <td colSpan={7}>No pending approvals for this filter and monitor scope.</td>
                         </tr>
                       ) : null}
                     </tbody>
@@ -2725,6 +2961,9 @@ export default function App() {
                     {approvalState.loading ? "Submitting..." : "Submit Approval Action"}
                   </button>
                 </form>
+                {!String(approvalForm.recommendation_id || "").trim() ? (
+                  <p className="subtitle">Recommendation ID is required by the approval API. Use the table row selector and Sync From Approval API to load it.</p>
+                ) : null}
                 {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
                 {approvalState.result ? <pre className="result">{JSON.stringify(approvalState.result, null, 2)}</pre> : null}
               </article>
@@ -3017,8 +3256,8 @@ export default function App() {
             <section className="grid single-col">
               <article className="panel">
                 <div className="panel-head">
-                  <h2>Closed Incidents</h2>
-                  <p>Closed incidents and current closure report summary.</p>
+                  <h2>Closed Tickets</h2>
+                  <p>Closed tickets and current closure report summary.</p>
                   <button className="button-secondary" onClick={loadClosedIncidents}>Refresh</button>
                 </div>
                 <div className="filter-grid sticky-controls">
