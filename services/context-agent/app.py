@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from common.config import get_settings
-from common.event_publishers import EventPublisher, RabbitMQPublisher
+from common.event_publishers import EventPublisher, RabbitMQPublisher, build_agent_event_contract
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Alert, Context, Incident
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
@@ -52,17 +52,56 @@ async def _publish_context_event(
         provider_used = "rabbitmq"
         selected = publishers.get("rabbitmq", app.state.producer)
 
-    await selected.publish(
-        CONTEXT_EVENTS,
-        {
-            "context": context,
-            "incident": incident,
-            "decision": decision,
-            "transport": provider_used,
-        },
-        key=alert.service,
+    payload = _build_context_event_payload(
+        alert=alert,
+        incident=incident,
+        context=context,
+        decision=decision,
+        provider_used=provider_used,
     )
+    await selected.publish(CONTEXT_EVENTS, payload, key=alert.service)
     return provider_used
+
+
+def _build_context_event_payload(
+    *,
+    alert: Alert,
+    incident: Incident,
+    context: Context,
+    decision: dict[str, Any] | None,
+    provider_used: str,
+) -> dict[str, Any]:
+    decision_payload = decision if isinstance(decision, dict) else {}
+    flow_id = str(decision_payload.get("flow_id") or incident.id)
+    event_contract = build_agent_event_contract(
+        flow_id=flow_id,
+        incident_id=str(incident.id),
+        trace_id=str(incident.trace_id or alert.trace_id or ""),
+        correlation_id=str(alert.correlation_id or "") or None,
+        agent="context-agent",
+        payload={
+            "service": alert.service,
+            "transport_provider": provider_used,
+            "topic": CONTEXT_EVENTS,
+            "rag_document_count": context.metadata.get("rag_documents", 0),
+        },
+        metadata={
+            "workflow": decision_payload.get("workflow"),
+            "requires_approval": decision_payload.get("requires_approval"),
+            "message_bus_provider": decision_payload.get("message_bus_provider"),
+        },
+        confidence=0.8,
+        reasoning="connector fusion across observability, cmdb, and rag context",
+        citations=[f"rag://{alert.service}", "cmdb://dependencies"],
+        evidence_ids=[f"alert:{alert.id}", f"incident:{incident.id}"],
+    )
+    return {
+        "context": context,
+        "incident": incident,
+        "decision": decision,
+        "transport": provider_used,
+        "event_contract": event_contract,
+    }
 
 
 def _build_ingress_consumers() -> list[tuple[str, object, object]]:
@@ -105,7 +144,7 @@ async def startup(app: FastAPI) -> None:
     async def handle(payload: dict) -> None:
         alert = Alert.model_validate(payload["alert"])
         incident = Incident.model_validate(payload["incident"])
-        context = await agent.collect(alert, incident)
+        context = await agent.collect_with_runtime(alert, incident)
         provider = _extract_message_bus_provider(payload)
         provider_used = await _publish_context_event(
             app=app,

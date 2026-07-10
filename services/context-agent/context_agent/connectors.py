@@ -6,10 +6,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from common.agent_runtime import AgentRuntime, ContextFailure
 from common.agentic import AgentContext, BaseAgent
 from common.embeddings import HashingEmbeddingModel, cosine_similarity
 from common.models import Alert, Context, Incident
 from common.resilience import retry_async
+from common.tool_registry import ToolRegistry, ToolSpec
 
 
 class BaseConnector:
@@ -369,6 +371,43 @@ class ContextIntelligenceAgent(BaseAgent):
         ]
     )
     name: str = "context-agent"
+    runtime: AgentRuntime = field(default_factory=AgentRuntime)
+    tool_registry: ToolRegistry = field(default_factory=ToolRegistry)
+
+    def __post_init__(self) -> None:
+        if self.tool_registry.tools:
+            return
+
+        for connector in self.connectors:
+            tool_name = f"connector.{connector.name}"
+
+            async def _handler(payload: dict[str, Any], _connector: BaseConnector = connector) -> dict[str, Any]:
+                alert_payload = payload.get("alert")
+                incident_payload = payload.get("incident")
+                if not isinstance(alert_payload, dict) or not isinstance(incident_payload, dict):
+                    raise ValueError("connector payload must include alert and incident objects")
+                alert = Alert.model_validate(alert_payload)
+                incident = Incident.model_validate(incident_payload)
+                return await _connector.fetch(alert, incident)
+
+            self.tool_registry.register(
+                ToolSpec(
+                    name=tool_name,
+                    handler=_handler,
+                    timeout_seconds=10.0,
+                    permissions={"context-agent"},
+                )
+            )
+
+    async def _run_connector(self, connector: BaseConnector, alert: Alert, incident: Incident) -> dict[str, Any]:
+        return await self.tool_registry.execute(
+            f"connector.{connector.name}",
+            {
+                "alert": alert.model_dump(mode="json"),
+                "incident": incident.model_dump(mode="json"),
+            },
+            role="context-agent",
+        )
 
     async def can_execute(self, context: AgentContext) -> bool:
         return context.alert is not None and context.incident is not None
@@ -376,7 +415,7 @@ class ContextIntelligenceAgent(BaseAgent):
     async def collect(self, alert: Alert, incident: Incident) -> Context:
         results = await asyncio.gather(
             *[
-                retry_async(lambda connector=connector: connector.fetch(alert, incident))
+                retry_async(lambda connector=connector: self._run_connector(connector, alert, incident))
                 for connector in self.connectors
             ]
         )
@@ -432,10 +471,17 @@ class ContextIntelligenceAgent(BaseAgent):
 
     async def execute(self, context: AgentContext) -> Context:
         if context.alert is None or context.incident is None:
-            raise ValueError("AgentContext must include alert and incident")
+            raise ContextFailure("AgentContext must include alert and incident")
         result = await self.collect(context.alert, context.incident)
         context.set_result(self.name, result.model_dump(mode="json"))
         return result
 
     async def validate(self, result: Any) -> bool:
         return isinstance(result, Context)
+
+    async def collect_with_runtime(self, alert: Alert, incident: Incident) -> Context:
+        runtime_context = AgentContext(alert=alert, incident=incident)
+        runtime_result = await self.runtime.run(self, runtime_context)
+        if not isinstance(runtime_result.result, Context):
+            raise ContextFailure("context runtime produced non-context output")
+        return runtime_result.result

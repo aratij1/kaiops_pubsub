@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from common.config import Settings
 from common.logging import get_logger
+from common.models import AgentEventContractV1
 from common.rabbitmq import RabbitMQProducer
 from common.resilience import retry_async
 
@@ -63,12 +64,52 @@ def build_event_envelope(
         "idempotency": idempotency if isinstance(idempotency, dict) else {},
         "payload": payload if isinstance(payload, dict) else {},
     }
+    # Keep compatibility with existing nested envelope while exposing a flat contract-friendly view.
+    envelope["incident_id"] = incident_id
+    envelope["trace_id"] = str(identity_map.get("trace_id") or "")
+    envelope["flow_id"] = str(scope.get("flow_id") if isinstance(scope, dict) else "")
+    envelope["agent"] = str(scope.get("agent") if isinstance(scope, dict) else "")
+    envelope["version"] = schema_version
+    envelope["timestamp"] = envelope["produced_at"]
+    envelope["confidence"] = float((ai or {}).get("confidence") or 0.0)
     if isinstance(ai, dict) and ai:
         envelope["ai"] = ai
 
     if not envelope["idempotency"].get("idempotency_key"):
         envelope["idempotency"]["idempotency_key"] = f"{envelope['event_type']}:{incident_id}"
     return envelope
+
+
+def build_agent_event_contract(
+    *,
+    flow_id: str,
+    incident_id: str,
+    trace_id: str,
+    agent: str,
+    payload: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
+    confidence: float = 0.0,
+    reasoning: str = "",
+    citations: list[str] | None = None,
+    evidence_ids: list[str] | None = None,
+    correlation_id: str | None = None,
+    version: str = "v1",
+) -> dict[str, Any]:
+    event = AgentEventContractV1(
+        flow_id=flow_id,
+        incident_id=incident_id,
+        trace_id=trace_id,
+        correlation_id=correlation_id,
+        agent=agent,
+        version=version,
+        payload=payload,
+        metadata=metadata or {},
+        confidence=confidence,
+        reasoning=reasoning,
+        citations=citations or [],
+        evidence_ids=evidence_ids or [],
+    )
+    return event.model_dump(mode="json")
 
 
 def build_orchestration_envelope(
