@@ -134,6 +134,7 @@ services:
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./observability/alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
+      - ./rag/changes/prometheus_rules:/etc/prometheus/generated-rules:ro
       - prometheus-data:/prometheus
     depends_on:
       api-gateway: { condition: service_healthy }
