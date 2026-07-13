@@ -6,10 +6,11 @@ import re
 from typing import Any
 
 from common.config import get_settings
-from common.event_publishers import EventPublisher, RabbitMQPublisher, build_agent_event_contract
+from common.event_publishers import EventPublisher, RabbitMQPublisher, build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Alert, Context, Incident
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
+from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
 from common.topics import CONTEXT_EVENTS, ORCHESTRATION_EVENTS
@@ -61,6 +62,68 @@ async def _publish_context_event(
     )
     await selected.publish(CONTEXT_EVENTS, payload, key=alert.service)
     return provider_used
+
+
+async def _persist_context_event(
+    *,
+    app: FastAPI,
+    alert: Alert,
+    incident: Incident,
+    context: Context,
+    decision: dict[str, Any] | None,
+    provider_used: str,
+) -> None:
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        return
+    decision_payload = decision if isinstance(decision, dict) else {}
+    async with app.state.session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_incident_event(
+            build_event_envelope(
+                event_type="incident.context.collected",
+                identity={
+                    "incident_id": str(incident.id),
+                    "alert_id": str(alert.id),
+                    "trace_id": str(incident.trace_id or alert.trace_id or ""),
+                    "correlation_id": str(alert.correlation_id or "") or None,
+                    "causation_id": None,
+                    "parent_event_id": None,
+                },
+                scope={
+                    "tenant_id": "default",
+                    "service": str(alert.service or "unknown"),
+                    "environment": str(alert.environment or "prod"),
+                    "region": None,
+                    "team": str(alert.metadata.get("owner_team") or "") or None,
+                },
+                state={
+                    "severity": str(getattr(alert.severity, "value", alert.severity) or "warning").lower(),
+                    "status": "investigating",
+                    "owner": None,
+                },
+                policy={
+                    "risk_tier": str(decision_payload.get("risk_tier") or "unknown"),
+                    "execution_mode": str(decision_payload.get("execution_mode") or "unknown"),
+                    "requires_approval": decision_payload.get("requires_approval"),
+                    "policy_version": decision_payload.get("policy_version"),
+                    "policy_reason": decision_payload.get("policy_reason"),
+                },
+                transport={
+                    "provider": provider_used,
+                    "channel": CONTEXT_EVENTS,
+                    "partition": None,
+                    "offset": None,
+                    "delivery_tag": None,
+                },
+                payload={
+                    "workflow": decision_payload.get("workflow"),
+                    "deployment": context.deployment,
+                    "related_incidents": len(context.related_incidents),
+                    "dependency_services": len(context.dependency_services),
+                },
+            )
+        )
+        await session.commit()
 
 
 def _build_context_event_payload(
@@ -153,6 +216,14 @@ async def startup(app: FastAPI) -> None:
             incident=incident,
             context=context,
             decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
+        )
+        await _persist_context_event(
+            app=app,
+            alert=alert,
+            incident=incident,
+            context=context,
+            decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
+            provider_used=provider_used,
         )
         EVENTS_PROCESSED.labels(settings.service_name, f"{ORCHESTRATION_EVENTS}:{provider_used}", "ok").inc()
 

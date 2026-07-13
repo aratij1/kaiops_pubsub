@@ -14,6 +14,7 @@ validation, and knowledge capture.
 - Prometheus + MySQL landing pad monitoring setup: [docs/PROMETHEUS_MYSQL_LANDING_PAD_SETUP.md](docs/PROMETHEUS_MYSQL_LANDING_PAD_SETUP.md)
 - Event envelope schema v1: [docs/metadata/event-envelope-v1.schema.json](docs/metadata/event-envelope-v1.schema.json)
 - Docs index and standards overview: [docs/README.md](docs/README.md)
+- Deployment strategy runbook: [docs/DEPLOYMENT_STRATEGY.md](docs/DEPLOYMENT_STRATEGY.md)
 - RAG content governance and templates: [docs/RAG_CONTENT_STANDARD.md](docs/RAG_CONTENT_STANDARD.md)
 - RAG templates: [docs/rag-templates/runbook.template.md](docs/rag-templates/runbook.template.md), [docs/rag-templates/incident.template.md](docs/rag-templates/incident.template.md), [docs/rag-templates/change.template.md](docs/rag-templates/change.template.md), [docs/rag-templates/dependency.template.md](docs/rag-templates/dependency.template.md), [docs/rag-templates/deployment.template.md](docs/rag-templates/deployment.template.md), [docs/rag-templates/sop.template.md](docs/rag-templates/sop.template.md), [docs/rag-templates/onboarding.template.md](docs/rag-templates/onboarding.template.md)
 - RAG metadata validator: [scripts/validate-rag-metadata.py](scripts/validate-rag-metadata.py)

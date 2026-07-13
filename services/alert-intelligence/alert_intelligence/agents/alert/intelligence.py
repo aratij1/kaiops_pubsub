@@ -59,7 +59,7 @@ class AlertIntelligenceAgent(BaseAgent):
 
     def classify_severity(self, alert: Alert) -> Alert:
         text = f"{alert.name} {alert.description}".lower()
-        critical_terms = ("outage", "unavailable", "data loss", "payment", "security")
+        critical_terms = ("outage", "unavailable", "data loss", "security")
         high_terms = ("latency", "error", "saturation", "throttling", "degraded")
         if alert.severity == AlertSeverity.CRITICAL or any(term in text for term in critical_terms):
             alert.severity = AlertSeverity.CRITICAL

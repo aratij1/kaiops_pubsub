@@ -9,6 +9,7 @@ This folder is the canonical home for platform documentation, architecture stand
 - [Orchestration policy](ORCHESTRATION_POLICY.md)
 - [Policy, workflow, and AI orchestrator flow](POLICY_WORKFLOW_AI_ORCHESTRATOR_FLOW.md)
 - [Enterprise hardening plan](ENTERPRISE_HARDENING_PLAN.md)
+- [Deployment strategy](DEPLOYMENT_STRATEGY.md)
 - [Windows update and run guide](WINDOWS_UPDATE_AND_RUN.md)
 
 ## Metadata and Schemas

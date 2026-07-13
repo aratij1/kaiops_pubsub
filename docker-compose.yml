@@ -134,6 +134,7 @@ services:
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./observability/alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
+      - prometheus-data:/prometheus
     depends_on:
       api-gateway: { condition: service_healthy }
       monitoring-adapter: { condition: service_started }
@@ -148,6 +149,7 @@ services:
     ports: ["8001:8000"]
     volumes:
       - ./rag:/app/rag
+      - ./ingested_alerts:/app/ingested_alerts
     depends_on:
       kafka: { condition: service_healthy }
       mysql: { condition: service_healthy }
@@ -272,3 +274,4 @@ services:
 
 volumes:
   mysql-data:
+  prometheus-data:

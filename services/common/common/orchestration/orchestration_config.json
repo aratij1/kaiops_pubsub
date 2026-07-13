@@ -1,6 +1,6 @@
 {
   "policy_version": "policy-v1",
-  "approval_severities": ["high", "critical"],
+  "approval_severities": ["critical"],
   "confidence_guided_execute_threshold": 0.75,
   "confidence_auto_execute_threshold": 0.9,
   "default_correlation_threshold": 0.72,

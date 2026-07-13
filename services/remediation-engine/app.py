@@ -6,7 +6,7 @@ from typing import Any
 
 from common.agent_runtime import PolicyViolation
 from common.config import get_settings
-from common.event_publishers import build_agent_event_contract
+from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
@@ -73,6 +73,80 @@ def _build_remediation_event_payload(
     }
 
 
+async def _persist_remediation_event(
+    *,
+    app: FastAPI,
+    action: RemediationAction,
+    source_payload: dict[str, Any],
+    source: str,
+) -> None:
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        return
+    recommendation = source_payload.get("recommendation", {}) if isinstance(source_payload.get("recommendation"), dict) else {}
+    decision = source_payload.get("decision", {}) if isinstance(source_payload.get("decision"), dict) else {}
+    recommendation_metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
+    orchestration = recommendation_metadata.get("orchestration_decision", {}) if isinstance(recommendation_metadata.get("orchestration_decision"), dict) else {}
+
+    action_status = str(action.status.value or "pending").lower()
+    state_status = "remediating"
+    if action_status == "succeeded":
+        state_status = "validating"
+    elif action_status in {"failed", "rejected"}:
+        state_status = "failed"
+
+    async with app.state.session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_incident_event(
+            build_event_envelope(
+                event_type="incident.remediation.executed",
+                identity={
+                    "incident_id": str(action.incident_id),
+                    "alert_id": None,
+                    "trace_id": str(recommendation.get("trace_id") or ""),
+                    "correlation_id": str(recommendation.get("correlation_id") or "") or None,
+                    "causation_id": None,
+                    "parent_event_id": None,
+                },
+                scope={
+                    "tenant_id": "default",
+                    "service": str(action.target or "unknown"),
+                    "environment": "prod",
+                    "region": None,
+                    "team": None,
+                },
+                state={
+                    "severity": str(recommendation.get("severity") or "warning").lower(),
+                    "status": state_status,
+                    "owner": None,
+                },
+                policy={
+                    "risk_tier": str(decision.get("risk_tier") or orchestration.get("risk_tier") or "unknown"),
+                    "execution_mode": str(decision.get("execution_mode") or orchestration.get("execution_mode") or "unknown"),
+                    "requires_approval": decision.get("requires_approval") if "requires_approval" in decision else orchestration.get("requires_approval"),
+                    "policy_version": action.parameters.get("policy_version") or decision.get("policy_version") or orchestration.get("policy_version") or recommendation_metadata.get("policy_version"),
+                    "policy_reason": action.parameters.get("policy_reason") or decision.get("policy_reason") or orchestration.get("policy_reason") or recommendation_metadata.get("policy_reason"),
+                },
+                transport={
+                    "provider": str(decision.get("message_bus_provider") or orchestration.get("message_bus_provider") or "unknown"),
+                    "channel": REMEDIATION_EVENTS,
+                    "partition": None,
+                    "offset": None,
+                    "delivery_tag": None,
+                },
+                payload={
+                    "source": source,
+                    "approval_id": str(action.approval_id) if action.approval_id else None,
+                    "action_id": str(action.id),
+                    "action_type": action.action_type,
+                    "status": action.status.value,
+                    "output": action.output,
+                    "error": action.error,
+                },
+            )
+        )
+        await session.commit()
+
+
 async def startup(app: FastAPI) -> None:
     workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
     approval_consumers: list[tuple[str, Any, ConsumeRunner]] = []
@@ -99,6 +173,7 @@ async def startup(app: FastAPI) -> None:
         approval_payload = _extract_approval_payload(payload)
         approval = Approval.model_validate(approval_payload)
         action = await execute_approval(approval)
+        await _persist_remediation_event(app=app, action=action, source_payload=payload, source=APPROVAL_EVENTS)
         payload_out = _build_remediation_event_payload(action=action, source_payload=payload, source=APPROVAL_EVENTS)
         await app.state.producer.publish(REMEDIATION_EVENTS, payload_out, key=str(action.incident_id))
         EVENTS_PROCESSED.labels(settings.service_name, APPROVAL_EVENTS, "ok").inc()
@@ -125,6 +200,7 @@ async def startup(app: FastAPI) -> None:
         if approval is None:
             return
         action = await execute_approval(approval)
+        await _persist_remediation_event(app=app, action=action, source_payload=payload, source=RESOLUTION_EVENTS)
         payload_out = _build_remediation_event_payload(action=action, source_payload=payload, source=RESOLUTION_EVENTS)
         await app.state.producer.publish(REMEDIATION_EVENTS, payload_out, key=str(action.incident_id))
         EVENTS_PROCESSED.labels(settings.service_name, RESOLUTION_EVENTS, "ok").inc()

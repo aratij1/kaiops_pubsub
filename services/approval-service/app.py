@@ -7,7 +7,7 @@ from typing import Any
 from uuid import UUID
 
 from common.config import get_settings
-from common.event_publishers import build_agent_event_contract
+from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Approval, ApprovalDecision
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
@@ -211,6 +211,62 @@ async def _store_and_publish(approval: Approval) -> None:
         async with app.state.session_factory() as session:
             repo = IncidentRepository(session)
             await repo.save_approval(approval)
+            pending = PENDING_INCIDENTS.get(str(approval.incident_id), {})
+            recommendation = pending.get("recommendation", {}) if isinstance(pending.get("recommendation"), dict) else {}
+            decision = pending.get("decision", {}) if isinstance(pending.get("decision"), dict) else {}
+            recommendation_id = str(approval.recommendation_id)
+            status = "awaiting_approval"
+            if approval.decision == ApprovalDecision.APPROVED or approval.decision == ApprovalDecision.MODIFIED:
+                status = "remediating"
+            elif approval.decision == ApprovalDecision.REJECTED:
+                status = "failed"
+            await repo.save_incident_event(
+                build_event_envelope(
+                    event_type="incident.approval.recorded",
+                    identity={
+                        "incident_id": str(approval.incident_id),
+                        "alert_id": None,
+                        "trace_id": str(recommendation.get("trace_id") or ""),
+                        "correlation_id": str(recommendation.get("correlation_id") or "") or None,
+                        "causation_id": None,
+                        "parent_event_id": None,
+                    },
+                    scope={
+                        "tenant_id": "default",
+                        "service": str(pending.get("incident", {}).get("service") if isinstance(pending.get("incident"), dict) else "unknown") or "unknown",
+                        "environment": str(pending.get("incident", {}).get("environment") if isinstance(pending.get("incident"), dict) else "prod") or "prod",
+                        "region": None,
+                        "team": None,
+                    },
+                    state={
+                        "severity": str((recommendation.get("severity") or "warning")).lower(),
+                        "status": status,
+                        "owner": str(approval.approver or "") or None,
+                    },
+                    policy={
+                        "risk_tier": str(decision.get("risk_tier") or "unknown"),
+                        "execution_mode": str(decision.get("execution_mode") or "unknown"),
+                        "requires_approval": decision.get("requires_approval"),
+                        "policy_version": approval.metadata.get("policy_version"),
+                        "policy_reason": approval.metadata.get("policy_reason"),
+                    },
+                    transport={
+                        "provider": str(decision.get("message_bus_provider") or "unknown"),
+                        "channel": APPROVAL_EVENTS,
+                        "partition": None,
+                        "offset": None,
+                        "delivery_tag": None,
+                    },
+                    payload={
+                        "recommendation_id": recommendation_id,
+                        "decision": approval.decision.value,
+                        "approver": approval.approver,
+                        "channel": approval.channel,
+                        "comment": approval.comment,
+                        "modified_action": approval.modified_action,
+                    },
+                )
+            )
             await session.commit()
     payload = _build_approval_event_payload(approval)
     await app.state.producer.publish(APPROVAL_EVENTS, payload, key=str(approval.incident_id))
