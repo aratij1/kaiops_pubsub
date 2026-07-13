@@ -2102,6 +2102,27 @@ async def get_onboarding_state() -> OnboardingStateResponse:
     return OnboardingStateResponse(rows=rows)
 
 
+@app.delete("/onboarding/state/{project_name}")
+async def delete_onboarding_state(project_name: str, provider_name: str | None = None) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Database is not enabled for onboarding state deletion")
+
+    normalized_project = str(project_name or "").strip()
+    if not normalized_project:
+        raise HTTPException(status_code=400, detail="project_name is required")
+
+    normalized_provider = str(provider_name or "").strip().lower() or None
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        deleted = await repo.delete_onboarding_state(normalized_project, normalized_provider)
+        await session.commit()
+
+    if deleted <= 0:
+        raise HTTPException(status_code=404, detail="Onboarding state row not found")
+    return {"deleted": deleted, "project_name": normalized_project, "provider_name": normalized_provider}
+
+
 @app.get("/landing-pad/recent")
 async def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 200))
@@ -2296,6 +2317,97 @@ async def get_onboarding_rules_pipeline(workflow_id: str) -> dict[str, Any]:
         "updated_at": latest.get("updated_at"),
         "result": payload.get("result") if isinstance(payload.get("result"), dict) else {},
     }
+
+
+@app.put("/onboarding/rules/pipeline/{workflow_id}")
+async def update_onboarding_rules_pipeline(workflow_id: str, payload: dict[str, Any] = ALERT_BODY) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Database is not enabled for onboarding workflow update")
+
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        rows = await repo.list_onboarding_state()
+        matched = find_pipeline_rows(rows, workflow_id)
+        if not matched:
+            raise HTTPException(status_code=404, detail="Onboarding rule workflow not found")
+
+        latest = matched[-1]
+        connectivity_payload = (
+            dict(latest.get("connectivity_payload", {}))
+            if isinstance(latest.get("connectivity_payload"), dict)
+            else {}
+        )
+        previous_result = connectivity_payload.get("result", {}) if isinstance(connectivity_payload.get("result"), dict) else {}
+        incoming_result = payload.get("result", {}) if isinstance(payload.get("result"), dict) else {}
+        merged_result = {**previous_result, **incoming_result}
+
+        target_project_name = str(payload.get("project_name") or latest.get("project_name") or "").strip()
+        if not target_project_name:
+            raise HTTPException(status_code=400, detail="project_name is required")
+
+        project_payload = latest.get("project_payload", {}) if isinstance(latest.get("project_payload"), dict) else {}
+        if isinstance(payload.get("project"), dict):
+            project_payload = {**project_payload, **payload.get("project", {})}
+
+        connectivity_payload.update(
+            {
+                "workflow_id": workflow_id,
+                "status": str(payload.get("status") or connectivity_payload.get("status") or merged_result.get("status") or "updated"),
+                "pipeline": str(connectivity_payload.get("pipeline") or latest.get("provider_name") or "onboarding_pipeline"),
+                "summary": payload.get("summary") if isinstance(payload.get("summary"), dict) else connectivity_payload.get("summary", {}),
+                "result": merged_result,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+        await repo.save_onboarding_state(
+            project_name=target_project_name,
+            provider_name=str(latest.get("provider_name") or "onboarding_pipeline").strip().lower(),
+            owner_team=str(payload.get("owner_team") or latest.get("owner_team") or "").strip() or None,
+            environment=str(payload.get("environment") or latest.get("environment") or "").strip() or None,
+            region=str(payload.get("region") or latest.get("region") or "").strip() or None,
+            endpoint_url=str(payload.get("endpoint_url") or latest.get("endpoint_url") or "").strip() or None,
+            test_status=str(connectivity_payload.get("status") or latest.get("test_status") or "updated"),
+            test_message=str(payload.get("test_message") or latest.get("test_message") or "Workflow updated by admin"),
+            project_payload=project_payload,
+            connectivity_payload=connectivity_payload,
+            last_tested_at=datetime.now(timezone.utc),
+        )
+        await session.commit()
+
+    return {
+        "workflow_id": workflow_id,
+        "status": connectivity_payload.get("status"),
+        "pipeline": connectivity_payload.get("pipeline"),
+        "project_name": target_project_name,
+        "updated_at": connectivity_payload.get("updated_at"),
+        "result": connectivity_payload.get("result", {}),
+    }
+
+
+@app.delete("/onboarding/rules/pipeline/{workflow_id}")
+async def delete_onboarding_rules_pipeline(workflow_id: str) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Database is not enabled for onboarding workflow delete")
+
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        rows = await repo.list_onboarding_state()
+        matched = find_pipeline_rows(rows, workflow_id)
+        if not matched:
+            raise HTTPException(status_code=404, detail="Onboarding rule workflow not found")
+
+        deleted_total = 0
+        for row in matched:
+            deleted_total += await repo.delete_onboarding_state(
+                str(row.get("project_name") or "").strip(),
+                str(row.get("provider_name") or "").strip().lower() or None,
+            )
+        await session.commit()
+
+    return {"workflow_id": workflow_id, "deleted": deleted_total}
 
 
 @app.post("/sample/payment-latency/workflow")

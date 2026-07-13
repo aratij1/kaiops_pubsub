@@ -379,6 +379,24 @@ async def get_onboarding_state(
     )
 
 
+@app.delete("/onboarding/state/{project_name}")
+async def delete_onboarding_state(
+    project_name: str,
+    request: Request,
+    provider_name: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    query_suffix = f"?{urlencode({'provider_name': provider_name})}" if provider_name else ""
+    return await guarded_proxy(
+        request=request,
+        method="DELETE",
+        path=f"/onboarding/state/{project_name}{query_suffix}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/onboarding/rules/capabilities")
 async def get_onboarding_rule_capabilities(
     request: Request,
@@ -435,6 +453,39 @@ async def get_onboarding_rules_pipeline(
     return await guarded_proxy(
         request=request,
         method="GET",
+        path=f"/onboarding/rules/pipeline/{workflow_id}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.put("/onboarding/rules/pipeline/{workflow_id}")
+async def put_onboarding_rules_pipeline(
+    workflow_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="PUT",
+        path=f"/onboarding/rules/pipeline/{workflow_id}",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.delete("/onboarding/rules/pipeline/{workflow_id}")
+async def delete_onboarding_rules_pipeline(
+    workflow_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="DELETE",
         path=f"/onboarding/rules/pipeline/{workflow_id}",
         target_base=settings.monitoring_adapter_url,
         payload={},
