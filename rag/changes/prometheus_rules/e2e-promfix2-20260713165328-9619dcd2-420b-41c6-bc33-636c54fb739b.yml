@@ -1,0 +1,35 @@
+groups:
+- name: e2e-promfix2-20260713165328-generated-rules
+  rules:
+  - alert: e2e-promfix2-20260713165328-cpu-usage-percent-warning-prometheus
+    expr: avg_over_time(cpu_usage_percent[5m]) > 81.0
+    for: 5m
+    labels:
+      severity: warning
+      project: e2e-promfix2-20260713165328
+      environment: prod
+    annotations:
+      summary: Alert when CPU usage is above 81 for 5 minutes
+      description: Generated from plain-language onboarding for project e2e-promfix2-20260713165328.
+  - alert: e2e-promfix2-20260713165328-request-latency-ms-p95-warning-prometheus
+    expr: quantile_over_time(0.95, request_latency_ms_p95[10m]) > 1500.0
+    for: 10m
+    labels:
+      severity: warning
+      project: e2e-promfix2-20260713165328
+      environment: prod
+    annotations:
+      summary: Alert when p95 latency is above 1500 for 10 minutes
+      description: Generated from plain-language onboarding for project e2e-promfix2-20260713165328.
+  - alert: e2e-promfix2-20260713165328-onboarding-smoke-test
+    expr: vector(1)
+    for: 0m
+    labels:
+      severity: info
+      project: e2e-promfix2-20260713165328
+      environment: prod
+      onboarding_test: 'true'
+    annotations:
+      summary: e2e-promfix2-20260713165328 onboarding smoke test
+      description: Auto-generated alert used to verify Prometheus rule loading and
+        alert flow.

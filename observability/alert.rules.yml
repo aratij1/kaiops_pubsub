@@ -67,3 +67,15 @@ groups:
         annotations:
           summary: "MySQL connections are high"
           description: "MySQL threads_connected is {{ $value }} which is above threshold 150."
+
+      - alert: KaiOpsMySQLAlertsTableRowsHigh
+        expr: kaiops_mysql_alerts_table_rows{database="kaiops", table="alerts"} > 20
+        for: 1m
+        labels:
+          severity: warning
+          category: database
+          project: kaiops-core
+          service: mysql
+        annotations:
+          summary: "KaiOps alerts table row count is high"
+          description: "alerts table has {{ $value }} rows, above threshold 20 for kaiops-core."

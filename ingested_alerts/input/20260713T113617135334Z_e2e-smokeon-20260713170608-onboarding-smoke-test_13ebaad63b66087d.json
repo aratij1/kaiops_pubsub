@@ -1,0 +1,46 @@
+{
+  "received_at": "2026-07-13T11:36:17.135334+00:00",
+  "source": "prometheus-alertmanager",
+  "alert": {
+    "source": "prometheus-alertmanager",
+    "name": "e2e-smokeon-20260713170608-onboarding-smoke-test",
+    "service": "kaiops-platform",
+    "environment": "prod",
+    "severity": "info",
+    "description": "Auto-generated alert used to verify Prometheus rule loading and alert flow.",
+    "labels": {
+      "alertname": "e2e-smokeon-20260713170608-onboarding-smoke-test",
+      "environment": "prod",
+      "onboarding_test": "true",
+      "project": "e2e-smokeon-20260713170608",
+      "severity": "info",
+      "alert_status": "firing",
+      "alert_fingerprint": "13ebaad63b66087d"
+    },
+    "annotations": {
+      "description": "Auto-generated alert used to verify Prometheus rule loading and alert flow.",
+      "summary": "e2e-smokeon-20260713170608 onboarding smoke test",
+      "startsAt": "2026-07-13T11:36:12.078Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://083644d185d4:9090/graph?g0.expr=vector%281%29&g0.tab=1"
+    }
+  },
+  "raw": {
+    "status": "firing",
+    "labels": {
+      "alertname": "e2e-smokeon-20260713170608-onboarding-smoke-test",
+      "environment": "prod",
+      "onboarding_test": "true",
+      "project": "e2e-smokeon-20260713170608",
+      "severity": "info"
+    },
+    "annotations": {
+      "description": "Auto-generated alert used to verify Prometheus rule loading and alert flow.",
+      "summary": "e2e-smokeon-20260713170608 onboarding smoke test"
+    },
+    "startsAt": "2026-07-13T11:36:12.078Z",
+    "endsAt": "0001-01-01T00:00:00Z",
+    "generatorURL": "http://083644d185d4:9090/graph?g0.expr=vector%281%29&g0.tab=1",
+    "fingerprint": "13ebaad63b66087d"
+  }
+}

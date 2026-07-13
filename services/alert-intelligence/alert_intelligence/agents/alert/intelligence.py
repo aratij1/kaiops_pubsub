@@ -61,9 +61,16 @@ class AlertIntelligenceAgent(BaseAgent):
         text = f"{alert.name} {alert.description}".lower()
         critical_terms = ("outage", "unavailable", "data loss", "security")
         high_terms = ("latency", "error", "saturation", "throttling", "degraded")
-        if alert.severity == AlertSeverity.CRITICAL or any(term in text for term in critical_terms):
+        threshold_breach_terms = ("above threshold", "threshold exceeded", "breach")
+        has_high_signal = any(term in text for term in high_terms)
+        has_threshold_breach = any(term in text for term in threshold_breach_terms)
+        if (
+            alert.severity == AlertSeverity.CRITICAL
+            or any(term in text for term in critical_terms)
+            or (has_high_signal and has_threshold_breach)
+        ):
             alert.severity = AlertSeverity.CRITICAL
-        elif alert.severity == AlertSeverity.HIGH or any(term in text for term in high_terms):
+        elif alert.severity == AlertSeverity.HIGH or has_high_signal:
             alert.severity = AlertSeverity.HIGH
         elif "warn" in text:
             alert.severity = AlertSeverity.WARNING

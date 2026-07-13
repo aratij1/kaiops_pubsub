@@ -49,6 +49,7 @@ const TAB_SHORTCUT_MAP = {
   Digit0: "summary",
 };
 const VALID_TABS = new Set(Object.values(TAB_SHORTCUT_MAP));
+const MONITORING_TOOL_OPTIONS = ["prometheus", "new_relic", "datadog"];
 
 const ROLE_ALLOWED_TABS = {
   administrator: ["home", "copilot", "approval", "executive", "admin", "trace", "safety", "rag", "finops", "closed", "summary"],
@@ -63,6 +64,28 @@ function normalizeRoleName(value) {
     .trim()
     .toLowerCase()
     .replace(/\s+/g, "_");
+}
+
+function simplifyMonitoringUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+  return withScheme.replace(/\/+$/, "");
+}
+
+function extractMonitoringToolAndUrl(source, fallbackTool = "prometheus", fallbackUrl = "") {
+  const payload = source && typeof source === "object" ? source : {};
+  const provider = String(payload.selected_provider || payload.provider || fallbackTool || "prometheus").trim().toLowerCase();
+  const tool = MONITORING_TOOL_OPTIONS.includes(provider) ? provider : fallbackTool;
+  const urlsByTool = {
+    prometheus: simplifyMonitoringUrl(payload.prometheus_url),
+    new_relic: simplifyMonitoringUrl(payload.new_relic_url),
+    datadog: simplifyMonitoringUrl(payload.datadog_url),
+  };
+  const url = urlsByTool[tool] || urlsByTool.prometheus || urlsByTool.new_relic || urlsByTool.datadog || simplifyMonitoringUrl(fallbackUrl);
+  return { tool, url };
 }
 
 function looksLikeUuid(value) {
@@ -438,6 +461,22 @@ function percentile(values, fraction) {
   return nums[index];
 }
 
+function normalizeUsageRow(row) {
+  const entry = row && typeof row === "object" ? row : {};
+  const inputTokens = toFiniteNumber(entry.input_tokens);
+  const outputTokens = toFiniteNumber(entry.output_tokens);
+  const totalTokens = toFiniteNumber(entry.total_tokens || (inputTokens + outputTokens));
+  return {
+    task: entry.task || entry.agent || entry.service || entry.action || "-",
+    provider: entry.provider || entry.vendor || "unknown",
+    model: entry.model || entry.model_name || "unknown",
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: totalTokens,
+    total_cost_usd: toFiniteNumber(entry.total_cost_usd || entry.cost_usd),
+  };
+}
+
 function HorizontalBarChart({ title, subtitle, items }) {
   const safeItems = Array.isArray(items) ? items : [];
   const maxValue = safeItems.reduce((best, item) => Math.max(best, toFiniteNumber(item?.value)), 0);
@@ -740,6 +779,8 @@ export default function App() {
     environment: "prod",
     region: "us-east-1",
     deployment_mode: "on_prem",
+    monitoring_tool: "prometheus",
+    monitoring_url: "http://prometheus.local:9090",
     prometheus_url: "http://prometheus.local:9090",
     new_relic_url: "",
     datadog_url: "",
@@ -751,6 +792,8 @@ export default function App() {
     vertex_model_armor_template: "",
     assignment_username: "",
     assignment_project: "",
+    start_rule_onboarding: false,
+    rule_onboarding_plain_language: "",
   });
   const [onboardingState, setOnboardingState] = useState({ loading: false, connectivity: {}, rows: [], error: "", success: "" });
   const [onboardingRuleCapabilities, setOnboardingRuleCapabilities] = useState({ loading: false, rows: [], error: "" });
@@ -777,19 +820,18 @@ export default function App() {
       "Alert if CPU stays above 80% for more than 5 minutes with high severity",
       "Alert when latency is over 2000 for 10 minutes critical",
     ].join("\n"),
-    target_platforms_csv: "prometheus, datadog",
-    discovery_json: JSON.stringify(
-      {
-        kubernetes: {
-          namespaces: ["default"],
-          services: ["payments-api"],
-        },
-      },
-      null,
-      2,
-    ),
+    selected_tool: "prometheus",
   });
+  const [onboardingProjectMode, setOnboardingProjectMode] = useState("existing");
   const [onboardingRuleRunState, setOnboardingRuleRunState] = useState({ loading: false, result: null, error: "" });
+  const [onboardingWorkflowSteps, setOnboardingWorkflowSteps] = useState([]);
+  const [onboardingGeneratedDocs, setOnboardingGeneratedDocs] = useState([]);
+  const [onboardingDocApprovalState, setOnboardingDocApprovalState] = useState({
+    loading: false,
+    error: "",
+    success: "",
+    approved: false,
+  });
   const [onboardingRuleLookup, setOnboardingRuleLookup] = useState({ workflow_id: "", loading: false, result: null, error: "" });
   const [selectedOnboardingProject, setSelectedOnboardingProject] = useState("");
   const [onboardingRuleEditor, setOnboardingRuleEditor] = useState({
@@ -1377,6 +1419,7 @@ export default function App() {
     }
     const projectPayload = row.project_payload && typeof row.project_payload === "object" ? row.project_payload : {};
     const connectivityPayload = row.connectivity_payload && typeof row.connectivity_payload === "object" ? row.connectivity_payload : {};
+    const monitoring = extractMonitoringToolAndUrl(connectivityPayload);
     setSelectedOnboardingProject(String(row.project_name || projectPayload.name || "").trim());
     setOnboardingForm((curr) => ({
       ...curr,
@@ -1385,16 +1428,106 @@ export default function App() {
       environment: String(row.environment || projectPayload.environment || curr.environment || "prod").trim(),
       region: String(row.region || projectPayload.region || curr.region || "").trim(),
       deployment_mode: String(connectivityPayload.deployment_mode || curr.deployment_mode || "on_prem").trim(),
-      prometheus_url: String(connectivityPayload.prometheus_url || curr.prometheus_url || "").trim(),
-      new_relic_url: String(connectivityPayload.new_relic_url || curr.new_relic_url || "").trim(),
-      datadog_url: String(connectivityPayload.datadog_url || curr.datadog_url || "").trim(),
+      monitoring_tool: monitoring.tool,
+      monitoring_url: monitoring.url,
+      prometheus_url: monitoring.tool === "prometheus" ? monitoring.url : "",
+      new_relic_url: monitoring.tool === "new_relic" ? monitoring.url : "",
+      datadog_url: monitoring.tool === "datadog" ? monitoring.url : "",
       gcp_project_id: String(connectivityPayload.gcp_project_id || curr.gcp_project_id || "").trim(),
       gcp_region: String(connectivityPayload.gcp_region || curr.gcp_region || "").trim(),
       pubsub_topic: String(connectivityPayload.pubsub_topic || curr.pubsub_topic || "").trim(),
       pubsub_subscription: String(connectivityPayload.pubsub_subscription || curr.pubsub_subscription || "").trim(),
       vertex_model_armor_enabled: Boolean(connectivityPayload.vertex_model_armor_enabled ?? curr.vertex_model_armor_enabled),
       vertex_model_armor_template: String(connectivityPayload.vertex_model_armor_template || curr.vertex_model_armor_template || "").trim(),
+      assignment_project: String(row.project_name || projectPayload.name || curr.name || "").trim(),
     }));
+    setOnboardingProjectMode("existing");
+    setExistingRulePipelineForm((curr) => ({
+      ...curr,
+      platform: monitoring.tool,
+      connection_url: monitoring.url,
+    }));
+    setNewRulePipelineForm((curr) => ({
+      ...curr,
+      selected_tool: monitoring.tool,
+    }));
+  }
+
+  function resetNewProjectOnboardingDraft() {
+    setSelectedOnboardingProject("");
+    setOnboardingWorkflowSteps([]);
+    setOnboardingGeneratedDocs([]);
+    setOnboardingDocApprovalState({ loading: false, error: "", success: "", approved: false });
+    setOnboardingForm((curr) => ({
+      ...curr,
+      name: "",
+      owner_team: "",
+      environment: "prod",
+      region: curr.region || "us-east-1",
+      monitoring_tool: curr.monitoring_tool || "prometheus",
+      monitoring_url: "",
+      prometheus_url: "",
+      new_relic_url: "",
+      datadog_url: "",
+      assignment_username: "",
+      assignment_project: "",
+      start_rule_onboarding: false,
+      rule_onboarding_plain_language: "",
+    }));
+  }
+
+  async function ingestGeneratedOnboardingDocuments(documents) {
+    const rows = Array.isArray(documents) ? documents : [];
+    if (!rows.length) {
+      return { total: 0, ingested: 0, failed: 0 };
+    }
+
+    let ingested = 0;
+    let failed = 0;
+    for (const row of rows) {
+      try {
+        await fetchJson("/api-gateway/rag/documents", {
+          method: "POST",
+          body: JSON.stringify(row),
+        });
+        ingested += 1;
+      } catch (_error) {
+        failed += 1;
+      }
+    }
+    if (ingested > 0) {
+      await loadRagDocs();
+    }
+    return { total: rows.length, ingested, failed };
+  }
+
+  async function approveGeneratedOnboardingDocuments() {
+    const docs = Array.isArray(onboardingGeneratedDocs) ? onboardingGeneratedDocs : [];
+    if (!docs.length) {
+      return;
+    }
+    setOnboardingDocApprovalState({ loading: true, error: "", success: "", approved: false });
+    try {
+      const summary = await ingestGeneratedOnboardingDocuments(docs);
+      if (summary.failed > 0) {
+        setOnboardingDocApprovalState({
+          loading: false,
+          error: `Approved, but ${summary.failed} document(s) failed to ingest.`,
+          success: "",
+          approved: false,
+        });
+        return;
+      }
+      setOnboardingDocApprovalState({
+        loading: false,
+        error: "",
+        success: `Approved and ingested ${summary.ingested}/${summary.total} document(s).`,
+        approved: true,
+      });
+      setOnboardingState((current) => ({ ...current, success: `Project onboarding saved. Documents approved: ${summary.ingested}/${summary.total}.` }));
+    } catch (error) {
+      setOnboardingDocApprovalState({ loading: false, error: error.message, success: "", approved: false });
+    }
   }
 
   function openRuleWorkflowEditor(row) {
@@ -1491,6 +1624,7 @@ export default function App() {
       const preferredProjectRow = projectRows.find((row) => String(row?.project_name || "").trim() === preferredProjectName)
         || projectRows[0]
         || null;
+      const monitoring = extractMonitoringToolAndUrl(connectivity);
       setOnboardingForm((curr) => ({
         ...curr,
         name: String(project?.name || curr.name || "").trim(),
@@ -1498,17 +1632,22 @@ export default function App() {
         environment: String(project?.environment || curr.environment || "prod").trim(),
         region: String(project?.region || curr.region || "").trim(),
         deployment_mode: String(connectivity?.deployment_mode || curr.deployment_mode || "on_prem").trim(),
-        prometheus_url: String(connectivity?.prometheus_url || curr.prometheus_url || "").trim(),
-        new_relic_url: String(connectivity?.new_relic_url || curr.new_relic_url || "").trim(),
-        datadog_url: String(connectivity?.datadog_url || curr.datadog_url || "").trim(),
+        monitoring_tool: monitoring.tool,
+        monitoring_url: monitoring.url,
+        prometheus_url: monitoring.tool === "prometheus" ? monitoring.url : "",
+        new_relic_url: monitoring.tool === "new_relic" ? monitoring.url : "",
+        datadog_url: monitoring.tool === "datadog" ? monitoring.url : "",
         gcp_project_id: String(connectivity?.gcp_project_id || curr.gcp_project_id || "").trim(),
         gcp_region: String(connectivity?.gcp_region || curr.gcp_region || "").trim(),
         pubsub_topic: String(connectivity?.pubsub_topic || curr.pubsub_topic || "").trim(),
         pubsub_subscription: String(connectivity?.pubsub_subscription || curr.pubsub_subscription || "").trim(),
         vertex_model_armor_enabled: Boolean(connectivity?.vertex_model_armor_enabled ?? curr.vertex_model_armor_enabled),
         vertex_model_armor_template: String(connectivity?.vertex_model_armor_template || curr.vertex_model_armor_template || "").trim(),
+        assignment_project: String(project?.name || curr.name || "").trim(),
       }));
-      if (preferredProjectRow) {
+      setExistingRulePipelineForm((curr) => ({ ...curr, platform: monitoring.tool, connection_url: monitoring.url }));
+      setNewRulePipelineForm((curr) => ({ ...curr, selected_tool: monitoring.tool }));
+      if (preferredProjectRow && onboardingProjectMode !== "new") {
         applyProjectOnboardingRow(preferredProjectRow);
       } else if (String(project?.name || "").trim()) {
         setSelectedOnboardingProject(String(project.name).trim());
@@ -1521,11 +1660,31 @@ export default function App() {
 
   async function saveOnboardingConnectivity(event) {
     event.preventDefault();
+    const pendingApprovalDocs = Array.isArray(onboardingGeneratedDocs) ? onboardingGeneratedDocs : [];
+    const hasPendingApproval = pendingApprovalDocs.length > 0 && !Boolean(onboardingDocApprovalState.approved);
+    if (hasPendingApproval) {
+      setOnboardingState((current) => ({
+        ...current,
+        loading: false,
+        error: "Please review and approve generated documents before creating/updating another project.",
+        success: "",
+      }));
+      return;
+    }
     setOnboardingState((current) => ({ ...current, loading: true, error: "", success: "" }));
+    setOnboardingGeneratedDocs([]);
+    setOnboardingDocApprovalState({ loading: false, error: "", success: "", approved: false });
     try {
+      const selectedMonitoringTool = String(onboardingForm.monitoring_tool || "prometheus").trim().toLowerCase();
+      const monitoringUrl = simplifyMonitoringUrl(onboardingForm.monitoring_url);
       const username = String(onboardingForm.assignment_username || "").trim();
-      const assignmentProject = String(onboardingForm.assignment_project || "").trim();
+      const assignmentProject = String(onboardingForm.name || "").trim();
       const userAssignments = username && assignmentProject ? { [username]: [assignmentProject] } : {};
+      const monitoringUrls = {
+        prometheus_url: selectedMonitoringTool === "prometheus" ? monitoringUrl : "",
+        new_relic_url: selectedMonitoringTool === "new_relic" ? monitoringUrl : "",
+        datadog_url: selectedMonitoringTool === "datadog" ? monitoringUrl : "",
+      };
       const payload = {
         project: {
           name: String(onboardingForm.name || "").trim(),
@@ -1534,9 +1693,7 @@ export default function App() {
           region: String(onboardingForm.region || "").trim(),
         },
         deployment_mode: String(onboardingForm.deployment_mode || "on_prem").trim(),
-        prometheus_url: String(onboardingForm.prometheus_url || "").trim(),
-        new_relic_url: String(onboardingForm.new_relic_url || "").trim(),
-        datadog_url: String(onboardingForm.datadog_url || "").trim(),
+        ...monitoringUrls,
         gcp_project_id: String(onboardingForm.gcp_project_id || "").trim(),
         gcp_region: String(onboardingForm.gcp_region || "").trim(),
         pubsub_topic: String(onboardingForm.pubsub_topic || "").trim(),
@@ -1544,21 +1701,74 @@ export default function App() {
         vertex_model_armor_enabled: Boolean(onboardingForm.vertex_model_armor_enabled),
         vertex_model_armor_template: String(onboardingForm.vertex_model_armor_template || "").trim(),
         user_assignments: userAssignments,
+        active_provider: selectedMonitoringTool,
       };
-      await fetchJson("/api-gateway/onboarding/connectivity", {
+
+      const plainLanguageRequirements = String(onboardingForm.rule_onboarding_plain_language || "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const shouldStartRuleOnboarding = Boolean(onboardingForm.start_rule_onboarding) && plainLanguageRequirements.length > 0;
+
+      const response = await fetchJson("/api-gateway/onboarding/complete", {
         method: "POST",
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          project_mode: onboardingProjectMode === "new" ? "new" : "existing",
+          connectivity: payload,
+          start_rules_onboarding: shouldStartRuleOnboarding,
+          plain_language_requirements: plainLanguageRequirements,
+          selected_monitoring_tool: selectedMonitoringTool,
+          generate_documents: true,
+        }),
       });
+
+      const completePayload = unwrap(response);
+      const workflowSteps = Array.isArray(completePayload?.workflow_steps) ? completePayload.workflow_steps : [];
+      setOnboardingWorkflowSteps(workflowSteps);
+      setOnboardingForm((curr) => ({
+        ...curr,
+        monitoring_tool: selectedMonitoringTool,
+        monitoring_url: monitoringUrl,
+        assignment_project: String(curr.name || "").trim(),
+        ...monitoringUrls,
+      }));
+
+      const rulesOnboarding = completePayload?.rules_onboarding || {};
+      if (rulesOnboarding?.started && rulesOnboarding?.result) {
+        const ruleResult = rulesOnboarding.result;
+        setOnboardingRuleRunState({ loading: false, result: ruleResult, error: "" });
+        setOnboardingRuleLookup((current) => ({
+          ...current,
+          workflow_id: String(rulesOnboarding.workflow_id || ruleResult?.workflow_id || current.workflow_id || "").trim(),
+        }));
+      } else {
+        setOnboardingRuleRunState((current) => ({ ...current, loading: false }));
+      }
+      const generatedDocs = Array.isArray(completePayload?.rag_documents) ? completePayload.rag_documents : [];
+      setOnboardingGeneratedDocs(generatedDocs);
+
       setSelectedOnboardingProject(String(payload.project.name || "").trim());
+      if (onboardingProjectMode === "new") {
+        setOnboardingProjectMode("existing");
+      }
       await loadOnboardingAdminData();
-      setOnboardingState((current) => ({ ...current, success: "Project onboarding saved." }));
+      setOnboardingState((current) => ({
+        ...current,
+        success: shouldStartRuleOnboarding
+          ? generatedDocs.length
+            ? `Workflow completed through step ${workflowSteps.length || 0}. Review generated documents and click Approve.`
+            : `Workflow completed through step ${workflowSteps.length || 0}. No documents were generated.`
+          : "Project onboarding saved.",
+      }));
     } catch (error) {
       setOnboardingState((current) => ({ ...current, loading: false, error: error.message, success: "" }));
+      setOnboardingRuleRunState((current) => ({ ...current, loading: false }));
     }
   }
 
   function onboardingProjectSeed() {
     const projectName = String(selectedOnboardingProject || onboardingForm.name || "").trim();
+    const selectedMonitoringTool = String(onboardingForm.monitoring_tool || "prometheus").trim().toLowerCase();
     return {
       project_name: projectName,
       description: "",
@@ -1572,18 +1782,7 @@ export default function App() {
       technology_stack: [],
       cloud_provider: onboardingForm.deployment_mode === "gcp_cloud" ? "gcp" : "on_prem",
       region: String(onboardingForm.region || "").trim(),
-      monitoring_platforms: ["prometheus", "new_relic", "datadog"].filter((platform) => {
-        if (platform === "prometheus") {
-          return Boolean(String(onboardingForm.prometheus_url || "").trim());
-        }
-        if (platform === "new_relic") {
-          return Boolean(String(onboardingForm.new_relic_url || "").trim());
-        }
-        if (platform === "datadog") {
-          return Boolean(String(onboardingForm.datadog_url || "").trim());
-        }
-        return false;
-      }),
+      monitoring_platforms: MONITORING_TOOL_OPTIONS.includes(selectedMonitoringTool) ? [selectedMonitoringTool] : ["prometheus"],
       notification_platforms: ["slack", "teams", "pagerduty"],
     };
   }
@@ -1652,20 +1851,14 @@ export default function App() {
         throw new Error("Provide at least one monitoring requirement.");
       }
 
-      const targetPlatforms = String(newRulePipelineForm.target_platforms_csv || "")
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean);
-
-      let discoveryInputs = {};
-      const rawDiscovery = String(newRulePipelineForm.discovery_json || "").trim();
-      if (rawDiscovery) {
-        const parsed = JSON.parse(rawDiscovery);
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-          throw new Error("Discovery JSON must be an object.");
-        }
-        discoveryInputs = parsed;
-      }
+      const selectedTool = String(newRulePipelineForm.selected_tool || onboardingForm.monitoring_tool || "prometheus").trim().toLowerCase();
+      const targetPlatforms = MONITORING_TOOL_OPTIONS.includes(selectedTool) ? [selectedTool] : ["prometheus"];
+      const discoveryInputs = {
+        endpoint_url: simplifyMonitoringUrl(onboardingForm.monitoring_url),
+        deployment_mode: String(onboardingForm.deployment_mode || "on_prem").trim(),
+        environment: String(onboardingForm.environment || "prod").trim(),
+        generated_from_plain_language: true,
+      };
 
       const payload = {
         project: onboardingProjectSeed(),
@@ -2393,6 +2586,57 @@ export default function App() {
     return [];
   }, [panelWorkflow]);
 
+  const allUsageRows = useMemo(() => {
+    const merged = [];
+
+    const appendUsage = (candidate) => {
+      if (!Array.isArray(candidate)) {
+        return;
+      }
+      candidate.forEach((row) => {
+        merged.push(normalizeUsageRow(row));
+      });
+    };
+
+    appendUsage(panelWorkflowUsage);
+    appendUsage(selectedAlertUsage);
+    appendUsage(latestWorkflow?.finops?.calls);
+    appendUsage(latestWorkflow?.recommendation?.metadata?.model_usage);
+    appendUsage(latestWorkflow?.recommendation?.metadata?.llm_calls);
+
+    monitorScopedIncidentMetadata.forEach((row) => {
+      appendUsage(row?.finops?.calls);
+      appendUsage(row?.model_usage);
+      appendUsage(row?.llm_usage);
+
+      const synthetic = normalizeUsageRow({
+        task: row?.latest_event_type || "incident",
+        provider: row?.provider || row?.llm_provider,
+        model: row?.model || row?.llm_model,
+        input_tokens: row?.input_tokens,
+        output_tokens: row?.output_tokens,
+        total_tokens: row?.total_tokens,
+        total_cost_usd: row?.total_cost_usd || row?.cost_usd,
+      });
+      if (
+        synthetic.provider !== "unknown"
+        || synthetic.model !== "unknown"
+        || synthetic.total_tokens > 0
+        || synthetic.total_cost_usd > 0
+      ) {
+        merged.push(synthetic);
+      }
+    });
+
+    gatewayRecent.rows.forEach((row) => {
+      appendUsage(row?.finops?.calls);
+      appendUsage(row?.model_usage);
+      appendUsage(row?.llm_usage);
+    });
+
+    return merged;
+  }, [panelWorkflowUsage, selectedAlertUsage, latestWorkflow, monitorScopedIncidentMetadata, gatewayRecent.rows]);
+
   useEffect(() => {
     if (activeTab !== "home" || homeDetailTab !== "api") {
       return;
@@ -2545,9 +2789,9 @@ export default function App() {
       || selectedAlertWorkflow?.finops?.totals
       || latestWorkflow?.finops?.totals
       || {};
-    const finopsCalls = toFiniteNumber(finopsTotals?.calls || panelWorkflowUsage.length);
-    const finopsTokens = toFiniteNumber(finopsTotals?.total_tokens || panelWorkflowUsage.reduce((sum, row) => sum + toFiniteNumber(row?.total_tokens || (toFiniteNumber(row?.input_tokens) + toFiniteNumber(row?.output_tokens))), 0));
-    const finopsCost = toFiniteNumber(finopsTotals?.total_cost_usd || panelWorkflowUsage.reduce((sum, row) => sum + toFiniteNumber(row?.total_cost_usd), 0));
+    const finopsCalls = toFiniteNumber(finopsTotals?.calls || allUsageRows.length);
+    const finopsTokens = toFiniteNumber(finopsTotals?.total_tokens || allUsageRows.reduce((sum, row) => sum + toFiniteNumber(row?.total_tokens), 0));
+    const finopsCost = toFiniteNumber(finopsTotals?.total_cost_usd || allUsageRows.reduce((sum, row) => sum + toFiniteNumber(row?.total_cost_usd), 0));
 
     return {
       totalRequests,
@@ -2560,20 +2804,20 @@ export default function App() {
       finopsTokens,
       finopsCost,
     };
-  }, [gatewayRecent.rows, panelWorkflow, selectedAlertWorkflow, latestWorkflow, panelWorkflowUsage]);
+  }, [gatewayRecent.rows, panelWorkflow, selectedAlertWorkflow, latestWorkflow, allUsageRows]);
 
   const finopsByProvider = useMemo(() => {
     const grouped = new Map();
-    panelWorkflowUsage.forEach((row) => {
+    allUsageRows.forEach((row) => {
       const key = String(row?.provider || "unknown");
       const current = grouped.get(key) || { provider: key, calls: 0, total_tokens: 0, total_cost_usd: 0 };
       current.calls += 1;
-      current.total_tokens += Number(row?.input_tokens || 0) + Number(row?.output_tokens || 0);
+      current.total_tokens += Number(row?.total_tokens || 0);
       current.total_cost_usd += Number(row?.total_cost_usd || 0);
       grouped.set(key, current);
     });
     return Array.from(grouped.values());
-  }, [panelWorkflowUsage]);
+  }, [allUsageRows]);
 
   const closedRiskOptions = useMemo(() => {
     return Array.from(
@@ -2596,6 +2840,32 @@ export default function App() {
       return riskPass && modePass;
     });
   }, [closedIncidents.rows, closedFilters]);
+
+  const executiveClosedSummary = useMemo(() => {
+    const rows = Array.isArray(closedIncidents.rows) ? closedIncidents.rows : [];
+    const restored = rows.filter((row) => row?.health_restored === true).length;
+    const byRisk = new Map();
+    const byMode = new Map();
+
+    rows.forEach((row) => {
+      const risk = String(row?.risk_tier || row?.risk || row?.severity || "unknown").toLowerCase();
+      const mode = String(row?.execution_mode || "unknown").toLowerCase();
+      byRisk.set(risk, (byRisk.get(risk) || 0) + 1);
+      byMode.set(mode, (byMode.get(mode) || 0) + 1);
+    });
+
+    const riskItems = Array.from(byRisk.entries()).map(([label, value]) => ({ label, value, tone: "risk" }));
+    const modeItems = Array.from(byMode.entries()).map(([label, value]) => ({ label, value, tone: "meta" }));
+
+    return {
+      total: rows.length,
+      restored,
+      closureRate: rows.length ? (restored / rows.length) * 100 : 0,
+      riskItems,
+      modeItems,
+      recentRows: rows.slice(0, 15),
+    };
+  }, [closedIncidents.rows]);
 
   useEffect(() => {
     if (!latestIncidentId && !latestRecommendationId) {
@@ -2879,7 +3149,6 @@ export default function App() {
     { id: "executive", icon: "EX", shortLabel: "Executive", label: "Executive Dashboard", tone: "meta" },
     { id: "admin", icon: "AD", shortLabel: "Admin", label: "Admin Center", tone: "bus" },
     { id: "finops", icon: "FX", shortLabel: "FinOps", label: "FinOps", tone: "cost" },
-    { id: "closed", icon: "CL", shortLabel: "Tickets", label: "Closed Tickets", tone: "ops" },
   ];
 
   const currentRole = useMemo(() => normalizeRoleName(adminSession?.user?.role_name), [adminSession?.user?.role_name]);
@@ -2898,13 +3167,76 @@ export default function App() {
   const visibleSidebarSections = useMemo(() => sidebarSections.filter((tab) => allowedTabs.includes(tab.id)), [sidebarSections, allowedTabs]);
   const isAuthenticated = Boolean(String(adminSession.accessToken || "").trim());
   const isAdministrator = currentRole === "administrator";
+  const onboardingValidationErrors = useMemo(() => {
+    const errors = [];
+    if (!String(onboardingForm.name || "").trim()) {
+      errors.push("Project name is required.");
+    }
+    if (!String(onboardingForm.owner_team || "").trim()) {
+      errors.push("Owner team is required.");
+    }
+    if (!String(onboardingForm.region || "").trim()) {
+      errors.push("Region is required.");
+    }
+    if (String(onboardingForm.deployment_mode || "").trim() === "gcp_cloud" && !String(onboardingForm.gcp_project_id || "").trim()) {
+      errors.push("GCP Project ID is required for Google Cloud deployment.");
+    }
+    if (Boolean(onboardingForm.start_rule_onboarding) && !String(onboardingForm.rule_onboarding_plain_language || "").trim()) {
+      errors.push("Add plain-English rule intent when Generate Rules Now is enabled.");
+    }
+    return errors;
+  }, [
+    onboardingForm.name,
+    onboardingForm.owner_team,
+    onboardingForm.region,
+    onboardingForm.deployment_mode,
+    onboardingForm.gcp_project_id,
+    onboardingForm.start_rule_onboarding,
+    onboardingForm.rule_onboarding_plain_language,
+  ]);
+  const onboardingAdvisory = useMemo(() => {
+    if (String(onboardingForm.deployment_mode || "").trim() !== "on_prem") {
+      return "";
+    }
+    if (String(onboardingForm.monitoring_url || "").trim()) {
+      return "";
+    }
+    return "Tool endpoint URL is optional now, but recommended for connectivity and rule simulation quality.";
+  }, [onboardingForm.deployment_mode, onboardingForm.monitoring_url]);
+  const onboardingHasPendingDocumentApproval = useMemo(
+    () => onboardingGeneratedDocs.length > 0 && !onboardingDocApprovalState.approved,
+    [onboardingGeneratedDocs.length, onboardingDocApprovalState.approved],
+  );
+  const onboardingDocumentSummary = useMemo(
+    () => ({
+      total: onboardingGeneratedDocs.length,
+      approved: onboardingDocApprovalState.approved,
+    }),
+    [onboardingGeneratedDocs.length, onboardingDocApprovalState.approved],
+  );
+  const onboardingNextAction = useMemo(() => {
+    if (onboardingState.loading) {
+      return "Step 2/4: Saving project and generating workflow artifacts...";
+    }
+    if (onboardingHasPendingDocumentApproval) {
+      return "Step 3/4: Review generated documents below, then click Approve Documents.";
+    }
+    if (onboardingDocumentSummary.approved) {
+      return "Step 4/4: Documents approved. You can continue with another update or proceed to advanced workflow management.";
+    }
+    return "Step 1/4: Complete project details and click Create Project or Update Project.";
+  }, [
+    onboardingState.loading,
+    onboardingHasPendingDocumentApproval,
+    onboardingDocumentSummary.approved,
+  ]);
 
   useEffect(() => {
-    if (selectedOnboardingProject || !projectOnboardingRows.length) {
+    if (onboardingProjectMode === "new" || selectedOnboardingProject || !projectOnboardingRows.length) {
       return;
     }
     applyProjectOnboardingRow(projectOnboardingRows[0]);
-  }, [selectedOnboardingProject, projectOnboardingRows]);
+  }, [onboardingProjectMode, selectedOnboardingProject, projectOnboardingRows]);
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -2972,6 +3304,7 @@ export default function App() {
           ],
           ["Closed Incidents", closedIncidents.rows.length],
           ["Health Restored", closedIncidents.rows.filter((row) => row?.health_restored === true).length],
+          ["LLM Cost (USD)", executiveMetrics.finopsCost.toFixed(6)],
         ],
         refresh: refreshAll,
       },
@@ -3029,17 +3362,19 @@ export default function App() {
         title: "LLM FinOps",
         caption: "Token usage, provider costs, and model-level breakdown.",
         metrics: [
-          ["LLM Calls", panelWorkflowUsage.length],
+          ["LLM Calls", allUsageRows.length],
           [
             "Total Cost (USD)",
-            panelWorkflowUsage
+            allUsageRows
               .reduce((sum, row) => sum + Number(row?.total_cost_usd || 0), 0)
               .toFixed(6),
           ],
-          ["Providers", new Set(panelWorkflowUsage.map((row) => row.provider).filter(Boolean)).size],
-          ["Models", new Set(panelWorkflowUsage.map((row) => row.model).filter(Boolean)).size],
+          ["Providers", new Set(allUsageRows.map((row) => row.provider).filter(Boolean)).size],
+          ["Models", new Set(allUsageRows.map((row) => row.model).filter(Boolean)).size],
         ],
-        refresh: () => runWorkflow(selectedFlow),
+        refresh: async () => {
+          await Promise.all([loadIncidentMetadata(), loadGatewaySummary(), loadGatewayRecent(), loadClosedIncidents(), loadRecentAlerts()]);
+        },
       },
       rag: {
         title: "Message Bus",
@@ -3098,10 +3433,11 @@ export default function App() {
     approvalForm.action,
     workflowEventRows.length,
     selectedFlow,
-    panelWorkflowUsage,
+    allUsageRows,
     messageBusActual,
     observedRouting,
     gatewaySummary.data,
+    executiveMetrics.finopsCost,
   ]);
 
   function downloadFullHtmlReportPack() {
@@ -3779,6 +4115,10 @@ export default function App() {
                   <div className="stat-card"><strong>Total Requests</strong><span>{executiveMetrics.totalRequests}</span></div>
                   <div className="stat-card"><strong>Failures</strong><span>{executiveMetrics.failedRequests}</span></div>
                   <div className="stat-card"><strong>P95 Latency</strong><span>{executiveMetrics.p95LatencyMs.toFixed(1)} ms</span></div>
+                  <div className="stat-card"><strong>Closed Tickets</strong><span>{executiveClosedSummary.total}</span></div>
+                  <div className="stat-card"><strong>Closure Rate</strong><span>{executiveClosedSummary.closureRate.toFixed(1)}%</span></div>
+                  <div className="stat-card"><strong>Pending Approvals</strong><span>{pendingApprovals.length}</span></div>
+                  <div className="stat-card"><strong>LLM Cost</strong><span>${executiveMetrics.finopsCost.toFixed(6)}</span></div>
                 </div>
 
                 <div className="executive-chart-grid">
@@ -3802,7 +4142,7 @@ export default function App() {
                   />
                   <HorizontalBarChart
                     title="FinOps Overview"
-                    subtitle="Current workflow-level LLM cost and token usage"
+                    subtitle="Aggregated LLM usage and spend"
                     items={[
                       { label: "Model Calls", value: executiveMetrics.finopsCalls, tone: "meta" },
                       { label: "Tokens", value: executiveMetrics.finopsTokens, tone: "cost" },
@@ -3813,6 +4153,16 @@ export default function App() {
                         tone: "bus",
                       },
                     ]}
+                  />
+                  <HorizontalBarChart
+                    title="Closed Tickets by Risk"
+                    subtitle="Recent closure distribution"
+                    items={executiveClosedSummary.riskItems}
+                  />
+                  <HorizontalBarChart
+                    title="Closed Tickets by Execution Mode"
+                    subtitle="How incidents were handled"
+                    items={executiveClosedSummary.modeItems}
                   />
                 </div>
 
@@ -3851,6 +4201,39 @@ export default function App() {
                     </tbody>
                   </table>
                 </div>
+
+                <h3>Recently Closed Tickets</h3>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Incident</th>
+                        <th>Service</th>
+                        <th>Risk</th>
+                        <th>Execution Mode</th>
+                        <th>Status</th>
+                        <th>Closed At</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {executiveClosedSummary.recentRows.map((row, index) => (
+                        <tr key={`exec-closed-${row.incident_id || index}`}>
+                          <td>{row.incident_id || "-"}</td>
+                          <td>{row.service || "-"}</td>
+                          <td>{row.risk_tier || row.risk || row.severity || "-"}</td>
+                          <td>{row.execution_mode || "-"}</td>
+                          <td>{row.status || "closed"}</td>
+                          <td>{row.closed_at || row.updated_at || "-"}</td>
+                        </tr>
+                      ))}
+                      {!executiveClosedSummary.recentRows.length ? (
+                        <tr>
+                          <td colSpan={6}>No closed tickets are available yet.</td>
+                        </tr>
+                      ) : null}
+                    </tbody>
+                  </table>
+                </div>
               </article>
             </section>
           ) : null}
@@ -3866,6 +4249,7 @@ export default function App() {
                 <div className="detail-tabs sticky-controls">
                   <button type="button" className={`detail-tab ${adminWorkspace === "users" ? "active" : ""}`} onClick={() => setAdminWorkspace("users")}>User Management</button>
                   <button type="button" className={`detail-tab ${adminWorkspace === "project" ? "active" : ""}`} onClick={() => setAdminWorkspace("project")}>Project Onboarding</button>
+                  <button type="button" className={`detail-tab ${adminWorkspace === "projects" ? "active" : ""}`} onClick={() => setAdminWorkspace("projects")}>Saved Projects</button>
                   <button type="button" className={`detail-tab ${adminWorkspace === "alerts" ? "active" : ""}`} onClick={() => setAdminWorkspace("alerts")}>Alerts Onboarding</button>
                 </div>
 
@@ -3984,7 +4368,7 @@ export default function App() {
                             type="button"
                             className="button-secondary"
                             onClick={() => deleteProjectOnboarding(selectedOnboardingProject || onboardingForm.name)}
-                            disabled={onboardingState.loading || !String(selectedOnboardingProject || onboardingForm.name || "").trim()}
+                            disabled={onboardingProjectMode === "new" || onboardingState.loading || !String(selectedOnboardingProject || onboardingForm.name || "").trim()}
                           >
                             Delete Project
                           </button>
@@ -3992,7 +4376,38 @@ export default function App() {
                       </div>
                       <div className="filter-grid">
                         <label>
-                          Existing Projects
+                          Project Mode
+                          <select
+                            value={onboardingProjectMode}
+                            onChange={(e) => {
+                              const nextMode = e.target.value;
+                              setOnboardingProjectMode(nextMode);
+                              if (nextMode === "new") {
+                                resetNewProjectOnboardingDraft();
+                              }
+                            }}
+                          >
+                            <option value="existing">Update Existing Project</option>
+                            <option value="new">Create New Project</option>
+                          </select>
+                        </label>
+                        <div style={{ display: "flex", alignItems: "end" }}>
+                          <button type="button" className="button-secondary" onClick={resetNewProjectOnboardingDraft}>
+                            Clear Form
+                          </button>
+                        </div>
+                      </div>
+                      <p className="subtitle">Flow: 1) Configure project 2) Create/Update 3) Review generated docs 4) Approve documents.</p>
+                      <p className="subtitle"><strong>Next Action:</strong> {onboardingNextAction}</p>
+                      {onboardingDocumentSummary.total > 0 ? (
+                        <p className="subtitle">
+                          <strong>Document Status:</strong> {onboardingDocumentSummary.total} generated, {onboardingDocumentSummary.approved ? "approved" : "pending approval"}.
+                        </p>
+                      ) : null}
+                      {onboardingProjectMode === "existing" ? (
+                        <div className="filter-grid">
+                        <label>
+                          Select Existing Project
                           <select
                             value={selectedOnboardingProject}
                             onChange={(e) => {
@@ -4011,16 +4426,26 @@ export default function App() {
                             })}
                           </select>
                         </label>
-                      </div>
+                        </div>
+                      ) : null}
                       <form className="form" onSubmit={saveOnboardingConnectivity}>
+                        {onboardingValidationErrors.length ? (
+                          <div>
+                            {onboardingValidationErrors.map((msg, index) => <p key={`onboarding-error-${index}`} className="error">{msg}</p>)}
+                          </div>
+                        ) : null}
+                        {onboardingHasPendingDocumentApproval ? (
+                          <p className="error">Approve pending generated documents before submitting another Create/Update.</p>
+                        ) : null}
+                        {onboardingAdvisory ? <p className="subtitle">{onboardingAdvisory}</p> : null}
                         <div className="filter-grid">
-                          <label>Project<input value={onboardingForm.name} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, name: e.target.value }))} /></label>
-                          <label>Owner Team<input value={onboardingForm.owner_team} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, owner_team: e.target.value }))} /></label>
+                          <label>Project Name *<input placeholder="example-payments" value={onboardingForm.name} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, name: e.target.value, assignment_project: e.target.value }))} /></label>
+                          <label>Owner Team *<input placeholder="sre-platform" value={onboardingForm.owner_team} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, owner_team: e.target.value }))} /></label>
                           <label>Environment<select value={onboardingForm.environment} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, environment: e.target.value }))}><option value="dev">dev</option><option value="staging">staging</option><option value="prod">prod</option></select></label>
-                          <label>Region<input value={onboardingForm.region} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, region: e.target.value }))} /></label>
+                          <label>Region *<input placeholder="ap-south-1" value={onboardingForm.region} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, region: e.target.value }))} /></label>
                         </div>
                         <div className="filter-grid">
-                          <label>Deployment Mode
+                          <label>Deployment
                             <select value={onboardingForm.deployment_mode} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, deployment_mode: e.target.value }))}>
                               <option value="on_prem">On-Prem</option>
                               <option value="gcp_cloud">Google Cloud</option>
@@ -4036,10 +4461,48 @@ export default function App() {
                           </div>
                         ) : null}
                         <div className="filter-grid">
-                          <label>Prometheus URL<input value={onboardingForm.prometheus_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, prometheus_url: e.target.value }))} /></label>
-                          <label>New Relic URL<input value={onboardingForm.new_relic_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, new_relic_url: e.target.value }))} /></label>
-                          <label>Datadog URL<input value={onboardingForm.datadog_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, datadog_url: e.target.value }))} /></label>
-                          <label>Assign Username<input value={onboardingForm.assignment_username} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, assignment_username: e.target.value }))} /></label>
+                          <label>
+                            Monitoring Tool
+                            <select
+                              value={onboardingForm.monitoring_tool}
+                              onChange={(e) => {
+                                const nextTool = e.target.value;
+                                setOnboardingForm((curr) => ({
+                                  ...curr,
+                                  monitoring_tool: nextTool,
+                                  prometheus_url: nextTool === "prometheus" ? curr.monitoring_url : "",
+                                  new_relic_url: nextTool === "new_relic" ? curr.monitoring_url : "",
+                                  datadog_url: nextTool === "datadog" ? curr.monitoring_url : "",
+                                }));
+                                setNewRulePipelineForm((curr) => ({ ...curr, selected_tool: nextTool }));
+                                setExistingRulePipelineForm((curr) => ({ ...curr, platform: nextTool }));
+                              }}
+                            >
+                              <option value="prometheus">Prometheus</option>
+                              <option value="new_relic">New Relic</option>
+                              <option value="datadog">Datadog</option>
+                            </select>
+                          </label>
+                          <label>
+                            Tool Endpoint URL (optional)
+                            <input
+                              value={onboardingForm.monitoring_url}
+                              placeholder="prometheus:9090"
+                              onBlur={(e) => {
+                                const normalized = simplifyMonitoringUrl(e.target.value);
+                                setOnboardingForm((curr) => ({
+                                  ...curr,
+                                  monitoring_url: normalized,
+                                  prometheus_url: curr.monitoring_tool === "prometheus" ? normalized : "",
+                                  new_relic_url: curr.monitoring_tool === "new_relic" ? normalized : "",
+                                  datadog_url: curr.monitoring_tool === "datadog" ? normalized : "",
+                                }));
+                                setExistingRulePipelineForm((curr) => ({ ...curr, connection_url: normalized }));
+                              }}
+                              onChange={(e) => setOnboardingForm((curr) => ({ ...curr, monitoring_url: e.target.value }))}
+                            />
+                          </label>
+                          <label>Assign User (optional)<input placeholder="username" value={onboardingForm.assignment_username} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, assignment_username: e.target.value }))} /></label>
                         </div>
                         {onboardingForm.deployment_mode === "gcp_cloud" ? (
                           <div className="filter-grid">
@@ -4052,29 +4515,334 @@ export default function App() {
                             <label>Model Armor Template<input value={onboardingForm.vertex_model_armor_template} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, vertex_model_armor_template: e.target.value }))} /></label>
                           </div>
                         ) : null}
-                        <label>Assignment Project<input value={onboardingForm.assignment_project} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, assignment_project: e.target.value }))} /></label>
-                        <button className="button-primary" type="submit" disabled={onboardingState.loading}>{onboardingState.loading ? "Saving..." : "Save Onboarding"}</button>
+                        <label>Assignment Project (auto)<input value={onboardingForm.name} readOnly /></label>
+                        <div className="filter-grid">
+                          <label>
+                            Generate Rules Now
+                            <select
+                              value={String(onboardingForm.start_rule_onboarding)}
+                              onChange={(e) => setOnboardingForm((curr) => ({ ...curr, start_rule_onboarding: e.target.value === "true" }))}
+                            >
+                              <option value="false">No</option>
+                              <option value="true">Yes</option>
+                            </select>
+                          </label>
+                        </div>
+                        {onboardingForm.start_rule_onboarding ? (
+                          <label>
+                            Rule Intent (Plain English)
+                            <textarea
+                              rows={5}
+                              placeholder="Example: Alert when checkout API 5xx is above 3% for 5 minutes and route to SRE."
+                              value={onboardingForm.rule_onboarding_plain_language}
+                              onChange={(e) => {
+                                const nextText = e.target.value;
+                                setOnboardingForm((curr) => ({ ...curr, rule_onboarding_plain_language: nextText }));
+                                setNewRulePipelineForm((curr) => ({ ...curr, requirements_text: nextText }));
+                              }}
+                            />
+                          </label>
+                        ) : null}
+                        <button className="button-primary" type="submit" disabled={onboardingState.loading || onboardingValidationErrors.length > 0 || onboardingHasPendingDocumentApproval}>
+                          {onboardingState.loading ? "Saving..." : onboardingProjectMode === "new" ? "Create Project" : "Update Project"}
+                        </button>
                       </form>
                       {onboardingState.error ? <p className="error">{onboardingState.error}</p> : null}
                       {onboardingState.success ? <p className="subtitle">{onboardingState.success}</p> : null}
                     </article>
 
                     <article className="panel">
-                      <h3>Saved Projects</h3>
+                      <div className="panel-head">
+                        <h3>Generated Documents Review</h3>
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button
+                            type="button"
+                            className="button-secondary"
+                            onClick={() => {
+                              setOnboardingGeneratedDocs([]);
+                              setOnboardingDocApprovalState({ loading: false, error: "", success: "", approved: false });
+                            }}
+                            disabled={!onboardingGeneratedDocs.length || onboardingDocApprovalState.loading}
+                          >
+                            Clear
+                          </button>
+                          <button
+                            type="button"
+                            className="button-primary"
+                            onClick={approveGeneratedOnboardingDocuments}
+                            disabled={!onboardingGeneratedDocs.length || onboardingDocApprovalState.loading || onboardingDocApprovalState.approved}
+                          >
+                            {onboardingDocApprovalState.loading ? "Approving..." : onboardingDocApprovalState.approved ? "Approved" : "Approve Documents"}
+                          </button>
+                        </div>
+                      </div>
+                      <p className="subtitle">After Create/Update Project, review all generated documents below, then approve to ingest them.</p>
+                      {onboardingDocApprovalState.error ? <p className="error">{onboardingDocApprovalState.error}</p> : null}
+                      {onboardingDocApprovalState.success ? <p className="subtitle">{onboardingDocApprovalState.success}</p> : null}
+                      {!onboardingGeneratedDocs.length ? (
+                        <p className="subtitle">No documents pending review.</p>
+                      ) : (
+                        <div className="table-wrap">
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>Kind</th>
+                                <th>Title</th>
+                                <th>Summary</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {onboardingGeneratedDocs.map((doc, index) => (
+                                <tr key={`onboarding-doc-${index}`}>
+                                  <td>{String(doc?.kind || "-")}</td>
+                                  <td>{String(doc?.title || "-")}</td>
+                                  <td>{String(doc?.summary || "-")}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                      {onboardingGeneratedDocs.length ? (
+                        <details style={{ marginTop: 12 }}>
+                          <summary style={{ cursor: "pointer" }}>View Full Documents JSON</summary>
+                          <pre className="result">{JSON.stringify(onboardingGeneratedDocs, null, 2)}</pre>
+                        </details>
+                      ) : null}
+                    </article>
+
+                    <article className="panel">
+                      <h3>Rule Onboarding Status</h3>
+                      <p className="subtitle">Rule onboarding is optional. If enabled above, plain-language requirements are converted into tool-specific rules and documentation automatically.</p>
+                      <h3>Step-by-Step Workflow Progress</h3>
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>Step</th>
+                              <th>Status</th>
+                              <th>What Happened</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(onboardingWorkflowSteps.length ? onboardingWorkflowSteps : [
+                              { step: 1, title: "Create/Update Project", status: "pending", details: { message: "Start by creating or updating a project." } },
+                              { step: 2, title: "Ask To Add New Rules", status: "pending", details: { message: "Choose whether to generate new rules." } },
+                              { step: 3, title: "Capture Rules In Plain English", status: "pending", details: { message: "Provide plain-English rule intent." } },
+                              { step: 4, title: "Convert To YAML, Upload In Prometheus, Test", status: "pending", details: { message: "System will convert, attempt upload/reload, and test." } },
+                              { step: 5, title: "Generate Monitoring/Troubleshooting/Resolution Docs", status: "pending", details: { message: "System will generate documentation payloads." } },
+                            ]).map((row) => {
+                              const message = row?.details?.message
+                                || row?.details?.choice
+                                || row?.details?.workflow_id
+                                || `Requirements: ${Number(row?.details?.requirements_count || 0)}`;
+                              return (
+                                <tr key={`workflow-step-${row.step}-${row.title}`}>
+                                  <td>{row.step}. {row.title}</td>
+                                  <td>{row.status || "pending"}</td>
+                                  <td>{String(message || "-")}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div className="filter-grid">
+                        <label>
+                          Current Project
+                          <input value={onboardingForm.name} readOnly />
+                        </label>
+                        <label>
+                          Monitoring Tool
+                          <input value={onboardingForm.monitoring_tool} readOnly />
+                        </label>
+                        <label>
+                          Last Workflow ID
+                          <input value={String(onboardingRuleLookup.workflow_id || onboardingRuleRunState?.result?.workflow_id || "").trim()} readOnly />
+                        </label>
+                      </div>
+                      {onboardingRuleRunState.error ? <p className="error">{onboardingRuleRunState.error}</p> : null}
+                      {onboardingRuleRunState.result ? <pre className="result">{JSON.stringify(onboardingRuleRunState.result, null, 2)}</pre> : null}
+                    </article>
+
+                    <article className="panel">
+                      <h3>Advanced Rule Workflow Management</h3>
+                      <details>
+                        <summary style={{ cursor: "pointer", marginBottom: 12 }}>Open Advanced Tools</summary>
+
+                        <form className="form" onSubmit={lookupOnboardingRuleWorkflow}>
+                          <div className="filter-grid">
+                            <label>
+                              Workflow ID
+                              <input
+                                value={onboardingRuleLookup.workflow_id}
+                                placeholder="Paste workflow id"
+                                onChange={(e) => setOnboardingRuleLookup((curr) => ({ ...curr, workflow_id: e.target.value }))}
+                              />
+                            </label>
+                          </div>
+                          <button className="button-secondary" type="submit" disabled={onboardingRuleLookup.loading}>
+                            {onboardingRuleLookup.loading ? "Fetching..." : "Lookup Workflow"}
+                          </button>
+                        </form>
+                        {onboardingRuleLookup.error ? <p className="error">{onboardingRuleLookup.error}</p> : null}
+                        {onboardingRuleLookup.result ? <pre className="result">{JSON.stringify(onboardingRuleLookup.result, null, 2)}</pre> : null}
+
+                        <div className="table-wrap" style={{ marginTop: 12 }}>
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>Project</th>
+                                <th>Pipeline</th>
+                                <th>Workflow ID</th>
+                                <th>Status</th>
+                                <th>Updated</th>
+                                <th>Action</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {ruleOnboardingRows.slice(0, 100).map((row, index) => {
+                                const payload = row.connectivity_payload && typeof row.connectivity_payload === "object" ? row.connectivity_payload : {};
+                                const workflowId = String(payload.workflow_id || "").trim();
+                                return (
+                                  <tr key={`rule-workflow-row-${index}`}>
+                                    <td>{row.project_name || "-"}</td>
+                                    <td>{row.provider_name || payload.pipeline || "-"}</td>
+                                    <td>{workflowId || "-"}</td>
+                                    <td>{payload.status || row.test_status || "-"}</td>
+                                    <td>{row.updated_at || row.created_at || "-"}</td>
+                                    <td>
+                                      <div style={{ display: "flex", gap: 8 }}>
+                                        <button type="button" className="button-secondary" onClick={() => openRuleWorkflowEditor(row)} disabled={!workflowId}>
+                                          Edit
+                                        </button>
+                                        <button type="button" className="button-secondary" onClick={() => deleteRuleWorkflow(workflowId)} disabled={!workflowId || onboardingRuleEditorState.loading}>
+                                          Delete
+                                        </button>
+                                      </div>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                              {!ruleOnboardingRows.length ? (
+                                <tr>
+                                  <td colSpan={6}>No saved rule workflows available.</td>
+                                </tr>
+                              ) : null}
+                            </tbody>
+                          </table>
+                        </div>
+
+                        <h3>Edit Rule Workflow Result</h3>
+                        <form className="form" onSubmit={saveRuleWorkflowEditor}>
+                          <div className="filter-grid">
+                            <label>
+                              Workflow ID
+                              <input
+                                value={onboardingRuleEditor.workflow_id}
+                                onChange={(e) => setOnboardingRuleEditor((current) => ({ ...current, workflow_id: e.target.value }))}
+                                placeholder="Workflow ID"
+                              />
+                            </label>
+                            <label>
+                              Project Name
+                              <input
+                                value={onboardingRuleEditor.project_name}
+                                onChange={(e) => setOnboardingRuleEditor((current) => ({ ...current, project_name: e.target.value }))}
+                                placeholder="Project name"
+                              />
+                            </label>
+                          </div>
+                          <label>
+                            Workflow Result JSON
+                            <textarea
+                              rows={10}
+                              value={onboardingRuleEditor.payload_json}
+                              onChange={(e) => setOnboardingRuleEditor((current) => ({ ...current, payload_json: e.target.value }))}
+                              placeholder="Paste workflow result JSON"
+                            />
+                          </label>
+                          <button className="button-primary" type="submit" disabled={onboardingRuleEditorState.loading}>
+                            {onboardingRuleEditorState.loading ? "Saving..." : "Save Workflow Changes"}
+                          </button>
+                        </form>
+                        {onboardingRuleEditorState.error ? <p className="error">{onboardingRuleEditorState.error}</p> : null}
+                        {onboardingRuleEditorState.success ? <p className="subtitle">{onboardingRuleEditorState.success}</p> : null}
+
+                        <div className="panel-head" style={{ marginTop: 12 }}>
+                          <h3>Monitoring Platform Capabilities</h3>
+                          <button type="button" className="button-secondary" onClick={loadOnboardingRuleCapabilities}>
+                            Refresh
+                          </button>
+                        </div>
+                        {onboardingRuleCapabilities.error ? <p className="error">{onboardingRuleCapabilities.error}</p> : null}
+                        <div className="table-wrap">
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>Platform</th>
+                                <th>Pull Rules</th>
+                                <th>Push Rules</th>
+                                <th>Simulation</th>
+                                <th>Dashboards</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {onboardingRuleCapabilities.rows.map((row, index) => (
+                                <tr key={`capability-${row.platform || index}`}>
+                                  <td>{row.platform || "-"}</td>
+                                  <td>{String(Boolean(row.can_pull_rules))}</td>
+                                  <td>{String(Boolean(row.can_push_rules))}</td>
+                                  <td>{String(Boolean(row.supports_simulation))}</td>
+                                  <td>{String(Boolean(row.supports_dashboard_refs))}</td>
+                                </tr>
+                              ))}
+                              {!onboardingRuleCapabilities.rows.length && !onboardingRuleCapabilities.loading ? (
+                                <tr>
+                                  <td colSpan={5}>No capabilities loaded yet.</td>
+                                </tr>
+                              ) : null}
+                            </tbody>
+                          </table>
+                        </div>
+                      </details>
+                    </article>
+                  </div>
+
+                ) : null}
+
+                {adminWorkspace === "projects" ? (
+                  <div className="grid single-col">
+                    <article className="panel">
+                      <div className="panel-head">
+                        <h3>Saved Projects</h3>
+                        <button type="button" className="button-secondary" onClick={loadOnboardingAdminData}>
+                          Refresh
+                        </button>
+                      </div>
+                      <p className="subtitle">Manage existing projects here. Use Modify to open Project Onboarding with the selected project prefilled.</p>
                       <div className="table-wrap">
                         <table>
                           <thead><tr><th>Project</th><th>Owner</th><th>Environment</th><th>Updated</th><th>Action</th></tr></thead>
                           <tbody>
-                            {projectOnboardingRows.slice(0, 50).map((row, index) => (
-                              <tr key={`onboarding-project-row-${index}`}>
+                            {projectOnboardingRows.slice(0, 100).map((row, index) => (
+                              <tr key={`saved-project-row-${index}`}>
                                 <td>{row.project_name || "-"}</td>
                                 <td>{row.owner_team || "-"}</td>
                                 <td>{row.environment || "-"}</td>
                                 <td>{row.updated_at || row.created_at || "-"}</td>
                                 <td>
                                   <div style={{ display: "flex", gap: 8 }}>
-                                    <button type="button" className="button-secondary" onClick={() => applyProjectOnboardingRow(row)}>
-                                      Edit
+                                    <button
+                                      type="button"
+                                      className="button-secondary"
+                                      onClick={() => {
+                                        setOnboardingProjectMode("existing");
+                                        applyProjectOnboardingRow(row);
+                                        setAdminWorkspace("project");
+                                      }}
+                                    >
+                                      Modify
                                     </button>
                                     <button type="button" className="button-secondary" onClick={() => deleteProjectOnboarding(row.project_name)}>
                                       Delete
@@ -4083,300 +4851,12 @@ export default function App() {
                                 </td>
                               </tr>
                             ))}
-                            {!projectOnboardingRows.length ? <tr><td colSpan={5}>No project onboarding rows available.</td></tr> : null}
-                          </tbody>
-                        </table>
-                      </div>
-                    </article>
-
-                    <article className="panel">
-                      <div className="panel-head">
-                        <h3>Rule Onboarding Wizard</h3>
-                        <button type="button" className="button-secondary" onClick={loadOnboardingRuleCapabilities}>
-                          Refresh Capabilities
-                        </button>
-                      </div>
-                      <p className="subtitle">Two pipelines: existing monitoring rule sync (pull/push) and new AI-driven rule onboarding.</p>
-
-                      <div className="detail-tabs sticky-controls">
-                        <button
-                          type="button"
-                          className={`detail-tab ${onboardingRuleWizardStep === 1 ? "active" : ""}`}
-                          onClick={() => setOnboardingRuleWizardStep(1)}
-                        >
-                          Step 1: Select Pipeline
-                        </button>
-                        <button
-                          type="button"
-                          className={`detail-tab ${onboardingRuleWizardStep === 2 ? "active" : ""}`}
-                          onClick={() => setOnboardingRuleWizardStep(2)}
-                        >
-                          Step 2: Configure
-                        </button>
-                        <button
-                          type="button"
-                          className={`detail-tab ${onboardingRuleWizardStep === 3 ? "active" : ""}`}
-                          onClick={() => setOnboardingRuleWizardStep(3)}
-                        >
-                          Step 3: Run & Review
-                        </button>
-                      </div>
-
-                      {onboardingRuleWizardStep === 1 ? (
-                        <div className="filter-grid">
-                          <label>
-                            Pipeline
-                            <select
-                              value={onboardingRuleWizardMode}
-                              onChange={(e) => setOnboardingRuleWizardMode(e.target.value)}
-                            >
-                              <option value="existing">Existing Rule Sync (Pull/Push)</option>
-                              <option value="new">New Rule Onboarding</option>
-                            </select>
-                          </label>
-                          <label>
-                            Project Name
-                            <input value={onboardingForm.name} readOnly />
-                          </label>
-                          <label>
-                            Environment
-                            <input value={onboardingForm.environment} readOnly />
-                          </label>
-                          <label>
-                            Region
-                            <input value={onboardingForm.region} readOnly />
-                          </label>
-                        </div>
-                      ) : null}
-
-                      {onboardingRuleWizardStep === 2 && onboardingRuleWizardMode === "existing" ? (
-                        <form className="form" onSubmit={runExistingRulePipeline}>
-                          <div className="filter-grid">
-                            <label>
-                              Platform
-                              <select
-                                value={existingRulePipelineForm.platform}
-                                onChange={(e) => setExistingRulePipelineForm((curr) => ({ ...curr, platform: e.target.value }))}
-                              >
-                                {(onboardingRuleCapabilities.rows.length
-                                  ? onboardingRuleCapabilities.rows.map((row) => row.platform)
-                                  : ["prometheus", "datadog", "new_relic"]
-                                ).map((platform) => (
-                                  <option key={`existing-platform-${platform}`} value={platform}>{platform}</option>
-                                ))}
-                              </select>
-                            </label>
-                            <label>
-                              Mode
-                              <select
-                                value={existingRulePipelineForm.mode}
-                                onChange={(e) => setExistingRulePipelineForm((curr) => ({ ...curr, mode: e.target.value }))}
-                              >
-                                <option value="pull">pull</option>
-                                <option value="push">push</option>
-                                <option value="bidirectional">bidirectional</option>
-                              </select>
-                            </label>
-                            <label>
-                              Connection URL (optional)
-                              <input
-                                value={existingRulePipelineForm.connection_url}
-                                placeholder="http://prometheus:9090"
-                                onChange={(e) => setExistingRulePipelineForm((curr) => ({ ...curr, connection_url: e.target.value }))}
-                              />
-                            </label>
-                          </div>
-                          <label>
-                            Rules To Push (JSON Array)
-                            <textarea
-                              rows={10}
-                              value={existingRulePipelineForm.rules_json}
-                              onChange={(e) => setExistingRulePipelineForm((curr) => ({ ...curr, rules_json: e.target.value }))}
-                            />
-                          </label>
-                          <button className="button-primary" type="submit" disabled={onboardingRuleRunState.loading}>
-                            {onboardingRuleRunState.loading ? "Running..." : "Run Existing Rule Pipeline"}
-                          </button>
-                        </form>
-                      ) : null}
-
-                      {onboardingRuleWizardStep === 2 && onboardingRuleWizardMode === "new" ? (
-                        <form className="form" onSubmit={runNewRulePipeline}>
-                          <label>
-                            Monitoring Requirements (one per line)
-                            <textarea
-                              rows={6}
-                              value={newRulePipelineForm.requirements_text}
-                              onChange={(e) => setNewRulePipelineForm((curr) => ({ ...curr, requirements_text: e.target.value }))}
-                            />
-                          </label>
-                          <div className="filter-grid">
-                            <label>
-                              Target Platforms (comma separated)
-                              <input
-                                value={newRulePipelineForm.target_platforms_csv}
-                                onChange={(e) => setNewRulePipelineForm((curr) => ({ ...curr, target_platforms_csv: e.target.value }))}
-                              />
-                            </label>
-                          </div>
-                          <label>
-                            Discovery Inputs (JSON object)
-                            <textarea
-                              rows={8}
-                              value={newRulePipelineForm.discovery_json}
-                              onChange={(e) => setNewRulePipelineForm((curr) => ({ ...curr, discovery_json: e.target.value }))}
-                            />
-                          </label>
-                          <button className="button-primary" type="submit" disabled={onboardingRuleRunState.loading}>
-                            {onboardingRuleRunState.loading ? "Running..." : "Run New Rule Onboarding Pipeline"}
-                          </button>
-                        </form>
-                      ) : null}
-
-                      {onboardingRuleWizardStep === 3 ? (
-                        <div className="grid single-col">
-                          <form className="form" onSubmit={lookupOnboardingRuleWorkflow}>
-                            <div className="filter-grid">
-                              <label>
-                                Workflow ID
-                                <input
-                                  value={onboardingRuleLookup.workflow_id}
-                                  placeholder="Paste workflow id"
-                                  onChange={(e) => setOnboardingRuleLookup((curr) => ({ ...curr, workflow_id: e.target.value }))}
-                                />
-                              </label>
-                            </div>
-                            <button className="button-secondary" type="submit" disabled={onboardingRuleLookup.loading}>
-                              {onboardingRuleLookup.loading ? "Fetching..." : "Lookup Workflow"}
-                            </button>
-                          </form>
-                          {onboardingRuleLookup.error ? <p className="error">{onboardingRuleLookup.error}</p> : null}
-                          {onboardingRuleLookup.result ? <pre className="result">{JSON.stringify(onboardingRuleLookup.result, null, 2)}</pre> : null}
-                          {onboardingRuleRunState.error ? <p className="error">{onboardingRuleRunState.error}</p> : null}
-                          {onboardingRuleRunState.result ? <pre className="result">{JSON.stringify(onboardingRuleRunState.result, null, 2)}</pre> : null}
-                        </div>
-                      ) : null}
-                    </article>
-
-                    <article className="panel">
-                      <h3>Saved Rule Workflows</h3>
-                      <div className="table-wrap">
-                        <table>
-                          <thead>
-                            <tr>
-                              <th>Project</th>
-                              <th>Pipeline</th>
-                              <th>Workflow ID</th>
-                              <th>Status</th>
-                              <th>Updated</th>
-                              <th>Action</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {ruleOnboardingRows.slice(0, 100).map((row, index) => {
-                              const payload = row.connectivity_payload && typeof row.connectivity_payload === "object" ? row.connectivity_payload : {};
-                              const workflowId = String(payload.workflow_id || "").trim();
-                              return (
-                                <tr key={`rule-workflow-row-${index}`}>
-                                  <td>{row.project_name || "-"}</td>
-                                  <td>{row.provider_name || payload.pipeline || "-"}</td>
-                                  <td>{workflowId || "-"}</td>
-                                  <td>{payload.status || row.test_status || "-"}</td>
-                                  <td>{row.updated_at || row.created_at || "-"}</td>
-                                  <td>
-                                    <div style={{ display: "flex", gap: 8 }}>
-                                      <button type="button" className="button-secondary" onClick={() => openRuleWorkflowEditor(row)} disabled={!workflowId}>
-                                        Edit
-                                      </button>
-                                      <button type="button" className="button-secondary" onClick={() => deleteRuleWorkflow(workflowId)} disabled={!workflowId || onboardingRuleEditorState.loading}>
-                                        Delete
-                                      </button>
-                                    </div>
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                            {!ruleOnboardingRows.length ? (
-                              <tr>
-                                <td colSpan={6}>No saved rule workflows available.</td>
-                              </tr>
-                            ) : null}
-                          </tbody>
-                        </table>
-                      </div>
-
-                      <h3>Edit Rule Workflow Result</h3>
-                      <form className="form" onSubmit={saveRuleWorkflowEditor}>
-                        <div className="filter-grid">
-                          <label>
-                            Workflow ID
-                            <input
-                              value={onboardingRuleEditor.workflow_id}
-                              onChange={(e) => setOnboardingRuleEditor((current) => ({ ...current, workflow_id: e.target.value }))}
-                              placeholder="Workflow ID"
-                            />
-                          </label>
-                          <label>
-                            Project Name
-                            <input
-                              value={onboardingRuleEditor.project_name}
-                              onChange={(e) => setOnboardingRuleEditor((current) => ({ ...current, project_name: e.target.value }))}
-                              placeholder="Project name"
-                            />
-                          </label>
-                        </div>
-                        <label>
-                          Workflow Result JSON
-                          <textarea
-                            rows={10}
-                            value={onboardingRuleEditor.payload_json}
-                            onChange={(e) => setOnboardingRuleEditor((current) => ({ ...current, payload_json: e.target.value }))}
-                            placeholder="Paste workflow result JSON"
-                          />
-                        </label>
-                        <button className="button-primary" type="submit" disabled={onboardingRuleEditorState.loading}>
-                          {onboardingRuleEditorState.loading ? "Saving..." : "Save Workflow Changes"}
-                        </button>
-                      </form>
-                      {onboardingRuleEditorState.error ? <p className="error">{onboardingRuleEditorState.error}</p> : null}
-                      {onboardingRuleEditorState.success ? <p className="subtitle">{onboardingRuleEditorState.success}</p> : null}
-                    </article>
-
-                    <article className="panel">
-                      <h3>Monitoring Platform Capabilities</h3>
-                      {onboardingRuleCapabilities.error ? <p className="error">{onboardingRuleCapabilities.error}</p> : null}
-                      <div className="table-wrap">
-                        <table>
-                          <thead>
-                            <tr>
-                              <th>Platform</th>
-                              <th>Pull Rules</th>
-                              <th>Push Rules</th>
-                              <th>Simulation</th>
-                              <th>Dashboards</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {onboardingRuleCapabilities.rows.map((row, index) => (
-                              <tr key={`capability-${row.platform || index}`}>
-                                <td>{row.platform || "-"}</td>
-                                <td>{String(Boolean(row.can_pull_rules))}</td>
-                                <td>{String(Boolean(row.can_push_rules))}</td>
-                                <td>{String(Boolean(row.supports_simulation))}</td>
-                                <td>{String(Boolean(row.supports_dashboard_refs))}</td>
-                              </tr>
-                            ))}
-                            {!onboardingRuleCapabilities.rows.length && !onboardingRuleCapabilities.loading ? (
-                              <tr>
-                                <td colSpan={5}>No capabilities loaded yet.</td>
-                              </tr>
-                            ) : null}
+                            {!projectOnboardingRows.length ? <tr><td colSpan={5}>No saved projects available.</td></tr> : null}
                           </tbody>
                         </table>
                       </div>
                     </article>
                   </div>
-
                 ) : null}
 
                 {adminWorkspace === "alerts" ? (
@@ -4950,7 +5430,7 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {panelWorkflowUsage.map((row, index) => (
+                      {allUsageRows.map((row, index) => (
                         <tr key={`${row.task || "task"}-${index}`}>
                           <td>{row.task || "-"}</td>
                           <td>{row.provider || "-"}</td>
@@ -4960,7 +5440,7 @@ export default function App() {
                           <td>{row.total_cost_usd || "-"}</td>
                         </tr>
                       ))}
-                      {!panelWorkflowUsage.length ? (
+                      {!allUsageRows.length ? (
                         <tr>
                           <td colSpan={6}>No usage yet. Run a sample workflow from Home or open a processed alert to populate FinOps data.</td>
                         </tr>

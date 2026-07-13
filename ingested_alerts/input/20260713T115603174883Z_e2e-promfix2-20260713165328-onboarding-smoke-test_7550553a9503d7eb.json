@@ -1,0 +1,46 @@
+{
+  "received_at": "2026-07-13T11:56:03.174883+00:00",
+  "source": "prometheus-alertmanager",
+  "alert": {
+    "source": "prometheus-alertmanager",
+    "name": "e2e-promfix2-20260713165328-onboarding-smoke-test",
+    "service": "kaiops-platform",
+    "environment": "prod",
+    "severity": "info",
+    "description": "Auto-generated alert used to verify Prometheus rule loading and alert flow.",
+    "labels": {
+      "alertname": "e2e-promfix2-20260713165328-onboarding-smoke-test",
+      "environment": "prod",
+      "onboarding_test": "true",
+      "project": "e2e-promfix2-20260713165328",
+      "severity": "info",
+      "alert_status": "firing",
+      "alert_fingerprint": "7550553a9503d7eb"
+    },
+    "annotations": {
+      "description": "Auto-generated alert used to verify Prometheus rule loading and alert flow.",
+      "summary": "e2e-promfix2-20260713165328 onboarding smoke test",
+      "startsAt": "2026-07-13T11:23:33.1Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://083644d185d4:9090/graph?g0.expr=vector%281%29&g0.tab=1"
+    }
+  },
+  "raw": {
+    "status": "firing",
+    "labels": {
+      "alertname": "e2e-promfix2-20260713165328-onboarding-smoke-test",
+      "environment": "prod",
+      "onboarding_test": "true",
+      "project": "e2e-promfix2-20260713165328",
+      "severity": "info"
+    },
+    "annotations": {
+      "description": "Auto-generated alert used to verify Prometheus rule loading and alert flow.",
+      "summary": "e2e-promfix2-20260713165328 onboarding smoke test"
+    },
+    "startsAt": "2026-07-13T11:23:33.1Z",
+    "endsAt": "0001-01-01T00:00:00Z",
+    "generatorURL": "http://083644d185d4:9090/graph?g0.expr=vector%281%29&g0.tab=1",
+    "fingerprint": "7550553a9503d7eb"
+  }
+}

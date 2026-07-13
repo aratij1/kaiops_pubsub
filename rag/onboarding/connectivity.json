@@ -1,14 +1,14 @@
 {
   "project": {
-    "name": "test1",
-    "owner_team": "arati",
+    "name": "test5",
+    "owner_team": "sre",
     "environment": "prod",
-    "region": "us-east-1"
+    "region": "ap-south-1"
   },
   "deployment_mode": "on_prem",
-  "prometheus_url": "http://prometheus.local:9090",
-  "new_relic_url": "http://newrelic.local:443",
-  "datadog_url": "http://datadog.local:443",
+  "prometheus_url": "",
+  "new_relic_url": "",
+  "datadog_url": "",
   "gcp_project_id": "",
   "gcp_region": "us-central1",
   "pubsub_topic": "kaiops-orchestration-events",
