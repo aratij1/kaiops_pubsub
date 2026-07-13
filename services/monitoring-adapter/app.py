@@ -21,6 +21,8 @@ from common.logging import get_logger
 from common.models import (
     Alert,
     AlertSeverity,
+    Incident,
+    IncidentStatus,
     Approval,
     ApprovalDecision,
     Recommendation,
@@ -73,6 +75,7 @@ settings = get_settings()
 settings.service_name = "monitoring-adapter"
 logger = get_logger(__name__)
 RECENT_ALERTS: deque[dict[str, Any]] = deque(maxlen=200)
+# Fallback only for deployments without database-backed workflow state.
 PENDING_WORKFLOWS: dict[str, dict[str, Any]] = {}
 CLOSED_INCIDENTS: deque[dict[str, Any]] = deque(maxlen=500)
 LANDING_PAD_INPUT_DIR = Path(os.getenv("LANDING_PAD_INPUT_DIR", "/app/ingested_alerts/input"))
@@ -349,7 +352,7 @@ def _record_worker_success(worker_name: str) -> None:
 async def _load_pending_workflow_from_db(incident_id: str) -> dict[str, Any] | None:
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
-        return None
+        return PENDING_WORKFLOWS.get(str(incident_id))
     async with session_factory() as session:
         repo = IncidentRepository(session)
         return await repo.get_pending_workflow(incident_id)
@@ -360,6 +363,7 @@ async def _save_pending_workflow_to_db(
 ) -> None:
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
+        PENDING_WORKFLOWS[str(incident_id)] = _json_safe(payload)
         return
     async with session_factory() as session:
         repo = IncidentRepository(session)
@@ -376,6 +380,7 @@ async def _save_pending_workflow_to_db(
 async def _mark_pending_workflow_completed_in_db(incident_id: str, final_payload: dict[str, Any]) -> None:
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
+        PENDING_WORKFLOWS.pop(str(incident_id), None)
         return
     async with session_factory() as session:
         repo = IncidentRepository(session)
@@ -1620,7 +1625,6 @@ async def run_local_payment_workflow(
         incident_id_str = str(incident.id)
         recommendation_id_str = str(recommendation.id)
         safe_pending_payload = _json_safe(pending_payload)
-        PENDING_WORKFLOWS[incident_id_str] = safe_pending_payload
         await _save_pending_workflow_to_db(
             incident_id=incident_id_str,
             recommendation_id=recommendation_id_str,
@@ -1880,16 +1884,14 @@ async def continue_pending_workflow(
     from remediation_engine import RemediationEngine
 
     incident_key = str(incident_id)
-    pending = PENDING_WORKFLOWS.get(incident_key)
-    if not pending:
-        persisted = await _load_pending_workflow_from_db(incident_key)
-        if persisted and str(persisted.get("status") or "").strip().lower() == "completed":
-            completed_payload = persisted.get("completed_payload") if isinstance(persisted.get("completed_payload"), dict) else None
-            if completed_payload:
-                return completed_payload
-        if persisted and isinstance(persisted.get("payload"), dict):
-            pending = persisted.get("payload", {})
-            PENDING_WORKFLOWS[incident_key] = pending
+    persisted = await _load_pending_workflow_from_db(incident_key)
+    pending: dict[str, Any] | None = None
+    if persisted and str(persisted.get("status") or "").strip().lower() == "completed":
+        completed_payload = persisted.get("completed_payload") if isinstance(persisted.get("completed_payload"), dict) else None
+        if completed_payload:
+            return completed_payload
+    if persisted and isinstance(persisted.get("payload"), dict):
+        pending = persisted.get("payload", {})
 
     if not pending:
         raise HTTPException(status_code=404, detail="No pending workflow found for incident")
@@ -2123,6 +2125,13 @@ async def continue_pending_workflow(
     }
 
     metrics_base = pending.get("metrics_base", {}) if isinstance(pending.get("metrics_base"), dict) else {}
+    final_incident_status = IncidentStatus.CLOSED if closure_report.health_restored else IncidentStatus.FAILED
+    final_incident_payload = {
+        **incident_data,
+        "status": final_incident_status.value,
+        "closed_at": datetime.now(timezone.utc).isoformat() if closure_report.health_restored else incident_data.get("closed_at"),
+    }
+    final_incident = Incident.model_validate(final_incident_payload)
     metrics = {
         **metrics_base,
         "agent_handoffs": 6,
@@ -2137,7 +2146,7 @@ async def continue_pending_workflow(
         "mode": "local-no-kafka",
         "scenario": pending.get("scenario", {}),
         "alert": pending.get("alert", {}),
-        "incident": pending.get("incident", {}),
+        "incident": final_incident.model_dump(mode="json"),
         "decision": pending.get("decision", {}),
         "context": pending.get("context", {}),
         "recommendation": recommendation_data,
@@ -2159,6 +2168,7 @@ async def continue_pending_workflow(
         trace_id=approval_trace_id,
     )
     await persist_step(
+        lambda repo: repo.save_incident(final_incident),
         lambda repo: repo.save_incident_event(
             _json_safe(
                 _build_local_metadata_envelope(
@@ -2181,7 +2191,6 @@ async def continue_pending_workflow(
         )
     )
     await _mark_pending_workflow_completed_in_db(incident_key, final_payload)
-    PENDING_WORKFLOWS.pop(incident_key, None)
     return final_payload
 
 

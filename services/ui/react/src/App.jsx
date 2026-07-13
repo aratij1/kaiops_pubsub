@@ -923,11 +923,12 @@ export default function App() {
     setSelectedStageCompleteness({ loading: true, data: null, error: "", incidentId: normalized });
     try {
       const payload = await fetchJson(`/api-gateway/incidents/${normalized}/stage-completeness`);
+      const stageData = payload?.data || payload;
       setSelectedStageCompleteness((prev) => {
         if (String(prev.incidentId || "") !== normalized) {
           return prev;
         }
-        return { loading: false, data: payload, error: "", incidentId: normalized };
+        return { loading: false, data: stageData, error: "", incidentId: normalized };
       });
     } catch (error) {
       setSelectedStageCompleteness((prev) => {
@@ -2756,12 +2757,17 @@ export default function App() {
 
   const executiveMetrics = useMemo(() => {
     const rows = Array.isArray(gatewayRecent.rows) ? gatewayRecent.rows : [];
-    const totalRequests = rows.length;
-    const successRequests = rows.filter((row) => {
+    const summaryTotal = toFiniteNumber(gatewaySummary.data?.window_events || gatewaySummary.data?.total_events || 0);
+    const recentSuccess = rows.filter((row) => {
       const status = Number(row?.status_code || 0);
       return status >= 200 && status < 400;
     }).length;
-    const failedRequests = rows.filter((row) => Number(row?.status_code || 0) >= 400).length;
+    const recentFailure = rows.filter((row) => Number(row?.status_code || 0) >= 400).length;
+    const totalRequests = rows.length || summaryTotal;
+    const successRequests = rows.length ? recentSuccess : toFiniteNumber(gatewaySummary.data?.allowed || 0);
+    const failedRequests = rows.length
+      ? recentFailure
+      : toFiniteNumber(gatewaySummary.data?.blocked || 0) + toFiniteNumber(gatewaySummary.data?.review || 0);
     const latencyValues = rows
       .map((row) => Number(row?.latency_ms ?? row?.gateway?.latency_ms ?? row?.latency ?? 0))
       .filter((value) => Number.isFinite(value) && value > 0);
@@ -2804,7 +2810,7 @@ export default function App() {
       finopsTokens,
       finopsCost,
     };
-  }, [gatewayRecent.rows, panelWorkflow, selectedAlertWorkflow, latestWorkflow, allUsageRows]);
+  }, [gatewayRecent.rows, gatewaySummary.data, panelWorkflow, selectedAlertWorkflow, latestWorkflow, allUsageRows]);
 
   const finopsByProvider = useMemo(() => {
     const grouped = new Map();
@@ -3902,6 +3908,8 @@ export default function App() {
                           <tbody>
                             <tr><th>Alert</th><td>{selectedAlertRow?.name || selectedAlertWorkflow?.alert?.name || "-"}</td></tr>
                             <tr><th>Incident</th><td>{selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "-"}</td></tr>
+                            <tr><th>Persisted Incident Status</th><td>{selectedStageCompleteness.data?.status || selectedAlertWorkflow?.incident?.status || "-"}</td></tr>
+                            <tr><th>Closed At</th><td>{selectedAlertWorkflow?.incident?.closed_at || "-"}</td></tr>
                             <tr><th>Service</th><td>{selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "-"}</td></tr>
                             <tr><th>Root Cause</th><td>{selectedAlertWorkflow?.recommendation?.root_cause || "-"}</td></tr>
                             <tr><th>Recommended Action</th><td>{selectedAlertWorkflow?.recommendation?.recommended_action || "-"}</td></tr>

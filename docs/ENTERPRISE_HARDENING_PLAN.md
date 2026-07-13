@@ -34,14 +34,14 @@ This document turns the latest architecture/code review into an execution-ready 
 ### 2) K8s secret/config DB mismatch
 - Owner: Platform Engineering
 - Files:
-  - `k8s/secret.yaml`
+  - `k8s/create-secret.ps1`
   - `k8s/configmap.yaml`
 - Problem:
   - K8s secret still uses postgres URL while codebase/runtime is MySQL-first.
   - Placeholder API keys remain in manifest.
 - Implementation:
-  - Replace DB URL with MySQL DSN.
-  - Remove placeholder secrets from committed manifests and document external secret manager usage.
+  - Generate the deployment secret out of band from environment or secret manager values.
+  - Remove committed secret manifests and document the runtime secret creation workflow.
 - Acceptance criteria:
   - K8s deployment connects to intended DB backend.
   - Secret values are managed outside git (or encrypted workflow).

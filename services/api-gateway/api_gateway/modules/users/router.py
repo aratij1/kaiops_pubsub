@@ -19,8 +19,20 @@ from api_gateway.modules.users.schemas import (
 )
 from api_gateway.modules.users.service import UserService
 from api_gateway.modules.users.models import SystemRole
+from common.config import get_settings
 
 router = APIRouter(tags=["user-management"])
+settings = get_settings()
+
+
+def _client_ip(request: Request, x_forwarded_for: str | None) -> str | None:
+    if settings.trust_x_forwarded_for and x_forwarded_for:
+        forwarded = [item.strip() for item in x_forwarded_for.split(",") if item.strip()]
+        if forwarded:
+            return forwarded[0][:64]
+    if request.client and request.client.host:
+        return str(request.client.host)[:64]
+    return None
 
 
 @router.post("/auth/login", response_model=AuthTokenResponse)
@@ -30,7 +42,7 @@ async def auth_login(
     x_forwarded_for: str | None = Header(default=None),
     user_service: UserService = Depends(get_user_service),
 ):
-    ip_address = x_forwarded_for or (request.client.host if request.client else None)
+    ip_address = _client_ip(request, x_forwarded_for)
     data = await user_service.login(
         username=payload.username,
         password=payload.password,
@@ -51,7 +63,7 @@ async def auth_logout(
     auth: AuthContext = Depends(current_auth_context),
     user_service: UserService = Depends(get_user_service),
 ):
-    return await user_service.logout(jwt_id=auth.jwt_id, user_id=auth.user_id)
+    return await user_service.logout(session_jti=auth.session_jti, user_id=auth.user_id)
 
 
 @router.get("/auth/me", response_model=AuthMeResponse)
