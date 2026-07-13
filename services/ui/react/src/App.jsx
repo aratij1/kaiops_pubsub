@@ -791,6 +791,13 @@ export default function App() {
   });
   const [onboardingRuleRunState, setOnboardingRuleRunState] = useState({ loading: false, result: null, error: "" });
   const [onboardingRuleLookup, setOnboardingRuleLookup] = useState({ workflow_id: "", loading: false, result: null, error: "" });
+  const [selectedOnboardingProject, setSelectedOnboardingProject] = useState("");
+  const [onboardingRuleEditor, setOnboardingRuleEditor] = useState({
+    workflow_id: "",
+    project_name: "",
+    payload_json: "",
+  });
+  const [onboardingRuleEditorState, setOnboardingRuleEditorState] = useState({ loading: false, error: "", success: "" });
   const [alertOnboarding, setAlertOnboarding] = useState({
     kind: "incident",
     title: "New Alert Onboarding",
@@ -1364,6 +1371,110 @@ export default function App() {
     }
   }
 
+  function applyProjectOnboardingRow(row) {
+    if (!row || typeof row !== "object") {
+      return;
+    }
+    const projectPayload = row.project_payload && typeof row.project_payload === "object" ? row.project_payload : {};
+    const connectivityPayload = row.connectivity_payload && typeof row.connectivity_payload === "object" ? row.connectivity_payload : {};
+    setSelectedOnboardingProject(String(row.project_name || projectPayload.name || "").trim());
+    setOnboardingForm((curr) => ({
+      ...curr,
+      name: String(row.project_name || projectPayload.name || curr.name || "").trim(),
+      owner_team: String(row.owner_team || projectPayload.owner_team || curr.owner_team || "").trim(),
+      environment: String(row.environment || projectPayload.environment || curr.environment || "prod").trim(),
+      region: String(row.region || projectPayload.region || curr.region || "").trim(),
+      deployment_mode: String(connectivityPayload.deployment_mode || curr.deployment_mode || "on_prem").trim(),
+      prometheus_url: String(connectivityPayload.prometheus_url || curr.prometheus_url || "").trim(),
+      new_relic_url: String(connectivityPayload.new_relic_url || curr.new_relic_url || "").trim(),
+      datadog_url: String(connectivityPayload.datadog_url || curr.datadog_url || "").trim(),
+      gcp_project_id: String(connectivityPayload.gcp_project_id || curr.gcp_project_id || "").trim(),
+      gcp_region: String(connectivityPayload.gcp_region || curr.gcp_region || "").trim(),
+      pubsub_topic: String(connectivityPayload.pubsub_topic || curr.pubsub_topic || "").trim(),
+      pubsub_subscription: String(connectivityPayload.pubsub_subscription || curr.pubsub_subscription || "").trim(),
+      vertex_model_armor_enabled: Boolean(connectivityPayload.vertex_model_armor_enabled ?? curr.vertex_model_armor_enabled),
+      vertex_model_armor_template: String(connectivityPayload.vertex_model_armor_template || curr.vertex_model_armor_template || "").trim(),
+    }));
+  }
+
+  function openRuleWorkflowEditor(row) {
+    const connectivityPayload = row?.connectivity_payload && typeof row.connectivity_payload === "object" ? row.connectivity_payload : {};
+    const workflowId = String(connectivityPayload.workflow_id || "").trim();
+    const resultPayload = connectivityPayload.result && typeof connectivityPayload.result === "object" ? connectivityPayload.result : {};
+    setOnboardingRuleEditor({
+      workflow_id: workflowId,
+      project_name: String(row?.project_name || "").trim(),
+      payload_json: JSON.stringify(resultPayload, null, 2),
+    });
+    setOnboardingRuleEditorState({ loading: false, error: "", success: "" });
+    setOnboardingRuleLookup((current) => ({ ...current, workflow_id: workflowId }));
+  }
+
+  async function saveRuleWorkflowEditor(event) {
+    event.preventDefault();
+    const workflowId = String(onboardingRuleEditor.workflow_id || "").trim();
+    const projectName = String(onboardingRuleEditor.project_name || onboardingForm.name || "").trim();
+    if (!workflowId || !projectName) {
+      setOnboardingRuleEditorState({ loading: false, error: "Workflow ID and project name are required.", success: "" });
+      return;
+    }
+    setOnboardingRuleEditorState({ loading: true, error: "", success: "" });
+    try {
+      const parsedResult = JSON.parse(String(onboardingRuleEditor.payload_json || "{}").trim() || "{}");
+      await fetchJson(`/api-gateway/onboarding/rules/pipeline/${encodeURIComponent(workflowId)}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          project_name: projectName,
+          result: parsedResult,
+          status: "updated",
+        }),
+      });
+      await loadOnboardingAdminData();
+      setOnboardingRuleEditorState({ loading: false, error: "", success: "Rule workflow updated." });
+    } catch (error) {
+      setOnboardingRuleEditorState({ loading: false, error: error.message, success: "" });
+    }
+  }
+
+  async function deleteRuleWorkflow(workflowId) {
+    const normalizedWorkflowId = String(workflowId || "").trim();
+    if (!normalizedWorkflowId) {
+      return;
+    }
+    setOnboardingRuleEditorState({ loading: true, error: "", success: "" });
+    try {
+      await fetchJson(`/api-gateway/onboarding/rules/pipeline/${encodeURIComponent(normalizedWorkflowId)}`, {
+        method: "DELETE",
+      });
+      await loadOnboardingAdminData();
+      setOnboardingRuleEditor((current) => (
+        String(current.workflow_id || "") === normalizedWorkflowId
+          ? { workflow_id: "", project_name: "", payload_json: "" }
+          : current
+      ));
+      setOnboardingRuleEditorState({ loading: false, error: "", success: "Rule workflow deleted." });
+    } catch (error) {
+      setOnboardingRuleEditorState({ loading: false, error: error.message, success: "" });
+    }
+  }
+
+  async function deleteProjectOnboarding(projectName) {
+    const normalizedProject = String(projectName || "").trim();
+    if (!normalizedProject) {
+      return;
+    }
+    setOnboardingState((current) => ({ ...current, loading: true, error: "", success: "" }));
+    try {
+      await fetchJson(`/api-gateway/onboarding/state/${encodeURIComponent(normalizedProject)}`, {
+        method: "DELETE",
+      });
+      await loadOnboardingAdminData();
+      setOnboardingState((current) => ({ ...current, success: "Project onboarding deleted." }));
+    } catch (error) {
+      setOnboardingState((current) => ({ ...current, loading: false, error: error.message, success: "" }));
+    }
+  }
+
   async function loadOnboardingAdminData() {
     setOnboardingState((current) => ({ ...current, loading: true, error: "", success: "" }));
     try {
@@ -1374,6 +1485,12 @@ export default function App() {
       const connectivity = connectivityPayload?.data?.connectivity || connectivityPayload?.connectivity || {};
       const rows = statePayload?.data?.rows || statePayload?.rows || [];
       const project = connectivity?.project || {};
+      const allRows = Array.isArray(rows) ? rows : [];
+      const projectRows = allRows.filter((row) => String(row?.provider_name || "").trim().toLowerCase() === "project");
+      const preferredProjectName = String(project?.name || selectedOnboardingProject || "").trim();
+      const preferredProjectRow = projectRows.find((row) => String(row?.project_name || "").trim() === preferredProjectName)
+        || projectRows[0]
+        || null;
       setOnboardingForm((curr) => ({
         ...curr,
         name: String(project?.name || curr.name || "").trim(),
@@ -1391,7 +1508,12 @@ export default function App() {
         vertex_model_armor_enabled: Boolean(connectivity?.vertex_model_armor_enabled ?? curr.vertex_model_armor_enabled),
         vertex_model_armor_template: String(connectivity?.vertex_model_armor_template || curr.vertex_model_armor_template || "").trim(),
       }));
-      setOnboardingState({ loading: false, connectivity, rows: Array.isArray(rows) ? rows : [], error: "", success: "" });
+      if (preferredProjectRow) {
+        applyProjectOnboardingRow(preferredProjectRow);
+      } else if (String(project?.name || "").trim()) {
+        setSelectedOnboardingProject(String(project.name).trim());
+      }
+      setOnboardingState({ loading: false, connectivity, rows: allRows, error: "", success: "" });
     } catch (error) {
       setOnboardingState({ loading: false, connectivity: {}, rows: [], error: error.message, success: "" });
     }
@@ -1427,6 +1549,7 @@ export default function App() {
         method: "POST",
         body: JSON.stringify(payload),
       });
+      setSelectedOnboardingProject(String(payload.project.name || "").trim());
       await loadOnboardingAdminData();
       setOnboardingState((current) => ({ ...current, success: "Project onboarding saved." }));
     } catch (error) {
@@ -1435,8 +1558,9 @@ export default function App() {
   }
 
   function onboardingProjectSeed() {
+    const projectName = String(selectedOnboardingProject || onboardingForm.name || "").trim();
     return {
-      project_name: String(onboardingForm.name || "").trim(),
+      project_name: projectName,
       description: "",
       business_unit: "",
       environment: String(onboardingForm.environment || "prod").trim().toLowerCase(),
@@ -2751,23 +2875,36 @@ export default function App() {
 
   const sidebarSections = [
     { id: "home", icon: "DB", shortLabel: "Dashboard", label: "Dashboard", tone: "ops" },
-    { id: "copilot", icon: "CP", shortLabel: "Copilot", label: "Copilot Studio", tone: "meta" },
     { id: "approval", icon: "AL", shortLabel: "Approval", label: "Human Approval", tone: "risk" },
     { id: "executive", icon: "EX", shortLabel: "Executive", label: "Executive Dashboard", tone: "meta" },
     { id: "admin", icon: "AD", shortLabel: "Admin", label: "Admin Center", tone: "bus" },
-    { id: "trace", icon: "AG", shortLabel: "Flow", label: "Agent Flow", tone: "ops" },
-    { id: "safety", icon: "GW", shortLabel: "Safety", label: "Gateway Safety", tone: "risk" },
-    { id: "rag", icon: "MB", shortLabel: "Bus", label: "Message Bus", tone: "bus" },
     { id: "finops", icon: "FX", shortLabel: "FinOps", label: "FinOps", tone: "cost" },
     { id: "closed", icon: "CL", shortLabel: "Tickets", label: "Closed Tickets", tone: "ops" },
-    { id: "summary", icon: "MD", shortLabel: "Metadata", label: "Incident Metadata Explorer", tone: "meta" },
   ];
 
   const currentRole = useMemo(() => normalizeRoleName(adminSession?.user?.role_name), [adminSession?.user?.role_name]);
+  const projectOnboardingRows = useMemo(
+    () => (onboardingState.rows || []).filter((row) => String(row?.provider_name || "").trim().toLowerCase() === "project"),
+    [onboardingState.rows],
+  );
+  const ruleOnboardingRows = useMemo(
+    () => (onboardingState.rows || []).filter((row) => {
+      const provider = String(row?.provider_name || "").trim().toLowerCase();
+      return provider === "existing_rule_sync" || provider === "new_rule_onboarding";
+    }),
+    [onboardingState.rows],
+  );
   const allowedTabs = useMemo(() => ROLE_ALLOWED_TABS[currentRole] || ["approval"], [currentRole]);
   const visibleSidebarSections = useMemo(() => sidebarSections.filter((tab) => allowedTabs.includes(tab.id)), [sidebarSections, allowedTabs]);
   const isAuthenticated = Boolean(String(adminSession.accessToken || "").trim());
   const isAdministrator = currentRole === "administrator";
+
+  useEffect(() => {
+    if (selectedOnboardingProject || !projectOnboardingRows.length) {
+      return;
+    }
+    applyProjectOnboardingRow(projectOnboardingRows[0]);
+  }, [selectedOnboardingProject, projectOnboardingRows]);
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -3839,7 +3976,42 @@ export default function App() {
                 {adminWorkspace === "project" ? (
                   <div className="grid single-col">
                     <article className="panel">
-                      <div className="panel-head"><h3>Project Onboarding</h3><button type="button" className="button-secondary" onClick={loadOnboardingAdminData}>Refresh</button></div>
+                      <div className="panel-head">
+                        <h3>Project Onboarding</h3>
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button type="button" className="button-secondary" onClick={loadOnboardingAdminData}>Refresh</button>
+                          <button
+                            type="button"
+                            className="button-secondary"
+                            onClick={() => deleteProjectOnboarding(selectedOnboardingProject || onboardingForm.name)}
+                            disabled={onboardingState.loading || !String(selectedOnboardingProject || onboardingForm.name || "").trim()}
+                          >
+                            Delete Project
+                          </button>
+                        </div>
+                      </div>
+                      <div className="filter-grid">
+                        <label>
+                          Existing Projects
+                          <select
+                            value={selectedOnboardingProject}
+                            onChange={(e) => {
+                              const nextProjectName = e.target.value;
+                              setSelectedOnboardingProject(nextProjectName);
+                              const row = projectOnboardingRows.find((item) => String(item?.project_name || "") === nextProjectName);
+                              if (row) {
+                                applyProjectOnboardingRow(row);
+                              }
+                            }}
+                          >
+                            <option value="">Select project</option>
+                            {projectOnboardingRows.map((row, index) => {
+                              const name = String(row?.project_name || "").trim() || `project-${index + 1}`;
+                              return <option key={`project-select-${name}-${index}`} value={name}>{name}</option>;
+                            })}
+                          </select>
+                        </label>
+                      </div>
                       <form className="form" onSubmit={saveOnboardingConnectivity}>
                         <div className="filter-grid">
                           <label>Project<input value={onboardingForm.name} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, name: e.target.value }))} /></label>
@@ -3888,20 +4060,30 @@ export default function App() {
                     </article>
 
                     <article className="panel">
-                      <h3>Saved Onboarding State</h3>
+                      <h3>Saved Projects</h3>
                       <div className="table-wrap">
                         <table>
-                          <thead><tr><th>Project</th><th>Provider</th><th>Status</th><th>Updated</th></tr></thead>
+                          <thead><tr><th>Project</th><th>Owner</th><th>Environment</th><th>Updated</th><th>Action</th></tr></thead>
                           <tbody>
-                            {(onboardingState.rows || []).slice(0, 50).map((row, index) => (
-                              <tr key={`onboarding-row-${index}`}>
+                            {projectOnboardingRows.slice(0, 50).map((row, index) => (
+                              <tr key={`onboarding-project-row-${index}`}>
                                 <td>{row.project_name || "-"}</td>
-                                <td>{row.provider_name || "-"}</td>
-                                <td>{row.status || "-"}</td>
+                                <td>{row.owner_team || "-"}</td>
+                                <td>{row.environment || "-"}</td>
                                 <td>{row.updated_at || row.created_at || "-"}</td>
+                                <td>
+                                  <div style={{ display: "flex", gap: 8 }}>
+                                    <button type="button" className="button-secondary" onClick={() => applyProjectOnboardingRow(row)}>
+                                      Edit
+                                    </button>
+                                    <button type="button" className="button-secondary" onClick={() => deleteProjectOnboarding(row.project_name)}>
+                                      Delete
+                                    </button>
+                                  </div>
+                                </td>
                               </tr>
                             ))}
-                            {!onboardingState.rows.length ? <tr><td colSpan={4}>No onboarding rows available.</td></tr> : null}
+                            {!projectOnboardingRows.length ? <tr><td colSpan={5}>No project onboarding rows available.</td></tr> : null}
                           </tbody>
                         </table>
                       </div>
@@ -4074,6 +4256,90 @@ export default function App() {
                           {onboardingRuleRunState.result ? <pre className="result">{JSON.stringify(onboardingRuleRunState.result, null, 2)}</pre> : null}
                         </div>
                       ) : null}
+                    </article>
+
+                    <article className="panel">
+                      <h3>Saved Rule Workflows</h3>
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>Project</th>
+                              <th>Pipeline</th>
+                              <th>Workflow ID</th>
+                              <th>Status</th>
+                              <th>Updated</th>
+                              <th>Action</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {ruleOnboardingRows.slice(0, 100).map((row, index) => {
+                              const payload = row.connectivity_payload && typeof row.connectivity_payload === "object" ? row.connectivity_payload : {};
+                              const workflowId = String(payload.workflow_id || "").trim();
+                              return (
+                                <tr key={`rule-workflow-row-${index}`}>
+                                  <td>{row.project_name || "-"}</td>
+                                  <td>{row.provider_name || payload.pipeline || "-"}</td>
+                                  <td>{workflowId || "-"}</td>
+                                  <td>{payload.status || row.test_status || "-"}</td>
+                                  <td>{row.updated_at || row.created_at || "-"}</td>
+                                  <td>
+                                    <div style={{ display: "flex", gap: 8 }}>
+                                      <button type="button" className="button-secondary" onClick={() => openRuleWorkflowEditor(row)} disabled={!workflowId}>
+                                        Edit
+                                      </button>
+                                      <button type="button" className="button-secondary" onClick={() => deleteRuleWorkflow(workflowId)} disabled={!workflowId || onboardingRuleEditorState.loading}>
+                                        Delete
+                                      </button>
+                                    </div>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                            {!ruleOnboardingRows.length ? (
+                              <tr>
+                                <td colSpan={6}>No saved rule workflows available.</td>
+                              </tr>
+                            ) : null}
+                          </tbody>
+                        </table>
+                      </div>
+
+                      <h3>Edit Rule Workflow Result</h3>
+                      <form className="form" onSubmit={saveRuleWorkflowEditor}>
+                        <div className="filter-grid">
+                          <label>
+                            Workflow ID
+                            <input
+                              value={onboardingRuleEditor.workflow_id}
+                              onChange={(e) => setOnboardingRuleEditor((current) => ({ ...current, workflow_id: e.target.value }))}
+                              placeholder="Workflow ID"
+                            />
+                          </label>
+                          <label>
+                            Project Name
+                            <input
+                              value={onboardingRuleEditor.project_name}
+                              onChange={(e) => setOnboardingRuleEditor((current) => ({ ...current, project_name: e.target.value }))}
+                              placeholder="Project name"
+                            />
+                          </label>
+                        </div>
+                        <label>
+                          Workflow Result JSON
+                          <textarea
+                            rows={10}
+                            value={onboardingRuleEditor.payload_json}
+                            onChange={(e) => setOnboardingRuleEditor((current) => ({ ...current, payload_json: e.target.value }))}
+                            placeholder="Paste workflow result JSON"
+                          />
+                        </label>
+                        <button className="button-primary" type="submit" disabled={onboardingRuleEditorState.loading}>
+                          {onboardingRuleEditorState.loading ? "Saving..." : "Save Workflow Changes"}
+                        </button>
+                      </form>
+                      {onboardingRuleEditorState.error ? <p className="error">{onboardingRuleEditorState.error}</p> : null}
+                      {onboardingRuleEditorState.success ? <p className="subtitle">{onboardingRuleEditorState.success}</p> : null}
                     </article>
 
                     <article className="panel">
