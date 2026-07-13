@@ -101,6 +101,7 @@ class KnowledgeBaseRecord(Base, TimestampMixin):
 
 class AuditLogRecord(Base, TimestampMixin):
     __tablename__ = "audit_logs"
+    __table_args__ = (Index("idx_audit_logs_resource_action_created", "resource_type", "action", "created_at"),)
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     actor: Mapped[str] = mapped_column(String(255), index=True)
@@ -278,6 +279,24 @@ async def create_schema(engine: AsyncEngine) -> None:
         try:
             await connection.run_sync(Base.metadata.create_all)
             if engine.dialect.name == "mysql":
+                has_audit_index = await connection.scalar(
+                    text(
+                        """
+                        SELECT COUNT(*)
+                        FROM information_schema.statistics
+                        WHERE table_schema = DATABASE()
+                          AND table_name = 'audit_logs'
+                          AND index_name = 'idx_audit_logs_resource_action_created'
+                        """
+                    )
+                )
+                if int(has_audit_index or 0) == 0:
+                    await connection.execute(
+                        text(
+                            "CREATE INDEX idx_audit_logs_resource_action_created ON audit_logs (resource_type, action, created_at)"
+                        )
+                    )
+
                 has_agent_table = await connection.scalar(
                     text(
                         """

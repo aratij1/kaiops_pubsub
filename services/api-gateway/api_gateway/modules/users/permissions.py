@@ -15,6 +15,7 @@ class AuthContext:
     user_id: int
     role: str
     jwt_id: str
+    session_jti: str
     token_type: str
 
 
@@ -33,11 +34,16 @@ async def current_auth_context(
     token_type = str(payload.get("type") or "")
     if token_type != "access":
         raise HTTPException(status_code=401, detail="Access token required")
+    session_jti = str(payload.get("sid") or "").strip()
+    if not session_jti:
+        raise HTTPException(status_code=401, detail="Access token is missing session binding")
+    await user_service.ensure_active_session(session_jti=session_jti, user_id=int(payload.get("sub", "0")))
 
     return AuthContext(
         user_id=int(payload.get("sub", "0")),
         role=str(payload.get("role") or ""),
         jwt_id=str(payload.get("jti") or ""),
+        session_jti=session_jti,
         token_type=token_type,
     )
 
