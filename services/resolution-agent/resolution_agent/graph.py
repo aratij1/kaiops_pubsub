@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, TypedDict
 
 from common.agent_runtime import AgentRuntime, ContextFailure, ValidationError
@@ -42,7 +43,63 @@ class ResolutionIntelligenceAgent(BaseAgent):
         self.model_gateway = model_gateway or RouterModelGateway(self.model_router)
         self.runtime = runtime or AgentRuntime(max_attempts=2)
         self.memory_store = memory_store or InMemoryStore()
+        # Bound each model call so a single blocked provider cannot stall event consumption.
+        self.model_step_timeout_seconds = 20.0
         self.graph = self._build_graph()
+
+    async def _generate_with_fallback(
+        self,
+        *,
+        context: Context,
+        task: ModelTask,
+        prompt: str,
+        payload: dict[str, Any],
+        fallback_content: str,
+    ) -> dict[str, Any]:
+        try:
+            response = await asyncio.wait_for(
+                self.model_gateway.generate(
+                    GenerationRequest(
+                        severity=context.alert.severity,
+                        task=task.value,
+                        prompt=prompt,
+                        payload=payload,
+                    )
+                ),
+                timeout=self.model_step_timeout_seconds,
+            )
+            if not isinstance(response, dict):
+                raise ValueError("model gateway returned a non-dict response")
+            usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+            usage.setdefault("provider", str(response.get("model") or "unknown"))
+            usage.setdefault("model", str(usage.get("provider") or "unknown"))
+            usage.setdefault("task", task.value)
+            usage.setdefault("input_tokens", 0)
+            usage.setdefault("output_tokens", 0)
+            usage.setdefault("total_tokens", 0)
+            usage.setdefault("total_cost_usd", 0.0)
+            usage.setdefault("estimated", True)
+            return {
+                "model": str(response.get("model") or "unknown"),
+                "content": str(response.get("content") or fallback_content),
+                "usage": usage,
+            }
+        except Exception as exc:
+            return {
+                "model": "fallback",
+                "content": fallback_content,
+                "usage": {
+                    "provider": "fallback",
+                    "model": "fallback",
+                    "task": task.value,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "total_cost_usd": 0.0,
+                    "estimated": True,
+                    "error": str(exc),
+                },
+            }
 
     async def can_execute(self, context: AgentContext) -> bool:
         return "context-agent" in context.previous_agent_results or "context" in context.previous_agent_results
@@ -95,13 +152,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
         context = state["context"]
         prompt = PROMPT_IDENTIFY_ROOT_CAUSE
         payload = {"summary": context.alert.description, **state["gathered_context"]}
-        response = await self.model_gateway.generate(
-            GenerationRequest(
-                severity=context.alert.severity,
-                task=ModelTask.RCA.value,
-                prompt=prompt,
-                payload=payload,
-            )
+        response = await self._generate_with_fallback(
+            context=context,
+            task=ModelTask.RCA,
+            prompt=prompt,
+            payload=payload,
+            fallback_content=f"Likely service degradation in {context.alert.service}",
         )
         deployment = context.deployment or "unknown change"
         state["root_cause"] = deployment if "Deployment" in deployment else response["content"]
@@ -131,13 +187,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
         context = state["context"]
         prompt = PROMPT_ASSESS_IMPACT
         payload = {"service": context.alert.service, "metrics": context.observability}
-        response = await self.model_gateway.generate(
-            GenerationRequest(
-                severity=context.alert.severity,
-                task=ModelTask.IMPACT.value,
-                prompt=prompt,
-                payload=payload,
-            )
+        response = await self._generate_with_fallback(
+            context=context,
+            task=ModelTask.IMPACT,
+            prompt=prompt,
+            payload=payload,
+            fallback_content=f"{context.alert.service.title()} service impact requires immediate triage",
         )
         if "latency" in context.alert.description.lower():
             state["impact"] = f"{context.alert.service.title()} latency"
@@ -176,13 +231,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
         else:
             prompt = PROMPT_RECOMMEND_REMEDIATION
             payload = {"service": context.alert.service, "runbook": context.runbook}
-            response = await self.model_gateway.generate(
-                GenerationRequest(
-                    severity=context.alert.severity,
-                    task=ModelTask.FIX.value,
-                    prompt=prompt,
-                    payload=payload,
-                )
+            response = await self._generate_with_fallback(
+                context=context,
+                task=ModelTask.FIX,
+                prompt=prompt,
+                payload=payload,
+                fallback_content=f"Investigate {context.alert.service} health and apply documented runbook remediation",
             )
             action = response["content"]
             commands = []

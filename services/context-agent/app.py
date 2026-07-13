@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 import re
 from typing import Any
 
@@ -343,7 +344,13 @@ def write_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
     connector = vector_connector()
     root = connector.root_path()
     target_dir = root / kind_directory(request.kind)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        if not (target_dir.exists() and target_dir.is_dir()):
+            fallback_root = Path("/tmp/kaiops/rag")
+            target_dir = fallback_root / kind_directory(request.kind)
+            target_dir.mkdir(parents=True, exist_ok=True)
     base_name = slugify(request.alert_id or request.title)
     target = target_dir / f"{base_name}.md"
     if not request.alert_id:

@@ -717,8 +717,57 @@ def _build_onboarding_rag_documents(
 def _prometheus_rules_output_path(project_name: str, workflow_id: str) -> Path:
     safe_project = re.sub(r"[^a-zA-Z0-9_-]", "-", str(project_name or "project").strip()) or "project"
     safe_workflow = re.sub(r"[^a-zA-Z0-9_-]", "-", str(workflow_id or "workflow").strip()) or str(uuid.uuid4())
-    output_dir = rag_root_path() / "changes" / "prometheus_rules"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    primary_output_dir = rag_root_path() / "changes" / "prometheus_rules"
+
+    def _ensure_writable_directory(path: Path) -> None:
+        # Handle races and stale filesystem entries (including broken symlinks)
+        # so onboarding can always write generated rules.
+        for _ in range(3):
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                return
+            except FileExistsError:
+                if path.exists() and path.is_dir():
+                    return
+
+                if os.path.lexists(path):
+                    try:
+                        path.unlink()
+                    except IsADirectoryError:
+                        # Another request may have completed directory creation.
+                        if path.exists() and path.is_dir():
+                            return
+                        raise
+
+                parent = path.parent
+                try:
+                    parent.mkdir(parents=True, exist_ok=True)
+                except FileExistsError:
+                    if parent.exists() and parent.is_dir():
+                        continue
+                    if os.path.lexists(parent):
+                        try:
+                            parent.unlink()
+                        except IsADirectoryError:
+                            if parent.exists() and parent.is_dir():
+                                continue
+                            raise
+
+        # Final attempt after cleanup/retry loop.
+        path.mkdir(parents=True, exist_ok=True)
+
+    output_dir = primary_output_dir
+    try:
+        _ensure_writable_directory(primary_output_dir)
+    except Exception:
+        logger.exception(
+            "prometheus_rules_output_dir_unavailable",
+            extra={"primary_output_dir": str(primary_output_dir)},
+        )
+        fallback_output_dir = Path("/tmp/kaiops/prometheus_rules")
+        _ensure_writable_directory(fallback_output_dir)
+        output_dir = fallback_output_dir
+
     return output_dir / f"{safe_project}-{safe_workflow}.yml"
 
 
