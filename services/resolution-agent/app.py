@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
 from common.config import get_settings
-from common.event_publishers import build_agent_event_contract
+from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Context, Incident, Recommendation
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
@@ -62,6 +62,88 @@ def _build_resolution_event_payload(
     }
 
 
+async def _persist_resolution_event(
+    *,
+    app: FastAPI,
+    context: Context,
+    incident: Incident,
+    recommendation: Recommendation,
+    decision_payload: dict[str, Any],
+) -> None:
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        return
+    metadata = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
+    orchestration = (
+        metadata.get("orchestration_decision")
+        if isinstance(metadata.get("orchestration_decision"), dict)
+        else {}
+    )
+    requires_approval = decision_payload.get("requires_approval")
+    if requires_approval is None:
+        requires_approval = orchestration.get("requires_approval")
+    status = "awaiting_approval" if bool(requires_approval) else "remediating"
+    provider = (
+        decision_payload.get("message_bus_provider")
+        or orchestration.get("message_bus_provider")
+        or "unknown"
+    )
+    async with app.state.session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_incident_event(
+            build_event_envelope(
+                event_type="incident.recommendation.generated",
+                identity={
+                    "incident_id": str(incident.id),
+                    "alert_id": str(context.alert.id),
+                    "trace_id": str(incident.trace_id or context.alert.trace_id or ""),
+                    "correlation_id": str(context.alert.correlation_id or "") or None,
+                    "causation_id": None,
+                    "parent_event_id": None,
+                },
+                scope={
+                    "tenant_id": "default",
+                    "service": str(context.alert.service or "unknown"),
+                    "environment": str(context.alert.environment or "prod"),
+                    "region": None,
+                    "team": str(context.alert.metadata.get("owner_team") or "") or None,
+                },
+                state={
+                    "severity": str(getattr(context.alert.severity, "value", context.alert.severity) or "warning").lower(),
+                    "status": status,
+                    "owner": None,
+                },
+                policy={
+                    "risk_tier": str(decision_payload.get("risk_tier") or orchestration.get("risk_tier") or "unknown"),
+                    "execution_mode": str(decision_payload.get("execution_mode") or orchestration.get("execution_mode") or "unknown"),
+                    "requires_approval": requires_approval,
+                    "policy_version": decision_payload.get("policy_version") or orchestration.get("policy_version") or metadata.get("policy_version"),
+                    "policy_reason": decision_payload.get("policy_reason") or orchestration.get("policy_reason") or metadata.get("policy_reason"),
+                },
+                transport={
+                    "provider": str(provider),
+                    "channel": RESOLUTION_EVENTS,
+                    "partition": None,
+                    "offset": None,
+                    "delivery_tag": None,
+                },
+                ai={
+                    "confidence": float(recommendation.confidence),
+                    "model_provider": str((metadata.get("model_usage") or [{}])[0].get("provider") if isinstance(metadata.get("model_usage"), list) and metadata.get("model_usage") else "") or None,
+                    "model_name": str((metadata.get("model_usage") or [{}])[0].get("model") if isinstance(metadata.get("model_usage"), list) and metadata.get("model_usage") else "") or None,
+                    "fallback_reason": None,
+                },
+                payload={
+                    "recommendation_id": str(recommendation.id),
+                    "recommended_action": recommendation.recommended_action,
+                    "root_cause": recommendation.root_cause,
+                    "impact": recommendation.impact,
+                    "risk": recommendation.risk,
+                },
+            )
+        )
+        await session.commit()
+
+
 async def startup(app: FastAPI) -> None:
     workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
     consumers: list[tuple[str, Any, ConsumeRunner]] = []
@@ -98,6 +180,13 @@ async def startup(app: FastAPI) -> None:
                 repo = IncidentRepository(session)
                 await repo.save_recommendation_as_audit(recommendation)
                 await session.commit()
+        await _persist_resolution_event(
+            app=app,
+            context=context,
+            incident=incident,
+            recommendation=recommendation,
+            decision_payload=decision_payload,
+        )
         payload_out = _build_resolution_event_payload(
             context=context,
             incident=incident,

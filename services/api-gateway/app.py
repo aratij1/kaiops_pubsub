@@ -174,6 +174,21 @@ async def guarded_proxy(
                 trace_id=trace_id,
             )
             status = "ok"
+        except httpx.HTTPStatusError as exc:
+            downstream_payload: Any
+            try:
+                downstream_payload = exc.response.json()
+            except Exception:
+                downstream_payload = {"message": (exc.response.text or "").strip()}
+            status_code = int(exc.response.status_code or 502)
+            response_payload = {
+                "error": str(exc),
+                "trace_id": trace_id,
+                "target_url": target_url,
+                "downstream": downstream_payload,
+                "hint": "Downstream service rejected the request payload.",
+            }
+            status = "error"
         except httpx.HTTPError as exc:
             status_code = 502
             response_payload = {
@@ -364,6 +379,69 @@ async def get_onboarding_state(
     )
 
 
+@app.get("/onboarding/rules/capabilities")
+async def get_onboarding_rule_capabilities(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/onboarding/rules/capabilities",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/onboarding/rules/pipeline/existing")
+async def post_onboarding_rules_pipeline_existing(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/onboarding/rules/pipeline/existing",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/onboarding/rules/pipeline/new")
+async def post_onboarding_rules_pipeline_new(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/onboarding/rules/pipeline/new",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/onboarding/rules/pipeline/{workflow_id}")
+async def get_onboarding_rules_pipeline(
+    workflow_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/onboarding/rules/pipeline/{workflow_id}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/agent-work/items")
 async def get_agent_work_items(
     request: Request,
@@ -421,6 +499,40 @@ async def get_incident_metadata(
     if service:
         params["service"] = str(service)
     path = f"/incidents/metadata?{urlencode(params)}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/incidents/{incident_id}/stage-completeness")
+async def get_incident_stage_completeness(
+    incident_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/incidents/{incident_id}/stage-completeness"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/landing-pad/recent")
+async def get_landing_pad_recent(
+    request: Request,
+    limit: int = 20,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/landing-pad/recent?{urlencode({'limit': str(limit)})}"
     return await guarded_proxy(
         request=request,
         method="GET",
