@@ -6,7 +6,7 @@ from typing import Any
 
 from closure_service import ClosureValidationAgent
 from common.config import get_settings
-from common.event_publishers import build_agent_event_contract
+from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import RemediationAction, ResolutionReport
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
@@ -71,6 +71,71 @@ def _build_closure_event_payload(
     }
 
 
+async def _persist_closure_event(
+    *,
+    app: FastAPI,
+    action: RemediationAction,
+    report: ResolutionReport,
+    source_payload: dict[str, Any],
+) -> None:
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        return
+    source_contract = source_payload.get("event_contract", {}) if isinstance(source_payload.get("event_contract"), dict) else {}
+    source_recommendation = source_payload.get("source_payload", {}).get("recommendation") if isinstance(source_payload.get("source_payload"), dict) else {}
+    recommendation = source_recommendation if isinstance(source_recommendation, dict) else {}
+    status = "closed" if bool(report.health_restored) else "failed"
+
+    async with app.state.session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_incident_event(
+            build_event_envelope(
+                event_type="incident.closure.completed",
+                identity={
+                    "incident_id": str(action.incident_id),
+                    "alert_id": None,
+                    "trace_id": str(source_contract.get("trace_id") or recommendation.get("trace_id") or ""),
+                    "correlation_id": str(source_contract.get("correlation_id") or recommendation.get("correlation_id") or "") or None,
+                    "causation_id": None,
+                    "parent_event_id": None,
+                },
+                scope={
+                    "tenant_id": "default",
+                    "service": str(action.target or "unknown"),
+                    "environment": "prod",
+                    "region": None,
+                    "team": None,
+                },
+                state={
+                    "severity": str(recommendation.get("severity") or "warning").lower(),
+                    "status": status,
+                    "owner": None,
+                },
+                policy={
+                    "risk_tier": "unknown",
+                    "execution_mode": "unknown",
+                    "requires_approval": None,
+                    "policy_version": None,
+                    "policy_reason": "closure validation completed",
+                },
+                transport={
+                    "provider": "unknown",
+                    "channel": CLOSURE_EVENTS,
+                    "partition": None,
+                    "offset": None,
+                    "delivery_tag": None,
+                },
+                payload={
+                    "report_id": str(report.id),
+                    "remediation_action_id": str(action.id),
+                    "action_taken": report.action_taken,
+                    "health_restored": report.health_restored,
+                    "alerts_cleared": report.alerts_cleared,
+                },
+            )
+        )
+        await session.commit()
+
+
 async def startup(app: FastAPI) -> None:
     workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
     consumers: list[tuple[str, Any, ConsumeRunner]] = []
@@ -88,6 +153,7 @@ async def startup(app: FastAPI) -> None:
     async def handle(payload: dict) -> None:
         action = RemediationAction.model_validate(_extract_remediation_action_payload(payload))
         report = await validate(action)
+        await _persist_closure_event(app=app, action=action, report=report, source_payload=payload)
         payload_out = _build_closure_event_payload(action=action, report=report, source_payload=payload)
         await app.state.producer.publish(CLOSURE_EVENTS, payload_out, key=str(action.incident_id))
         EVENTS_PROCESSED.labels(settings.service_name, REMEDIATION_EVENTS, "ok").inc()

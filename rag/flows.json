@@ -283,6 +283,19 @@
     "source": "rag-incident"
   },
   {
+    "id": "new-alert-onboarding",
+    "alert_id": "NEW-ALERT-ONBOARDING",
+    "alert_name": "New Alert Onboarding",
+    "alert_type": "availability",
+    "title": "New Alert Onboarding",
+    "service": "payments",
+    "severity": "HIGH",
+    "summary": "create an alert for kaiops to see not more than 10 records are thre in alert table",
+    "recommended_action": "Investigate issue",
+    "description": "create an alert for kaiops to see not more than 10 records are thre in alert table",
+    "source": "rag-incident"
+  },
+  {
     "id": "orders-replica-lag",
     "alert_id": "ORDERS-REPLICA-LAG",
     "alert_name": "Orders database replica lag",

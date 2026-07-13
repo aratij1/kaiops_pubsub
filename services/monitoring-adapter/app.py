@@ -55,6 +55,14 @@ from monitoring_adapter.state import (
     severity_from_string,
     slugify,
 )
+from monitoring_adapter.onboarding_pipelines import (
+    ExistingRulePipelineRequest,
+    NewRuleOnboardingRequest,
+    capabilities_catalog,
+    find_pipeline_rows,
+    run_existing_rule_pipeline,
+    run_new_rule_pipeline,
+)
 
 ALERT_BODY = Body(...)
 
@@ -64,6 +72,7 @@ logger = get_logger(__name__)
 RECENT_ALERTS: deque[dict[str, Any]] = deque(maxlen=200)
 PENDING_WORKFLOWS: dict[str, dict[str, Any]] = {}
 CLOSED_INCIDENTS: deque[dict[str, Any]] = deque(maxlen=500)
+LANDING_PAD_INPUT_DIR = Path(os.getenv("LANDING_PAD_INPUT_DIR", "/app/ingested_alerts/input"))
 WORKER_FAILURE_COUNTS: dict[str, int] = {
     "incident_projection_worker": 0,
 }
@@ -72,6 +81,30 @@ _ALLOWED_PROJECT_ENVIRONMENTS = {"dev", "staging", "prod"}
 _ALLOWED_ONBOARDING_PROVIDERS = {"prometheus", "new_relic", "datadog"}
 _ALLOWED_ACTIVE_PROVIDERS = {"prometheus", "new_relic", "datadog", "pubsub"}
 _ALLOWED_DEPLOYMENT_MODES = {"on_prem", "gcp_cloud"}
+ONBOARDING_RULE_EVENTS = "onboarding-rule-events"
+
+
+def _persist_alert_to_landing_pad(mapped_payload: dict[str, Any], raw_alert: dict[str, Any]) -> str | None:
+    try:
+        LANDING_PAD_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))
+        labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
+        fingerprint = str(labels.get("alert_fingerprint") or "no-fingerprint").strip() or "no-fingerprint"
+        safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:24]
+        file_name = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}_{alert_name}_{safe_fingerprint}.json"
+        out_path = LANDING_PAD_INPUT_DIR / file_name
+        payload = {
+            "received_at": now.isoformat(),
+            "source": "prometheus-alertmanager",
+            "alert": mapped_payload,
+            "raw": raw_alert,
+        }
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return str(out_path)
+    except Exception:
+        logger.exception("failed to persist alert to landing pad input")
+        return None
 
 
 class OnboardingProviderStatus(BaseModel):
@@ -554,6 +587,64 @@ async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
             )
 
         await session.commit()
+
+
+async def persist_onboarding_pipeline_result(result: dict[str, Any]) -> None:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        return
+
+    project = result.get("project", {}) if isinstance(result.get("project"), dict) else {}
+    project_name = _normalize_project_name({"name": project.get("project_name")})
+    provider_name = str(result.get("pipeline") or "onboarding_pipeline").strip().lower()
+
+    payload = {
+        "workflow_id": result.get("workflow_id"),
+        "onboarding_id": result.get("onboarding_id"),
+        "project_id": result.get("project_id"),
+        "trace_id": result.get("trace_id"),
+        "status": result.get("status"),
+        "pipeline": result.get("pipeline"),
+        "summary": result.get("summary") or result.get("approval_package") or {},
+        "event_contract": result.get("event_contract") or {},
+        "result": result,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_onboarding_state(
+            project_name=project_name,
+            provider_name=provider_name,
+            owner_team=str(project.get("support_team", "")).strip() or None,
+            environment=str(project.get("environment", "")).strip() or None,
+            region=str(project.get("region", "")).strip() or None,
+            endpoint_url=None,
+            test_status=str(result.get("status", "completed")),
+            test_message=f"{provider_name} workflow persisted",
+            project_payload=project,
+            connectivity_payload=payload,
+            last_tested_at=datetime.now(timezone.utc),
+        )
+        await session.commit()
+
+
+async def publish_onboarding_pipeline_event(result: dict[str, Any]) -> None:
+    contract = result.get("event_contract", {}) if isinstance(result.get("event_contract"), dict) else {}
+    if not contract:
+        return
+    try:
+        started = perf_counter()
+        await app.state.producer.publish(
+            ONBOARDING_RULE_EVENTS,
+            contract,
+            key=str(contract.get("project_id") or "onboarding"),
+        )
+        EVENT_PUBLISH_LATENCY.labels(settings.service_name, ONBOARDING_RULE_EVENTS, "monitoring-adapter").observe(
+            max(0.0, perf_counter() - started)
+        )
+    except Exception:
+        logger.exception("failed to publish onboarding pipeline event")
 
 
 async def run_local_payment_workflow(
@@ -1878,6 +1969,7 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
 
         alert = _build_alert_from_payload(mapped_payload, trace_id=x_trace_id)
         await _publish_ingested_alert(alert)
+        landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item)
         ingested_rows.append(
             {
                 "alert_id": str(alert.id),
@@ -1885,6 +1977,7 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 "service": alert.service,
                 "severity": alert.severity.value,
                 "status": status,
+                "landing_pad_file": landing_pad_file,
             }
         )
 
@@ -2009,6 +2102,53 @@ async def get_onboarding_state() -> OnboardingStateResponse:
     return OnboardingStateResponse(rows=rows)
 
 
+@app.get("/landing-pad/recent")
+async def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit), 200))
+    input_dir = LANDING_PAD_INPUT_DIR
+    input_dir.mkdir(parents=True, exist_ok=True)
+
+    files = sorted(
+        [path for path in input_dir.glob("*.json") if path.is_file()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[:safe_limit]
+
+    rows: list[dict[str, Any]] = []
+    for path in files:
+        entry: dict[str, Any] = {
+            "file": path.name,
+            "path": str(path),
+            "modified_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+            "size_bytes": int(path.stat().st_size),
+        }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            alert = payload.get("alert", {}) if isinstance(payload, dict) else {}
+            labels = alert.get("labels", {}) if isinstance(alert.get("labels"), dict) else {}
+            annotations = alert.get("annotations", {}) if isinstance(alert.get("annotations"), dict) else {}
+            entry.update(
+                {
+                    "received_at": payload.get("received_at") if isinstance(payload, dict) else None,
+                    "name": alert.get("name") if isinstance(alert, dict) else None,
+                    "service": alert.get("service") if isinstance(alert, dict) else None,
+                    "severity": alert.get("severity") if isinstance(alert, dict) else None,
+                    "alert_status": labels.get("alert_status") if isinstance(labels, dict) else None,
+                    "alertname": labels.get("alertname") if isinstance(labels, dict) else None,
+                    "summary": annotations.get("summary") if isinstance(annotations, dict) else None,
+                }
+            )
+        except Exception:
+            entry["parse_error"] = "invalid_json"
+        rows.append(entry)
+
+    return {
+        "input_dir": str(input_dir),
+        "rows": rows,
+        "count": len(rows),
+    }
+
+
 @app.get("/agent-work/items")
 async def get_agent_work_items(limit: int = 100) -> dict[str, Any]:
     session_factory = getattr(app.state, "session_factory", None)
@@ -2082,6 +2222,21 @@ async def get_incident_metadata(
     return {"rows": rows, "count": len(rows)}
 
 
+@app.get("/incidents/{incident_id}/stage-completeness")
+async def get_incident_stage_completeness(incident_id: str) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Database is not enabled for incident stage completeness")
+
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        result = await repo.get_incident_stage_completeness(incident_id)
+
+    if not result:
+        raise HTTPException(status_code=404, detail="No incident stage completeness found for incident")
+    return result
+
+
 @app.post("/onboarding/connectivity", response_model=OnboardingConnectivityResponse)
 async def post_onboarding_connectivity(
     payload: OnboardingConnectivityPayload = Body(...),
@@ -2093,6 +2248,54 @@ async def post_onboarding_connectivity(
     await persist_onboarding_connectivity(validated_payload)
     snapshot = OnboardingConnectivitySnapshot.model_validate(sanitized if isinstance(sanitized, dict) else {})
     return OnboardingConnectivityResponse(connectivity=snapshot)
+
+
+@app.get("/onboarding/rules/capabilities")
+async def get_onboarding_rule_capabilities() -> dict[str, Any]:
+    rows = capabilities_catalog()
+    return {"rows": rows, "count": len(rows)}
+
+
+@app.post("/onboarding/rules/pipeline/existing")
+async def onboarding_rules_pipeline_existing(payload: ExistingRulePipelineRequest = Body(...)) -> dict[str, Any]:
+    result = run_existing_rule_pipeline(payload)
+    await persist_onboarding_pipeline_result(result)
+    await publish_onboarding_pipeline_event(result)
+    return result
+
+
+@app.post("/onboarding/rules/pipeline/new")
+async def onboarding_rules_pipeline_new(payload: NewRuleOnboardingRequest = Body(...)) -> dict[str, Any]:
+    result = run_new_rule_pipeline(payload)
+    await persist_onboarding_pipeline_result(result)
+    await publish_onboarding_pipeline_event(result)
+    return result
+
+
+@app.get("/onboarding/rules/pipeline/{workflow_id}")
+async def get_onboarding_rules_pipeline(workflow_id: str) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Database is not enabled for onboarding workflow lookup")
+
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        rows = await repo.list_onboarding_state()
+
+    matched = find_pipeline_rows(rows, workflow_id)
+    if not matched:
+        raise HTTPException(status_code=404, detail="Onboarding rule workflow not found")
+
+    latest = matched[-1]
+    payload = latest.get("connectivity_payload", {}) if isinstance(latest.get("connectivity_payload"), dict) else {}
+    return {
+        "workflow_id": workflow_id,
+        "status": payload.get("status"),
+        "pipeline": payload.get("pipeline"),
+        "project_name": latest.get("project_name"),
+        "updated_at": latest.get("updated_at"),
+        "result": payload.get("result") if isinstance(payload.get("result"), dict) else {},
+    }
 
 
 @app.post("/sample/payment-latency/workflow")

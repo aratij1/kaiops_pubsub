@@ -15,9 +15,38 @@ groups:
         for: 5m
         labels:
           severity: warning
+          category: latency
+          landing_pad: realtime
         annotations:
           summary: "High p95 latency in KaiOps service"
           description: "Service {{ $labels.service }} operation {{ $labels.operation }} p95 latency is above 2s."
+
+      - alert: KaiOpsHighLatencyP99
+        expr: histogram_quantile(0.99, sum(rate(kaiops_request_latency_seconds_bucket[5m])) by (le, service, operation)) > 3
+        for: 3m
+        labels:
+          severity: critical
+          category: latency
+          landing_pad: realtime
+        annotations:
+          summary: "Critical p99 latency in KaiOps service"
+          description: "Service {{ $labels.service }} operation {{ $labels.operation }} p99 latency is above 3s."
+
+      - alert: KaiOpsLatencySLIRegression
+        expr: |
+          (
+            sum(rate(kaiops_request_latency_seconds_bucket{le="1"}[10m])) by (service, operation)
+            /
+            sum(rate(kaiops_request_latency_seconds_count[10m])) by (service, operation)
+          ) < 0.95
+        for: 10m
+        labels:
+          severity: warning
+          category: latency
+          landing_pad: realtime
+        annotations:
+          summary: "Latency SLI regression detected"
+          description: "Under 95% of requests are completing within 1 second for {{ $labels.service }} / {{ $labels.operation }} over the last 10 minutes."
 
   - name: mysql-health
     rules:
