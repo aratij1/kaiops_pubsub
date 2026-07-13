@@ -258,6 +258,27 @@ Service ports:
 - Model router: <http://localhost:8005>
 - Resolution agent: <http://localhost:8006>
 - Approval service: <http://localhost:8007>
+
+## Alert Pipeline Smoke Check
+
+Use the local smoke target to verify the alert path end-to-end:
+
+```powershell
+./scripts/smoke-alert-pipeline.ps1 -EnsureDockerStack
+```
+
+What it verifies:
+
+- Prometheus metric availability for the MySQL alerts table gauge
+- Prometheus alert presence for `KaiOpsMySQLAlertsTableRowsHigh`
+- Alertmanager receipt of the same alert
+- KaiMS gateway `GET /alerts/recent` contains the alert in `data.rows`
+
+Useful options:
+
+- `-Rebuild` to rebuild compose services before checking
+- `-TimeoutSeconds 120` to allow longer wait windows
+- `-AlertName <name>` to validate a different alert
 - Remediation engine: <http://localhost:8008>
 - Closure service: <http://localhost:8009>
 

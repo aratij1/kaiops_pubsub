@@ -1,0 +1,25 @@
+groups:
+- name: kaiops-core-generated-rules
+  rules:
+  - alert: kaiops-core-cpu-usage-percent-warning-prometheus
+    expr: avg_over_time(cpu_usage_percent[5m]) > 80.0
+    for: 5m
+    labels:
+      severity: warning
+      project: kaiops-core
+      environment: prod
+    annotations:
+      summary: create rule if any table has 0 records
+      description: Generated from plain-language onboarding for project kaiops-core.
+  - alert: kaiops-core-onboarding-smoke-test
+    expr: vector(1)
+    for: 0m
+    labels:
+      severity: info
+      project: kaiops-core
+      environment: prod
+      onboarding_test: 'true'
+    annotations:
+      summary: kaiops-core onboarding smoke test
+      description: Auto-generated alert used to verify Prometheus rule loading and
+        alert flow.

@@ -1,0 +1,46 @@
+{
+  "received_at": "2026-07-13T05:11:57.731041+00:00",
+  "source": "prometheus-alertmanager",
+  "alert": {
+    "source": "prometheus-alertmanager",
+    "name": "KaiOpsPipelineLiveTest",
+    "service": "api-gateway",
+    "environment": "prod",
+    "severity": "critical",
+    "description": "Manual API injected alert",
+    "labels": {
+      "alertname": "KaiOpsPipelineLiveTest",
+      "category": "latency",
+      "project": "kaiops-core",
+      "service": "api-gateway",
+      "severity": "critical",
+      "alert_status": "firing",
+      "alert_fingerprint": "751cc584f047b7f3"
+    },
+    "annotations": {
+      "description": "Manual API injected alert",
+      "summary": "Pipeline live test",
+      "startsAt": "2026-07-13T05:11:57.4246539Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://localhost/manual-test"
+    }
+  },
+  "raw": {
+    "status": "firing",
+    "labels": {
+      "alertname": "KaiOpsPipelineLiveTest",
+      "category": "latency",
+      "project": "kaiops-core",
+      "service": "api-gateway",
+      "severity": "critical"
+    },
+    "annotations": {
+      "description": "Manual API injected alert",
+      "summary": "Pipeline live test"
+    },
+    "startsAt": "2026-07-13T05:11:57.4246539Z",
+    "endsAt": "0001-01-01T00:00:00Z",
+    "generatorURL": "http://localhost/manual-test",
+    "fingerprint": "751cc584f047b7f3"
+  }
+}

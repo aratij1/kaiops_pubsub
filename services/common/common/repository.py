@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.database import (
@@ -945,8 +945,8 @@ class IncidentRepository:
             return None
         result = await self.session.execute(
             select(OnboardingStateRecord).where(
-                OnboardingStateRecord.project_name == normalized_project,
-                OnboardingStateRecord.provider_name == normalized_provider,
+                func.lower(func.trim(OnboardingStateRecord.project_name)) == normalized_project.lower(),
+                func.lower(func.trim(OnboardingStateRecord.provider_name)) == normalized_provider,
             )
         )
         row = result.scalar_one_or_none()
@@ -971,10 +971,12 @@ class IncidentRepository:
         normalized_project = str(project_name or "").strip()
         if not normalized_project:
             return 0
-        statement = delete(OnboardingStateRecord).where(OnboardingStateRecord.project_name == normalized_project)
+        statement = delete(OnboardingStateRecord).where(
+            func.lower(func.trim(OnboardingStateRecord.project_name)) == normalized_project.lower()
+        )
         normalized_provider = str(provider_name or "").strip().lower()
         if normalized_provider:
-            statement = statement.where(OnboardingStateRecord.provider_name == normalized_provider)
+            statement = statement.where(func.lower(func.trim(OnboardingStateRecord.provider_name)) == normalized_provider)
         result = await self.session.execute(statement)
         return int(result.rowcount or 0)
 

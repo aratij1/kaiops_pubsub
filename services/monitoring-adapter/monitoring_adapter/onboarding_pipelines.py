@@ -7,6 +7,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
+import yaml
 
 
 _SUPPORTED_PLATFORMS = {
@@ -418,6 +419,76 @@ def find_pipeline_rows(rows: list[dict[str, Any]], workflow_id: str) -> list[dic
     return matched
 
 
+def build_prometheus_rules_yaml(
+    project_name: str,
+    rules: list[dict[str, Any]],
+    *,
+    include_smoke_test_alert: bool = True,
+) -> str:
+    normalized_project = slugify(project_name)
+    prometheus_rules = [
+        rule for rule in rules
+        if str(rule.get("platform") or "prometheus").strip().lower() == "prometheus"
+    ]
+    group_rules: list[dict[str, Any]] = []
+    for rule in prometheus_rules:
+        alert_name = str(rule.get("name") or slugify(str(rule.get("metric") or "generated-rule"))).strip()
+        expr = str(rule.get("expression") or "").strip()
+        if not expr:
+            continue
+        duration = str(rule.get("duration") or "5m").strip() or "5m"
+        severity = str(rule.get("severity") or "warning").strip().lower() or "warning"
+        labels = rule.get("labels", {}) if isinstance(rule.get("labels"), dict) else {}
+        prom_labels = {
+            "severity": severity,
+            "project": str(labels.get("project") or normalized_project),
+            "environment": str(labels.get("environment") or "prod"),
+        }
+        annotations = {
+            "summary": str(rule.get("source_requirement") or alert_name),
+            "description": f"Generated from plain-language onboarding for project {normalized_project}.",
+        }
+        group_rules.append(
+            {
+                "alert": alert_name,
+                "expr": expr,
+                "for": duration,
+                "labels": prom_labels,
+                "annotations": annotations,
+            }
+        )
+
+    if include_smoke_test_alert:
+        # Add a deterministic smoke-test alert so onboarding can verify end-to-end alert wiring.
+        group_rules.append(
+            {
+                "alert": f"{normalized_project}-onboarding-smoke-test",
+                "expr": "vector(1)",
+                "for": "0m",
+                "labels": {
+                    "severity": "info",
+                    "project": normalized_project,
+                    "environment": "prod",
+                    "onboarding_test": "true",
+                },
+                "annotations": {
+                    "summary": f"{normalized_project} onboarding smoke test",
+                    "description": "Auto-generated alert used to verify Prometheus rule loading and alert flow.",
+                },
+            }
+        )
+
+    payload = {
+        "groups": [
+            {
+                "name": f"{normalized_project}-generated-rules",
+                "rules": group_rules,
+            }
+        ]
+    }
+    return yaml.safe_dump(payload, sort_keys=False, default_flow_style=False)
+
+
 def build_event_contract(
     *,
     event_type: str,
@@ -635,7 +706,16 @@ def slugify(value: str) -> str:
 def _expression_for_platform(platform: str, metric: str, threshold: float, duration: str, aggregation: str) -> str:
     platform = _normalize_platform(platform)
     if platform == "prometheus":
-        return f"{aggregation}({metric}[{duration}]) > {threshold}"
+        normalized_metric = str(metric or "").strip() or "up"
+        normalized_duration = str(duration or "5m").strip() or "5m"
+        normalized_aggregation = str(aggregation or "avg").strip().lower()
+        if normalized_aggregation == "p95":
+            return f"quantile_over_time(0.95, {normalized_metric}[{normalized_duration}]) > {threshold}"
+        if normalized_aggregation == "max":
+            return f"max_over_time({normalized_metric}[{normalized_duration}]) > {threshold}"
+        if normalized_aggregation == "sum":
+            return f"sum_over_time({normalized_metric}[{normalized_duration}]) > {threshold}"
+        return f"avg_over_time({normalized_metric}[{normalized_duration}]) > {threshold}"
     if platform == "datadog":
         return f"avg(last_{duration}):avg:{metric}{{*}} > {threshold}"
     if platform == "new_relic":

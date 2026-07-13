@@ -1,0 +1,25 @@
+groups:
+- name: test5-generated-rules
+  rules:
+  - alert: test5-cpu-usage-percent-warning-prometheus
+    expr: avg_over_time(cpu_usage_percent[5m]) > 80.0
+    for: 5m
+    labels:
+      severity: warning
+      project: test5
+      environment: prod
+    annotations:
+      summary: if the table count is more than 5 raise alert
+      description: Generated from plain-language onboarding for project test5.
+  - alert: test5-onboarding-smoke-test
+    expr: vector(1)
+    for: 0m
+    labels:
+      severity: info
+      project: test5
+      environment: prod
+      onboarding_test: 'true'
+    annotations:
+      summary: test5 onboarding smoke test
+      description: Auto-generated alert used to verify Prometheus rule loading and
+        alert flow.

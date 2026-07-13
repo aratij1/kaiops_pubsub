@@ -5,11 +5,12 @@ import json
 import os
 import re
 import sys
+import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import UUID
 
@@ -32,6 +33,7 @@ from common.service import create_app
 from common.telemetry import EVENT_CONTRACTS_EMITTED, EVENT_PUBLISH_LATENCY
 from common.topics import RAW_ALERTS
 from common.prompts import PROMPT_SUMMARIZE_RCA
+import httpx
 from fastapi import Body, Header, HTTPException
 from pydantic import BaseModel, Field, model_validator
 from monitoring_adapter.state import (
@@ -58,6 +60,7 @@ from monitoring_adapter.state import (
 from monitoring_adapter.onboarding_pipelines import (
     ExistingRulePipelineRequest,
     NewRuleOnboardingRequest,
+    build_prometheus_rules_yaml,
     capabilities_catalog,
     find_pipeline_rows,
     run_existing_rule_pipeline,
@@ -236,10 +239,7 @@ class OnboardingConnectivityPayload(BaseModel):
         self.pubsub_subscription = str(self.pubsub_subscription or "").strip()
         self.vertex_model_armor_template = str(self.vertex_model_armor_template or "").strip()
 
-        if self.deployment_mode == "on_prem":
-            if not any((self.prometheus_url, self.new_relic_url, self.datadog_url)):
-                raise ValueError("At least one provider endpoint must be configured for on_prem mode")
-        else:
+        if self.deployment_mode == "gcp_cloud":
             if not self.gcp_project_id:
                 raise ValueError("gcp_project_id is required for gcp_cloud mode")
 
@@ -275,11 +275,50 @@ class OnboardingStateResponse(BaseModel):
     rows: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class OnboardingCompletePayload(BaseModel):
+    connectivity: OnboardingConnectivityPayload
+    project_mode: Literal["new", "existing"] = "existing"
+    start_rules_onboarding: bool = False
+    plain_language_requirements: list[str] = Field(default_factory=list)
+    selected_monitoring_tool: str | None = None
+    generate_documents: bool = True
+    include_smoke_test_alert: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_raw_payload(cls, raw: Any) -> Any:
+        if not isinstance(raw, dict):
+            raise ValueError("Invalid onboarding completion payload")
+        normalized = dict(raw)
+        requirements_raw = normalized.get("plain_language_requirements", [])
+        if isinstance(requirements_raw, str):
+            requirements = [line.strip() for line in requirements_raw.splitlines() if line.strip()]
+        elif isinstance(requirements_raw, list):
+            requirements = [str(item or "").strip() for item in requirements_raw if str(item or "").strip()]
+        else:
+            raise ValueError("plain_language_requirements must be a list or newline-delimited string")
+        normalized["plain_language_requirements"] = requirements
+        selected_tool = str(normalized.get("selected_monitoring_tool") or "").strip().lower().replace(" ", "_")
+        normalized["selected_monitoring_tool"] = selected_tool or None
+        normalized["generate_documents"] = bool(normalized.get("generate_documents", True))
+        normalized["include_smoke_test_alert"] = bool(normalized.get("include_smoke_test_alert", True))
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_payload(self) -> "OnboardingCompletePayload":
+        if self.selected_monitoring_tool and self.selected_monitoring_tool not in _ALLOWED_ONBOARDING_PROVIDERS:
+            raise ValueError("selected_monitoring_tool must be one of prometheus, new_relic, datadog")
+        if self.start_rules_onboarding and not self.plain_language_requirements:
+            raise ValueError("plain_language_requirements are required when start_rules_onboarding is true")
+        return self
+
+
 OnboardingProject.model_rebuild()
 OnboardingConnectivityPayload.model_rebuild()
 OnboardingConnectivitySnapshot.model_rebuild()
 OnboardingConnectivityResponse.model_rebuild()
 OnboardingStateResponse.model_rebuild()
+OnboardingCompletePayload.model_rebuild()
 
 
 def _json_safe(value: Any) -> Any:
@@ -512,6 +551,340 @@ def _normalize_project_name(project: dict[str, Any]) -> str:
 
 def _normalize_provider_name(provider_name: str) -> str:
     return provider_name.strip().lower().replace(" ", "_")
+
+
+def _select_monitoring_tool(connectivity: OnboardingConnectivityPayload, preferred: str | None = None) -> str:
+    preferred_tool = _normalize_provider_name(preferred or "") if preferred else ""
+    if preferred_tool in _ALLOWED_ONBOARDING_PROVIDERS:
+        return preferred_tool
+    active_provider = _normalize_provider_name(str(connectivity.active_provider or ""))
+    if active_provider in _ALLOWED_ONBOARDING_PROVIDERS:
+        return active_provider
+    if connectivity.prometheus_url:
+        return "prometheus"
+    if connectivity.new_relic_url:
+        return "new_relic"
+    if connectivity.datadog_url:
+        return "datadog"
+    return "prometheus"
+
+
+def _selected_tool_url(connectivity: OnboardingConnectivityPayload, selected_tool: str) -> str:
+    if selected_tool == "new_relic":
+        return str(connectivity.new_relic_url or "").strip()
+    if selected_tool == "datadog":
+        return str(connectivity.datadog_url or "").strip()
+    return str(connectivity.prometheus_url or "").strip()
+
+
+def _build_onboarding_rule_seed(connectivity: OnboardingConnectivityPayload, selected_tool: str) -> dict[str, Any]:
+    project = connectivity.project
+    return {
+        "project_name": str(project.name or "").strip(),
+        "description": "Monitoring onboarding workflow",
+        "business_unit": "",
+        "environment": str(project.environment or "prod").strip().lower(),
+        "criticality": "high",
+        "sla": "",
+        "support_team": str(project.owner_team or "").strip(),
+        "business_owner": "",
+        "technical_owner": "",
+        "technology_stack": [],
+        "cloud_provider": "gcp" if connectivity.deployment_mode == "gcp_cloud" else "on_prem",
+        "region": str(project.region or "").strip(),
+        "monitoring_platforms": [selected_tool],
+        "notification_platforms": ["slack", "teams", "pagerduty"],
+    }
+
+
+def _build_onboarding_rag_documents(
+    *,
+    connectivity: OnboardingConnectivityPayload,
+    selected_tool: str,
+    workflow_result: dict[str, Any],
+    requirements: list[str],
+) -> list[dict[str, Any]]:
+    project_name = str(connectivity.project.name or "").strip()
+    owner_team = str(connectivity.project.owner_team or "").strip() or "platform-ops"
+    environment = str(connectivity.project.environment or "prod").strip()
+    workflow_id = str(workflow_result.get("workflow_id") or "").strip()
+    onboarding_id = str(workflow_result.get("onboarding_id") or "").strip()
+    trace_id = str(workflow_result.get("trace_id") or "").strip()
+    generated_rules = workflow_result.get("generated_rules", []) if isinstance(workflow_result.get("generated_rules"), list) else []
+    rules_summary = "\n".join(
+        f"- {item.get('name', 'unnamed-rule')} ({item.get('platform', selected_tool)}): {item.get('expression', '')}" for item in generated_rules[:15]
+    ) or "- Rules generated by onboarding pipeline"
+    requirements_summary = "\n".join(f"- {line}" for line in requirements) or "- Plain-language requirement provided"
+    source_ref = f"workflow:{workflow_id}" if workflow_id else "workflow:new-rule-onboarding"
+
+    shared_metadata = {
+        "project_name": project_name,
+        "selected_monitoring_tool": selected_tool,
+        "workflow_id": workflow_id,
+        "onboarding_id": onboarding_id,
+        "trace_id": trace_id,
+        "owner_team": owner_team,
+    }
+
+    incident_doc = {
+        "kind": "incident",
+        "alert_id": f"{project_name}-rule-onboarding",
+        "alert_type": "monitoring-rule-onboarding",
+        "severity": "high",
+        "title": f"{project_name} Monitoring Rule Onboarding",
+        "summary": f"Plain-language monitoring requirements were converted to {selected_tool} rules.",
+        "content": (
+            f"Project {project_name} onboarding completed in {environment}.\n"
+            f"Selected tool: {selected_tool}.\n"
+            f"Requirements:\n{requirements_summary}\n\nGenerated rules:\n{rules_summary}"
+        ),
+        "services": [project_name],
+        "deployment": environment,
+        "recommended_action": "Review generated rules and approve production deployment.",
+        "source_system": "monitoring-adapter",
+        "source_ref": source_ref,
+        "metadata": {k: str(v or "") for k, v in shared_metadata.items()},
+    }
+
+    runbook_doc = {
+        "kind": "runbook",
+        "alert_id": f"{project_name}-rule-runbook",
+        "alert_type": "rule-operations",
+        "severity": "high",
+        "title": f"{project_name} Rule Monitoring & Resolution Runbook",
+        "summary": "Operational runbook for monitoring generated rules, triage, RCA, and resolution.",
+        "content": (
+            "1. Verify rule expression output for false positives.\n"
+            "2. Validate alert routing and escalation channels.\n"
+            "3. Run RCA checklist for noisy or missed alerts.\n"
+            "4. Apply threshold or duration tuning and redeploy through workflow editor.\n"
+            "5. Confirm health restoration and close incident with audit notes."
+        ),
+        "services": [project_name],
+        "deployment": environment,
+        "root_cause": "Threshold drift, metric quality, or dependency changes can cause noisy or delayed alerts.",
+        "impact": "Delayed detection and unnecessary incidents for production services.",
+        "execution_plan": "Tune rule thresholds, re-run simulation, then promote approved rules.",
+        "recommended_action": "Use workflow simulation and governance checks before production push.",
+        "source_system": "monitoring-adapter",
+        "source_ref": source_ref,
+        "metadata": {k: str(v or "") for k, v in shared_metadata.items()},
+    }
+
+    dependency_doc = {
+        "kind": "dependency",
+        "alert_id": f"{project_name}-rule-dependencies",
+        "alert_type": "dependency-map",
+        "severity": "warning",
+        "title": f"{project_name} Rule Dependency & RCA Metadata",
+        "summary": "Dependency and metadata baseline for rule monitoring, RCA, and resolution workflows.",
+        "content": (
+            f"Monitoring tool endpoint: {_selected_tool_url(connectivity, selected_tool) or 'not-provided'}.\n"
+            f"Deployment mode: {connectivity.deployment_mode}.\n"
+            "Track dependencies for data pipeline, scrape/export health, and notification delivery."
+        ),
+        "services": [project_name],
+        "deployment": environment,
+        "dependencies": [selected_tool, "notification-platform", "incident-orchestrator"],
+        "source_system": "monitoring-adapter",
+        "source_ref": source_ref,
+        "metadata": {k: str(v or "") for k, v in shared_metadata.items()},
+    }
+
+    change_doc = {
+        "kind": "change",
+        "alert_id": f"{project_name}-rule-change",
+        "alert_type": "rules-change-plan",
+        "severity": "warning",
+        "title": f"{project_name} Rules Change Record",
+        "summary": "Change record for generated monitoring rules and rollout governance.",
+        "content": (
+            "This change introduces LLM-generated monitoring rules from plain-language requirements.\n"
+            "Rollout phases: staging validation, simulation review, governance approval, production deployment."
+        ),
+        "services": [project_name],
+        "deployment": environment,
+        "change_id": onboarding_id or workflow_id or f"{project_name}-rule-change",
+        "execution_plan": "Deploy by environment with rollback guardrails and post-deploy SLO checks.",
+        "source_system": "monitoring-adapter",
+        "source_ref": source_ref,
+        "metadata": {k: str(v or "") for k, v in shared_metadata.items()},
+    }
+
+    return [incident_doc, runbook_doc, dependency_doc, change_doc]
+
+
+def _prometheus_rules_output_path(project_name: str, workflow_id: str) -> Path:
+    safe_project = re.sub(r"[^a-zA-Z0-9_-]", "-", str(project_name or "project").strip()) or "project"
+    safe_workflow = re.sub(r"[^a-zA-Z0-9_-]", "-", str(workflow_id or "workflow").strip()) or str(uuid.uuid4())
+    output_dir = rag_root_path() / "changes" / "prometheus_rules"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir / f"{safe_project}-{safe_workflow}.yml"
+
+
+async def _generate_upload_and_test_prometheus_rules(
+    *,
+    endpoint_url: str,
+    project_name: str,
+    workflow_id: str,
+    generated_rules: list[dict[str, Any]],
+    include_smoke_test_alert: bool,
+) -> dict[str, Any]:
+    yaml_content = build_prometheus_rules_yaml(
+        project_name,
+        generated_rules,
+        include_smoke_test_alert=include_smoke_test_alert,
+    )
+    output_path = _prometheus_rules_output_path(project_name, workflow_id)
+    output_path.write_text(yaml_content, encoding="utf-8")
+    expected_group_name = f"{re.sub(r'[^a-zA-Z0-9]+', '-', str(project_name or '').strip().lower()).strip('-') or 'project'}-generated-rules"
+
+    details: dict[str, Any] = {
+        "yaml_generated": True,
+        "yaml_path": str(output_path),
+        "yaml": yaml_content,
+        "upload": {
+            "attempted": False,
+            "ok": False,
+            "message": "Prometheus push API is not available; rules are written to local changes directory.",
+            "reload_requested": False,
+            "reload_ok": False,
+        },
+        "test": {
+            "attempted": False,
+            "ok": False,
+            "message": "Prometheus endpoint not provided.",
+            "loaded_rule_groups": 0,
+            "loaded_rules": 0,
+            "active_alerts": 0,
+        },
+        "smoke_test_alert_enabled": include_smoke_test_alert,
+    }
+
+    normalized_endpoint = str(endpoint_url or "").strip().rstrip("/")
+    if not normalized_endpoint:
+        return details
+
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        reload_url = f"{normalized_endpoint}/-/reload"
+        rules_url = f"{normalized_endpoint}/api/v1/rules"
+        alerts_url = f"{normalized_endpoint}/api/v1/alerts"
+        details["upload"]["attempted"] = True
+        details["upload"]["reload_requested"] = True
+        try:
+            reload_response = await client.post(reload_url)
+            details["upload"]["reload_ok"] = reload_response.status_code < 400
+            details["upload"]["message"] = f"Reload endpoint returned HTTP {reload_response.status_code}."
+        except Exception as exc:
+            details["upload"]["message"] = f"Reload request failed: {exc}"
+
+        details["test"]["attempted"] = True
+        try:
+            rules_response = await client.get(rules_url)
+            body = rules_response.json() if "application/json" in str(rules_response.headers.get("content-type", "")).lower() else {}
+            api_status = str(body.get("status") or "").strip().lower() if isinstance(body, dict) else ""
+            loaded_group_count = 0
+            loaded_rule_count = 0
+            if isinstance(body, dict):
+                data = body.get("data", {}) if isinstance(body.get("data"), dict) else {}
+                groups = data.get("groups", []) if isinstance(data.get("groups"), list) else []
+                matching_groups = [
+                    group for group in groups
+                    if str(group.get("name") or "").strip() == expected_group_name
+                ]
+                loaded_group_count = len(matching_groups)
+                loaded_rule_count = sum(len(group.get("rules", []) or []) for group in matching_groups)
+
+            active_alert_count = 0
+            try:
+                alerts_response = await client.get(alerts_url)
+                alerts_body = alerts_response.json() if "application/json" in str(alerts_response.headers.get("content-type", "")).lower() else {}
+                if isinstance(alerts_body, dict):
+                    alerts_data = alerts_body.get("data", {}) if isinstance(alerts_body.get("data"), dict) else {}
+                    alerts = alerts_data.get("alerts", []) if isinstance(alerts_data.get("alerts"), list) else []
+                    active_alert_count = len(
+                        [
+                            alert
+                            for alert in alerts
+                            if str((alert.get("labels") or {}).get("project") or "").strip() == expected_group_name.removesuffix("-generated-rules")
+                        ]
+                    )
+            except Exception:
+                active_alert_count = 0
+
+            details["test"]["loaded_rule_groups"] = loaded_group_count
+            details["test"]["loaded_rules"] = loaded_rule_count
+            details["test"]["active_alerts"] = active_alert_count
+
+            rules_api_ok = rules_response.status_code < 400 and api_status in {"", "success"}
+            loaded_ok = loaded_rule_count > 0
+            details["test"]["ok"] = bool(rules_api_ok and loaded_ok)
+            details["upload"]["ok"] = bool(details["upload"].get("reload_ok") and loaded_ok)
+            details["test"]["message"] = (
+                f"Rules API HTTP {rules_response.status_code}; loaded_groups={loaded_group_count}; "
+                f"loaded_rules={loaded_rule_count}; active_alerts={active_alert_count}."
+            )
+        except Exception as exc:
+            details["test"]["message"] = f"Prometheus test request failed: {exc}"
+            details["upload"]["ok"] = bool(details["upload"].get("reload_ok", False))
+
+    return details
+
+
+def _build_onboarding_steps_response(
+    *,
+    project_mode: str,
+    start_rules_onboarding: bool,
+    requirements: list[str],
+    rules_result: dict[str, Any] | None,
+    prometheus_result: dict[str, Any] | None,
+    rag_documents: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    step_one = {
+        "step": 1,
+        "title": "Create/Update Project",
+        "status": "completed",
+        "details": {"project_mode": project_mode},
+    }
+    step_two = {
+        "step": 2,
+        "title": "Ask To Add New Rules",
+        "status": "completed",
+        "details": {
+            "choice": "yes" if start_rules_onboarding else "no",
+        },
+    }
+    step_three = {
+        "step": 3,
+        "title": "Capture Rules In Plain English",
+        "status": "completed" if start_rules_onboarding and requirements else "skipped",
+        "details": {
+            "requirements_count": len(requirements),
+            "requirements": requirements,
+        },
+    }
+    step_four_status = "skipped"
+    step_four_details: dict[str, Any] = {
+        "message": "Rule conversion and Prometheus upload were skipped.",
+    }
+    if start_rules_onboarding and rules_result:
+        step_four_status = "completed"
+        step_four_details = {
+            "workflow_id": rules_result.get("workflow_id"),
+            "rule_conversion": "completed",
+            "prometheus": prometheus_result or {"message": "Prometheus deployment not attempted."},
+        }
+
+    step_five = {
+        "step": 5,
+        "title": "Generate Monitoring/Troubleshooting/Resolution Docs",
+        "status": "completed" if rag_documents else "skipped",
+        "details": {
+            "generated_document_count": len(rag_documents),
+            "documents": rag_documents,
+        },
+    }
+    return [step_one, step_two, step_three, {"step": 4, "title": "Convert To YAML, Upload In Prometheus, Test", "status": step_four_status, "details": step_four_details}, step_five]
 
 
 async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
@@ -2118,9 +2491,13 @@ async def delete_onboarding_state(project_name: str, provider_name: str | None =
         deleted = await repo.delete_onboarding_state(normalized_project, normalized_provider)
         await session.commit()
 
-    if deleted <= 0:
-        raise HTTPException(status_code=404, detail="Onboarding state row not found")
-    return {"deleted": deleted, "project_name": normalized_project, "provider_name": normalized_provider}
+    # Keep delete idempotent for admin UX: deleting an already-absent row should not be treated as an API error.
+    return {
+        "deleted": deleted,
+        "project_name": normalized_project,
+        "provider_name": normalized_provider,
+        "message": "Onboarding state deleted" if deleted > 0 else "Onboarding state row not found (already deleted)",
+    }
 
 
 @app.get("/landing-pad/recent")
@@ -2271,6 +2648,100 @@ async def post_onboarding_connectivity(
     return OnboardingConnectivityResponse(connectivity=snapshot)
 
 
+@app.post("/onboarding/complete")
+async def post_onboarding_complete(payload: OnboardingCompletePayload = Body(...)) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        payload = OnboardingCompletePayload.model_validate(payload)
+
+    connectivity = payload.connectivity
+    connectivity_payload = connectivity.model_dump(mode="json")
+
+    sanitized_connectivity = save_onboarding_connectivity(connectivity_payload)
+    await persist_onboarding_connectivity(connectivity_payload)
+    connectivity_snapshot = OnboardingConnectivitySnapshot.model_validate(
+        sanitized_connectivity if isinstance(sanitized_connectivity, dict) else {}
+    )
+
+    response: dict[str, Any] = {
+        "project_mode": payload.project_mode,
+        "connectivity": connectivity_snapshot.model_dump(mode="json"),
+        "rules_onboarding": {
+            "started": False,
+            "status": "not-requested",
+        },
+        "rag_documents": [],
+        "workflow_steps": _build_onboarding_steps_response(
+            project_mode=payload.project_mode,
+            start_rules_onboarding=False,
+            requirements=[],
+            rules_result=None,
+            prometheus_result=None,
+            rag_documents=[],
+        ),
+    }
+
+    if not payload.start_rules_onboarding:
+        return response
+
+    selected_tool = _select_monitoring_tool(connectivity, payload.selected_monitoring_tool)
+    requirements = [item for item in payload.plain_language_requirements if str(item or "").strip()]
+    endpoint_url = _selected_tool_url(connectivity, selected_tool)
+
+    project_seed = _build_onboarding_rule_seed(connectivity, selected_tool)
+    new_rule_payload = NewRuleOnboardingRequest.model_validate(
+        {
+            "project": project_seed,
+            "monitoring_requirements": requirements,
+            "target_platforms": [selected_tool],
+            "discovery_inputs": {
+                "endpoint_url": endpoint_url,
+                "deployment_mode": str(connectivity.deployment_mode or "on_prem").strip(),
+                "environment": str(connectivity.project.environment or "prod").strip(),
+                "region": str(connectivity.project.region or "").strip(),
+                "selected_monitoring_tool": selected_tool,
+                "generated_from_plain_language": True,
+            },
+        }
+    )
+
+    workflow_result = run_new_rule_pipeline(new_rule_payload)
+    await persist_onboarding_pipeline_result(workflow_result)
+    await publish_onboarding_pipeline_event(workflow_result)
+
+    prometheus_upload_result: dict[str, Any] | None = None
+    if selected_tool == "prometheus":
+        prometheus_upload_result = await _generate_upload_and_test_prometheus_rules(
+            endpoint_url=endpoint_url,
+            project_name=str(connectivity.project.name or "").strip(),
+            workflow_id=str(workflow_result.get("workflow_id") or "").strip(),
+            generated_rules=workflow_result.get("generated_rules", []) if isinstance(workflow_result.get("generated_rules"), list) else [],
+            include_smoke_test_alert=payload.include_smoke_test_alert,
+        )
+
+    response["rules_onboarding"] = {
+        "started": True,
+        "status": str(workflow_result.get("status") or "completed"),
+        "workflow_id": str(workflow_result.get("workflow_id") or "").strip(),
+        "result": workflow_result,
+    }
+    if payload.generate_documents:
+        response["rag_documents"] = _build_onboarding_rag_documents(
+            connectivity=connectivity,
+            selected_tool=selected_tool,
+            workflow_result=workflow_result,
+            requirements=requirements,
+        )
+    response["workflow_steps"] = _build_onboarding_steps_response(
+        project_mode=payload.project_mode,
+        start_rules_onboarding=payload.start_rules_onboarding,
+        requirements=requirements,
+        rules_result=workflow_result,
+        prometheus_result=prometheus_upload_result,
+        rag_documents=response.get("rag_documents", []),
+    )
+    return response
+
+
 @app.get("/onboarding/rules/capabilities")
 async def get_onboarding_rule_capabilities() -> dict[str, Any]:
     rows = capabilities_catalog()
@@ -2287,6 +2758,15 @@ async def onboarding_rules_pipeline_existing(payload: ExistingRulePipelineReques
 
 @app.post("/onboarding/rules/pipeline/new")
 async def onboarding_rules_pipeline_new(payload: NewRuleOnboardingRequest = Body(...)) -> dict[str, Any]:
+    result = run_new_rule_pipeline(payload)
+    await persist_onboarding_pipeline_result(result)
+    await publish_onboarding_pipeline_event(result)
+    return result
+
+
+@app.post("/onboarding/rules/pipeline/create")
+async def onboarding_rules_pipeline_new_alias(payload: NewRuleOnboardingRequest = Body(...)) -> dict[str, Any]:
+    # Backward-compatible alias for older callers.
     result = run_new_rule_pipeline(payload)
     await persist_onboarding_pipeline_result(result)
     await publish_onboarding_pipeline_event(result)
