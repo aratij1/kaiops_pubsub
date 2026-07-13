@@ -44,6 +44,18 @@ _STATUS_PRECEDENCE = {
     "closed": 7,
 }
 
+_EVENT_TABLE_HINTS: dict[str, list[str]] = {
+    "incident.alert.enriched": ["alerts", "incidents", "agent_work_items"],
+    "incident.workflow.selected": ["incident_events", "incident_projections", "agent_work_items"],
+    "incident.context.collected": ["incident_events", "incident_projections", "agent_work_items"],
+    "incident.recommendation.generated": ["incident_events", "audit_logs", "incident_projections", "agent_work_items"],
+    "incident.approval.requested": ["incident_events", "approvals", "incident_projections", "agent_work_items"],
+    "incident.approval.recorded": ["incident_events", "approvals", "incident_projections", "agent_work_items"],
+    "incident.remediation.executed": ["incident_events", "actions", "incident_projections", "agent_work_items"],
+    "incident.closure.completed": ["incident_events", "rca_reports", "incident_projections", "agent_work_items"],
+}
+
+
 
 def _is_meaningful_value(value: Any) -> bool:
     if value is None:
@@ -191,6 +203,82 @@ def _extract_flow_id(payload: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _extract_source_channel(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    source_event_contract = (
+        payload.get("source_event_contract") if isinstance(payload.get("source_event_contract"), dict) else {}
+    )
+    source_payload = payload.get("source_payload") if isinstance(payload.get("source_payload"), dict) else {}
+    source_payload_contract = (
+        source_payload.get("event_contract") if isinstance(source_payload.get("event_contract"), dict) else {}
+    )
+    candidates = [
+        source_event_contract.get("transport", {}).get("channel")
+        if isinstance(source_event_contract.get("transport"), dict)
+        else None,
+        source_payload.get("transport", {}).get("channel")
+        if isinstance(source_payload.get("transport"), dict)
+        else None,
+        source_payload_contract.get("transport", {}).get("channel")
+        if isinstance(source_payload_contract.get("transport"), dict)
+        else None,
+    ]
+    for candidate in candidates:
+        token = str(candidate or "").strip()
+        if token:
+            return token
+    return None
+
+
+def _extract_query_hint(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+
+    candidate_keys = (
+        "sql",
+        "query",
+        "statement",
+        "db_query",
+        "query_text",
+        "lookup_query",
+    )
+
+    queue: list[Any] = [payload]
+    seen: set[int] = set()
+    while queue:
+        item = queue.pop(0)
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, dict):
+            for key in candidate_keys:
+                value = item.get(key)
+                token = str(value or "").strip()
+                if token:
+                    return token
+            for value in item.values():
+                if isinstance(value, (dict, list, tuple)):
+                    queue.append(value)
+        elif isinstance(item, (list, tuple)):
+            queue.extend(item)
+    return None
+
+
+def _infer_table_hints(event_type: str, payload: dict[str, Any] | None) -> list[str]:
+    hints = list(_EVENT_TABLE_HINTS.get(str(event_type or "").strip().lower(), []))
+    if not isinstance(payload, dict):
+        return hints
+
+    query_hint = _extract_query_hint(payload)
+    if query_hint:
+        upper_query = query_hint.upper()
+        for table in ("INCIDENT_EVENTS", "INCIDENT_PROJECTIONS", "AGENT_WORK_ITEMS", "AUDIT_LOGS", "APPROVALS", "ACTIONS", "RCA_REPORTS"):
+            if table in upper_query and table.lower() not in hints:
+                hints.append(table.lower())
+    return hints
+
+
 class IncidentRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
@@ -226,7 +314,54 @@ class IncidentRepository:
             .limit(safe_limit)
         )
         rows = result.scalars().all()
-        return [row.payload for row in rows]
+        if not rows:
+            return []
+
+        alert_id_set = {str(row.id) for row in rows}
+        alert_to_incident: dict[str, str] = {}
+
+        # Incident payload carries linked alert IDs. Build a reverse map to incident IDs,
+        # preferring most recent incidents by updated timestamp.
+        incident_result = await self.session.execute(
+            select(IncidentRecord)
+            .order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc())
+            .limit(max(500, safe_limit * 10))
+        )
+        for incident in incident_result.scalars().all():
+            payload = incident.payload if isinstance(incident.payload, dict) else {}
+            linked_alert_ids = payload.get("alert_ids", []) if isinstance(payload.get("alert_ids"), list) else []
+            for item in linked_alert_ids:
+                alert_id = str(item)
+                if alert_id in alert_id_set and alert_id not in alert_to_incident:
+                    alert_to_incident[alert_id] = str(incident.id)
+
+        projection_status_by_incident: dict[str, str] = {}
+        projection_incident_ids = {
+            self._parse_uuid(incident_id)
+            for incident_id in alert_to_incident.values()
+            if self._parse_uuid(incident_id) is not None
+        }
+        if projection_incident_ids:
+            projection_result = await self.session.execute(
+                select(IncidentProjectionRecord).where(IncidentProjectionRecord.incident_id.in_(projection_incident_ids))
+            )
+            for projection in projection_result.scalars().all():
+                projection_status_by_incident[str(projection.incident_id)] = str(projection.status or "").strip()
+
+        enriched_rows: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row.payload) if isinstance(row.payload, dict) else {}
+            alert_id = str(row.id)
+            incident_id = str(payload.get("incident_id") or "").strip() or alert_to_incident.get(alert_id)
+            if incident_id:
+                payload["incident_id"] = incident_id
+                projection_status = projection_status_by_incident.get(incident_id)
+                if projection_status:
+                    payload["status"] = projection_status
+                    payload["state"] = projection_status
+            enriched_rows.append(payload)
+
+        return enriched_rows
 
     async def get_processed_result_by_alert_id(self, alert_id: str) -> dict[str, Any] | None:
         normalized_alert_id = str(alert_id or "").strip()
@@ -333,6 +468,8 @@ class IncidentRepository:
             {
                 "sequence": row.sequence,
                 "agent": row.agent_name,
+                "status": row.status,
+                "timestamp": row.updated_at,
                 "action": (row.details or {}).get("action") or row.work_item,
                 "input": (row.details or {}).get("input", {}),
                 "decision": (row.details or {}).get("decision"),
@@ -345,6 +482,62 @@ class IncidentRepository:
             for row in work_rows
         ]
         events = _deduplicate_events(events)
+
+        incident_event_result = await self.session.execute(
+            select(IncidentEventRecord)
+            .where(IncidentEventRecord.incident_id == UUID(incident_id_str))
+            .order_by(IncidentEventRecord.created_at.asc())
+        )
+        incident_event_rows = incident_event_result.scalars().all()
+        event_trace: list[dict[str, Any]] = []
+        for row in incident_event_rows:
+            payload = row.payload if isinstance(row.payload, dict) else {}
+            source_channel = _extract_source_channel(payload)
+            query_hint = _extract_query_hint(payload)
+            event_trace.append(
+                {
+                    "timestamp": row.created_at,
+                    "service": row.service,
+                    "event_type": row.event_type,
+                    "event_stage": row.event_stage,
+                    "status": row.status,
+                    "source_channel": source_channel,
+                    "transport_channel": row.transport_channel,
+                    "transport_provider": row.transport_provider,
+                    "risk_tier": row.risk_tier,
+                    "execution_mode": row.execution_mode,
+                    "policy_reason": row.policy_reason,
+                    "trace_id": row.trace_id,
+                    "table_hints": _infer_table_hints(row.event_type, payload),
+                    "query_hint": query_hint,
+                }
+            )
+
+        if not events and event_trace:
+            events = [
+                {
+                    "sequence": index + 1,
+                    "agent": str(item.get("service") or "-") or "-",
+                    "status": str(item.get("status") or item.get("event_stage") or "-") or "-",
+                    "timestamp": item.get("timestamp"),
+                    "action": str(item.get("event_type") or "incident.event"),
+                    "input": {
+                        "source_channel": item.get("source_channel"),
+                        "transport_channel": item.get("transport_channel"),
+                        "transport_provider": item.get("transport_provider"),
+                    },
+                    "decision": str(item.get("policy_reason") or item.get("status") or item.get("event_stage") or "").strip() or None,
+                    "metrics": {
+                        "risk_tier": item.get("risk_tier"),
+                        "execution_mode": item.get("execution_mode"),
+                    },
+                    "output": str(item.get("event_type") or "incident.event"),
+                    "communicates_to": str(item.get("transport_channel") or "").strip(),
+                    "llm_calls": [],
+                    "llm_errors": [],
+                }
+                for index, item in enumerate(event_trace)
+            ]
 
         recommendation_metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
         orchestration_decision = (
@@ -421,7 +614,173 @@ class IncidentRepository:
                 "currency": "USD",
             },
             "events": events,
+            "event_trace": event_trace,
+            "trace_summary": {
+                "services_called": sorted({str(item.get("service") or "").strip() for item in event_trace if str(item.get("service") or "").strip()}),
+                "channels": sorted(
+                    {
+                        str(channel).strip()
+                        for item in event_trace
+                        for channel in (item.get("source_channel"), item.get("transport_channel"))
+                        if str(channel or "").strip()
+                    }
+                ),
+                "tables_touched": sorted(
+                    {
+                        str(table).strip()
+                        for item in event_trace
+                        for table in (item.get("table_hints") or [])
+                        if str(table or "").strip()
+                    }
+                ),
+                "event_count": len(event_trace),
+            },
             "next_step": "Loaded processed incident summary from database.",
+        }
+
+    async def get_incident_stage_completeness(self, incident_id: str) -> dict[str, Any] | None:
+        incident_uuid = self._parse_uuid(incident_id)
+        if incident_uuid is None:
+            return None
+
+        incident_result = await self.session.execute(
+            select(IncidentRecord).where(IncidentRecord.id == incident_uuid)
+        )
+        incident_record = incident_result.scalar_one_or_none()
+        if incident_record is None:
+            return None
+
+        events_result = await self.session.execute(
+            select(IncidentEventRecord)
+            .where(IncidentEventRecord.incident_id == incident_uuid)
+            .order_by(IncidentEventRecord.created_at.asc())
+        )
+        event_rows = events_result.scalars().all()
+        event_types = {
+            str(row.event_type or "").strip().lower()
+            for row in event_rows
+            if str(row.event_type or "").strip()
+        }
+        event_statuses = {
+            str(row.status or "").strip().lower()
+            for row in event_rows
+            if str(row.status or "").strip()
+        }
+
+        work_result = await self.session.execute(
+            select(AgentWorkItemRecord).where(AgentWorkItemRecord.incident_id == incident_uuid)
+        )
+        work_rows = work_result.scalars().all()
+
+        approval_result = await self.session.execute(
+            select(ApprovalRecord).where(ApprovalRecord.incident_id == incident_uuid)
+        )
+        approval_rows = approval_result.scalars().all()
+
+        action_result = await self.session.execute(
+            select(ActionRecord).where(ActionRecord.incident_id == incident_uuid)
+        )
+        action_rows = action_result.scalars().all()
+
+        report_result = await self.session.execute(
+            select(RcaReportRecord).where(RcaReportRecord.incident_id == incident_uuid)
+        )
+        report_rows = report_result.scalars().all()
+        incident_status = str(incident_record.status or "").strip().lower()
+
+        stage_matrix = [
+            {
+                "stage": "alert_enriched",
+                "label": "Alert Intelligence Agent",
+                "event_types": ["incident.alert.enriched"],
+            },
+            {
+                "stage": "workflow_selected",
+                "label": "Orchestrator Agent",
+                "event_types": ["incident.workflow.selected"],
+            },
+            {
+                "stage": "context_collected",
+                "label": "Context Intelligence Agent",
+                "event_types": ["incident.context.collected"],
+            },
+            {
+                "stage": "recommendation_generated",
+                "label": "Resolution Intelligence Agent",
+                "event_types": ["incident.recommendation.generated"],
+            },
+            {
+                "stage": "approval_recorded",
+                "label": "Human Approval Layer",
+                "event_types": ["incident.approval.recorded", "incident.approval.requested"],
+            },
+            {
+                "stage": "remediation_executed",
+                "label": "Remediation Automation Engine",
+                "event_types": ["incident.remediation.executed"],
+            },
+            {
+                "stage": "closure_completed",
+                "label": "Closure & Validation",
+                "event_types": ["incident.closure.completed", "incident.closed"],
+            },
+        ]
+
+        stages = []
+        for row in stage_matrix:
+            matched = [event_type for event_type in row["event_types"] if event_type in event_types]
+            persisted = bool(matched)
+
+            # Use persisted relational evidence to avoid under-reporting when some
+            # services emit equivalent terminal states under different event names.
+            if row["stage"] == "alert_enriched" and not persisted:
+                persisted = len(work_rows) > 0 or len(event_rows) > 0
+            elif row["stage"] == "context_collected" and not persisted:
+                persisted = any(
+                    str(work.agent_name or "").strip().lower() in {"context intelligence agent", "context-agent"}
+                    for work in work_rows
+                )
+            elif row["stage"] == "approval_recorded" and not persisted:
+                persisted = len(approval_rows) > 0
+            elif row["stage"] == "remediation_executed" and not persisted:
+                persisted = len(action_rows) > 0 or "remediating" in event_statuses
+            elif row["stage"] == "closure_completed" and not persisted:
+                persisted = len(report_rows) > 0 or incident_status in {"closed", "resolved"}
+
+            stages.append(
+                {
+                    "stage": row["stage"],
+                    "label": row["label"],
+                    "persisted": persisted,
+                    "matched_event_types": matched,
+                }
+            )
+
+        completed = len([row for row in stages if row["persisted"]])
+        total = len(stages)
+        missing = [row["stage"] for row in stages if not row["persisted"]]
+        latest_event_at = event_rows[-1].created_at if event_rows else None
+
+        return {
+            "incident_id": str(incident_record.id),
+            "status": str(incident_record.status or "unknown"),
+            "service": str(incident_record.service or "unknown"),
+            "counts": {
+                "incident_events": len(event_rows),
+                "agent_work_items": len(work_rows),
+                "approvals": len(approval_rows),
+                "actions": len(action_rows),
+                "rca_reports": len(report_rows),
+            },
+            "event_types": sorted(event_types),
+            "stages": stages,
+            "stage_completion": {
+                "completed": completed,
+                "total": total,
+                "percentage": round((completed / total) * 100, 2) if total else 0.0,
+                "missing": missing,
+            },
+            "latest_event_at": latest_event_at,
         }
 
     async def save_incident(self, incident: Incident) -> None:

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 
 const DEFAULT_ALERT = {
@@ -20,7 +20,22 @@ const SERVICE_TOPIC_FLOW = [
   { service: "closure-service", consumes: "remediation-events", publishes: "closure-events", agent: "Closure & Validation" },
 ];
 
+const AGENT_DISPLAY_ALIASES = {
+  "orchestrator agent": "Master Agent",
+  orchestrator: "Master Agent",
+  "closure & validation": "Validator Agent",
+  "closure-service": "Validator Agent",
+};
+
+const AGENT_ROUTE_ALIASES = {
+  "master agent": "orchestrator agent",
+  "master agent (orchestrator agent)": "orchestrator agent",
+  "validator agent": "closure & validation",
+  "validator agent (closure & validation)": "closure & validation",
+};
+
 const PREFERENCE_STORAGE_KEY = "kaiops.ui.preferences.v1";
+const UI_THEME_VALUES = new Set(["auto", "light", "dark"]);
 const TAB_SHORTCUT_MAP = {
   Digit1: "home",
   Digit2: "approval",
@@ -50,31 +65,72 @@ function normalizeRoleName(value) {
     .replace(/\s+/g, "_");
 }
 
+function looksLikeUuid(value) {
+  const token = String(value || "").trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token);
+}
+
 function extractObservedRoutingMetrics(workflow) {
   if (!workflow || typeof workflow !== "object") {
     return {};
   }
-  const events = Array.isArray(workflow.events) ? workflow.events : [];
-  const orchestratorEvent = [...events]
-    .reverse()
-    .find((item) => String(item?.agent || "").trim().toLowerCase() === "orchestrator agent");
+  const rawEvents = [workflow.events, workflow.workflow_events, workflow.agent_events]
+    .find((items) => Array.isArray(items)) || [];
+  const events = rawEvents.filter((item) => item && typeof item === "object");
+  const traceRows = [workflow.event_trace, workflow.trace_events, workflow?.trace?.events]
+    .find((items) => Array.isArray(items)) || [];
+  const latestEvent = [...events].reverse().find((item) => item && typeof item === "object") || null;
+  const orchestratorEvent = [...events].reverse().find((item) => {
+    const agent = String(item?.agent || "").trim().toLowerCase();
+    return agent.includes("orchestrator") || agent.includes("master");
+  }) || latestEvent;
+  const latestTrace = [...traceRows]
+    .filter((row) => row && typeof row === "object")
+    .sort((a, b) => {
+      const aTime = parseUtcTimestamp(a.timestamp)?.getTime() || 0;
+      const bTime = parseUtcTimestamp(b.timestamp)?.getTime() || 0;
+      return bTime - aTime;
+    })[0] || null;
 
-  if (!orchestratorEvent || typeof orchestratorEvent !== "object") {
-    return {};
-  }
+  const recommendationMetadata =
+    typeof workflow?.recommendation?.metadata === "object" ? workflow.recommendation.metadata : {};
+  const metrics = typeof orchestratorEvent?.metrics === "object"
+    ? { ...orchestratorEvent.metrics }
+    : (typeof latestEvent?.metrics === "object" ? { ...latestEvent.metrics } : {});
+  const decision =
+    (typeof workflow?.decision === "object" && workflow.decision)
+    || (typeof workflow?.orchestration_decision === "object" && workflow.orchestration_decision)
+    || (typeof recommendationMetadata?.orchestration_decision === "object" && recommendationMetadata.orchestration_decision)
+    || (typeof orchestratorEvent?.decision === "object" && orchestratorEvent.decision)
+    || {};
 
-  const metrics = typeof orchestratorEvent.metrics === "object" ? { ...orchestratorEvent.metrics } : {};
-  const decision = typeof orchestratorEvent.decision === "object" ? orchestratorEvent.decision : {};
+  const provider =
+    metrics.message_bus_provider
+    || decision.message_bus_provider
+    || latestTrace?.transport_provider
+    || latestEvent?.input?.transport_provider
+    || latestEvent?.transport_provider
+    || workflow?.transport_provider
+    || "";
 
   return {
     ...metrics,
-    workflow: metrics.workflow || decision.workflow,
-    next_action: metrics.next_action || decision.next_action,
-    requires_approval: metrics.requires_approval ?? decision.requires_approval,
-    risk_tier: metrics.risk_tier || decision.risk_tier,
-    execution_mode: metrics.execution_mode || decision.execution_mode,
-    policy_version: metrics.policy_version || decision.policy_version,
-    message_bus_provider: metrics.message_bus_provider || decision.message_bus_provider,
+    workflow: metrics.workflow || decision.workflow || workflow?.scenario?.id || "",
+    next_action:
+      metrics.next_action
+      || decision.next_action
+      || workflow?.next_step
+      || workflow?.recommendation?.recommended_action
+      || "",
+    requires_approval:
+      metrics.requires_approval
+      ?? decision.requires_approval
+      ?? workflow?.approval?.required
+      ?? workflow?.recommendation?.requires_approval,
+    risk_tier: metrics.risk_tier || decision.risk_tier || latestTrace?.risk_tier || "",
+    execution_mode: metrics.execution_mode || decision.execution_mode || latestTrace?.execution_mode || "",
+    policy_version: metrics.policy_version || decision.policy_version || workflow?.recommendation?.policy_version || "",
+    message_bus_provider: provider,
   };
 }
 
@@ -96,6 +152,54 @@ function hasTokenOverlap(left, right) {
   return leftTokens.some((token) => rightSet.has(token));
 }
 
+const KAIOPS_CORE_SERVICE_SET = new Set([
+  "api-gateway",
+  "monitoring-adapter",
+  "alert-intelligence",
+  "orchestrator",
+  "context-agent",
+  "resolution-agent",
+  "approval-service",
+  "remediation-engine",
+  "closure-service",
+  "model-router",
+]);
+
+function normalizeMonitorToken(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_]+/g, "-")
+    .replace(/-+/g, "-");
+}
+
+function isKaiopsCoreSelection(value) {
+  const token = normalizeMonitorToken(value);
+  return token === "kaiops-core" || token === "kaiops" || token === "core";
+}
+
+function isKaiopsCoreAlert(row) {
+  const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
+  const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
+  const service = String(row?.service || labels?.service || "").trim().toLowerCase();
+  const alertName = String(row?.name || labels?.alertname || "").trim().toLowerCase();
+  const ownerTeam = String(metadata?.owner_team || labels?.team || "").trim().toLowerCase();
+  const project = String(row?.project || row?.project_name || row?.application || labels?.project || labels?.project_name || "")
+    .trim()
+    .toLowerCase();
+
+  if (KAIOPS_CORE_SERVICE_SET.has(service)) {
+    return true;
+  }
+  if (alertName.includes("kaiops")) {
+    return true;
+  }
+  if (ownerTeam === "platform-ops" || ownerTeam === "kaiops") {
+    return true;
+  }
+  return project.includes("kaiops");
+}
+
 function filterAlertsForMonitor(rows, applicationToMonitor) {
   const target = String(applicationToMonitor || "").trim().toLowerCase();
   const alertRows = Array.isArray(rows) ? rows : [];
@@ -103,12 +207,29 @@ function filterAlertsForMonitor(rows, applicationToMonitor) {
     return alertRows;
   }
   return alertRows.filter((row) => {
+    if (isKaiopsCoreSelection(target)) {
+      return isKaiopsCoreAlert(row);
+    }
+    const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
+    const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
     const candidates = [
       row?.application,
       row?.project,
       row?.project_name,
       row?.service,
       row?.source,
+      row?.name,
+      metadata?.owner_team,
+      labels?.application,
+      labels?.project,
+      labels?.project_name,
+      labels?.deployment,
+      labels?.namespace,
+      labels?.service,
+      labels?.job,
+      labels?.instance,
+      labels?.team,
+      labels?.alertname,
     ]
       .map((value) => String(value || "").trim().toLowerCase())
       .filter(Boolean);
@@ -129,6 +250,12 @@ function filterRowsForMonitor(rows, applicationToMonitor) {
     return items;
   }
   return items.filter((row) => {
+    if (isKaiopsCoreSelection(target)) {
+      const service = String(row?.service || "").trim().toLowerCase();
+      const owner = String(row?.owner || row?.owner_team || "").trim().toLowerCase();
+      return KAIOPS_CORE_SERVICE_SET.has(service) || owner === "platform-ops" || owner === "kaiops";
+    }
+    const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
     const candidates = [
       row?.application,
       row?.project,
@@ -136,6 +263,16 @@ function filterRowsForMonitor(rows, applicationToMonitor) {
       row?.service,
       row?.source,
       row?.provider_name,
+      row?.owner,
+      row?.owner_team,
+      labels?.application,
+      labels?.project,
+      labels?.project_name,
+      labels?.deployment,
+      labels?.namespace,
+      labels?.service,
+      labels?.job,
+      labels?.instance,
     ]
       .map((value) => String(value || "").trim().toLowerCase())
       .filter(Boolean);
@@ -217,6 +354,288 @@ function asDisplayValue(value) {
   return String(value);
 }
 
+function parseUtcTimestamp(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return null;
+  }
+  const normalized = /Z$|[+-]\d\d:\d\d$/.test(raw) ? raw : `${raw}Z`;
+  const parsed = new Date(normalized);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  return parsed;
+}
+
+function formatUtcTimestamp(value) {
+  const parsed = parseUtcTimestamp(value);
+  return parsed ? parsed.toISOString() : "-";
+}
+
+function elapsedSeconds(start, end) {
+  const startDate = parseUtcTimestamp(start);
+  const endDate = parseUtcTimestamp(end);
+  if (!startDate || !endDate) {
+    return "-";
+  }
+  return ((endDate.getTime() - startDate.getTime()) / 1000).toFixed(3);
+}
+
+function routeForAgent(agentName) {
+  const rawNeedle = String(agentName || "").trim().toLowerCase();
+  const needle = AGENT_ROUTE_ALIASES[rawNeedle] || rawNeedle;
+  if (!needle) {
+    return null;
+  }
+  return (
+    SERVICE_TOPIC_FLOW.find((row) => String(row?.agent || "").trim().toLowerCase() === needle) || null
+  );
+}
+
+function displayAgentName(agentName) {
+  const token = String(agentName || "").trim();
+  if (!token) {
+    return "-";
+  }
+  const alias = AGENT_DISPLAY_ALIASES[token.toLowerCase()];
+  return alias ? `${alias} (${token})` : token;
+}
+
+function compactText(value, maxLength = 180) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  return text.length > maxLength ? `${text.slice(0, Math.max(24, maxLength - 1))}...` : text;
+}
+
+function summarizeEventType(value) {
+  const token = String(value || "").trim();
+  if (!token) {
+    return "Workflow Event";
+  }
+  return token
+    .split(".")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" -> ");
+}
+
+function toFiniteNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function percentile(values, fraction) {
+  const nums = (Array.isArray(values) ? values : [])
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b);
+  if (!nums.length) {
+    return 0;
+  }
+  const index = Math.min(nums.length - 1, Math.max(0, Math.ceil(fraction * nums.length) - 1));
+  return nums[index];
+}
+
+function HorizontalBarChart({ title, subtitle, items }) {
+  const safeItems = Array.isArray(items) ? items : [];
+  const maxValue = safeItems.reduce((best, item) => Math.max(best, toFiniteNumber(item?.value)), 0);
+  return (
+    <article className="panel executive-chart-card">
+      <div className="panel-head">
+        <h3>{title}</h3>
+      </div>
+      {subtitle ? <p className="subtitle">{subtitle}</p> : null}
+      <div className="executive-bars">
+        {safeItems.map((item, index) => {
+          const value = toFiniteNumber(item?.value);
+          const widthPct = maxValue > 0 ? (value / maxValue) * 100 : 0;
+          const normalizedWidth = maxValue > 0 && value > 0 ? Math.max(4, widthPct) : 0;
+          const tone = String(item?.tone || "ops");
+          return (
+            <div className="executive-bar-row" key={`bar-${index}`}>
+              <span>{item?.label || "-"}</span>
+              <strong>{item?.displayValue ?? String(value)}</strong>
+              <div className="executive-bar-track">
+                <div className={`executive-bar-fill tone-${tone}`} style={{ width: `${normalizedWidth}%` }} />
+              </div>
+            </div>
+          );
+        })}
+        {!safeItems.length ? <p className="subtitle">No chart data available.</p> : null}
+      </div>
+    </article>
+  );
+}
+
+function SuccessFailureDonut({ success, failure }) {
+  const safeSuccess = Math.max(0, toFiniteNumber(success));
+  const safeFailure = Math.max(0, toFiniteNumber(failure));
+  const total = safeSuccess + safeFailure;
+  const successPct = total > 0 ? (safeSuccess / total) * 100 : 0;
+  return (
+    <article className="panel executive-chart-card">
+      <div className="panel-head">
+        <h3>Success vs Failure</h3>
+      </div>
+      <div className="executive-donut-wrap">
+        <div
+          className="executive-donut"
+          style={{
+            background: `conic-gradient(var(--ok) 0 ${successPct}%, var(--danger) ${successPct}% 100%)`,
+          }}
+        >
+          <div className="executive-donut-core">
+            <strong>{total}</strong>
+            <span>Requests</span>
+          </div>
+        </div>
+        <div className="executive-donut-legend">
+          <div><span className="legend-dot legend-ok" />Success: {safeSuccess}</div>
+          <div><span className="legend-dot legend-danger" />Failure: {safeFailure}</div>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function FlowTimelineGraph({ rows }) {
+  const timelineRows = Array.isArray(rows) ? rows : [];
+  if (!timelineRows.length) {
+    return <p className="subtitle">No timeline data found for selected alert.</p>;
+  }
+  return (
+    <div className="timeline-graph">
+      {timelineRows.map((row, index) => (
+        <article
+          className="timeline-node"
+          key={`timeline-node-${index}`}
+          style={{ animationDelay: `${Math.min(index * 70, 560)}ms` }}
+        >
+          <div className="timeline-rail">
+            <span className="timeline-dot" />
+            {index < timelineRows.length - 1 ? <span className="timeline-line" /> : null}
+          </div>
+          <div className="timeline-body">
+            <div className="timeline-headline">
+              <strong>{row.stage || "-"}</strong>
+              <span>{formatUtcTimestamp(row.timestamp)}</span>
+            </div>
+            <div className="timeline-meta">
+              <span>{row.agent || "-"}</span>
+              <span>{row.service || "-"}</span>
+              <span>{row.elapsed !== "-" ? `${row.elapsed}s` : "-"}</span>
+            </div>
+            <p>{row.detail || "-"}</p>
+            <div className="timeline-tags">
+              <span className="timeline-tag">in: {row.consumes || "-"}</span>
+              <span className="timeline-tag">out: {row.publishes || "-"}</span>
+              <span className="timeline-tag">db: {row.tables || "-"}</span>
+            </div>
+          </div>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function AgentEventsGraph({ rows }) {
+  const eventRows = Array.isArray(rows) ? rows : [];
+  if (!eventRows.length) {
+    return <p className="subtitle">No events found for selected alert.</p>;
+  }
+  return (
+    <div className="agent-events-graph">
+      {eventRows.map((row, index) => (
+        <article
+          className="agent-event-card"
+          key={`agent-event-${index}`}
+          style={{ animationDelay: `${Math.min(index * 60, 480)}ms` }}
+        >
+          <div className="agent-event-step">{row.sequence || index + 1}</div>
+          <div className="agent-event-body">
+            <strong>{row.agent || "-"}</strong>
+            <p>{row.action || "-"}</p>
+            <div className="agent-event-kv">
+              <span>Decision: {compactText(row.decision, 120) || "-"}</span>
+              <span>Output: {compactText(row.output, 120) || "-"}</span>
+              <span>Next: {row.communicates_to || "-"}</span>
+            </div>
+          </div>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function TopicFlowGraph({ routing, timelineRows }) {
+  const safeRouting = routing && typeof routing === "object" ? routing : {};
+  const channels = Array.from(new Set(
+    (Array.isArray(timelineRows) ? timelineRows : [])
+      .flatMap((row) => [row?.consumes, row?.publishes])
+      .map((item) => String(item || "").trim())
+      .filter(Boolean)
+  ));
+
+  return (
+    <div className="topic-flow-graph">
+      <div className="topic-flow-pill">
+        <span>Provider</span>
+        <strong>{String(safeRouting?.message_bus_provider || "-").toUpperCase()}</strong>
+      </div>
+      <div className="topic-flow-pill">
+        <span>Workflow</span>
+        <strong>{safeRouting?.workflow || "-"}</strong>
+      </div>
+      <div className="topic-flow-pill">
+        <span>Execution</span>
+        <strong>{safeRouting?.execution_mode || "-"}</strong>
+      </div>
+      <div className="topic-channel-rail">
+        {channels.length ? channels.map((channel, index) => (
+          <div key={`channel-${index}`} className="topic-channel-chip" style={{ animationDelay: `${Math.min(index * 70, 560)}ms` }}>
+            {channel}
+          </div>
+        )) : <p className="subtitle">No observed channels for selected alert.</p>}
+      </div>
+    </div>
+  );
+}
+
+function ExecutionPlanGraph({ plan }) {
+  const safePlan = plan && typeof plan === "object" ? plan : {};
+  const commands = Array.isArray(safePlan.commands) ? safePlan.commands : [];
+
+  return (
+    <div className="execution-graph">
+      <article className="execution-card">
+        <h4>Plan Core</h4>
+        <div className="execution-grid">
+          <span>Workflow</span><strong>{safePlan.workflow || "-"}</strong>
+          <span>Action</span><strong>{safePlan.action || "-"}</strong>
+          <span>Rationale</span><strong>{safePlan.rationale || "-"}</strong>
+          <span>Mode</span><strong>{safePlan.executionMode || "-"}</strong>
+          <span>Risk</span><strong>{safePlan.riskTier || "-"}</strong>
+          <span>Provider</span><strong>{String(safePlan.provider || "-").toUpperCase()}</strong>
+          <span>Approval</span><strong>{String(safePlan.requiresApproval)}</strong>
+        </div>
+      </article>
+      <article className="execution-card">
+        <h4>Command Sequence</h4>
+        <div className="execution-command-list">
+          {commands.length ? commands.map((command, index) => (
+            <div className="execution-command" key={`cmd-${index}`} style={{ animationDelay: `${Math.min(index * 80, 640)}ms` }}>
+              <span>{index + 1}</span>
+              <code>{String(command || "-")}</code>
+            </div>
+          )) : <p className="subtitle">No command sequence found.</p>}
+        </div>
+      </article>
+    </div>
+  );
+}
+
 function renderHtmlTable(headers, rows) {
   const safeHeaders = Array.isArray(headers) ? headers : [];
   const safeRows = Array.isArray(rows) ? rows : [];
@@ -233,11 +652,12 @@ function renderHtmlTable(headers, rows) {
 }
 
 export default function App() {
-  const defaultMonitorApplications = ["payments", "checkout", "orders-db", "inventory"];
+  const defaultMonitorApplications = ["payments", "checkout", "orders-db", "inventory", "kaiops-core"];
   const [applicationToMonitor, setApplicationToMonitor] = useState("payments");
   const [monitorApplications, setMonitorApplications] = useState(defaultMonitorApplications);
   const [activeTab, setActiveTab] = useState("home");
   const [uiDensity, setUiDensity] = useState("comfortable");
+  const [uiTheme, setUiTheme] = useState("auto");
   const [health, setHealth] = useState({ loading: false, ok: false, message: "Not checked" });
   const [alerts, setAlerts] = useState({ loading: false, rows: [], error: "" });
   const [incidentMetadata, setIncidentMetadata] = useState({ loading: false, rows: [], error: "" });
@@ -245,6 +665,7 @@ export default function App() {
   const [flows, setFlows] = useState({ loading: false, rows: [], error: "" });
   const [gatewaySummary, setGatewaySummary] = useState({ loading: false, data: {}, error: "" });
   const [gatewayRecent, setGatewayRecent] = useState({ loading: false, rows: [], error: "" });
+  const [landingPadRecent, setLandingPadRecent] = useState({ loading: false, rows: [], error: "" });
   const [ragDocs, setRagDocs] = useState({ loading: false, rows: [], error: "" });
   const [guidanceQuery, setGuidanceQuery] = useState("");
   const [guidanceState, setGuidanceState] = useState({ loading: false, rows: [], error: "" });
@@ -258,10 +679,15 @@ export default function App() {
     payload: null,
     error: "",
   });
-  const [collapsedGroups, setCollapsedGroups] = useState({ monitor: false, context: false, view: false, sections: false });
   const [selectedAlertId, setSelectedAlertId] = useState("");
   const [selectedApprovalIncidentId, setSelectedApprovalIncidentId] = useState("");
-  const [selectedAlertData, setSelectedAlertData] = useState({ loading: false, payload: null, error: "" });
+  const [selectedAlertData, setSelectedAlertData] = useState({ loading: false, payload: null, error: "", alertId: "" });
+  const [selectedStageCompleteness, setSelectedStageCompleteness] = useState({
+    loading: false,
+    data: null,
+    error: "",
+    incidentId: "",
+  });
   const [homeDetailTab, setHomeDetailTab] = useState("summary");
   const [approvalForm, setApprovalForm] = useState({
     action: "approve",
@@ -327,6 +753,44 @@ export default function App() {
     assignment_project: "",
   });
   const [onboardingState, setOnboardingState] = useState({ loading: false, connectivity: {}, rows: [], error: "", success: "" });
+  const [onboardingRuleCapabilities, setOnboardingRuleCapabilities] = useState({ loading: false, rows: [], error: "" });
+  const [onboardingRuleWizardStep, setOnboardingRuleWizardStep] = useState(1);
+  const [onboardingRuleWizardMode, setOnboardingRuleWizardMode] = useState("existing");
+  const [existingRulePipelineForm, setExistingRulePipelineForm] = useState({
+    platform: "prometheus",
+    mode: "bidirectional",
+    connection_url: "",
+    rules_json: JSON.stringify([
+      {
+        name: "project_cpu_high",
+        metric: "cpu_usage_percent",
+        threshold: 85,
+        duration: "5m",
+        aggregation: "avg",
+        severity: "high",
+        labels: { project: "kaiops-project" },
+      },
+    ], null, 2),
+  });
+  const [newRulePipelineForm, setNewRulePipelineForm] = useState({
+    requirements_text: [
+      "Alert if CPU stays above 80% for more than 5 minutes with high severity",
+      "Alert when latency is over 2000 for 10 minutes critical",
+    ].join("\n"),
+    target_platforms_csv: "prometheus, datadog",
+    discovery_json: JSON.stringify(
+      {
+        kubernetes: {
+          namespaces: ["default"],
+          services: ["payments-api"],
+        },
+      },
+      null,
+      2,
+    ),
+  });
+  const [onboardingRuleRunState, setOnboardingRuleRunState] = useState({ loading: false, result: null, error: "" });
+  const [onboardingRuleLookup, setOnboardingRuleLookup] = useState({ workflow_id: "", loading: false, result: null, error: "" });
   const [alertOnboarding, setAlertOnboarding] = useState({
     kind: "incident",
     title: "New Alert Onboarding",
@@ -344,6 +808,7 @@ export default function App() {
     results: [],
     error: "",
   });
+  const alertDetailsRef = useRef(null);
 
   const formValid = useMemo(() => {
     return [form.source, form.name, form.service, form.severity, form.description].every((v) => String(v || "").trim());
@@ -381,12 +846,47 @@ export default function App() {
     if (!normalized) {
       return;
     }
-    setSelectedAlertData({ loading: true, payload: null, error: "" });
+    setSelectedAlertData({ loading: true, payload: null, error: "", alertId: normalized });
     try {
       const payload = await fetchJson(`/monitoring-adapter/alerts/${normalized}/processed-result`);
-      setSelectedAlertData({ loading: false, payload, error: "" });
+      setSelectedAlertData((prev) => {
+        if (String(prev.alertId || "") !== normalized) {
+          return prev;
+        }
+        return { loading: false, payload, error: "", alertId: normalized };
+      });
     } catch (error) {
-      setSelectedAlertData({ loading: false, payload: null, error: error.message });
+      setSelectedAlertData((prev) => {
+        if (String(prev.alertId || "") !== normalized) {
+          return prev;
+        }
+        return { loading: false, payload: null, error: error.message, alertId: normalized };
+      });
+    }
+  }
+
+  async function loadIncidentStageCompleteness(incidentId) {
+    const normalized = String(incidentId || "").trim();
+    if (!normalized) {
+      setSelectedStageCompleteness({ loading: false, data: null, error: "", incidentId: "" });
+      return;
+    }
+    setSelectedStageCompleteness({ loading: true, data: null, error: "", incidentId: normalized });
+    try {
+      const payload = await fetchJson(`/api-gateway/incidents/${normalized}/stage-completeness`);
+      setSelectedStageCompleteness((prev) => {
+        if (String(prev.incidentId || "") !== normalized) {
+          return prev;
+        }
+        return { loading: false, data: payload, error: "", incidentId: normalized };
+      });
+    } catch (error) {
+      setSelectedStageCompleteness((prev) => {
+        if (String(prev.incidentId || "") !== normalized) {
+          return prev;
+        }
+        return { loading: false, data: null, error: error.message, incidentId: normalized };
+      });
     }
   }
 
@@ -396,9 +896,57 @@ export default function App() {
       return;
     }
     setSelectedAlertId(String(alertId));
+    setActiveTab("home");
     setHomeDetailTab("summary");
     loadAlertDetails(alertId);
   }
+
+  function openAlertDetailsFromIncident(row) {
+    const incidentId = String(row?.incident_id || row?.id || "").trim();
+    if (!incidentId) {
+      return;
+    }
+    const scopedAlerts = filterAlertsForMonitor(alerts.rows, applicationToMonitor);
+    const matchedAlert = scopedAlerts.find((alertRow) => {
+      const alertId = String(alertRow?.alert_id || alertRow?.id || alertRow?.incident_id || "").trim();
+      const sourceIncident = String(alertRow?.incident_id || "").trim();
+      return alertId === incidentId || sourceIncident === incidentId;
+    });
+    openAlertDetails(matchedAlert || row);
+  }
+
+  useEffect(() => {
+    if (activeTab !== "home" || !selectedAlertId) {
+      return;
+    }
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      alertDetailsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }, [activeTab, selectedAlertId]);
+
+  useEffect(() => {
+    if (activeTab !== "home") {
+      return;
+    }
+    const payload = selectedAlertData?.payload?.data || selectedAlertData?.payload || {};
+    const workflow = payload?.workflow || payload || {};
+    const currentIncidentId = String(workflow?.incident?.id || workflow?.incident_id || "").trim();
+
+    if (!currentIncidentId) {
+      setSelectedStageCompleteness({ loading: false, data: null, error: "", incidentId: "" });
+      return;
+    }
+    if (
+      String(selectedStageCompleteness.incidentId || "") === String(currentIncidentId)
+      && (selectedStageCompleteness.data || selectedStageCompleteness.loading || selectedStageCompleteness.error)
+    ) {
+      return;
+    }
+    loadIncidentStageCompleteness(currentIncidentId);
+  }, [activeTab, selectedAlertData.payload, selectedStageCompleteness.incidentId, selectedStageCompleteness.data, selectedStageCompleteness.loading, selectedStageCompleteness.error]);
 
   useEffect(() => {
     const scopedRows = filterAlertsForMonitor(alerts.rows, applicationToMonitor);
@@ -410,7 +958,7 @@ export default function App() {
         setSelectedAlertId("");
       }
       if (selectedAlertData.payload || selectedAlertData.error) {
-        setSelectedAlertData({ loading: false, payload: null, error: "" });
+        setSelectedAlertData({ loading: false, payload: null, error: "", alertId: "" });
       }
       return;
     }
@@ -418,10 +966,13 @@ export default function App() {
       (row) => String(row?.alert_id || row?.id || row?.incident_id || "") === selectedAlertId
     );
     if (selectedExists) {
+      if (String(selectedAlertData.alertId || "") !== String(selectedAlertId || "")) {
+        loadAlertDetails(selectedAlertId);
+      }
       return;
     }
     openAlertDetails(scopedRows[0]);
-  }, [activeTab, alerts.rows, applicationToMonitor, selectedAlertId, selectedAlertData.payload, selectedAlertData.error]);
+  }, [activeTab, alerts.rows, applicationToMonitor, selectedAlertId, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId]);
 
   async function loadIncidentMetadata() {
     setIncidentMetadata((prev) => ({ ...prev, loading: true, error: "" }));
@@ -525,6 +1076,18 @@ export default function App() {
     }
   }
 
+  async function loadLandingPadRecent() {
+    setLandingPadRecent((prev) => ({ ...prev, loading: true, error: "" }));
+    try {
+      const payload = await fetchJson("/api-gateway/landing-pad/recent?limit=50");
+      const data = unwrap(payload);
+      const rows = data?.rows || [];
+      setLandingPadRecent({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
+    } catch (error) {
+      setLandingPadRecent({ loading: false, rows: [], error: error.message });
+    }
+  }
+
   async function loadRagDocs() {
     setRagDocs((prev) => ({ ...prev, loading: true, error: "" }));
     try {
@@ -545,7 +1108,30 @@ export default function App() {
         .map((row) => String(row?.project_name || "").trim())
         .filter(Boolean);
       const alertApplications = alerts.rows
-        .map((row) => String(row?.application || row?.project_name || row?.project || row?.service || "").trim())
+        .flatMap((row) => {
+          const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
+          const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
+          const base = [
+            row?.application,
+            row?.project_name,
+            row?.project,
+            row?.service,
+            labels?.application,
+            labels?.project,
+            labels?.project_name,
+            labels?.deployment,
+            labels?.service,
+            labels?.job,
+            labels?.instance,
+            metadata?.owner_team,
+          ]
+            .map((value) => String(value || "").trim())
+            .filter(Boolean);
+          if (isKaiopsCoreAlert(row)) {
+            base.push("kaiops-core");
+          }
+          return base;
+        })
         .filter(Boolean);
       const unique = Array.from(new Set([...defaultMonitorApplications, ...projects, ...alertApplications]));
       setMonitorApplications(unique.length ? unique : defaultMonitorApplications);
@@ -848,6 +1434,155 @@ export default function App() {
     }
   }
 
+  function onboardingProjectSeed() {
+    return {
+      project_name: String(onboardingForm.name || "").trim(),
+      description: "",
+      business_unit: "",
+      environment: String(onboardingForm.environment || "prod").trim().toLowerCase(),
+      criticality: "high",
+      sla: "",
+      support_team: String(onboardingForm.owner_team || "").trim(),
+      business_owner: "",
+      technical_owner: "",
+      technology_stack: [],
+      cloud_provider: onboardingForm.deployment_mode === "gcp_cloud" ? "gcp" : "on_prem",
+      region: String(onboardingForm.region || "").trim(),
+      monitoring_platforms: ["prometheus", "new_relic", "datadog"].filter((platform) => {
+        if (platform === "prometheus") {
+          return Boolean(String(onboardingForm.prometheus_url || "").trim());
+        }
+        if (platform === "new_relic") {
+          return Boolean(String(onboardingForm.new_relic_url || "").trim());
+        }
+        if (platform === "datadog") {
+          return Boolean(String(onboardingForm.datadog_url || "").trim());
+        }
+        return false;
+      }),
+      notification_platforms: ["slack", "teams", "pagerduty"],
+    };
+  }
+
+  async function loadOnboardingRuleCapabilities() {
+    setOnboardingRuleCapabilities((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const response = await fetchJson("/api-gateway/onboarding/rules/capabilities");
+      const payload = unwrap(response);
+      const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+      setOnboardingRuleCapabilities({ loading: false, rows, error: "" });
+    } catch (error) {
+      setOnboardingRuleCapabilities({ loading: false, rows: [], error: error.message });
+    }
+  }
+
+  async function runExistingRulePipeline(event) {
+    event.preventDefault();
+    setOnboardingRuleRunState({ loading: true, result: null, error: "" });
+    try {
+      let rulesToPush = [];
+      const rawRules = String(existingRulePipelineForm.rules_json || "").trim();
+      if (rawRules) {
+        const parsed = JSON.parse(rawRules);
+        if (!Array.isArray(parsed)) {
+          throw new Error("Rules JSON must be an array of rule objects.");
+        }
+        rulesToPush = parsed;
+      }
+
+      const payload = {
+        project: onboardingProjectSeed(),
+        platform: String(existingRulePipelineForm.platform || "prometheus").trim(),
+        mode: String(existingRulePipelineForm.mode || "bidirectional").trim(),
+        rules_to_push: rulesToPush,
+        connection_profile: {
+          endpoint_url: String(existingRulePipelineForm.connection_url || "").trim(),
+        },
+      };
+
+      const response = await fetchJson("/api-gateway/onboarding/rules/pipeline/existing", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      const result = unwrap(response);
+      setOnboardingRuleRunState({ loading: false, result, error: "" });
+      setOnboardingRuleLookup((current) => ({
+        ...current,
+        workflow_id: String(result?.workflow_id || current.workflow_id || "").trim(),
+      }));
+      await loadOnboardingAdminData();
+    } catch (error) {
+      setOnboardingRuleRunState({ loading: false, result: null, error: error.message });
+    }
+  }
+
+  async function runNewRulePipeline(event) {
+    event.preventDefault();
+    setOnboardingRuleRunState({ loading: true, result: null, error: "" });
+    try {
+      const requirements = String(newRulePipelineForm.requirements_text || "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      if (!requirements.length) {
+        throw new Error("Provide at least one monitoring requirement.");
+      }
+
+      const targetPlatforms = String(newRulePipelineForm.target_platforms_csv || "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+
+      let discoveryInputs = {};
+      const rawDiscovery = String(newRulePipelineForm.discovery_json || "").trim();
+      if (rawDiscovery) {
+        const parsed = JSON.parse(rawDiscovery);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("Discovery JSON must be an object.");
+        }
+        discoveryInputs = parsed;
+      }
+
+      const payload = {
+        project: onboardingProjectSeed(),
+        monitoring_requirements: requirements,
+        target_platforms: targetPlatforms,
+        discovery_inputs: discoveryInputs,
+      };
+
+      const response = await fetchJson("/api-gateway/onboarding/rules/pipeline/new", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      const result = unwrap(response);
+      setOnboardingRuleRunState({ loading: false, result, error: "" });
+      setOnboardingRuleLookup((current) => ({
+        ...current,
+        workflow_id: String(result?.workflow_id || current.workflow_id || "").trim(),
+      }));
+      await loadOnboardingAdminData();
+    } catch (error) {
+      setOnboardingRuleRunState({ loading: false, result: null, error: error.message });
+    }
+  }
+
+  async function lookupOnboardingRuleWorkflow(event) {
+    event.preventDefault();
+    const workflowId = String(onboardingRuleLookup.workflow_id || "").trim();
+    if (!workflowId) {
+      setOnboardingRuleLookup((current) => ({ ...current, error: "Workflow ID is required." }));
+      return;
+    }
+    setOnboardingRuleLookup((current) => ({ ...current, loading: true, result: null, error: "" }));
+    try {
+      const response = await fetchJson(`/api-gateway/onboarding/rules/pipeline/${encodeURIComponent(workflowId)}`);
+      const result = unwrap(response);
+      setOnboardingRuleLookup((current) => ({ ...current, loading: false, result, error: "" }));
+    } catch (error) {
+      setOnboardingRuleLookup((current) => ({ ...current, loading: false, result: null, error: error.message }));
+    }
+  }
+
   async function submitAlertOnboarding(event) {
     event.preventDefault();
     setAlertOnboardingState({ loading: true, result: null, error: "" });
@@ -1006,6 +1741,7 @@ export default function App() {
       loadMonitorApplications(),
       loadGatewaySummary(),
       loadGatewayRecent(),
+      loadLandingPadRecent(),
       loadIncidentMetadata(),
       loadClosedIncidents(),
       loadRagDocs(),
@@ -1029,6 +1765,9 @@ export default function App() {
         if (prefs.uiDensity === "comfortable" || prefs.uiDensity === "compact") {
           setUiDensity(prefs.uiDensity);
         }
+        if (typeof prefs.uiTheme === "string" && UI_THEME_VALUES.has(prefs.uiTheme)) {
+          setUiTheme(prefs.uiTheme);
+        }
         if (typeof prefs.selectedFlow === "string" && prefs.selectedFlow.trim()) {
           setSelectedFlow(prefs.selectedFlow);
         }
@@ -1051,16 +1790,34 @@ export default function App() {
     if (typeof window === "undefined") {
       return;
     }
+    const root = window.document?.documentElement;
+    if (!root) {
+      return;
+    }
+    root.classList.remove("dm-theme-light", "dm-theme-dark");
+    if (uiTheme === "light") {
+      root.classList.add("dm-theme-light");
+    } else if (uiTheme === "dark") {
+      root.classList.add("dm-theme-dark");
+    }
+    root.setAttribute("data-ui-theme", uiTheme);
+  }, [uiTheme]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
     const payload = {
       applicationToMonitor,
       uiDensity,
+      uiTheme,
       selectedFlow,
       activeTab,
       metadataFilters,
       closedFilters,
     };
     window.localStorage.setItem(PREFERENCE_STORAGE_KEY, JSON.stringify(payload));
-  }, [applicationToMonitor, uiDensity, selectedFlow, activeTab, metadataFilters, closedFilters]);
+  }, [applicationToMonitor, uiDensity, uiTheme, selectedFlow, activeTab, metadataFilters, closedFilters]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -1119,6 +1876,13 @@ export default function App() {
   }, [activeTab]);
 
   useEffect(() => {
+    if (activeTab !== "admin" || adminWorkspace !== "project") {
+      return;
+    }
+    loadOnboardingRuleCapabilities();
+  }, [activeTab, adminWorkspace]);
+
+  useEffect(() => {
     const stressAlertPresent = alerts.rows.some((row) => {
       return String(row?.application || row?.project || row?.project_name || row?.source || "")
         .trim()
@@ -1145,6 +1909,10 @@ export default function App() {
     loadAdminUsersAndRoles();
   }, [adminSession.accessToken, activeTab]);
 
+  useEffect(() => {
+    loadMonitorApplications();
+  }, [alerts.rows]);
+
   const latestWorkflow = useMemo(() => {
     return workflowState?.result?.data || {};
   }, [workflowState]);
@@ -1162,8 +1930,8 @@ export default function App() {
   }, [alerts.rows, applicationToMonitor]);
 
   const visibleAlerts = useMemo(() => {
-    return monitorScopedAlerts.length ? monitorScopedAlerts : alerts.rows;
-  }, [monitorScopedAlerts, alerts.rows]);
+    return monitorScopedAlerts;
+  }, [monitorScopedAlerts]);
 
   const monitorScopedIncidentMetadata = useMemo(() => {
     return filterRowsForMonitor(incidentMetadata.rows, applicationToMonitor);
@@ -1182,16 +1950,295 @@ export default function App() {
   }, [selectedAlertPayload]);
 
   const selectedAlertEvents = useMemo(() => {
-    const events = selectedAlertWorkflow?.events || [];
+    const events =
+      selectedAlertWorkflow?.events
+      || selectedAlertWorkflow?.workflow_events
+      || selectedAlertWorkflow?.agent_events
+      || [];
     return Array.isArray(events) ? events : [];
   }, [selectedAlertWorkflow]);
 
+  const selectedAlertEventTrace = useMemo(() => {
+    const rows =
+      selectedAlertWorkflow?.event_trace
+      || selectedAlertWorkflow?.trace_events
+      || selectedAlertWorkflow?.trace?.events
+      || [];
+    if (!Array.isArray(rows)) {
+      return [];
+    }
+    return rows
+      .filter((row) => row && typeof row === "object")
+      .sort((a, b) => {
+        const aTime = parseUtcTimestamp(a.timestamp)?.getTime() || 0;
+        const bTime = parseUtcTimestamp(b.timestamp)?.getTime() || 0;
+        return aTime - bTime;
+      })
+      .slice(-300);
+  }, [selectedAlertWorkflow]);
+
+  const selectedAlertEventsDisplay = useMemo(() => {
+    const mappedEvents = selectedAlertEvents.map((event, index) => {
+      const decision = event?.decision;
+      const input = typeof event?.input === "object" && event.input ? event.input : {};
+      return {
+        sequence: event?.sequence || index + 1,
+        agent: displayAgentName(event?.agent || event?.service || "-"),
+        action: event?.action || event?.event_type || event?.status || "-",
+        decision: decision && typeof decision === "object" ? JSON.stringify(decision) : String(decision || "-"),
+        output:
+          event?.output && typeof event.output === "object"
+            ? JSON.stringify(event.output)
+            : String(event?.output || event?.event_type || "-"),
+        communicates_to: event?.communicates_to || event?.transport_channel || input?.transport_channel || "-",
+      };
+    });
+
+    const traceRows = selectedAlertEventTrace.map((row, index) => ({
+      sequence: mappedEvents.length + index + 1,
+      agent: displayAgentName(row?.service || "-"),
+      action: summarizeEventType(row?.event_type),
+      decision: row?.policy_reason || row?.status || row?.event_stage || "-",
+      output: row?.event_type || "-",
+      communicates_to: row?.transport_channel || "-",
+    }));
+
+    if (!mappedEvents.length) {
+      return traceRows;
+    }
+
+    const seenSignatures = new Set(
+      mappedEvents.map((row) => `${String(row.agent || "").toLowerCase()}|${String(row.action || "").toLowerCase()}`)
+    );
+    const appendedTraceRows = traceRows.filter((row) => {
+      const signature = `${String(row.agent || "").toLowerCase()}|${String(row.action || "").toLowerCase()}`;
+      if (seenSignatures.has(signature)) {
+        return false;
+      }
+      seenSignatures.add(signature);
+      return true;
+    });
+
+    return [...mappedEvents, ...appendedTraceRows].map((row, index) => ({
+      ...row,
+      sequence: index + 1,
+    }));
+  }, [selectedAlertEvents, selectedAlertEventTrace, selectedAlertWorkflow]);
+
   const selectedAlertUsage = useMemo(() => {
-    const usage = selectedAlertWorkflow?.recommendation?.metadata?.model_usage || [];
+    const usage =
+      selectedAlertWorkflow?.recommendation?.metadata?.model_usage
+      || selectedAlertWorkflow?.finops?.calls
+      || selectedAlertWorkflow?.recommendation?.metadata?.llm_calls
+      || [];
     return Array.isArray(usage) ? usage : [];
   }, [selectedAlertWorkflow]);
 
   const selectedAlertRouting = useMemo(() => extractObservedRoutingMetrics(selectedAlertWorkflow), [selectedAlertWorkflow]);
+
+  const selectedExecutionPlan = useMemo(() => {
+    const recommendation =
+      typeof selectedAlertWorkflow?.recommendation === "object" && selectedAlertWorkflow.recommendation
+        ? selectedAlertWorkflow.recommendation
+        : {};
+    const recommendationMetadata =
+      typeof recommendation?.metadata === "object" && recommendation.metadata
+        ? recommendation.metadata
+        : {};
+    const decision =
+      (typeof selectedAlertWorkflow?.decision === "object" && selectedAlertWorkflow.decision)
+      || (typeof selectedAlertWorkflow?.orchestration_decision === "object" && selectedAlertWorkflow.orchestration_decision)
+      || (typeof recommendationMetadata?.orchestration_decision === "object" && recommendationMetadata.orchestration_decision)
+      || {};
+    const remediationAction =
+      typeof selectedAlertWorkflow?.remediation_action === "object" && selectedAlertWorkflow.remediation_action
+        ? selectedAlertWorkflow.remediation_action
+        : {};
+    const commands =
+      (Array.isArray(recommendation?.commands) && recommendation.commands)
+      || (Array.isArray(remediationAction?.commands) && remediationAction.commands)
+      || (Array.isArray(decision?.commands) && decision.commands)
+      || [];
+
+    return {
+      action:
+        recommendation?.recommended_action
+        || remediationAction?.action
+        || selectedAlertRouting?.next_action
+        || selectedAlertWorkflow?.next_step
+        || "-",
+      rationale:
+        recommendation?.rationale
+        || remediationAction?.reason
+        || selectedAlertRouting?.policy_reason
+        || recommendation?.policy_reason
+        || "-",
+      requiresApproval:
+        selectedAlertRouting?.requires_approval
+        ?? decision?.requires_approval
+        ?? selectedAlertWorkflow?.approval?.required
+        ?? "-",
+      workflow: selectedAlertRouting?.workflow || decision?.workflow || selectedAlertWorkflow?.scenario?.id || "-",
+      executionMode: selectedAlertRouting?.execution_mode || decision?.execution_mode || "-",
+      riskTier: selectedAlertRouting?.risk_tier || decision?.risk_tier || "-",
+      provider: selectedAlertRouting?.message_bus_provider || decision?.message_bus_provider || "-",
+      commands,
+    };
+  }, [selectedAlertWorkflow, selectedAlertRouting]);
+
+  const selectedIncidentId = useMemo(() => {
+    return String(selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "").trim();
+  }, [selectedAlertWorkflow]);
+
+  const selectedIncidentMetadataRow = useMemo(() => {
+    if (!selectedIncidentId) {
+      return null;
+    }
+    const scoped = monitorScopedIncidentMetadata.find(
+      (row) => String(row?.incident_id || "").trim() === selectedIncidentId
+    );
+    if (scoped) {
+      return scoped;
+    }
+    return incidentMetadata.rows.find((row) => String(row?.incident_id || "").trim() === selectedIncidentId) || null;
+  }, [selectedIncidentId, monitorScopedIncidentMetadata, incidentMetadata.rows]);
+
+  const selectedAlertTimelineRows = useMemo(() => {
+    const ingestAt =
+      selectedAlertWorkflow?.alert?.created_at ||
+      selectedAlertRow?.created_at ||
+      selectedAlertRow?.starts_at ||
+      "";
+    const incidentCreatedAt = selectedAlertWorkflow?.incident?.created_at || "";
+    const latestFlowUpdateAt =
+      selectedIncidentMetadataRow?.updated_at ||
+      selectedIncidentMetadataRow?.latest_event_at ||
+      "";
+    const latestEventType = String(selectedIncidentMetadataRow?.latest_event_type || "").trim();
+
+    const summaryRows = [
+      {
+        stage: "Alert Ingested",
+        agent: "monitoring-adapter",
+        service: "monitoring-adapter",
+        consumes: "-",
+        publishes: "raw-alerts",
+        timestamp: ingestAt,
+        elapsed: "0.000",
+        detail: "Alert accepted and persisted.",
+        tables: "alerts",
+        query: "INSERT alerts",
+      },
+      {
+        stage: "Incident Created",
+        agent: "alert-intelligence",
+        service: "alert-intelligence",
+        consumes: "raw-alerts",
+        publishes: "enriched-alerts",
+        timestamp: incidentCreatedAt,
+        elapsed: elapsedSeconds(ingestAt, incidentCreatedAt),
+        detail: "Incident opened from alert correlation.",
+        tables: "incidents, agent_work_items",
+        query: "INSERT incidents; INSERT agent_work_items",
+      },
+    ];
+
+    const traceRows = selectedAlertEventTrace.map((event, index) => {
+      const stageName = summarizeEventType(event.event_type);
+      const tableHints = Array.isArray(event.table_hints) ? event.table_hints.filter(Boolean) : [];
+      const detailParts = [
+        compactText(event.event_stage, 40),
+        compactText(event.status, 40),
+        compactText(event.policy_reason, 120),
+      ].filter(Boolean);
+      return {
+        stage: `${stageName}${index + 1 <= 9 ? ` (${index + 1})` : ""}`,
+        agent: displayAgentName(event.service || "-"),
+        service: event.service || "-",
+        consumes: event.source_channel || "-",
+        publishes: event.transport_channel || "-",
+        timestamp: event.timestamp || "",
+        elapsed: elapsedSeconds(ingestAt, event.timestamp || ""),
+        detail: detailParts.join(" | ") || "Trace event recorded.",
+        tables: tableHints.join(", ") || "-",
+        query: compactText(event.query_hint, 140) || "-",
+      };
+    });
+
+    const workflowRows =
+      traceRows.length > 0
+        ? traceRows
+        : selectedAlertEvents
+            .filter((event) => event && typeof event === "object")
+            .sort((a, b) => Number(a.sequence || 0) - Number(b.sequence || 0))
+            .map((event) => {
+              const route = routeForAgent(event.agent);
+              const step = Number(event.sequence || 0);
+              const timestamp = event.timestamp || "";
+              const stageName = step > 0 ? `Workflow Step ${step}` : "Workflow Step";
+              const decisionText =
+                event.decision && typeof event.decision === "object"
+                  ? JSON.stringify(event.decision)
+                  : String(event.decision || "").trim();
+              const actionText = String(event.action || event.output || event.status || "").trim();
+              return {
+                stage: stageName,
+                agent: displayAgentName(event.agent || "-"),
+                service: route?.service || "-",
+                consumes: route?.consumes || "-",
+                publishes: route?.publishes || "-",
+                timestamp,
+                elapsed: elapsedSeconds(ingestAt, timestamp),
+                detail: compactText(decisionText || actionText || "Workflow event recorded.", 160),
+                tables: "-",
+                query: "-",
+              };
+            });
+
+    const terminalRows = [
+      {
+        stage: "Latest Workflow Update",
+        agent: "incident-projection",
+        service: "monitoring-adapter",
+        consumes: "incident-events",
+        publishes: "incident-projections",
+        timestamp: latestFlowUpdateAt,
+        elapsed: elapsedSeconds(ingestAt, latestFlowUpdateAt),
+        detail: latestEventType || "Latest incident metadata/projection update.",
+        tables: "incident_projections",
+        query: "UPSERT incident_projections",
+      },
+      {
+        stage: "Current Incident Status",
+        agent: "workflow-state",
+        service: "ui",
+        consumes: "incident-projections",
+        publishes: "ui",
+        timestamp: latestFlowUpdateAt || incidentCreatedAt || ingestAt,
+        elapsed: elapsedSeconds(ingestAt, latestFlowUpdateAt || incidentCreatedAt || ingestAt),
+        detail: String(selectedIncidentMetadataRow?.status || selectedAlertWorkflow?.incident?.status || "unknown"),
+        tables: "incident_projections",
+        query: "SELECT incident_projections",
+      },
+    ];
+
+    const rows = [...summaryRows, ...workflowRows, ...terminalRows].filter(
+      (row, index, allRows) => {
+        const stage = String(row.stage || "").trim();
+        const agent = String(row.agent || "").trim();
+        const timestamp = String(row.timestamp || "").trim();
+        const key = `${stage}|${agent}|${timestamp}`;
+        return allRows.findIndex((candidate) => {
+          const cStage = String(candidate.stage || "").trim();
+          const cAgent = String(candidate.agent || "").trim();
+          const cTime = String(candidate.timestamp || "").trim();
+          return `${cStage}|${cAgent}|${cTime}` === key;
+        }) === index;
+      }
+    );
+
+    return rows;
+  }, [selectedAlertWorkflow, selectedAlertRow, selectedIncidentMetadataRow, selectedAlertEvents, selectedAlertEventTrace]);
 
   const hasSelectedWorkflowData = useMemo(() => {
     if (!selectedAlertWorkflow || typeof selectedAlertWorkflow !== "object") {
@@ -1222,6 +2269,13 @@ export default function App() {
     return [];
   }, [panelWorkflow]);
 
+  useEffect(() => {
+    if (activeTab !== "home" || homeDetailTab !== "api") {
+      return;
+    }
+    loadGatewayRecent();
+  }, [activeTab, homeDetailTab]);
+
   const workflowEventRows = useMemo(() => {
     const mapped = panelWorkflowEvents
       .filter((event) => event && typeof event === "object")
@@ -1231,7 +2285,7 @@ export default function App() {
         const outputValue = event.output;
         return {
           sequence: event.sequence || "-",
-          agent: event.agent || "-",
+            agent: displayAgentName(event.agent || "-"),
           action: event.action || "-",
           decision: typeof decisionValue === "object" ? JSON.stringify(decisionValue) : String(decisionValue || "-"),
           output: typeof outputValue === "object" ? JSON.stringify(outputValue) : String(outputValue || "-"),
@@ -1243,7 +2297,7 @@ export default function App() {
     }
     return gatewayRecent.rows.slice(0, 80).map((event, index) => ({
       sequence: index + 1,
-      agent: "API Gateway",
+      agent: displayAgentName("API Gateway"),
       action: event.path || "gateway.event",
       decision: event?.safety?.decision || "-",
       output: String(event.status_code || "-") + (event.trace_id ? ` | trace ${event.trace_id}` : ""),
@@ -1264,12 +2318,25 @@ export default function App() {
   const messageBusActual = useMemo(() => {
     const workflow = panelWorkflow;
     const events = Array.isArray(workflow.events) ? workflow.events : [];
+    const traceRows = Array.isArray(workflow.event_trace) ? workflow.event_trace : [];
     const observedAgents = new Set(events.map((item) => String(item?.agent || "").trim()));
+    const observedServices = new Set(traceRows.map((item) => String(item?.service || "").trim()));
     const observedProvider = String(observedRouting?.message_bus_provider || "").trim().toUpperCase() || "N/A";
     const approval = typeof workflow.approval === "object" ? workflow.approval : {};
     const remediation = typeof workflow.remediation_action === "object" ? workflow.remediation_action : {};
     const closure = typeof workflow.closure_report === "object" ? workflow.closure_report : {};
     const hasWorkflow = Boolean(workflow.alert || workflow.incident || events.length);
+    const observedChannels = new Set();
+    traceRows.forEach((row) => {
+      const source = String(row?.source_channel || "").trim();
+      const transport = String(row?.transport_channel || "").trim();
+      if (source) {
+        observedChannels.add(source);
+      }
+      if (transport) {
+        observedChannels.add(transport);
+      }
+    });
 
     const published = [];
     const consumed = [];
@@ -1278,6 +2345,8 @@ export default function App() {
       if (row.agent === "alert") {
         isObserved = hasWorkflow;
       } else if (observedAgents.has(row.agent)) {
+        isObserved = true;
+      } else if (observedServices.has(row.service)) {
         isObserved = true;
       } else if (row.agent === "Human Approval Layer" && Object.keys(approval).length) {
         isObserved = true;
@@ -1305,8 +2374,69 @@ export default function App() {
       };
     });
 
+    observedChannels.forEach((channel) => {
+      if (!published.includes(channel)) {
+        published.push(channel);
+      }
+      if (!consumed.includes(channel)) {
+        consumed.push(channel);
+      }
+    });
+
     return { published, consumed, rows };
   }, [panelWorkflow, observedRouting]);
+
+  const executiveMetrics = useMemo(() => {
+    const rows = Array.isArray(gatewayRecent.rows) ? gatewayRecent.rows : [];
+    const totalRequests = rows.length;
+    const successRequests = rows.filter((row) => {
+      const status = Number(row?.status_code || 0);
+      return status >= 200 && status < 400;
+    }).length;
+    const failedRequests = rows.filter((row) => Number(row?.status_code || 0) >= 400).length;
+    const latencyValues = rows
+      .map((row) => Number(row?.latency_ms ?? row?.gateway?.latency_ms ?? row?.latency ?? 0))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    const avgLatencyMs = latencyValues.length
+      ? latencyValues.reduce((sum, value) => sum + value, 0) / latencyValues.length
+      : 0;
+    const p95LatencyMs = percentile(latencyValues, 0.95);
+
+    const latencyTrend = rows
+      .slice(0, 12)
+      .reverse()
+      .map((row, index) => {
+        const value = Number(row?.latency_ms ?? row?.gateway?.latency_ms ?? row?.latency ?? 0);
+        const status = Number(row?.status_code || 0);
+        return {
+          label: `${index + 1}`,
+          value: Number.isFinite(value) ? value : 0,
+          displayValue: `${Number.isFinite(value) ? value.toFixed(1) : "0.0"} ms`,
+          tone: status >= 400 ? "risk" : "ops",
+        };
+      });
+
+    const finopsTotals =
+      panelWorkflow?.finops?.totals
+      || selectedAlertWorkflow?.finops?.totals
+      || latestWorkflow?.finops?.totals
+      || {};
+    const finopsCalls = toFiniteNumber(finopsTotals?.calls || panelWorkflowUsage.length);
+    const finopsTokens = toFiniteNumber(finopsTotals?.total_tokens || panelWorkflowUsage.reduce((sum, row) => sum + toFiniteNumber(row?.total_tokens || (toFiniteNumber(row?.input_tokens) + toFiniteNumber(row?.output_tokens))), 0));
+    const finopsCost = toFiniteNumber(finopsTotals?.total_cost_usd || panelWorkflowUsage.reduce((sum, row) => sum + toFiniteNumber(row?.total_cost_usd), 0));
+
+    return {
+      totalRequests,
+      successRequests,
+      failedRequests,
+      avgLatencyMs,
+      p95LatencyMs,
+      latencyTrend,
+      finopsCalls,
+      finopsTokens,
+      finopsCost,
+    };
+  }, [gatewayRecent.rows, panelWorkflow, selectedAlertWorkflow, latestWorkflow, panelWorkflowUsage]);
 
   const finopsByProvider = useMemo(() => {
     const grouped = new Map();
@@ -1359,13 +2489,19 @@ export default function App() {
   }
 
   function approvalRecommendationId(row) {
-    return String(
-      row?.recommendation_id
-      || row?.recommended_action_id
-      || row?.remediation_recommendation_id
-      || row?.recommendation?.id
-      || ""
-    ).trim();
+    const candidates = [
+      row?.recommendation_id,
+      row?.recommendation?.id,
+      row?.remediation_recommendation_id,
+      row?.recommended_action_id,
+    ];
+    for (const candidate of candidates) {
+      const token = String(candidate || "").trim();
+      if (looksLikeUuid(token)) {
+        return token;
+      }
+    }
+    return "";
   }
 
   function approvalFlowId(row) {
@@ -1381,13 +2517,19 @@ export default function App() {
     const recommendation = normalized.recommendation && typeof normalized.recommendation === "object"
       ? normalized.recommendation
       : {};
-    return String(
-      normalized.recommendation_id
-      || recommendation.id
-      || normalized.remediation_recommendation_id
-      || normalized.recommended_action_id
-      || ""
-    ).trim();
+    const candidates = [
+      normalized.recommendation_id,
+      recommendation.id,
+      normalized.remediation_recommendation_id,
+      normalized.recommended_action_id,
+    ];
+    for (const candidate of candidates) {
+      const token = String(candidate || "").trim();
+      if (looksLikeUuid(token)) {
+        return token;
+      }
+    }
+    return "";
   }
 
   function approvalFlowFromPayload(payload) {
@@ -1488,6 +2630,24 @@ export default function App() {
   }, [selectedApprovalRow, approvalIncidentContext, selectedApprovalIncidentId]);
 
   useEffect(() => {
+    if (!selectedApprovalIncidentId) {
+      return;
+    }
+    setApprovalForm((current) => {
+      const nextIncidentId = String(selectedApprovalIncidentId || "").trim() || current.incident_id;
+      const nextRecommendationId = String(selectedApprovalRecommendationId || "").trim() || current.recommendation_id;
+      if (nextIncidentId === current.incident_id && nextRecommendationId === current.recommendation_id) {
+        return current;
+      }
+      return {
+        ...current,
+        incident_id: nextIncidentId,
+        recommendation_id: nextRecommendationId,
+      };
+    });
+  }, [selectedApprovalIncidentId, selectedApprovalRecommendationId]);
+
+  useEffect(() => {
     if (!filteredPendingApprovals.length) {
       if (selectedApprovalIncidentId) {
         setSelectedApprovalIncidentId("");
@@ -1539,9 +2699,20 @@ export default function App() {
     event.preventDefault();
     setApprovalState({ loading: true, result: null, error: "" });
     try {
+      const incidentId = String(approvalForm.incident_id || selectedApprovalIncidentId || "").trim();
+      const recommendationIdCandidate = String(
+        approvalForm.recommendation_id
+        || selectedApprovalRecommendationId
+        || approvalRecommendationFromPayload(approvalIncidentContext.payload)
+        || ""
+      ).trim();
+      if (!looksLikeUuid(incidentId) || !looksLikeUuid(recommendationIdCandidate)) {
+        throw new Error("Approval requires valid UUID incident_id and recommendation_id. Select a pending row and sync context first.");
+      }
+
       const payload = {
-        incident_id: String(approvalForm.incident_id || "").trim(),
-        recommendation_id: String(approvalForm.recommendation_id || "").trim(),
+        incident_id: incidentId,
+        recommendation_id: recommendationIdCandidate,
         approver: String(approvalForm.approver || "").trim(),
         channel: String(approvalForm.channel || "web").trim(),
         comment: String(approvalForm.comment || "").trim() || null,
@@ -1556,7 +2727,11 @@ export default function App() {
       setApprovalState({ loading: false, result: response, error: "" });
       await Promise.all([loadIncidentMetadata(), loadGatewayRecent(), loadGatewaySummary()]);
     } catch (error) {
-      setApprovalState({ loading: false, result: null, error: error.message });
+      const raw = String(error?.message || "");
+      const concise = raw.includes("HTTP 422")
+        ? "Approval payload was rejected (422). Confirm incident_id and recommendation_id are valid UUIDs from the selected pending incident."
+        : raw;
+      setApprovalState({ loading: false, result: null, error: concise });
     }
   }
 
@@ -1603,10 +2778,6 @@ export default function App() {
     }
     setActiveTab(allowedTabs[0] || "approval");
   }, [isAuthenticated, allowedTabs, activeTab]);
-
-  function toggleSidebarGroup(group) {
-    setCollapsedGroups((current) => ({ ...current, [group]: !current[group] }));
-  }
 
   function openSection(tabId) {
     if (!allowedTabs.includes(tabId)) {
@@ -1820,6 +2991,7 @@ export default function App() {
 
     const monitorAlertsRows = monitorScopedAlerts.slice(0, 200).map((row, index) => [
       row.alert_id || row.id || row.incident_id || index,
+      formatUtcTimestamp(row.created_at || row.starts_at),
       row.name || row.alert_name || "-",
       row.application || row.project_name || row.project || row.service || "-",
       row.service || "-",
@@ -1932,7 +3104,7 @@ export default function App() {
     const sections = [
       `<section><h2>Report Context</h2>${renderHtmlTable(["Field", "Value"], [["Generated At", generatedAt], ["Application Scope", applicationToMonitor], ["Active Tab", activeTab], ["Health", health.message]])}</section>`,
       `<section><h2>Dashboard Metrics</h2>${renderHtmlTable(["Metric", "Value"], homeMetrics)}</section>`,
-      `<section><h2>Alert Stream</h2>${renderHtmlTable(["Alert ID", "Name", "Application", "Service", "Severity", "Status"], monitorAlertsRows)}</section>`,
+      `<section><h2>Alert Stream</h2>${renderHtmlTable(["Alert ID", "Time (UTC)", "Name", "Application", "Service", "Severity", "Status"], monitorAlertsRows)}</section>`,
       `<section><h2>Alert Details Workspace</h2>${renderHtmlTable(["Field", "Value"], selectedSummaryRows)}${renderHtmlTable(["Step", "Agent", "Action", "Decision", "Output", "Communicates To"], selectedEventsRows)}${renderHtmlTable(["Task", "Provider", "Model", "Input", "Output", "Cost USD"], selectedUsageRows)}${renderHtmlTable(["Field", "Value"], selectedRoutingRows)}<h3>Raw Payload</h3><pre>${htmlEscape(JSON.stringify(selectedAlertData.payload || {}, null, 2))}</pre></section>`,
       `<section><h2>Executive Dashboard</h2>${renderHtmlTable(["Metric", "Value"], executiveMetrics)}${renderHtmlTable(["Incident", "Service", "Risk", "Execution Mode", "Provider", "Status"], metadataRows)}</section>`,
       `<section><h2>Incident Metadata Explorer</h2>${renderHtmlTable(["Incident", "Service", "Risk", "Execution Mode", "Provider", "Status"], metadataRows)}</section>`,
@@ -2015,113 +3187,91 @@ export default function App() {
         <aside className="sidebar panel sidebar-panel">
           <div className="sidebar-head">
             <h2>Control Panel</h2>
-            <p className="subtitle">Operator controls and navigation.</p>
+            <p className="subtitle">Essential navigation.</p>
           </div>
 
           <div className="sidebar-group">
-            <div className="sidebar-group-head">
-              <h3>Monitor</h3>
-              <button type="button" className="sidebar-toggle" onClick={() => toggleSidebarGroup("monitor")}>
-                {collapsedGroups.monitor ? "Show" : "Hide"}
-              </button>
-            </div>
-            {!collapsedGroups.monitor ? (
-              <>
-                <label>
-                  Application
-                  <select value={applicationToMonitor} onChange={(e) => setApplicationToMonitor(e.target.value)}>
-                    {monitorApplications.map((app) => (
-                      <option key={app} value={app}>{app}</option>
-                    ))}
-                  </select>
-                </label>
-                <HealthBadge ok={health.ok} label={health.message} />
-              </>
-            ) : null}
-          </div>
-
-          <div className="sidebar-group actions-group">
-            <h3>Quick Actions</h3>
-            <div className="sidebar-actions">
-              <button className="button-secondary" onClick={refreshAll}>Refresh</button>
-              <button className="button-primary" onClick={checkHealth} disabled={health.loading}>
-                {health.loading ? "Checking..." : "Health"}
-              </button>
-              <button className="button-secondary sidebar-action-wide" onClick={() => runWorkflow(selectedFlow)} disabled={workflowState.loading}>
-                {workflowState.loading ? "Running Flow..." : "Run Selected Flow"}
-              </button>
-            </div>
-            <p className="keyboard-hint">Shortcuts: Alt+1 Dashboard, Alt+2 Human Approval ... Alt+0 Metadata</p>
+            <h3>Monitor</h3>
+            <label>
+              Application
+              <select value={applicationToMonitor} onChange={(e) => setApplicationToMonitor(e.target.value)}>
+                {monitorApplications.map((app) => (
+                  <option key={app} value={app}>{app}</option>
+                ))}
+              </select>
+            </label>
+            <HealthBadge ok={health.ok} label={health.message} />
           </div>
 
           <div className="sidebar-group">
-            <div className="sidebar-group-head">
-              <h3>View</h3>
-              <button type="button" className="sidebar-toggle" onClick={() => toggleSidebarGroup("view")}>
-                {collapsedGroups.view ? "Show" : "Hide"}
+            <h3>View Density</h3>
+            <div className="density-switch" role="group" aria-label="Density options">
+              <button
+                type="button"
+                className={`density-option ${uiDensity === "comfortable" ? "active" : ""}`}
+                onClick={() => setUiDensity("comfortable")}
+              >
+                Comfortable
+              </button>
+              <button
+                type="button"
+                className={`density-option ${uiDensity === "compact" ? "active" : ""}`}
+                onClick={() => setUiDensity("compact")}
+              >
+                Compact
               </button>
             </div>
-            {!collapsedGroups.view ? (
-              <div className="density-switch" role="group" aria-label="Density options">
-                <button
-                  type="button"
-                  className={`density-option ${uiDensity === "comfortable" ? "active" : ""}`}
-                  onClick={() => setUiDensity("comfortable")}
-                >
-                  Comfortable
-                </button>
-                <button
-                  type="button"
-                  className={`density-option ${uiDensity === "compact" ? "active" : ""}`}
-                  onClick={() => setUiDensity("compact")}
-                >
-                  Compact
-                </button>
+            <h3 style={{ marginTop: 10 }}>Theme</h3>
+            <div className="theme-switch" role="group" aria-label="Theme options">
+              <button
+                type="button"
+                className={`density-option ${uiTheme === "auto" ? "active" : ""}`}
+                onClick={() => setUiTheme("auto")}
+              >
+                Auto
+              </button>
+              <button
+                type="button"
+                className={`density-option ${uiTheme === "light" ? "active" : ""}`}
+                onClick={() => setUiTheme("light")}
+              >
+                Light
+              </button>
+              <button
+                type="button"
+                className={`density-option ${uiTheme === "dark" ? "active" : ""}`}
+                onClick={() => setUiTheme("dark")}
+              >
+                Dark
+              </button>
+            </div>
+          </div>
+
+          <div className="sidebar-group">
+            <h3>Sections</h3>
+            <div className="sidebar-sections-wrap">
+              <div className="sidebar-sections">
+                {visibleSidebarSections.map((tab) => (
+                  <button
+                    key={`sidebar-${tab.id}`}
+                    type="button"
+                    className={`sidebar-section ${activeTab === tab.id ? "active" : ""}`}
+                    onClick={() => openSection(tab.id)}
+                    title={tab.label}
+                  >
+                    <span className={`sidebar-icon sidebar-icon-${tab.tone || "ops"}`} aria-hidden="true">{tab.icon}</span>
+                    <span>{tab.shortLabel}</span>
+                  </button>
+                ))}
               </div>
-            ) : null}
+            </div>
           </div>
 
-          <div className="sidebar-group">
-            <div className="sidebar-group-head">
-              <h3>Current Context</h3>
-              <button type="button" className="sidebar-toggle" onClick={() => toggleSidebarGroup("context")}>
-                {collapsedGroups.context ? "Show" : "Hide"}
-              </button>
-            </div>
-            {!collapsedGroups.context ? (
-              <div className="context-list">
-                <div className="context-row"><span>Selected Flow</span><strong>{selectedFlow || "-"}</strong></div>
-                <div className="context-row"><span>Incident ID</span><strong>{latestIncidentId || "-"}</strong></div>
-                <div className="context-row"><span>Recommendation ID</span><strong>{latestRecommendationId || "-"}</strong></div>
-              </div>
-            ) : null}
-          </div>
-
-          <div className="sidebar-group">
-            <div className="sidebar-group-head">
-              <h3>Sections</h3>
-              <button type="button" className="sidebar-toggle" onClick={() => toggleSidebarGroup("sections")}>
-                {collapsedGroups.sections ? "Show" : "Hide"}
-              </button>
-            </div>
-            {!collapsedGroups.sections ? (
-              <div className="sidebar-sections-wrap">
-                <div className="sidebar-sections">
-                  {visibleSidebarSections.map((tab) => (
-                    <button
-                      key={`sidebar-${tab.id}`}
-                      type="button"
-                      className={`sidebar-section ${activeTab === tab.id ? "active" : ""}`}
-                      onClick={() => openSection(tab.id)}
-                      title={tab.label}
-                    >
-                      <span className={`sidebar-icon sidebar-icon-${tab.tone || "ops"}`} aria-hidden="true">{tab.icon}</span>
-                      <span>{tab.shortLabel}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ) : null}
+          <div className="sidebar-group compact-tools">
+            <button className="button-secondary" onClick={refreshAll}>Refresh</button>
+            <button className="button-secondary" onClick={checkHealth} disabled={health.loading}>
+              {health.loading ? "Checking..." : "Health"}
+            </button>
           </div>
         </aside>
 
@@ -2181,11 +3331,13 @@ export default function App() {
                     <thead>
                       <tr>
                         <th>Alert ID</th>
+                        <th>Time (UTC)</th>
                         <th>Name</th>
                         <th>Application</th>
                         <th>Service</th>
                         <th>Severity</th>
                         <th>Status</th>
+                        <th>Action</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -2212,17 +3364,30 @@ export default function App() {
                             aria-label={`Open alert ${rowId}`}
                           >
                             <td title={fullAlertId}>{compactAlertId}</td>
+                            <td>{formatUtcTimestamp(row.created_at || row.starts_at)}</td>
                             <td>{row.name || row.alert_name || "-"}</td>
                             <td>{application}</td>
                             <td>{row.service || "-"}</td>
                             <td><span className={`pill severity-${severity.toLowerCase()}`}>{severity}</span></td>
                             <td><span className={`pill status-${status.toLowerCase()}`}>{status}</span></td>
+                            <td>
+                              <button
+                                type="button"
+                                className="button-secondary"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  openAlertDetails(row);
+                                }}
+                              >
+                                Open
+                              </button>
+                            </td>
                           </tr>
                         );
                       })}
                       {!visibleAlerts.length && !alerts.loading ? (
                         <tr>
-                          <td colSpan={6}>No alerts available for {applicationToMonitor}.</td>
+                          <td colSpan={8}>No alerts available for {applicationToMonitor}.</td>
                         </tr>
                       ) : null}
                     </tbody>
@@ -2231,7 +3396,7 @@ export default function App() {
               </article>
 
               {selectedAlertRow ? (
-                <article className="panel">
+                <article className="panel" ref={alertDetailsRef}>
                   <div className="panel-head">
                     <h2>Alert Details Workspace</h2>
                   </div>
@@ -2242,14 +3407,14 @@ export default function App() {
                   </div>
 
                   <div className="detail-tabs">
-                    {["summary", "events", "finops", "api", "topics", "execution", "raw"].map((tab) => (
+                    {["summary", "timeline", "events", "finops", "api", "topics", "execution", "raw"].map((tab) => (
                       <button
                         key={`detail-${tab}`}
                         type="button"
                         className={`detail-tab ${homeDetailTab === tab ? "active" : ""}`}
                         onClick={() => setHomeDetailTab(tab)}
                       >
-                        {tab === "summary" ? "Summary" : tab === "events" ? "Agent Events" : tab === "finops" ? "FinOps" : tab === "api" ? "API Gateway" : tab === "topics" ? "Message Bus Topics" : tab === "execution" ? "Execution Plan" : "Raw Payload"}
+                        {tab === "summary" ? "Summary" : tab === "timeline" ? "Flow Timeline" : tab === "events" ? "Agent Events" : tab === "finops" ? "FinOps" : tab === "api" ? "API Gateway" : tab === "topics" ? "Message Bus Topics" : tab === "execution" ? "Execution Plan" : "Raw Payload"}
                       </button>
                     ))}
                   </div>
@@ -2258,52 +3423,64 @@ export default function App() {
                   {selectedAlertData.error ? <p className="error">{selectedAlertData.error}</p> : null}
 
                   {homeDetailTab === "summary" ? (
-                    <div className="table-wrap">
-                      <table>
-                        <tbody>
-                          <tr><th>Alert</th><td>{selectedAlertRow?.name || selectedAlertWorkflow?.alert?.name || "-"}</td></tr>
-                          <tr><th>Incident</th><td>{selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "-"}</td></tr>
-                          <tr><th>Service</th><td>{selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "-"}</td></tr>
-                          <tr><th>Root Cause</th><td>{selectedAlertWorkflow?.recommendation?.root_cause || "-"}</td></tr>
-                          <tr><th>Recommended Action</th><td>{selectedAlertWorkflow?.recommendation?.recommended_action || "-"}</td></tr>
-                          <tr><th>Impact</th><td>{selectedAlertWorkflow?.recommendation?.impact || "-"}</td></tr>
-                        </tbody>
-                      </table>
-                    </div>
+                    <>
+                      <div className="table-wrap">
+                        <table>
+                          <tbody>
+                            <tr><th>Alert</th><td>{selectedAlertRow?.name || selectedAlertWorkflow?.alert?.name || "-"}</td></tr>
+                            <tr><th>Incident</th><td>{selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "-"}</td></tr>
+                            <tr><th>Service</th><td>{selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "-"}</td></tr>
+                            <tr><th>Root Cause</th><td>{selectedAlertWorkflow?.recommendation?.root_cause || "-"}</td></tr>
+                            <tr><th>Recommended Action</th><td>{selectedAlertWorkflow?.recommendation?.recommended_action || "-"}</td></tr>
+                            <tr><th>Impact</th><td>{selectedAlertWorkflow?.recommendation?.impact || "-"}</td></tr>
+                          </tbody>
+                        </table>
+                      </div>
+
+                      <h3>Persisted Stage Completeness</h3>
+                      {selectedStageCompleteness.loading ? <p className="subtitle">Loading stage completeness...</p> : null}
+                      {selectedStageCompleteness.error ? <p className="error">{selectedStageCompleteness.error}</p> : null}
+                      {selectedStageCompleteness.data ? (
+                        <div className="table-wrap">
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>Stage</th>
+                                <th>Persisted</th>
+                                <th>Matched Event Types</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {(selectedStageCompleteness.data?.stages || []).map((row, index) => (
+                                <tr key={`stage-${row.stage || index}`}>
+                                  <td>{row.label || row.stage || "-"}</td>
+                                  <td>{row.persisted ? "yes" : "no"}</td>
+                                  <td>{Array.isArray(row.matched_event_types) && row.matched_event_types.length ? row.matched_event_types.join(" | ") : "-"}</td>
+                                </tr>
+                              ))}
+                              {!Array.isArray(selectedStageCompleteness.data?.stages) || !selectedStageCompleteness.data.stages.length ? (
+                                <tr><td colSpan={3}>No persisted stage rows found for incident.</td></tr>
+                              ) : null}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : null}
+
+                      {selectedStageCompleteness.data ? (
+                        <p className="subtitle">
+                          Completion: {selectedStageCompleteness.data?.stage_completion?.completed ?? 0}/{selectedStageCompleteness.data?.stage_completion?.total ?? 0}
+                          {" "}({selectedStageCompleteness.data?.stage_completion?.percentage ?? 0}%)
+                        </p>
+                      ) : null}
+                    </>
+                  ) : null}
+
+                  {homeDetailTab === "timeline" ? (
+                    <FlowTimelineGraph rows={selectedAlertTimelineRows} />
                   ) : null}
 
                   {homeDetailTab === "events" ? (
-                    <div className="table-wrap">
-                      <table>
-                        <thead>
-                          <tr>
-                            <th>Step</th>
-                            <th>Agent</th>
-                            <th>Action</th>
-                            <th>Decision</th>
-                            <th>Output</th>
-                            <th>Communicates To</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {selectedAlertEvents.map((event, index) => (
-                            <tr key={`evt-${index}`}>
-                              <td>{event.sequence || "-"}</td>
-                              <td>{event.agent || "-"}</td>
-                              <td>{event.action || "-"}</td>
-                              <td>{typeof event.decision === "object" ? JSON.stringify(event.decision) : String(event.decision || "-")}</td>
-                              <td>{typeof event.output === "object" ? JSON.stringify(event.output) : String(event.output || "-")}</td>
-                              <td>{event.communicates_to || "-"}</td>
-                            </tr>
-                          ))}
-                          {!selectedAlertEvents.length ? (
-                            <tr>
-                              <td colSpan={6}>No events found for selected alert.</td>
-                            </tr>
-                          ) : null}
-                        </tbody>
-                      </table>
-                    </div>
+                    <AgentEventsGraph rows={selectedAlertEventsDisplay} />
                   ) : null}
 
                   {homeDetailTab === "finops" ? (
@@ -2362,36 +3539,22 @@ export default function App() {
                               <td>{row.trace_id || "-"}</td>
                             </tr>
                           ))}
+                          {!gatewayRecent.rows.length ? (
+                            <tr>
+                              <td colSpan={5}>No API gateway events found. Refresh or invoke a gateway endpoint.</td>
+                            </tr>
+                          ) : null}
                         </tbody>
                       </table>
                     </div>
                   ) : null}
 
                   {homeDetailTab === "topics" ? (
-                    <div className="table-wrap">
-                      <table>
-                        <tbody>
-                          <tr><th>Observed Provider</th><td>{selectedAlertRouting?.message_bus_provider || "-"}</td></tr>
-                          <tr><th>Workflow</th><td>{selectedAlertRouting?.workflow || "-"}</td></tr>
-                          <tr><th>Next Action</th><td>{selectedAlertRouting?.next_action || "-"}</td></tr>
-                          <tr><th>Execution Mode</th><td>{selectedAlertRouting?.execution_mode || "-"}</td></tr>
-                          <tr><th>Risk Tier</th><td>{selectedAlertRouting?.risk_tier || "-"}</td></tr>
-                        </tbody>
-                      </table>
-                    </div>
+                    <TopicFlowGraph routing={selectedAlertRouting} timelineRows={selectedAlertTimelineRows} />
                   ) : null}
 
                   {homeDetailTab === "execution" ? (
-                    <div className="table-wrap">
-                      <table>
-                        <tbody>
-                          <tr><th>Action</th><td>{selectedAlertWorkflow?.recommendation?.recommended_action || "-"}</td></tr>
-                          <tr><th>Rationale</th><td>{selectedAlertWorkflow?.recommendation?.rationale || "-"}</td></tr>
-                          <tr><th>Requires Approval</th><td>{String(selectedAlertRouting?.requires_approval ?? "-")}</td></tr>
-                          <tr><th>Commands</th><td>{Array.isArray(selectedAlertWorkflow?.recommendation?.commands) ? selectedAlertWorkflow.recommendation.commands.join(" | ") : "-"}</td></tr>
-                        </tbody>
-                      </table>
-                    </div>
+                    <ExecutionPlanGraph plan={selectedExecutionPlan} />
                   ) : null}
 
                   {homeDetailTab === "raw" ? (
@@ -2476,10 +3639,46 @@ export default function App() {
                 </div>
                 <div className="stat-grid">
                   <div className="stat-card"><strong>Open Alerts</strong><span>{monitorScopedAlerts.length}</span></div>
-                  <div className="stat-card"><strong>Critical</strong><span>{monitorScopedAlerts.filter((row) => String(row?.severity || "").toLowerCase() === "critical").length}</span></div>
-                  <div className="stat-card"><strong>High</strong><span>{monitorScopedAlerts.filter((row) => String(row?.severity || "").toLowerCase() === "high").length}</span></div>
-                  <div className="stat-card"><strong>Closed Incidents</strong><span>{closedIncidents.rows.length}</span></div>
+                  <div className="stat-card"><strong>Total Requests</strong><span>{executiveMetrics.totalRequests}</span></div>
+                  <div className="stat-card"><strong>Failures</strong><span>{executiveMetrics.failedRequests}</span></div>
+                  <div className="stat-card"><strong>P95 Latency</strong><span>{executiveMetrics.p95LatencyMs.toFixed(1)} ms</span></div>
                 </div>
+
+                <div className="executive-chart-grid">
+                  <HorizontalBarChart
+                    title="Request Volume"
+                    subtitle="Observed API gateway events in current window"
+                    items={[
+                      { label: "Total", value: executiveMetrics.totalRequests, tone: "meta" },
+                      { label: "Success", value: executiveMetrics.successRequests, tone: "ops" },
+                      { label: "Failure", value: executiveMetrics.failedRequests, tone: "risk" },
+                    ]}
+                  />
+                  <SuccessFailureDonut
+                    success={executiveMetrics.successRequests}
+                    failure={executiveMetrics.failedRequests}
+                  />
+                  <HorizontalBarChart
+                    title="Latency Trend"
+                    subtitle={`Avg ${executiveMetrics.avgLatencyMs.toFixed(1)} ms | P95 ${executiveMetrics.p95LatencyMs.toFixed(1)} ms`}
+                    items={executiveMetrics.latencyTrend}
+                  />
+                  <HorizontalBarChart
+                    title="FinOps Overview"
+                    subtitle="Current workflow-level LLM cost and token usage"
+                    items={[
+                      { label: "Model Calls", value: executiveMetrics.finopsCalls, tone: "meta" },
+                      { label: "Tokens", value: executiveMetrics.finopsTokens, tone: "cost" },
+                      {
+                        label: "Cost USD",
+                        value: executiveMetrics.finopsCost,
+                        displayValue: `$${executiveMetrics.finopsCost.toFixed(6)}`,
+                        tone: "bus",
+                      },
+                    ]}
+                  />
+                </div>
+
                 <div className="table-wrap">
                   <table>
                     <thead>
@@ -2489,6 +3688,7 @@ export default function App() {
                         <th>Risk</th>
                         <th>Status</th>
                         <th>Execution Mode</th>
+                        <th>Action</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -2499,11 +3699,16 @@ export default function App() {
                           <td>{row.risk_tier || "-"}</td>
                           <td>{row.status || "-"}</td>
                           <td>{row.execution_mode || "-"}</td>
+                          <td>
+                            <button type="button" className="button-secondary" onClick={() => openAlertDetailsFromIncident(row)}>
+                              Open
+                            </button>
+                          </td>
                         </tr>
                       ))}
                       {!monitorScopedIncidentMetadata.length ? (
                         <tr>
-                          <td colSpan={5}>No executive rows available for {applicationToMonitor}.</td>
+                          <td colSpan={6}>No executive rows available for {applicationToMonitor}.</td>
                         </tr>
                       ) : null}
                     </tbody>
@@ -2701,6 +3906,209 @@ export default function App() {
                         </table>
                       </div>
                     </article>
+
+                    <article className="panel">
+                      <div className="panel-head">
+                        <h3>Rule Onboarding Wizard</h3>
+                        <button type="button" className="button-secondary" onClick={loadOnboardingRuleCapabilities}>
+                          Refresh Capabilities
+                        </button>
+                      </div>
+                      <p className="subtitle">Two pipelines: existing monitoring rule sync (pull/push) and new AI-driven rule onboarding.</p>
+
+                      <div className="detail-tabs sticky-controls">
+                        <button
+                          type="button"
+                          className={`detail-tab ${onboardingRuleWizardStep === 1 ? "active" : ""}`}
+                          onClick={() => setOnboardingRuleWizardStep(1)}
+                        >
+                          Step 1: Select Pipeline
+                        </button>
+                        <button
+                          type="button"
+                          className={`detail-tab ${onboardingRuleWizardStep === 2 ? "active" : ""}`}
+                          onClick={() => setOnboardingRuleWizardStep(2)}
+                        >
+                          Step 2: Configure
+                        </button>
+                        <button
+                          type="button"
+                          className={`detail-tab ${onboardingRuleWizardStep === 3 ? "active" : ""}`}
+                          onClick={() => setOnboardingRuleWizardStep(3)}
+                        >
+                          Step 3: Run & Review
+                        </button>
+                      </div>
+
+                      {onboardingRuleWizardStep === 1 ? (
+                        <div className="filter-grid">
+                          <label>
+                            Pipeline
+                            <select
+                              value={onboardingRuleWizardMode}
+                              onChange={(e) => setOnboardingRuleWizardMode(e.target.value)}
+                            >
+                              <option value="existing">Existing Rule Sync (Pull/Push)</option>
+                              <option value="new">New Rule Onboarding</option>
+                            </select>
+                          </label>
+                          <label>
+                            Project Name
+                            <input value={onboardingForm.name} readOnly />
+                          </label>
+                          <label>
+                            Environment
+                            <input value={onboardingForm.environment} readOnly />
+                          </label>
+                          <label>
+                            Region
+                            <input value={onboardingForm.region} readOnly />
+                          </label>
+                        </div>
+                      ) : null}
+
+                      {onboardingRuleWizardStep === 2 && onboardingRuleWizardMode === "existing" ? (
+                        <form className="form" onSubmit={runExistingRulePipeline}>
+                          <div className="filter-grid">
+                            <label>
+                              Platform
+                              <select
+                                value={existingRulePipelineForm.platform}
+                                onChange={(e) => setExistingRulePipelineForm((curr) => ({ ...curr, platform: e.target.value }))}
+                              >
+                                {(onboardingRuleCapabilities.rows.length
+                                  ? onboardingRuleCapabilities.rows.map((row) => row.platform)
+                                  : ["prometheus", "datadog", "new_relic"]
+                                ).map((platform) => (
+                                  <option key={`existing-platform-${platform}`} value={platform}>{platform}</option>
+                                ))}
+                              </select>
+                            </label>
+                            <label>
+                              Mode
+                              <select
+                                value={existingRulePipelineForm.mode}
+                                onChange={(e) => setExistingRulePipelineForm((curr) => ({ ...curr, mode: e.target.value }))}
+                              >
+                                <option value="pull">pull</option>
+                                <option value="push">push</option>
+                                <option value="bidirectional">bidirectional</option>
+                              </select>
+                            </label>
+                            <label>
+                              Connection URL (optional)
+                              <input
+                                value={existingRulePipelineForm.connection_url}
+                                placeholder="http://prometheus:9090"
+                                onChange={(e) => setExistingRulePipelineForm((curr) => ({ ...curr, connection_url: e.target.value }))}
+                              />
+                            </label>
+                          </div>
+                          <label>
+                            Rules To Push (JSON Array)
+                            <textarea
+                              rows={10}
+                              value={existingRulePipelineForm.rules_json}
+                              onChange={(e) => setExistingRulePipelineForm((curr) => ({ ...curr, rules_json: e.target.value }))}
+                            />
+                          </label>
+                          <button className="button-primary" type="submit" disabled={onboardingRuleRunState.loading}>
+                            {onboardingRuleRunState.loading ? "Running..." : "Run Existing Rule Pipeline"}
+                          </button>
+                        </form>
+                      ) : null}
+
+                      {onboardingRuleWizardStep === 2 && onboardingRuleWizardMode === "new" ? (
+                        <form className="form" onSubmit={runNewRulePipeline}>
+                          <label>
+                            Monitoring Requirements (one per line)
+                            <textarea
+                              rows={6}
+                              value={newRulePipelineForm.requirements_text}
+                              onChange={(e) => setNewRulePipelineForm((curr) => ({ ...curr, requirements_text: e.target.value }))}
+                            />
+                          </label>
+                          <div className="filter-grid">
+                            <label>
+                              Target Platforms (comma separated)
+                              <input
+                                value={newRulePipelineForm.target_platforms_csv}
+                                onChange={(e) => setNewRulePipelineForm((curr) => ({ ...curr, target_platforms_csv: e.target.value }))}
+                              />
+                            </label>
+                          </div>
+                          <label>
+                            Discovery Inputs (JSON object)
+                            <textarea
+                              rows={8}
+                              value={newRulePipelineForm.discovery_json}
+                              onChange={(e) => setNewRulePipelineForm((curr) => ({ ...curr, discovery_json: e.target.value }))}
+                            />
+                          </label>
+                          <button className="button-primary" type="submit" disabled={onboardingRuleRunState.loading}>
+                            {onboardingRuleRunState.loading ? "Running..." : "Run New Rule Onboarding Pipeline"}
+                          </button>
+                        </form>
+                      ) : null}
+
+                      {onboardingRuleWizardStep === 3 ? (
+                        <div className="grid single-col">
+                          <form className="form" onSubmit={lookupOnboardingRuleWorkflow}>
+                            <div className="filter-grid">
+                              <label>
+                                Workflow ID
+                                <input
+                                  value={onboardingRuleLookup.workflow_id}
+                                  placeholder="Paste workflow id"
+                                  onChange={(e) => setOnboardingRuleLookup((curr) => ({ ...curr, workflow_id: e.target.value }))}
+                                />
+                              </label>
+                            </div>
+                            <button className="button-secondary" type="submit" disabled={onboardingRuleLookup.loading}>
+                              {onboardingRuleLookup.loading ? "Fetching..." : "Lookup Workflow"}
+                            </button>
+                          </form>
+                          {onboardingRuleLookup.error ? <p className="error">{onboardingRuleLookup.error}</p> : null}
+                          {onboardingRuleLookup.result ? <pre className="result">{JSON.stringify(onboardingRuleLookup.result, null, 2)}</pre> : null}
+                          {onboardingRuleRunState.error ? <p className="error">{onboardingRuleRunState.error}</p> : null}
+                          {onboardingRuleRunState.result ? <pre className="result">{JSON.stringify(onboardingRuleRunState.result, null, 2)}</pre> : null}
+                        </div>
+                      ) : null}
+                    </article>
+
+                    <article className="panel">
+                      <h3>Monitoring Platform Capabilities</h3>
+                      {onboardingRuleCapabilities.error ? <p className="error">{onboardingRuleCapabilities.error}</p> : null}
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>Platform</th>
+                              <th>Pull Rules</th>
+                              <th>Push Rules</th>
+                              <th>Simulation</th>
+                              <th>Dashboards</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {onboardingRuleCapabilities.rows.map((row, index) => (
+                              <tr key={`capability-${row.platform || index}`}>
+                                <td>{row.platform || "-"}</td>
+                                <td>{String(Boolean(row.can_pull_rules))}</td>
+                                <td>{String(Boolean(row.can_push_rules))}</td>
+                                <td>{String(Boolean(row.supports_simulation))}</td>
+                                <td>{String(Boolean(row.supports_dashboard_refs))}</td>
+                              </tr>
+                            ))}
+                            {!onboardingRuleCapabilities.rows.length && !onboardingRuleCapabilities.loading ? (
+                              <tr>
+                                <td colSpan={5}>No capabilities loaded yet.</td>
+                              </tr>
+                            ) : null}
+                          </tbody>
+                        </table>
+                      </div>
+                    </article>
                   </div>
 
                 ) : null}
@@ -2881,6 +4289,7 @@ export default function App() {
                         <th>Execution Mode</th>
                         <th>Provider</th>
                         <th>Status</th>
+                        <th>Action</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -2892,11 +4301,16 @@ export default function App() {
                           <td>{row.execution_mode || "-"}</td>
                           <td>{row.transport_provider || "-"}</td>
                           <td>{row.status || "-"}</td>
+                          <td>
+                            <button type="button" className="button-secondary" onClick={() => openAlertDetailsFromIncident(row)}>
+                              Open
+                            </button>
+                          </td>
                         </tr>
                       ))}
                       {!monitorScopedIncidentMetadata.length && !incidentMetadata.loading ? (
                         <tr>
-                          <td colSpan={6}>No incidents available for {applicationToMonitor}. Run one sample flow from Home.</td>
+                          <td colSpan={7}>No incidents available for {applicationToMonitor}. Run one sample flow from Home.</td>
                         </tr>
                       ) : null}
                     </tbody>
@@ -2923,6 +4337,7 @@ export default function App() {
                         <th>Service</th>
                         <th>Severity</th>
                         <th>Status</th>
+                        <th>Action</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -2934,11 +4349,16 @@ export default function App() {
                           <td>{row.service || "-"}</td>
                           <td>{String(row.severity || "").toUpperCase() || "-"}</td>
                           <td>{row.status || row.state || "open"}</td>
+                          <td>
+                            <button type="button" className="button-secondary" onClick={() => openAlertDetails(row)}>
+                              Open
+                            </button>
+                          </td>
                         </tr>
                       ))}
                       {!monitorScopedAlerts.length ? (
                         <tr>
-                          <td colSpan={6}>No recent alerts available for {applicationToMonitor}. Run a sample flow from Incident Summary.</td>
+                          <td colSpan={7}>No recent alerts available for {applicationToMonitor}. Run a sample flow from Incident Summary.</td>
                         </tr>
                       ) : null}
                     </tbody>
@@ -3049,6 +4469,7 @@ export default function App() {
                         <th>Severity</th>
                         <th>Execution Mode</th>
                         <th>Status</th>
+                        <th>Action</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -3069,11 +4490,16 @@ export default function App() {
                           <td>{row.severity || row.risk_tier || "-"}</td>
                           <td>{row.execution_mode || "-"}</td>
                           <td>{row.status || "pending"}</td>
+                          <td>
+                            <button className="button-secondary" type="button" onClick={() => openAlertDetailsFromIncident(row)}>
+                              Open
+                            </button>
+                          </td>
                         </tr>
                       )})}
                       {!filteredPendingApprovals.length ? (
                         <tr>
-                          <td colSpan={7}>No pending approvals for this filter and monitor scope.</td>
+                          <td colSpan={8}>No pending approvals for this filter and monitor scope.</td>
                         </tr>
                       ) : null}
                     </tbody>
@@ -3366,7 +4792,7 @@ export default function App() {
                 <div className="panel-head">
                   <h2>Gateway Safety</h2>
                   <p>Review gateway decision, policy reasons, and safety metrics before closure.</p>
-                  <button className="button-secondary" onClick={() => { loadGatewaySummary(); loadGatewayRecent(); }}>
+                  <button className="button-secondary" onClick={() => { loadGatewaySummary(); loadGatewayRecent(); loadLandingPadRecent(); }}>
                     Refresh
                   </button>
                 </div>
@@ -3405,6 +4831,40 @@ export default function App() {
                       {!gatewayRecent.rows.length ? (
                         <tr>
                           <td colSpan={6}>No gateway events yet.</td>
+                        </tr>
+                      ) : null}
+                    </tbody>
+                  </table>
+                </div>
+
+                <h3>Landing Pad Realtime Ingestion</h3>
+                {landingPadRecent.error ? <p className="error">{landingPadRecent.error}</p> : null}
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Received At (UTC)</th>
+                        <th>Alert</th>
+                        <th>Service</th>
+                        <th>Severity</th>
+                        <th>Status</th>
+                        <th>File</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {landingPadRecent.rows.map((row, index) => (
+                        <tr key={`${row.file || "landing-pad"}-${index}`}>
+                          <td>{row.received_at || row.modified_at || "-"}</td>
+                          <td>{row.name || row.alertname || "-"}</td>
+                          <td>{row.service || "-"}</td>
+                          <td>{String(row.severity || "-").toUpperCase()}</td>
+                          <td>{row.alert_status || "-"}</td>
+                          <td>{row.file || "-"}</td>
+                        </tr>
+                      ))}
+                      {!landingPadRecent.rows.length ? (
+                        <tr>
+                          <td colSpan={6}>No realtime landing-pad ingestion records yet.</td>
                         </tr>
                       ) : null}
                     </tbody>

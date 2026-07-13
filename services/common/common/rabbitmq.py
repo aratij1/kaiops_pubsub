@@ -146,70 +146,81 @@ async def consume_forever(
     consumer: RabbitMQConsumer,
     handler: Callable[[dict[str, Any]], Awaitable[None]],
 ) -> None:
-    await consumer.start()
-    if consumer._queue is None:
-        while True:
-            await asyncio.sleep(3600)
+    while True:
+        try:
+            await consumer.start()
+            if consumer._queue is None:
+                await asyncio.sleep(1)
+                continue
 
-    async with consumer._queue.iterator() as iterator:
-        async for message in iterator:
+            async with consumer._queue.iterator() as iterator:
+                async for message in iterator:
+                    try:
+                        decoded = json.loads(message.body.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        logger.warning("failed to decode rabbitmq message", extra={"topic": consumer._topic})
+                        await message.ack()
+                        continue
+
+                    payload = decoded.get("payload") if isinstance(decoded, dict) else None
+                    if not isinstance(payload, dict):
+                        await message.ack()
+                        continue
+
+                    attempts = 0
+                    max_retries = max(0, int(consumer._settings.rabbitmq_consumer_max_retries or 0))
+                    success = False
+
+                    while attempts <= max_retries:
+                        try:
+                            await handler(payload)
+                            success = True
+                            break
+                        except Exception:
+                            attempts += 1
+                            if attempts > max_retries:
+                                break
+                            await asyncio.sleep(min(2**attempts, 5))
+
+                    if success:
+                        await message.ack()
+                        continue
+
+                    logger.error(
+                        "failed to process rabbitmq message",
+                        extra={"topic": consumer._topic, "attempts": attempts, "max_retries": max_retries},
+                    )
+                    if consumer._exchange is not None and consumer._dlq_routing_key:
+                        try:
+                            envelope = {
+                                "failed_topic": consumer._topic,
+                                "payload": payload,
+                                "error": "handler_failed",
+                                "attempts": attempts,
+                                "failed_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            await consumer._exchange.publish(
+                                Message(
+                                    json.dumps(envelope, default=str).encode("utf-8"),
+                                    content_type="application/json",
+                                    delivery_mode=DeliveryMode.PERSISTENT,
+                                    type=consumer._dlq_routing_key,
+                                    app_id="kaiops",
+                                ),
+                                routing_key=consumer._dlq_routing_key,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "failed to publish rabbitmq dlq message",
+                                extra={"topic": consumer._topic, "dlq": consumer._dlq_routing_key},
+                            )
+                    await message.ack()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("rabbitmq consumer loop crashed; restarting", extra={"topic": consumer._topic})
             try:
-                decoded = json.loads(message.body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                logger.warning("failed to decode rabbitmq message", extra={"topic": consumer._topic})
-                await message.ack()
-                continue
-
-            payload = decoded.get("payload") if isinstance(decoded, dict) else None
-            if not isinstance(payload, dict):
-                await message.ack()
-                continue
-
-            attempts = 0
-            max_retries = max(0, int(consumer._settings.rabbitmq_consumer_max_retries or 0))
-            success = False
-
-            while attempts <= max_retries:
-                try:
-                    await handler(payload)
-                    success = True
-                    break
-                except Exception:
-                    attempts += 1
-                    if attempts > max_retries:
-                        break
-                    await asyncio.sleep(min(2**attempts, 5))
-
-            if success:
-                await message.ack()
-                continue
-
-            logger.error(
-                "failed to process rabbitmq message",
-                extra={"topic": consumer._topic, "attempts": attempts, "max_retries": max_retries},
-            )
-            if consumer._exchange is not None and consumer._dlq_routing_key:
-                try:
-                    envelope = {
-                        "failed_topic": consumer._topic,
-                        "payload": payload,
-                        "error": "handler_failed",
-                        "attempts": attempts,
-                        "failed_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    await consumer._exchange.publish(
-                        Message(
-                            json.dumps(envelope, default=str).encode("utf-8"),
-                            content_type="application/json",
-                            delivery_mode=DeliveryMode.PERSISTENT,
-                            type=consumer._dlq_routing_key,
-                            app_id="kaiops",
-                        ),
-                        routing_key=consumer._dlq_routing_key,
-                    )
-                except Exception:
-                    logger.exception(
-                        "failed to publish rabbitmq dlq message",
-                        extra={"topic": consumer._topic, "dlq": consumer._dlq_routing_key},
-                    )
-            await message.ack()
+                await consumer.stop()
+            except Exception:
+                logger.exception("rabbitmq consumer stop failed", extra={"topic": consumer._topic})
+            await asyncio.sleep(1)
