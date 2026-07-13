@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.database import (
@@ -937,6 +937,48 @@ class IncidentRepository:
             }
             for row in rows
         ]
+
+    async def get_onboarding_state_row(self, project_name: str, provider_name: str) -> dict[str, Any] | None:
+        normalized_project = str(project_name or "").strip()
+        normalized_provider = str(provider_name or "").strip().lower()
+        if not normalized_project or not normalized_provider:
+            return None
+        result = await self.session.execute(
+            select(OnboardingStateRecord).where(
+                func.lower(func.trim(OnboardingStateRecord.project_name)) == normalized_project.lower(),
+                func.lower(func.trim(OnboardingStateRecord.provider_name)) == normalized_provider,
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return {
+            "project_name": row.project_name,
+            "provider_name": row.provider_name,
+            "owner_team": row.owner_team,
+            "environment": row.environment,
+            "region": row.region,
+            "endpoint_url": row.endpoint_url,
+            "test_status": row.test_status,
+            "test_message": row.test_message,
+            "project_payload": row.project_payload,
+            "connectivity_payload": row.connectivity_payload,
+            "updated_at": row.updated_at,
+            "last_tested_at": row.last_tested_at,
+        }
+
+    async def delete_onboarding_state(self, project_name: str, provider_name: str | None = None) -> int:
+        normalized_project = str(project_name or "").strip()
+        if not normalized_project:
+            return 0
+        statement = delete(OnboardingStateRecord).where(
+            func.lower(func.trim(OnboardingStateRecord.project_name)) == normalized_project.lower()
+        )
+        normalized_provider = str(provider_name or "").strip().lower()
+        if normalized_provider:
+            statement = statement.where(func.lower(func.trim(OnboardingStateRecord.provider_name)) == normalized_provider)
+        result = await self.session.execute(statement)
+        return int(result.rowcount or 0)
 
     async def save_agent_work_item(
         self,

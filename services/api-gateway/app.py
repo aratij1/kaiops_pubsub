@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+import logging
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlencode
 from uuid import uuid4
 
 import httpx
+import pymysql
 from api_gateway import SafetyAnalyzer
 from api_gateway.modules.users.router import router as user_management_router
 from api_gateway.modules.users.service import UserService
@@ -19,7 +21,7 @@ from common.service import create_app
 from common.telemetry import REQUEST_LATENCY
 from fastapi import Body, Header, HTTPException, Request
 from opentelemetry import trace
-from prometheus_client import Counter
+from prometheus_client import Counter, Gauge
 
 REQUEST_BODY = Body(default={})
 
@@ -27,6 +29,39 @@ settings = get_settings()
 settings.service_name = "api-gateway"
 analyzer = SafetyAnalyzer()
 AUDIT_EVENTS: deque[GatewayAuditEvent] = deque(maxlen=200)
+logger = logging.getLogger("api-gateway")
+
+
+def _query_alerts_table_row_count() -> float:
+    if not settings.database_enabled:
+        return 0.0
+    connection = None
+    try:
+        connection = pymysql.connect(
+            host=settings.db_host,
+            port=int(settings.db_port),
+            user=settings.db_user,
+            password=settings.db_password,
+            database=settings.db_database,
+            connect_timeout=3,
+            read_timeout=3,
+            write_timeout=3,
+            cursorclass=pymysql.cursors.Cursor,
+            autocommit=True,
+        )
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM alerts")
+            row = cursor.fetchone()
+            return float((row or [0])[0] or 0)
+    except Exception as exc:
+        logger.warning("alerts_table_row_count_query_failed", extra={"error": str(exc)})
+        return 0.0
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
 
 
 async def startup(app: FastAPI) -> None:
@@ -35,6 +70,8 @@ async def startup(app: FastAPI) -> None:
         await app.state.user_service.bootstrap_defaults()
     else:
         app.state.user_service = UserService(settings=settings, session_factory=None)
+
+    ALERTS_TABLE_ROWS.labels(settings.db_database, "alerts").set_function(_query_alerts_table_row_count)
 
 
 app = create_app(title="KaiMS API Gateway", settings=settings, startup=startup)
@@ -49,6 +86,11 @@ GATEWAY_SAFETY_BLOCKS = Counter(
     "kaiops_gateway_safety_blocks_total",
     "API gateway blocked requests by category",
     ["category"],
+)
+ALERTS_TABLE_ROWS = Gauge(
+    "kaiops_mysql_alerts_table_rows",
+    "Current number of records in MySQL alerts table",
+    ["database", "table"],
 )
 
 
@@ -379,6 +421,24 @@ async def get_onboarding_state(
     )
 
 
+@app.delete("/onboarding/state/{project_name}")
+async def delete_onboarding_state(
+    project_name: str,
+    request: Request,
+    provider_name: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    query_suffix = f"?{urlencode({'provider_name': provider_name})}" if provider_name else ""
+    return await guarded_proxy(
+        request=request,
+        method="DELETE",
+        path=f"/onboarding/state/{project_name}{query_suffix}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/onboarding/rules/capabilities")
 async def get_onboarding_rule_capabilities(
     request: Request,
@@ -426,6 +486,23 @@ async def post_onboarding_rules_pipeline_new(
     )
 
 
+@app.post("/onboarding/rules/pipeline/create")
+async def post_onboarding_rules_pipeline_create_alias(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    # Backward-compatible alias for clients still using older onboarding route names.
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/onboarding/rules/pipeline/new",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/onboarding/rules/pipeline/{workflow_id}")
 async def get_onboarding_rules_pipeline(
     workflow_id: str,
@@ -435,6 +512,39 @@ async def get_onboarding_rules_pipeline(
     return await guarded_proxy(
         request=request,
         method="GET",
+        path=f"/onboarding/rules/pipeline/{workflow_id}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.put("/onboarding/rules/pipeline/{workflow_id}")
+async def put_onboarding_rules_pipeline(
+    workflow_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="PUT",
+        path=f"/onboarding/rules/pipeline/{workflow_id}",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.delete("/onboarding/rules/pipeline/{workflow_id}")
+async def delete_onboarding_rules_pipeline(
+    workflow_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="DELETE",
         path=f"/onboarding/rules/pipeline/{workflow_id}",
         target_base=settings.monitoring_adapter_url,
         payload={},
@@ -553,6 +663,22 @@ async def post_onboarding_connectivity(
         request=request,
         method="POST",
         path="/onboarding/connectivity",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/onboarding/complete")
+async def post_onboarding_complete(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/onboarding/complete",
         target_base=settings.monitoring_adapter_url,
         payload=payload,
         trace_id=trace_id_from_header(x_trace_id),

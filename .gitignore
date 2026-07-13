@@ -14,3 +14,13 @@ build/
 *.egg-info/
 data/
 logs/local/*.log
+
+# Generated UI and runtime artifacts
+.tmp-ui-bundle.js
+ingested_alerts/input/*.json
+
+# Generated onboarding outputs
+rag/changes/**
+rag/dependencies/*.md
+rag/incidents/*-rule-onboarding.md
+rag/runbooks/*-rule-runbook.md
