@@ -39,6 +39,13 @@ x-service-env: &service-env
   RABBITMQ_CONSUMER_MAX_RETRIES: "3"
   RABBITMQ_DLQ_SUFFIX: .dlq
   DATABASE_ENABLED: "true"
+  GCP_PROJECT_ID: ${GCP_PROJECT_ID:-kaiops-local}
+  GCP_PUBSUB_ENABLED: ${GCP_PUBSUB_ENABLED:-true}
+  PUBSUB_EMULATOR_HOST: pubsub-emulator:8085
+  GCP_PUBSUB_TOPIC_PREFIX: kaiops
+  GCP_PUBSUB_SUBSCRIPTION_PREFIX: kaiops
+  GCP_PUBSUB_DLQ_SUFFIX: .dlq
+  GCP_PUBSUB_CONSUMER_MAX_RETRIES: "3"
 
 x-service-build: &service-build
   context: .
@@ -102,6 +109,17 @@ services:
       timeout: 10s
       retries: 20
 
+  pubsub-emulator:
+    image: gcr.io/google.com/cloudsdktool/cloud-sdk:emulators
+    command: ["gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085", "--project=${GCP_PROJECT_ID:-kaiops-local}"]
+    ports: ["8085:8085"]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/8085'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
   mysql-exporter:
     image: prom/mysqld-exporter:v0.16.0
     command:
@@ -153,6 +171,7 @@ services:
       - ./ingested_alerts:/app/ingested_alerts
     depends_on:
       kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
 
@@ -175,6 +194,7 @@ services:
     depends_on:
       monitoring-adapter: { condition: service_started }
       approval-service: { condition: service_started }
+      rabbitmq: { condition: service_healthy }
 
   alert-intelligence:
     build: *service-build
@@ -186,6 +206,7 @@ services:
       kafka: { condition: service_healthy }
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
+      pubsub-emulator: { condition: service_healthy }
 
   orchestrator:
     build: *service-build
@@ -241,6 +262,7 @@ services:
     ports: ["8007:8000"]
     depends_on:
       kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
   remediation-engine:

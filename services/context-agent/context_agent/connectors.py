@@ -6,9 +6,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from langchain_core.embeddings import Embeddings
+
 from common.agent_runtime import AgentRuntime, ContextFailure
 from common.agentic import AgentContext, BaseAgent
-from common.embeddings import HashingEmbeddingModel, cosine_similarity
+from common.config import get_settings
+from common.embeddings import get_embedding_model, cosine_similarity
 from common.models import Alert, Context, Incident
 from common.resilience import retry_async
 from common.tool_registry import ToolRegistry, ToolSpec
@@ -76,7 +79,7 @@ class CMDBConnector(BaseConnector):
 @dataclass
 class VectorDBConnector(BaseConnector):
     name: str = "vector-db"
-    embedding_model: HashingEmbeddingModel = field(default_factory=HashingEmbeddingModel)
+    embedding_model: Embeddings = field(default_factory=lambda: get_embedding_model(get_settings()))
     rag_root: Path | None = None
     documents: list[dict[str, Any]] = field(default_factory=list)
     _document_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
