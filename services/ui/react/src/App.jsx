@@ -53,8 +53,8 @@ const MONITORING_TOOL_OPTIONS = ["prometheus", "new_relic", "datadog"];
 
 const ROLE_ALLOWED_TABS = {
   administrator: ["home", "copilot", "approval", "executive", "admin", "trace", "safety", "rag", "finops", "closed", "summary"],
-  l1_operator: ["approval"],
-  l2_engineer: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "finops", "closed", "summary"],
+  l1_operator: ["home"],
+  l2_engineer: ["home", "copilot", "approval", "trace", "safety", "rag", "finops", "closed", "summary"],
   l3_engineer: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "finops", "closed", "summary"],
   executive: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "finops", "closed", "summary"],
 };
@@ -792,6 +792,7 @@ export default function App() {
     vertex_model_armor_template: "",
     assignment_username: "",
     assignment_project: "",
+    onboarding_path: "existing_monitoring",
     start_rule_onboarding: false,
     rule_onboarding_plain_language: "",
   });
@@ -1291,7 +1292,7 @@ export default function App() {
     setAdminUsers({ loading: false, rows: [], error: "" });
     setAdminEditUser({ id: null, username: "", email: "", first_name: "", last_name: "", role_id: 1, status: "active", is_active: true });
     setAdminResetPasswordForm({ user_id: null, new_password: "" });
-    setActiveTab("approval");
+    setActiveTab("home");
   }
 
   async function loadAdminUsersAndRoles() {
@@ -1472,6 +1473,7 @@ export default function App() {
       datadog_url: "",
       assignment_username: "",
       assignment_project: "",
+      onboarding_path: "existing_monitoring",
       start_rule_onboarding: false,
       rule_onboarding_plain_language: "",
     }));
@@ -1705,16 +1707,18 @@ export default function App() {
         active_provider: selectedMonitoringTool,
       };
 
+      const onboardingPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim().toLowerCase();
       const plainLanguageRequirements = String(onboardingForm.rule_onboarding_plain_language || "")
         .split(/\r?\n/)
         .map((line) => line.trim())
         .filter(Boolean);
-      const shouldStartRuleOnboarding = Boolean(onboardingForm.start_rule_onboarding) && plainLanguageRequirements.length > 0;
+      const shouldStartRuleOnboarding = onboardingPath === "setup_monitoring" && plainLanguageRequirements.length > 0;
 
       const response = await fetchJson("/api-gateway/onboarding/complete", {
         method: "POST",
         body: JSON.stringify({
           project_mode: onboardingProjectMode === "new" ? "new" : "existing",
+          onboarding_path: onboardingPath,
           connectivity: payload,
           start_rules_onboarding: shouldStartRuleOnboarding,
           plain_language_requirements: plainLanguageRequirements,
@@ -1759,7 +1763,9 @@ export default function App() {
           ? generatedDocs.length
             ? `Workflow completed through step ${workflowSteps.length || 0}. Review generated documents and click Approve.`
             : `Workflow completed through step ${workflowSteps.length || 0}. No documents were generated.`
-          : "Project onboarding saved.",
+          : onboardingPath === "existing_monitoring"
+            ? "Project onboarding saved. Send alerts to landing pad to trigger the downstream workflow."
+            : "Project onboarding saved.",
       }));
     } catch (error) {
       setOnboardingState((current) => ({ ...current, loading: false, error: error.message, success: "" }));
@@ -2144,7 +2150,7 @@ export default function App() {
         return;
       }
       const roleName = normalizeRoleName(adminSession?.user?.role_name);
-      const roleTabs = ROLE_ALLOWED_TABS[roleName] || ["approval"];
+      const roleTabs = ROLE_ALLOWED_TABS[roleName] || ["home"];
       if (!event.altKey) {
         return;
       }
@@ -3169,7 +3175,7 @@ export default function App() {
     }),
     [onboardingState.rows],
   );
-  const allowedTabs = useMemo(() => ROLE_ALLOWED_TABS[currentRole] || ["approval"], [currentRole]);
+  const allowedTabs = useMemo(() => ROLE_ALLOWED_TABS[currentRole] || ["home"], [currentRole]);
   const visibleSidebarSections = useMemo(() => sidebarSections.filter((tab) => allowedTabs.includes(tab.id)), [sidebarSections, allowedTabs]);
   const isAuthenticated = Boolean(String(adminSession.accessToken || "").trim());
   const isAdministrator = currentRole === "administrator";
@@ -3187,8 +3193,9 @@ export default function App() {
     if (String(onboardingForm.deployment_mode || "").trim() === "gcp_cloud" && !String(onboardingForm.gcp_project_id || "").trim()) {
       errors.push("GCP Project ID is required for Google Cloud deployment.");
     }
-    if (Boolean(onboardingForm.start_rule_onboarding) && !String(onboardingForm.rule_onboarding_plain_language || "").trim()) {
-      errors.push("Add plain-English rule intent when Generate Rules Now is enabled.");
+    const isSetupMonitoringPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim() === "setup_monitoring";
+    if (isSetupMonitoringPath && !String(onboardingForm.rule_onboarding_plain_language || "").trim()) {
+      errors.push("Add plain-English rule intent when the Setup Monitoring path is selected.");
     }
     return errors;
   }, [
@@ -3197,10 +3204,14 @@ export default function App() {
     onboardingForm.region,
     onboardingForm.deployment_mode,
     onboardingForm.gcp_project_id,
-    onboardingForm.start_rule_onboarding,
+    onboardingForm.onboarding_path,
     onboardingForm.rule_onboarding_plain_language,
   ]);
   const onboardingAdvisory = useMemo(() => {
+    const onboardingPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim();
+    if (onboardingPath === "existing_monitoring") {
+      return "Existing monitoring path: configure your tool and send alerts to /alerts/alertmanager to trigger workflow.";
+    }
     if (String(onboardingForm.deployment_mode || "").trim() !== "on_prem") {
       return "";
     }
@@ -3208,7 +3219,7 @@ export default function App() {
       return "";
     }
     return "Tool endpoint URL is optional now, but recommended for connectivity and rule simulation quality.";
-  }, [onboardingForm.deployment_mode, onboardingForm.monitoring_url]);
+  }, [onboardingForm.deployment_mode, onboardingForm.monitoring_url, onboardingForm.onboarding_path]);
   const onboardingHasPendingDocumentApproval = useMemo(
     () => onboardingGeneratedDocs.length > 0 && !onboardingDocApprovalState.approved,
     [onboardingGeneratedDocs.length, onboardingDocApprovalState.approved],
@@ -3221,6 +3232,7 @@ export default function App() {
     [onboardingGeneratedDocs.length, onboardingDocApprovalState.approved],
   );
   const onboardingNextAction = useMemo(() => {
+    const onboardingPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim();
     if (onboardingState.loading) {
       return "Step 2/4: Saving project and generating workflow artifacts...";
     }
@@ -3230,12 +3242,22 @@ export default function App() {
     if (onboardingDocumentSummary.approved) {
       return "Step 4/4: Documents approved. You can continue with another update or proceed to advanced workflow management.";
     }
-    return "Step 1/4: Complete project details and click Create Project or Update Project.";
+    return onboardingPath === "setup_monitoring"
+      ? "Step 1/4: Complete project and monitoring-rule setup details, then click Create Project or Update Project."
+      : "Step 1/4: Complete project details, save, then ingest alerts into landing pad.";
   }, [
     onboardingState.loading,
     onboardingHasPendingDocumentApproval,
     onboardingDocumentSummary.approved,
+    onboardingForm.onboarding_path,
   ]);
+
+  const adminWorkspaceCaptions = useMemo(() => ({
+    users: "Manage users, roles, and credentials.",
+    project: "Set up project monitoring using existing ingestion or guided rule creation.",
+    projects: "Browse persisted project onboarding records.",
+    alerts: "Author and bulk upload alert onboarding knowledge docs.",
+  }), []);
 
   useEffect(() => {
     if (onboardingProjectMode === "new" || selectedOnboardingProject || !projectOnboardingRows.length) {
@@ -3653,7 +3675,7 @@ export default function App() {
               <button className="button-primary" type="submit" disabled={adminSession.loading}>{adminSession.loading ? "Signing in..." : "Sign In"}</button>
             </form>
             {adminSession.error ? <p className="error">{adminSession.error}</p> : null}
-            <p className="subtitle">Role access: Admin = all screens, L2/L3 = all except Admin Center, L1 = Alerts only.</p>
+            <p className="subtitle">Role access: Admin = all screens, L3 = all except Admin Center, L2 = all except Admin Center and Executive, L1 = Dashboard only.</p>
           </article>
         </section>
       </main>
@@ -4255,11 +4277,12 @@ export default function App() {
                 </div>
 
                 <div className="detail-tabs sticky-controls">
-                  <button type="button" className={`detail-tab ${adminWorkspace === "users" ? "active" : ""}`} onClick={() => setAdminWorkspace("users")}>User Management</button>
-                  <button type="button" className={`detail-tab ${adminWorkspace === "project" ? "active" : ""}`} onClick={() => setAdminWorkspace("project")}>Project Onboarding</button>
-                  <button type="button" className={`detail-tab ${adminWorkspace === "projects" ? "active" : ""}`} onClick={() => setAdminWorkspace("projects")}>Saved Projects</button>
-                  <button type="button" className={`detail-tab ${adminWorkspace === "alerts" ? "active" : ""}`} onClick={() => setAdminWorkspace("alerts")}>Alerts Onboarding</button>
+                  <button type="button" className={`detail-tab ${adminWorkspace === "users" ? "active" : ""}`} onClick={() => setAdminWorkspace("users")}>Users & Access</button>
+                  <button type="button" className={`detail-tab ${adminWorkspace === "project" ? "active" : ""}`} onClick={() => setAdminWorkspace("project")}>Project Setup Flows</button>
+                  <button type="button" className={`detail-tab ${adminWorkspace === "projects" ? "active" : ""}`} onClick={() => setAdminWorkspace("projects")}>Project Registry</button>
+                  <button type="button" className={`detail-tab ${adminWorkspace === "alerts" ? "active" : ""}`} onClick={() => setAdminWorkspace("alerts")}>Alert Knowledge Base</button>
                 </div>
+                <p className="subtitle">{adminWorkspaceCaptions[adminWorkspace] || "Administrative workspace controls."}</p>
 
                 {adminWorkspace === "users" ? (
                   <div className="grid single-col">
@@ -4405,7 +4428,7 @@ export default function App() {
                           </button>
                         </div>
                       </div>
-                      <p className="subtitle">Flow: 1) Configure project 2) Create/Update 3) Review generated docs 4) Approve documents.</p>
+                      <p className="subtitle">Flow options: Existing Monitoring (ingest alerts to landing pad) or Setup Monitoring (generate rules, upload, and validate).</p>
                       <p className="subtitle"><strong>Next Action:</strong> {onboardingNextAction}</p>
                       {onboardingDocumentSummary.total > 0 ? (
                         <p className="subtitle">
@@ -4470,6 +4493,25 @@ export default function App() {
                         ) : null}
                         <div className="filter-grid">
                           <label>
+                            Onboarding Path
+                            <select
+                              value={onboardingForm.onboarding_path}
+                              onChange={(e) => {
+                                const nextPath = e.target.value;
+                                setOnboardingForm((curr) => ({
+                                  ...curr,
+                                  onboarding_path: nextPath,
+                                  start_rule_onboarding: nextPath === "setup_monitoring",
+                                }));
+                              }}
+                            >
+                              <option value="existing_monitoring">Existing Monitoring -&gt; Ingest Alerts To Landing Pad</option>
+                              <option value="setup_monitoring">No Monitoring Yet -&gt; Create Rules &amp; Configure Prometheus</option>
+                            </select>
+                          </label>
+                        </div>
+                        <div className="filter-grid">
+                          <label>
                             Monitoring Tool
                             <select
                               value={onboardingForm.monitoring_tool}
@@ -4524,19 +4566,7 @@ export default function App() {
                           </div>
                         ) : null}
                         <label>Assignment Project (auto)<input value={onboardingForm.name} readOnly /></label>
-                        <div className="filter-grid">
-                          <label>
-                            Generate Rules Now
-                            <select
-                              value={String(onboardingForm.start_rule_onboarding)}
-                              onChange={(e) => setOnboardingForm((curr) => ({ ...curr, start_rule_onboarding: e.target.value === "true" }))}
-                            >
-                              <option value="false">No</option>
-                              <option value="true">Yes</option>
-                            </select>
-                          </label>
-                        </div>
-                        {onboardingForm.start_rule_onboarding ? (
+                        {onboardingForm.onboarding_path === "setup_monitoring" ? (
                           <label>
                             Rule Intent (Plain English)
                             <textarea
@@ -4550,7 +4580,7 @@ export default function App() {
                               }}
                             />
                           </label>
-                        ) : null}
+                        ) : <p className="subtitle">Alerts from your configured monitoring tool can be ingested into landing pad to trigger the remaining workflow.</p>}
                         <button className="button-primary" type="submit" disabled={onboardingState.loading || onboardingValidationErrors.length > 0 || onboardingHasPendingDocumentApproval}>
                           {onboardingState.loading ? "Saving..." : onboardingProjectMode === "new" ? "Create Project" : "Update Project"}
                         </button>
@@ -4633,15 +4663,27 @@ export default function App() {
                             </tr>
                           </thead>
                           <tbody>
-                            {(onboardingWorkflowSteps.length ? onboardingWorkflowSteps : [
-                              { step: 1, title: "Create/Update Project", status: "pending", details: { message: "Start by creating or updating a project." } },
-                              { step: 2, title: "Ask To Add New Rules", status: "pending", details: { message: "Choose whether to generate new rules." } },
-                              { step: 3, title: "Capture Rules In Plain English", status: "pending", details: { message: "Provide plain-English rule intent." } },
-                              { step: 4, title: "Convert To YAML, Upload In Prometheus, Test", status: "pending", details: { message: "System will convert, attempt upload/reload, and test." } },
-                              { step: 5, title: "Generate Monitoring/Troubleshooting/Resolution Docs", status: "pending", details: { message: "System will generate documentation payloads." } },
-                            ]).map((row) => {
+                            {(onboardingWorkflowSteps.length ? onboardingWorkflowSteps : (
+                              String(onboardingForm.onboarding_path || "existing_monitoring").trim() === "setup_monitoring"
+                                ? [
+                                  { step: 1, title: "Create/Update Project", status: "pending", details: { message: "Start by creating or updating a project." } },
+                                  { step: 2, title: "Select Onboarding Path", status: "pending", details: { message: "Choose Setup Monitoring." } },
+                                  { step: 3, title: "Capture Rules In Plain English", status: "pending", details: { message: "Provide plain-English rule intent." } },
+                                  { step: 4, title: "Convert To YAML, Upload In Prometheus, Test", status: "pending", details: { message: "System will convert, attempt upload/reload, and test." } },
+                                  { step: 5, title: "Generate Monitoring/Troubleshooting/Resolution Docs", status: "pending", details: { message: "System will generate documentation payloads." } },
+                                ]
+                                : [
+                                  { step: 1, title: "Create/Update Project", status: "pending", details: { message: "Start by creating or updating a project." } },
+                                  { step: 2, title: "Select Onboarding Path", status: "pending", details: { message: "Choose Existing Monitoring." } },
+                                  { step: 3, title: "Configure Landing Pad Ingestion", status: "pending", details: { message: "Connect your monitoring tool and route alerts to landing pad." } },
+                                  { step: 4, title: "Ingest Alerts and Trigger Workflow", status: "pending", details: { message: "Incoming alerts will trigger downstream workflow stages." } },
+                                  { step: 5, title: "Generate Monitoring/Troubleshooting/Resolution Docs", status: "pending", details: { message: "Optional generated docs can be reviewed and approved." } },
+                                ]
+                            )).map((row) => {
                               const message = row?.details?.message
+                                || row?.details?.summary
                                 || row?.details?.choice
+                                || row?.details?.path
                                 || row?.details?.workflow_id
                                 || `Requirements: ${Number(row?.details?.requirements_count || 0)}`;
                               return (

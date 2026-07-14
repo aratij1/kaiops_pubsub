@@ -62,6 +62,14 @@ class UserService:
             return f"{username.strip().lower()}@kaiops.example.com"
         return email
 
+    def _coerce_utc(self, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            # MySQL DATETIME values may be returned as naive objects; treat them as UTC.
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
     def _encode_token(
         self,
         *,
@@ -100,7 +108,8 @@ class UserService:
                 raise HTTPException(status_code=401, detail="Session is invalid")
             if int(session.user_id) != int(user_id):
                 raise HTTPException(status_code=401, detail="Session does not belong to this user")
-            if session.expiry_time < datetime.now(UTC):
+            session_expiry = self._coerce_utc(session.expiry_time)
+            if session_expiry is None or session_expiry < datetime.now(UTC):
                 raise HTTPException(status_code=401, detail="Session expired")
 
         await run_in_session(self.session_factory, op)
@@ -209,7 +218,8 @@ class UserService:
             role_name = role.name if role else "Unknown"
 
             now = datetime.now(UTC)
-            if user.locked_until and user.locked_until > now:
+            locked_until = self._coerce_utc(user.locked_until)
+            if locked_until and locked_until > now:
                 raise HTTPException(status_code=423, detail="Account is locked")
 
             if not user.is_active or user.status.lower() != "active":
@@ -300,7 +310,8 @@ class UserService:
             session = await repo.get_session_by_jti(session_jti)
             if session is None or session.status != "active":
                 raise HTTPException(status_code=401, detail="Session is invalid")
-            if session.expiry_time < datetime.now(UTC):
+            session_expiry = self._coerce_utc(session.expiry_time)
+            if session_expiry is None or session_expiry < datetime.now(UTC):
                 raise HTTPException(status_code=401, detail="Session expired")
             if int(session.user_id) != user_id:
                 raise HTTPException(status_code=401, detail="Session does not belong to this user")

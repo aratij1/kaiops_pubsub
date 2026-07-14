@@ -281,6 +281,7 @@ class OnboardingStateResponse(BaseModel):
 class OnboardingCompletePayload(BaseModel):
     connectivity: OnboardingConnectivityPayload
     project_mode: Literal["new", "existing"] = "existing"
+    onboarding_path: Literal["existing_monitoring", "setup_monitoring"] = "existing_monitoring"
     start_rules_onboarding: bool = False
     plain_language_requirements: list[str] = Field(default_factory=list)
     selected_monitoring_tool: str | None = None
@@ -303,6 +304,8 @@ class OnboardingCompletePayload(BaseModel):
         normalized["plain_language_requirements"] = requirements
         selected_tool = str(normalized.get("selected_monitoring_tool") or "").strip().lower().replace(" ", "_")
         normalized["selected_monitoring_tool"] = selected_tool or None
+        onboarding_path = str(normalized.get("onboarding_path") or "existing_monitoring").strip().lower()
+        normalized["onboarding_path"] = onboarding_path or "existing_monitoring"
         normalized["generate_documents"] = bool(normalized.get("generate_documents", True))
         normalized["include_smoke_test_alert"] = bool(normalized.get("include_smoke_test_alert", True))
         return normalized
@@ -311,7 +314,7 @@ class OnboardingCompletePayload(BaseModel):
     def _validate_payload(self) -> "OnboardingCompletePayload":
         if self.selected_monitoring_tool and self.selected_monitoring_tool not in _ALLOWED_ONBOARDING_PROVIDERS:
             raise ValueError("selected_monitoring_tool must be one of prometheus, new_relic, datadog")
-        if self.start_rules_onboarding and not self.plain_language_requirements:
+        if self.onboarding_path == "setup_monitoring" and not self.plain_language_requirements:
             raise ValueError("plain_language_requirements are required when start_rules_onboarding is true")
         return self
 
@@ -602,6 +605,22 @@ def _build_onboarding_rule_seed(connectivity: OnboardingConnectivityPayload, sel
     }
 
 
+def _build_landing_pad_summary(connectivity: OnboardingConnectivityPayload, selected_tool: str) -> dict[str, Any]:
+    project_name = str(connectivity.project.name or "").strip()
+    configured_endpoint = _selected_tool_url(connectivity, selected_tool)
+    return {
+        "ready": True,
+        "project_name": project_name,
+        "selected_monitoring_tool": selected_tool,
+        "configured_monitoring_endpoint": configured_endpoint,
+        "landing_pad_endpoint": "/alerts/alertmanager",
+        "message": (
+            "Send alerts from your monitoring platform to /alerts/alertmanager. "
+            "Landing pad ingestion will trigger the downstream KaiMS workflow."
+        ),
+    }
+
+
 def _build_onboarding_rag_documents(
     *,
     connectivity: OnboardingConnectivityPayload,
@@ -887,13 +906,16 @@ async def _generate_upload_and_test_prometheus_rules(
 
 def _build_onboarding_steps_response(
     *,
+    onboarding_path: str,
     project_mode: str,
     start_rules_onboarding: bool,
     requirements: list[str],
     rules_result: dict[str, Any] | None,
     prometheus_result: dict[str, Any] | None,
     rag_documents: list[dict[str, Any]],
+    landing_pad_summary: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    uses_setup_flow = str(onboarding_path or "").strip().lower() == "setup_monitoring"
     step_one = {
         "step": 1,
         "title": "Create/Update Project",
@@ -902,32 +924,49 @@ def _build_onboarding_steps_response(
     }
     step_two = {
         "step": 2,
-        "title": "Ask To Add New Rules",
+        "title": "Select Onboarding Path",
         "status": "completed",
         "details": {
-            "choice": "yes" if start_rules_onboarding else "no",
+            "path": "setup_monitoring" if uses_setup_flow else "existing_monitoring",
+            "summary": (
+                "Create monitoring rules and configure Prometheus"
+                if uses_setup_flow
+                else "Use existing monitoring and ingest alerts into landing pad"
+            ),
         },
     }
     step_three = {
         "step": 3,
-        "title": "Capture Rules In Plain English",
-        "status": "completed" if start_rules_onboarding and requirements else "skipped",
+        "title": "Capture Rules In Plain English" if uses_setup_flow else "Configure Landing Pad Ingestion",
+        "status": (
+            "completed" if (uses_setup_flow and start_rules_onboarding and requirements) else
+            ("completed" if not uses_setup_flow else "skipped")
+        ),
         "details": {
-            "requirements_count": len(requirements),
-            "requirements": requirements,
+            "requirements_count": len(requirements) if uses_setup_flow else 0,
+            "requirements": requirements if uses_setup_flow else [],
+            "landing_pad": landing_pad_summary if not uses_setup_flow else {},
         },
     }
     step_four_status = "skipped"
+    step_four_title = "Convert To YAML, Upload In Prometheus, Test" if uses_setup_flow else "Ingest Alerts and Trigger Workflow"
     step_four_details: dict[str, Any] = {
-        "message": "Rule conversion and Prometheus upload were skipped.",
+        "message": (
+            "Rule conversion and Prometheus upload were skipped."
+            if uses_setup_flow
+            else "Alert ingestion via landing pad is ready; incoming alerts will trigger downstream workflow."
+        ),
+        "landing_pad": landing_pad_summary if not uses_setup_flow else {},
     }
-    if start_rules_onboarding and rules_result:
+    if uses_setup_flow and start_rules_onboarding and rules_result:
         step_four_status = "completed"
         step_four_details = {
             "workflow_id": rules_result.get("workflow_id"),
             "rule_conversion": "completed",
             "prometheus": prometheus_result or {"message": "Prometheus deployment not attempted."},
         }
+    if not uses_setup_flow:
+        step_four_status = "completed"
 
     step_five = {
         "step": 5,
@@ -938,7 +977,7 @@ def _build_onboarding_steps_response(
             "documents": rag_documents,
         },
     }
-    return [step_one, step_two, step_three, {"step": 4, "title": "Convert To YAML, Upload In Prometheus, Test", "status": step_four_status, "details": step_four_details}, step_five]
+    return [step_one, step_two, step_three, {"step": 4, "title": step_four_title, "status": step_four_status, "details": step_four_details}, step_five]
 
 
 async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
@@ -2713,6 +2752,9 @@ async def post_onboarding_complete(payload: OnboardingCompletePayload = Body(...
 
     connectivity = payload.connectivity
     connectivity_payload = connectivity.model_dump(mode="json")
+    selected_tool = _select_monitoring_tool(connectivity, payload.selected_monitoring_tool)
+    landing_pad_summary = _build_landing_pad_summary(connectivity, selected_tool)
+    should_start_rules_onboarding = bool(payload.onboarding_path == "setup_monitoring" and payload.start_rules_onboarding)
 
     sanitized_connectivity = save_onboarding_connectivity(connectivity_payload)
     await persist_onboarding_connectivity(connectivity_payload)
@@ -2722,26 +2764,29 @@ async def post_onboarding_complete(payload: OnboardingCompletePayload = Body(...
 
     response: dict[str, Any] = {
         "project_mode": payload.project_mode,
+        "onboarding_path": payload.onboarding_path,
         "connectivity": connectivity_snapshot.model_dump(mode="json"),
+        "landing_pad_ingestion": landing_pad_summary,
         "rules_onboarding": {
             "started": False,
-            "status": "not-requested",
+            "status": "not-required" if payload.onboarding_path == "existing_monitoring" else "not-requested",
         },
         "rag_documents": [],
         "workflow_steps": _build_onboarding_steps_response(
+            onboarding_path=payload.onboarding_path,
             project_mode=payload.project_mode,
-            start_rules_onboarding=False,
+            start_rules_onboarding=should_start_rules_onboarding,
             requirements=[],
             rules_result=None,
             prometheus_result=None,
             rag_documents=[],
+            landing_pad_summary=landing_pad_summary,
         ),
     }
 
-    if not payload.start_rules_onboarding:
+    if not should_start_rules_onboarding:
         return response
 
-    selected_tool = _select_monitoring_tool(connectivity, payload.selected_monitoring_tool)
     requirements = [item for item in payload.plain_language_requirements if str(item or "").strip()]
     endpoint_url = _selected_tool_url(connectivity, selected_tool)
 
@@ -2790,12 +2835,14 @@ async def post_onboarding_complete(payload: OnboardingCompletePayload = Body(...
             requirements=requirements,
         )
     response["workflow_steps"] = _build_onboarding_steps_response(
+        onboarding_path=payload.onboarding_path,
         project_mode=payload.project_mode,
-        start_rules_onboarding=payload.start_rules_onboarding,
+        start_rules_onboarding=should_start_rules_onboarding,
         requirements=requirements,
         rules_result=workflow_result,
         prometheus_result=prometheus_upload_result,
         rag_documents=response.get("rag_documents", []),
+        landing_pad_summary=landing_pad_summary,
     )
     return response
 
