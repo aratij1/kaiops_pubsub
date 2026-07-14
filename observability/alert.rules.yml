@@ -69,8 +69,8 @@ groups:
           description: "MySQL threads_connected is {{ $value }} which is above threshold 150."
 
       - alert: KaiOpsMySQLAlertsTableRowsHigh
-        expr: kaiops_mysql_alerts_table_rows{database="kaiops", table="alerts"} > 20
-        for: 1m
+        expr: kaiops_mysql_alerts_table_rows{database="kaiops", table="alerts"} > 300
+        for: 10m
         labels:
           severity: warning
           category: database
@@ -79,3 +79,280 @@ groups:
         annotations:
           summary: "KaiOps alerts table row count is high"
           description: "alerts table has {{ $value }} rows, above threshold 20 for kaiops-core."
+
+  - name: kaiops-enterprise-alerts
+    # Local vs k8s rule gating:
+    # Kubernetes-only alerts are guarded with:
+    #   and on() (count(up{job="kube-state-metrics"}) > 0)
+    # This keeps them inactive in local Docker (no kube-state-metrics)
+    # and automatically active in Kubernetes environments.
+    rules:
+      - alert: HighCPUUsage
+        expr: (100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)) > 90
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High CPU usage"
+          description: "CPU utilization is above 90% for more than 5 minutes on {{ $labels.instance }}."
+
+      - alert: HighMemoryUsage
+        expr: ((1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100) > 85
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High memory usage"
+          description: "Memory utilization is above 85% for more than 5 minutes on {{ $labels.instance }}."
+
+      - alert: DiskSpaceLow
+        expr: ((1 - (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"})) * 100) > 90
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Disk space low"
+          description: "Disk utilization is above 90% on {{ $labels.instance }} mount {{ $labels.mountpoint }}."
+
+      - alert: DiskIOHigh
+        expr: sum by (instance) (rate(node_disk_reads_completed_total[5m]) + rate(node_disk_writes_completed_total[5m])) > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk I/O high"
+          description: "Disk IOPS exceeded configured threshold on {{ $labels.instance }}."
+
+      - alert: PodRestartingFrequently
+        expr: (sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total[10m])) > 3) and on() (count(up{job="kube-state-metrics"}) > 0)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pod restarting frequently"
+          description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} restarted more than 3 times in 10 minutes."
+
+      - alert: PodCrashLoopBackOff
+        expr: (max by (namespace, pod, container) (kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}) > 0) and on() (count(up{job="kube-state-metrics"}) > 0)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pod in CrashLoopBackOff"
+          description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }} is in CrashLoopBackOff."
+
+      - alert: ServiceDown
+        expr: up{job=~"kaiops-.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service down"
+          description: "Endpoint {{ $labels.job }} is unreachable."
+
+      - alert: HighErrorRate
+        expr: (sum(rate(kaiops_gateway_requests_total{status!="ok"}[5m])) / clamp_min(sum(rate(kaiops_gateway_requests_total[5m])), 1)) > 0.08
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High application error rate"
+          description: "Gateway non-ok status ratio is above threshold for the last 5 minutes."
+
+      - alert: HighRequestLatency
+        expr: histogram_quantile(0.95, sum(rate(kaiops_request_latency_seconds_bucket[5m])) by (le, service, operation)) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High request latency"
+          description: "P95 latency is above 500ms for {{ $labels.service }} {{ $labels.operation }}."
+
+      - alert: LowRequestThroughput
+        expr: sum(rate(kaiops_gateway_requests_total[5m])) < 0.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low request throughput"
+          description: "Request throughput dropped below expected baseline."
+
+      - alert: NodeNotReady
+        expr: (kube_node_status_condition{condition="Ready", status="true"} == 0) and on() (count(up{job="kube-state-metrics"}) > 0)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node not ready"
+          description: "Kubernetes node {{ $labels.node }} is not Ready."
+
+      - alert: ContainerOOMKilled
+        expr: (increase(kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}[5m]) > 0) and on() (count(up{job="kube-state-metrics"}) > 0)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Container OOMKilled"
+          description: "Container {{ $labels.container }} in pod {{ $labels.namespace }}/{{ $labels.pod }} was OOMKilled."
+
+      - alert: HighNetworkLatency
+        expr: probe_duration_seconds{job="blackbox"} > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High network latency"
+          description: "HTTP probe duration is above 200ms for target {{ $labels.instance }}."
+
+      - alert: HighNetworkPacketLoss
+        expr: avg_over_time(probe_success{job="blackbox"}[5m]) < 0.95
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High network packet loss"
+          description: "HTTP probe success ratio dropped below 95% for target {{ $labels.instance }}."
+
+      - alert: KafkaConsumerLag
+        expr: sum(kafka_consumergroup_lag) > 50000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag high"
+          description: "Kafka consumer lag is above 10,000 messages."
+
+      - alert: KafkaBrokerDown
+        expr: up{job=~".*kafka.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka broker down"
+          description: "Kafka broker target {{ $labels.instance }} is not responding."
+
+      - alert: DatabaseConnectionFailure
+        expr: (rate(mysql_global_status_aborted_connects[5m]) > 0.1) or ((mysql_global_status_threads_connected / clamp_min(mysql_global_variables_max_connections, 1)) > 0.98)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database connection failure risk"
+          description: "MySQL connection failures are detected or connection usage is above 95%."
+
+      - alert: DatabaseSlowQueries
+        expr: rate(mysql_global_status_slow_queries[5m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Database slow queries"
+          description: "Slow query rate is above baseline."
+
+      - alert: SSLCertificateExpiry
+        expr: (probe_ssl_earliest_cert_expiry - time()) < 2592000
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SSL certificate expiry approaching"
+          description: "SSL certificate for {{ $labels.instance }} expires in less than 30 days."
+
+      - alert: KubernetesDeploymentReplicasMismatch
+        expr: (kube_deployment_status_replicas_available < kube_deployment_spec_replicas) and on() (count(up{job="kube-state-metrics"}) > 0)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Deployment replicas mismatch"
+          description: "Available replicas are lower than desired for deployment {{ $labels.namespace }}/{{ $labels.deployment }}."
+
+      - alert: LLMAPIFailure
+        expr: increase(kaiops_agent_executions_total{agent="resolution-agent",status!="succeeded"}[10m]) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LLM API failures"
+          description: "Resolution agent recorded non-succeeded executions in the last 10 minutes."
+
+      - alert: RAGRetrievalFailure
+        expr: increase(kaiops_agent_executions_total{agent="context-agent",status!="succeeded"}[10m]) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RAG retrieval failure"
+          description: "Context agent recorded non-succeeded executions in the last 10 minutes."
+
+      - alert: VectorDBHighLatency
+        expr: histogram_quantile(0.95, sum(rate(kaiops_agent_stage_latency_seconds_bucket{agent="context-agent",stage="execute"}[5m])) by (le)) > 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Vector DB high latency"
+          description: "Context agent execute-stage P95 latency is above 3 seconds."
+
+      - alert: KafkaTopicBacklog
+        expr: sum(kafka_topic_partition_current_offset - kafka_topic_partition_oldest_offset) > 250000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka topic backlog high"
+          description: "Kafka topic backlog exceeded threshold."
+
+      - alert: AgentProcessingTimeout
+        expr: histogram_quantile(0.95, sum(rate(kaiops_agent_stage_latency_seconds_bucket[5m])) by (le, agent)) > 90
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Agent processing timeout"
+          description: "Agent {{ $labels.agent }} processing exceeded 60 seconds at P95."
+
+      - alert: WorkflowExecutionFailure
+        expr: increase(kaiops_events_processed_total{status!="ok"}[10m]) > 2
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Workflow execution failure"
+          description: "One or more pipeline services reported non-ok event processing results."
+
+      - alert: PolicyEngineUnavailable
+        expr: absent(kaiops_events_processed_total{service="orchestrator"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Policy engine unavailable"
+          description: "No orchestrator event-processing metric is present."
+
+      - alert: AutomationExecutionFailure
+        expr: increase(kaiops_events_processed_total{service="remediation-engine",status!="ok"}[10m]) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Automation execution failure"
+          description: "Remediation engine reported non-ok event processing results."
+
+      - alert: HumanApprovalTimeout
+        expr: sum(rate(kaiops_events_processed_total{service="approval-service",status="ok"}[20m])) == 0 and sum(rate(kaiops_events_processed_total{service="resolution-agent",status="ok"}[20m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Human approval timeout"
+          description: "No approval processing detected while resolution events are being produced."
+
+      - alert: IncidentProcessingQueueHigh
+        expr: sum(rate(kaiops_events_processed_total{topic=~"raw-alerts.*",status="ok"}[10m])) > 1 and sum(rate(kaiops_events_processed_total{topic=~"closure-events.*",status="ok"}[10m])) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Incident processing queue high"
+          description: "Raw alerts are being processed but no closure events are observed."

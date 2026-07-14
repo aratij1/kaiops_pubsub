@@ -113,6 +113,35 @@ services:
     depends_on:
       mysql: { condition: service_healthy }
 
+  node-exporter:
+    image: prom/node-exporter:v1.8.1
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($|/)
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    ports: ["9100:9100"]
+
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    command:
+      - --config.file=/etc/blackbox_exporter/config.yml
+    volumes:
+      - ./observability/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    ports: ["9115:9115"]
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    command:
+      - --kafka.server=kafka:9092
+    ports: ["9308:9308"]
+    depends_on:
+      kafka: { condition: service_healthy }
+
   alertmanager:
     image: prom/alertmanager:v0.27.0
     command:
@@ -140,6 +169,9 @@ services:
       api-gateway: { condition: service_healthy }
       monitoring-adapter: { condition: service_started }
       mysql-exporter: { condition: service_started }
+      node-exporter: { condition: service_started }
+      blackbox-exporter: { condition: service_started }
+      kafka-exporter: { condition: service_started }
       alertmanager: { condition: service_started }
 
   monitoring-adapter:
