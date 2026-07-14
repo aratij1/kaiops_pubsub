@@ -84,7 +84,7 @@ pythonpath = [
     "backend/src/closure-service",
     "backend/src/monitoring-adapter",
 ]
-testpaths = ["tests"]
+testpaths = ["backend/tests"]
 
 [tool.ruff]
 line-length = 120
