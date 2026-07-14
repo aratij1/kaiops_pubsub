@@ -49,9 +49,9 @@ This document turns the latest architecture/code review into an execution-ready 
 ### 3) Pending approval state durability
 - Owner: Monitoring Adapter + Data Engineering
 - Files:
-  - `services/monitoring-adapter/app.py`
-  - `services/common/common/repository.py`
-  - `database/schema.sql`
+  - `backend/src/monitoring-adapter/app.py`
+  - `backend/src/common/common/repository.py`
+  - `backend/database/schema.sql`
 - Problem:
   - `PENDING_WORKFLOWS` in-memory map loses state on restart.
 - Implementation:
@@ -64,7 +64,7 @@ This document turns the latest architecture/code review into an execution-ready 
 ### 4) Silent failures in background workers
 - Owner: Monitoring Adapter
 - Files:
-  - `services/monitoring-adapter/app.py`
+  - `backend/src/monitoring-adapter/app.py`
 - Problem:
   - Bare `except Exception: pass` hides projection/ingestion failures.
 - Implementation:
@@ -79,8 +79,8 @@ This document turns the latest architecture/code review into an execution-ready 
 ### 5) Message reliability contract (DLQ + retry semantics)
 - Owner: Messaging Platform + Service Owners
 - Files:
-  - `services/common/common/kafka.py`
-  - `services/common/common/rabbitmq.py`
+  - `backend/src/common/common/kafka.py`
+  - `backend/src/common/common/rabbitmq.py`
 - Problem:
   - Kafka auto-commit and RabbitMQ `requeue=False` can drop failed messages without replay policy.
 - Implementation:
@@ -93,8 +93,8 @@ This document turns the latest architecture/code review into an execution-ready 
 ### 6) Token/session hardening
 - Owner: API Gateway Security
 - Files:
-  - `services/api-gateway/api_gateway/modules/users/service.py`
-  - `services/api-gateway/api_gateway/modules/users/permissions.py`
+  - `backend/src/api-gateway/api_gateway/modules/users/service.py`
+  - `backend/src/api-gateway/api_gateway/modules/users/permissions.py`
 - Problem:
   - Refresh token is reused without rotation.
   - Access token auth path does not consult revocation/session state.
@@ -109,9 +109,9 @@ This document turns the latest architecture/code review into an execution-ready 
 ### 7) Agent work item history model
 - Owner: Data Model + Monitoring Adapter
 - Files:
-  - `database/schema.sql`
-  - `services/common/common/database.py`
-  - `services/common/common/repository.py`
+  - `backend/database/schema.sql`
+  - `backend/src/common/common/database.py`
+  - `backend/src/common/common/repository.py`
 - Problem:
   - Composite PK `(incident_id, agent_name)` overwrites repeated attempts.
 - Implementation:
@@ -124,8 +124,8 @@ This document turns the latest architecture/code review into an execution-ready 
 ### 8) Alert intelligence state consistency across replicas
 - Owner: Alert Intelligence + Data Engineering
 - Files:
-  - `services/alert-intelligence/alert_intelligence/agents/alert/intelligence.py`
-  - `services/common/common/repository_interfaces.py`
+  - `backend/src/alert-intelligence/alert_intelligence/agents/alert/intelligence.py`
+  - `backend/src/common/common/repository_interfaces.py`
 - Problem:
   - In-memory history repository yields inconsistent dedup/correlation in horizontal scale.
 - Implementation:
@@ -155,7 +155,7 @@ This document turns the latest architecture/code review into an execution-ready 
 ### 10) Audit retention and long-term observability
 - Owner: API Gateway + SRE
 - Files:
-  - `services/api-gateway/app.py`
+  - `backend/src/api-gateway/app.py`
 - Problem:
   - Gateway audit stream retained only in memory (`deque(maxlen=200)`).
 - Implementation:

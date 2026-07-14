@@ -25,10 +25,10 @@ Use this quick rule for any new content:
 
 ## Required Folder Usage
 
-- rag/runbooks: procedural runbooks and SOPs
-- rag/incidents: incident knowledge entries and post-incident summaries
-- rag/changes: curated change summaries with operational impact
-- rag/dependencies: human-readable dependency narratives (not canonical graph)
+- backend/rag/runbooks: procedural runbooks and SOPs
+- backend/rag/incidents: incident knowledge entries and post-incident summaries
+- backend/rag/changes: curated change summaries with operational impact
+- backend/rag/dependencies: human-readable dependency narratives (not canonical graph)
 
 ## Required Metadata By Folder
 The context-agent parser reads key-value metadata lines at the top of each markdown file, followed by a blank line.
@@ -97,19 +97,19 @@ Optional keys:
 ## Sync Standard (Source System -> RAG)
 
 1. Incident close:
-- Create or update a single incident knowledge markdown in rag/incidents.
+- Create or update a single incident knowledge markdown in backend/rag/incidents.
 - Include root cause, impact, validated remediation, and prevention notes.
 
 2. Approved change:
-- Create/update summary in rag/changes.
+- Create/update summary in backend/rag/changes.
 - Include operational blast radius and rollback signal.
 
 3. Runbook/SOP update:
-- Update markdown in rag/runbooks.
+- Update markdown in backend/rag/runbooks.
 - Update last_reviewed metadata.
 
 4. Dependency review:
-- Refresh narrative docs in rag/dependencies after major architecture changes.
+- Refresh narrative docs in backend/rag/dependencies after major architecture changes.
 
 5. Reload index:
 - Trigger POST /rag/reload after batch updates.

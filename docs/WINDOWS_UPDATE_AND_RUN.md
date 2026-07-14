@@ -1,8 +1,7 @@
 # Windows Update and Run Guide
 
-Use this guide when your local UI still shows old behavior such as
-`Inject payment latency alert` or Docker logs show the React UI calling
-`/sample/payment-latency` directly.
+Use this guide when your local checkout might be out of date, or when Docker
+logs show the React UI calling `/sample/payment-latency` directly.
 
 ## 1. Update your local source code
 
@@ -50,25 +49,14 @@ Run:
 Or manually check:
 
 ```powershell
-Select-String -Path .\services\ui\app.py -Pattern "Run Flow"
-Select-String -Path .\services\ui\app.py -Pattern "Gateway & Safety"
-Select-String -Path .\services\ui\app.py -Pattern "Closed Incidents"
-Select-String -Path .\services\ui\app.py -Pattern "Human approval"
-Select-String -Path .\services\ui\app.py -Pattern "RAG Ingestion"
-Select-String -Path .\services\api-gateway\app.py -Pattern "/security/check"
-Select-String -Path .\services\api-gateway\app.py -Pattern "/rag/documents"
-Select-String -Path .\services\api-gateway\app.py -Pattern "/sample/flows"
-Select-String -Path .\services\monitoring-adapter\app.py -Pattern "payment-latency/workflow"
+Select-String -Path .\backend\src\api-gateway\app.py -Pattern "/security/check"
+Select-String -Path .\backend\src\api-gateway\app.py -Pattern "/rag/documents"
+Select-String -Path .\backend\src\api-gateway\app.py -Pattern "/sample/flows"
+Select-String -Path .\backend\src\monitoring-adapter\app.py -Pattern "payment-latency/workflow"
 Select-String -Path .\docker-compose.yml -Pattern "healthcheck"
 ```
 
-All three commands should print a match.
-
-This old UI check should print nothing:
-
-```powershell
-Select-String -Path .\services\ui\app.py -Pattern "Inject payment latency alert"
-```
+All commands should print a match.
 
 ## 3. Run locally without Docker
 
@@ -83,7 +71,7 @@ $env:OPENAI_API_KEY = "your-rotated-key"
 If you start services manually in PowerShell, quote environment variable values:
 
 ```powershell
-$env:PYTHONPATH = "$PWD\services\common;$PWD\services\api-gateway;$PWD\services\alert-intelligence;$PWD\services\context-agent;$PWD\services\model-router;$PWD\services\resolution-agent;$PWD\services\orchestrator;$PWD\services\approval-service;$PWD\services\remediation-engine;$PWD\services\closure-service;$PWD\services\monitoring-adapter"
+$env:PYTHONPATH = "$PWD\backend\src\common;$PWD\backend\src\api-gateway;$PWD\backend\src\alert-intelligence;$PWD\backend\src\context-agent;$PWD\backend\src\model-router;$PWD\backend\src\resolution-agent;$PWD\backend\src\orchestrator;$PWD\backend\src\approval-service;$PWD\backend\src\remediation-engine;$PWD\backend\src\closure-service;$PWD\backend\src\monitoring-adapter"
 $env:KAFKA_ENABLED = "false"
 $env:DATABASE_ENABLED = "false"
 $env:OPENAI_API_KEY = "your-rotated-key"
@@ -121,45 +109,14 @@ docker compose ps
 Invoke-RestMethod -Uri "http://localhost:8001/healthz"
 ```
 
-Open the UI:
+Open the UI (React, the active frontend):
 
 ```text
 http://localhost:8501
 ```
 
-The sidebar should let you choose one of 10 incident flows and the run button
-should say:
-
-```text
-Run Flow
-```
-
-The UI should also contain these tabs:
-
-```text
-Incident Summary
-Approval
-Agent Trace
-FinOps
-RAG Ingestion
-Gateway & Safety
-Closed Incidents
-```
-
-After running a workflow, the UI should show readable cards and tables, not raw
-JSON:
-
-- `Incident Summary` shows severity, RCA confidence, gateway safety, latency, handoffs,
-  dependencies, changes, and recommendation.
-- `Approval` shows full incident and recommendation IDs plus approve, reject,
-  and modify actions.
-- `Agent Trace` shows every agent handoff, input, decision, output, and metrics.
-- `FinOps` shows tokens and cost by provider, model, and task.
-- `RAG Ingestion` lets you add, reload, list, and search RAG documents.
-- `Gateway & Safety` shows trace ID, policy decision, policy reasons,
-  route, recent audit events, and gateway summary.
-- `Closed Incidents` shows the final closure report, validation checks,
-  knowledge-base update, and lessons learned.
+The Alert Stream panel should let you browse and select alerts, with a
+configurable "Show N alerts" limit next to the Refresh button.
 
 ## 6. Test the workflows
 

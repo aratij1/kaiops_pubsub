@@ -9,7 +9,7 @@ This document describes how KaiMS makes orchestration decisions using:
 
 ## 1. Policy Engine Flow
 
-Source: `services/common/common/orchestration/policy_engine.py`
+Source: `backend/src/common/common/orchestration/policy_engine.py`
 
 ```mermaid
 flowchart TD
@@ -34,7 +34,7 @@ Outputs:
 
 ## 2. Workflow Engine Flow
 
-Source: `services/common/common/orchestration/workflow_engine.py`
+Source: `backend/src/common/common/orchestration/workflow_engine.py`
 
 ```mermaid
 flowchart TD
@@ -89,7 +89,7 @@ Planner is advisory only. Policy remains authoritative.
 
 ## 4. AI Orchestrator Agent Flow
 
-Source: `services/orchestrator/orchestrator/workflow.py`
+Source: `backend/src/orchestrator/orchestrator/workflow.py`
 
 ```mermaid
 sequenceDiagram
@@ -153,8 +153,8 @@ flowchart LR
 
 Sources:
 
-- `services/context-agent/app.py`
-- `services/context-agent/context_agent/connectors.py`
+- `backend/src/context-agent/app.py`
+- `backend/src/context-agent/context_agent/connectors.py`
 
 ```mermaid
 flowchart TD

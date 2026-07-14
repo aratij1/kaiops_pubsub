@@ -120,7 +120,7 @@ Use two layers:
 - One row per incident for fast dashboard/API reads.
 - Updated by projection workers from the event store.
 
-For existing databases, apply [database/migrations/20260708_incident_projection_backfill.sql](database/migrations/20260708_incident_projection_backfill.sql) once to seed projections from historical `incidents` rows.
+For existing databases, apply [backend/database/migrations/20260708_incident_projection_backfill.sql](backend/database/migrations/20260708_incident_projection_backfill.sql) once to seed projections from historical `incidents` rows.
 
 ## Scalability Guardrails
 
