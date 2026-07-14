@@ -299,7 +299,7 @@ services:
     build:
       context: ./services/ui/react
       dockerfile: Dockerfile
-    ports: ["8501:80"]
+    ports: ["80:80"]
     depends_on:
       api-gateway: { condition: service_healthy }
       approval-service: { condition: service_started }
