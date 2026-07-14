@@ -147,7 +147,7 @@ def ensure_flow_catalog_exists() -> list[dict[str, str]]:
 
 
 def load_scenarios_from_text_file() -> dict[str, dict[str, Any]]:
-    """Load additional alert scenarios from rag/scenarios.txt.
+    """Load additional alert scenarios from backend/rag/scenarios.txt.
 
     Expected format (pipe-delimited):
     id|title|source|service|severity|description|root_cause|impact|recommended_action
@@ -278,4 +278,4 @@ def resolve_flow_id(flow_id: str, scenarios: dict[str, dict[str, Any]]) -> str:
         return "payment-latency"
     if scenarios:
         return next(iter(scenarios))
-    raise HTTPException(status_code=500, detail="No alert scenarios configured. Add entries to rag/scenarios.txt")
+    raise HTTPException(status_code=500, detail="No alert scenarios configured. Add entries to backend/rag/scenarios.txt")

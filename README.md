@@ -84,30 +84,35 @@ To add a new enterprise agent:
 
 Notes:
 
-- Canonical topic names are defined in `services/common/common/topics.py`.
+- Canonical topic names are defined in `backend/src/common/common/topics.py`.
 - With `KAFKA_ENABLED=false`, the local in-process workflow path bypasses Kafka topics and runs directly via gateway/monitoring-adapter workflow endpoints.
 
 ## Folder Structure
 
 ```text
-services/
-  api-gateway/             Safety checks, trace IDs, observability, proxy routes
-  monitoring-adapter/      FastAPI webhook adapter for monitoring tools
-  alert-intelligence/      Deduplication, correlation, severity, enrichment
-  orchestrator/            Workflow decision and downstream invocation
-  model-router/            GPT-4o, GPT-5, Claude, Gemini, local Llama routing
-  context-agent/           CMDB, ServiceNow, Kubernetes, Jenkins, GitHub, RAG
-  resolution-agent/        LangGraph RCA -> impact -> fix -> confidence
-  approval-service/        Slack/Teams/email/web approval API
-  remediation-engine/      Strategy plugins for Jenkins/K8s/Ansible/Terraform/API
-  closure-service/         Health validation, ticket closure, KB/RCA storage
-  common/                  Models, Kafka, SQLAlchemy, telemetry, resilience
-  ui/                      React incident operations dashboard
-rag/                       Markdown RAG corpus for runbooks, incidents, changes, dependencies
-database/schema.sql        MySQL DDL and canonical schema for the platform
-database/migrations/       Schema migrations and backfills for metadata/RBAC
-k8s/                       Namespace, ConfigMap, generated Secret workflow, Deployments, Services, Ingress, HPA
-.github/workflows/ci.yml   Lint, test, Docker build, Kubernetes validation
+backend/
+  src/
+    api-gateway/             Safety checks, trace IDs, observability, proxy routes
+    monitoring-adapter/      FastAPI webhook adapter for monitoring tools
+    alert-intelligence/      Deduplication, correlation, severity, enrichment
+    orchestrator/            Workflow decision and downstream invocation
+    model-router/            GPT-4o, GPT-5, Claude, Gemini, local Llama routing
+    context-agent/           CMDB, ServiceNow, Kubernetes, Jenkins, GitHub, RAG
+    resolution-agent/        LangGraph RCA -> impact -> fix -> confidence
+    approval-service/        Slack/Teams/email/web approval API
+    remediation-engine/      Strategy plugins for Jenkins/K8s/Ansible/Terraform/API
+    closure-service/         Health validation, ticket closure, KB/RCA storage
+    common/                  Models, Kafka, SQLAlchemy, telemetry, resilience
+  tests/                     Automated test suite (pytest)
+  database/schema.sql        MySQL DDL and canonical schema for the platform
+  database/migrations/       Schema migrations and backfills for metadata/RBAC
+  rag/                       Markdown RAG corpus for runbooks, incidents, changes, dependencies
+  ingested_alerts/           Raw/processed/failed alert samples ingested by monitoring-adapter
+frontend/
+  react/                     React incident operations dashboard
+k8s/                         Namespace, ConfigMap, generated Secret workflow, Deployments, Services, Ingress, HPA
+scripts/                     Local dev, RAG validation, and smoke-test tooling
+.github/workflows/ci.yml     Lint, test, Docker build, Kubernetes validation
 ```
 
 ## Core APIs
@@ -187,10 +192,10 @@ Default seeded users (override these in non-demo environments):
 
 Database objects are defined in:
 
-- `database/schema.sql`
-- `database/migrations/20260701_user_rbac.sql`
-- `database/migrations/20260708_incident_metadata_layer.sql`
-- `database/migrations/20260708_incident_projection_backfill.sql`
+- `backend/database/schema.sql`
+- `backend/database/migrations/20260701_user_rbac.sql`
+- `backend/database/migrations/20260708_incident_metadata_layer.sql`
+- `backend/database/migrations/20260708_incident_projection_backfill.sql`
 
 Apply migration manually for existing DBs before starting services.
 
@@ -311,8 +316,8 @@ terminals before using the dashboard buttons. For example:
 ```bash
 export KAFKA_ENABLED=false
 export DATABASE_ENABLED=false
-uvicorn app:app --host 0.0.0.0 --port 8001 --app-dir services/monitoring-adapter
-cd services/ui/react && npm install && npm run dev
+uvicorn app:app --host 0.0.0.0 --port 8001 --app-dir backend/src/monitoring-adapter
+cd frontend/react && npm install && npm run dev
 ```
 
 On PowerShell, use `$env:KAFKA_ENABLED="false"` and
@@ -469,7 +474,7 @@ override flows.
 - AsyncIO-first Kafka, HTTP, and agent workflows
 - SQLAlchemy async PostgreSQL persistence
 - Redis-ready configuration
-- File-backed RAG corpus in `rag/` loaded by the Context Intelligence Agent
+- File-backed RAG corpus in `backend/rag/` loaded by the Context Intelligence Agent
 - Prometheus client metrics
 - OpenTelemetry FastAPI tracing with optional OTLP exporter
 - Structured JSON logging
@@ -483,10 +488,10 @@ override flows.
 
 ## RAG Knowledge Corpus
 
-Context retrieval loads Markdown documents from `rag/` at startup:
+Context retrieval loads Markdown documents from `backend/rag/` at startup:
 
 ```text
-rag/
+backend/rag/
   runbooks/
   incidents/
   deployments/

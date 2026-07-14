@@ -78,7 +78,7 @@ class _FakeSession:
         self.jwt_id = jwt_id
         self.status = status
         self.ip_address = "127.0.0.1"
-        self.device = "Streamlit UI"
+        self.device = "React UI"
         self.expiry_time = __import__("datetime").datetime.now(__import__("datetime").UTC) + __import__("datetime").timedelta(minutes=30)
         self.updated_at = None
 
@@ -113,7 +113,7 @@ def test_seeded_admin_login(monkeypatch) -> None:
     monkeypatch.setattr("api_gateway.modules.users.service.run_in_session", fake_run_in_session)
 
     result = __import__("asyncio").run(
-        svc.login(username="admin", password=password, ip_address=None, device="Streamlit UI")
+        svc.login(username="admin", password=password, ip_address=None, device="React UI")
     )
 
     assert result["user"]["username"] == "admin"
@@ -133,7 +133,7 @@ def test_seeded_admin_login_repairs_malformed_hash(monkeypatch) -> None:
     monkeypatch.setattr("api_gateway.modules.users.service.run_in_session", fake_run_in_session)
 
     result = __import__("asyncio").run(
-        svc.login(username="admin", password=password, ip_address=None, device="Streamlit UI")
+        svc.login(username="admin", password=password, ip_address=None, device="React UI")
     )
 
     assert result["user"]["username"] == "admin"
@@ -153,7 +153,7 @@ def test_seeded_admin_login_normalizes_reserved_email_for_response(monkeypatch) 
 
     monkeypatch.setattr("api_gateway.modules.users.service.run_in_session", fake_run_in_session)
 
-    __import__("asyncio").run(svc.login(username="admin", password=password, ip_address=None, device="Streamlit UI"))
+    __import__("asyncio").run(svc.login(username="admin", password=password, ip_address=None, device="React UI"))
     normalized = svc._user_to_dict(fake_repo.user, "Administrator")
 
     assert normalized["email"] == "admin@kaiops.example.com"

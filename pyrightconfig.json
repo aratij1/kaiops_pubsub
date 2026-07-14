@@ -1,17 +1,17 @@
 {
-  "include": ["services", "tests"],
+  "include": ["backend"],
   "extraPaths": [
-    "services/common",
-    "services/api-gateway",
-    "services/alert-intelligence",
-    "services/context-agent",
-    "services/model-router",
-    "services/resolution-agent",
-    "services/orchestrator",
-    "services/approval-service",
-    "services/remediation-engine",
-    "services/closure-service",
-    "services/monitoring-adapter"
+    "backend/src/common",
+    "backend/src/api-gateway",
+    "backend/src/alert-intelligence",
+    "backend/src/context-agent",
+    "backend/src/model-router",
+    "backend/src/resolution-agent",
+    "backend/src/orchestrator",
+    "backend/src/approval-service",
+    "backend/src/remediation-engine",
+    "backend/src/closure-service",
+    "backend/src/monitoring-adapter"
   ],
   "pythonVersion": "3.12",
   "typeCheckingMode": "basic"
