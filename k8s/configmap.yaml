@@ -4,6 +4,7 @@ metadata:
   name: kaiops-config
   namespace: kaiops
 data:
+  ENVIRONMENT: prod
   KAFKA_BOOTSTRAP_SERVERS: kafka:9092
   REDIS_URL: redis://redis:6379/0
   CONTEXT_AGENT_URL: http://context-agent:8000
@@ -24,3 +25,4 @@ data:
   RABBITMQ_CONSUMER_MAX_RETRIES: "3"
   RABBITMQ_DLQ_SUFFIX: .dlq
   DATABASE_ENABLED: "true"
+  TRUST_X_FORWARDED_FOR: "true"

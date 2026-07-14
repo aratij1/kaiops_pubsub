@@ -11,6 +11,7 @@ from aio_pika import DeliveryMode, ExchangeType, Message, RobustChannel, RobustC
 
 from common.config import Settings
 from common.logging import get_logger
+from common.message_processing import ProcessedMessageCache, extract_message_identity
 
 logger = get_logger(__name__)
 
@@ -146,6 +147,7 @@ async def consume_forever(
     consumer: RabbitMQConsumer,
     handler: Callable[[dict[str, Any]], Awaitable[None]],
 ) -> None:
+    processed_cache = ProcessedMessageCache()
     while True:
         try:
             await consumer.start()
@@ -167,14 +169,22 @@ async def consume_forever(
                         await message.ack()
                         continue
 
+                    identity = extract_message_identity(payload)
+                    if processed_cache.contains(identity):
+                        logger.info("skipping duplicate rabbitmq message", extra={"topic": consumer._topic, "message_identity": identity})
+                        await message.ack()
+                        continue
+
                     attempts = 0
                     max_retries = max(0, int(consumer._settings.rabbitmq_consumer_max_retries or 0))
                     success = False
+                    dlq_published = False
 
                     while attempts <= max_retries:
                         try:
                             await handler(payload)
                             success = True
+                            processed_cache.mark(identity)
                             break
                         except Exception:
                             attempts += 1
@@ -209,12 +219,18 @@ async def consume_forever(
                                 ),
                                 routing_key=consumer._dlq_routing_key,
                             )
+                            processed_cache.mark(identity)
+                            dlq_published = True
                         except Exception:
                             logger.exception(
                                 "failed to publish rabbitmq dlq message",
                                 extra={"topic": consumer._topic, "dlq": consumer._dlq_routing_key},
                             )
-                    await message.ack()
+                    if dlq_published:
+                        await message.ack()
+                        continue
+
+                    await message.nack(requeue=True)
         except asyncio.CancelledError:
             raise
         except Exception:

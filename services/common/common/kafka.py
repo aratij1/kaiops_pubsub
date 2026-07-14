@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from common.config import Settings
 from common.logging import get_logger
+from common.message_processing import ProcessedMessageCache, extract_message_identity
 from common.resilience import retry_async
 
 logger = get_logger(__name__)
@@ -152,15 +153,27 @@ async def consume_forever(
     except Exception:
         logger.exception("failed to initialize kafka dlq producer", extra={"topic": consumer._topic})
 
+    processed_cache = ProcessedMessageCache()
+
     try:
         async for record in consumer._consumer:
             payload = record.value if isinstance(record.value, dict) else {}
+            identity = extract_message_identity(payload)
+            if processed_cache.contains(identity):
+                logger.info("skipping duplicate kafka message", extra={"topic": consumer._topic, "message_identity": identity})
+                if consumer._consumer is not None:
+                    await consumer._consumer.commit()
+                continue
+
             attempts = 0
             max_retries = max(0, int(consumer._settings.kafka_consumer_max_retries or 0))
+            should_commit = False
             try:
                 while attempts <= max_retries:
                     try:
                         await handler(payload)
+                        processed_cache.mark(identity)
+                        should_commit = True
                         break
                     except Exception:
                         attempts += 1
@@ -185,10 +198,12 @@ async def consume_forever(
                                 "failed_at": datetime.now(timezone.utc).isoformat(),
                             },
                         )
+                        processed_cache.mark(identity)
+                        should_commit = True
                     except Exception:
                         logger.exception("failed to publish kafka dlq message", extra={"topic": dlq_topic})
             finally:
-                if consumer._consumer is not None:
+                if should_commit and consumer._consumer is not None:
                     await consumer._consumer.commit()
     finally:
         await dlq_producer.stop()

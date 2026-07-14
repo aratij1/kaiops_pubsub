@@ -62,13 +62,31 @@ class UserService:
             return f"{username.strip().lower()}@kaiops.example.com"
         return email
 
-    def _encode_token(self, *, user_id: int, role: str, token_type: str, expires_delta: timedelta, jwt_id: str) -> str:
+    def _coerce_utc(self, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            # MySQL DATETIME values may be returned as naive objects; treat them as UTC.
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    def _encode_token(
+        self,
+        *,
+        user_id: int,
+        role: str,
+        token_type: str,
+        expires_delta: timedelta,
+        jwt_id: str,
+        session_jti: str,
+    ) -> str:
         now = datetime.now(UTC)
         payload = {
             "sub": str(user_id),
             "role": role,
             "type": token_type,
             "jti": jwt_id,
+            "sid": session_jti,
             "iat": int(now.timestamp()),
             "exp": int((now + expires_delta).timestamp()),
         }
@@ -82,6 +100,19 @@ class UserService:
             return payload
         except jwt.PyJWTError as exc:
             raise HTTPException(status_code=401, detail=f"Invalid token: {exc}") from exc
+
+    async def ensure_active_session(self, *, session_jti: str, user_id: int) -> None:
+        async def op(repo: UserRepository):
+            session = await repo.get_session_by_jti(session_jti)
+            if session is None or session.status != "active":
+                raise HTTPException(status_code=401, detail="Session is invalid")
+            if int(session.user_id) != int(user_id):
+                raise HTTPException(status_code=401, detail="Session does not belong to this user")
+            session_expiry = self._coerce_utc(session.expiry_time)
+            if session_expiry is None or session_expiry < datetime.now(UTC):
+                raise HTTPException(status_code=401, detail="Session expired")
+
+        await run_in_session(self.session_factory, op)
 
     def _user_to_dict(self, user: UserRecord, role_name: str) -> dict:
         normalized_email = self._normalize_local_email(user.username, user.email)
@@ -187,7 +218,8 @@ class UserService:
             role_name = role.name if role else "Unknown"
 
             now = datetime.now(UTC)
-            if user.locked_until and user.locked_until > now:
+            locked_until = self._coerce_utc(user.locked_until)
+            if locked_until and locked_until > now:
                 raise HTTPException(status_code=423, detail="Account is locked")
 
             if not user.is_active or user.status.lower() != "active":
@@ -228,6 +260,7 @@ class UserService:
                 token_type="access",
                 expires_delta=access_expires,
                 jwt_id=access_jti,
+                session_jti=refresh_jti,
             )
             refresh_token = self._encode_token(
                 user_id=user.id,
@@ -235,6 +268,7 @@ class UserService:
                 token_type="refresh",
                 expires_delta=refresh_expires,
                 jwt_id=refresh_jti,
+                session_jti=refresh_jti,
             )
 
             await repo.create_session(
@@ -270,13 +304,17 @@ class UserService:
 
         user_id = int(payload.get("sub", "0"))
         jti = str(payload.get("jti") or "")
+        session_jti = str(payload.get("sid") or jti or "")
 
         async def op(repo: UserRepository):
-            session = await repo.get_session_by_jti(jti)
+            session = await repo.get_session_by_jti(session_jti)
             if session is None or session.status != "active":
                 raise HTTPException(status_code=401, detail="Session is invalid")
-            if session.expiry_time < datetime.now(UTC):
+            session_expiry = self._coerce_utc(session.expiry_time)
+            if session_expiry is None or session_expiry < datetime.now(UTC):
                 raise HTTPException(status_code=401, detail="Session expired")
+            if int(session.user_id) != user_id:
+                raise HTTPException(status_code=401, detail="Session does not belong to this user")
 
             user = await repo.get_user(user_id)
             if user is None:
@@ -284,14 +322,38 @@ class UserService:
             role = await repo.get_role(user.role_id)
             role_name = role.name if role else "Unknown"
 
+            session.status = "rotated"
+            session.updated_at = datetime.now(UTC)
+
             access_jti = uuid4().hex
+            new_refresh_jti = uuid4().hex
             access_expires = timedelta(minutes=self.settings.jwt_access_token_minutes)
+            refresh_expires = timedelta(minutes=self.settings.jwt_refresh_token_minutes)
             access_token = self._encode_token(
                 user_id=user.id,
                 role=role_name,
                 token_type="access",
                 expires_delta=access_expires,
                 jwt_id=access_jti,
+                session_jti=new_refresh_jti,
+            )
+            rotated_refresh_token = self._encode_token(
+                user_id=user.id,
+                role=role_name,
+                token_type="refresh",
+                expires_delta=refresh_expires,
+                jwt_id=new_refresh_jti,
+                session_jti=new_refresh_jti,
+            )
+
+            await repo.create_session(
+                user_id=user.id,
+                jwt_id=new_refresh_jti,
+                login_time=datetime.now(UTC),
+                expiry_time=datetime.now(UTC) + refresh_expires,
+                ip_address=session.ip_address,
+                device=session.device,
+                status="active",
             )
 
             await repo.add_audit(
@@ -299,11 +361,11 @@ class UserService:
                 action="token.refresh",
                 resource_type="session",
                 resource_id=str(session.id),
-                payload={"jwt_id": jti},
+                payload={"jwt_id": jti, "rotated_to": new_refresh_jti},
             )
             return {
                 "access_token": access_token,
-                "refresh_token": refresh_token,
+                "refresh_token": rotated_refresh_token,
                 "expires_in": int(access_expires.total_seconds()),
                 "user": self._user_to_dict(user, role_name),
             }
@@ -321,15 +383,15 @@ class UserService:
 
         return await run_in_session(self.session_factory, op)
 
-    async def logout(self, *, jwt_id: str, user_id: int) -> dict:
+    async def logout(self, *, session_jti: str, user_id: int) -> dict:
         async def op(repo: UserRepository):
             user = await repo.get_user(user_id)
-            await repo.revoke_session(jwt_id)
+            await repo.revoke_session(session_jti)
             await repo.add_audit(
                 actor=user.username if user else "unknown",
                 action="logout",
                 resource_type="session",
-                resource_id=jwt_id,
+                resource_id=session_jti,
                 payload={},
             )
             return {"status": "ok"}

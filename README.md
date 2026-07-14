@@ -106,7 +106,7 @@ services/
 rag/                       Markdown RAG corpus for runbooks, incidents, changes, dependencies
 database/schema.sql        MySQL DDL and canonical schema for the platform
 database/migrations/       Schema migrations and backfills for metadata/RBAC
-k8s/                       Namespace, ConfigMap, Secret, Deployments, Services, Ingress, HPA
+k8s/                       Namespace, ConfigMap, generated Secret workflow, Deployments, Services, Ingress, HPA
 .github/workflows/ci.yml   Lint, test, Docker build, Kubernetes validation
 ```
 
@@ -225,6 +225,29 @@ $env:GROQ_API_KEY = "your-groq-key"
 $env:GROQ_MODEL = "llama-3.3-70b-versatile"
 $env:LLM_REQUEST_TIMEOUT_SECONDS = "120"
 ```
+
+## Kubernetes Secret Management
+
+Kubernetes runtime secrets are intentionally not stored in git.
+
+Required secret values:
+
+- `DATABASE_URL`
+- `OPENAI_API_KEY`
+- `GEMINI_API_KEY`
+- `GROQ_API_KEY`
+
+Create the deployment secret out of band before applying the workloads:
+
+```powershell
+$env:DATABASE_URL = "mysql+aiomysql://kaiops:<password>@mysql:3306/kaiops"
+$env:OPENAI_API_KEY = "your-rotated-key"
+$env:GEMINI_API_KEY = ""
+$env:GROQ_API_KEY = ""
+./k8s/create-secret.ps1
+```
+
+This creates or updates the `kaiops-secrets` secret in the `kaiops` namespace without committing secret material to the repository.
 
 Real LLM-backed workflows can take longer than mock flows. The API Gateway
 defaults to a 180 second downstream timeout.

@@ -14,6 +14,7 @@ from api_gateway import SafetyAnalyzer
 from api_gateway.modules.users.router import router as user_management_router
 from api_gateway.modules.users.service import UserService
 from common.config import get_settings
+from common.database import AuditLogRecord
 from common.event_publishers import build_agent_event_contract
 from common.kafka import normalize_payload
 from common.models import GatewayAuditEvent, SafetyDecision
@@ -22,6 +23,7 @@ from common.telemetry import REQUEST_LATENCY
 from fastapi import Body, Header, HTTPException, Request
 from opentelemetry import trace
 from prometheus_client import Counter, Gauge
+from sqlalchemy import func, select
 
 REQUEST_BODY = Body(default={})
 
@@ -30,6 +32,93 @@ settings.service_name = "api-gateway"
 analyzer = SafetyAnalyzer()
 AUDIT_EVENTS: deque[GatewayAuditEvent] = deque(maxlen=200)
 logger = logging.getLogger("api-gateway")
+
+
+async def _persist_gateway_audit_event(app: FastAPI, event: GatewayAuditEvent) -> None:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        return
+    payload = event.model_dump(mode="json")
+    async with session_factory() as session:
+        session.add(
+            AuditLogRecord(
+                id=event.id,
+                actor="api-gateway",
+                action="gateway.request",
+                resource_type="gateway",
+                resource_id=str(event.trace_id or event.id),
+                payload=payload,
+            )
+        )
+        await session.commit()
+
+
+def _gateway_event_from_audit_payload(payload: dict[str, Any]) -> GatewayAuditEvent | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return GatewayAuditEvent.model_validate(payload)
+    except Exception:
+        return None
+
+
+async def _load_recent_gateway_audit_events(app: FastAPI, limit: int) -> list[GatewayAuditEvent]:
+    session_factory = getattr(app.state, "session_factory", None)
+    safe_limit = max(1, min(int(limit), 100))
+    if not settings.database_enabled or session_factory is None:
+        return list(AUDIT_EVENTS)[:safe_limit]
+    async with session_factory() as session:
+        result = await session.execute(
+            select(AuditLogRecord)
+            .where(AuditLogRecord.resource_type == "gateway")
+            .where(AuditLogRecord.action == "gateway.request")
+            .order_by(AuditLogRecord.created_at.desc())
+            .limit(safe_limit)
+        )
+        rows = result.scalars().all()
+    events = [_gateway_event_from_audit_payload(row.payload or {}) for row in rows]
+    return [event for event in events if event is not None]
+
+
+async def _load_gateway_audit_summary(app: FastAPI) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        events = list(AUDIT_EVENTS)
+        blocked = sum(1 for event in events if event.safety.decision == SafetyDecision.BLOCK)
+        review = sum(1 for event in events if event.safety.decision == SafetyDecision.REVIEW)
+        allowed = sum(1 for event in events if event.safety.decision == SafetyDecision.ALLOW)
+        return {
+            "total_events": len(events),
+            "allowed": allowed,
+            "review": review,
+            "blocked": blocked,
+            "latest_trace_id": events[0].trace_id if events else None,
+        }
+
+    recent_events = await _load_recent_gateway_audit_events(app, 250)
+    async with session_factory() as session:
+        total = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(AuditLogRecord)
+                    .where(AuditLogRecord.resource_type == "gateway")
+                    .where(AuditLogRecord.action == "gateway.request")
+                )
+            ).scalar_one()
+        )
+    blocked = sum(1 for event in recent_events if event.safety.decision == SafetyDecision.BLOCK)
+    review = sum(1 for event in recent_events if event.safety.decision == SafetyDecision.REVIEW)
+    allowed = sum(1 for event in recent_events if event.safety.decision == SafetyDecision.ALLOW)
+    latest_event = recent_events[0] if recent_events else None
+    return {
+        "total_events": total,
+        "window_events": len(recent_events),
+        "allowed": allowed,
+        "review": review,
+        "blocked": blocked,
+        "latest_trace_id": latest_event.trace_id if latest_event else None,
+    }
 
 
 def _query_alerts_table_row_count() -> float:
@@ -196,6 +285,7 @@ async def guarded_proxy(
                 request_preview=preview(payload),
             )
             AUDIT_EVENTS.appendleft(event)
+            await _persist_gateway_audit_event(app, event)
             GATEWAY_REQUESTS.labels(path, safety.decision.value, "blocked").inc()
             REQUEST_LATENCY.labels(settings.service_name, path).observe(latency_ms / 1000)
             raise HTTPException(
@@ -264,6 +354,7 @@ async def guarded_proxy(
             response_preview=preview(response_payload),
         )
         AUDIT_EVENTS.appendleft(event)
+        await _persist_gateway_audit_event(app, event)
         GATEWAY_REQUESTS.labels(path, safety.decision.value, status).inc()
         REQUEST_LATENCY.labels(settings.service_name, path).observe(latency_ms / 1000)
 
@@ -844,7 +935,7 @@ async def security_check(payload: dict[str, Any] = REQUEST_BODY) -> dict[str, An
 
 @app.get("/observability/recent")
 async def recent_events(limit: int = 25) -> dict[str, Any]:
-    events = list(AUDIT_EVENTS)[: max(1, min(limit, 100))]
+    events = await _load_recent_gateway_audit_events(app, limit)
     response_rows: list[dict[str, Any]] = []
     for event in events:
         row = event.model_dump(mode="json")
@@ -855,14 +946,4 @@ async def recent_events(limit: int = 25) -> dict[str, Any]:
 
 @app.get("/observability/summary")
 async def observability_summary() -> dict[str, Any]:
-    events = list(AUDIT_EVENTS)
-    blocked = sum(1 for event in events if event.safety.decision == SafetyDecision.BLOCK)
-    review = sum(1 for event in events if event.safety.decision == SafetyDecision.REVIEW)
-    allowed = sum(1 for event in events if event.safety.decision == SafetyDecision.ALLOW)
-    return {
-        "total_events": len(events),
-        "allowed": allowed,
-        "review": review,
-        "blocked": blocked,
-        "latest_trace_id": events[0].trace_id if events else None,
-    }
+    return await _load_gateway_audit_summary(app)

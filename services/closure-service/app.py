@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
+from datetime import datetime, timezone
 from typing import Any
 
 from closure_service import ClosureValidationAgent
 from common.config import get_settings
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
-from common.models import RemediationAction, ResolutionReport
+from common.models import Incident, IncidentStatus, RemediationAction, ResolutionReport
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app
@@ -87,6 +88,19 @@ async def _persist_closure_event(
 
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
+        incident_payload = await repo.get_incident(str(action.incident_id)) or {}
+        final_incident_payload = {
+            **(incident_payload if isinstance(incident_payload, dict) else {}),
+            "id": str(action.incident_id),
+            "service": str((incident_payload or {}).get("service") or action.target or "unknown"),
+            "title": str((incident_payload or {}).get("title") or f"Incident {action.incident_id}"),
+            "environment": str((incident_payload or {}).get("environment") or "prod"),
+            "severity": str((incident_payload or {}).get("severity") or recommendation.get("severity") or "warning").lower(),
+            "status": IncidentStatus.CLOSED.value if report.health_restored else IncidentStatus.FAILED.value,
+            "closed_at": datetime.now(timezone.utc).isoformat() if report.health_restored else (incident_payload or {}).get("closed_at"),
+            "trace_id": str((incident_payload or {}).get("trace_id") or source_contract.get("trace_id") or recommendation.get("trace_id") or "") or None,
+        }
+        await repo.save_incident(Incident.model_validate(final_incident_payload))
         await repo.save_incident_event(
             build_event_envelope(
                 event_type="incident.closure.completed",
