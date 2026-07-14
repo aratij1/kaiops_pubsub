@@ -711,6 +711,8 @@ export default function App() {
   const [submitState, setSubmitState] = useState({ loading: false, result: null, error: "" });
   const [workflowState, setWorkflowState] = useState({ loading: false, result: null, error: "" });
   const [approvalState, setApprovalState] = useState({ loading: false, result: null, error: "" });
+  const [inlineRejectState, setInlineRejectState] = useState({ incidentId: "", comment: "" });
+  const [showAdvancedApprovalForm, setShowAdvancedApprovalForm] = useState(false);
   const [approvalFilter, setApprovalFilter] = useState("all");
   const [approvalIncidentContext, setApprovalIncidentContext] = useState({
     loading: false,
@@ -3101,6 +3103,113 @@ export default function App() {
     return String(approvalForm.modified_action || "").trim().length > 0;
   }, [approvalForm]);
 
+  async function executeApprovalAction({
+    incidentId,
+    recommendationId,
+    action,
+    approver,
+    channel,
+    comment,
+    modifiedAction,
+  }) {
+    const normalizedIncidentId = String(incidentId || "").trim();
+    const normalizedRecommendationId = String(recommendationId || "").trim();
+    const normalizedAction = String(action || "approve").trim().toLowerCase() || "approve";
+
+    if (!looksLikeUuid(normalizedIncidentId) || !looksLikeUuid(normalizedRecommendationId)) {
+      throw new Error("Approval requires valid UUID incident_id and recommendation_id. Select a pending row and sync context first.");
+    }
+
+    const payload = {
+      incident_id: normalizedIncidentId,
+      recommendation_id: normalizedRecommendationId,
+      approver: String(approver || "").trim(),
+      channel: String(channel || "web").trim(),
+      comment: String(comment || "").trim() || null,
+    };
+
+    if (normalizedAction === "modify") {
+      payload.modified_action = String(modifiedAction || "").trim();
+    }
+
+    return fetchJson(`/api-gateway/approval/${normalizedAction}`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async function approveIncidentRow(row) {
+    const incidentId = approvalIncidentId(row);
+    const rowRecommendationId = approvalRecommendationId(row);
+    const recommendationId = rowRecommendationId
+      || (approvalIncidentContext.incident_id === incidentId ? approvalRecommendationFromPayload(approvalIncidentContext.payload) : "");
+
+    setSelectedApprovalIncidentId(incidentId);
+    setApprovalState({ loading: true, result: null, error: "" });
+
+    try {
+      const response = await executeApprovalAction({
+        incidentId,
+        recommendationId,
+        action: "approve",
+        approver: approvalForm.approver,
+        channel: approvalForm.channel,
+        comment: approvalForm.comment,
+      });
+      setApprovalForm((current) => ({
+        ...current,
+        action: "approve",
+        incident_id: incidentId || current.incident_id,
+        recommendation_id: recommendationId || current.recommendation_id,
+      }));
+      setApprovalState({ loading: false, result: response, error: "" });
+      await Promise.all([loadIncidentMetadata(), loadGatewayRecent(), loadGatewaySummary()]);
+    } catch (error) {
+      const raw = String(error?.message || "");
+      const concise = raw.includes("HTTP 422")
+        ? "Inline approve needs a valid recommendation_id. Use Sync From Approval API first if this row has not been enriched yet."
+        : raw;
+      setApprovalState({ loading: false, result: null, error: concise });
+    }
+  }
+
+  async function rejectIncidentRow(row) {
+    const incidentId = approvalIncidentId(row);
+    const rowRecommendationId = approvalRecommendationId(row);
+    const recommendationId = rowRecommendationId
+      || (approvalIncidentContext.incident_id === incidentId ? approvalRecommendationFromPayload(approvalIncidentContext.payload) : "");
+
+    setSelectedApprovalIncidentId(incidentId);
+    setApprovalState({ loading: true, result: null, error: "" });
+
+    try {
+      const response = await executeApprovalAction({
+        incidentId,
+        recommendationId,
+        action: "reject",
+        approver: approvalForm.approver,
+        channel: approvalForm.channel,
+        comment: inlineRejectState.comment,
+      });
+      setApprovalForm((current) => ({
+        ...current,
+        action: "reject",
+        incident_id: incidentId || current.incident_id,
+        recommendation_id: recommendationId || current.recommendation_id,
+        comment: inlineRejectState.comment || current.comment,
+      }));
+      setInlineRejectState({ incidentId: "", comment: "" });
+      setApprovalState({ loading: false, result: response, error: "" });
+      await Promise.all([loadIncidentMetadata(), loadGatewayRecent(), loadGatewaySummary()]);
+    } catch (error) {
+      const raw = String(error?.message || "");
+      const concise = raw.includes("HTTP 422")
+        ? "Inline reject needs a valid recommendation_id. Use Sync From Approval API first if this row has not been enriched yet."
+        : raw;
+      setApprovalState({ loading: false, result: null, error: concise });
+    }
+  }
+
   async function submitApproval(event) {
     event.preventDefault();
     setApprovalState({ loading: true, result: null, error: "" });
@@ -3112,23 +3221,14 @@ export default function App() {
         || approvalRecommendationFromPayload(approvalIncidentContext.payload)
         || ""
       ).trim();
-      if (!looksLikeUuid(incidentId) || !looksLikeUuid(recommendationIdCandidate)) {
-        throw new Error("Approval requires valid UUID incident_id and recommendation_id. Select a pending row and sync context first.");
-      }
-
-      const payload = {
-        incident_id: incidentId,
-        recommendation_id: recommendationIdCandidate,
-        approver: String(approvalForm.approver || "").trim(),
-        channel: String(approvalForm.channel || "web").trim(),
-        comment: String(approvalForm.comment || "").trim() || null,
-      };
-      if (approvalForm.action === "modify") {
-        payload.modified_action = String(approvalForm.modified_action || "").trim();
-      }
-      const response = await fetchJson(`/api-gateway/approval/${approvalForm.action}`, {
-        method: "POST",
-        body: JSON.stringify(payload),
+      const response = await executeApprovalAction({
+        incidentId,
+        recommendationId: recommendationIdCandidate,
+        action: approvalForm.action,
+        approver: approvalForm.approver,
+        channel: approvalForm.channel,
+        comment: approvalForm.comment,
+        modifiedAction: approvalForm.modified_action,
       });
       setApprovalState({ loading: false, result: response, error: "" });
       await Promise.all([loadIncidentMetadata(), loadGatewayRecent(), loadGatewaySummary()]);
@@ -5250,6 +5350,9 @@ export default function App() {
                   <button className="button-secondary" type="button" onClick={() => selectedApprovalIncidentId && loadApprovalIncidentContext(selectedApprovalIncidentId)} disabled={!selectedApprovalIncidentId || approvalIncidentContext.loading}>
                     {approvalIncidentContext.loading ? "Syncing..." : "Sync From Approval API"}
                   </button>
+                  <button className="button-secondary" type="button" onClick={() => setShowAdvancedApprovalForm((current) => !current)}>
+                    {showAdvancedApprovalForm ? "Hide Advanced Approval Form" : "Show Advanced Approval Form"}
+                  </button>
                 </div>
                 {approvalIncidentContext.error ? <p className="error">{approvalIncidentContext.error}</p> : null}
 
@@ -5265,7 +5368,7 @@ export default function App() {
                         <th>Severity</th>
                         <th>Execution Mode</th>
                         <th>Status</th>
-                        <th>Action</th>
+                        <th>Actions</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -5273,6 +5376,10 @@ export default function App() {
                         const incidentId = approvalIncidentId(row);
                         const recommendationId = approvalRecommendationId(row);
                         const selected = incidentId && incidentId === selectedApprovalIncidentId;
+                        const canQuickApprove = looksLikeUuid(incidentId) && looksLikeUuid(recommendationId);
+                        const quickApproveBusy = approvalState.loading && selected && approvalForm.action === "approve";
+                        const quickRejectBusy = approvalState.loading && selected && approvalForm.action === "reject";
+                        const rejectExpanded = inlineRejectState.incidentId === incidentId;
                         return (
                         <tr key={incidentId || index} className={selected ? "row-selected" : ""}>
                           <td>
@@ -5290,6 +5397,44 @@ export default function App() {
                             <button className="button-secondary" type="button" onClick={() => openAlertDetailsFromIncident(row)}>
                               Open
                             </button>
+                            <button
+                              className="button-primary"
+                              type="button"
+                              onClick={() => approveIncidentRow(row)}
+                              disabled={!canQuickApprove || approvalState.loading}
+                              title={canQuickApprove ? "Approve this incident directly" : "Recommendation ID unavailable. Use Sync From Approval API first."}
+                              style={{ marginLeft: 8 }}
+                            >
+                              {quickApproveBusy ? "Approving..." : "Approve"}
+                            </button>
+                            <button
+                              className="button-secondary"
+                              type="button"
+                              onClick={() => setInlineRejectState((current) => current.incidentId === incidentId ? { incidentId: "", comment: "" } : { incidentId, comment: "" })}
+                              disabled={!canQuickApprove || approvalState.loading}
+                              title={canQuickApprove ? "Reject this incident with a comment" : "Recommendation ID unavailable. Use Sync From Approval API first."}
+                              style={{ marginLeft: 8 }}
+                            >
+                              {rejectExpanded ? "Cancel Reject" : "Reject"}
+                            </button>
+                            {rejectExpanded ? (
+                              <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
+                                <textarea
+                                  rows={2}
+                                  placeholder="Add rejection comment"
+                                  value={inlineRejectState.comment}
+                                  onChange={(e) => setInlineRejectState({ incidentId, comment: e.target.value })}
+                                />
+                                <button
+                                  className="button-primary"
+                                  type="button"
+                                  onClick={() => rejectIncidentRow(row)}
+                                  disabled={!String(inlineRejectState.comment || "").trim() || approvalState.loading}
+                                >
+                                  {quickRejectBusy ? "Rejecting..." : "Confirm Reject"}
+                                </button>
+                              </div>
+                            ) : null}
                           </td>
                         </tr>
                       )})}
@@ -5301,53 +5446,59 @@ export default function App() {
                     </tbody>
                   </table>
                 </div>
-                <form className="form" onSubmit={submitApproval}>
-                  <label>
-                    Action
-                    <select value={approvalForm.action} onChange={(e) => setApprovalForm({ ...approvalForm, action: e.target.value })}>
-                      <option value="approve">approve</option>
-                      <option value="reject">reject</option>
-                      <option value="modify">modify</option>
-                    </select>
-                  </label>
-                  <label>
-                    Incident ID
-                    <input value={approvalForm.incident_id} onChange={(e) => setApprovalForm({ ...approvalForm, incident_id: e.target.value })} />
-                  </label>
-                  <label>
-                    Recommendation ID
-                    <input value={approvalForm.recommendation_id} onChange={(e) => setApprovalForm({ ...approvalForm, recommendation_id: e.target.value })} />
-                  </label>
-                  <label>
-                    Approver
-                    <input value={approvalForm.approver} onChange={(e) => setApprovalForm({ ...approvalForm, approver: e.target.value })} />
-                  </label>
-                  <label>
-                    Channel
-                    <select value={approvalForm.channel} onChange={(e) => setApprovalForm({ ...approvalForm, channel: e.target.value })}>
-                      <option value="web">web</option>
-                      <option value="slack">slack</option>
-                      <option value="teams">teams</option>
-                      <option value="email">email</option>
-                    </select>
-                  </label>
-                  {approvalForm.action === "modify" ? (
-                    <label>
-                      Modified Action
-                      <textarea rows={3} value={approvalForm.modified_action} onChange={(e) => setApprovalForm({ ...approvalForm, modified_action: e.target.value })} />
-                    </label>
-                  ) : null}
-                  <label>
-                    Comment
-                    <textarea rows={3} value={approvalForm.comment} onChange={(e) => setApprovalForm({ ...approvalForm, comment: e.target.value })} />
-                  </label>
-                  <button className="button-primary" type="submit" disabled={!approvalReady || approvalState.loading}>
-                    {approvalState.loading ? "Submitting..." : "Submit Approval Action"}
-                  </button>
-                </form>
-                {!String(approvalForm.recommendation_id || "").trim() ? (
-                  <p className="subtitle">Recommendation ID is required by the approval API. Use the table row selector and Sync From Approval API to load it.</p>
-                ) : null}
+                {showAdvancedApprovalForm ? (
+                  <>
+                    <form className="form" onSubmit={submitApproval}>
+                      <label>
+                        Action
+                        <select value={approvalForm.action} onChange={(e) => setApprovalForm({ ...approvalForm, action: e.target.value })}>
+                          <option value="approve">approve</option>
+                          <option value="reject">reject</option>
+                          <option value="modify">modify</option>
+                        </select>
+                      </label>
+                      <label>
+                        Incident ID
+                        <input value={approvalForm.incident_id} onChange={(e) => setApprovalForm({ ...approvalForm, incident_id: e.target.value })} />
+                      </label>
+                      <label>
+                        Recommendation ID
+                        <input value={approvalForm.recommendation_id} onChange={(e) => setApprovalForm({ ...approvalForm, recommendation_id: e.target.value })} />
+                      </label>
+                      <label>
+                        Approver
+                        <input value={approvalForm.approver} onChange={(e) => setApprovalForm({ ...approvalForm, approver: e.target.value })} />
+                      </label>
+                      <label>
+                        Channel
+                        <select value={approvalForm.channel} onChange={(e) => setApprovalForm({ ...approvalForm, channel: e.target.value })}>
+                          <option value="web">web</option>
+                          <option value="slack">slack</option>
+                          <option value="teams">teams</option>
+                          <option value="email">email</option>
+                        </select>
+                      </label>
+                      {approvalForm.action === "modify" ? (
+                        <label>
+                          Modified Action
+                          <textarea rows={3} value={approvalForm.modified_action} onChange={(e) => setApprovalForm({ ...approvalForm, modified_action: e.target.value })} />
+                        </label>
+                      ) : null}
+                      <label>
+                        Comment
+                        <textarea rows={3} value={approvalForm.comment} onChange={(e) => setApprovalForm({ ...approvalForm, comment: e.target.value })} />
+                      </label>
+                      <button className="button-primary" type="submit" disabled={!approvalReady || approvalState.loading}>
+                        {approvalState.loading ? "Submitting..." : "Submit Approval Action"}
+                      </button>
+                    </form>
+                    {!String(approvalForm.recommendation_id || "").trim() ? (
+                      <p className="subtitle">Recommendation ID is required by the approval API. Use the table row selector and Sync From Approval API to load it.</p>
+                    ) : null}
+                  </>
+                ) : (
+                  <p className="subtitle">Use inline Approve or Reject for common actions. Open the advanced form for modify or manual approval payload editing.</p>
+                )}
                 {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
                 {approvalState.result ? <pre className="result">{JSON.stringify(approvalState.result, null, 2)}</pre> : null}
               </article>
