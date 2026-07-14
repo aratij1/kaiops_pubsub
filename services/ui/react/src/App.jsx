@@ -699,6 +699,7 @@ export default function App() {
   const [uiTheme, setUiTheme] = useState("auto");
   const [health, setHealth] = useState({ loading: false, ok: false, message: "Not checked" });
   const [alerts, setAlerts] = useState({ loading: false, rows: [], error: "" });
+  const [alertsLimit, setAlertsLimit] = useState(50);
   const [incidentMetadata, setIncidentMetadata] = useState({ loading: false, rows: [], error: "" });
   const [closedIncidents, setClosedIncidents] = useState({ loading: false, rows: [], error: "" });
   const [flows, setFlows] = useState({ loading: false, rows: [], error: "" });
@@ -882,7 +883,7 @@ export default function App() {
   async function loadRecentAlerts() {
     setAlerts((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/alerts/all?limit=50");
+      const payload = await fetchJson(`/api-gateway/alerts/all?limit=${alertsLimit}`);
       const data = unwrap(payload);
       const rows = data?.rows || [];
       setAlerts({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
@@ -2177,6 +2178,13 @@ export default function App() {
   useEffect(() => {
     refreshAll();
   }, []);
+
+  useEffect(() => {
+    if (alertsLimit === 50) {
+      return;
+    }
+    loadRecentAlerts();
+  }, [alertsLimit]);
 
   useEffect(() => {
     if (activeTab !== "summary") {
@@ -3822,6 +3830,21 @@ export default function App() {
               <article className="panel">
                 <div className="panel-head">
                   <h2>Alert Stream</h2>
+                  <label className="alerts-limit-select">
+                    Show
+                    <select
+                      value={alertsLimit}
+                      disabled={alerts.loading}
+                      onChange={(event) => setAlertsLimit(Number(event.target.value))}
+                    >
+                      <option value={25}>25</option>
+                      <option value={50}>50</option>
+                      <option value={100}>100</option>
+                      <option value={200}>200</option>
+                      <option value={500}>500</option>
+                    </select>
+                    alerts
+                  </label>
                   <button className="button-secondary" onClick={loadRecentAlerts} disabled={alerts.loading}>
                     {alerts.loading ? "Loading..." : "Refresh"}
                   </button>
