@@ -152,7 +152,7 @@ services:
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./observability/alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
-      - ./rag/changes/prometheus_rules:/etc/prometheus/generated-rules:ro
+      - ./backend/rag/changes/prometheus_rules:/etc/prometheus/generated-rules:ro
       - prometheus-data:/prometheus
     depends_on:
       api-gateway: { condition: service_healthy }
@@ -167,8 +167,8 @@ services:
     working_dir: /app/backend/src/monitoring-adapter
     ports: ["8001:8000"]
     volumes:
-      - ./rag:/app/rag
-      - ./ingested_alerts:/app/ingested_alerts
+      - ./backend/rag:/app/rag
+      - ./backend/ingested_alerts:/app/ingested_alerts
     depends_on:
       kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
@@ -227,7 +227,7 @@ services:
     working_dir: /app/backend/src/context-agent
     ports: ["8004:8000"]
     volumes:
-      - ./rag:/app/rag
+      - ./backend/rag:/app/rag
     depends_on:
       kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }

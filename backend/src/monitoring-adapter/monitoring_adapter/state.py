@@ -37,7 +37,7 @@ def slugify(value: str) -> str:
 @lru_cache(maxsize=1)
 def rag_root_path() -> Path:
     here = Path(__file__).resolve()
-    candidates = [here.parents[2] / "rag", Path.cwd() / "rag", Path("/app/rag")]
+    candidates = [here.parents[3] / "rag", Path.cwd() / "backend" / "rag", Path("/app/rag")]
     for candidate in candidates:
         if candidate.exists():
             return candidate

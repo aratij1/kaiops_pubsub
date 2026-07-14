@@ -22,9 +22,9 @@ jobs:
       - name: Validate RAG metadata
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            python scripts/validate-rag-metadata-delta.py --rag-root rag --base-ref origin/${{ github.base_ref }}
+            python scripts/validate-rag-metadata-delta.py --rag-root backend/rag --base-ref origin/${{ github.base_ref }}
           else
-            python scripts/validate-rag-metadata.py --rag-root rag
+            python scripts/validate-rag-metadata.py --rag-root backend/rag
           fi
       - name: Test
         run: pytest

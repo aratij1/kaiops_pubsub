@@ -8,7 +8,7 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY backend/src ./backend/src
-COPY rag ./rag
+COPY backend/rag ./rag
 
 RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir .
 

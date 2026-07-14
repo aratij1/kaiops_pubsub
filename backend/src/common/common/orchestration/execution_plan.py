@@ -10,9 +10,9 @@ from common.models import Alert
 def _repo_root() -> Path:
     current = Path(__file__).resolve()
     for parent in current.parents:
-        if (parent / "rag").exists() and (parent / "services").exists():
+        if (parent / "pyproject.toml").exists() and (parent / "backend").exists():
             return parent
-    return current.parents[4]
+    return current.parents[5]
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -24,11 +24,11 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _execution_catalogs() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
-    root = _repo_root()
-    connectors = _read_json(root / "rag" / "execution" / "connectors.json")
-    actions = _read_json(root / "rag" / "execution" / "action_catalog.json")
-    playbooks = _read_json(root / "rag" / "execution" / "playbooks.json")
-    connectivity = _read_json(root / "rag" / "onboarding" / "connectivity.json")
+    root = _repo_root() / "backend" / "rag"
+    connectors = _read_json(root / "execution" / "connectors.json")
+    actions = _read_json(root / "execution" / "action_catalog.json")
+    playbooks = _read_json(root / "execution" / "playbooks.json")
+    connectivity = _read_json(root / "onboarding" / "connectivity.json")
     return connectors, actions, playbooks, connectivity
 
 
