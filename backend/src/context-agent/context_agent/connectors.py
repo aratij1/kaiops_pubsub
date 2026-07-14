@@ -181,16 +181,16 @@ class VectorDBConnector(BaseConnector):
     def root_path(self) -> Path:
         root = self.rag_root or self._discover_rag_root()
         if root is None:
-            root = Path.cwd() / "rag"
+            root = Path.cwd() / "backend" / "rag"
         root.mkdir(parents=True, exist_ok=True)
         return root
 
     def _discover_rag_root(self) -> Path | None:
         candidates = [Path.cwd(), *Path.cwd().parents, Path("/app")]
         for candidate in candidates:
-            rag_root = candidate / "rag"
-            if rag_root.exists():
-                return rag_root
+            for rag_root in (candidate / "backend" / "rag", candidate / "rag"):
+                if rag_root.exists():
+                    return rag_root
         return None
 
     def _parse_metadata_document(self, path: Path) -> dict[str, Any]:

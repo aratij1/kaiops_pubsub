@@ -17,10 +17,10 @@ logs/local/*.log
 
 # Generated UI and runtime artifacts
 .tmp-ui-bundle.js
-ingested_alerts/input/*.json
+backend/ingested_alerts/input/*.json
 
 # Generated onboarding outputs
-rag/changes/**
-rag/dependencies/*.md
-rag/incidents/*-rule-onboarding.md
-rag/runbooks/*-rule-runbook.md
+backend/rag/changes/**
+backend/rag/dependencies/*.md
+backend/rag/incidents/*-rule-onboarding.md
+backend/rag/runbooks/*-rule-runbook.md

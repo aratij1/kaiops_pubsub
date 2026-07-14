@@ -6,7 +6,7 @@ from typing import Any
 import re
 
 ROOT = Path(__file__).resolve().parents[1]
-RAG = ROOT / "rag"
+RAG = ROOT / "backend" / "rag"
 TODAY = date.today().isoformat()
 
 @dataclass

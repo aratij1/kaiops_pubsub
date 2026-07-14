@@ -133,7 +133,7 @@ def validate_corpus(rag_root: Path, targets: list[Path] | None = None) -> list[V
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate RAG markdown metadata headers")
-    parser.add_argument("--rag-root", default="rag", help="Path to rag corpus root")
+    parser.add_argument("--rag-root", default="backend/rag", help="Path to rag corpus root")
     parser.add_argument(
         "--paths",
         nargs="*",
