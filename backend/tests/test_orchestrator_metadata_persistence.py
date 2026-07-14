@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from common.models import Alert, AlertSeverity, Incident
-MODULE_PATH = Path(__file__).resolve().parents[1] / "backend" / "src" / "orchestrator" / "app.py"
+MODULE_PATH = Path(__file__).resolve().parents[1] / "src" / "orchestrator" / "app.py"
 SPEC = importlib.util.spec_from_file_location("orchestrator_service_app", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 orchestrator_app = importlib.util.module_from_spec(SPEC)
