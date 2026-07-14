@@ -1,3 +1,9 @@
+param(
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 100)]
+    [int]$Rounds = 3
+)
+
 $ErrorActionPreference = 'Stop'
 
 function Run-Round {
@@ -109,14 +115,14 @@ function Run-Round {
     }
 }
 
-$r1 = Run-Round -Tag 'R1'
-$r2 = Run-Round -Tag 'R2'
-$r3 = Run-Round -Tag 'R3'
+$results = for ($roundIndex = 1; $roundIndex -le $Rounds; $roundIndex++) {
+    Run-Round -Tag ("R{0}" -f $roundIndex)
+}
 
 $summary = [pscustomobject]@{
-    results = @($r1, $r2, $r3)
-    passed = (@($r1, $r2, $r3) | Where-Object { $_.status -eq 'pass' }).Count
-    failed = (@($r1, $r2, $r3) | Where-Object { $_.status -eq 'fail' }).Count
+    results = @($results)
+    passed = (@($results) | Where-Object { $_.status -eq 'pass' }).Count
+    failed = (@($results) | Where-Object { $_.status -eq 'fail' }).Count
 }
 
 $summary | ConvertTo-Json -Depth 8
