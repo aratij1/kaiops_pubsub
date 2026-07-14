@@ -5,7 +5,7 @@ import pytest
 
 
 def load_remediation_app_module():
-    module_path = Path("services/remediation-engine/app.py")
+    module_path = Path("backend/src/remediation-engine/app.py")
     spec = util.spec_from_file_location("remediation_engine_app", module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError("Unable to load remediation-engine app module")

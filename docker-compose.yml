@@ -164,7 +164,7 @@ services:
     build: *service-build
     environment: { <<: *service-env, SERVICE_NAME: monitoring-adapter }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/services/monitoring-adapter
+    working_dir: /app/backend/src/monitoring-adapter
     ports: ["8001:8000"]
     volumes:
       - ./rag:/app/rag
@@ -179,7 +179,7 @@ services:
     build: *service-build
     environment: { <<: *service-env, SERVICE_NAME: api-gateway }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/services/api-gateway
+    working_dir: /app/backend/src/api-gateway
     ports: ["8010:8000"]
     healthcheck:
       test:
@@ -200,7 +200,7 @@ services:
     build: *service-build
     environment: { <<: *service-env, SERVICE_NAME: alert-intelligence }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/services/alert-intelligence
+    working_dir: /app/backend/src/alert-intelligence
     ports: ["8002:8000"]
     depends_on:
       kafka: { condition: service_healthy }
@@ -212,7 +212,7 @@ services:
     build: *service-build
     environment: { <<: *service-env, SERVICE_NAME: orchestrator }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/services/orchestrator
+    working_dir: /app/backend/src/orchestrator
     ports: ["8003:8000"]
     depends_on:
       kafka: { condition: service_healthy }
@@ -224,7 +224,7 @@ services:
     build: *service-build
     environment: { <<: *service-env, SERVICE_NAME: context-agent }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/services/context-agent
+    working_dir: /app/backend/src/context-agent
     ports: ["8004:8000"]
     volumes:
       - ./rag:/app/rag
@@ -237,7 +237,7 @@ services:
     build: *service-build
     environment: { <<: *service-env, SERVICE_NAME: model-router }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/services/model-router
+    working_dir: /app/backend/src/model-router
     ports: ["8005:8000"]
     depends_on:
       kafka: { condition: service_healthy }
@@ -247,7 +247,7 @@ services:
     build: *service-build
     environment: { <<: *service-env, SERVICE_NAME: resolution-agent }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/services/resolution-agent
+    working_dir: /app/backend/src/resolution-agent
     ports: ["8006:8000"]
     depends_on:
       kafka: { condition: service_healthy }
@@ -258,7 +258,7 @@ services:
     build: *service-build
     environment: { <<: *service-env, SERVICE_NAME: approval-service }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/services/approval-service
+    working_dir: /app/backend/src/approval-service
     ports: ["8007:8000"]
     depends_on:
       kafka: { condition: service_healthy }
@@ -269,7 +269,7 @@ services:
     build: *service-build
     environment: { <<: *service-env, SERVICE_NAME: remediation-engine }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/services/remediation-engine
+    working_dir: /app/backend/src/remediation-engine
     ports: ["8008:8000"]
     depends_on:
       kafka: { condition: service_healthy }
@@ -279,7 +279,7 @@ services:
     build: *service-build
     environment: { <<: *service-env, SERVICE_NAME: closure-service }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/services/closure-service
+    working_dir: /app/backend/src/closure-service
     ports: ["8009:8000"]
     depends_on:
       kafka: { condition: service_healthy }
@@ -287,7 +287,7 @@ services:
 
   ui:
     build:
-      context: ./services/ui/react
+      context: ./frontend/react
       dockerfile: Dockerfile
     ports: ["8501:80"]
     depends_on:

@@ -43,7 +43,7 @@ class FailingRouter(ModelRouter):
 
 
 def load_monitoring_app_module():
-    module_path = Path("services/monitoring-adapter/app.py")
+    module_path = Path("backend/src/monitoring-adapter/app.py")
     spec = importlib.util.spec_from_file_location("monitoring_adapter_app", module_path)
     assert spec is not None
     assert spec.loader is not None
