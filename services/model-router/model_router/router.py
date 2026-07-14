@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 from common.config import Settings, get_settings
+from common.model_evaluation import VertexEvaluationClient
 from common.models import AlertSeverity
 from common.prompts import SYSTEM_PROMPT_SRE, render_task_payload_prompt
 from common.resilience import CircuitBreaker
@@ -301,6 +302,27 @@ class ModelRouter:
         }
     )
     prompt_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = field(default_factory=OrderedDict)
+    evaluation_client: VertexEvaluationClient = field(default_factory=lambda: VertexEvaluationClient(get_settings()))
+
+    async def _attach_evaluation(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Best-effort: scores the response via Vertex AI Gen AI Evaluation.
+        No-op unless VERTEX_EVALUATION_ENABLED=true and GCP_PROJECT_ID is set."""
+        if not self.evaluation_client.enabled:
+            return result
+        content = str(result.get("content") or "")
+        if not content:
+            return result
+        evaluation = await asyncio.to_thread(
+            self.evaluation_client.evaluate, content, metric=self.settings.vertex_evaluation_metric
+        )
+        if evaluation is not None:
+            result["evaluation"] = {
+                "metric": evaluation.metric,
+                "score": evaluation.score,
+                "explanation": evaluation.explanation,
+                "confidence": evaluation.confidence,
+            }
+        return result
 
     def select_model(self, *, severity: AlertSeverity, task: ModelTask) -> str:
         if severity == AlertSeverity.CRITICAL:
@@ -347,6 +369,7 @@ class ModelRouter:
                 usage = response.usage.as_dict()
                 usage["task"] = task.value
                 result = {"model": provider_name, "content": response.content, "usage": usage}
+                result = await self._attach_evaluation(result)
                 if self.settings.model_router_prompt_cache_enabled:
                     _prompt_cache_set(
                         cache_key,
@@ -391,6 +414,7 @@ class ModelRouter:
         usage = response.usage.as_dict()
         usage["task"] = task.value
         result = {"model": provider_name, "content": response.content, "usage": usage}
+        result = await self._attach_evaluation(result)
         if self.settings.model_router_prompt_cache_enabled:
             _prompt_cache_set(
                 cache_key,
