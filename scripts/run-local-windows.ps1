@@ -85,17 +85,17 @@ if (-not (Test-Path $Python)) {
 }
 
 $ServicePaths = @(
-    "services\common",
-    "services\api-gateway",
-    "services\alert-intelligence",
-    "services\context-agent",
-    "services\model-router",
-    "services\resolution-agent",
-    "services\orchestrator",
-    "services\approval-service",
-    "services\remediation-engine",
-    "services\closure-service",
-    "services\monitoring-adapter"
+    "backend\src\common",
+    "backend\src\api-gateway",
+    "backend\src\alert-intelligence",
+    "backend\src\context-agent",
+    "backend\src\model-router",
+    "backend\src\resolution-agent",
+    "backend\src\orchestrator",
+    "backend\src\approval-service",
+    "backend\src\remediation-engine",
+    "backend\src\closure-service",
+    "backend\src\monitoring-adapter"
 ) | ForEach-Object { Join-Path $RepoRoot $_ }
 
 $PythonPath = $ServicePaths -join ";"
@@ -241,22 +241,22 @@ function Test-UrlReady {
 
 Start-KaiMSWindow `
     -Title "KaiMS monitoring-adapter :8001" `
-    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8001 --app-dir services/monitoring-adapter"
+    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8001 --app-dir backend/src/monitoring-adapter"
 
 Start-KaiMSWindow `
     -Title "KaiMS approval-service :8007" `
-    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8007 --app-dir services/approval-service"
+    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8007 --app-dir backend/src/approval-service"
 
 Start-KaiMSWindow `
     -Title "KaiMS context-agent :8004" `
-    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8004 --app-dir services/context-agent"
+    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8004 --app-dir backend/src/context-agent"
 
 Start-KaiMSWindow `
     -Title "KaiMS api-gateway :8010" `
-    -Command "`$env:MONITORING_ADAPTER_URL = 'http://localhost:8001'; `$env:APPROVAL_SERVICE_URL = 'http://localhost:8007'; `$env:CONTEXT_AGENT_URL = 'http://localhost:8004'; & '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8010 --app-dir services/api-gateway"
+    -Command "`$env:MONITORING_ADAPTER_URL = 'http://localhost:8001'; `$env:APPROVAL_SERVICE_URL = 'http://localhost:8007'; `$env:CONTEXT_AGENT_URL = 'http://localhost:8004'; & '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8010 --app-dir backend/src/api-gateway"
 
 if (-not $NoUi) {
-    $UiFolder = (Join-Path $RepoRoot "services\ui\react").Replace("'", "''")
+    $UiFolder = (Join-Path $RepoRoot "frontend\react").Replace("'", "''")
     $UiCommand = @"
 Set-Location -LiteralPath '$UiFolder'
 npm install

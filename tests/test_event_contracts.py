@@ -18,43 +18,43 @@ from common.models import (
 from orchestrator.message_bus import publish_orchestration_event
 from context_agent import ContextIntelligenceAgent
 
-_CONTEXT_APP_PATH = Path(__file__).resolve().parents[1] / "services" / "context-agent" / "app.py"
+_CONTEXT_APP_PATH = Path(__file__).resolve().parents[1] / "backend" / "src" / "context-agent" / "app.py"
 _CONTEXT_SPEC = importlib.util.spec_from_file_location("context_agent_app", _CONTEXT_APP_PATH)
 assert _CONTEXT_SPEC is not None and _CONTEXT_SPEC.loader is not None
 context_agent_app = importlib.util.module_from_spec(_CONTEXT_SPEC)
 _CONTEXT_SPEC.loader.exec_module(context_agent_app)
 
-_RESOLUTION_APP_PATH = Path(__file__).resolve().parents[1] / "services" / "resolution-agent" / "app.py"
+_RESOLUTION_APP_PATH = Path(__file__).resolve().parents[1] / "backend" / "src" / "resolution-agent" / "app.py"
 _RESOLUTION_SPEC = importlib.util.spec_from_file_location("resolution_agent_app", _RESOLUTION_APP_PATH)
 assert _RESOLUTION_SPEC is not None and _RESOLUTION_SPEC.loader is not None
 resolution_agent_app = importlib.util.module_from_spec(_RESOLUTION_SPEC)
 _RESOLUTION_SPEC.loader.exec_module(resolution_agent_app)
 
-_APPROVAL_APP_PATH = Path(__file__).resolve().parents[1] / "services" / "approval-service" / "app.py"
+_APPROVAL_APP_PATH = Path(__file__).resolve().parents[1] / "backend" / "src" / "approval-service" / "app.py"
 _APPROVAL_SPEC = importlib.util.spec_from_file_location("approval_service_app", _APPROVAL_APP_PATH)
 assert _APPROVAL_SPEC is not None and _APPROVAL_SPEC.loader is not None
 approval_service_app = importlib.util.module_from_spec(_APPROVAL_SPEC)
 _APPROVAL_SPEC.loader.exec_module(approval_service_app)
 
-_REMEDIATION_APP_PATH = Path(__file__).resolve().parents[1] / "services" / "remediation-engine" / "app.py"
+_REMEDIATION_APP_PATH = Path(__file__).resolve().parents[1] / "backend" / "src" / "remediation-engine" / "app.py"
 _REMEDIATION_SPEC = importlib.util.spec_from_file_location("remediation_engine_app", _REMEDIATION_APP_PATH)
 assert _REMEDIATION_SPEC is not None and _REMEDIATION_SPEC.loader is not None
 remediation_engine_app = importlib.util.module_from_spec(_REMEDIATION_SPEC)
 _REMEDIATION_SPEC.loader.exec_module(remediation_engine_app)
 
-_CLOSURE_APP_PATH = Path(__file__).resolve().parents[1] / "services" / "closure-service" / "app.py"
+_CLOSURE_APP_PATH = Path(__file__).resolve().parents[1] / "backend" / "src" / "closure-service" / "app.py"
 _CLOSURE_SPEC = importlib.util.spec_from_file_location("closure_service_app", _CLOSURE_APP_PATH)
 assert _CLOSURE_SPEC is not None and _CLOSURE_SPEC.loader is not None
 closure_service_app = importlib.util.module_from_spec(_CLOSURE_SPEC)
 _CLOSURE_SPEC.loader.exec_module(closure_service_app)
 
-_MONITORING_APP_PATH = Path(__file__).resolve().parents[1] / "services" / "monitoring-adapter" / "app.py"
+_MONITORING_APP_PATH = Path(__file__).resolve().parents[1] / "backend" / "src" / "monitoring-adapter" / "app.py"
 _MONITORING_SPEC = importlib.util.spec_from_file_location("monitoring_adapter_app", _MONITORING_APP_PATH)
 assert _MONITORING_SPEC is not None and _MONITORING_SPEC.loader is not None
 monitoring_adapter_app = importlib.util.module_from_spec(_MONITORING_SPEC)
 _MONITORING_SPEC.loader.exec_module(monitoring_adapter_app)
 
-_API_GATEWAY_APP_PATH = Path(__file__).resolve().parents[1] / "services" / "api-gateway" / "app.py"
+_API_GATEWAY_APP_PATH = Path(__file__).resolve().parents[1] / "backend" / "src" / "api-gateway" / "app.py"
 _API_GATEWAY_SPEC = importlib.util.spec_from_file_location("api_gateway_app", _API_GATEWAY_APP_PATH)
 assert _API_GATEWAY_SPEC is not None and _API_GATEWAY_SPEC.loader is not None
 api_gateway_app = importlib.util.module_from_spec(_API_GATEWAY_SPEC)
