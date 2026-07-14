@@ -1,6 +1,7 @@
 from api_gateway.modules.users.service import UserService
 from common.config import Settings
 from common.database import RoleRecord, UserRecord
+from fastapi import HTTPException
 
 
 def _service() -> UserService:
@@ -31,11 +32,13 @@ def test_jwt_encode_decode_round_trip() -> None:
         token_type="access",
         expires_delta=__import__("datetime").timedelta(minutes=5),
         jwt_id="abc123",
+        session_jti="session-123",
     )
     payload = svc.decode_token(token)
     assert payload["sub"] == "7"
     assert payload["role"] == "Administrator"
     assert payload["type"] == "access"
+    assert payload["sid"] == "session-123"
 
 
 class _FakeLoginRepo:
@@ -66,6 +69,37 @@ class _FakeLoginRepo:
 
     async def create_session(self, **kwargs):
         self.sessions.append(kwargs)
+
+
+class _FakeSession:
+    def __init__(self, *, session_id: int = 1, user_id: int = 1, jwt_id: str = "refresh-jti", status: str = "active") -> None:
+        self.id = session_id
+        self.user_id = user_id
+        self.jwt_id = jwt_id
+        self.status = status
+        self.ip_address = "127.0.0.1"
+        self.device = "Streamlit UI"
+        self.expiry_time = __import__("datetime").datetime.now(__import__("datetime").UTC) + __import__("datetime").timedelta(minutes=30)
+        self.updated_at = None
+
+
+class _FakeSessionRepo(_FakeLoginRepo):
+    def __init__(self, password_hash: str) -> None:
+        super().__init__(password_hash)
+        self.session_by_jti: dict[str, _FakeSession] = {}
+        self.revoked: list[str] = []
+
+    async def get_user(self, user_id: int):
+        return self.user if user_id == self.user.id else None
+
+    async def get_session_by_jti(self, jwt_id: str):
+        return self.session_by_jti.get(jwt_id)
+
+    async def revoke_session(self, jwt_id: str):
+        self.revoked.append(jwt_id)
+        session = self.session_by_jti.get(jwt_id)
+        if session is not None:
+            session.status = "revoked"
 
 
 def test_seeded_admin_login(monkeypatch) -> None:
@@ -123,3 +157,66 @@ def test_seeded_admin_login_normalizes_reserved_email_for_response(monkeypatch) 
     normalized = svc._user_to_dict(fake_repo.user, "Administrator")
 
     assert normalized["email"] == "admin@kaiops.example.com"
+
+
+def test_ensure_active_session_rejects_revoked_session(monkeypatch) -> None:
+    svc = _service()
+    fake_repo = _FakeSessionRepo(svc.hash_password("Admin@123456"))
+    fake_repo.session_by_jti["refresh-jti"] = _FakeSession(status="revoked")
+
+    async def fake_run_in_session(factory, fn):
+        return await fn(fake_repo)
+
+    monkeypatch.setattr("api_gateway.modules.users.service.run_in_session", fake_run_in_session)
+
+    try:
+        __import__("asyncio").run(svc.ensure_active_session(session_jti="refresh-jti", user_id=1))
+        assert False, "Expected ensure_active_session to reject revoked sessions"
+    except HTTPException as exc:
+        assert exc.status_code == 401
+
+
+def test_refresh_rotates_session_and_tokens(monkeypatch) -> None:
+    svc = _service()
+    fake_repo = _FakeSessionRepo(svc.hash_password("Admin@123456"))
+    fake_repo.session_by_jti["refresh-jti"] = _FakeSession(jwt_id="refresh-jti", status="active")
+    refresh_token = svc._encode_token(
+        user_id=1,
+        role="Administrator",
+        token_type="refresh",
+        expires_delta=__import__("datetime").timedelta(minutes=30),
+        jwt_id="refresh-jti",
+        session_jti="refresh-jti",
+    )
+
+    async def fake_run_in_session(factory, fn):
+        return await fn(fake_repo)
+
+    monkeypatch.setattr("api_gateway.modules.users.service.run_in_session", fake_run_in_session)
+
+    result = __import__("asyncio").run(svc.refresh(refresh_token=refresh_token))
+    rotated_payload = svc.decode_token(result["refresh_token"])
+    access_payload = svc.decode_token(result["access_token"])
+
+    assert fake_repo.session_by_jti["refresh-jti"].status == "rotated"
+    assert len(fake_repo.sessions) == 1
+    assert rotated_payload["jti"] != "refresh-jti"
+    assert rotated_payload["sid"] == rotated_payload["jti"]
+    assert access_payload["sid"] == rotated_payload["jti"]
+
+
+def test_logout_revokes_bound_session(monkeypatch) -> None:
+    svc = _service()
+    fake_repo = _FakeSessionRepo(svc.hash_password("Admin@123456"))
+    fake_repo.session_by_jti["refresh-jti"] = _FakeSession(jwt_id="refresh-jti", status="active")
+
+    async def fake_run_in_session(factory, fn):
+        return await fn(fake_repo)
+
+    monkeypatch.setattr("api_gateway.modules.users.service.run_in_session", fake_run_in_session)
+
+    result = __import__("asyncio").run(svc.logout(session_jti="refresh-jti", user_id=1))
+
+    assert result["status"] == "ok"
+    assert fake_repo.revoked == ["refresh-jti"]
+    assert fake_repo.session_by_jti["refresh-jti"].status == "revoked"

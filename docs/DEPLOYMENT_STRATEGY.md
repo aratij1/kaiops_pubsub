@@ -106,7 +106,7 @@ Example rollout commands:
 ```bash
 kubectl apply -f k8s/namespace.yaml
 kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/secret.yaml
+./k8s/create-secret.ps1
 kubectl apply -f k8s/services.yaml
 kubectl apply -f k8s/hpa.yaml
 kubectl apply -f k8s/ingress.yaml

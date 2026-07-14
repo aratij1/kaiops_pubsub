@@ -85,3 +85,73 @@ async def test_model_router_failover() -> None:
     assert response["model"] == "gpt-4o"
     assert response["usage"]["total_tokens"] == 150
     assert response["usage"]["total_cost_usd"] > 0
+
+
+@pytest.mark.asyncio
+async def test_model_router_cache_hit_zeroes_billable_cost(monkeypatch) -> None:
+    from common.config import Settings
+
+    settings = Settings(
+        MODEL_ROUTER_PROMPT_CACHE_ENABLED=True,
+        MODEL_ROUTER_PROMPT_CACHE_TTL_SECONDS=300,
+        MODEL_ROUTER_PROMPT_CACHE_MAX_ENTRIES=16,
+    )
+    provider = StaticProvider("gpt-4o")
+    router = ModelRouter(
+        settings=settings,
+        providers={
+            "gpt-5": StaticProvider("gpt-5"),
+            "gpt-4o": provider,
+            "local-llama": StaticProvider("local-llama"),
+        },
+    )
+
+    first = await router.route(
+        severity=AlertSeverity.WARNING,
+        task=ModelTask.GENERAL,
+        prompt="summarize",
+        payload={"service": "payments"},
+    )
+    second = await router.route(
+        severity=AlertSeverity.WARNING,
+        task=ModelTask.GENERAL,
+        prompt="summarize",
+        payload={"service": "payments"},
+    )
+
+    assert first.get("cached") is None
+    assert second["cached"] is True
+    assert second["usage"]["cached"] is True
+    assert second["usage"]["total_cost_usd"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_model_router_cache_can_be_disabled() -> None:
+    from common.config import Settings
+
+    settings = Settings(MODEL_ROUTER_PROMPT_CACHE_ENABLED=False)
+    provider = StaticProvider("gpt-4o")
+    router = ModelRouter(
+        settings=settings,
+        providers={
+            "gpt-5": StaticProvider("gpt-5"),
+            "gpt-4o": provider,
+            "local-llama": StaticProvider("local-llama"),
+        },
+    )
+
+    first = await router.route(
+        severity=AlertSeverity.WARNING,
+        task=ModelTask.GENERAL,
+        prompt="summarize",
+        payload={"service": "payments"},
+    )
+    second = await router.route(
+        severity=AlertSeverity.WARNING,
+        task=ModelTask.GENERAL,
+        prompt="summarize",
+        payload={"service": "payments"},
+    )
+
+    assert first.get("cached") is None
+    assert second.get("cached") is None

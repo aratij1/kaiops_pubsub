@@ -21,6 +21,8 @@ from common.logging import get_logger
 from common.models import (
     Alert,
     AlertSeverity,
+    Incident,
+    IncidentStatus,
     Approval,
     ApprovalDecision,
     Recommendation,
@@ -73,6 +75,7 @@ settings = get_settings()
 settings.service_name = "monitoring-adapter"
 logger = get_logger(__name__)
 RECENT_ALERTS: deque[dict[str, Any]] = deque(maxlen=200)
+# Fallback only for deployments without database-backed workflow state.
 PENDING_WORKFLOWS: dict[str, dict[str, Any]] = {}
 CLOSED_INCIDENTS: deque[dict[str, Any]] = deque(maxlen=500)
 LANDING_PAD_INPUT_DIR = Path(os.getenv("LANDING_PAD_INPUT_DIR", "/app/ingested_alerts/input"))
@@ -278,6 +281,7 @@ class OnboardingStateResponse(BaseModel):
 class OnboardingCompletePayload(BaseModel):
     connectivity: OnboardingConnectivityPayload
     project_mode: Literal["new", "existing"] = "existing"
+    onboarding_path: Literal["existing_monitoring", "setup_monitoring"] = "existing_monitoring"
     start_rules_onboarding: bool = False
     plain_language_requirements: list[str] = Field(default_factory=list)
     selected_monitoring_tool: str | None = None
@@ -300,6 +304,8 @@ class OnboardingCompletePayload(BaseModel):
         normalized["plain_language_requirements"] = requirements
         selected_tool = str(normalized.get("selected_monitoring_tool") or "").strip().lower().replace(" ", "_")
         normalized["selected_monitoring_tool"] = selected_tool or None
+        onboarding_path = str(normalized.get("onboarding_path") or "existing_monitoring").strip().lower()
+        normalized["onboarding_path"] = onboarding_path or "existing_monitoring"
         normalized["generate_documents"] = bool(normalized.get("generate_documents", True))
         normalized["include_smoke_test_alert"] = bool(normalized.get("include_smoke_test_alert", True))
         return normalized
@@ -308,7 +314,7 @@ class OnboardingCompletePayload(BaseModel):
     def _validate_payload(self) -> "OnboardingCompletePayload":
         if self.selected_monitoring_tool and self.selected_monitoring_tool not in _ALLOWED_ONBOARDING_PROVIDERS:
             raise ValueError("selected_monitoring_tool must be one of prometheus, new_relic, datadog")
-        if self.start_rules_onboarding and not self.plain_language_requirements:
+        if self.onboarding_path == "setup_monitoring" and not self.plain_language_requirements:
             raise ValueError("plain_language_requirements are required when start_rules_onboarding is true")
         return self
 
@@ -349,7 +355,7 @@ def _record_worker_success(worker_name: str) -> None:
 async def _load_pending_workflow_from_db(incident_id: str) -> dict[str, Any] | None:
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
-        return None
+        return PENDING_WORKFLOWS.get(str(incident_id))
     async with session_factory() as session:
         repo = IncidentRepository(session)
         return await repo.get_pending_workflow(incident_id)
@@ -360,6 +366,7 @@ async def _save_pending_workflow_to_db(
 ) -> None:
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
+        PENDING_WORKFLOWS[str(incident_id)] = _json_safe(payload)
         return
     async with session_factory() as session:
         repo = IncidentRepository(session)
@@ -376,6 +383,7 @@ async def _save_pending_workflow_to_db(
 async def _mark_pending_workflow_completed_in_db(incident_id: str, final_payload: dict[str, Any]) -> None:
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
+        PENDING_WORKFLOWS.pop(str(incident_id), None)
         return
     async with session_factory() as session:
         repo = IncidentRepository(session)
@@ -594,6 +602,22 @@ def _build_onboarding_rule_seed(connectivity: OnboardingConnectivityPayload, sel
         "region": str(project.region or "").strip(),
         "monitoring_platforms": [selected_tool],
         "notification_platforms": ["slack", "teams", "pagerduty"],
+    }
+
+
+def _build_landing_pad_summary(connectivity: OnboardingConnectivityPayload, selected_tool: str) -> dict[str, Any]:
+    project_name = str(connectivity.project.name or "").strip()
+    configured_endpoint = _selected_tool_url(connectivity, selected_tool)
+    return {
+        "ready": True,
+        "project_name": project_name,
+        "selected_monitoring_tool": selected_tool,
+        "configured_monitoring_endpoint": configured_endpoint,
+        "landing_pad_endpoint": "/alerts/alertmanager",
+        "message": (
+            "Send alerts from your monitoring platform to /alerts/alertmanager. "
+            "Landing pad ingestion will trigger the downstream KaiMS workflow."
+        ),
     }
 
 
@@ -882,13 +906,16 @@ async def _generate_upload_and_test_prometheus_rules(
 
 def _build_onboarding_steps_response(
     *,
+    onboarding_path: str,
     project_mode: str,
     start_rules_onboarding: bool,
     requirements: list[str],
     rules_result: dict[str, Any] | None,
     prometheus_result: dict[str, Any] | None,
     rag_documents: list[dict[str, Any]],
+    landing_pad_summary: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    uses_setup_flow = str(onboarding_path or "").strip().lower() == "setup_monitoring"
     step_one = {
         "step": 1,
         "title": "Create/Update Project",
@@ -897,32 +924,49 @@ def _build_onboarding_steps_response(
     }
     step_two = {
         "step": 2,
-        "title": "Ask To Add New Rules",
+        "title": "Select Onboarding Path",
         "status": "completed",
         "details": {
-            "choice": "yes" if start_rules_onboarding else "no",
+            "path": "setup_monitoring" if uses_setup_flow else "existing_monitoring",
+            "summary": (
+                "Create monitoring rules and configure Prometheus"
+                if uses_setup_flow
+                else "Use existing monitoring and ingest alerts into landing pad"
+            ),
         },
     }
     step_three = {
         "step": 3,
-        "title": "Capture Rules In Plain English",
-        "status": "completed" if start_rules_onboarding and requirements else "skipped",
+        "title": "Capture Rules In Plain English" if uses_setup_flow else "Configure Landing Pad Ingestion",
+        "status": (
+            "completed" if (uses_setup_flow and start_rules_onboarding and requirements) else
+            ("completed" if not uses_setup_flow else "skipped")
+        ),
         "details": {
-            "requirements_count": len(requirements),
-            "requirements": requirements,
+            "requirements_count": len(requirements) if uses_setup_flow else 0,
+            "requirements": requirements if uses_setup_flow else [],
+            "landing_pad": landing_pad_summary if not uses_setup_flow else {},
         },
     }
     step_four_status = "skipped"
+    step_four_title = "Convert To YAML, Upload In Prometheus, Test" if uses_setup_flow else "Ingest Alerts and Trigger Workflow"
     step_four_details: dict[str, Any] = {
-        "message": "Rule conversion and Prometheus upload were skipped.",
+        "message": (
+            "Rule conversion and Prometheus upload were skipped."
+            if uses_setup_flow
+            else "Alert ingestion via landing pad is ready; incoming alerts will trigger downstream workflow."
+        ),
+        "landing_pad": landing_pad_summary if not uses_setup_flow else {},
     }
-    if start_rules_onboarding and rules_result:
+    if uses_setup_flow and start_rules_onboarding and rules_result:
         step_four_status = "completed"
         step_four_details = {
             "workflow_id": rules_result.get("workflow_id"),
             "rule_conversion": "completed",
             "prometheus": prometheus_result or {"message": "Prometheus deployment not attempted."},
         }
+    if not uses_setup_flow:
+        step_four_status = "completed"
 
     step_five = {
         "step": 5,
@@ -933,7 +977,7 @@ def _build_onboarding_steps_response(
             "documents": rag_documents,
         },
     }
-    return [step_one, step_two, step_three, {"step": 4, "title": "Convert To YAML, Upload In Prometheus, Test", "status": step_four_status, "details": step_four_details}, step_five]
+    return [step_one, step_two, step_three, {"step": 4, "title": step_four_title, "status": step_four_status, "details": step_four_details}, step_five]
 
 
 async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
@@ -1620,7 +1664,6 @@ async def run_local_payment_workflow(
         incident_id_str = str(incident.id)
         recommendation_id_str = str(recommendation.id)
         safe_pending_payload = _json_safe(pending_payload)
-        PENDING_WORKFLOWS[incident_id_str] = safe_pending_payload
         await _save_pending_workflow_to_db(
             incident_id=incident_id_str,
             recommendation_id=recommendation_id_str,
@@ -1880,16 +1923,14 @@ async def continue_pending_workflow(
     from remediation_engine import RemediationEngine
 
     incident_key = str(incident_id)
-    pending = PENDING_WORKFLOWS.get(incident_key)
-    if not pending:
-        persisted = await _load_pending_workflow_from_db(incident_key)
-        if persisted and str(persisted.get("status") or "").strip().lower() == "completed":
-            completed_payload = persisted.get("completed_payload") if isinstance(persisted.get("completed_payload"), dict) else None
-            if completed_payload:
-                return completed_payload
-        if persisted and isinstance(persisted.get("payload"), dict):
-            pending = persisted.get("payload", {})
-            PENDING_WORKFLOWS[incident_key] = pending
+    persisted = await _load_pending_workflow_from_db(incident_key)
+    pending: dict[str, Any] | None = None
+    if persisted and str(persisted.get("status") or "").strip().lower() == "completed":
+        completed_payload = persisted.get("completed_payload") if isinstance(persisted.get("completed_payload"), dict) else None
+        if completed_payload:
+            return completed_payload
+    if persisted and isinstance(persisted.get("payload"), dict):
+        pending = persisted.get("payload", {})
 
     if not pending:
         raise HTTPException(status_code=404, detail="No pending workflow found for incident")
@@ -2123,6 +2164,13 @@ async def continue_pending_workflow(
     }
 
     metrics_base = pending.get("metrics_base", {}) if isinstance(pending.get("metrics_base"), dict) else {}
+    final_incident_status = IncidentStatus.CLOSED if closure_report.health_restored else IncidentStatus.FAILED
+    final_incident_payload = {
+        **incident_data,
+        "status": final_incident_status.value,
+        "closed_at": datetime.now(timezone.utc).isoformat() if closure_report.health_restored else incident_data.get("closed_at"),
+    }
+    final_incident = Incident.model_validate(final_incident_payload)
     metrics = {
         **metrics_base,
         "agent_handoffs": 6,
@@ -2137,7 +2185,7 @@ async def continue_pending_workflow(
         "mode": "local-no-kafka",
         "scenario": pending.get("scenario", {}),
         "alert": pending.get("alert", {}),
-        "incident": pending.get("incident", {}),
+        "incident": final_incident.model_dump(mode="json"),
         "decision": pending.get("decision", {}),
         "context": pending.get("context", {}),
         "recommendation": recommendation_data,
@@ -2159,6 +2207,7 @@ async def continue_pending_workflow(
         trace_id=approval_trace_id,
     )
     await persist_step(
+        lambda repo: repo.save_incident(final_incident),
         lambda repo: repo.save_incident_event(
             _json_safe(
                 _build_local_metadata_envelope(
@@ -2181,7 +2230,6 @@ async def continue_pending_workflow(
         )
     )
     await _mark_pending_workflow_completed_in_db(incident_key, final_payload)
-    PENDING_WORKFLOWS.pop(incident_key, None)
     return final_payload
 
 
@@ -2704,6 +2752,9 @@ async def post_onboarding_complete(payload: OnboardingCompletePayload = Body(...
 
     connectivity = payload.connectivity
     connectivity_payload = connectivity.model_dump(mode="json")
+    selected_tool = _select_monitoring_tool(connectivity, payload.selected_monitoring_tool)
+    landing_pad_summary = _build_landing_pad_summary(connectivity, selected_tool)
+    should_start_rules_onboarding = bool(payload.onboarding_path == "setup_monitoring" and payload.start_rules_onboarding)
 
     sanitized_connectivity = save_onboarding_connectivity(connectivity_payload)
     await persist_onboarding_connectivity(connectivity_payload)
@@ -2713,26 +2764,29 @@ async def post_onboarding_complete(payload: OnboardingCompletePayload = Body(...
 
     response: dict[str, Any] = {
         "project_mode": payload.project_mode,
+        "onboarding_path": payload.onboarding_path,
         "connectivity": connectivity_snapshot.model_dump(mode="json"),
+        "landing_pad_ingestion": landing_pad_summary,
         "rules_onboarding": {
             "started": False,
-            "status": "not-requested",
+            "status": "not-required" if payload.onboarding_path == "existing_monitoring" else "not-requested",
         },
         "rag_documents": [],
         "workflow_steps": _build_onboarding_steps_response(
+            onboarding_path=payload.onboarding_path,
             project_mode=payload.project_mode,
-            start_rules_onboarding=False,
+            start_rules_onboarding=should_start_rules_onboarding,
             requirements=[],
             rules_result=None,
             prometheus_result=None,
             rag_documents=[],
+            landing_pad_summary=landing_pad_summary,
         ),
     }
 
-    if not payload.start_rules_onboarding:
+    if not should_start_rules_onboarding:
         return response
 
-    selected_tool = _select_monitoring_tool(connectivity, payload.selected_monitoring_tool)
     requirements = [item for item in payload.plain_language_requirements if str(item or "").strip()]
     endpoint_url = _selected_tool_url(connectivity, selected_tool)
 
@@ -2781,12 +2835,14 @@ async def post_onboarding_complete(payload: OnboardingCompletePayload = Body(...
             requirements=requirements,
         )
     response["workflow_steps"] = _build_onboarding_steps_response(
+        onboarding_path=payload.onboarding_path,
         project_mode=payload.project_mode,
-        start_rules_onboarding=payload.start_rules_onboarding,
+        start_rules_onboarding=should_start_rules_onboarding,
         requirements=requirements,
         rules_result=workflow_result,
         prometheus_result=prometheus_upload_result,
         rag_documents=response.get("rag_documents", []),
+        landing_pad_summary=landing_pad_summary,
     )
     return response
 

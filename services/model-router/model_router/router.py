@@ -18,12 +18,6 @@ from common.resilience import CircuitBreaker
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# In-process prompt response cache (client-side prompt caching)
-# ---------------------------------------------------------------------------
-_PROMPT_CACHE_MAX: int = 512
-_PROMPT_CACHE_TTL: float = 300.0  # 5 minutes
-_prompt_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
 _SYSTEM_PROMPT_HASH = hashlib.sha256(SYSTEM_PROMPT_SRE.encode("utf-8")).hexdigest()[:16]
 
 
@@ -43,22 +37,39 @@ def _make_prompt_cache_key(provider: str, task: str, prompt: str, payload: dict[
     return hashlib.sha256(raw.encode()).hexdigest()[:40]
 
 
-def _prompt_cache_get(key: str) -> dict[str, Any] | None:
-    if key not in _prompt_cache:
+def _prompt_cache_get(key: str, *, cache: OrderedDict[str, tuple[float, dict[str, Any]]], ttl_seconds: float) -> dict[str, Any] | None:
+    if key not in cache:
         return None
-    ts, value = _prompt_cache[key]
-    if _time.monotonic() - ts > _PROMPT_CACHE_TTL:
-        del _prompt_cache[key]
+    ts, value = cache[key]
+    if _time.monotonic() - ts > ttl_seconds:
+        del cache[key]
         return None
-    _prompt_cache.move_to_end(key)
+    cache.move_to_end(key)
     return value
 
 
-def _prompt_cache_set(key: str, value: dict[str, Any]) -> None:
-    _prompt_cache[key] = (_time.monotonic(), value)
-    _prompt_cache.move_to_end(key)
-    while len(_prompt_cache) > _PROMPT_CACHE_MAX:
-        _prompt_cache.popitem(last=False)
+def _prompt_cache_set(
+    key: str,
+    value: dict[str, Any],
+    *,
+    cache: OrderedDict[str, tuple[float, dict[str, Any]]],
+    max_entries: int,
+) -> None:
+    cache[key] = (_time.monotonic(), value)
+    cache.move_to_end(key)
+    while len(cache) > max_entries:
+        cache.popitem(last=False)
+
+
+def _mark_usage_as_cached(result: dict[str, Any]) -> dict[str, Any]:
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    cached_usage = dict(usage)
+    cached_usage["cached"] = True
+    cached_usage["cache_hit"] = True
+    cached_usage["input_cost_usd"] = 0.0
+    cached_usage["output_cost_usd"] = 0.0
+    cached_usage["total_cost_usd"] = 0.0
+    return {**result, "usage": cached_usage, "cached": True}
 
 
 class ModelTask(StrEnum):
@@ -281,6 +292,7 @@ class OllamaModelProvider(ModelProvider):
 @dataclass
 class ModelRouter:
     providers: dict[str, ModelProvider] = field(default_factory=lambda: build_default_providers(get_settings()))
+    settings: Settings = field(default_factory=get_settings)
     failover_chain: dict[str, list[str]] = field(
         default_factory=lambda: {
             "gpt-5": ["gpt-4o", "local-llama"],
@@ -288,6 +300,7 @@ class ModelRouter:
             "gpt-4o": ["gpt-5", "local-llama"],
         }
     )
+    prompt_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = field(default_factory=OrderedDict)
 
     def select_model(self, *, severity: AlertSeverity, task: ModelTask) -> str:
         if severity == AlertSeverity.CRITICAL:
@@ -312,10 +325,16 @@ class ModelRouter:
             getattr(primary_provider, "base_url", getattr(primary_provider, "endpoint", "")) if primary_provider is not None else "",
         )
         cache_key = _make_prompt_cache_key(provider_identity, task.value, prompt, payload)
-        cached = _prompt_cache_get(cache_key)
+        cached = None
+        if self.settings.model_router_prompt_cache_enabled:
+            cached = _prompt_cache_get(
+                cache_key,
+                cache=self.prompt_cache,
+                ttl_seconds=self.settings.model_router_prompt_cache_ttl_seconds,
+            )
         if cached is not None:
             logger.debug("Prompt cache hit: %s", cache_key[:12])
-            return {**cached, "cached": True}
+            return _mark_usage_as_cached(cached)
         candidates = list(dict.fromkeys([primary, *self.failover_chain.get(primary, [])]))
         errors: list[str] = []
         for provider_name in candidates:
@@ -328,7 +347,13 @@ class ModelRouter:
                 usage = response.usage.as_dict()
                 usage["task"] = task.value
                 result = {"model": provider_name, "content": response.content, "usage": usage}
-                _prompt_cache_set(cache_key, result)
+                if self.settings.model_router_prompt_cache_enabled:
+                    _prompt_cache_set(
+                        cache_key,
+                        result,
+                        cache=self.prompt_cache,
+                        max_entries=self.settings.model_router_prompt_cache_max_entries,
+                    )
                 return result
             except Exception as exc:
                 errors.append(f"{provider_name}: {exc}")
@@ -343,11 +368,6 @@ class ModelRouter:
         prompt: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        cache_key = _make_prompt_cache_key(provider_name, task.value, prompt, payload)
-        cached = _prompt_cache_get(cache_key)
-        if cached is not None:
-            logger.debug("Prompt cache hit (provider): %s", cache_key[:12])
-            return {**cached, "cached": True}
         provider = self.providers.get(provider_name)
         if provider is None:
             raise RuntimeError(f"{provider_name} provider is not registered")
@@ -357,15 +377,27 @@ class ModelRouter:
             getattr(provider, "base_url", getattr(provider, "endpoint", "")),
         )
         cache_key = _make_prompt_cache_key(provider_identity, task.value, prompt, payload)
-        cached = _prompt_cache_get(cache_key)
+        cached = None
+        if self.settings.model_router_prompt_cache_enabled:
+            cached = _prompt_cache_get(
+                cache_key,
+                cache=self.prompt_cache,
+                ttl_seconds=self.settings.model_router_prompt_cache_ttl_seconds,
+            )
         if cached is not None:
             logger.debug("Prompt cache hit (provider): %s", cache_key[:12])
-            return {**cached, "cached": True}
+            return _mark_usage_as_cached(cached)
         response = await provider.generate(prompt, payload)
         usage = response.usage.as_dict()
         usage["task"] = task.value
         result = {"model": provider_name, "content": response.content, "usage": usage}
-        _prompt_cache_set(cache_key, result)
+        if self.settings.model_router_prompt_cache_enabled:
+            _prompt_cache_set(
+                cache_key,
+                result,
+                cache=self.prompt_cache,
+                max_entries=self.settings.model_router_prompt_cache_max_entries,
+            )
         return result
 
 
