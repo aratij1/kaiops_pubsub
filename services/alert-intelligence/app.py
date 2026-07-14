@@ -9,6 +9,7 @@ from common.config import get_settings
 from common.event_publishers import build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Alert
+from common.pubsub import PubSubConsumer, consume_forever as consume_pubsub_forever
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.repository_interfaces import SqlAlertHistoryRepository
@@ -85,6 +86,9 @@ async def startup(app: FastAPI) -> None:
     if settings.kafka_enabled:
         for worker in range(workers):
             consumers.insert(worker, (f"kafka-w{worker + 1}", KafkaConsumer(settings, RAW_ALERTS), consume_kafka_forever))
+    if settings.gcp_pubsub_enabled:
+        for worker in range(workers):
+            consumers.append((f"pubsub-w{worker + 1}", PubSubConsumer(settings, RAW_ALERTS), consume_pubsub_forever))
 
     async def handle(payload: dict) -> None:
         raw_alert_payload = payload.get("alert") if isinstance(payload.get("alert"), dict) else payload
