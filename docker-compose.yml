@@ -321,7 +321,7 @@ services:
     build:
       context: ./frontend/react
       dockerfile: Dockerfile
-    ports: ["80:80"]
+    ports: ["8501:80"]
     depends_on:
       api-gateway: { condition: service_healthy }
       approval-service: { condition: service_started }

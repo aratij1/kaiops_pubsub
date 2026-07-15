@@ -121,6 +121,7 @@ async def _persist_context_event(
                     "deployment": context.deployment,
                     "related_incidents": len(context.related_incidents),
                     "dependency_services": len(context.dependency_services),
+                    "document_available": bool(context.metadata.get("rag_service_tagged_match", False)),
                 },
             )
         )
@@ -423,6 +424,43 @@ def rebuild_flow_catalog_from_rag(connector: VectorDBConnector) -> None:
     merged = list(by_id.values())
     merged.sort(key=lambda item: str(item.get("title", "")).lower())
     catalog_path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+    markdown_path = connector.root_path() / "flows.md"
+    markdown_path.write_text(render_flow_catalog_markdown(merged), encoding="utf-8")
+
+
+def render_flow_catalog_markdown(entries: list[dict[str, Any]]) -> str:
+    field_labels = [
+        ("service", "Service"),
+        ("severity", "Severity"),
+        ("alert_type", "Alert Type"),
+        ("alert_id", "Alert ID"),
+        ("summary", "Summary"),
+        ("recommended_action", "Recommended Action"),
+        ("root_cause", "Root Cause"),
+        ("impact", "Impact"),
+        ("deployment", "Deployment"),
+        ("change_id", "Change ID"),
+        ("execution_plan", "Execution Plan"),
+    ]
+    lines = [
+        "# Alert Flow Catalog",
+        "",
+        "_Auto-generated from RAG incident documents whenever flows.json is rebuilt. "
+        "Edit the source incident docs and resubmit them — this file is overwritten "
+        "on every rebuild and excluded from RAG document matching._",
+        "",
+    ]
+    if not entries:
+        lines.append("_No incident-kind RAG documents are currently onboarded._")
+    for entry in entries:
+        title = str(entry.get("title") or entry.get("alert_name") or "Untitled Alert")
+        lines.append(f"## {title}")
+        for key, label in field_labels:
+            value = entry.get(key)
+            if value not in (None, ""):
+                lines.append(f"- **{label}:** {value}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def read_flow_catalog(connector: VectorDBConnector) -> list[dict[str, Any]]:
@@ -460,7 +498,13 @@ async def ingest_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
     result = write_rag_document(request)
     if request.kind == "incident":
         rebuild_flow_catalog_from_rag(vector_connector())
-    return {"status": "ingested", **result}
+    document_flag_updated = False
+    if request.alert_id and settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
+        async with app.state.session_factory() as session:
+            repo = IncidentRepository(session)
+            document_flag_updated = await repo.update_projection_document_flag(request.alert_id, True)
+            await session.commit()
+    return {"status": "ingested", "document_flag_updated": document_flag_updated, **result}
 
 
 @app.get("/rag/documents")

@@ -7,9 +7,9 @@
 :root.dm-theme-light body,
 :root[data-ui-theme="light"] body {
   background:
-    radial-gradient(circle at 10% 2%, rgba(47, 124, 197, 0.11) 0, rgba(47, 124, 197, 0) 34%),
-    radial-gradient(circle at 94% 0%, rgba(242, 140, 40, 0.14) 0, rgba(242, 140, 40, 0) 32%),
-    linear-gradient(180deg, #f8fbff 0%, #edf4fc 100%);
+    radial-gradient(circle at 10% 2%, rgba(211, 47, 47, 0.08) 0, rgba(211, 47, 47, 0) 34%),
+    radial-gradient(circle at 94% 0%, rgba(211, 47, 47, 0.06) 0, rgba(211, 47, 47, 0) 32%),
+    linear-gradient(180deg, #ffffff 0%, #fbf6f6 100%);
 
 }
 
@@ -25,9 +25,9 @@
 @media (prefers-color-scheme: light) {
   :root[data-ui-theme="auto"] body {
     background:
-      radial-gradient(circle at 10% 2%, rgba(47, 124, 197, 0.11) 0, rgba(47, 124, 197, 0) 34%),
-      radial-gradient(circle at 94% 0%, rgba(242, 140, 40, 0.14) 0, rgba(242, 140, 40, 0) 32%),
-      linear-gradient(180deg, #f8fbff 0%, #edf4fc 100%);
+      radial-gradient(circle at 10% 2%, rgba(211, 47, 47, 0.08) 0, rgba(211, 47, 47, 0) 34%),
+      radial-gradient(circle at 94% 0%, rgba(211, 47, 47, 0.06) 0, rgba(211, 47, 47, 0) 32%),
+      linear-gradient(180deg, #ffffff 0%, #fbf6f6 100%);
   }
 
   :root[data-ui-theme="auto"] .sidebar-group,

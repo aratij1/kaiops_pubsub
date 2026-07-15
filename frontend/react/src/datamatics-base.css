@@ -3,12 +3,12 @@
 :root {
   --dm-font-heading: "Space Grotesk", "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
   --dm-font-body: "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
-  --dm-color-primary-700: #004a8c;
-  --dm-color-primary-600: #005baa;
-  --dm-color-primary-500: #2f7cc5;
-  --dm-color-accent-500: #f28c28;
-  --dm-color-surface-900: #102840;
-  --dm-color-surface-700: #1e446f;
+  --dm-color-primary-700: #7f1010;
+  --dm-color-primary-600: #d32f2f;
+  --dm-color-primary-500: #e57373;
+  --dm-color-accent-500: #b71c1c;
+  --dm-color-surface-900: #2a0a0a;
+  --dm-color-surface-700: #5c1414;
   --dm-color-panel: #ffffff;
   --dm-color-text: #0f172a;
   --dm-color-text-soft: #4b5563;
@@ -36,9 +36,9 @@ body {
   font-family: var(--dm-font-body);
   color: var(--ink);
   background:
-    radial-gradient(circle at 6% 8%, rgba(47, 124, 197, 0.14) 0, rgba(47, 124, 197, 0) 34%),
-    radial-gradient(circle at 95% 4%, rgba(242, 140, 40, 0.16) 0, rgba(242, 140, 40, 0) 30%),
-    linear-gradient(180deg, #f5f9ff 0%, #eaf2fb 100%);
+    radial-gradient(circle at 6% 8%, rgba(211, 47, 47, 0.10) 0, rgba(211, 47, 47, 0) 34%),
+    radial-gradient(circle at 95% 4%, rgba(211, 47, 47, 0.08) 0, rgba(211, 47, 47, 0) 30%),
+    linear-gradient(180deg, #ffffff 0%, #fbf6f6 100%);
 }
 
 h1,
@@ -59,8 +59,8 @@ h4,
 }
 
 .hero {
-  background: linear-gradient(122deg, #113457 0%, var(--dm-color-primary-600) 48%, var(--dm-color-primary-500) 100%);
-  color: #eaf3ff;
+  background: linear-gradient(122deg, var(--dm-color-primary-700) 0%, var(--dm-color-primary-600) 48%, var(--dm-color-primary-500) 100%);
+  color: #fff5f5;
 }
 
 .hero h1,
@@ -94,8 +94,8 @@ h4,
 }
 
 .sidebar-section.active {
-  border-color: rgba(242, 140, 40, 0.64);
-  background: linear-gradient(180deg, #edf5ff 0%, #ddeeff 100%);
+  border-color: rgba(211, 47, 47, 0.55);
+  background: linear-gradient(180deg, #fff1f1 0%, #ffe1e1 100%);
 }
 
 .pill.severity-critical,

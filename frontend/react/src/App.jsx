@@ -852,8 +852,10 @@ export default function App() {
     services: "payments",
     severity: "high",
     alert_type: "availability",
+    alert_id: "",
   });
   const [alertOnboardingState, setAlertOnboardingState] = useState({ loading: false, result: null, error: "" });
+  const [docPromptAlert, setDocPromptAlert] = useState(null);
   const [alertBulkState, setAlertBulkState] = useState({
     fileName: "",
     loading: false,
@@ -1925,6 +1927,7 @@ export default function App() {
           .filter(Boolean),
         severity: String(alertOnboarding.severity || "").trim(),
         alert_type: String(alertOnboarding.alert_type || "").trim(),
+        alert_id: String(alertOnboarding.alert_id || "").trim() || null,
       };
       const response = await fetchJson("/api-gateway/rag/documents", {
         method: "POST",
@@ -1932,9 +1935,34 @@ export default function App() {
       });
       setAlertOnboardingState({ loading: false, result: response, error: "" });
       await loadRagDocs();
+      if (docPromptAlert) {
+        await loadRecentAlerts();
+        setDocPromptAlert(null);
+      }
     } catch (error) {
       setAlertOnboardingState({ loading: false, result: null, error: error.message });
     }
+  }
+
+  function openDocumentPrompt(row) {
+    const alertId = String(row?.alert_id || row?.id || "").trim();
+    setAlertOnboarding((curr) => ({
+      ...curr,
+      kind: "runbook",
+      title: String(row?.name || row?.alert_name || "Runbook").slice(0, 160),
+      summary: "",
+      content: "Provide troubleshooting and escalation steps for this alert scenario.",
+      services: String(row?.service || "").trim(),
+      severity: String(row?.severity || "high").toLowerCase(),
+      alert_type: String(row?.name || row?.alert_name || "").trim(),
+      alert_id: alertId,
+    }));
+    setAlertOnboardingState({ loading: false, result: null, error: "" });
+    setDocPromptAlert(row);
+  }
+
+  function closeDocumentPrompt() {
+    setDocPromptAlert(null);
   }
 
   function toText(value) {
@@ -3961,6 +3989,7 @@ export default function App() {
                         <th>Service</th>
                         <th>Severity</th>
                         <th>Status</th>
+                        <th>Docs</th>
                         <th>Action</th>
                       </tr>
                     </thead>
@@ -3972,6 +4001,7 @@ export default function App() {
                         const severity = String(row.severity || "-").toUpperCase();
                         const status = String(row.status || row.state || "open");
                         const application = row.application || row.project_name || row.project || row.service || "-";
+                        const documentAvailable = row.document_available;
                         return (
                           <tr
                             key={rowId}
@@ -3995,6 +4025,24 @@ export default function App() {
                             <td><span className={`pill severity-${severity.toLowerCase()}`}>{severity}</span></td>
                             <td><span className={`pill status-${status.toLowerCase()}`}>{status}</span></td>
                             <td>
+                              {documentAvailable === false ? (
+                                <button
+                                  type="button"
+                                  className="button-secondary pill status-blocked"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    openDocumentPrompt(row);
+                                  }}
+                                >
+                                  Provide Docs
+                                </button>
+                              ) : documentAvailable === true ? (
+                                <span className="pill status-resolved">Available</span>
+                              ) : (
+                                <span className="pill">-</span>
+                              )}
+                            </td>
+                            <td>
                               <button
                                 type="button"
                                 className="button-secondary"
@@ -4011,13 +4059,47 @@ export default function App() {
                       })}
                       {!visibleAlerts.length && !alerts.loading ? (
                         <tr>
-                          <td colSpan={8}>No alerts available for {applicationToMonitor}.</td>
+                          <td colSpan={9}>No alerts available for {applicationToMonitor}.</td>
                         </tr>
                       ) : null}
                     </tbody>
                   </table>
                 </div>
               </article>
+
+              {docPromptAlert ? (
+                <article className="panel" role="dialog" aria-label="Provide documents for alert">
+                  <div className="panel-head">
+                    <h3>Provide Documents</h3>
+                    <button type="button" className="button-secondary" onClick={closeDocumentPrompt}>Close</button>
+                  </div>
+                  <p className="subtitle">
+                    No knowledge base document was found for alert{" "}
+                    <strong>{String(docPromptAlert.name || docPromptAlert.alert_name || docPromptAlert.alert_id || docPromptAlert.id || "-")}</strong>.
+                    Upload a runbook or incident doc so future alerts of this type can be resolved automatically.
+                  </p>
+                  <form className="form" onSubmit={submitAlertOnboarding}>
+                    <div className="filter-grid">
+                      <label>Kind
+                        <select value={alertOnboarding.kind} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, kind: e.target.value }))}>
+                          <option value="incident">incident</option>
+                          <option value="runbook">runbook</option>
+                          <option value="deployment">deployment</option>
+                          <option value="change">change</option>
+                          <option value="dependency">dependency</option>
+                        </select>
+                      </label>
+                      <label>Title<input value={alertOnboarding.title} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, title: e.target.value }))} /></label>
+                      <label>Severity<select value={alertOnboarding.severity} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, severity: e.target.value }))}><option value="critical">critical</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option></select></label>
+                    </div>
+                    <label>Services (comma separated)<input value={alertOnboarding.services} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, services: e.target.value }))} /></label>
+                    <label>Summary<textarea rows={2} value={alertOnboarding.summary} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, summary: e.target.value }))} /></label>
+                    <label>Content<textarea rows={5} value={alertOnboarding.content} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, content: e.target.value }))} /></label>
+                    <button className="button-primary" type="submit" disabled={alertOnboardingState.loading}>{alertOnboardingState.loading ? "Uploading..." : "Upload Document"}</button>
+                  </form>
+                  {alertOnboardingState.error ? <p className="error">{alertOnboardingState.error}</p> : null}
+                </article>
+              ) : null}
 
               {selectedAlertRow ? (
                 <article className="panel" ref={alertDetailsRef}>

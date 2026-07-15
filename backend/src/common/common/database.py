@@ -218,6 +218,7 @@ class IncidentProjectionRecord(Base, TimestampMixin):
     latest_event_type: Mapped[str | None] = mapped_column(String(128), index=True)
     latest_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    document_available: Mapped[bool | None] = mapped_column(Boolean)
     projection_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
@@ -446,6 +447,22 @@ async def create_schema(engine: AsyncEngine) -> None:
                     if int(has_flow_index or 0) == 0:
                         await connection.execute(
                             text("CREATE INDEX idx_incident_projections_flow ON incident_projections (flow_id)")
+                        )
+
+                    has_document_available_column = await connection.scalar(
+                        text(
+                            """
+                            SELECT COUNT(*)
+                            FROM information_schema.columns
+                            WHERE table_schema = DATABASE()
+                              AND table_name = 'incident_projections'
+                              AND column_name = 'document_available'
+                            """
+                        )
+                    )
+                    if int(has_document_available_column or 0) == 0:
+                        await connection.execute(
+                            text("ALTER TABLE incident_projections ADD COLUMN document_available BOOLEAN NULL")
                         )
         finally:
             if engine.dialect.name == "postgresql":
