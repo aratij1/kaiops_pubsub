@@ -1,0 +1,52 @@
+name: deploy-vm
+
+on:
+  push:
+    branches:
+      - main
+      - cursor/agentic-incident-platform-f631
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to VM over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          port: ${{ secrets.VM_PORT || '22' }}
+          script_stop: true
+          script: |
+            set -e
+
+            APP_DIR="${{ secrets.VM_APP_DIR }}"
+            BRANCH="${{ secrets.VM_BRANCH }}"
+
+            if [ -z "$APP_DIR" ]; then
+              echo "VM_APP_DIR secret is required"
+              exit 1
+            fi
+
+            if [ -z "$BRANCH" ]; then
+              BRANCH="main"
+            fi
+
+            cd "$APP_DIR"
+
+            git fetch origin
+            git checkout "$BRANCH"
+            git pull --ff-only origin "$BRANCH"
+
+            docker compose up -d --build --remove-orphans
+            docker image prune -f
+
+            # Basic post-deploy health probe
+            curl -fsS http://localhost:8010/healthz >/dev/null
+            echo "Deployment successful"
