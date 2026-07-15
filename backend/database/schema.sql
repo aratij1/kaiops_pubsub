@@ -211,6 +211,7 @@ CREATE TABLE IF NOT EXISTS incident_projections (
     latest_event_at DATETIME(6),
     first_seen_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    document_available BOOLEAN,
     projection_payload JSON NOT NULL,
     KEY idx_incident_projections_status (status),
     KEY idx_incident_projections_recommendation (recommendation_id),

@@ -104,7 +104,11 @@ class VectorDBConnector(BaseConnector):
         if root is None or not root.exists():
             return []
         self._document_cache.clear()
-        documents = [self._parse_metadata_document(path) for path in sorted(root.rglob("*.md"))]
+        documents = [
+            self._parse_metadata_document(path)
+            for path in sorted(root.rglob("*.md"))
+            if path.name != "flows.md"
+        ]
         derived_documents: list[dict[str, Any]] = []
         for doc in documents:
             if str(doc.get("kind", "")).strip().lower() != "incident":
@@ -214,8 +218,15 @@ class VectorDBConnector(BaseConnector):
         body_lines: list[str] = []
         in_metadata = True
         for line in raw.splitlines():
-            if in_metadata and not line.strip():
+            stripped = line.strip()
+            # Some generated docs have stray blank lines (or bare \r line
+            # endings that splitlines() treats as blanks) within the header
+            # block; skip them instead of ending metadata mode early.
+            if in_metadata and not stripped:
+                continue
+            if in_metadata and stripped.startswith("#"):
                 in_metadata = False
+                body_lines.append(line)
                 continue
             if in_metadata and ":" in line:
                 key, value = line.split(":", 1)
@@ -243,6 +254,11 @@ class VectorDBConnector(BaseConnector):
                 for line in handle:
                     stripped = line.strip()
                     if not stripped:
+                        # Some generated docs have stray blank lines (or bare
+                        # \r line endings that read() splits into blanks)
+                        # within the header block; skip rather than stop.
+                        continue
+                    if stripped.startswith("#"):
                         break
                     if ":" in line:
                         key, value = line.split(":", 1)
@@ -320,6 +336,41 @@ class VectorDBConnector(BaseConnector):
             return True
         return str(doc.get("kind", "")).strip().lower() in preferred_kinds
 
+    def has_service_tagged_match(self, alert: Alert, min_similarity: float = 0.1) -> bool:
+        """True only if some doc explicitly declares this alert's service.
+
+        Unlike _rank_documents (used for general context enrichment, which
+        deliberately falls back to the whole corpus so it can still surface
+        loosely-related info), this is the strict signal behind
+        "document_available": with hundreds of similar-domain ops documents,
+        a bare similarity score can't reliably tell "genuinely relevant" from
+        "coincidentally shares vocabulary" apart. Requiring an explicit
+        services tag first narrows the candidate pool enough that similarity
+        becomes a meaningful sanity check rather than the only signal.
+        """
+        service = str(alert.service or "").strip().lower()
+        if not service:
+            return False
+        candidates = []
+        for doc in self.documents:
+            doc_services = doc.get("services", [])
+            if isinstance(doc_services, str):
+                doc_services = [doc_services]
+            if not isinstance(doc_services, list) or not doc_services:
+                continue
+            normalized = {str(item).strip().lower() for item in doc_services if str(item).strip()}
+            if service in normalized or any(service in item or item in service for item in normalized):
+                candidates.append(doc)
+        if not candidates:
+            return False
+        hydrated = [dict(doc) if doc.get("_synthetic") else self._load_full_document(str(doc.get("path", ""))) for doc in candidates]
+        query_vector = self.embedding_model.embed(f"{alert.service} {alert.name} {alert.description}")
+        best_score = max(
+            cosine_similarity(query_vector, doc.get("_embedding") or self.embedding_model.embed(self._document_text(doc)))
+            for doc in hydrated
+        )
+        return best_score >= min_similarity
+
     def _metadata_rank_score(self, query_vector: list[float], doc: dict[str, Any]) -> float:
         embedding = doc.get("_metadata_embedding")
         if not isinstance(embedding, list):
@@ -353,11 +404,17 @@ class VectorDBConnector(BaseConnector):
             key=lambda doc: self._metadata_rank_score(query_vector, doc),
         )
         hydrated = [dict(doc) if doc.get("_synthetic") else self._load_full_document(str(doc.get("path", ""))) for doc in shortlisted]
-        return heapq.nlargest(
-            limit,
-            hydrated,
-            key=lambda doc: cosine_similarity(query_vector, doc.get("_embedding") or self.embedding_model.embed(self._document_text(doc))),
-        )
+        scored = [
+            (cosine_similarity(query_vector, doc.get("_embedding") or self.embedding_model.embed(self._document_text(doc))), doc)
+            for doc in hydrated
+        ]
+        top = heapq.nlargest(limit, scored, key=lambda item: item[0])
+        results = []
+        for score, doc in top:
+            doc = dict(doc)
+            doc["_similarity"] = score
+            results.append(doc)
+        return results
 
 
 @dataclass
@@ -424,6 +481,8 @@ class ContextIntelligenceAgent(BaseAgent):
         )
         by_name = {connector.name: result for connector, result in zip(self.connectors, results, strict=True)}
         vector_matches = by_name["vector-db"]["matches"]
+        vector_connector = next((c for c in self.connectors if isinstance(c, VectorDBConnector)), None)
+        service_tagged_match = bool(vector_connector and vector_connector.has_service_tagged_match(alert))
         runbook = next((doc["content"] for doc in vector_matches if doc["kind"] == "runbook"), "")
         related = [doc for doc in vector_matches if doc["kind"] == "incident"]
         deployment_doc = next((doc for doc in vector_matches if doc["kind"] == "deployment"), {})
@@ -469,6 +528,8 @@ class ContextIntelligenceAgent(BaseAgent):
                     {"kind": doc.get("kind"), "title": doc.get("title"), "path": doc.get("path")}
                     for doc in vector_matches
                 ],
+                "rag_top_similarity": max((doc.get("_similarity", 0.0) for doc in vector_matches), default=0.0),
+                "rag_service_tagged_match": service_tagged_match,
             },
         )
 

@@ -15,7 +15,7 @@
 :root.dm-theme-dark body,
 :root[data-ui-theme="dark"] body {
   background:
-    radial-gradient(circle at 8% 0%, rgba(242, 140, 40, 0.14) 0, rgba(242, 140, 40, 0) 35%),
+    radial-gradient(circle at 8% 0%, rgba(211, 47, 47, 0.16) 0, rgba(211, 47, 47, 0) 35%),
     linear-gradient(180deg, #102840 0%, #1a3a5d 100%);
   color: var(--ink);
 }
@@ -32,7 +32,7 @@
 
 :root.dm-theme-dark .hero,
 :root[data-ui-theme="dark"] .hero {
-  background: linear-gradient(122deg, #0f2238 0%, #0d5a9f 50%, #2f7cc5 100%);
+  background: linear-gradient(122deg, #2a0a0a 0%, #7f1010 50%, #d32f2f 100%);
 }
 
 :root.dm-theme-dark .hero h1,
@@ -184,7 +184,7 @@
 
   :root[data-ui-theme="auto"] body {
     background:
-      radial-gradient(circle at 8% 0%, rgba(242, 140, 40, 0.14) 0, rgba(242, 140, 40, 0) 35%),
+      radial-gradient(circle at 8% 0%, rgba(211, 47, 47, 0.16) 0, rgba(211, 47, 47, 0) 35%),
       linear-gradient(180deg, #102840 0%, #1a3a5d 100%);
     color: var(--ink);
   }
@@ -197,7 +197,7 @@
   }
 
   :root[data-ui-theme="auto"] .hero {
-    background: linear-gradient(122deg, #0f2238 0%, #0d5a9f 50%, #2f7cc5 100%);
+    background: linear-gradient(122deg, #2a0a0a 0%, #7f1010 50%, #d32f2f 100%);
   }
 
   :root[data-ui-theme="auto"] .hero h1,

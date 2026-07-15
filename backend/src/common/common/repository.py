@@ -203,6 +203,15 @@ def _extract_flow_id(payload: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _extract_document_available(payload: dict[str, Any] | None) -> bool | None:
+    if not isinstance(payload, dict):
+        return None
+    if "document_available" not in payload:
+        return None
+    value = payload.get("document_available")
+    return bool(value) if value is not None else None
+
+
 def _extract_source_channel(payload: dict[str, Any] | None) -> str | None:
     if not isinstance(payload, dict):
         return None
@@ -336,6 +345,7 @@ class IncidentRepository:
                     alert_to_incident[alert_id] = str(incident.id)
 
         projection_status_by_incident: dict[str, str] = {}
+        projection_document_available_by_incident: dict[str, bool | None] = {}
         projection_incident_ids = {
             self._parse_uuid(incident_id)
             for incident_id in alert_to_incident.values()
@@ -346,7 +356,9 @@ class IncidentRepository:
                 select(IncidentProjectionRecord).where(IncidentProjectionRecord.incident_id.in_(projection_incident_ids))
             )
             for projection in projection_result.scalars().all():
-                projection_status_by_incident[str(projection.incident_id)] = str(projection.status or "").strip()
+                incident_key = str(projection.incident_id)
+                projection_status_by_incident[incident_key] = str(projection.status or "").strip()
+                projection_document_available_by_incident[incident_key] = projection.document_available
 
         enriched_rows: list[dict[str, Any]] = []
         for row in rows:
@@ -359,9 +371,32 @@ class IncidentRepository:
                 if projection_status:
                     payload["status"] = projection_status
                     payload["state"] = projection_status
+                if incident_id in projection_document_available_by_incident:
+                    payload["document_available"] = projection_document_available_by_incident[incident_id]
             enriched_rows.append(payload)
 
         return enriched_rows
+
+    async def update_projection_document_flag(self, alert_id: str, available: bool) -> bool:
+        """Set incident_projections.document_available for the incident linked to alert_id.
+
+        Used after a user uploads a document for an alert so the landing page
+        reflects availability immediately, without waiting for context re-collection.
+        """
+        parsed_alert_id = self._parse_uuid(alert_id)
+        if parsed_alert_id is None:
+            return False
+        result = await self.session.execute(
+            select(IncidentProjectionRecord)
+            .where(IncidentProjectionRecord.alert_id == parsed_alert_id)
+            .order_by(IncidentProjectionRecord.latest_event_at.desc())
+        )
+        projection = result.scalars().first()
+        if projection is None:
+            return False
+        projection.document_available = available
+        await self.session.merge(projection)
+        return True
 
     async def get_processed_result_by_alert_id(self, alert_id: str) -> dict[str, Any] | None:
         normalized_alert_id = str(alert_id or "").strip()
@@ -1159,20 +1194,29 @@ class IncidentRepository:
                 status=event_record.status or "open",
             )
 
+        # document_available is not part of the status lifecycle, so it must not be
+        # dropped by the regression guard below when events share a timestamp.
+        document_available = _extract_document_available(event_record.payload)
+        if document_available is not None:
+            projection.document_available = document_available
+
         # Do not regress projection lifecycle when two events share the same timestamp.
         # In local/demo runs, recommendation and closed can be written within the same second.
         existing_latest = _utc_dt(projection.latest_event_at)
         incoming_latest = _utc_dt(event_record.created_at)
         if existing_latest is not None and incoming_latest is not None:
             if incoming_latest < existing_latest:
+                await self.session.merge(projection)
                 return
             if incoming_latest == existing_latest:
                 existing_rank = _status_rank(projection.status)
                 incoming_rank = _status_rank(event_record.status)
                 if incoming_rank < existing_rank:
+                    await self.session.merge(projection)
                     return
 
-        projection.alert_id = event_record.alert_id
+        if event_record.alert_id is not None:
+            projection.alert_id = event_record.alert_id
         projection.trace_id = event_record.trace_id
         recommendation_uuid = _extract_recommendation_uuid(event_record.payload)
         flow_id = _extract_flow_id(event_record.payload)
