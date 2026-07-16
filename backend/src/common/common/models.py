@@ -50,6 +50,33 @@ class SafetyDecision(StrEnum):
     BLOCK = "block"
 
 
+class MonitoringPlatform(StrEnum):
+    PROMETHEUS = "prometheus"
+    DATADOG = "datadog"
+    NEW_RELIC = "new_relic"
+    DYNATRACE = "dynatrace"
+    SPLUNK = "splunk"
+
+
+class ApplicationStatus(StrEnum):
+    REGISTERED = "registered"
+    DISCOVERING = "discovering"
+    DISCOVERED = "discovered"
+    METRICS_VALIDATED = "metrics_validated"
+    RULES_GENERATED = "rules_generated"
+    PROMETHEUS_UPDATED = "prometheus_updated"
+    VALIDATED = "validated"
+    DASHBOARD_CREATED = "dashboard_created"
+    FAILED = "failed"
+    DELETED = "deleted"
+
+
+class GovernanceDecision(StrEnum):
+    APPROVED = "approved"
+    REQUIRES_APPROVAL = "requires_approval"
+    REJECTED = "rejected"
+
+
 class BaseEvent(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
@@ -57,6 +84,133 @@ class BaseEvent(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     trace_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ApplicationRegistration(BaseEvent):
+    tenant_id: str = "default"
+    name: str
+    owner_team: str
+    owner_email: str | None = None
+    environment: str = "prod"
+    namespace: str
+    region: str = "us-east-1"
+    technology: str
+    monitoring_platform: MonitoringPlatform = MonitoringPlatform.PROMETHEUS
+    metrics_endpoint: str
+    labels: dict[str, str] = Field(default_factory=dict)
+    status: ApplicationStatus = ApplicationStatus.REGISTERED
+
+
+class ApplicationDiscoveryResult(BaseEvent):
+    application_id: UUID
+    tenant_id: str = "default"
+    name: str
+    environment: str = "prod"
+    namespace: str
+    technology: str
+    resource_kind: str = "deployment"
+    discovered_resources: list[dict[str, Any]] = Field(default_factory=list)
+    metrics_endpoint: str
+    labels: dict[str, str] = Field(default_factory=dict)
+    status: ApplicationStatus = ApplicationStatus.DISCOVERED
+
+
+class MetricsValidationResult(BaseEvent):
+    application_id: UUID
+    tenant_id: str = "default"
+    metrics_endpoint: str
+    metrics_available: bool = False
+    technology: str = "unknown"
+    exporter: str = "unknown"
+    labels: dict[str, str] = Field(default_factory=dict)
+    metric_families: list[str] = Field(default_factory=list)
+    sample_metrics: list[str] = Field(default_factory=list)
+    status: ApplicationStatus = ApplicationStatus.METRICS_VALIDATED
+
+
+class PrometheusRuleSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    expr: str
+    duration: str = "5m"
+    severity: str = "warning"
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+
+
+class RecordingRuleSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    expr: str
+    labels: dict[str, str] = Field(default_factory=dict)
+
+
+class ScrapeConfigSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_name: str
+    targets: list[str] = Field(default_factory=list)
+    metrics_path: str = "/metrics"
+    scheme: str = "http"
+    labels: dict[str, str] = Field(default_factory=dict)
+
+
+class RulesGeneratedResult(BaseEvent):
+    application_id: UUID
+    tenant_id: str = "default"
+    platform: MonitoringPlatform = MonitoringPlatform.PROMETHEUS
+    scrape_config: ScrapeConfigSpec
+    alert_rules: list[PrometheusRuleSpec] = Field(default_factory=list)
+    recording_rules: list[RecordingRuleSpec] = Field(default_factory=list)
+    governance: dict[str, Any] = Field(default_factory=dict)
+    status: ApplicationStatus = ApplicationStatus.RULES_GENERATED
+
+
+class PrometheusUpdateResult(BaseEvent):
+    application_id: UUID
+    tenant_id: str = "default"
+    platform: MonitoringPlatform = MonitoringPlatform.PROMETHEUS
+    files: dict[str, str] = Field(default_factory=dict)
+    reload_ok: bool = False
+    provider_response: dict[str, Any] = Field(default_factory=dict)
+    status: ApplicationStatus = ApplicationStatus.PROMETHEUS_UPDATED
+
+
+class MonitoringValidationResult(BaseEvent):
+    application_id: UUID
+    tenant_id: str = "default"
+    target_up: bool = False
+    metrics_available: bool = False
+    alerts_loaded: bool = False
+    recording_rules_loaded: bool = False
+    service_discovery_ok: bool = False
+    dashboard_ready: bool = False
+    details: dict[str, Any] = Field(default_factory=dict)
+    status: ApplicationStatus = ApplicationStatus.VALIDATED
+
+
+class GrafanaDashboardResult(BaseEvent):
+    application_id: UUID
+    tenant_id: str = "default"
+    dashboard_uid: str
+    title: str
+    url: str | None = None
+    dashboard: dict[str, Any] = Field(default_factory=dict)
+    status: ApplicationStatus = ApplicationStatus.DASHBOARD_CREATED
+
+
+class MonitoringAuditEvent(BaseEvent):
+    application_id: UUID
+    tenant_id: str = "default"
+    event_type: str
+    actor: str
+    agent: str
+    decision: str
+    execution_time_ms: float = 0.0
+    input: dict[str, Any] = Field(default_factory=dict)
+    output: dict[str, Any] = Field(default_factory=dict)
 
 
 class Alert(BaseEvent):

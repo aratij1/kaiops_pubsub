@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app/backend/src/common:/app/backend/src/api-gateway:/app/backend/src/alert-intelligence:/app/backend/src/orchestrator:/app/backend/src/context-agent:/app/backend/src/model-router:/app/backend/src/resolution-agent:/app/backend/src/approval-service:/app/backend/src/remediation-engine:/app/backend/src/closure-service:/app/backend/src/monitoring-adapter
+    PYTHONPATH=/app/backend/src/common:/app/backend/src/api-gateway:/app/backend/src/application-onboarding:/app/backend/src/alert-intelligence:/app/backend/src/audit-service:/app/backend/src/dashboard-generator:/app/backend/src/discovery-service:/app/backend/src/orchestrator:/app/backend/src/context-agent:/app/backend/src/model-router:/app/backend/src/metrics-validation-agent:/app/backend/src/prometheus-config-service:/app/backend/src/resolution-agent:/app/backend/src/rule-generation-agent:/app/backend/src/approval-service:/app/backend/src/remediation-engine:/app/backend/src/closure-service:/app/backend/src/validation-agent:/app/backend/src/monitoring-adapter
 
 WORKDIR /app
 

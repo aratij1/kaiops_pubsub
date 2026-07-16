@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from common.config import get_settings
 from common.models import AlertSeverity
 from common.service import create_app
@@ -20,7 +22,7 @@ class RouteRequest(BaseModel):
 
 
 @app.post("/route")
-async def route(request: RouteRequest) -> dict[str, str]:
+async def route(request: RouteRequest) -> dict[str, Any]:
     return await router.route(
         severity=request.severity,
         task=request.task,

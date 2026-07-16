@@ -17,7 +17,7 @@ from common.telemetry import EVENTS_PROCESSED
 from common.topics import CONTEXT_EVENTS, ORCHESTRATION_EVENTS
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import VectorDBConnector
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 settings = get_settings()
@@ -268,6 +268,10 @@ class RagDocumentRequest(BaseModel):
     metadata: dict[str, str] = Field(default_factory=dict)
 
 
+class RagDocumentUpdateRequest(RagDocumentRequest):
+    path: str = Field(min_length=3)
+
+
 def vector_connector() -> VectorDBConnector:
     for connector in agent.connectors:
         if isinstance(connector, VectorDBConnector):
@@ -359,6 +363,20 @@ def write_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
         while target.exists():
             target = target_dir / f"{base_name}-{counter}.md"
             counter += 1
+    target.write_text(render_document(request), encoding="utf-8")
+    count = connector.reload()
+    return {"path": str(target), "document_count": count}
+
+
+def write_rag_document_to_path(request: RagDocumentRequest, path: str) -> dict[str, Any]:
+    connector = vector_connector()
+    root = connector.root_path().resolve()
+    target = Path(path).expanduser().resolve()
+    if root not in target.parents:
+        raise HTTPException(status_code=400, detail="Document path is outside the RAG directory")
+    if target.suffix.lower() != ".md":
+        raise HTTPException(status_code=400, detail="Document path must end with .md")
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(render_document(request), encoding="utf-8")
     count = connector.reload()
     return {"path": str(target), "document_count": count}
@@ -505,6 +523,21 @@ async def ingest_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
             document_flag_updated = await repo.update_projection_document_flag(request.alert_id, True)
             await session.commit()
     return {"status": "ingested", "document_flag_updated": document_flag_updated, **result}
+
+
+@app.put("/rag/documents")
+async def update_rag_document(request: RagDocumentUpdateRequest) -> dict[str, Any]:
+    payload = request.model_dump(exclude={"path"})
+    result = write_rag_document_to_path(RagDocumentRequest(**payload), request.path)
+    if request.kind == "incident":
+        rebuild_flow_catalog_from_rag(vector_connector())
+    document_flag_updated = False
+    if request.alert_id and settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
+        async with app.state.session_factory() as session:
+            repo = IncidentRepository(session)
+            document_flag_updated = await repo.update_projection_document_flag(request.alert_id, True)
+            await session.commit()
+    return {"status": "updated", "document_flag_updated": document_flag_updated, **result}
 
 
 @app.get("/rag/documents")
