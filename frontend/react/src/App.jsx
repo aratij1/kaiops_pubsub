@@ -1127,7 +1127,6 @@ export default function App() {
   const [alerts, setAlerts] = useState({ loading: false, rows: [], error: "" });
   const [alertSeverityOverrides, setAlertSeverityOverrides] = useState({ loading: false, rows: [], error: "", savingKey: "" });
   const [alertSeverityDrafts, setAlertSeverityDrafts] = useState({});
-  const [alertsLimit, setAlertsLimit] = useState(50);
   const [incidentMetadata, setIncidentMetadata] = useState({ loading: false, rows: [], error: "" });
   const [closedIncidents, setClosedIncidents] = useState({ loading: false, rows: [], error: "" });
   const [flows, setFlows] = useState({ loading: false, rows: [], error: "" });
@@ -1560,6 +1559,7 @@ export default function App() {
     if (!incidentId) {
       return;
     }
+    setApprovalState({ loading: false, result: null, error: "" });
     const scopedAlerts = filterAlertsForMonitor(alerts.rows, applicationToMonitor);
     const matchedAlert = scopedAlerts.find((alertRow) => {
       const alertId = String(alertRow?.alert_id || alertRow?.id || alertRow?.incident_id || "").trim();
@@ -4029,7 +4029,7 @@ export default function App() {
       incident_id: incidentId || current.incident_id,
       recommendation_id: recommendationId || current.recommendation_id,
     }));
-    setApprovalState((current) => ({ ...current, error: "" }));
+    setApprovalState({ loading: false, result: null, error: "" });
     loadApprovalIncidentContext(incidentId);
   }
 
@@ -6890,7 +6890,10 @@ export default function App() {
                                 <button
                                   className="button-secondary"
                                   type="button"
-                                  onClick={() => setInlineRejectState((current) => current.incidentId === incidentId ? { incidentId: "", comment: "" } : { incidentId, comment: "" })}
+                                  onClick={() => {
+                                    setApprovalState({ loading: false, result: null, error: "" });
+                                    setInlineRejectState((current) => current.incidentId === incidentId ? { incidentId: "", comment: "" } : { incidentId, comment: "" });
+                                  }}
                                   disabled={!canQuickApprove || approvalState.loading}
                                   title={canQuickApprove ? "Reject this incident with a comment" : "Recommendation ID unavailable. Use Sync From Approval API first."}
                                   style={{ marginLeft: 8 }}

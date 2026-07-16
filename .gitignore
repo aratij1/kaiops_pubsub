@@ -18,6 +18,8 @@ logs/local/*.log
 # Generated UI and runtime artifacts
 .tmp-ui-bundle.js
 backend/ingested_alerts/input/*.json
+backend/ingested_alerts/processed/*.json
+backend/ingested_alerts/failed/*.json
 
 # Generated onboarding outputs
 backend/rag/changes/**

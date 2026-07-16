@@ -104,6 +104,8 @@ RECENT_ALERTS: deque[dict[str, Any]] = deque(maxlen=200)
 PENDING_WORKFLOWS: dict[str, dict[str, Any]] = {}
 CLOSED_INCIDENTS: deque[dict[str, Any]] = deque(maxlen=500)
 LANDING_PAD_INPUT_DIR = Path(os.getenv("LANDING_PAD_INPUT_DIR", "/app/ingested_alerts/input"))
+LANDING_PAD_PROCESSED_DIR = LANDING_PAD_INPUT_DIR.parent / "processed"
+LANDING_PAD_FAILED_DIR = LANDING_PAD_INPUT_DIR.parent / "failed"
 WORKER_FAILURE_COUNTS: dict[str, int] = {
     "incident_projection_worker": 0,
 }
@@ -115,26 +117,35 @@ _ALLOWED_DEPLOYMENT_MODES = {"on_prem", "gcp_cloud"}
 ONBOARDING_RULE_EVENTS = "onboarding-rule-events"
 
 
-def _persist_alert_to_landing_pad(mapped_payload: dict[str, Any], raw_alert: dict[str, Any]) -> str | None:
+def _persist_alert_to_landing_pad(
+    mapped_payload: dict[str, Any],
+    raw_alert: dict[str, Any],
+    *,
+    status: Literal["processed", "failed"],
+    error: str | None = None,
+) -> str | None:
     try:
-        LANDING_PAD_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+        target_dir = LANDING_PAD_PROCESSED_DIR if status == "processed" else LANDING_PAD_FAILED_DIR
+        target_dir.mkdir(parents=True, exist_ok=True)
         now = datetime.now(timezone.utc)
         alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))
         labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
         fingerprint = str(labels.get("alert_fingerprint") or "no-fingerprint").strip() or "no-fingerprint"
         safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:24]
         file_name = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}_{alert_name}_{safe_fingerprint}.json"
-        out_path = LANDING_PAD_INPUT_DIR / file_name
+        out_path = target_dir / file_name
         payload = {
             "received_at": now.isoformat(),
             "source": "prometheus-alertmanager",
+            "status": status,
+            "error": error,
             "alert": mapped_payload,
             "raw": raw_alert,
         }
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return str(out_path)
     except Exception:
-        logger.exception("failed to persist alert to landing pad input")
+        logger.exception("failed to persist alert to landing pad %s", status)
         return None
 
 
@@ -3211,9 +3222,23 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
             },
         }
 
-        alert = _build_alert_from_payload(mapped_payload, trace_id=x_trace_id)
-        await _publish_ingested_alert(alert)
-        landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item)
+        try:
+            alert = _build_alert_from_payload(mapped_payload, trace_id=x_trace_id)
+            await _publish_ingested_alert(alert)
+        except Exception as exc:
+            logger.exception("failed to ingest alertmanager alert")
+            _persist_alert_to_landing_pad(mapped_payload, item, status="failed", error=str(exc))
+            skipped_rows.append(
+                {
+                    "status": status,
+                    "alertname": str(merged_labels.get("alertname") or "unknown-alert"),
+                    "service": str(merged_labels.get("service") or merged_labels.get("job") or "unknown"),
+                    "reason": f"ingestion failed: {exc}",
+                }
+            )
+            continue
+
+        landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item, status="processed")
         ingested_rows.append(
             {
                 "alert_id": str(alert.id),
@@ -3403,11 +3428,16 @@ async def delete_onboarding_state(project_name: str, provider_name: str | None =
 @app.get("/landing-pad/recent")
 async def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 200))
-    input_dir = LANDING_PAD_INPUT_DIR
-    input_dir.mkdir(parents=True, exist_ok=True)
+    LANDING_PAD_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    LANDING_PAD_FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
     files = sorted(
-        [path for path in input_dir.glob("*.json") if path.is_file()],
+        [
+            path
+            for source_dir in (LANDING_PAD_PROCESSED_DIR, LANDING_PAD_FAILED_DIR)
+            for path in source_dir.glob("*.json")
+            if path.is_file()
+        ],
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )[:safe_limit]
@@ -3428,6 +3458,8 @@ async def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
             entry.update(
                 {
                     "received_at": payload.get("received_at") if isinstance(payload, dict) else None,
+                    "status": payload.get("status") if isinstance(payload, dict) else None,
+                    "error": payload.get("error") if isinstance(payload, dict) else None,
                     "name": alert.get("name") if isinstance(alert, dict) else None,
                     "service": alert.get("service") if isinstance(alert, dict) else None,
                     "severity": alert.get("severity") if isinstance(alert, dict) else None,
@@ -3441,7 +3473,8 @@ async def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
         rows.append(entry)
 
     return {
-        "input_dir": str(input_dir),
+        "processed_dir": str(LANDING_PAD_PROCESSED_DIR),
+        "failed_dir": str(LANDING_PAD_FAILED_DIR),
         "rows": rows,
         "count": len(rows),
     }
