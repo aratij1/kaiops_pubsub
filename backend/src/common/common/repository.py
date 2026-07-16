@@ -9,24 +9,49 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.database import (
     ActionRecord,
+    AlertRuleRecord,
     AgentWorkItemRecord,
     AlertRecord,
+    ApplicationEnvironmentRecord,
+    ApplicationLabelRecord,
+    ApplicationRecord,
     ApprovalRecord,
     AuditLogRecord,
+    GrafanaDashboardRecord,
     IncidentEventRecord,
     IncidentRecord,
     IncidentProjectionRecord,
     KnowledgeBaseRecord,
+    MonitoringProfileRecord,
+    MonitoringIntegrationRecord,
+    MonitoringCredentialRecord,
+    MonitoringWebhookEndpointRecord,
+    MonitoringAlertMappingRecord,
+    MonitoringConnectionHealthRecord,
+    MonitoringReceivedAlertRecord,
+    MonitoringNormalizedAlertRecord,
+    MonitoringConnectionAuditRecord,
+    OnboardingHistoryRecord,
     RcaReportRecord,
+    PrometheusConfigRecord,
+    RecordingRuleRecord,
     OnboardingStateRecord,
     PendingWorkflowRecord,
+    ValidationHistoryRecord,
 )
 from common.models import (
     Alert,
     Approval,
+    ApplicationRegistration,
+    GrafanaDashboardResult,
     Incident,
+    MetricsValidationResult,
+    MonitoringAuditEvent,
+    MonitoringValidationResult,
+    PrometheusUpdateResult,
     Recommendation,
     RemediationAction,
+    RulesGeneratedResult,
     ResolutionReport,
 )
 
@@ -529,6 +554,25 @@ class IncidentRepository:
             payload = row.payload if isinstance(row.payload, dict) else {}
             source_channel = _extract_source_channel(payload)
             query_hint = _extract_query_hint(payload)
+            input_value = payload.get("input") if isinstance(payload.get("input"), (dict, list, str, int, float, bool)) else None
+            if input_value is None and isinstance(payload.get("request"), (dict, list, str, int, float, bool)):
+                input_value = payload.get("request")
+            if input_value is None and isinstance(payload.get("input_payload"), (dict, list, str, int, float, bool)):
+                input_value = payload.get("input_payload")
+            if input_value is None and isinstance(payload.get("context"), (dict, list, str, int, float, bool)):
+                input_value = payload.get("context")
+
+            output_value = payload.get("output") if isinstance(payload.get("output"), (dict, list, str, int, float, bool)) else None
+            if output_value is None and isinstance(payload.get("result"), (dict, list, str, int, float, bool)):
+                output_value = payload.get("result")
+            if output_value is None and payload:
+                # Fall back to the full payload so timeline output renders real event data.
+                output_value = payload
+
+            error_value = payload.get("error") if isinstance(payload.get("error"), (dict, list, str, int, float, bool)) else None
+            if error_value is None and isinstance(payload.get("exception"), (dict, list, str, int, float, bool)):
+                error_value = payload.get("exception")
+
             event_trace.append(
                 {
                     "timestamp": row.created_at,
@@ -545,6 +589,10 @@ class IncidentRepository:
                     "trace_id": row.trace_id,
                     "table_hints": _infer_table_hints(row.event_type, payload),
                     "query_hint": query_hint,
+                    "payload": payload,
+                    "input_value": input_value,
+                    "output_value": output_value,
+                    "error": error_value,
                 }
             )
 
@@ -918,6 +966,730 @@ class IncidentRepository:
                 payload=report.model_dump(mode="json"),
             )
         )
+
+    async def save_application(self, application: ApplicationRegistration) -> None:
+        await self.session.merge(
+            ApplicationRecord(
+                id=self._require("application.id", application.id),
+                tenant_id=self._require("application.tenant_id", application.tenant_id),
+                name=self._require("application.name", application.name),
+                owner_team=self._require("application.owner_team", application.owner_team),
+                owner_email=application.owner_email,
+                environment=self._require("application.environment", application.environment),
+                namespace=self._require("application.namespace", application.namespace),
+                region=self._require("application.region", application.region),
+                technology=self._require("application.technology", application.technology),
+                monitoring_platform=str(application.monitoring_platform),
+                metrics_endpoint=self._require("application.metrics_endpoint", application.metrics_endpoint),
+                status=str(application.status),
+                payload=application.model_dump(mode="json"),
+            )
+        )
+        await self.session.execute(delete(ApplicationEnvironmentRecord).where(ApplicationEnvironmentRecord.application_id == application.id))
+        await self.session.execute(delete(ApplicationLabelRecord).where(ApplicationLabelRecord.application_id == application.id))
+        self.session.add(
+            ApplicationEnvironmentRecord(
+                application_id=application.id,
+                tenant_id=application.tenant_id,
+                environment=application.environment,
+                namespace=application.namespace,
+                region=application.region,
+                cluster=application.labels.get("cluster") if isinstance(application.labels, dict) else None,
+                payload={"metrics_endpoint": application.metrics_endpoint},
+            )
+        )
+        for key, value in (application.labels or {}).items():
+            self.session.add(
+                ApplicationLabelRecord(
+                    application_id=application.id,
+                    tenant_id=application.tenant_id,
+                    label_key=str(key),
+                    label_value=str(value),
+                )
+            )
+
+    async def update_application_status(
+        self,
+        application_id: Any,
+        *,
+        status: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        record = await self.session.get(ApplicationRecord, application_id)
+        if record is None:
+            return
+        record.status = str(status)
+        if isinstance(payload, dict) and payload:
+            merged_payload = dict(record.payload or {})
+            merged_payload.update(payload)
+            record.payload = merged_payload
+        await self.session.merge(record)
+    
+    async def save_monitoring_integration(
+        self,
+        *,
+        integration_id: Any,
+        tenant_id: str,
+        project_name: str,
+        provider: str,
+        status: str,
+        active: bool,
+        auth_type: str,
+        endpoint_url: str | None,
+        webhook_path: str,
+        deployment_mode: str,
+        config_payload: dict[str, Any],
+        validation_payload: dict[str, Any],
+    ) -> None:
+        parsed_id = self._parse_uuid(integration_id)
+        if parsed_id is None:
+            raise ValueError("monitoring_integration.id is required")
+        await self.session.merge(
+            MonitoringIntegrationRecord(
+                id=parsed_id,
+                tenant_id=self._require("monitoring_integration.tenant_id", tenant_id),
+                project_name=self._require("monitoring_integration.project_name", project_name),
+                provider=self._require("monitoring_integration.provider", provider),
+                status=self._require("monitoring_integration.status", status),
+                active=bool(active),
+                auth_type=self._require("monitoring_integration.auth_type", auth_type),
+                endpoint_url=endpoint_url,
+                webhook_path=self._require("monitoring_integration.webhook_path", webhook_path),
+                deployment_mode=self._require("monitoring_integration.deployment_mode", deployment_mode),
+                config_payload=config_payload or {},
+                validation_payload=validation_payload or {},
+            )
+        )
+    
+    async def list_monitoring_integrations(self, tenant_id: str = "default") -> list[dict[str, Any]]:
+        result = await self.session.execute(
+            select(MonitoringIntegrationRecord)
+            .where(MonitoringIntegrationRecord.tenant_id == str(tenant_id or "default"))
+            .order_by(MonitoringIntegrationRecord.updated_at.desc())
+        )
+        rows = result.scalars().all()
+        return [
+            {
+                "id": str(row.id),
+                "tenant_id": row.tenant_id,
+                "project_name": row.project_name,
+                "provider": row.provider,
+                "status": row.status,
+                "active": row.active,
+                "auth_type": row.auth_type,
+                "endpoint_url": row.endpoint_url,
+                "webhook_path": row.webhook_path,
+                "deployment_mode": row.deployment_mode,
+                "config_payload": row.config_payload,
+                "validation_payload": row.validation_payload,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            }
+            for row in rows
+        ]
+    
+    async def get_monitoring_integration(self, integration_id: Any) -> dict[str, Any] | None:
+        parsed_id = self._parse_uuid(integration_id)
+        if parsed_id is None:
+            return None
+        result = await self.session.execute(
+            select(MonitoringIntegrationRecord).where(MonitoringIntegrationRecord.id == parsed_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return {
+            "id": str(row.id),
+            "tenant_id": row.tenant_id,
+            "project_name": row.project_name,
+            "provider": row.provider,
+            "status": row.status,
+            "active": row.active,
+            "auth_type": row.auth_type,
+            "endpoint_url": row.endpoint_url,
+            "webhook_path": row.webhook_path,
+            "deployment_mode": row.deployment_mode,
+            "config_payload": row.config_payload,
+            "validation_payload": row.validation_payload,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
+    
+    async def delete_monitoring_integration(self, integration_id: Any) -> int:
+        parsed_id = self._parse_uuid(integration_id)
+        if parsed_id is None:
+            return 0
+        result = await self.session.execute(
+            delete(MonitoringIntegrationRecord).where(MonitoringIntegrationRecord.id == parsed_id)
+        )
+        return int(result.rowcount or 0)
+    
+    async def save_monitoring_credential(
+        self,
+        *,
+        credential_id: Any,
+        integration_id: Any,
+        credential_type: str,
+        secret_ref: str,
+        encrypted_payload: dict[str, Any],
+        redacted_payload: dict[str, Any],
+    ) -> None:
+        cred_id = self._parse_uuid(credential_id)
+        int_id = self._parse_uuid(integration_id)
+        if cred_id is None or int_id is None:
+            raise ValueError("monitoring_credential ids are required")
+        await self.session.merge(
+            MonitoringCredentialRecord(
+                id=cred_id,
+                integration_id=int_id,
+                credential_type=self._require("monitoring_credential.credential_type", credential_type),
+                secret_ref=self._require("monitoring_credential.secret_ref", secret_ref),
+                encrypted_payload=encrypted_payload or {},
+                redacted_payload=redacted_payload or {},
+            )
+        )
+    
+    async def save_monitoring_webhook_endpoint(
+        self,
+        *,
+        endpoint_id: Any,
+        integration_id: Any,
+        provider: str,
+        webhook_path: str,
+        token_hash: str | None,
+        hmac_enabled: bool,
+        m_tls_enabled: bool,
+        active: bool,
+        metadata_payload: dict[str, Any],
+    ) -> None:
+        endpoint_uuid = self._parse_uuid(endpoint_id)
+        integration_uuid = self._parse_uuid(integration_id)
+        if endpoint_uuid is None or integration_uuid is None:
+            raise ValueError("monitoring_webhook_endpoint ids are required")
+        await self.session.merge(
+            MonitoringWebhookEndpointRecord(
+                id=endpoint_uuid,
+                integration_id=integration_uuid,
+                provider=self._require("monitoring_webhook_endpoint.provider", provider),
+                webhook_path=self._require("monitoring_webhook_endpoint.webhook_path", webhook_path),
+                token_hash=token_hash,
+                hmac_enabled=bool(hmac_enabled),
+                m_tls_enabled=bool(m_tls_enabled),
+                active=bool(active),
+                metadata_payload=metadata_payload or {},
+            )
+        )
+    
+    async def replace_monitoring_alert_mappings(
+        self,
+        *,
+        integration_id: Any,
+        provider: str,
+        mappings: list[dict[str, Any]],
+    ) -> int:
+        integration_uuid = self._parse_uuid(integration_id)
+        if integration_uuid is None:
+            return 0
+        await self.session.execute(
+            delete(MonitoringAlertMappingRecord).where(MonitoringAlertMappingRecord.integration_id == integration_uuid)
+        )
+        inserted = 0
+        for item in mappings:
+            provider_field = str(item.get("provider_field") or "").strip()
+            kaiops_field = str(item.get("kaiops_field") or "").strip()
+            if not provider_field or not kaiops_field:
+                continue
+            self.session.add(
+                MonitoringAlertMappingRecord(
+                    id=uuid4(),
+                    integration_id=integration_uuid,
+                    provider=str(provider or "").strip(),
+                    provider_field=provider_field,
+                    kaiops_field=kaiops_field,
+                    transform=str(item.get("transform") or "").strip() or None,
+                    required=bool(item.get("required", False)),
+                    mapping_payload=item if isinstance(item, dict) else {},
+                )
+            )
+            inserted += 1
+        return inserted
+    
+    async def list_monitoring_alert_mappings(self, integration_id: Any) -> list[dict[str, Any]]:
+        integration_uuid = self._parse_uuid(integration_id)
+        if integration_uuid is None:
+            return []
+        result = await self.session.execute(
+            select(MonitoringAlertMappingRecord)
+            .where(MonitoringAlertMappingRecord.integration_id == integration_uuid)
+            .order_by(MonitoringAlertMappingRecord.provider_field)
+        )
+        rows = result.scalars().all()
+        return [
+            {
+                "id": str(row.id),
+                "integration_id": str(row.integration_id),
+                "provider": row.provider,
+                "provider_field": row.provider_field,
+                "kaiops_field": row.kaiops_field,
+                "transform": row.transform,
+                "required": row.required,
+                "mapping_payload": row.mapping_payload,
+                "updated_at": row.updated_at,
+            }
+            for row in rows
+        ]
+    
+    async def save_monitoring_connection_health(
+        self,
+        *,
+        health_id: Any,
+        integration_id: Any,
+        provider: str,
+        status: str,
+        connectivity_ok: bool,
+        authentication_ok: bool,
+        webhook_ok: bool,
+        last_received_alert_at: datetime | None,
+        last_successful_test_at: datetime | None,
+        rate_limit_remaining: int | None,
+        payload: dict[str, Any],
+    ) -> None:
+        health_uuid = self._parse_uuid(health_id)
+        integration_uuid = self._parse_uuid(integration_id)
+        if health_uuid is None or integration_uuid is None:
+            raise ValueError("monitoring_connection_health ids are required")
+        await self.session.merge(
+            MonitoringConnectionHealthRecord(
+                id=health_uuid,
+                integration_id=integration_uuid,
+                provider=self._require("monitoring_connection_health.provider", provider),
+                status=self._require("monitoring_connection_health.status", status),
+                connectivity_ok=bool(connectivity_ok),
+                authentication_ok=bool(authentication_ok),
+                webhook_ok=bool(webhook_ok),
+                last_received_alert_at=last_received_alert_at,
+                last_successful_test_at=last_successful_test_at,
+                rate_limit_remaining=rate_limit_remaining,
+                payload=payload or {},
+            )
+        )
+    
+    async def list_monitoring_connection_health(self, tenant_id: str = "default") -> list[dict[str, Any]]:
+        integration_rows = await self.list_monitoring_integrations(tenant_id=tenant_id)
+        integration_ids = [self._parse_uuid(row.get("id")) for row in integration_rows]
+        integration_ids = [item for item in integration_ids if item is not None]
+        if not integration_ids:
+            return []
+        result = await self.session.execute(
+            select(MonitoringConnectionHealthRecord)
+            .where(MonitoringConnectionHealthRecord.integration_id.in_(integration_ids))
+            .order_by(MonitoringConnectionHealthRecord.updated_at.desc())
+        )
+        rows = result.scalars().all()
+        return [
+            {
+                "id": str(row.id),
+                "integration_id": str(row.integration_id),
+                "provider": row.provider,
+                "status": row.status,
+                "connectivity_ok": row.connectivity_ok,
+                "authentication_ok": row.authentication_ok,
+                "webhook_ok": row.webhook_ok,
+                "last_received_alert_at": row.last_received_alert_at,
+                "last_successful_test_at": row.last_successful_test_at,
+                "rate_limit_remaining": row.rate_limit_remaining,
+                "payload": row.payload,
+                "updated_at": row.updated_at,
+            }
+            for row in rows
+        ]
+    
+    async def save_monitoring_received_alert(
+        self,
+        *,
+        received_alert_id: Any,
+        integration_id: Any | None,
+        tenant_id: str,
+        provider: str,
+        provider_alert_id: str | None,
+        dedupe_key: str | None,
+        signature_valid: bool,
+        auth_valid: bool,
+        status: str,
+        raw_payload: dict[str, Any],
+    ) -> None:
+        record_id = self._parse_uuid(received_alert_id)
+        integration_uuid = self._parse_uuid(integration_id)
+        if record_id is None:
+            raise ValueError("monitoring_received_alert.id is required")
+        await self.session.merge(
+            MonitoringReceivedAlertRecord(
+                id=record_id,
+                integration_id=integration_uuid,
+                tenant_id=str(tenant_id or "default"),
+                provider=self._require("monitoring_received_alert.provider", provider),
+                provider_alert_id=provider_alert_id,
+                dedupe_key=dedupe_key,
+                signature_valid=bool(signature_valid),
+                auth_valid=bool(auth_valid),
+                status=self._require("monitoring_received_alert.status", status),
+                raw_payload=raw_payload or {},
+            )
+        )
+    
+    async def save_monitoring_normalized_alert(
+        self,
+        *,
+        normalized_alert_id: Any,
+        received_alert_id: Any,
+        integration_id: Any | None,
+        tenant_id: str,
+        provider: str,
+        application: str | None,
+        environment: str | None,
+        severity: str | None,
+        alert_name: str,
+        resource: str | None,
+        labels: dict[str, Any],
+        annotations: dict[str, Any],
+        normalized_payload: dict[str, Any],
+    ) -> None:
+        normalized_id = self._parse_uuid(normalized_alert_id)
+        received_id = self._parse_uuid(received_alert_id)
+        integration_uuid = self._parse_uuid(integration_id)
+        if normalized_id is None or received_id is None:
+            raise ValueError("monitoring_normalized_alert ids are required")
+        await self.session.merge(
+            MonitoringNormalizedAlertRecord(
+                id=normalized_id,
+                received_alert_id=received_id,
+                integration_id=integration_uuid,
+                tenant_id=str(tenant_id or "default"),
+                provider=self._require("monitoring_normalized_alert.provider", provider),
+                application=application,
+                environment=environment,
+                severity=severity,
+                alert_name=self._require("monitoring_normalized_alert.alert_name", alert_name),
+                resource=resource,
+                labels=labels or {},
+                annotations=annotations or {},
+                normalized_payload=normalized_payload or {},
+            )
+        )
+    
+    async def list_monitoring_received_alerts(self, tenant_id: str = "default", limit: int = 200) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 1000))
+        result = await self.session.execute(
+            select(MonitoringReceivedAlertRecord)
+            .where(MonitoringReceivedAlertRecord.tenant_id == str(tenant_id or "default"))
+            .order_by(MonitoringReceivedAlertRecord.created_at.desc())
+            .limit(safe_limit)
+        )
+        rows = result.scalars().all()
+        return [
+            {
+                "id": str(row.id),
+                "integration_id": str(row.integration_id) if row.integration_id else None,
+                "tenant_id": row.tenant_id,
+                "provider": row.provider,
+                "provider_alert_id": row.provider_alert_id,
+                "dedupe_key": row.dedupe_key,
+                "signature_valid": row.signature_valid,
+                "auth_valid": row.auth_valid,
+                "status": row.status,
+                "raw_payload": row.raw_payload,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+    
+    async def save_monitoring_connection_audit(
+        self,
+        *,
+        audit_id: Any,
+        integration_id: Any | None,
+        tenant_id: str,
+        actor: str,
+        action: str,
+        provider: str | None,
+        outcome: str,
+        message: str | None,
+        payload: dict[str, Any],
+    ) -> None:
+        record_id = self._parse_uuid(audit_id)
+        integration_uuid = self._parse_uuid(integration_id)
+        if record_id is None:
+            raise ValueError("monitoring_connection_audit.id is required")
+        await self.session.merge(
+            MonitoringConnectionAuditRecord(
+                id=record_id,
+                integration_id=integration_uuid,
+                tenant_id=str(tenant_id or "default"),
+                actor=self._require("monitoring_connection_audit.actor", actor),
+                action=self._require("monitoring_connection_audit.action", action),
+                provider=provider,
+                outcome=self._require("monitoring_connection_audit.outcome", outcome),
+                message=message,
+                payload=payload or {},
+            )
+        )
+    
+    async def list_monitoring_connection_audit(self, tenant_id: str = "default", limit: int = 200) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 2000))
+        result = await self.session.execute(
+            select(MonitoringConnectionAuditRecord)
+            .where(MonitoringConnectionAuditRecord.tenant_id == str(tenant_id or "default"))
+            .order_by(MonitoringConnectionAuditRecord.created_at.desc())
+            .limit(safe_limit)
+        )
+        rows = result.scalars().all()
+        return [
+            {
+                "id": str(row.id),
+                "integration_id": str(row.integration_id) if row.integration_id else None,
+                "tenant_id": row.tenant_id,
+                "actor": row.actor,
+                "action": row.action,
+                "provider": row.provider,
+                "outcome": row.outcome,
+                "message": row.message,
+                "payload": row.payload,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+
+    async def list_applications(self) -> list[dict[str, Any]]:
+        result = await self.session.execute(select(ApplicationRecord).order_by(ApplicationRecord.updated_at.desc()))
+        rows = result.scalars().all()
+        return [
+            {
+                "id": str(row.id),
+                "tenant_id": row.tenant_id,
+                "name": row.name,
+                "owner_team": row.owner_team,
+                "owner_email": row.owner_email,
+                "environment": row.environment,
+                "namespace": row.namespace,
+                "region": row.region,
+                "technology": row.technology,
+                "monitoring_platform": row.monitoring_platform,
+                "metrics_endpoint": row.metrics_endpoint,
+                "status": row.status,
+                "payload": row.payload,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            }
+            for row in rows
+        ]
+
+    async def get_application(self, application_id: Any) -> dict[str, Any] | None:
+        record = await self.session.get(ApplicationRecord, application_id)
+        if record is None:
+            return None
+        return {
+            "id": str(record.id),
+            "tenant_id": record.tenant_id,
+            "name": record.name,
+            "owner_team": record.owner_team,
+            "owner_email": record.owner_email,
+            "environment": record.environment,
+            "namespace": record.namespace,
+            "region": record.region,
+            "technology": record.technology,
+            "monitoring_platform": record.monitoring_platform,
+            "metrics_endpoint": record.metrics_endpoint,
+            "status": record.status,
+            "payload": record.payload,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+        }
+
+    async def delete_application(self, application_id: Any) -> int:
+        await self.session.execute(delete(ApplicationEnvironmentRecord).where(ApplicationEnvironmentRecord.application_id == application_id))
+        await self.session.execute(delete(ApplicationLabelRecord).where(ApplicationLabelRecord.application_id == application_id))
+        result = await self.session.execute(delete(ApplicationRecord).where(ApplicationRecord.id == application_id))
+        return int(result.rowcount or 0)
+
+    async def save_monitoring_profile(self, result: MetricsValidationResult, governance_status: str | None = None) -> None:
+        await self.session.merge(
+            MonitoringProfileRecord(
+                application_id=result.application_id,
+                tenant_id=result.tenant_id,
+                platform="prometheus",
+                exporter=result.exporter,
+                technology=result.technology,
+                metrics_available=result.metrics_available,
+                governance_status=governance_status,
+                payload=result.model_dump(mode="json"),
+            )
+        )
+
+    async def replace_rules(self, result: RulesGeneratedResult) -> None:
+        await self.session.execute(delete(AlertRuleRecord).where(AlertRuleRecord.application_id == result.application_id))
+        await self.session.execute(delete(RecordingRuleRecord).where(RecordingRuleRecord.application_id == result.application_id))
+        for rule in result.alert_rules:
+            self.session.add(
+                AlertRuleRecord(
+                    application_id=result.application_id,
+                    tenant_id=result.tenant_id,
+                    name=rule.name,
+                    expression=rule.expr,
+                    duration=rule.duration,
+                    severity=rule.severity,
+                    labels=rule.labels,
+                    annotations=rule.annotations,
+                    payload=rule.model_dump(mode="json"),
+                )
+            )
+        for rule in result.recording_rules:
+            self.session.add(
+                RecordingRuleRecord(
+                    application_id=result.application_id,
+                    tenant_id=result.tenant_id,
+                    name=rule.name,
+                    expression=rule.expr,
+                    labels=rule.labels,
+                    payload=rule.model_dump(mode="json"),
+                )
+            )
+
+    async def save_prometheus_update(self, result: PrometheusUpdateResult) -> None:
+        for config_type, file_path in result.files.items():
+            content = ""
+            provider_response = result.provider_response if isinstance(result.provider_response, dict) else {}
+            if config_type in provider_response and isinstance(provider_response.get(config_type), str):
+                content = str(provider_response.get(config_type) or "")
+            self.session.add(
+                PrometheusConfigRecord(
+                    application_id=result.application_id,
+                    tenant_id=result.tenant_id,
+                    config_type=config_type,
+                    version=1,
+                    file_path=file_path,
+                    content=content,
+                    payload=result.model_dump(mode="json"),
+                )
+            )
+
+    async def save_validation_result(self, result: MonitoringValidationResult) -> None:
+        self.session.add(
+            ValidationHistoryRecord(
+                application_id=result.application_id,
+                tenant_id=result.tenant_id,
+                target_up=result.target_up,
+                metrics_available=result.metrics_available,
+                alerts_loaded=result.alerts_loaded,
+                recording_rules_loaded=result.recording_rules_loaded,
+                service_discovery_ok=result.service_discovery_ok,
+                dashboard_ready=result.dashboard_ready,
+                payload=result.model_dump(mode="json"),
+            )
+        )
+
+    async def save_dashboard_result(self, result: GrafanaDashboardResult) -> None:
+        await self.session.merge(
+            GrafanaDashboardRecord(
+                application_id=result.application_id,
+                tenant_id=result.tenant_id,
+                dashboard_uid=result.dashboard_uid,
+                title=result.title,
+                url=result.url,
+                payload=result.model_dump(mode="json"),
+            )
+        )
+
+    async def save_monitoring_audit(self, audit_event: MonitoringAuditEvent) -> None:
+        self.session.add(
+            OnboardingHistoryRecord(
+                application_id=audit_event.application_id,
+                tenant_id=audit_event.tenant_id,
+                event_type=audit_event.event_type,
+                status=audit_event.decision,
+                actor=audit_event.actor,
+                agent=audit_event.agent,
+                decision=audit_event.decision,
+                execution_time_ms=audit_event.execution_time_ms,
+                payload=audit_event.model_dump(mode="json"),
+            )
+        )
+        self.session.add(
+            AuditLogRecord(
+                actor=audit_event.actor,
+                action=audit_event.event_type,
+                resource_type="application",
+                resource_id=str(audit_event.application_id),
+                payload=audit_event.model_dump(mode="json"),
+            )
+        )
+
+    async def list_application_history(self, application_id: Any) -> list[dict[str, Any]]:
+        result = await self.session.execute(
+            select(OnboardingHistoryRecord)
+            .where(OnboardingHistoryRecord.application_id == application_id)
+            .order_by(OnboardingHistoryRecord.created_at.desc())
+        )
+        rows = result.scalars().all()
+        return [
+            {
+                "id": str(row.id),
+                "application_id": str(row.application_id),
+                "tenant_id": row.tenant_id,
+                "event_type": row.event_type,
+                "status": row.status,
+                "actor": row.actor,
+                "agent": row.agent,
+                "decision": row.decision,
+                "execution_time_ms": row.execution_time_ms,
+                "payload": row.payload,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+
+    async def list_application_dashboards(self, application_id: Any) -> list[dict[str, Any]]:
+        result = await self.session.execute(
+            select(GrafanaDashboardRecord)
+            .where(GrafanaDashboardRecord.application_id == application_id)
+            .order_by(GrafanaDashboardRecord.updated_at.desc())
+        )
+        rows = result.scalars().all()
+        return [
+            {
+                "id": str(row.id),
+                "application_id": str(row.application_id),
+                "dashboard_uid": row.dashboard_uid,
+                "title": row.title,
+                "url": row.url,
+                "payload": row.payload,
+                "updated_at": row.updated_at,
+            }
+            for row in rows
+        ]
+
+    async def list_application_validations(self, application_id: Any) -> list[dict[str, Any]]:
+        result = await self.session.execute(
+            select(ValidationHistoryRecord)
+            .where(ValidationHistoryRecord.application_id == application_id)
+            .order_by(ValidationHistoryRecord.created_at.desc())
+        )
+        rows = result.scalars().all()
+        return [
+            {
+                "id": str(row.id),
+                "application_id": str(row.application_id),
+                "tenant_id": row.tenant_id,
+                "target_up": row.target_up,
+                "metrics_available": row.metrics_available,
+                "alerts_loaded": row.alerts_loaded,
+                "recording_rules_loaded": row.recording_rules_loaded,
+                "service_discovery_ok": row.service_discovery_ok,
+                "dashboard_ready": row.dashboard_ready,
+                "payload": row.payload,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
 
     async def save_onboarding_state(
         self,

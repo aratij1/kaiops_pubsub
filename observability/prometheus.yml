@@ -100,3 +100,11 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["kafka-exporter:9308"]
+
+  - job_name: kaiops-dynamic-applications
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/generated-targets/*.json
+    relabel_configs:
+      - source_labels: [__meta_filepath]
+        target_label: kaiops_generated_target

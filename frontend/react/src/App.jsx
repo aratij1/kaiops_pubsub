@@ -50,6 +50,7 @@ const TAB_SHORTCUT_MAP = {
 };
 const VALID_TABS = new Set(Object.values(TAB_SHORTCUT_MAP));
 const MONITORING_TOOL_OPTIONS = ["prometheus", "new_relic", "datadog"];
+const ALERT_DOC_KIND_OPTIONS = ["incident", "runbook", "deployment", "change", "dependency"];
 
 const ROLE_ALLOWED_TABS = {
   administrator: ["home", "copilot", "approval", "executive", "admin", "trace", "safety", "rag", "finops", "closed", "summary"],
@@ -73,6 +74,14 @@ function simplifyMonitoringUrl(value) {
   }
   const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
   return withScheme.replace(/\/+$/, "");
+}
+
+function normalizeMatchToken(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function severityOverrideKey(name, service = "", environment = "") {
+  return [normalizeMatchToken(name), normalizeMatchToken(service), normalizeMatchToken(environment)].join("|");
 }
 
 function extractMonitoringToolAndUrl(source, fallbackTool = "prometheus", fallbackUrl = "") {
@@ -401,7 +410,35 @@ function elapsedSeconds(start, end) {
   if (!startDate || !endDate) {
     return "-";
   }
-  return ((endDate.getTime() - startDate.getTime()) / 1000).toFixed(3);
+  const delta = Math.max(0, endDate.getTime() - startDate.getTime());
+  return (delta / 1000).toFixed(3);
+}
+
+function normalizeTraceServiceName(event) {
+  const rawService = String(event?.service || "").trim();
+  if (!rawService) {
+    return "-";
+  }
+  if (!looksLikeUuid(rawService)) {
+    return rawService;
+  }
+  const eventType = String(event?.event_type || "").trim().toLowerCase();
+  if (eventType.includes("closure")) {
+    return "closure-service";
+  }
+  if (eventType.includes("recommendation") || eventType.includes("resolution")) {
+    return "resolution-agent";
+  }
+  if (eventType.includes("approval")) {
+    return "approval-service";
+  }
+  if (eventType.includes("context")) {
+    return "context-agent";
+  }
+  if (eventType.includes("workflow") || eventType.includes("orchestration")) {
+    return "orchestrator";
+  }
+  return "monitoring-adapter";
 }
 
 function routeForAgent(agentName) {
@@ -432,6 +469,213 @@ function compactText(value, maxLength = 180) {
   return text.length > maxLength ? `${text.slice(0, Math.max(24, maxLength - 1))}...` : text;
 }
 
+function hasMeaningfulValue(value) {
+  if (value === null || value === undefined) {
+    return false;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim();
+    return Boolean(normalized && normalized !== "-");
+  }
+  if (Array.isArray(value)) {
+    return value.length > 0;
+  }
+  if (typeof value === "object") {
+    return Object.keys(value).length > 0;
+  }
+  return true;
+}
+
+function stringifyTimelineValue(value) {
+  if (!hasMeaningfulValue(value)) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (_error) {
+    return String(value);
+  }
+}
+
+function isFailureStatus(value) {
+  const token = String(value || "").trim().toLowerCase();
+  if (!token) {
+    return false;
+  }
+  return ["fail", "failed", "failure", "error", "exception", "rejected", "timeout", "denied"].some((flag) => token.includes(flag));
+}
+
+function normalizeApprovalStatus(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isApprovalResolvedStatus(value) {
+  const token = normalizeApprovalStatus(value);
+  if (!token) {
+    return false;
+  }
+  return ["approved", "rejected", "closed", "resolved", "failed", "cancelled", "canceled"].includes(token);
+}
+
+function isApprovalPendingStatus(value) {
+  const token = normalizeApprovalStatus(value);
+  if (!token) {
+    return false;
+  }
+  return ["awaiting_approval", "pending", "queued", "awaiting user approval", "standby"].includes(token);
+}
+
+function statusPillClass(value) {
+  const token = normalizeApprovalStatus(value);
+  if (!token) {
+    return "status-open";
+  }
+  if (token.includes("approved")) {
+    return "status-approved";
+  }
+  if (token.includes("rejected")) {
+    return "status-rejected";
+  }
+  if (token.includes("closed") || token.includes("resolved")) {
+    return "status-closed";
+  }
+  if (token.includes("failed") || token.includes("error") || token.includes("blocked") || token.includes("denied")) {
+    return "status-failed";
+  }
+  const normalized = token.replace(/[^a-z0-9]+/g, "_");
+  return normalized ? `status-${normalized}` : "status-open";
+}
+
+function extractEventError(event) {
+  if (!event || typeof event !== "object") {
+    return "";
+  }
+  const status = String(event.status || "").trim();
+  const candidates = [
+    event.error,
+    event.errors,
+    event.exception,
+    event.failure,
+    event.failure_reason,
+    event.error_message,
+    event.detail,
+    event.message,
+  ];
+  const hit = candidates.find((item) => hasMeaningfulValue(item));
+  if (hit !== undefined) {
+    return stringifyTimelineValue(hit);
+  }
+  if (isFailureStatus(status)) {
+    const reason = hasMeaningfulValue(event.policy_reason) ? stringifyTimelineValue(event.policy_reason) : "";
+    return reason || `Status: ${status}`;
+  }
+  return "";
+}
+
+function extractEventInput(event) {
+  if (!event || typeof event !== "object") {
+    return null;
+  }
+  const payload = typeof event.payload === "object" && event.payload ? event.payload : null;
+  const candidates = [
+    event.input_value,
+    event.input,
+    event.input_payload,
+    event.request,
+    event.context,
+    event.source_payload,
+    payload?.input,
+    payload?.request,
+    payload?.context,
+  ];
+  const hit = candidates.find((item) => hasMeaningfulValue(item));
+  return hit === undefined ? null : hit;
+}
+
+function extractEventOutput(event) {
+  if (!event || typeof event !== "object") {
+    return null;
+  }
+  const payload = typeof event.payload === "object" && event.payload ? event.payload : null;
+  const candidates = [
+    event.output_value,
+    event.output,
+    event.result,
+    payload,
+    event.response,
+    event.recommendation,
+    event.decision,
+  ];
+  const hit = candidates.find((item) => hasMeaningfulValue(item));
+  if (!hasMeaningfulValue(hit)) {
+    return null;
+  }
+  const eventType = String(event.event_type || "").trim();
+  if (typeof hit === "string" && eventType && hit.trim() === eventType && hasMeaningfulValue(payload)) {
+    return payload;
+  }
+  return hit;
+}
+
+function deriveExecutionCommands(workflow, traceRows) {
+  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
+  const safeTraceRows = Array.isArray(traceRows) ? traceRows : [];
+  const recommendation = typeof safeWorkflow.recommendation === "object" && safeWorkflow.recommendation ? safeWorkflow.recommendation : {};
+  const recommendationMetadata = typeof recommendation.metadata === "object" && recommendation.metadata ? recommendation.metadata : {};
+  const remediationAction = typeof safeWorkflow.remediation_action === "object" && safeWorkflow.remediation_action ? safeWorkflow.remediation_action : {};
+  const decision =
+    (typeof safeWorkflow.decision === "object" && safeWorkflow.decision)
+    || (typeof safeWorkflow.orchestration_decision === "object" && safeWorkflow.orchestration_decision)
+    || (typeof recommendationMetadata.orchestration_decision === "object" && recommendationMetadata.orchestration_decision)
+    || {};
+
+  const explicit =
+    (Array.isArray(recommendation.commands) && recommendation.commands)
+    || (Array.isArray(remediationAction.commands) && remediationAction.commands)
+    || (Array.isArray(decision.commands) && decision.commands)
+    || [];
+  if (explicit.length) {
+    return explicit.map((item) => String(item || "").trim()).filter(Boolean);
+  }
+
+  const derived = [];
+  safeTraceRows.forEach((row) => {
+    const payload = typeof row?.payload === "object" && row.payload ? row.payload : {};
+    const nextAction = String(payload?.next_action || "").trim();
+    if (nextAction) {
+      derived.push(`next_action: ${nextAction}`);
+    }
+    const recommendedAction = String(payload?.recommended_action || "").trim();
+    if (recommendedAction) {
+      derived.push(`recommended_action: ${recommendedAction}`);
+    }
+    const actionTaken = String(payload?.action_taken || "").trim();
+    if (actionTaken) {
+      derived.push(`action_taken: ${actionTaken}`);
+    }
+    const downstreamAgents = Array.isArray(payload?.downstream_agents) ? payload.downstream_agents : [];
+    downstreamAgents
+      .map((item) => String(item || "").trim())
+      .filter(Boolean)
+      .forEach((agent) => derived.push(`dispatch_to: ${agent}`));
+  });
+
+  const unique = [];
+  const seen = new Set();
+  derived.forEach((item) => {
+    const key = String(item || "").trim().toLowerCase();
+    if (!key || seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    unique.push(item);
+  });
+  return unique;
+}
+
 function summarizeEventType(value) {
   const token = String(value || "").trim();
   if (!token) {
@@ -442,6 +686,121 @@ function summarizeEventType(value) {
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" -> ");
+}
+
+function buildAlertDocumentDrafts(alertRow, workflowPayload) {
+  const alertName = String(alertRow?.name || alertRow?.alert_name || "Alert").trim();
+  const service = String(alertRow?.service || "unknown-service").trim();
+  const severity = String(alertRow?.severity || "high").trim().toLowerCase();
+  const alertId = String(alertRow?.alert_id || alertRow?.id || "").trim();
+  const workflow = workflowPayload?.workflow || workflowPayload || {};
+  const recommendation = typeof workflow?.recommendation === "object" && workflow.recommendation ? workflow.recommendation : {};
+  const incident = typeof workflow?.incident === "object" && workflow.incident ? workflow.incident : {};
+  const rootCause = String(recommendation?.root_cause || "").trim();
+  const impact = String(recommendation?.impact || "").trim();
+  const suggestedAction = String(recommendation?.recommended_action || "").trim();
+  const commonHeader = `Alert ${alertName} observed on ${service} with severity ${severity.toUpperCase()}.`;
+  const fallbackRootCause = "Investigate recent deploys, dependency health, and resource saturation.";
+  const commonRoot = rootCause || fallbackRootCause;
+
+  return {
+    incident: {
+      kind: "incident",
+      title: `${alertName} Incident Summary`.slice(0, 160),
+      summary: [
+        `${alertName} detected for ${service}.`,
+        impact ? `Impact: ${impact}.` : "",
+      ].filter(Boolean).join(" "),
+      content: [
+        commonHeader,
+        `Probable root cause: ${commonRoot}`,
+        incident?.id ? `Incident reference: ${String(incident.id)}.` : "",
+        "Escalation path: L1 -> L2 -> L3 with timeline checkpoints at 5m, 15m, and 30m.",
+      ].filter(Boolean).join("\n\n"),
+      services: service,
+      severity,
+      alert_type: alertName,
+      alert_id: alertId,
+      root_cause: rootCause,
+      impact,
+      recommended_action: suggestedAction,
+    },
+    runbook: {
+      kind: "runbook",
+      title: `${alertName} Runbook`.slice(0, 160),
+      summary: [
+        `${alertName} detected for ${service}.`,
+        suggestedAction ? `Recommended action: ${suggestedAction}.` : "",
+      ].filter(Boolean).join(" "),
+      content: [
+        commonHeader,
+        `Probable root cause: ${commonRoot}`,
+        suggestedAction ? `Immediate action: ${suggestedAction}.` : "Immediate action: inspect logs, metrics, and dependency health.",
+        "Verification: confirm error rate and latency return to baseline before closure.",
+      ].filter(Boolean).join("\n\n"),
+      services: service,
+      severity,
+      alert_type: alertName,
+      alert_id: alertId,
+      root_cause: rootCause,
+      impact,
+      recommended_action: suggestedAction,
+    },
+    deployment: {
+      kind: "deployment",
+      title: `${alertName} Deployment Guidance`.slice(0, 160),
+      summary: `Deployment guardrails and rollback checks for ${service}.`,
+      content: [
+        commonHeader,
+        "Pre-deploy checks: SLO burn rate, dependency readiness, and database migration safety.",
+        "Post-deploy checks: p95 latency, error budget consumption, and alert noise monitoring for 30m.",
+        "Rollback criteria: sustained critical alerts for 10m or failed synthetic checks.",
+      ].join("\n\n"),
+      services: service,
+      severity,
+      alert_type: alertName,
+      alert_id: alertId,
+      root_cause: rootCause,
+      impact,
+      recommended_action: suggestedAction,
+    },
+    change: {
+      kind: "change",
+      title: `${alertName} Change Record`.slice(0, 160),
+      summary: `Change notes and approvals for ${service} remediation actions.`,
+      content: [
+        commonHeader,
+        "Change scope: configuration, deployment, and policy updates tied to this alert pattern.",
+        "Approval checklist: peer review, CAB approval (if required), and blast-radius assessment.",
+        "Backout plan: revert config, redeploy previous version, and validate health endpoints.",
+      ].join("\n\n"),
+      services: service,
+      severity,
+      alert_type: alertName,
+      alert_id: alertId,
+      root_cause: rootCause,
+      impact,
+      recommended_action: suggestedAction,
+    },
+    dependency: {
+      kind: "dependency",
+      title: `${alertName} Dependency Map`.slice(0, 160),
+      summary: `Dependency and upstream/downstream checks for ${service}.`,
+      content: [
+        commonHeader,
+        "Dependencies to inspect: datastore latency, queue backlog, external API error rates, and network saturation.",
+        "Signals to capture: timeout spikes, retry storms, and circuit breaker open rate.",
+        "Mitigation path: isolate degraded dependency, apply traffic shaping, and monitor stabilization.",
+      ].join("\n\n"),
+      services: service,
+      severity,
+      alert_type: alertName,
+      alert_id: alertId,
+      root_cause: rootCause,
+      impact,
+      recommended_action: suggestedAction,
+    },
+  };
 }
 
 function toFiniteNumber(value) {
@@ -463,18 +822,49 @@ function percentile(values, fraction) {
 
 function normalizeUsageRow(row) {
   const entry = row && typeof row === "object" ? row : {};
-  const inputTokens = toFiniteNumber(entry.input_tokens);
-  const outputTokens = toFiniteNumber(entry.output_tokens);
-  const totalTokens = toFiniteNumber(entry.total_tokens || (inputTokens + outputTokens));
+  const usage = entry?.usage && typeof entry.usage === "object" ? entry.usage : {};
+  const responseParams = entry?.response?.parameters && typeof entry.response.parameters === "object"
+    ? entry.response.parameters
+    : {};
+  const inputTokens = toFiniteNumber(entry.input_tokens ?? usage.input_tokens ?? entry.prompt_tokens ?? usage.prompt_tokens);
+  const outputTokens = toFiniteNumber(entry.output_tokens ?? usage.output_tokens ?? entry.completion_tokens ?? usage.completion_tokens);
+  const totalTokens = toFiniteNumber(entry.total_tokens ?? usage.total_tokens ?? (inputTokens + outputTokens));
+  const totalCostUsd = toFiniteNumber(
+    entry.total_cost_usd
+      ?? usage.total_cost_usd
+      ?? entry.cost_usd
+      ?? usage.cost_usd
+      ?? entry.total_cost
+      ?? usage.total_cost
+  );
+  const note = [entry.error, usage.error, entry.reason, usage.reason]
+    .map((item) => String(item || "").trim())
+    .find((item) => item && item !== "-") || "";
+  const estimated = Boolean(entry.estimated ?? usage.estimated);
   return {
-    task: entry.task || entry.agent || entry.service || entry.action || "-",
-    provider: entry.provider || entry.vendor || "unknown",
-    model: entry.model || entry.model_name || "unknown",
+    task: entry.task || entry.agent || entry.service || entry.action || entry.event_type || "-",
+    provider: entry.provider || entry.vendor || entry.model_provider || usage.provider || responseParams.provider || "-",
+    model: entry.model || entry.model_name || entry.deployment || usage.model || responseParams.model || "-",
     input_tokens: inputTokens,
     output_tokens: outputTokens,
     total_tokens: totalTokens,
-    total_cost_usd: toFiniteNumber(entry.total_cost_usd || entry.cost_usd),
+    total_cost_usd: totalCostUsd,
+    note,
+    estimated,
   };
+}
+
+function isPlaceholderUsageValue(value) {
+  const token = String(value || "").trim().toLowerCase();
+  return !token || token === "-" || token === "unknown" || token === "n/a" || token === "na" || token === "none" || token === "null";
+}
+
+function isMeaningfulUsageRow(row) {
+  const hasUsage = toFiniteNumber(row?.input_tokens) > 0 || toFiniteNumber(row?.output_tokens) > 0 || toFiniteNumber(row?.total_tokens) > 0 || toFiniteNumber(row?.total_cost_usd) > 0;
+  const hasProvider = !isPlaceholderUsageValue(row?.provider);
+  const hasModel = !isPlaceholderUsageValue(row?.model);
+  const hasErrorNote = Boolean(String(row?.note || "").trim());
+  return hasUsage || hasProvider || hasModel || hasErrorNote;
 }
 
 function HorizontalBarChart({ title, subtitle, items }) {
@@ -567,6 +957,24 @@ function FlowTimelineGraph({ rows }) {
               <span>{row.elapsed !== "-" ? `${row.elapsed}s` : "-"}</span>
             </div>
             <p>{row.detail || "-"}</p>
+            {row.inputValueText ? (
+              <details>
+                <summary>Input Value</summary>
+                <pre className="result">{row.inputValueText}</pre>
+              </details>
+            ) : null}
+            {row.outputValueText ? (
+              <details>
+                <summary>Output Value</summary>
+                <pre className="result">{row.outputValueText}</pre>
+              </details>
+            ) : null}
+            {row.errorValueText ? (
+              <details open>
+                <summary>Error</summary>
+                <pre className="result">{row.errorValueText}</pre>
+              </details>
+            ) : null}
             <div className="timeline-tags">
               <span className="timeline-tag">in: {row.consumes || "-"}</span>
               <span className="timeline-tag">out: {row.publishes || "-"}</span>
@@ -601,6 +1009,24 @@ function AgentEventsGraph({ rows }) {
               <span>Output: {compactText(row.output, 120) || "-"}</span>
               <span>Next: {row.communicates_to || "-"}</span>
             </div>
+            {row.inputValueText ? (
+              <details>
+                <summary>Input Value</summary>
+                <pre className="result">{row.inputValueText}</pre>
+              </details>
+            ) : null}
+            {row.outputValueText ? (
+              <details>
+                <summary>Output Value</summary>
+                <pre className="result">{row.outputValueText}</pre>
+              </details>
+            ) : null}
+            {row.errorValueText ? (
+              <details open>
+                <summary>Error</summary>
+                <pre className="result">{row.errorValueText}</pre>
+              </details>
+            ) : null}
           </div>
         </article>
       ))}
@@ -614,7 +1040,7 @@ function TopicFlowGraph({ routing, timelineRows }) {
     (Array.isArray(timelineRows) ? timelineRows : [])
       .flatMap((row) => [row?.consumes, row?.publishes])
       .map((item) => String(item || "").trim())
-      .filter(Boolean)
+      .filter((item) => item && item !== "-" && item.toLowerCase() !== "unknown")
   ));
 
   return (
@@ -699,6 +1125,8 @@ export default function App() {
   const [uiTheme, setUiTheme] = useState("auto");
   const [health, setHealth] = useState({ loading: false, ok: false, message: "Not checked" });
   const [alerts, setAlerts] = useState({ loading: false, rows: [], error: "" });
+  const [alertSeverityOverrides, setAlertSeverityOverrides] = useState({ loading: false, rows: [], error: "", savingKey: "" });
+  const [alertSeverityDrafts, setAlertSeverityDrafts] = useState({});
   const [alertsLimit, setAlertsLimit] = useState(50);
   const [incidentMetadata, setIncidentMetadata] = useState({ loading: false, rows: [], error: "" });
   const [closedIncidents, setClosedIncidents] = useState({ loading: false, rows: [], error: "" });
@@ -783,8 +1211,8 @@ export default function App() {
     region: "us-east-1",
     deployment_mode: "on_prem",
     monitoring_tool: "prometheus",
-    monitoring_url: "http://prometheus.local:9090",
-    prometheus_url: "http://prometheus.local:9090",
+    monitoring_url: "http://prometheus:9090",
+    prometheus_url: "http://prometheus:9090",
     new_relic_url: "",
     datadog_url: "",
     gcp_project_id: "",
@@ -829,6 +1257,7 @@ export default function App() {
   const [onboardingProjectMode, setOnboardingProjectMode] = useState("existing");
   const [onboardingRuleRunState, setOnboardingRuleRunState] = useState({ loading: false, result: null, error: "" });
   const [onboardingWorkflowSteps, setOnboardingWorkflowSteps] = useState([]);
+  const [onboardingLandingPadSummary, setOnboardingLandingPadSummary] = useState({});
   const [onboardingGeneratedDocs, setOnboardingGeneratedDocs] = useState([]);
   const [onboardingDocApprovalState, setOnboardingDocApprovalState] = useState({
     loading: false,
@@ -838,6 +1267,22 @@ export default function App() {
   });
   const [onboardingRuleLookup, setOnboardingRuleLookup] = useState({ workflow_id: "", loading: false, result: null, error: "" });
   const [selectedOnboardingProject, setSelectedOnboardingProject] = useState("");
+  const [monitoringAppForm, setMonitoringAppForm] = useState({
+    tenant_id: "default",
+    name: "",
+    owner_team: "platform-ops",
+    owner_email: "",
+    environment: "prod",
+    namespace: "default",
+    region: "us-east-1",
+    technology: "python-fastapi",
+    metrics_endpoint: "http://api-gateway:8000/metrics",
+    labels_text: "security=internal,compliance=sox,workload_kind=Deployment",
+  });
+  const [monitoringApps, setMonitoringApps] = useState({ loading: false, rows: [], error: "" });
+  const [monitoringAppSubmit, setMonitoringAppSubmit] = useState({ loading: false, error: "", success: "" });
+  const [selectedMonitoringAppId, setSelectedMonitoringAppId] = useState("");
+  const [monitoringAppDetails, setMonitoringAppDetails] = useState({ loading: false, history: [], validations: [], dashboards: [], error: "" });
   const [onboardingRuleEditor, setOnboardingRuleEditor] = useState({
     workflow_id: "",
     project_name: "",
@@ -856,6 +1301,12 @@ export default function App() {
   });
   const [alertOnboardingState, setAlertOnboardingState] = useState({ loading: false, result: null, error: "" });
   const [docPromptAlert, setDocPromptAlert] = useState(null);
+  const [docPromptKind, setDocPromptKind] = useState("runbook");
+  const [docPromptMode, setDocPromptMode] = useState("create");
+  const [docPromptExistingDoc, setDocPromptExistingDoc] = useState(null);
+  const [docPromptDocsByKind, setDocPromptDocsByKind] = useState({});
+  const [alertRuleDraft, setAlertRuleDraft] = useState({ platform: "prometheus", requirement: "" });
+  const [alertRuleState, setAlertRuleState] = useState({ loading: false, result: null, error: "" });
   const [alertBulkState, setAlertBulkState] = useState({
     fileName: "",
     loading: false,
@@ -864,6 +1315,8 @@ export default function App() {
     error: "",
   });
   const alertDetailsRef = useRef(null);
+  const docPromptRef = useRef(null);
+  const approvalQueueRef = useRef(null);
 
   const formValid = useMemo(() => {
     return [form.source, form.name, form.service, form.severity, form.description].every((v) => String(v || "").trim());
@@ -893,6 +1346,151 @@ export default function App() {
       setAlerts({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
     } catch (error) {
       setAlerts({ loading: false, rows: [], error: error.message });
+    }
+  }
+
+  async function loadAlertSeverityOverrides() {
+    setAlertSeverityOverrides((prev) => ({ ...prev, loading: true, error: "" }));
+    try {
+      const payload = await fetchJson("/api-gateway/alerts/severity-overrides");
+      const data = unwrap(payload);
+      const rows = Array.isArray(data?.rows) ? data.rows : [];
+      setAlertSeverityOverrides((prev) => ({ ...prev, loading: false, rows, error: "" }));
+    } catch (error) {
+      setAlertSeverityOverrides((prev) => ({ ...prev, loading: false, rows: [], error: error.message }));
+    }
+  }
+
+  async function applyAlertSeverityOverrideRule(row) {
+    const alertName = String(row?.name || row?.alert_name || "").trim();
+    const service = String(row?.service || "").trim();
+    const environment = String(row?.environment || "").trim();
+    const key = severityOverrideKey(alertName, service, environment);
+    const draftSeverity = String(alertSeverityDrafts[key] || row?.severity || "warning").trim().toLowerCase();
+    if (!alertName) {
+      setAlertSeverityOverrides((prev) => ({ ...prev, error: "Alert name is required for severity override." }));
+      return;
+    }
+    setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: key, error: "" }));
+    try {
+      await fetchJson("/api-gateway/alerts/severity-overrides", {
+        method: "PUT",
+        body: JSON.stringify({
+          name: alertName,
+          service,
+          environment,
+          severity: draftSeverity,
+          requested_by: String(adminSession?.user?.username || "ui-user").trim(),
+          requested_role: String(currentRole || "").trim(),
+          updated_at: new Date().toISOString(),
+        }),
+      });
+      await loadAlertSeverityOverrides();
+      setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: "", error: "" }));
+    } catch (error) {
+      setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: "", error: error.message }));
+    }
+  }
+
+  async function clearAlertSeverityOverrideRule(row) {
+    const alertName = String(row?.name || row?.alert_name || "").trim();
+    const service = String(row?.service || "").trim();
+    const environment = String(row?.environment || "").trim();
+    const key = severityOverrideKey(alertName, service, environment);
+    if (!alertName) {
+      return;
+    }
+    setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: key, error: "" }));
+    try {
+      const params = new URLSearchParams({ name: alertName, service, environment });
+      await fetchJson(`/api-gateway/alerts/severity-overrides?${params.toString()}`, { method: "DELETE" });
+      await loadAlertSeverityOverrides();
+      setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: "", error: "" }));
+    } catch (error) {
+      setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: "", error: error.message }));
+    }
+  }
+
+  async function loadMonitoringApplications() {
+    setMonitoringApps((prev) => ({ ...prev, loading: true, error: "" }));
+    try {
+      const payload = await fetchJson("/api-gateway/applications");
+      const data = unwrap(payload);
+      const rows = Array.isArray(data?.rows) ? data.rows : [];
+      setMonitoringApps({ loading: false, rows, error: "" });
+      setSelectedMonitoringAppId((current) => {
+        const normalizedCurrent = String(current || "").trim();
+        if (normalizedCurrent && rows.some((row) => String(row?.id || "").trim() === normalizedCurrent)) {
+          return normalizedCurrent;
+        }
+        return String(rows[0]?.id || "").trim();
+      });
+    } catch (error) {
+      setMonitoringApps({ loading: false, rows: [], error: error.message });
+    }
+  }
+
+  async function loadMonitoringApplicationDetails(applicationId) {
+    const normalized = String(applicationId || "").trim();
+    if (!normalized) {
+      setMonitoringAppDetails({ loading: false, history: [], validations: [], dashboards: [], error: "" });
+      return;
+    }
+    setMonitoringAppDetails((prev) => ({ ...prev, loading: true, error: "" }));
+    try {
+      const [historyPayload, validationsPayload, dashboardsPayload] = await Promise.all([
+        fetchJson(`/api-gateway/applications/${normalized}/history`),
+        fetchJson(`/api-gateway/applications/${normalized}/validations`),
+        fetchJson(`/api-gateway/applications/${normalized}/dashboards`),
+      ]);
+      const historyRows = Array.isArray(unwrap(historyPayload)?.rows) ? unwrap(historyPayload).rows : [];
+      const validationRows = Array.isArray(unwrap(validationsPayload)?.rows) ? unwrap(validationsPayload).rows : [];
+      const dashboardRows = Array.isArray(unwrap(dashboardsPayload)?.rows) ? unwrap(dashboardsPayload).rows : [];
+      setMonitoringAppDetails({ loading: false, history: historyRows, validations: validationRows, dashboards: dashboardRows, error: "" });
+    } catch (error) {
+      setMonitoringAppDetails({ loading: false, history: [], validations: [], dashboards: [], error: error.message });
+    }
+  }
+
+  async function submitMonitoringApplication(event) {
+    event.preventDefault();
+    setMonitoringAppSubmit({ loading: true, error: "", success: "" });
+    try {
+      const labels = Object.fromEntries(
+        String(monitoringAppForm.labels_text || "")
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+          .map((entry) => {
+            const [key, ...rest] = entry.split("=");
+            return [String(key || "").trim(), rest.join("=").trim()];
+          })
+          .filter(([key]) => key)
+      );
+      const payload = {
+        tenant_id: monitoringAppForm.tenant_id,
+        name: monitoringAppForm.name,
+        owner_team: monitoringAppForm.owner_team,
+        owner_email: monitoringAppForm.owner_email || null,
+        environment: monitoringAppForm.environment,
+        namespace: monitoringAppForm.namespace,
+        region: monitoringAppForm.region,
+        technology: monitoringAppForm.technology,
+        metrics_endpoint: monitoringAppForm.metrics_endpoint || "http://api-gateway:8000/metrics",
+        monitoring_platform: "prometheus",
+        labels,
+      };
+      await fetchJson("/api-gateway/applications", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      setMonitoringAppSubmit({ loading: false, error: "", success: `Queued onboarding for ${monitoringAppForm.name}` });
+      setMonitoringAppForm((curr) => ({ ...curr, name: "", owner_email: "", metrics_endpoint: "http://api-gateway:8000/metrics" }));
+      await loadMonitoringApplications();
+      await loadMonitorApplications();
+    } catch (error) {
+      setMonitoringAppSubmit({ loading: false, error: error.message, success: "" });
     }
   }
 
@@ -1157,11 +1755,18 @@ export default function App() {
 
   async function loadMonitorApplications() {
     try {
-      const payload = await fetchJson("/api-gateway/onboarding/state");
-      const data = unwrap(payload);
-      const rows = Array.isArray(data?.rows) ? data.rows : [];
-      const projects = rows
+      const [onboardingPayload, monitoringPayload] = await Promise.all([
+        fetchJson("/api-gateway/onboarding/state"),
+        fetchJson("/api-gateway/applications").catch(() => ({})),
+      ]);
+      const onboardingData = unwrap(onboardingPayload);
+      const onboardingRows = Array.isArray(onboardingData?.rows) ? onboardingData.rows : [];
+      const projects = onboardingRows
         .map((row) => String(row?.project_name || "").trim())
+        .filter(Boolean);
+      const monitoringRows = Array.isArray(unwrap(monitoringPayload)?.rows) ? unwrap(monitoringPayload).rows : [];
+      const monitoringApplications = monitoringRows
+        .map((row) => String(row?.name || row?.application || row?.project_name || "").trim())
         .filter(Boolean);
       const alertApplications = alerts.rows
         .flatMap((row) => {
@@ -1189,7 +1794,7 @@ export default function App() {
           return base;
         })
         .filter(Boolean);
-      const unique = Array.from(new Set([...defaultMonitorApplications, ...projects, ...alertApplications]));
+      const unique = Array.from(new Set([...defaultMonitorApplications, ...projects, ...monitoringApplications, ...alertApplications]));
       setMonitorApplications(unique.length ? unique : defaultMonitorApplications);
     } catch (_error) {
       setMonitorApplications(defaultMonitorApplications);
@@ -1734,7 +2339,11 @@ export default function App() {
 
       const completePayload = unwrap(response);
       const workflowSteps = Array.isArray(completePayload?.workflow_steps) ? completePayload.workflow_steps : [];
+      const landingPadSummary = completePayload?.landing_pad_ingestion && typeof completePayload.landing_pad_ingestion === "object"
+        ? completePayload.landing_pad_ingestion
+        : {};
       setOnboardingWorkflowSteps(workflowSteps);
+      setOnboardingLandingPadSummary(landingPadSummary);
       setOnboardingForm((curr) => ({
         ...curr,
         monitoring_tool: selectedMonitoringTool,
@@ -1912,6 +2521,239 @@ export default function App() {
     }
   }
 
+  function findMatchingRagDocument(alertRow, preferredKind = "") {
+    const alertId = String(alertRow?.alert_id || alertRow?.id || "").trim();
+    const alertType = String(alertRow?.name || alertRow?.alert_name || "").trim().toLowerCase();
+    const service = String(alertRow?.service || "").trim().toLowerCase();
+    const normalizedKind = String(preferredKind || "").trim().toLowerCase();
+    const docs = Array.isArray(ragDocs.rows) ? ragDocs.rows : [];
+    return docs.find((doc) => {
+      const docKind = String(doc?.kind || doc?.document_kind || "").trim().toLowerCase();
+      if (normalizedKind && docKind && docKind !== normalizedKind) {
+        return false;
+      }
+      const docAlertId = String(doc?.alert_id || "").trim();
+      if (alertId && docAlertId && docAlertId === alertId) {
+        return true;
+      }
+      const docAlertType = String(doc?.alert_type || "").trim().toLowerCase();
+      const docServices = Array.isArray(doc?.services) ? doc.services.map((item) => String(item || "").trim().toLowerCase()) : [];
+      return Boolean(alertType && docAlertType && alertType === docAlertType && service && docServices.includes(service));
+    }) || null;
+  }
+
+  function hasAlertDocuments(alertRow) {
+    if (!alertRow || typeof alertRow !== "object") {
+      return false;
+    }
+    const explicitFlag = alertRow.document_available === true;
+    if (explicitFlag) {
+      return true;
+    }
+    return Boolean(findMatchingRagDocument(alertRow));
+  }
+
+  function buildAlertDocumentDraft(alertRow, workflowPayload, preferredKind = "runbook") {
+    const allDrafts = buildAlertDocumentDrafts(alertRow, workflowPayload);
+    const kind = String(preferredKind || "runbook").trim().toLowerCase();
+    return allDrafts[kind] || allDrafts.runbook;
+  }
+
+  async function buildAlertDocumentDraftWithAnalysis(alertRow, preferredKind = "runbook") {
+    const alertId = String(alertRow?.alert_id || alertRow?.id || "").trim();
+    let workflowPayload = {};
+    if (alertId && String(selectedAlertData?.alertId || "").trim() === alertId && selectedAlertData?.payload) {
+      workflowPayload = selectedAlertData.payload?.data || selectedAlertData.payload;
+    } else if (alertId) {
+      try {
+        const payload = await fetchJson(`/monitoring-adapter/alerts/${alertId}/processed-result`);
+        workflowPayload = payload?.data || payload;
+      } catch (_error) {
+        workflowPayload = {};
+      }
+    }
+    return buildAlertDocumentDraft(alertRow, workflowPayload, preferredKind);
+  }
+
+  function buildDocPayloadFromDraft(draft) {
+    return {
+      kind: draft.kind,
+      title: draft.title,
+      summary: draft.summary || null,
+      content: draft.content,
+      services: String(draft.services || "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean),
+      severity: draft.severity,
+      alert_type: draft.alert_type,
+      alert_id: draft.alert_id || null,
+      root_cause: draft.root_cause || null,
+      impact: draft.impact || null,
+      recommended_action: draft.recommended_action || null,
+    };
+  }
+
+  function setDocPromptDraftForKind(row, kind) {
+    const normalizedKind = String(kind || "runbook").trim().toLowerCase();
+    const alertId = String(row?.alert_id || row?.id || "").trim();
+    const selectedPayload = String(selectedAlertData?.alertId || "").trim() === alertId
+      ? (selectedAlertData.payload?.data || selectedAlertData.payload || {})
+      : {};
+    const draft = buildAlertDocumentDraft(row, selectedPayload, normalizedKind);
+    const existingDoc = findMatchingRagDocument(row, normalizedKind);
+    setDocPromptKind(normalizedKind);
+    setDocPromptExistingDoc(existingDoc);
+    setDocPromptMode(existingDoc?.path ? "update" : "create");
+    setAlertOnboarding((curr) => ({
+      ...curr,
+      kind: draft.kind,
+      title: String(draft.title || "Alert Document").slice(0, 160),
+      summary: String(draft.summary || "").trim(),
+      content: String(draft.content || "Provide troubleshooting and escalation steps for this alert scenario.").trim(),
+      services: String(draft.services || "").trim(),
+      severity: String(draft.severity || "high").toLowerCase(),
+      alert_type: String(draft.alert_type || "").trim(),
+      alert_id: alertId,
+    }));
+  }
+
+  async function autoCreateAlertDocument(alertRow, preferredKind = "runbook") {
+    if (!alertRow || alertOnboardingState.loading) {
+      return;
+    }
+    setAlertOnboardingState({ loading: true, result: null, error: "" });
+    try {
+      const draft = await buildAlertDocumentDraftWithAnalysis(alertRow, preferredKind);
+      const existingDoc = findMatchingRagDocument(alertRow, draft.kind);
+      const payload = buildDocPayloadFromDraft(draft);
+      const response = await fetchJson("/api-gateway/rag/documents", {
+        method: existingDoc?.path ? "PUT" : "POST",
+        body: JSON.stringify(existingDoc?.path ? { ...payload, path: existingDoc.path } : payload),
+      });
+      const responseData = response?.data || response || {};
+      setAlertOnboardingState({
+        loading: false,
+        error: "",
+        result: {
+          ...response,
+          message: existingDoc?.path
+            ? `${draft.kind} document updated from alert analysis.`
+            : `${draft.kind} document created from alert analysis.`,
+        },
+      });
+      await Promise.all([loadRagDocs(), loadRecentAlerts()]);
+      if (docPromptAlert) {
+        const mergedDoc = {
+          ...(existingDoc || {}),
+          ...(typeof responseData === "object" && responseData ? responseData : {}),
+          kind: draft.kind,
+          path: responseData?.path || existingDoc?.path,
+          alert_id: draft.alert_id || existingDoc?.alert_id || null,
+        };
+        setDocPromptDocsByKind((curr) => ({ ...curr, [draft.kind]: mergedDoc }));
+        if (String(docPromptKind || "").trim().toLowerCase() === draft.kind) {
+          setDocPromptExistingDoc(mergedDoc);
+          setDocPromptMode(mergedDoc?.path ? "update" : "create");
+        }
+      }
+    } catch (error) {
+      setAlertOnboardingState({ loading: false, result: null, error: error.message });
+    }
+  }
+
+  async function autoCreateAllAlertDocuments(alertRow) {
+    if (!alertRow || alertOnboardingState.loading) {
+      return;
+    }
+    setAlertOnboardingState({ loading: true, result: null, error: "" });
+    try {
+      const results = [];
+      for (const kind of ALERT_DOC_KIND_OPTIONS) {
+        const draft = await buildAlertDocumentDraftWithAnalysis(alertRow, kind);
+        const existingDoc = findMatchingRagDocument(alertRow, kind);
+        const payload = buildDocPayloadFromDraft(draft);
+        const response = await fetchJson("/api-gateway/rag/documents", {
+          method: existingDoc?.path ? "PUT" : "POST",
+          body: JSON.stringify(existingDoc?.path ? { ...payload, path: existingDoc.path } : payload),
+        });
+        results.push({ kind, path: response?.data?.path || response?.path || existingDoc?.path || "" });
+      }
+      await Promise.all([loadRagDocs(), loadRecentAlerts()]);
+      setAlertOnboardingState({
+        loading: false,
+        error: "",
+        result: {
+          message: `Created/updated ${results.length} document types: ${results.map((item) => item.kind).join(", ")}`,
+          results,
+        },
+      });
+      if (docPromptAlert) {
+        const refreshedByKind = {};
+        ALERT_DOC_KIND_OPTIONS.forEach((kind) => {
+          const matched = findMatchingRagDocument(docPromptAlert, kind);
+          if (matched) {
+            refreshedByKind[kind] = matched;
+          }
+        });
+        setDocPromptDocsByKind(refreshedByKind);
+        setDocPromptExistingDoc(refreshedByKind[docPromptKind] || null);
+        setDocPromptMode(refreshedByKind[docPromptKind]?.path ? "update" : "create");
+      }
+    } catch (error) {
+      setAlertOnboardingState({ loading: false, result: null, error: error.message });
+    }
+  }
+
+  async function addRuleFromAlertPrompt() {
+    const row = docPromptAlert;
+    const requirement = String(alertRuleDraft.requirement || "").trim();
+    if (!row || !requirement) {
+      setAlertRuleState({ loading: false, result: null, error: "Provide a rule requirement first." });
+      return;
+    }
+    setAlertRuleState({ loading: true, result: null, error: "" });
+    try {
+      const service = String(row?.service || "unknown-service").trim();
+      const projectName = String(row?.application || row?.project_name || service || "alert-onboarding").trim();
+      const platform = String(alertRuleDraft.platform || "prometheus").trim().toLowerCase();
+      const payload = {
+        project: {
+          project_name: projectName,
+          environment: String(row?.environment || onboardingForm.environment || "prod").trim().toLowerCase(),
+          criticality: String(row?.severity || "high").trim().toLowerCase() === "critical" ? "high" : "medium",
+          support_team: String(onboardingForm.owner_team || "platform-ops").trim(),
+          region: String(onboardingForm.region || "us-east-1").trim(),
+          cloud_provider: onboardingForm.deployment_mode === "gcp_cloud" ? "gcp" : "on_prem",
+          monitoring_platforms: [platform],
+          notification_platforms: ["slack", "teams"],
+        },
+        monitoring_requirements: [requirement],
+        target_platforms: [platform],
+        discovery_inputs: {
+          source_alert_id: String(row?.alert_id || row?.id || "").trim(),
+          alert_type: String(row?.name || row?.alert_name || "").trim(),
+          service,
+          severity: String(row?.severity || "high").trim().toLowerCase(),
+          endpoint_url: simplifyMonitoringUrl(onboardingForm.monitoring_url),
+          generated_from_alert_analysis: true,
+        },
+      };
+      const response = await fetchJson("/api-gateway/onboarding/rules/pipeline/create", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      const data = unwrap(response);
+      const workflowId = String(data?.workflow_id || "").trim();
+      if (workflowId) {
+        setOnboardingRuleLookup((current) => ({ ...current, workflow_id: workflowId }));
+      }
+      setAlertRuleState({ loading: false, result: data, error: "" });
+    } catch (error) {
+      setAlertRuleState({ loading: false, result: null, error: error.message });
+    }
+  }
+
   async function submitAlertOnboarding(event) {
     event.preventDefault();
     setAlertOnboardingState({ loading: true, result: null, error: "" });
@@ -1929,40 +2771,66 @@ export default function App() {
         alert_type: String(alertOnboarding.alert_type || "").trim(),
         alert_id: String(alertOnboarding.alert_id || "").trim() || null,
       };
+      const isUpdate = docPromptMode === "update" && Boolean(docPromptExistingDoc?.path);
       const response = await fetchJson("/api-gateway/rag/documents", {
-        method: "POST",
-        body: JSON.stringify(payload),
+        method: isUpdate ? "PUT" : "POST",
+        body: JSON.stringify(isUpdate ? { ...payload, path: docPromptExistingDoc.path } : payload),
       });
-      setAlertOnboardingState({ loading: false, result: response, error: "" });
-      await loadRagDocs();
-      if (docPromptAlert) {
-        await loadRecentAlerts();
-        setDocPromptAlert(null);
-      }
+      const responseData = response?.data || response || {};
+      const normalizedKind = String(payload.kind || docPromptKind || "runbook").trim().toLowerCase();
+      const mergedDoc = {
+        ...(docPromptExistingDoc || {}),
+        ...(typeof responseData === "object" && responseData ? responseData : {}),
+        kind: normalizedKind,
+        alert_id: payload.alert_id,
+        alert_type: payload.alert_type,
+        services: payload.services,
+        path: responseData?.path || docPromptExistingDoc?.path,
+      };
+      setAlertOnboardingState({
+        loading: false,
+        result: {
+          ...response,
+          message: isUpdate ? `${normalizedKind} document updated.` : `${normalizedKind} document created.`,
+        },
+        error: "",
+      });
+      setDocPromptDocsByKind((curr) => ({ ...curr, [normalizedKind]: mergedDoc }));
+      setDocPromptExistingDoc(mergedDoc);
+      setDocPromptMode(mergedDoc?.path ? "update" : "create");
+      await Promise.all([loadRagDocs(), loadRecentAlerts()]);
     } catch (error) {
       setAlertOnboardingState({ loading: false, result: null, error: error.message });
     }
   }
 
   function openDocumentPrompt(row) {
-    const alertId = String(row?.alert_id || row?.id || "").trim();
-    setAlertOnboarding((curr) => ({
-      ...curr,
-      kind: "runbook",
-      title: String(row?.name || row?.alert_name || "Runbook").slice(0, 160),
-      summary: "",
-      content: "Provide troubleshooting and escalation steps for this alert scenario.",
-      services: String(row?.service || "").trim(),
-      severity: String(row?.severity || "high").toLowerCase(),
-      alert_type: String(row?.name || row?.alert_name || "").trim(),
-      alert_id: alertId,
-    }));
-    setAlertOnboardingState({ loading: false, result: null, error: "" });
+    const byKind = {};
+    ALERT_DOC_KIND_OPTIONS.forEach((kind) => {
+      const doc = findMatchingRagDocument(row, kind);
+      if (doc) {
+        byKind[kind] = doc;
+      }
+    });
+    setDocPromptDocsByKind(byKind);
     setDocPromptAlert(row);
+    setDocPromptDraftForKind(row, "runbook");
+    const defaultRequirement = `Create a ${String(row?.severity || "high").toLowerCase()} alert rule for ${String(row?.service || "this service").trim()} based on ${String(row?.name || row?.alert_name || "service degradation").trim()} and route incidents to on-call.`;
+    setAlertRuleDraft({ platform: String(onboardingForm.monitoring_tool || "prometheus").trim().toLowerCase(), requirement: defaultRequirement });
+    setAlertRuleState({ loading: false, result: null, error: "" });
+    setAlertOnboardingState({ loading: false, result: null, error: "" });
+    setTimeout(() => {
+      docPromptRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 50);
   }
 
   function closeDocumentPrompt() {
     setDocPromptAlert(null);
+    setDocPromptExistingDoc(null);
+    setDocPromptDocsByKind({});
+    setDocPromptKind("runbook");
+    setDocPromptMode("create");
+    setAlertRuleState({ loading: false, result: null, error: "" });
   }
 
   function toText(value) {
@@ -2092,6 +2960,7 @@ export default function App() {
     await Promise.all([
       checkHealth(),
       loadRecentAlerts(),
+      loadAlertSeverityOverrides(),
       loadFlows(),
       loadMonitorApplications(),
       loadGatewaySummary(),
@@ -2342,59 +3211,70 @@ export default function App() {
   const selectedAlertEventsDisplay = useMemo(() => {
     const mappedEvents = selectedAlertEvents.map((event, index) => {
       const decision = event?.decision;
-      const input = typeof event?.input === "object" && event.input ? event.input : {};
+      const inputValue = extractEventInput(event);
+      const outputValue = extractEventOutput(event);
+      const input = typeof inputValue === "object" && inputValue ? inputValue : {};
       return {
         sequence: event?.sequence || index + 1,
-        agent: displayAgentName(event?.agent || event?.service || "-"),
+        agent: displayAgentName(event?.agent || normalizeTraceServiceName(event) || "-"),
         action: event?.action || event?.event_type || event?.status || "-",
         decision: decision && typeof decision === "object" ? JSON.stringify(decision) : String(decision || "-"),
-        output:
-          event?.output && typeof event.output === "object"
-            ? JSON.stringify(event.output)
-            : String(event?.output || event?.event_type || "-"),
+        output: stringifyTimelineValue(outputValue) || String(event?.event_type || "-"),
         communicates_to: event?.communicates_to || event?.transport_channel || input?.transport_channel || "-",
+        inputValueText: stringifyTimelineValue(inputValue),
+        outputValueText: stringifyTimelineValue(outputValue),
+        errorValueText: extractEventError(event),
       };
     });
 
-    const traceRows = selectedAlertEventTrace.map((row, index) => ({
-      sequence: mappedEvents.length + index + 1,
-      agent: displayAgentName(row?.service || "-"),
-      action: summarizeEventType(row?.event_type),
-      decision: row?.policy_reason || row?.status || row?.event_stage || "-",
-      output: row?.event_type || "-",
-      communicates_to: row?.transport_channel || "-",
-    }));
+    const traceRows = selectedAlertEventTrace.map((row, index) => {
+      const inputValue = extractEventInput(row);
+      const outputValue = extractEventOutput(row);
+      return {
+        sequence: index + 1,
+        agent: displayAgentName(normalizeTraceServiceName(row)),
+        action: summarizeEventType(row?.event_type),
+        decision: row?.policy_reason || row?.status || row?.event_stage || "-",
+        output: stringifyTimelineValue(outputValue) || row?.event_type || "-",
+        communicates_to: row?.transport_channel || "-",
+        inputValueText: stringifyTimelineValue(inputValue),
+        outputValueText: stringifyTimelineValue(outputValue),
+        errorValueText: extractEventError(row),
+      };
+    });
 
-    if (!mappedEvents.length) {
+    if (traceRows.length) {
       return traceRows;
     }
 
-    const seenSignatures = new Set(
-      mappedEvents.map((row) => `${String(row.agent || "").toLowerCase()}|${String(row.action || "").toLowerCase()}`)
-    );
-    const appendedTraceRows = traceRows.filter((row) => {
-      const signature = `${String(row.agent || "").toLowerCase()}|${String(row.action || "").toLowerCase()}`;
-      if (seenSignatures.has(signature)) {
-        return false;
-      }
-      seenSignatures.add(signature);
-      return true;
-    });
-
-    return [...mappedEvents, ...appendedTraceRows].map((row, index) => ({
+    return mappedEvents.map((row, index) => ({
       ...row,
       sequence: index + 1,
     }));
-  }, [selectedAlertEvents, selectedAlertEventTrace, selectedAlertWorkflow]);
+  }, [selectedAlertEvents, selectedAlertEventTrace]);
 
   const selectedAlertUsage = useMemo(() => {
-    const usage =
-      selectedAlertWorkflow?.recommendation?.metadata?.model_usage
-      || selectedAlertWorkflow?.finops?.calls
-      || selectedAlertWorkflow?.recommendation?.metadata?.llm_calls
-      || [];
-    return Array.isArray(usage) ? usage : [];
-  }, [selectedAlertWorkflow]);
+    const rows = [];
+    const appendUsage = (candidate) => {
+      if (!Array.isArray(candidate)) {
+        return;
+      }
+      candidate.forEach((item) => rows.push(normalizeUsageRow(item)));
+    };
+
+    appendUsage(selectedAlertWorkflow?.recommendation?.metadata?.model_usage);
+    appendUsage(selectedAlertWorkflow?.finops?.calls);
+    appendUsage(selectedAlertWorkflow?.recommendation?.metadata?.llm_calls);
+
+    selectedAlertEventTrace.forEach((event) => {
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      appendUsage(payload?.model_usage);
+      appendUsage(payload?.llm_calls);
+      appendUsage(payload?.finops?.calls);
+    });
+
+    return rows.filter((row) => isMeaningfulUsageRow(row));
+  }, [selectedAlertWorkflow, selectedAlertEventTrace]);
 
   const selectedAlertRouting = useMemo(() => extractObservedRoutingMetrics(selectedAlertWorkflow), [selectedAlertWorkflow]);
 
@@ -2416,11 +3296,7 @@ export default function App() {
       typeof selectedAlertWorkflow?.remediation_action === "object" && selectedAlertWorkflow.remediation_action
         ? selectedAlertWorkflow.remediation_action
         : {};
-    const commands =
-      (Array.isArray(recommendation?.commands) && recommendation.commands)
-      || (Array.isArray(remediationAction?.commands) && remediationAction.commands)
-      || (Array.isArray(decision?.commands) && decision.commands)
-      || [];
+    const commands = deriveExecutionCommands(selectedAlertWorkflow, selectedAlertEventTrace);
 
     return {
       action:
@@ -2446,7 +3322,7 @@ export default function App() {
       provider: selectedAlertRouting?.message_bus_provider || decision?.message_bus_provider || "-",
       commands,
     };
-  }, [selectedAlertWorkflow, selectedAlertRouting]);
+  }, [selectedAlertWorkflow, selectedAlertRouting, selectedAlertEventTrace]);
 
   const selectedIncidentId = useMemo(() => {
     return String(selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "").trim();
@@ -2471,39 +3347,68 @@ export default function App() {
       selectedAlertRow?.created_at ||
       selectedAlertRow?.starts_at ||
       "";
-    const incidentCreatedAt = selectedAlertWorkflow?.incident?.created_at || "";
-    const latestFlowUpdateAt =
-      selectedIncidentMetadataRow?.updated_at ||
-      selectedIncidentMetadataRow?.latest_event_at ||
-      "";
-    const latestEventType = String(selectedIncidentMetadataRow?.latest_event_type || "").trim();
+    const incidentCreatedAt = selectedAlertWorkflow?.incident?.created_at || selectedIncidentMetadataRow?.created_at || "";
 
-    const summaryRows = [
-      {
-        stage: "Alert Ingested",
-        agent: "monitoring-adapter",
-        service: "monitoring-adapter",
-        consumes: "-",
-        publishes: "raw-alerts",
-        timestamp: ingestAt,
-        elapsed: "0.000",
-        detail: "Alert accepted and persisted.",
-        tables: "alerts",
-        query: "INSERT alerts",
-      },
-      {
-        stage: "Incident Created",
-        agent: "alert-intelligence",
-        service: "alert-intelligence",
-        consumes: "raw-alerts",
-        publishes: "enriched-alerts",
-        timestamp: incidentCreatedAt,
-        elapsed: elapsedSeconds(ingestAt, incidentCreatedAt),
-        detail: "Incident opened from alert correlation.",
-        tables: "incidents, agent_work_items",
-        query: "INSERT incidents; INSERT agent_work_items",
-      },
-    ];
+    const workflowRows = selectedAlertEvents
+      .filter((event) => event && typeof event === "object")
+      .sort((a, b) => {
+        const aSeq = Number(a.sequence || 0);
+        const bSeq = Number(b.sequence || 0);
+        if (aSeq && bSeq && aSeq !== bSeq) {
+          return aSeq - bSeq;
+        }
+        const aTime = parseUtcTimestamp(a.timestamp)?.getTime() || 0;
+        const bTime = parseUtcTimestamp(b.timestamp)?.getTime() || 0;
+        return aTime - bTime;
+      })
+      .map((event, index) => {
+        const route = routeForAgent(event.agent);
+        const inputPayload = extractEventInput(event);
+        const outputPayload = extractEventOutput(event);
+        const inputObject = typeof inputPayload === "object" && inputPayload ? inputPayload : {};
+        const outputObject = typeof outputPayload === "object" && outputPayload ? outputPayload : {};
+        const tableHints = [
+          ...(Array.isArray(outputObject.table_hints) ? outputObject.table_hints : []),
+          ...(Array.isArray(event?.metrics?.table_hints) ? event.metrics.table_hints : []),
+        ].filter(Boolean);
+        const consumes =
+          String(inputObject.source_channel || inputObject.topic || inputObject.from_topic || route?.consumes || "").trim() || "-";
+        const publishes =
+          String(
+            event.communicates_to
+            || inputObject.transport_channel
+            || inputObject.to_topic
+            || outputObject.transport_channel
+            || route?.publishes
+            || ""
+          ).trim() || "-";
+        const actionLabel = String(event.action || event.event_type || "").trim();
+        const stageName = actionLabel ? summarizeEventType(actionLabel) : `Workflow Event ${index + 1}`;
+        const detailParts = [
+          compactText(event.status, 40),
+          compactText(
+            event.decision && typeof event.decision === "object"
+              ? JSON.stringify(event.decision)
+              : event.decision,
+            120
+          ),
+        ].filter(Boolean);
+
+        return {
+          stage: stageName,
+          agent: displayAgentName(event.agent || "-"),
+          service: route?.service || event.service || "-",
+          consumes,
+          publishes,
+          timestamp: event.timestamp || "",
+          elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, event.timestamp || ""),
+          detail: detailParts.join(" | ") || "Workflow event recorded.",
+          tables: tableHints.length ? tableHints.join(", ") : "-",
+          inputValueText: stringifyTimelineValue(inputPayload),
+          outputValueText: stringifyTimelineValue(outputPayload),
+          errorValueText: extractEventError(event),
+        };
+      });
 
     const traceRows = selectedAlertEventTrace.map((event, index) => {
       const stageName = summarizeEventType(event.event_type);
@@ -2515,76 +3420,43 @@ export default function App() {
       ].filter(Boolean);
       return {
         stage: `${stageName}${index + 1 <= 9 ? ` (${index + 1})` : ""}`,
-        agent: displayAgentName(event.service || "-"),
-        service: event.service || "-",
+        agent: displayAgentName(normalizeTraceServiceName(event)),
+        service: normalizeTraceServiceName(event),
         consumes: event.source_channel || "-",
         publishes: event.transport_channel || "-",
         timestamp: event.timestamp || "",
         elapsed: elapsedSeconds(ingestAt, event.timestamp || ""),
         detail: detailParts.join(" | ") || "Trace event recorded.",
         tables: tableHints.join(", ") || "-",
-        query: compactText(event.query_hint, 140) || "-",
+        inputValueText: stringifyTimelineValue(
+          hasMeaningfulValue(event.input_value)
+            ? event.input_value
+            : {
+                source_channel: event.source_channel,
+                transport_provider: event.transport_provider,
+                risk_tier: event.risk_tier,
+                execution_mode: event.execution_mode,
+                trace_id: event.trace_id,
+              }
+        ),
+        outputValueText: stringifyTimelineValue(
+          hasMeaningfulValue(event.output_value)
+            ? event.output_value
+            : {
+                event_type: event.event_type,
+                event_stage: event.event_stage,
+                status: event.status,
+                transport_channel: event.transport_channel,
+                table_hints: event.table_hints,
+                query_hint: event.query_hint,
+              }
+        ),
+        errorValueText: stringifyTimelineValue(event.error) || extractEventError(event),
       };
     });
 
-    const workflowRows =
-      traceRows.length > 0
-        ? traceRows
-        : selectedAlertEvents
-            .filter((event) => event && typeof event === "object")
-            .sort((a, b) => Number(a.sequence || 0) - Number(b.sequence || 0))
-            .map((event) => {
-              const route = routeForAgent(event.agent);
-              const step = Number(event.sequence || 0);
-              const timestamp = event.timestamp || "";
-              const stageName = step > 0 ? `Workflow Step ${step}` : "Workflow Step";
-              const decisionText =
-                event.decision && typeof event.decision === "object"
-                  ? JSON.stringify(event.decision)
-                  : String(event.decision || "").trim();
-              const actionText = String(event.action || event.output || event.status || "").trim();
-              return {
-                stage: stageName,
-                agent: displayAgentName(event.agent || "-"),
-                service: route?.service || "-",
-                consumes: route?.consumes || "-",
-                publishes: route?.publishes || "-",
-                timestamp,
-                elapsed: elapsedSeconds(ingestAt, timestamp),
-                detail: compactText(decisionText || actionText || "Workflow event recorded.", 160),
-                tables: "-",
-                query: "-",
-              };
-            });
-
-    const terminalRows = [
-      {
-        stage: "Latest Workflow Update",
-        agent: "incident-projection",
-        service: "monitoring-adapter",
-        consumes: "incident-events",
-        publishes: "incident-projections",
-        timestamp: latestFlowUpdateAt,
-        elapsed: elapsedSeconds(ingestAt, latestFlowUpdateAt),
-        detail: latestEventType || "Latest incident metadata/projection update.",
-        tables: "incident_projections",
-        query: "UPSERT incident_projections",
-      },
-      {
-        stage: "Current Incident Status",
-        agent: "workflow-state",
-        service: "ui",
-        consumes: "incident-projections",
-        publishes: "ui",
-        timestamp: latestFlowUpdateAt || incidentCreatedAt || ingestAt,
-        elapsed: elapsedSeconds(ingestAt, latestFlowUpdateAt || incidentCreatedAt || ingestAt),
-        detail: String(selectedIncidentMetadataRow?.status || selectedAlertWorkflow?.incident?.status || "unknown"),
-        tables: "incident_projections",
-        query: "SELECT incident_projections",
-      },
-    ];
-
-    const rows = [...summaryRows, ...workflowRows, ...terminalRows].filter(
+    const sourceRows = traceRows.length ? traceRows : workflowRows;
+    const rows = sourceRows.filter(
       (row, index, allRows) => {
         const stage = String(row.stage || "").trim();
         const agent = String(row.agent || "").trim();
@@ -2599,7 +3471,31 @@ export default function App() {
       }
     );
 
-    return rows;
+    if (rows.length) {
+      return rows;
+    }
+
+    const fallbackStatus = String(selectedIncidentMetadataRow?.status || selectedAlertWorkflow?.incident?.status || "").trim();
+    if (!fallbackStatus) {
+      return [];
+    }
+
+    return [
+      {
+        stage: "Current Incident Status",
+        agent: "incident-projection",
+        service: "monitoring-adapter",
+        consumes: "-",
+        publishes: "-",
+        timestamp: selectedIncidentMetadataRow?.updated_at || selectedIncidentMetadataRow?.latest_event_at || incidentCreatedAt || ingestAt,
+        elapsed: "-",
+        detail: fallbackStatus,
+        tables: "-",
+        inputValueText: "",
+        outputValueText: stringifyTimelineValue(selectedIncidentMetadataRow),
+        errorValueText: "",
+      },
+    ];
   }, [selectedAlertWorkflow, selectedAlertRow, selectedIncidentMetadataRow, selectedAlertEvents, selectedAlertEventTrace]);
 
   const hasSelectedWorkflowData = useMemo(() => {
@@ -2663,12 +3559,7 @@ export default function App() {
         total_tokens: row?.total_tokens,
         total_cost_usd: row?.total_cost_usd || row?.cost_usd,
       });
-      if (
-        synthetic.provider !== "unknown"
-        || synthetic.model !== "unknown"
-        || synthetic.total_tokens > 0
-        || synthetic.total_cost_usd > 0
-      ) {
+      if (isMeaningfulUsageRow(synthetic)) {
         merged.push(synthetic);
       }
     });
@@ -2679,7 +3570,7 @@ export default function App() {
       appendUsage(row?.llm_usage);
     });
 
-    return merged;
+    return merged.filter((row) => isMeaningfulUsageRow(row));
   }, [panelWorkflowUsage, selectedAlertUsage, latestWorkflow, monitorScopedIncidentMetadata, gatewayRecent.rows]);
 
   useEffect(() => {
@@ -3025,7 +3916,10 @@ export default function App() {
     return monitorScopedIncidentMetadata.filter((row) => {
       const mode = String(row?.execution_mode || "").toLowerCase();
       const status = String(row?.status || "").toLowerCase();
-      return mode === "human-approval" || status === "awaiting_approval";
+      if (isApprovalPendingStatus(status)) {
+        return true;
+      }
+      return mode === "human-approval" && !isApprovalResolvedStatus(status);
     });
   }, [monitorScopedIncidentMetadata]);
 
@@ -3042,6 +3936,17 @@ export default function App() {
       return severity === approvalFilter;
     });
   }, [pendingApprovals, approvalFilter]);
+
+  const pendingApprovalByIncidentId = useMemo(() => {
+    const index = new Map();
+    pendingApprovals.forEach((row) => {
+      const incidentId = approvalIncidentId(row);
+      if (incidentId) {
+        index.set(incidentId, row);
+      }
+    });
+    return index;
+  }, [pendingApprovals]);
 
   const selectedApprovalRow = useMemo(() => {
     return filteredPendingApprovals.find((row) => approvalIncidentId(row) === selectedApprovalIncidentId) || null;
@@ -3128,6 +4033,136 @@ export default function App() {
     loadApprovalIncidentContext(incidentId);
   }
 
+  function resolvePendingApprovalFromAlertRow(alertRow) {
+    const directIncidentId = approvalIncidentId(alertRow);
+    if (directIncidentId && pendingApprovalByIncidentId.has(directIncidentId)) {
+      return pendingApprovalByIncidentId.get(directIncidentId) || null;
+    }
+
+    const service = String(alertRow?.service || "").trim().toLowerCase();
+    const severity = String(alertRow?.severity || "").trim().toLowerCase();
+    if (!service) {
+      return null;
+    }
+
+    const byServiceAndSeverity = pendingApprovals.find((row) => {
+      const rowService = String(row?.service || "").trim().toLowerCase();
+      const rowSeverity = String(row?.severity || row?.risk_tier || "").trim().toLowerCase();
+      return rowService === service && (!severity || !rowSeverity || rowSeverity === severity);
+    });
+    if (byServiceAndSeverity) {
+      return byServiceAndSeverity;
+    }
+
+    return pendingApprovals.find((row) => String(row?.service || "").trim().toLowerCase() === service) || null;
+  }
+
+  function selectApprovalFromAlertRow(alertRow) {
+    const matchedRow = resolvePendingApprovalFromAlertRow(alertRow);
+    if (!matchedRow) {
+      setApprovalState((current) => ({
+        ...current,
+        error: "No pending approval incident matched this alert. Open incident details or adjust the pending filter.",
+      }));
+      return null;
+    }
+    selectApprovalIncident(matchedRow);
+    approvalQueueRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    return matchedRow;
+  }
+
+  function applyApprovalResolutionToUi(incidentId, nextStatus, comment = "") {
+    const normalizedIncidentId = String(incidentId || "").trim();
+    const normalizedStatus = String(nextStatus || "").trim().toLowerCase();
+    if (!normalizedIncidentId || !normalizedStatus) {
+      return;
+    }
+
+    const patchIncidentRow = (row) => {
+      const rowIncidentId = String(row?.incident_id || row?.id || "").trim();
+      if (rowIncidentId !== normalizedIncidentId) {
+        return row;
+      }
+      return {
+        ...row,
+        status: normalizedStatus,
+        approval_status: normalizedStatus,
+        updated_at: new Date().toISOString(),
+        latest_comment: comment || row?.latest_comment || "",
+      };
+    };
+
+    setIncidentMetadata((prev) => ({
+      ...prev,
+      rows: Array.isArray(prev.rows) ? prev.rows.map(patchIncidentRow) : prev.rows,
+    }));
+
+    setAlerts((prev) => ({
+      ...prev,
+      rows: Array.isArray(prev.rows)
+        ? prev.rows.map((row) => {
+            const rowIncidentId = String(row?.incident_id || "").trim();
+            if (rowIncidentId !== normalizedIncidentId) {
+              return row;
+            }
+            return {
+              ...row,
+              status: normalizedStatus,
+              state: normalizedStatus,
+              updated_at: new Date().toISOString(),
+            };
+          })
+        : prev.rows,
+    }));
+
+    setSelectedAlertData((prev) => {
+      const payloadRoot = prev?.payload?.data || prev?.payload;
+      if (!payloadRoot || typeof payloadRoot !== "object") {
+        return prev;
+      }
+      const workflow = payloadRoot?.workflow || payloadRoot;
+      const workflowIncidentId = String(workflow?.incident?.id || workflow?.incident_id || "").trim();
+      if (workflowIncidentId !== normalizedIncidentId) {
+        return prev;
+      }
+
+      const nextWorkflow = {
+        ...(workflow || {}),
+        incident: {
+          ...(workflow?.incident || {}),
+          status: normalizedStatus,
+          updated_at: new Date().toISOString(),
+        },
+        approval: {
+          ...(workflow?.approval || {}),
+          status: normalizedStatus,
+          comment: comment || workflow?.approval?.comment || "",
+        },
+      };
+
+      if (prev?.payload?.data && typeof prev.payload === "object") {
+        return {
+          ...prev,
+          payload: {
+            ...prev.payload,
+            data: {
+              ...payloadRoot,
+              workflow: nextWorkflow,
+            },
+          },
+        };
+      }
+
+      return {
+        ...prev,
+        payload: {
+          ...payloadRoot,
+          workflow: nextWorkflow,
+        },
+      };
+    });
+  }
+
   const approvalReady = useMemo(() => {
     const hasBase = String(approvalForm.incident_id || "").trim() && String(approvalForm.recommendation_id || "").trim() && String(approvalForm.approver || "").trim();
     if (!hasBase) {
@@ -3174,11 +4209,34 @@ export default function App() {
     });
   }
 
+  async function resolveRecommendationIdForIncident(incidentId, preferredRecommendationId = "") {
+    const normalizedIncidentId = String(incidentId || "").trim();
+    const preferred = String(preferredRecommendationId || "").trim();
+    if (looksLikeUuid(preferred)) {
+      return preferred;
+    }
+
+    if (approvalIncidentContext.incident_id === normalizedIncidentId) {
+      const fromContext = approvalRecommendationFromPayload(approvalIncidentContext.payload);
+      if (looksLikeUuid(fromContext)) {
+        return fromContext;
+      }
+    }
+
+    const response = await fetchJson(`/api-gateway/approval/incident/${encodeURIComponent(normalizedIncidentId)}`);
+    const payload = unwrap(response);
+    const resolved = approvalRecommendationFromPayload(payload);
+    if (looksLikeUuid(resolved)) {
+      setApprovalIncidentContext({ loading: false, incident_id: normalizedIncidentId, payload, error: "" });
+      return resolved;
+    }
+    return "";
+  }
+
   async function approveIncidentRow(row) {
     const incidentId = approvalIncidentId(row);
     const rowRecommendationId = approvalRecommendationId(row);
-    const recommendationId = rowRecommendationId
-      || (approvalIncidentContext.incident_id === incidentId ? approvalRecommendationFromPayload(approvalIncidentContext.payload) : "");
+    const recommendationId = await resolveRecommendationIdForIncident(incidentId, rowRecommendationId);
 
     setSelectedApprovalIncidentId(incidentId);
     setApprovalState({ loading: true, result: null, error: "" });
@@ -3198,6 +4256,7 @@ export default function App() {
         incident_id: incidentId || current.incident_id,
         recommendation_id: recommendationId || current.recommendation_id,
       }));
+      applyApprovalResolutionToUi(incidentId, "approved", approvalForm.comment);
       setApprovalState({ loading: false, result: response, error: "" });
       await Promise.all([loadIncidentMetadata(), loadGatewayRecent(), loadGatewaySummary()]);
     } catch (error) {
@@ -3212,8 +4271,7 @@ export default function App() {
   async function rejectIncidentRow(row) {
     const incidentId = approvalIncidentId(row);
     const rowRecommendationId = approvalRecommendationId(row);
-    const recommendationId = rowRecommendationId
-      || (approvalIncidentContext.incident_id === incidentId ? approvalRecommendationFromPayload(approvalIncidentContext.payload) : "");
+    const recommendationId = await resolveRecommendationIdForIncident(incidentId, rowRecommendationId);
 
     setSelectedApprovalIncidentId(incidentId);
     setApprovalState({ loading: true, result: null, error: "" });
@@ -3234,6 +4292,7 @@ export default function App() {
         recommendation_id: recommendationId || current.recommendation_id,
         comment: inlineRejectState.comment || current.comment,
       }));
+      applyApprovalResolutionToUi(incidentId, "rejected", inlineRejectState.comment);
       setInlineRejectState({ incidentId: "", comment: "" });
       setApprovalState({ loading: false, result: response, error: "" });
       await Promise.all([loadIncidentMetadata(), loadGatewayRecent(), loadGatewaySummary()]);
@@ -3257,15 +4316,18 @@ export default function App() {
         || approvalRecommendationFromPayload(approvalIncidentContext.payload)
         || ""
       ).trim();
+      const recommendationId = await resolveRecommendationIdForIncident(incidentId, recommendationIdCandidate);
       const response = await executeApprovalAction({
         incidentId,
-        recommendationId: recommendationIdCandidate,
+        recommendationId,
         action: approvalForm.action,
         approver: approvalForm.approver,
         channel: approvalForm.channel,
         comment: approvalForm.comment,
         modifiedAction: approvalForm.modified_action,
       });
+      const actionStatus = approvalForm.action === "reject" ? "rejected" : "approved";
+      applyApprovalResolutionToUi(incidentId, actionStatus, approvalForm.comment);
       setApprovalState({ loading: false, result: response, error: "" });
       await Promise.all([loadIncidentMetadata(), loadGatewayRecent(), loadGatewaySummary()]);
     } catch (error) {
@@ -3315,6 +4377,17 @@ export default function App() {
   const visibleSidebarSections = useMemo(() => sidebarSections.filter((tab) => allowedTabs.includes(tab.id)), [sidebarSections, allowedTabs]);
   const isAuthenticated = Boolean(String(adminSession.accessToken || "").trim());
   const isAdministrator = currentRole === "administrator";
+  const canManageSeverityOverride = ["administrator", "l2_engineer", "l3_engineer", "p2", "p3"].includes(currentRole);
+  const severityOverrideByKey = useMemo(() => {
+    const map = new Map();
+    (alertSeverityOverrides.rows || []).forEach((row) => {
+      const key = severityOverrideKey(row?.name, row?.service, row?.environment);
+      if (key) {
+        map.set(key, row);
+      }
+    });
+    return map;
+  }, [alertSeverityOverrides.rows]);
   const onboardingValidationErrors = useMemo(() => {
     const errors = [];
     if (!String(onboardingForm.name || "").trim()) {
@@ -3356,6 +4429,49 @@ export default function App() {
     }
     return "Tool endpoint URL is optional now, but recommended for connectivity and rule simulation quality.";
   }, [onboardingForm.deployment_mode, onboardingForm.monitoring_url, onboardingForm.onboarding_path]);
+  const onboardingLandingPadDetails = useMemo(() => {
+    const summary = onboardingLandingPadSummary && typeof onboardingLandingPadSummary === "object" ? onboardingLandingPadSummary : {};
+    const landingPadPath = String(summary?.landing_pad_endpoint || "/alerts/alertmanager").trim() || "/alerts/alertmanager";
+    const selectedTool = String(summary?.selected_monitoring_tool || onboardingForm.monitoring_tool || "prometheus").trim().toLowerCase();
+    const configuredEndpoint = String(summary?.configured_monitoring_endpoint || onboardingForm.monitoring_url || "").trim();
+    const projectName = String(summary?.project_name || onboardingForm.name || "").trim() || "<project-name>";
+    const browserOrigin = typeof window !== "undefined" && window?.location?.origin ? window.location.origin : "http://localhost:8501";
+    const onboardingPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim().toLowerCase();
+    const routeMessage = String(summary?.message || "").trim() || "Send alerts from your monitoring platform to this landing pad endpoint to trigger workflow execution.";
+
+    const samplePayload = {
+      receiver: "kaiops",
+      status: "firing",
+      alerts: [
+        {
+          status: "firing",
+          labels: {
+            alertname: `${projectName}-high-latency`,
+            severity: "critical",
+            service: projectName,
+          },
+          annotations: {
+            summary: "P95 latency exceeded threshold",
+            description: "Checkout latency above 2s for 5 minutes",
+          },
+          startsAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+    };
+
+    return {
+      onboardingPath,
+      routeMessage,
+      selectedTool,
+      configuredEndpoint: configuredEndpoint || "Not set",
+      externalIngestionEndpoint: `${browserOrigin}/api-gateway${landingPadPath}`,
+      internalIngestionEndpoint: `http://monitoring-adapter:8000${landingPadPath}`,
+      method: "POST",
+      contentType: "application/json",
+      traceHeader: "x-trace-id (optional)",
+      samplePayload: JSON.stringify(samplePayload, null, 2),
+    };
+  }, [onboardingLandingPadSummary, onboardingForm.monitoring_tool, onboardingForm.monitoring_url, onboardingForm.name, onboardingForm.onboarding_path]);
   const onboardingHasPendingDocumentApproval = useMemo(
     () => onboardingGeneratedDocs.length > 0 && !onboardingDocApprovalState.approved,
     [onboardingGeneratedDocs.length, onboardingDocApprovalState.approved],
@@ -3390,10 +4506,24 @@ export default function App() {
 
   const adminWorkspaceCaptions = useMemo(() => ({
     users: "Manage users, roles, and credentials.",
-    project: "Set up project monitoring using existing ingestion or guided rule creation.",
-    projects: "Browse persisted project onboarding records.",
-    alerts: "Author and bulk upload alert onboarding knowledge docs.",
+    monitoring: "Application monitoring onboarding and lifecycle timeline.",
+    project: "Project setup, onboarding path, and optional rule automation.",
+    alerts: "Alert knowledge onboarding and bulk document ingestion.",
   }), []);
+
+  useEffect(() => {
+    if (!isAuthenticated || adminWorkspace !== "monitoring") {
+      return;
+    }
+    loadMonitoringApplications();
+  }, [isAuthenticated, adminWorkspace]);
+
+  useEffect(() => {
+    if (!selectedMonitoringAppId) {
+      return;
+    }
+    loadMonitoringApplicationDetails(selectedMonitoringAppId);
+  }, [selectedMonitoringAppId]);
 
   useEffect(() => {
     if (onboardingProjectMode === "new" || selectedOnboardingProject || !projectOnboardingRows.length) {
@@ -3425,6 +4555,8 @@ export default function App() {
     }
     if (workspace === "users") {
       setAdminWorkspace("users");
+    } else if (workspace === "monitoring") {
+      setAdminWorkspace("monitoring");
     } else if (workspace === "project") {
       setAdminWorkspace("project");
     } else if (workspace === "alerts") {
@@ -3978,6 +5110,10 @@ export default function App() {
                   </button>
                 </div>
                 {alerts.error ? <p className="error">{alerts.error}</p> : null}
+                {alertSeverityOverrides.error ? <p className="error">{alertSeverityOverrides.error}</p> : null}
+                {canManageSeverityOverride ? (
+                  <p className="subtitle">L2/L3/Admin can set future severity overrides by alert name + service + environment.</p>
+                ) : null}
                 <div className="table-wrap">
                   <table className="alert-stream-table">
                     <thead>
@@ -3988,6 +5124,7 @@ export default function App() {
                         <th>Application</th>
                         <th>Service</th>
                         <th>Severity</th>
+                        <th>Future Severity</th>
                         <th>Status</th>
                         <th>Docs</th>
                         <th>Action</th>
@@ -4001,7 +5138,14 @@ export default function App() {
                         const severity = String(row.severity || "-").toUpperCase();
                         const status = String(row.status || row.state || "open");
                         const application = row.application || row.project_name || row.project || row.service || "-";
-                        const documentAvailable = row.document_available;
+                        const documentAvailable = hasAlertDocuments(row);
+                        const alertName = String(row.name || row.alert_name || "").trim();
+                        const service = String(row.service || "").trim();
+                        const environment = String(row.environment || "").trim();
+                        const overrideKey = severityOverrideKey(alertName, service, environment);
+                        const overrideRow = severityOverrideByKey.get(overrideKey);
+                        const draftSeverity = String(alertSeverityDrafts[overrideKey] || overrideRow?.severity || String(row.severity || "warning").toLowerCase()).toLowerCase();
+                        const overrideSaving = alertSeverityOverrides.savingKey === overrideKey;
                         return (
                           <tr
                             key={rowId}
@@ -4023,24 +5167,70 @@ export default function App() {
                             <td>{application}</td>
                             <td>{row.service || "-"}</td>
                             <td><span className={`pill severity-${severity.toLowerCase()}`}>{severity}</span></td>
+                            <td>
+                              {canManageSeverityOverride ? (
+                                <div style={{ display: "grid", gap: 6 }}>
+                                  <select
+                                    value={draftSeverity}
+                                    onClick={(event) => event.stopPropagation()}
+                                    onChange={(event) => {
+                                      const next = String(event.target.value || "warning").toLowerCase();
+                                      setAlertSeverityDrafts((current) => ({ ...current, [overrideKey]: next }));
+                                    }}
+                                  >
+                                    <option value="info">info</option>
+                                    <option value="warning">warning</option>
+                                    <option value="high">high</option>
+                                    <option value="critical">critical</option>
+                                  </select>
+                                  <div style={{ display: "flex", gap: 6 }}>
+                                    <button
+                                      type="button"
+                                      className="button-secondary"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        applyAlertSeverityOverrideRule(row);
+                                      }}
+                                      disabled={overrideSaving || alertSeverityOverrides.loading || !alertName}
+                                    >
+                                      {overrideSaving ? "Saving..." : "Apply"}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="button-secondary"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        clearAlertSeverityOverrideRule(row);
+                                      }}
+                                      disabled={overrideSaving || !overrideRow}
+                                    >
+                                      Clear
+                                    </button>
+                                  </div>
+                                  {overrideRow ? <span className="pill status-approved">future: {String(overrideRow.severity || "-").toUpperCase()}</span> : null}
+                                </div>
+                              ) : (
+                                <span>{overrideRow ? String(overrideRow.severity || "-").toUpperCase() : "-"}</span>
+                              )}
+                            </td>
                             <td><span className={`pill status-${status.toLowerCase()}`}>{status}</span></td>
                             <td>
-                              {documentAvailable === false ? (
-                                <button
-                                  type="button"
-                                  className="button-secondary pill status-blocked"
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    openDocumentPrompt(row);
-                                  }}
-                                >
-                                  Provide Docs
-                                </button>
-                              ) : documentAvailable === true ? (
-                                <span className="pill status-resolved">Available</span>
-                              ) : (
-                                <span className="pill">-</span>
-                              )}
+                              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                                {!documentAvailable ? (
+                                  <button
+                                    type="button"
+                                    className="button-secondary pill status-blocked"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      openDocumentPrompt(row);
+                                    }}
+                                  >
+                                    Provide Docs
+                                  </button>
+                                ) : (
+                                  <span className="pill status-closed">Docs Ready</span>
+                                )}
+                              </div>
                             </td>
                             <td>
                               <button
@@ -4059,7 +5249,7 @@ export default function App() {
                       })}
                       {!visibleAlerts.length && !alerts.loading ? (
                         <tr>
-                          <td colSpan={9}>No alerts available for {applicationToMonitor}.</td>
+                          <td colSpan={10}>No alerts available for {applicationToMonitor}.</td>
                         </tr>
                       ) : null}
                     </tbody>
@@ -4068,16 +5258,82 @@ export default function App() {
               </article>
 
               {docPromptAlert ? (
-                <article className="panel" role="dialog" aria-label="Provide documents for alert">
+                <article className="panel" role="dialog" aria-label="Provide documents for alert" ref={docPromptRef}>
                   <div className="panel-head">
                     <h3>Provide Documents</h3>
                     <button type="button" className="button-secondary" onClick={closeDocumentPrompt}>Close</button>
                   </div>
                   <p className="subtitle">
-                    No knowledge base document was found for alert{" "}
+                    Configure documentation for alert{" "}
                     <strong>{String(docPromptAlert.name || docPromptAlert.alert_name || docPromptAlert.alert_id || docPromptAlert.id || "-")}</strong>.
-                    Upload a runbook or incident doc so future alerts of this type can be resolved automatically.
+                    All document types are available as tabs below.
                   </p>
+                  <div className="detail-tabs sticky-controls" style={{ marginBottom: 10 }}>
+                    {ALERT_DOC_KIND_OPTIONS.map((kind) => {
+                      const existing = docPromptDocsByKind[kind];
+                      const selected = docPromptKind === kind;
+                      const label = existing?.path ? `${kind} *` : kind;
+                      return (
+                        <button
+                          key={`doc-kind-${kind}`}
+                          type="button"
+                          className={selected ? "button-primary" : "button-secondary"}
+                          onClick={() => setDocPromptDraftForKind(docPromptAlert, kind)}
+                        >
+                          {label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="filter-grid">
+                    <label>
+                      Mode
+                      <select value={docPromptMode} onChange={(e) => setDocPromptMode(e.target.value)}>
+                        <option value="create">Create New</option>
+                        <option value="update" disabled={!docPromptExistingDoc?.path}>Update Existing</option>
+                      </select>
+                    </label>
+                    <div style={{ display: "flex", alignItems: "end", gap: 8 }}>
+                      <button
+                        type="button"
+                        className="button-secondary"
+                        onClick={async () => {
+                          const draft = await buildAlertDocumentDraftWithAnalysis(docPromptAlert, docPromptKind);
+                          setAlertOnboarding((curr) => ({
+                            ...curr,
+                            kind: draft.kind,
+                            title: draft.title,
+                            summary: draft.summary,
+                            content: draft.content,
+                            services: draft.services,
+                            severity: draft.severity,
+                            alert_type: draft.alert_type,
+                            alert_id: draft.alert_id,
+                          }));
+                        }}
+                        disabled={alertOnboardingState.loading}
+                      >
+                        Re-Analyze Alert
+                      </button>
+                      <button
+                        type="button"
+                        className="button-secondary"
+                        onClick={() => autoCreateAlertDocument(docPromptAlert, docPromptKind)}
+                        disabled={alertOnboardingState.loading}
+                      >
+                        Create Selected Doc
+                      </button>
+                      <button
+                        type="button"
+                        className="button-secondary"
+                        onClick={() => autoCreateAllAlertDocuments(docPromptAlert)}
+                        disabled={alertOnboardingState.loading}
+                      >
+                        Create All Docs
+                      </button>
+                    </div>
+                  </div>
+                  {docPromptExistingDoc?.path ? <p className="subtitle">Existing document: {docPromptExistingDoc.path}</p> : null}
                   <form className="form" onSubmit={submitAlertOnboarding}>
                     <div className="filter-grid">
                       <label>Kind
@@ -4095,9 +5351,38 @@ export default function App() {
                     <label>Services (comma separated)<input value={alertOnboarding.services} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, services: e.target.value }))} /></label>
                     <label>Summary<textarea rows={2} value={alertOnboarding.summary} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, summary: e.target.value }))} /></label>
                     <label>Content<textarea rows={5} value={alertOnboarding.content} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, content: e.target.value }))} /></label>
-                    <button className="button-primary" type="submit" disabled={alertOnboardingState.loading}>{alertOnboardingState.loading ? "Uploading..." : "Upload Document"}</button>
+                    <button className="button-primary" type="submit" disabled={alertOnboardingState.loading}>
+                      {alertOnboardingState.loading ? "Saving..." : docPromptMode === "update" && docPromptExistingDoc?.path ? "Update Document" : "Upload Document"}
+                    </button>
                   </form>
                   {alertOnboardingState.error ? <p className="error">{alertOnboardingState.error}</p> : null}
+                  {alertOnboardingState.result ? <p className="subtitle">{alertOnboardingState.result?.message || "Document saved."}</p> : null}
+
+                  <article className="panel" style={{ marginTop: 10 }}>
+                    <div className="panel-head">
+                      <h3>Add Rule From Alert</h3>
+                    </div>
+                    <p className="subtitle">Use plain language like earlier flow; the system generates and stores a rule workflow.</p>
+                    <div className="filter-grid">
+                      <label>
+                        Monitoring Platform
+                        <select value={alertRuleDraft.platform} onChange={(e) => setAlertRuleDraft((curr) => ({ ...curr, platform: e.target.value }))}>
+                          <option value="prometheus">prometheus</option>
+                          <option value="new_relic">new_relic</option>
+                          <option value="datadog">datadog</option>
+                        </select>
+                      </label>
+                    </div>
+                    <label>
+                      Rule Requirement (Plain English)
+                      <textarea rows={3} value={alertRuleDraft.requirement} onChange={(e) => setAlertRuleDraft((curr) => ({ ...curr, requirement: e.target.value }))} />
+                    </label>
+                    <button type="button" className="button-primary" onClick={addRuleFromAlertPrompt} disabled={alertRuleState.loading}>
+                      {alertRuleState.loading ? "Creating Rule..." : "Add Rule"}
+                    </button>
+                    {alertRuleState.error ? <p className="error">{alertRuleState.error}</p> : null}
+                    {alertRuleState.result?.workflow_id ? <p className="subtitle">Rule workflow created: {alertRuleState.result.workflow_id}</p> : null}
+                  </article>
                 </article>
               ) : null}
 
@@ -4135,7 +5420,14 @@ export default function App() {
                           <tbody>
                             <tr><th>Alert</th><td>{selectedAlertRow?.name || selectedAlertWorkflow?.alert?.name || "-"}</td></tr>
                             <tr><th>Incident</th><td>{selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "-"}</td></tr>
-                            <tr><th>Persisted Incident Status</th><td>{selectedStageCompleteness.data?.status || selectedAlertWorkflow?.incident?.status || "-"}</td></tr>
+                            <tr>
+                              <th>Persisted Incident Status</th>
+                              <td>
+                                <span className={`pill ${statusPillClass(selectedStageCompleteness.data?.status || selectedAlertWorkflow?.incident?.status)}`}>
+                                  {selectedStageCompleteness.data?.status || selectedAlertWorkflow?.incident?.status || "-"}
+                                </span>
+                              </td>
+                            </tr>
                             <tr><th>Closed At</th><td>{selectedAlertWorkflow?.incident?.closed_at || "-"}</td></tr>
                             <tr><th>Service</th><td>{selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "-"}</td></tr>
                             <tr><th>Root Cause</th><td>{selectedAlertWorkflow?.recommendation?.root_cause || "-"}</td></tr>
@@ -4202,6 +5494,7 @@ export default function App() {
                             <th>Input</th>
                             <th>Output</th>
                             <th>Cost USD</th>
+                            <th>Notes</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -4213,11 +5506,12 @@ export default function App() {
                               <td>{row.input_tokens || "-"}</td>
                               <td>{row.output_tokens || "-"}</td>
                               <td>{row.total_cost_usd || "-"}</td>
+                              <td>{compactText(row.note || (row.estimated ? "estimated usage" : ""), 140) || "-"}</td>
                             </tr>
                           ))}
                           {!selectedAlertUsage.length ? (
                             <tr>
-                              <td colSpan={6}>No FinOps usage found for selected alert.</td>
+                              <td colSpan={7}>No FinOps usage found for selected alert.</td>
                             </tr>
                           ) : null}
                         </tbody>
@@ -4290,7 +5584,7 @@ export default function App() {
                   <div className="copilot-summary-card copilot-tone-ops">
                     <strong>Project Onboarding</strong>
                     <span>Set project identity, environment, and monitoring endpoints.</span>
-                    <button type="button" className="button-primary" onClick={() => openCopilotWorkspace("project")}>Open Onboarding</button>
+                    <button type="button" className="button-primary" onClick={() => openCopilotWorkspace("monitoring")}>Open Onboarding</button>
                   </div>
                   <div className="copilot-summary-card copilot-tone-bus">
                     <strong>Alert Documents</strong>
@@ -4329,6 +5623,7 @@ export default function App() {
                 </div>
 
                 <div className="copilot-shortcuts">
+                  <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("monitoring")}>Monitoring Onboarding</button>
                   <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("project")}>Project Onboarding</button>
                   <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("alerts")}>Alert Documents</button>
                   <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("users")} disabled={!isAdministrator}>User Management</button>
@@ -4419,7 +5714,7 @@ export default function App() {
                           <td>{row.incident_id || "-"}</td>
                           <td>{row.service || "-"}</td>
                           <td>{row.risk_tier || "-"}</td>
-                          <td>{row.status || "-"}</td>
+                          <td><span className={`pill ${statusPillClass(row.status)}`}>{row.status || "-"}</span></td>
                           <td>{row.execution_mode || "-"}</td>
                           <td>
                             <button type="button" className="button-secondary" onClick={() => openAlertDetailsFromIncident(row)}>
@@ -4457,7 +5752,7 @@ export default function App() {
                           <td>{row.service || "-"}</td>
                           <td>{row.risk_tier || row.risk || row.severity || "-"}</td>
                           <td>{row.execution_mode || "-"}</td>
-                          <td>{row.status || "closed"}</td>
+                          <td><span className={`pill ${statusPillClass(row.status || "closed")}`}>{row.status || "closed"}</span></td>
                           <td>{row.closed_at || row.updated_at || "-"}</td>
                         </tr>
                       ))}
@@ -4475,17 +5770,17 @@ export default function App() {
 
           {activeTab === "admin" && isAdministrator ? (
             <section className="grid single-col">
-              <article className="panel">
+              <article className="panel admin-center-panel">
                 <div className="panel-head">
                   <h2>Admin Center</h2>
-                  <p>User management, project onboarding, and alerts onboarding workspace.</p>
+                  <p>Simplified workspace for onboarding and operations.</p>
                 </div>
 
                 <div className="detail-tabs sticky-controls">
                   <button type="button" className={`detail-tab ${adminWorkspace === "users" ? "active" : ""}`} onClick={() => setAdminWorkspace("users")}>Users & Access</button>
-                  <button type="button" className={`detail-tab ${adminWorkspace === "project" ? "active" : ""}`} onClick={() => setAdminWorkspace("project")}>Project Setup Flows</button>
-                  <button type="button" className={`detail-tab ${adminWorkspace === "projects" ? "active" : ""}`} onClick={() => setAdminWorkspace("projects")}>Project Registry</button>
-                  <button type="button" className={`detail-tab ${adminWorkspace === "alerts" ? "active" : ""}`} onClick={() => setAdminWorkspace("alerts")}>Alert Knowledge Base</button>
+                  <button type="button" className={`detail-tab ${adminWorkspace === "monitoring" ? "active" : ""}`} onClick={() => setAdminWorkspace("monitoring")}>Monitoring</button>
+                  <button type="button" className={`detail-tab ${adminWorkspace === "project" ? "active" : ""}`} onClick={() => setAdminWorkspace("project")}>Project Setup</button>
+                  <button type="button" className={`detail-tab ${adminWorkspace === "alerts" ? "active" : ""}`} onClick={() => setAdminWorkspace("alerts")}>Alert Knowledge</button>
                 </div>
                 <p className="subtitle">{adminWorkspaceCaptions[adminWorkspace] || "Administrative workspace controls."}</p>
 
@@ -4594,10 +5889,10 @@ export default function App() {
                 ) : null}
 
                 {adminWorkspace === "project" ? (
-                  <div className="grid single-col">
+                  <div className="grid single-col admin-flow-section admin-flow-project">
                     <article className="panel">
                       <div className="panel-head">
-                        <h3>Project Onboarding</h3>
+                        <h3>Step 2: Project Setup And Rule Flow</h3>
                         <div style={{ display: "flex", gap: 8 }}>
                           <button type="button" className="button-secondary" onClick={loadOnboardingAdminData}>Refresh</button>
                           <button
@@ -4633,7 +5928,7 @@ export default function App() {
                           </button>
                         </div>
                       </div>
-                      <p className="subtitle">Flow options: Existing Monitoring (ingest alerts to landing pad) or Setup Monitoring (generate rules, upload, and validate).</p>
+                      <p className="subtitle">After application monitoring registration, configure project-level routing and optional rule automation.</p>
                       <p className="subtitle"><strong>Next Action:</strong> {onboardingNextAction}</p>
                       {onboardingDocumentSummary.total > 0 ? (
                         <p className="subtitle">
@@ -4715,6 +6010,41 @@ export default function App() {
                             </select>
                           </label>
                         </div>
+                        <div className="panel" style={{ margin: "10px 0", borderStyle: "dashed" }}>
+                          <div className="panel-head">
+                            <h3>Landing Pad Details</h3>
+                            <p>Endpoint and payload guidance for alert ingestion into KaiOps workflow.</p>
+                          </div>
+                          <div className="filter-grid">
+                            <label>Ingestion Endpoint (UI/Gateway)
+                              <input value={onboardingLandingPadDetails.externalIngestionEndpoint} readOnly />
+                            </label>
+                            <label>Ingestion Endpoint (Container Network)
+                              <input value={onboardingLandingPadDetails.internalIngestionEndpoint} readOnly />
+                            </label>
+                            <label>Method
+                              <input value={onboardingLandingPadDetails.method} readOnly />
+                            </label>
+                            <label>Content Type
+                              <input value={onboardingLandingPadDetails.contentType} readOnly />
+                            </label>
+                            <label>Selected Monitoring Tool
+                              <input value={onboardingLandingPadDetails.selectedTool} readOnly />
+                            </label>
+                            <label>Configured Tool Endpoint
+                              <input value={onboardingLandingPadDetails.configuredEndpoint} readOnly />
+                            </label>
+                          </div>
+                          <p className="subtitle"><strong>Optional Header:</strong> {onboardingLandingPadDetails.traceHeader}</p>
+                          <p className="subtitle"><strong>Required Body:</strong> JSON payload with an alerts array.</p>
+                          <p className="subtitle"><strong>Flow Note:</strong> {onboardingLandingPadDetails.routeMessage}</p>
+                          {onboardingLandingPadDetails.onboardingPath === "existing_monitoring" ? (
+                            <p className="subtitle">Use this endpoint from your monitoring platform webhook to start landing-pad ingestion.</p>
+                          ) : (
+                            <p className="subtitle">Rule setup path is selected; this endpoint becomes active after rule and monitoring setup are completed.</p>
+                          )}
+                          <pre className="result">{onboardingLandingPadDetails.samplePayload}</pre>
+                        </div>
                         <div className="filter-grid">
                           <label>
                             Monitoring Tool
@@ -4742,7 +6072,7 @@ export default function App() {
                             Tool Endpoint URL (optional)
                             <input
                               value={onboardingForm.monitoring_url}
-                              placeholder="prometheus:9090"
+                              placeholder="http://prometheus:9090"
                               onBlur={(e) => {
                                 const normalized = simplifyMonitoringUrl(e.target.value);
                                 setOnboardingForm((curr) => ({
@@ -4756,6 +6086,7 @@ export default function App() {
                               }}
                               onChange={(e) => setOnboardingForm((curr) => ({ ...curr, monitoring_url: e.target.value }))}
                             />
+                            <span className="field-hint">In Docker Compose, use http://prometheus:9090 so the monitoring-adapter container can reach Prometheus.</span>
                           </label>
                           <label>Assign User (optional)<input placeholder="username" value={onboardingForm.assignment_username} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, assignment_username: e.target.value }))} /></label>
                         </div>
@@ -5066,47 +6397,123 @@ export default function App() {
 
                 ) : null}
 
-                {adminWorkspace === "projects" ? (
-                  <div className="grid single-col">
+                {adminWorkspace === "monitoring" ? (
+                  <div className="grid single-col admin-flow-section admin-flow-monitoring">
                     <article className="panel">
                       <div className="panel-head">
-                        <h3>Saved Projects</h3>
-                        <button type="button" className="button-secondary" onClick={loadOnboardingAdminData}>
-                          Refresh
-                        </button>
+                        <h3>Application Monitoring Onboarding</h3>
+                        <button className="button-secondary" type="button" onClick={loadMonitoringApplications} disabled={monitoringApps.loading}>Refresh</button>
                       </div>
-                      <p className="subtitle">Manage existing projects here. Use Modify to open Project Onboarding with the selected project prefilled.</p>
+                      <p className="subtitle">Start here. Register an application and inspect the end-to-end onboarding chain (discovery, validation, rules, Prometheus update, dashboard).</p>
+                      <form className="form" onSubmit={submitMonitoringApplication}>
+                        <div className="filter-grid">
+                          <label>Tenant<input value={monitoringAppForm.tenant_id} onChange={(e) => setMonitoringAppForm((curr) => ({ ...curr, tenant_id: e.target.value }))} /></label>
+                          <label>Application Name<input value={monitoringAppForm.name} onChange={(e) => setMonitoringAppForm((curr) => ({ ...curr, name: e.target.value }))} /></label>
+                          <label>Owner Team<input value={monitoringAppForm.owner_team} onChange={(e) => setMonitoringAppForm((curr) => ({ ...curr, owner_team: e.target.value }))} /></label>
+                          <label>Owner Email<input value={monitoringAppForm.owner_email} onChange={(e) => setMonitoringAppForm((curr) => ({ ...curr, owner_email: e.target.value }))} /></label>
+                        </div>
+                        <div className="filter-grid">
+                          <label>Environment<select value={monitoringAppForm.environment} onChange={(e) => setMonitoringAppForm((curr) => ({ ...curr, environment: e.target.value }))}><option value="dev">dev</option><option value="staging">staging</option><option value="prod">prod</option></select></label>
+                          <label>Namespace<input value={monitoringAppForm.namespace} onChange={(e) => setMonitoringAppForm((curr) => ({ ...curr, namespace: e.target.value }))} /></label>
+                          <label>Region<input value={monitoringAppForm.region} onChange={(e) => setMonitoringAppForm((curr) => ({ ...curr, region: e.target.value }))} /></label>
+                          <label>Technology<input value={monitoringAppForm.technology} onChange={(e) => setMonitoringAppForm((curr) => ({ ...curr, technology: e.target.value }))} /></label>
+                        </div>
+                        <label>Metrics Endpoint<input placeholder="http://api-gateway:8000/metrics" value={monitoringAppForm.metrics_endpoint} onChange={(e) => setMonitoringAppForm((curr) => ({ ...curr, metrics_endpoint: e.target.value }))} /></label>
+                        <label>Labels (comma-separated key=value)<input value={monitoringAppForm.labels_text} onChange={(e) => setMonitoringAppForm((curr) => ({ ...curr, labels_text: e.target.value }))} /></label>
+                        <button className="button-primary" type="submit" disabled={monitoringAppSubmit.loading}>{monitoringAppSubmit.loading ? "Submitting..." : "Register Application"}</button>
+                      </form>
+                      {monitoringAppSubmit.error ? <p className="error">{monitoringAppSubmit.error}</p> : null}
+                      {monitoringAppSubmit.success ? <p className="subtitle">{monitoringAppSubmit.success}</p> : null}
+                    </article>
+
+                    <article className="panel">
+                      <h3>Applications</h3>
+                      {monitoringApps.error ? <p className="error">{monitoringApps.error}</p> : null}
                       <div className="table-wrap">
                         <table>
-                          <thead><tr><th>Project</th><th>Owner</th><th>Environment</th><th>Updated</th><th>Action</th></tr></thead>
+                          <thead>
+                            <tr><th>Name</th><th>Tenant</th><th>Namespace</th><th>Environment</th><th>Technology</th><th>Status</th><th>Metrics Endpoint</th><th>Action</th></tr>
+                          </thead>
                           <tbody>
-                            {projectOnboardingRows.slice(0, 100).map((row, index) => (
-                              <tr key={`saved-project-row-${index}`}>
-                                <td>{row.project_name || "-"}</td>
-                                <td>{row.owner_team || "-"}</td>
+                            {monitoringApps.rows.map((row, index) => (
+                              <tr key={`monitoring-app-${row.id || index}`}>
+                                <td>{row.name || "-"}</td>
+                                <td>{row.tenant_id || "default"}</td>
+                                <td>{row.namespace || "-"}</td>
                                 <td>{row.environment || "-"}</td>
-                                <td>{row.updated_at || row.created_at || "-"}</td>
-                                <td>
-                                  <div style={{ display: "flex", gap: 8 }}>
-                                    <button
-                                      type="button"
-                                      className="button-secondary"
-                                      onClick={() => {
-                                        setOnboardingProjectMode("existing");
-                                        applyProjectOnboardingRow(row);
-                                        setAdminWorkspace("project");
-                                      }}
-                                    >
-                                      Modify
-                                    </button>
-                                    <button type="button" className="button-secondary" onClick={() => deleteProjectOnboarding(row.project_name)}>
-                                      Delete
-                                    </button>
-                                  </div>
-                                </td>
+                                <td>{row.technology || "-"}</td>
+                                <td><span className={`pill ${String(row.status || "").includes("failed") ? "status-failed" : "status-closed"}`}>{row.status || "-"}</span></td>
+                                <td>{row.metrics_endpoint || "-"}</td>
+                                <td><button type="button" className="button-secondary" onClick={() => setSelectedMonitoringAppId(String(row.id || ""))}>Inspect</button></td>
                               </tr>
                             ))}
-                            {!projectOnboardingRows.length ? <tr><td colSpan={5}>No saved projects available.</td></tr> : null}
+                            {!monitoringApps.rows.length ? <tr><td colSpan={8}>No monitoring applications registered yet.</td></tr> : null}
+                          </tbody>
+                        </table>
+                      </div>
+                    </article>
+
+                    <article className="panel">
+                      <div className="panel-head">
+                        <h3>Selected Application Timeline</h3>
+                        <p className="subtitle">{selectedMonitoringAppId || "Select an application to inspect stage history, validations, and dashboards."}</p>
+                      </div>
+                      {monitoringAppDetails.error ? <p className="error">{monitoringAppDetails.error}</p> : null}
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr><th>Event</th><th>Agent</th><th>Decision</th><th>Status</th><th>Execution (ms)</th><th>Timestamp</th></tr>
+                          </thead>
+                          <tbody>
+                            {monitoringAppDetails.history.map((row, index) => (
+                              <tr key={`monitoring-history-${row.id || index}`}>
+                                <td>{row.event_type || "-"}</td>
+                                <td>{row.agent || "-"}</td>
+                                <td>{row.decision || "-"}</td>
+                                <td>{row.status || "-"}</td>
+                                <td>{asDisplayValue(row.execution_time_ms)}</td>
+                                <td>{row.created_at || "-"}</td>
+                              </tr>
+                            ))}
+                            {!monitoringAppDetails.history.length ? <tr><td colSpan={6}>No stage history available yet.</td></tr> : null}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr><th>Target Up</th><th>Metrics</th><th>Alerts Loaded</th><th>Recording Rules</th><th>Service Discovery</th><th>Timestamp</th></tr>
+                          </thead>
+                          <tbody>
+                            {monitoringAppDetails.validations.map((row, index) => (
+                              <tr key={`monitoring-validation-${row.id || index}`}>
+                                <td>{String(Boolean(row.target_up))}</td>
+                                <td>{String(Boolean(row.metrics_available))}</td>
+                                <td>{String(Boolean(row.alerts_loaded))}</td>
+                                <td>{String(Boolean(row.recording_rules_loaded))}</td>
+                                <td>{String(Boolean(row.service_discovery_ok))}</td>
+                                <td>{row.created_at || "-"}</td>
+                              </tr>
+                            ))}
+                            {!monitoringAppDetails.validations.length ? <tr><td colSpan={6}>No validation records available yet.</td></tr> : null}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr><th>Dashboard UID</th><th>Title</th><th>URL</th><th>Updated</th></tr>
+                          </thead>
+                          <tbody>
+                            {monitoringAppDetails.dashboards.map((row, index) => (
+                              <tr key={`monitoring-dashboard-${row.id || index}`}>
+                                <td>{row.dashboard_uid || "-"}</td>
+                                <td>{row.title || "-"}</td>
+                                <td>{row.url || "-"}</td>
+                                <td>{row.updated_at || "-"}</td>
+                              </tr>
+                            ))}
+                            {!monitoringAppDetails.dashboards.length ? <tr><td colSpan={4}>No dashboards generated yet.</td></tr> : null}
                           </tbody>
                         </table>
                       </div>
@@ -5115,10 +6522,10 @@ export default function App() {
                 ) : null}
 
                 {adminWorkspace === "alerts" ? (
-                  <div className="grid single-col">
+                  <div className="grid single-col admin-flow-section admin-flow-knowledge">
                     <article className="panel">
-                      <h3>Alerts Onboarding</h3>
-                      <p className="subtitle">Create onboarding knowledge docs for alert types and runbook guidance.</p>
+                      <h3>Alert Knowledge Onboarding</h3>
+                      <p className="subtitle">Add monitoring/troubleshooting knowledge as part of the same onboarding flow.</p>
                       <form className="form" onSubmit={submitAlertOnboarding}>
                         <div className="filter-grid">
                           <label>Kind
@@ -5301,7 +6708,7 @@ export default function App() {
                           <td>{row.risk_tier || "-"}</td>
                           <td>{row.execution_mode || "-"}</td>
                           <td>{row.transport_provider || "-"}</td>
-                          <td>{row.status || "-"}</td>
+                          <td><span className={`pill ${statusPillClass(row.status)}`}>{row.status || "-"}</span></td>
                           <td>
                             <button type="button" className="button-secondary" onClick={() => openAlertDetailsFromIncident(row)}>
                               Open
@@ -5328,43 +6735,7 @@ export default function App() {
                   <h2>Human Approval & Alerts</h2>
                   <p>Pending approvals, recent alerts, and quick docs decision workspace.</p>
                 </div>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Incident</th>
-                        <th>Title</th>
-                        <th>Application</th>
-                        <th>Service</th>
-                        <th>Severity</th>
-                        <th>Status</th>
-                        <th>Action</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {monitorScopedAlerts.slice(0, 40).map((row, index) => (
-                        <tr key={row.alert_id || row.id || index}>
-                          <td>{row.alert_id || row.id || row.incident_id || "-"}</td>
-                          <td>{row.name || row.alert_name || row.description || "-"}</td>
-                          <td>{row.application || row.project_name || row.project || row.service || "-"}</td>
-                          <td>{row.service || "-"}</td>
-                          <td>{String(row.severity || "").toUpperCase() || "-"}</td>
-                          <td>{row.status || row.state || "open"}</td>
-                          <td>
-                            <button type="button" className="button-secondary" onClick={() => openAlertDetails(row)}>
-                              Open
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                      {!monitorScopedAlerts.length ? (
-                        <tr>
-                          <td colSpan={7}>No recent alerts available for {applicationToMonitor}. Run a sample flow from Incident Summary.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
+                <p className="subtitle">Unified approval queue: use the single table below to Open, Approve, or Reject incidents.</p>
 
                 <div className="search-row sticky-controls">
                   <label>
@@ -5462,7 +6833,7 @@ export default function App() {
                 {approvalIncidentContext.error ? <p className="error">{approvalIncidentContext.error}</p> : null}
 
                 <p className="subtitle">Latest workflow incident: {latestIncidentId || "not available"}</p>
-                <div className="table-wrap">
+                <div className="table-wrap" ref={approvalQueueRef}>
                   <table>
                     <thead>
                       <tr>
@@ -5481,10 +6852,12 @@ export default function App() {
                         const incidentId = approvalIncidentId(row);
                         const recommendationId = approvalRecommendationId(row);
                         const selected = incidentId && incidentId === selectedApprovalIncidentId;
-                        const canQuickApprove = looksLikeUuid(incidentId) && looksLikeUuid(recommendationId);
+                        const rowStatus = normalizeApprovalStatus(row?.status);
+                        const rowResolved = isApprovalResolvedStatus(rowStatus);
+                        const canQuickApprove = !rowResolved && looksLikeUuid(incidentId);
                         const quickApproveBusy = approvalState.loading && selected && approvalForm.action === "approve";
                         const quickRejectBusy = approvalState.loading && selected && approvalForm.action === "reject";
-                        const rejectExpanded = inlineRejectState.incidentId === incidentId;
+                        const rejectExpanded = !rowResolved && inlineRejectState.incidentId === incidentId;
                         return (
                         <tr key={incidentId || index} className={selected ? "row-selected" : ""}>
                           <td>
@@ -5497,31 +6870,39 @@ export default function App() {
                           <td>{row.service || "-"}</td>
                           <td>{row.severity || row.risk_tier || "-"}</td>
                           <td>{row.execution_mode || "-"}</td>
-                          <td>{row.status || "pending"}</td>
+                          <td><span className={`pill ${statusPillClass(rowStatus)}`}>{rowStatus || "pending"}</span></td>
                           <td>
                             <button className="button-secondary" type="button" onClick={() => openAlertDetailsFromIncident(row)}>
                               Open
                             </button>
-                            <button
-                              className="button-primary"
-                              type="button"
-                              onClick={() => approveIncidentRow(row)}
-                              disabled={!canQuickApprove || approvalState.loading}
-                              title={canQuickApprove ? "Approve this incident directly" : "Recommendation ID unavailable. Use Sync From Approval API first."}
-                              style={{ marginLeft: 8 }}
-                            >
-                              {quickApproveBusy ? "Approving..." : "Approve"}
-                            </button>
-                            <button
-                              className="button-secondary"
-                              type="button"
-                              onClick={() => setInlineRejectState((current) => current.incidentId === incidentId ? { incidentId: "", comment: "" } : { incidentId, comment: "" })}
-                              disabled={!canQuickApprove || approvalState.loading}
-                              title={canQuickApprove ? "Reject this incident with a comment" : "Recommendation ID unavailable. Use Sync From Approval API first."}
-                              style={{ marginLeft: 8 }}
-                            >
-                              {rejectExpanded ? "Cancel Reject" : "Reject"}
-                            </button>
+                            {!rowResolved ? (
+                              <>
+                                <button
+                                  className="button-primary"
+                                  type="button"
+                                  onClick={() => approveIncidentRow(row)}
+                                  disabled={!canQuickApprove || approvalState.loading}
+                                  title={canQuickApprove ? "Approve this incident directly" : "Recommendation ID unavailable. Use Sync From Approval API first."}
+                                  style={{ marginLeft: 8 }}
+                                >
+                                  {quickApproveBusy ? "Approving..." : "Approve"}
+                                </button>
+                                <button
+                                  className="button-secondary"
+                                  type="button"
+                                  onClick={() => setInlineRejectState((current) => current.incidentId === incidentId ? { incidentId: "", comment: "" } : { incidentId, comment: "" })}
+                                  disabled={!canQuickApprove || approvalState.loading}
+                                  title={canQuickApprove ? "Reject this incident with a comment" : "Recommendation ID unavailable. Use Sync From Approval API first."}
+                                  style={{ marginLeft: 8 }}
+                                >
+                                  {rejectExpanded ? "Cancel Reject" : "Reject"}
+                                </button>
+                              </>
+                            ) : (
+                              <span className={`pill ${statusPillClass(rowStatus)}`} style={{ marginLeft: 8 }}>
+                                {rowStatus}
+                              </span>
+                            )}
                             {rejectExpanded ? (
                               <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
                                 <textarea
@@ -5979,7 +7360,7 @@ export default function App() {
                           <td>{row.incident_id || "-"}</td>
                           <td>{row.service || "-"}</td>
                           <td>{row.severity || "-"}</td>
-                          <td>{row.status || "closed"}</td>
+                          <td><span className={`pill ${statusPillClass(row.status || "closed")}`}>{row.status || "closed"}</span></td>
                           <td>{row.closed_at || row.updated_at || "-"}</td>
                         </tr>
                       ))}

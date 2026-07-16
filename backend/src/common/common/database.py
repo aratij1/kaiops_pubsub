@@ -127,6 +127,143 @@ class OnboardingStateRecord(Base, TimestampMixin):
     last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class ApplicationRecord(Base, TimestampMixin):
+    __tablename__ = "applications"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    owner_team: Mapped[str] = mapped_column(String(255), index=True)
+    owner_email: Mapped[str | None] = mapped_column(String(255), index=True)
+    environment: Mapped[str] = mapped_column(String(64), index=True)
+    namespace: Mapped[str] = mapped_column(String(128), index=True)
+    region: Mapped[str] = mapped_column(String(128), index=True)
+    technology: Mapped[str] = mapped_column(String(128), index=True)
+    monitoring_platform: Mapped[str] = mapped_column(String(64), index=True, default="prometheus")
+    metrics_endpoint: Mapped[str] = mapped_column(String(512))
+    status: Mapped[str] = mapped_column(String(64), index=True, default="registered")
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class ApplicationEnvironmentRecord(Base, TimestampMixin):
+    __tablename__ = "application_environments"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    environment: Mapped[str] = mapped_column(String(64), index=True)
+    namespace: Mapped[str] = mapped_column(String(128), index=True)
+    region: Mapped[str] = mapped_column(String(128), index=True)
+    cluster: Mapped[str | None] = mapped_column(String(128), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class ApplicationLabelRecord(Base, TimestampMixin):
+    __tablename__ = "application_labels"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    label_key: Mapped[str] = mapped_column(String(255), index=True)
+    label_value: Mapped[str] = mapped_column(String(255), index=True)
+
+
+class MonitoringProfileRecord(Base, TimestampMixin):
+    __tablename__ = "monitoring_profiles"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    platform: Mapped[str] = mapped_column(String(64), index=True)
+    exporter: Mapped[str | None] = mapped_column(String(128), index=True)
+    technology: Mapped[str | None] = mapped_column(String(128), index=True)
+    metrics_available: Mapped[bool] = mapped_column(Boolean, default=False)
+    governance_status: Mapped[str | None] = mapped_column(String(64), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class PrometheusConfigRecord(Base, TimestampMixin):
+    __tablename__ = "prometheus_configs"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    config_type: Mapped[str] = mapped_column(String(64), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    file_path: Mapped[str] = mapped_column(String(512))
+    content: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class AlertRuleRecord(Base, TimestampMixin):
+    __tablename__ = "alert_rules"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    expression: Mapped[str] = mapped_column(Text)
+    duration: Mapped[str] = mapped_column(String(64), default="5m")
+    severity: Mapped[str] = mapped_column(String(32), index=True, default="warning")
+    labels: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    annotations: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class RecordingRuleRecord(Base, TimestampMixin):
+    __tablename__ = "recording_rules"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    expression: Mapped[str] = mapped_column(Text)
+    labels: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class GrafanaDashboardRecord(Base, TimestampMixin):
+    __tablename__ = "grafana_dashboards"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    dashboard_uid: Mapped[str] = mapped_column(String(255), index=True)
+    title: Mapped[str] = mapped_column(String(255), index=True)
+    url: Mapped[str | None] = mapped_column(String(512))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class OnboardingHistoryRecord(Base, TimestampMixin):
+    __tablename__ = "onboarding_history"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    event_type: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    actor: Mapped[str] = mapped_column(String(255), index=True)
+    agent: Mapped[str] = mapped_column(String(255), index=True)
+    decision: Mapped[str] = mapped_column(String(128), index=True)
+    execution_time_ms: Mapped[float] = mapped_column(default=0.0)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class ValidationHistoryRecord(Base, TimestampMixin):
+    __tablename__ = "validation_history"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    application_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    target_up: Mapped[bool] = mapped_column(Boolean, default=False)
+    metrics_available: Mapped[bool] = mapped_column(Boolean, default=False)
+    alerts_loaded: Mapped[bool] = mapped_column(Boolean, default=False)
+    recording_rules_loaded: Mapped[bool] = mapped_column(Boolean, default=False)
+    service_discovery_ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    dashboard_ready: Mapped[bool] = mapped_column(Boolean, default=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 class PendingWorkflowRecord(Base, TimestampMixin):
     __tablename__ = "pending_workflows"
 
@@ -260,6 +397,125 @@ class UserSessionRecord(Base, TimestampMixin):
     ip_address: Mapped[str | None] = mapped_column(String(64))
     device: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+
+
+class MonitoringIntegrationRecord(Base, TimestampMixin):
+    __tablename__ = "monitoring_integrations"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    project_name: Mapped[str] = mapped_column(String(255), index=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="draft")
+    active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    auth_type: Mapped[str] = mapped_column(String(64), default="api_key", index=True)
+    endpoint_url: Mapped[str | None] = mapped_column(String(512), index=True)
+    webhook_path: Mapped[str] = mapped_column(String(255), index=True)
+    deployment_mode: Mapped[str] = mapped_column(String(64), default="existing_monitoring")
+    config_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    validation_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class MonitoringCredentialRecord(Base, TimestampMixin):
+    __tablename__ = "monitoring_credentials"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    integration_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    credential_type: Mapped[str] = mapped_column(String(64), index=True)
+    secret_ref: Mapped[str] = mapped_column(String(255), index=True)
+    encrypted_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    redacted_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class MonitoringWebhookEndpointRecord(Base, TimestampMixin):
+    __tablename__ = "monitoring_webhook_endpoints"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    integration_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    webhook_path: Mapped[str] = mapped_column(String(255), index=True)
+    token_hash: Mapped[str | None] = mapped_column(String(255))
+    hmac_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    m_tls_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    metadata_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class MonitoringAlertMappingRecord(Base, TimestampMixin):
+    __tablename__ = "monitoring_alert_mappings"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    integration_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    provider_field: Mapped[str] = mapped_column(String(128), index=True)
+    kaiops_field: Mapped[str] = mapped_column(String(128), index=True)
+    transform: Mapped[str | None] = mapped_column(String(128))
+    required: Mapped[bool] = mapped_column(Boolean, default=False)
+    mapping_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class MonitoringConnectionHealthRecord(Base, TimestampMixin):
+    __tablename__ = "monitoring_connection_health"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    integration_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="unknown")
+    connectivity_ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    authentication_ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    webhook_ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_received_alert_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_successful_test_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    rate_limit_remaining: Mapped[int | None] = mapped_column(Integer)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class MonitoringReceivedAlertRecord(Base, TimestampMixin):
+    __tablename__ = "monitoring_received_alerts"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    integration_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    provider_alert_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    dedupe_key: Mapped[str | None] = mapped_column(String(255), index=True)
+    signature_valid: Mapped[bool] = mapped_column(Boolean, default=True)
+    auth_valid: Mapped[bool] = mapped_column(Boolean, default=True)
+    status: Mapped[str] = mapped_column(String(32), default="received", index=True)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class MonitoringNormalizedAlertRecord(Base, TimestampMixin):
+    __tablename__ = "monitoring_normalized_alerts"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    received_alert_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    integration_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    application: Mapped[str | None] = mapped_column(String(255), index=True)
+    environment: Mapped[str | None] = mapped_column(String(64), index=True)
+    severity: Mapped[str | None] = mapped_column(String(32), index=True)
+    alert_name: Mapped[str] = mapped_column(String(255), index=True)
+    resource: Mapped[str | None] = mapped_column(String(255), index=True)
+    labels: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    annotations: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    normalized_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class MonitoringConnectionAuditRecord(Base):
+    __tablename__ = "monitoring_connection_audit"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    integration_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    actor: Mapped[str] = mapped_column(String(255), index=True, default="system")
+    action: Mapped[str] = mapped_column(String(128), index=True)
+    provider: Mapped[str | None] = mapped_column(String(64), index=True)
+    outcome: Mapped[str] = mapped_column(String(32), index=True, default="success")
+    message: Mapped[str | None] = mapped_column(String(512))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
 def create_engine(settings: Settings) -> AsyncEngine:

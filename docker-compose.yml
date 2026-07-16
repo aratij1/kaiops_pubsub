@@ -19,9 +19,18 @@ x-service-env: &service-env
   MODEL_ROUTER_URL: http://model-router:8000
   MONITORING_ADAPTER_URL: http://monitoring-adapter:8000
   API_GATEWAY_URL: http://api-gateway:8000
+  APPLICATION_ONBOARDING_URL: http://application-onboarding:8000
+  PROMETHEUS_URL: http://prometheus:9090
+  GRAFANA_URL: http://grafana:3000
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
   OPENAI_GPT5_MODEL: ${OPENAI_GPT5_MODEL:-gpt-5}
   OPENAI_GPT4O_MODEL: ${OPENAI_GPT4O_MODEL:-gpt-4o}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+  GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}
+  GROQ_API_KEY: ${GROQ_API_KEY:-}
+  GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+  GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
   LOCAL_LLM_ENABLED: ${LOCAL_LLM_ENABLED:-false}
   LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-120}
   GATEWAY_REQUEST_TIMEOUT_SECONDS: ${GATEWAY_REQUEST_TIMEOUT_SECONDS:-180}
@@ -182,6 +191,7 @@ services:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./observability/alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
       - ./backend/rag/changes/prometheus_rules:/etc/prometheus/generated-rules:ro
+      - ./backend/rag/changes/prometheus_targets:/etc/prometheus/generated-targets:ro
       - prometheus-data:/prometheus
     depends_on:
       api-gateway: { condition: service_healthy }
@@ -207,6 +217,96 @@ services:
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
 
+  application-onboarding:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: application-onboarding }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/application-onboarding
+    ports: ["8011:8000"]
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  discovery-service:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: discovery-service }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/discovery-service
+    ports: ["8012:8000"]
+    depends_on:
+      application-onboarding: { condition: service_started }
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  metrics-validation-agent:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: metrics-validation-agent }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/metrics-validation-agent
+    ports: ["8013:8000"]
+    depends_on:
+      discovery-service: { condition: service_started }
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  rule-generation-agent:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: rule-generation-agent }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/rule-generation-agent
+    ports: ["8014:8000"]
+    depends_on:
+      metrics-validation-agent: { condition: service_started }
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  prometheus-config-service:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: prometheus-config-service }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/prometheus-config-service
+    ports: ["8015:8000"]
+    volumes:
+      - ./backend/rag:/app/rag
+    depends_on:
+      rule-generation-agent: { condition: service_started }
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+      prometheus: { condition: service_started }
+
+  validation-agent:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: validation-agent }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/validation-agent
+    ports: ["8016:8000"]
+    depends_on:
+      prometheus-config-service: { condition: service_started }
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+      prometheus: { condition: service_started }
+
+  dashboard-generator:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: dashboard-generator }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/dashboard-generator
+    ports: ["8017:8000"]
+    depends_on:
+      validation-agent: { condition: service_started }
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  audit-service:
+    build: *service-build
+    environment: { <<: *service-env, SERVICE_NAME: audit-service }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/audit-service
+    ports: ["8018:8000"]
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
   api-gateway:
     build: *service-build
     environment: { <<: *service-env, SERVICE_NAME: api-gateway }
@@ -225,6 +325,7 @@ services:
       start_period: 10s
     depends_on:
       monitoring-adapter: { condition: service_started }
+      application-onboarding: { condition: service_started }
       approval-service: { condition: service_started }
       rabbitmq: { condition: service_healthy }
 
@@ -322,6 +423,7 @@ services:
       context: ./frontend/react
       dockerfile: Dockerfile
     ports: ["8501:80"]
+    restart: unless-stopped
     depends_on:
       api-gateway: { condition: service_healthy }
       approval-service: { condition: service_started }

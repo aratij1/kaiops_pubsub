@@ -33,31 +33,46 @@ from common.models import (
 from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import EVENT_CONTRACTS_EMITTED, EVENT_PUBLISH_LATENCY
-from common.topics import RAW_ALERTS
+from common.topics import (
+    ALERT_CONTEXT_REQUESTED,
+    ALERT_NORMALIZED,
+    ALERT_RCA_REQUESTED,
+    ALERT_RECEIVED,
+    APPROVAL_REQUESTED,
+    AUTOMATION_EXECUTED,
+    RAW_ALERTS,
+    RESOLUTION_GENERATED,
+)
 from common.prompts import PROMPT_SUMMARIZE_RCA
 import httpx
-from fastapi import Body, Header, HTTPException
+from fastapi import Body, Header, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
 from monitoring_adapter.state import (
+    ALERT_SEVERITY_OVERRIDES_FILE,
     FLOW_CATALOG_FILE,
     ONBOARDING_CONNECTIVITY_FILE,
     SCENARIOS,
     SCENARIOS_TEXT_FILE,
+    alert_severity_overrides_path,
     default_flow_catalog_entries,
     ensure_flow_catalog_exists,
     flow_catalog_path,
+    load_alert_severity_overrides,
     list_scenarios,
     load_onboarding_connectivity,
     load_scenarios_from_text_file,
     merged_scenarios,
     onboarding_connectivity_path,
     rag_root_path,
+    remove_alert_severity_override,
     resolve_flow_id,
+    save_alert_severity_overrides,
     save_onboarding_connectivity,
     scenario_source_rows,
     scenarios_text_path,
     severity_from_string,
     slugify,
+    upsert_alert_severity_override,
 )
 from monitoring_adapter.onboarding_pipelines import (
     ExistingRulePipelineRequest,
@@ -67,6 +82,16 @@ from monitoring_adapter.onboarding_pipelines import (
     find_pipeline_rows,
     run_existing_rule_pipeline,
     run_new_rule_pipeline,
+)
+from monitoring_adapter.existing_monitoring import (
+    apply_field_mapping,
+    build_webhook_path,
+    default_field_mappings,
+    get_provider_adapter,
+    hash_secrets,
+    mask_secrets,
+    normalize_provider_name,
+    verify_hmac_signature,
 )
 
 ALERT_BODY = Body(...)
@@ -2305,9 +2330,26 @@ def _record_closed_incident(
 def _build_alert_from_payload(payload: dict[str, Any], trace_id: str | None = None) -> Alert:
     labels = payload.get("labels", {}) if isinstance(payload.get("labels"), dict) else {}
     annotations = payload.get("annotations", {}) if isinstance(payload.get("annotations"), dict) else {}
-    severity_value = severity_from_string(
-        str(payload.get("severity", labels.get("severity", "warning")))
-    )
+    severity_value = severity_from_string(str(payload.get("severity", labels.get("severity", "warning"))))
+
+    alert_name = str(payload.get("name", payload.get("alertname", labels.get("alertname", "unknown-alert")))).strip().lower()
+    service_name = str(payload.get("service", labels.get("service", labels.get("job", "")))).strip().lower()
+    environment_name = str(payload.get("environment", labels.get("env", labels.get("environment", "")))).strip().lower()
+    for rule in load_alert_severity_overrides():
+        if not isinstance(rule, dict):
+            continue
+        rule_name = str(rule.get("name") or "").strip().lower()
+        rule_service = str(rule.get("service") or "").strip().lower()
+        rule_environment = str(rule.get("environment") or "").strip().lower()
+        if not rule_name or rule_name != alert_name:
+            continue
+        if rule_service and rule_service != service_name:
+            continue
+        if rule_environment and rule_environment != environment_name:
+            continue
+        severity_value = severity_from_string(str(rule.get("severity") or severity_value))
+        break
+
     return Alert(
         source=payload.get("source", payload.get("generatorURL", "unknown")),
         name=payload.get("name", payload.get("alertname", labels.get("alertname", "unknown-alert"))),
@@ -2373,6 +2415,738 @@ def _build_raw_alert_event_payload(alert: Alert) -> dict[str, Any]:
         "alert": alert,
         "event_contract": event_contract,
     }
+
+
+def _normalize_slug(token: str) -> str:
+    return re.sub(r"[^a-z0-9_-]", "-", str(token or "").strip().lower())
+
+
+def _db_required() -> Any:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Database is required for monitoring integrations")
+    return session_factory
+
+
+def _merge_raw_and_labels(payload: dict[str, Any]) -> dict[str, Any]:
+    raw = payload.get("rawPayload") if isinstance(payload.get("rawPayload"), dict) else {}
+    labels = payload.get("labels") if isinstance(payload.get("labels"), dict) else {}
+    return {**raw, **labels}
+
+
+async def _publish_lifecycle_events(normalized: dict[str, Any], trace_id: str | None = None) -> None:
+    event_payload = {
+        "trace_id": str(trace_id or normalized.get("trace_id") or ""),
+        "provider": normalized.get("provider"),
+        "application": normalized.get("application"),
+        "environment": normalized.get("environment"),
+        "severity": normalized.get("severity"),
+        "alert_name": normalized.get("alertName"),
+        "resource": normalized.get("resource"),
+        "labels": normalized.get("labels", {}),
+        "annotations": normalized.get("annotations", {}),
+        "normalized": normalized,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    for topic in (
+        ALERT_RECEIVED,
+        ALERT_NORMALIZED,
+        ALERT_CONTEXT_REQUESTED,
+        ALERT_RCA_REQUESTED,
+        RESOLUTION_GENERATED,
+        APPROVAL_REQUESTED,
+        AUTOMATION_EXECUTED,
+    ):
+        started = perf_counter()
+        await app.state.producer.publish(topic, event_payload, key=str(normalized.get("application") or "unknown"))
+        EVENT_PUBLISH_LATENCY.labels(settings.service_name, topic, "monitoring-adapter").observe(
+            max(0.0, perf_counter() - started)
+        )
+        EVENT_CONTRACTS_EMITTED.labels(settings.service_name, topic, "monitoring-adapter", "v1").inc()
+
+
+async def _persist_monitoring_audit(
+    *,
+    tenant_id: str,
+    actor: str,
+    action: str,
+    provider: str | None,
+    outcome: str,
+    message: str,
+    payload: dict[str, Any],
+    integration_id: str | None = None,
+) -> None:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        return
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_monitoring_connection_audit(
+            audit_id=str(uuid.uuid4()),
+            integration_id=integration_id,
+            tenant_id=tenant_id,
+            actor=actor,
+            action=action,
+            provider=provider,
+            outcome=outcome,
+            message=message,
+            payload=payload,
+        )
+        await session.commit()
+
+
+async def _persist_received_and_normalized(
+    *,
+    tenant_id: str,
+    provider: str,
+    integration_id: str | None,
+    payload: dict[str, Any],
+    normalized: dict[str, Any],
+    signature_valid: bool,
+    auth_valid: bool,
+) -> tuple[str, str]:
+    session_factory = _db_required()
+    received_id = str(uuid.uuid4())
+    normalized_id = str(uuid.uuid4())
+    provider_alert_id = str(payload.get("id") or payload.get("alert_id") or payload.get("fingerprint") or "").strip() or None
+    dedupe_seed = f"{provider}:{provider_alert_id or normalized.get('alertName') or ''}:{normalized.get('resource') or ''}"
+    dedupe_key = uuid.uuid5(uuid.NAMESPACE_OID, dedupe_seed).hex
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_monitoring_received_alert(
+            received_alert_id=received_id,
+            integration_id=integration_id,
+            tenant_id=tenant_id,
+            provider=provider,
+            provider_alert_id=provider_alert_id,
+            dedupe_key=dedupe_key,
+            signature_valid=signature_valid,
+            auth_valid=auth_valid,
+            status="received",
+            raw_payload=payload,
+        )
+        await repo.save_monitoring_normalized_alert(
+            normalized_alert_id=normalized_id,
+            received_alert_id=received_id,
+            integration_id=integration_id,
+            tenant_id=tenant_id,
+            provider=provider,
+            application=str(normalized.get("application") or "unknown-app"),
+            environment=str(normalized.get("environment") or "prod"),
+            severity=str(normalized.get("severity") or "warning"),
+            alert_name=str(normalized.get("alertName") or "provider-alert"),
+            resource=str(normalized.get("resource") or "unknown"),
+            labels=normalized.get("labels", {}),
+            annotations=normalized.get("annotations", {}),
+            normalized_payload=normalized,
+        )
+        await session.commit()
+    return received_id, normalized_id
+
+
+def _integration_health_snapshot(
+    *,
+    provider: str,
+    validation: dict[str, Any],
+    test_ok: bool = True,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "provider": provider,
+        "validation": validation,
+        "detail": detail or {},
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return {
+        "status": "healthy" if test_ok and bool(validation.get("valid", False)) else "degraded",
+        "connectivity_ok": bool(validation.get("connectivity", False)),
+        "authentication_ok": bool(validation.get("authentication", False)),
+        "webhook_ok": bool(validation.get("alertmanager", False) or validation.get("api", False)),
+        "payload": payload,
+    }
+
+
+@app.get("/monitoring/providers")
+async def list_monitoring_providers() -> dict[str, Any]:
+    rows = [
+        {
+            "id": provider,
+            "name": provider.replace("_", " ").title(),
+            "category": "existing_monitoring",
+            "capabilities": ["connect", "validate", "discover", "webhook", "normalize"],
+        }
+        for provider in (
+            "prometheus",
+            "grafana",
+            "datadog",
+            "new_relic",
+            "dynatrace",
+            "azure_monitor",
+            "splunk",
+            "nagios",
+            "zabbix",
+            "elastic",
+        )
+    ]
+    return {"rows": rows, "count": len(rows)}
+
+
+@app.get("/monitoring/integrations")
+async def list_monitoring_integrations(tenant_id: str = "default") -> dict[str, Any]:
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        rows = await repo.list_monitoring_integrations(tenant_id=tenant_id)
+    return {"rows": rows, "count": len(rows)}
+
+
+@app.post("/monitoring/integrations")
+async def create_monitoring_integration(payload: dict[str, Any] = ALERT_BODY) -> dict[str, Any]:
+    session_factory = _db_required()
+    provider = normalize_provider_name(str(payload.get("provider") or ""))
+    integration_id = str(payload.get("id") or uuid.uuid4())
+    tenant_id = str(payload.get("tenant_id") or "default")
+    project_name = str(payload.get("project_name") or "untitled-project").strip() or "untitled-project"
+    auth_type = str(payload.get("auth_type") or "api_key").strip() or "api_key"
+    endpoint_url = str(payload.get("endpoint_url") or payload.get("server_url") or "").strip() or None
+    deployment_mode = str(payload.get("deployment_mode") or "existing_monitoring").strip() or "existing_monitoring"
+    config_payload = payload.get("config", {}) if isinstance(payload.get("config"), dict) else {}
+    credentials = payload.get("credentials", {}) if isinstance(payload.get("credentials"), dict) else {}
+    adapter = get_provider_adapter(provider)
+    validation = adapter.validate(config_payload, credentials)
+    webhook_path = str(payload.get("webhook_path") or build_webhook_path(provider)).strip()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_monitoring_integration(
+            integration_id=integration_id,
+            tenant_id=tenant_id,
+            project_name=project_name,
+            provider=provider,
+            status="validated" if validation.get("valid") else "draft",
+            active=bool(payload.get("active", False)),
+            auth_type=auth_type,
+            endpoint_url=endpoint_url,
+            webhook_path=webhook_path,
+            deployment_mode=deployment_mode,
+            config_payload=config_payload,
+            validation_payload=validation,
+        )
+        await repo.save_monitoring_credential(
+            credential_id=str(uuid.uuid4()),
+            integration_id=integration_id,
+            credential_type=auth_type,
+            secret_ref=str(payload.get("secret_ref") or f"secret://monitoring/{integration_id}"),
+            encrypted_payload=hash_secrets(credentials),
+            redacted_payload=mask_secrets(credentials),
+        )
+        await repo.save_monitoring_webhook_endpoint(
+            endpoint_id=str(uuid.uuid4()),
+            integration_id=integration_id,
+            provider=provider,
+            webhook_path=webhook_path,
+            token_hash=(hash_secrets({"token": str(payload.get("webhook_token") or "")}).get("token") or None),
+            hmac_enabled=bool(payload.get("hmac_enabled", False)),
+            m_tls_enabled=bool(payload.get("m_tls_enabled", False)),
+            active=True,
+            metadata_payload={"created_via": "monitoring-api"},
+        )
+        mappings_payload = payload.get("mappings") if isinstance(payload.get("mappings"), list) else default_field_mappings()
+        mappings_saved = await repo.replace_monitoring_alert_mappings(
+            integration_id=integration_id,
+            provider=provider,
+            mappings=mappings_payload,
+        )
+        health = _integration_health_snapshot(provider=provider, validation=validation)
+        await repo.save_monitoring_connection_health(
+            health_id=str(uuid.uuid4()),
+            integration_id=integration_id,
+            provider=provider,
+            status=health["status"],
+            connectivity_ok=health["connectivity_ok"],
+            authentication_ok=health["authentication_ok"],
+            webhook_ok=health["webhook_ok"],
+            last_received_alert_at=None,
+            last_successful_test_at=datetime.now(timezone.utc),
+            rate_limit_remaining=None,
+            payload=health["payload"],
+        )
+        await session.commit()
+
+    await _persist_monitoring_audit(
+        tenant_id=tenant_id,
+        actor="api",
+        action="integration.create",
+        provider=provider,
+        outcome="success",
+        message="Monitoring integration created",
+        payload={"integration_id": integration_id, "mappings_saved": mappings_saved},
+        integration_id=integration_id,
+    )
+
+    return {
+        "id": integration_id,
+        "tenant_id": tenant_id,
+        "provider": provider,
+        "project_name": project_name,
+        "webhook_path": webhook_path,
+        "status": "validated" if validation.get("valid") else "draft",
+        "validation": validation,
+    }
+
+
+@app.get("/monitoring/integrations/{integration_id}")
+async def get_monitoring_integration(integration_id: str) -> dict[str, Any]:
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        row = await repo.get_monitoring_integration(integration_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Monitoring integration not found")
+        mappings = await repo.list_monitoring_alert_mappings(integration_id)
+    row["mappings"] = mappings
+    return row
+
+
+@app.put("/monitoring/integrations/{integration_id}")
+async def update_monitoring_integration(integration_id: str, payload: dict[str, Any] = ALERT_BODY) -> dict[str, Any]:
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        existing = await repo.get_monitoring_integration(integration_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Monitoring integration not found")
+        provider = normalize_provider_name(str(payload.get("provider") or existing.get("provider") or ""))
+        adapter = get_provider_adapter(provider)
+        config_payload = payload.get("config_payload", existing.get("config_payload", {}))
+        if not isinstance(config_payload, dict):
+            config_payload = {}
+        credentials = payload.get("credentials", {}) if isinstance(payload.get("credentials"), dict) else {}
+        validation = adapter.validate(config_payload, credentials)
+        await repo.save_monitoring_integration(
+            integration_id=integration_id,
+            tenant_id=str(payload.get("tenant_id") or existing.get("tenant_id") or "default"),
+            project_name=str(payload.get("project_name") or existing.get("project_name") or "untitled-project"),
+            provider=provider,
+            status=str(payload.get("status") or existing.get("status") or "validated"),
+            active=bool(payload.get("active", existing.get("active", True))),
+            auth_type=str(payload.get("auth_type") or existing.get("auth_type") or "api_key"),
+            endpoint_url=str(payload.get("endpoint_url") or existing.get("endpoint_url") or "").strip() or None,
+            webhook_path=str(payload.get("webhook_path") or existing.get("webhook_path") or build_webhook_path(provider)).strip(),
+            deployment_mode=str(payload.get("deployment_mode") or existing.get("deployment_mode") or "existing_monitoring"),
+            config_payload=config_payload,
+            validation_payload=validation,
+        )
+        if isinstance(payload.get("mappings"), list):
+            await repo.replace_monitoring_alert_mappings(
+                integration_id=integration_id,
+                provider=provider,
+                mappings=payload.get("mappings", []),
+            )
+        await session.commit()
+
+    await _persist_monitoring_audit(
+        tenant_id=str(payload.get("tenant_id") or existing.get("tenant_id") or "default"),
+        actor="api",
+        action="integration.update",
+        provider=provider,
+        outcome="success",
+        message="Monitoring integration updated",
+        payload={"integration_id": integration_id},
+        integration_id=integration_id,
+    )
+    return {"id": integration_id, "provider": provider, "validation": validation, "status": "updated"}
+
+
+@app.delete("/monitoring/integrations/{integration_id}")
+async def delete_monitoring_integration(integration_id: str) -> dict[str, Any]:
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        deleted = await repo.delete_monitoring_integration(integration_id)
+        await session.commit()
+    return {"id": integration_id, "deleted": deleted > 0}
+
+
+@app.post("/monitoring/integrations/{integration_id}/validate")
+async def validate_monitoring_integration(integration_id: str, payload: dict[str, Any] = ALERT_BODY) -> dict[str, Any]:
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        row = await repo.get_monitoring_integration(integration_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Monitoring integration not found")
+        provider = normalize_provider_name(str(row.get("provider") or ""))
+        adapter = get_provider_adapter(provider)
+        config_payload = payload.get("config") if isinstance(payload.get("config"), dict) else row.get("config_payload", {})
+        credentials = payload.get("credentials") if isinstance(payload.get("credentials"), dict) else {}
+        validation = adapter.validate(config_payload, credentials)
+        health = _integration_health_snapshot(provider=provider, validation=validation)
+        await repo.save_monitoring_connection_health(
+            health_id=str(uuid.uuid4()),
+            integration_id=integration_id,
+            provider=provider,
+            status=health["status"],
+            connectivity_ok=health["connectivity_ok"],
+            authentication_ok=health["authentication_ok"],
+            webhook_ok=health["webhook_ok"],
+            last_received_alert_at=None,
+            last_successful_test_at=datetime.now(timezone.utc),
+            rate_limit_remaining=None,
+            payload=health["payload"],
+        )
+        await session.commit()
+    return {"id": integration_id, "provider": provider, "validation": validation, "health": health}
+
+
+@app.post("/monitoring/integrations/{integration_id}/discover")
+async def discover_monitoring_objects(integration_id: str, payload: dict[str, Any] = ALERT_BODY) -> dict[str, Any]:
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        row = await repo.get_monitoring_integration(integration_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Monitoring integration not found")
+    provider = normalize_provider_name(str(row.get("provider") or ""))
+    adapter = get_provider_adapter(provider)
+    config_payload = payload.get("config") if isinstance(payload.get("config"), dict) else row.get("config_payload", {})
+    credentials = payload.get("credentials") if isinstance(payload.get("credentials"), dict) else {}
+    discovered = adapter.discover_alerts(config_payload, credentials)
+    return {"id": integration_id, "provider": provider, "discovered": discovered}
+
+
+@app.post("/monitoring/integrations/{integration_id}/register-webhook")
+async def register_monitoring_webhook(integration_id: str, payload: dict[str, Any] = ALERT_BODY) -> dict[str, Any]:
+    session_factory = _db_required()
+    default_gateway_base = str(getattr(settings, "gateway_public_base_url", "") or "http://localhost:8080")
+    public_base_url = str(payload.get("public_base_url") or default_gateway_base).rstrip("/")
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        row = await repo.get_monitoring_integration(integration_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Monitoring integration not found")
+        provider = normalize_provider_name(str(row.get("provider") or ""))
+        adapter = get_provider_adapter(provider)
+        webhook_path = str(row.get("webhook_path") or build_webhook_path(provider))
+        webhook_url = f"{public_base_url}{webhook_path}"
+        registration = adapter.register_webhook(row.get("config_payload", {}), webhook_url)
+        await repo.save_monitoring_webhook_endpoint(
+            endpoint_id=str(uuid.uuid4()),
+            integration_id=integration_id,
+            provider=provider,
+            webhook_path=webhook_path,
+            token_hash=None,
+            hmac_enabled=bool(payload.get("hmac_enabled", False)),
+            m_tls_enabled=bool(payload.get("m_tls_enabled", False)),
+            active=True,
+            metadata_payload={"registration": registration},
+        )
+        await session.commit()
+    return {"id": integration_id, "provider": provider, "webhook_url": webhook_url, "registration": registration}
+
+
+@app.get("/monitoring/integrations/{integration_id}/mapping")
+async def get_monitoring_mapping(integration_id: str) -> dict[str, Any]:
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        integration = await repo.get_monitoring_integration(integration_id)
+        if integration is None:
+            raise HTTPException(status_code=404, detail="Monitoring integration not found")
+        rows = await repo.list_monitoring_alert_mappings(integration_id)
+    return {"id": integration_id, "provider": integration.get("provider"), "rows": rows, "count": len(rows)}
+
+
+@app.put("/monitoring/integrations/{integration_id}/mapping")
+async def put_monitoring_mapping(integration_id: str, payload: dict[str, Any] = ALERT_BODY) -> dict[str, Any]:
+    session_factory = _db_required()
+    mappings = payload.get("mappings") if isinstance(payload.get("mappings"), list) else []
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        integration = await repo.get_monitoring_integration(integration_id)
+        if integration is None:
+            raise HTTPException(status_code=404, detail="Monitoring integration not found")
+        count = await repo.replace_monitoring_alert_mappings(
+            integration_id=integration_id,
+            provider=str(integration.get("provider") or ""),
+            mappings=mappings,
+        )
+        await session.commit()
+    return {"id": integration_id, "saved": count}
+
+
+@app.post("/monitoring/integrations/{integration_id}/test-alert")
+async def test_monitoring_alert(integration_id: str, payload: dict[str, Any] = ALERT_BODY) -> dict[str, Any]:
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        integration = await repo.get_monitoring_integration(integration_id)
+        if integration is None:
+            raise HTTPException(status_code=404, detail="Monitoring integration not found")
+        mappings = await repo.list_monitoring_alert_mappings(integration_id)
+    provider = normalize_provider_name(str(integration.get("provider") or ""))
+    adapter = get_provider_adapter(provider)
+    sample_payload = payload.get("alert") if isinstance(payload.get("alert"), dict) else payload
+    normalized = adapter.normalize_alert(sample_payload if isinstance(sample_payload, dict) else {}, None)
+    normalized = apply_field_mapping(normalized, mappings)
+    raw_for_alert = _merge_raw_and_labels(normalized)
+    mapped_payload = {
+        "source": provider,
+        "name": str(normalized.get("alertName") or "provider-alert"),
+        "service": str(normalized.get("application") or "unknown-app"),
+        "environment": str(normalized.get("environment") or "prod"),
+        "severity": str(normalized.get("severity") or "warning"),
+        "description": str((normalized.get("annotations") or {}).get("summary") or normalized.get("alertName") or "provider-alert"),
+        "labels": normalized.get("labels", {}),
+        "annotations": normalized.get("annotations", {}),
+        "alertname": str(normalized.get("alertName") or "provider-alert"),
+        "raw": raw_for_alert,
+    }
+    alert = _build_alert_from_payload(mapped_payload)
+    await _publish_ingested_alert(alert)
+    await _publish_lifecycle_events(normalized)
+    await _persist_monitoring_audit(
+        tenant_id=str(integration.get("tenant_id") or "default"),
+        actor="api",
+        action="integration.test_alert",
+        provider=provider,
+        outcome="success",
+        message="Test alert processed",
+        payload={"integration_id": integration_id, "alert_id": str(alert.id)},
+        integration_id=integration_id,
+    )
+    return {"id": integration_id, "provider": provider, "alert_id": str(alert.id), "normalized": normalized}
+
+
+@app.post("/monitoring/integrations/{integration_id}/activate")
+async def activate_monitoring_integration(integration_id: str) -> dict[str, Any]:
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        row = await repo.get_monitoring_integration(integration_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Monitoring integration not found")
+        await repo.save_monitoring_integration(
+            integration_id=integration_id,
+            tenant_id=str(row.get("tenant_id") or "default"),
+            project_name=str(row.get("project_name") or "untitled-project"),
+            provider=str(row.get("provider") or "prometheus"),
+            status="active",
+            active=True,
+            auth_type=str(row.get("auth_type") or "api_key"),
+            endpoint_url=row.get("endpoint_url"),
+            webhook_path=str(row.get("webhook_path") or build_webhook_path(str(row.get("provider") or "prometheus"))),
+            deployment_mode=str(row.get("deployment_mode") or "existing_monitoring"),
+            config_payload=row.get("config_payload") or {},
+            validation_payload=row.get("validation_payload") or {},
+        )
+        await session.commit()
+    return {"id": integration_id, "active": True, "status": "active"}
+
+
+@app.post("/monitoring/integrations/{integration_id}/deactivate")
+async def deactivate_monitoring_integration(integration_id: str) -> dict[str, Any]:
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        row = await repo.get_monitoring_integration(integration_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Monitoring integration not found")
+        await repo.save_monitoring_integration(
+            integration_id=integration_id,
+            tenant_id=str(row.get("tenant_id") or "default"),
+            project_name=str(row.get("project_name") or "untitled-project"),
+            provider=str(row.get("provider") or "prometheus"),
+            status="inactive",
+            active=False,
+            auth_type=str(row.get("auth_type") or "api_key"),
+            endpoint_url=row.get("endpoint_url"),
+            webhook_path=str(row.get("webhook_path") or build_webhook_path(str(row.get("provider") or "prometheus"))),
+            deployment_mode=str(row.get("deployment_mode") or "existing_monitoring"),
+            config_payload=row.get("config_payload") or {},
+            validation_payload=row.get("validation_payload") or {},
+        )
+        await session.commit()
+    return {"id": integration_id, "active": False, "status": "inactive"}
+
+
+@app.get("/monitoring/health")
+async def get_monitoring_health(tenant_id: str = "default") -> dict[str, Any]:
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        rows = await repo.list_monitoring_connection_health(tenant_id=tenant_id)
+    return {"rows": rows, "count": len(rows)}
+
+
+@app.get("/monitoring/audit")
+async def get_monitoring_audit(tenant_id: str = "default", limit: int = 100) -> dict[str, Any]:
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        rows = await repo.list_monitoring_connection_audit(tenant_id=tenant_id, limit=limit)
+    return {"rows": rows, "count": len(rows)}
+
+
+async def _ingest_provider_alert(
+    *,
+    provider_hint: str,
+    payload: dict[str, Any],
+    x_trace_id: str | None,
+    x_signature: str | None,
+    x_webhook_token: str | None,
+) -> dict[str, Any]:
+    provider = normalize_provider_name(provider_hint)
+    tenant_id = str(payload.get("tenant_id") or "default")
+    integration_id = str(payload.get("integration_id") or "").strip() or None
+
+    session_factory = _db_required()
+    mappings: list[dict[str, Any]] = []
+    expected_token = ""
+    hmac_secret = ""
+    integration: dict[str, Any] | None = None
+    if integration_id:
+        async with session_factory() as session:
+            repo = IncidentRepository(session)
+            integration = await repo.get_monitoring_integration(integration_id)
+            if integration is not None:
+                mappings = await repo.list_monitoring_alert_mappings(integration_id)
+                config_payload = integration.get("config_payload") if isinstance(integration.get("config_payload"), dict) else {}
+                expected_token = str(config_payload.get("webhook_token") or "")
+                hmac_secret = str(config_payload.get("hmac_secret") or "")
+
+    auth_valid = True if not expected_token else (str(x_webhook_token or "") == expected_token)
+    body_as_string = json.dumps(payload, sort_keys=True)
+    signature_valid = verify_hmac_signature(hmac_secret, body_as_string, x_signature)
+
+    adapter = get_provider_adapter(provider)
+    normalized = adapter.normalize_alert(payload, None)
+    normalized = apply_field_mapping(normalized, mappings)
+
+    mapped_payload = {
+        "source": provider,
+        "name": str(normalized.get("alertName") or f"{provider}-alert"),
+        "service": str(normalized.get("application") or "unknown-app"),
+        "environment": str(normalized.get("environment") or "prod"),
+        "severity": str(normalized.get("severity") or "warning"),
+        "description": str((normalized.get("annotations") or {}).get("summary") or normalized.get("alertName") or f"{provider}-alert"),
+        "labels": normalized.get("labels", {}),
+        "annotations": normalized.get("annotations", {}),
+    }
+    alert = _build_alert_from_payload(mapped_payload, trace_id=x_trace_id)
+    await _publish_ingested_alert(alert)
+    received_id, normalized_id = await _persist_received_and_normalized(
+        tenant_id=tenant_id,
+        provider=provider,
+        integration_id=integration_id,
+        payload=payload,
+        normalized=normalized,
+        signature_valid=signature_valid,
+        auth_valid=auth_valid,
+    )
+    await _publish_lifecycle_events(normalized, trace_id=x_trace_id)
+    await _persist_monitoring_audit(
+        tenant_id=tenant_id,
+        actor="landing-pad",
+        action="webhook.ingest",
+        provider=provider,
+        outcome="success" if signature_valid and auth_valid else "degraded",
+        message="Provider webhook ingested",
+        payload={
+            "received_alert_id": received_id,
+            "normalized_alert_id": normalized_id,
+            "alert_id": str(alert.id),
+            "signature_valid": signature_valid,
+            "auth_valid": auth_valid,
+        },
+        integration_id=integration_id,
+    )
+    return {
+        "provider": provider,
+        "integration_id": integration_id,
+        "alert_id": str(alert.id),
+        "received_alert_id": received_id,
+        "normalized_alert_id": normalized_id,
+        "signature_valid": signature_valid,
+        "auth_valid": auth_valid,
+        "status": "accepted",
+    }
+
+
+@app.post("/api/v1/alerts/prometheus")
+async def ingest_prometheus_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+    return await _ingest_provider_alert(
+        provider_hint="prometheus",
+        payload=payload,
+        x_trace_id=x_trace_id,
+        x_signature=x_signature,
+        x_webhook_token=x_webhook_token,
+    )
+
+
+@app.post("/api/v1/alerts/datadog")
+async def ingest_datadog_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+    return await _ingest_provider_alert(
+        provider_hint="datadog",
+        payload=payload,
+        x_trace_id=x_trace_id,
+        x_signature=x_signature,
+        x_webhook_token=x_webhook_token,
+    )
+
+
+@app.post("/api/v1/alerts/newrelic")
+async def ingest_newrelic_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+    return await _ingest_provider_alert(
+        provider_hint="new_relic",
+        payload=payload,
+        x_trace_id=x_trace_id,
+        x_signature=x_signature,
+        x_webhook_token=x_webhook_token,
+    )
+
+
+@app.post("/api/v1/alerts/dynatrace")
+async def ingest_dynatrace_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+    return await _ingest_provider_alert(
+        provider_hint="dynatrace",
+        payload=payload,
+        x_trace_id=x_trace_id,
+        x_signature=x_signature,
+        x_webhook_token=x_webhook_token,
+    )
+
+
+@app.post("/api/v1/alerts/azure-monitor")
+async def ingest_azure_monitor_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+    return await _ingest_provider_alert(
+        provider_hint="azure_monitor",
+        payload=payload,
+        x_trace_id=x_trace_id,
+        x_signature=x_signature,
+        x_webhook_token=x_webhook_token,
+    )
+
+
+@app.post("/api/v1/alerts/splunk")
+async def ingest_splunk_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+    return await _ingest_provider_alert(
+        provider_hint="splunk",
+        payload=payload,
+        x_trace_id=x_trace_id,
+        x_signature=x_signature,
+        x_webhook_token=x_webhook_token,
+    )
+
+
+@app.post("/api/v1/alerts/generic")
+async def ingest_generic_provider_alert(provider: str = "prometheus", payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+    return await _ingest_provider_alert(
+        provider_hint=provider,
+        payload=payload,
+        x_trace_id=x_trace_id,
+        x_signature=x_signature,
+        x_webhook_token=x_webhook_token,
+    )
 
 
 @app.post("/alerts", response_model=Alert)
@@ -2476,6 +3250,35 @@ async def alerts_help() -> dict[str, Any]:
             },
         },
     }
+
+
+@app.get("/alerts/severity-overrides")
+async def get_alert_severity_overrides() -> dict[str, Any]:
+    rows = load_alert_severity_overrides()
+    return {
+        "rows": rows,
+        "count": len(rows),
+        "storage_file": str(alert_severity_overrides_path()),
+        "storage_key": ALERT_SEVERITY_OVERRIDES_FILE,
+    }
+
+
+@app.put("/alerts/severity-overrides")
+async def put_alert_severity_override(payload: dict[str, Any] = ALERT_BODY) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="payload must be an object")
+    rows = upsert_alert_severity_override(payload)
+    return {"ok": True, "rows": rows, "count": len(rows)}
+
+
+@app.delete("/alerts/severity-overrides")
+async def delete_alert_severity_override(
+    name: str = Query(default=""),
+    service: str = Query(default=""),
+    environment: str = Query(default=""),
+) -> dict[str, Any]:
+    rows = remove_alert_severity_override(name=name, service=service, environment=environment)
+    return {"ok": True, "rows": rows, "count": len(rows)}
 
 
 @app.get("/alerts/recent")

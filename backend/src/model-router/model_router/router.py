@@ -249,6 +249,137 @@ class OpenAIModelProvider(ModelProvider):
 
 
 @dataclass
+class GroqModelProvider(ModelProvider):
+    model: str = "llama-3.3-70b-versatile"
+    api_key: str | None = None
+    base_url: str = "https://api.groq.com/openai/v1"
+    timeout_seconds: float = 45.0
+    input_cost_per_million: float = 0.0
+    output_cost_per_million: float = 0.0
+
+    async def generate(self, prompt: str, payload: dict[str, Any]) -> ModelResponse:
+        self._ensure_available()
+        if not self.api_key:
+            self.breaker.record_failure()
+            raise RuntimeError(f"{self.name} unavailable: GROQ_API_KEY is not configured")
+
+        prompt_text = render_task_payload_prompt(prompt, payload)
+        request_payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT_SRE},
+                {"role": "user", "content": prompt_text},
+            ],
+            "temperature": 0.2,
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.post(
+                    f"{self.base_url.rstrip('/')}/chat/completions",
+                    headers=headers,
+                    json=request_payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPStatusError as exc:
+            self.breaker.record_failure()
+            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
+        except Exception:
+            self.breaker.record_failure()
+            raise
+
+        self.breaker.record_success()
+        choices = data.get("choices") if isinstance(data.get("choices"), list) else []
+        content_text = ""
+        if choices:
+            message = choices[0].get("message") if isinstance(choices[0], dict) else {}
+            content_text = str(message.get("content") or "")
+        if not content_text:
+            raise RuntimeError(f"{self.name} returned no text")
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        model_usage = build_usage(
+            provider=self.name,
+            model=str(data.get("model") or self.model),
+            input_tokens=int(usage.get("prompt_tokens", estimate_tokens(prompt_text))),
+            output_tokens=int(usage.get("completion_tokens", estimate_tokens(content_text))),
+            input_cost_per_million=self.input_cost_per_million,
+            output_cost_per_million=self.output_cost_per_million,
+            estimated=not bool(usage),
+        )
+        return ModelResponse(content=content_text, usage=model_usage)
+
+
+@dataclass
+class GeminiModelProvider(ModelProvider):
+    model: str = "gemini-2.5-flash"
+    api_key: str | None = None
+    base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    timeout_seconds: float = 45.0
+    input_cost_per_million: float = 0.0
+    output_cost_per_million: float = 0.0
+
+    async def generate(self, prompt: str, payload: dict[str, Any]) -> ModelResponse:
+        self._ensure_available()
+        if not self.api_key:
+            self.breaker.record_failure()
+            raise RuntimeError(f"{self.name} unavailable: GEMINI_API_KEY is not configured")
+
+        prompt_text = render_task_payload_prompt(prompt, payload)
+        model_path = self.model if self.model.startswith("models/") else f"models/{self.model}"
+        request_payload = {
+            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT_SRE}]},
+            "contents": [{"parts": [{"text": prompt_text}]}],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.post(
+                    f"{self.base_url.rstrip('/')}/{model_path}:generateContent",
+                    headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
+                    json=request_payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPStatusError as exc:
+            self.breaker.record_failure()
+            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
+        except Exception:
+            self.breaker.record_failure()
+            raise
+
+        self.breaker.record_success()
+        content_text = self._extract_text(data)
+        if not content_text:
+            raise RuntimeError(f"{self.name} returned no text")
+        usage_meta = data.get("usageMetadata") if isinstance(data.get("usageMetadata"), dict) else {}
+        model_usage = build_usage(
+            provider=self.name,
+            model=self.model,
+            input_tokens=int(usage_meta.get("promptTokenCount", estimate_tokens(prompt_text))),
+            output_tokens=int(usage_meta.get("candidatesTokenCount", estimate_tokens(content_text))),
+            input_cost_per_million=self.input_cost_per_million,
+            output_cost_per_million=self.output_cost_per_million,
+            estimated=not bool(usage_meta),
+        )
+        total_tokens = usage_meta.get("totalTokenCount")
+        if isinstance(total_tokens, int):
+            model_usage.total_tokens = total_tokens
+        return ModelResponse(content=content_text, usage=model_usage)
+
+    def _extract_text(self, data: dict[str, Any]) -> str:
+        candidates = data.get("candidates") if isinstance(data.get("candidates"), list) else []
+        for candidate in candidates:
+            content = candidate.get("content") if isinstance(candidate, dict) else {}
+            parts = content.get("parts") if isinstance(content, dict) else []
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if isinstance(part, dict) and part.get("text"):
+                    return str(part.get("text"))
+        return ""
+
+
+@dataclass
 class OllamaModelProvider(ModelProvider):
     endpoint: str = "http://ollama:11434"
     model: str = "llama3.1"
@@ -296,9 +427,11 @@ class ModelRouter:
     settings: Settings = field(default_factory=get_settings)
     failover_chain: dict[str, list[str]] = field(
         default_factory=lambda: {
-            "gpt-5": ["gpt-4o", "local-llama"],
-            "local-llama": ["gpt-4o"],
-            "gpt-4o": ["gpt-5", "local-llama"],
+            "gpt-5": ["gpt-4o", "gemini", "groq", "local-llama"],
+            "gpt-4o": ["gpt-5", "gemini", "groq", "local-llama"],
+            "gemini": ["gpt-4o", "groq", "local-llama"],
+            "groq": ["gpt-4o", "gemini", "local-llama"],
+            "local-llama": ["gpt-4o", "gemini", "groq"],
         }
     )
     prompt_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = field(default_factory=OrderedDict)
@@ -461,6 +594,24 @@ def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
         "claude": UnconfiguredModelProvider(
             name="claude",
             reason="set ANTHROPIC_API_KEY and add a Claude provider implementation",
+        ),
+        "gemini": GeminiModelProvider(
+            name="gemini",
+            model=settings.gemini_model,
+            api_key=settings.gemini_api_key,
+            base_url=settings.gemini_base_url,
+            timeout_seconds=settings.llm_request_timeout_seconds,
+            input_cost_per_million=settings.gemini_input_cost_per_million,
+            output_cost_per_million=settings.gemini_output_cost_per_million,
+        ),
+        "groq": GroqModelProvider(
+            name="groq",
+            model=settings.groq_model,
+            api_key=settings.groq_api_key,
+            base_url=settings.groq_base_url,
+            timeout_seconds=settings.llm_request_timeout_seconds,
+            input_cost_per_million=settings.groq_input_cost_per_million,
+            output_cost_per_million=settings.groq_output_cost_per_million,
         ),
         "local-llama": local_llama_provider,
     }

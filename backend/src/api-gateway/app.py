@@ -379,6 +379,134 @@ async def ingest_alert(
     )
 
 
+@app.post("/applications")
+async def create_application(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/applications",
+        target_base=settings.application_onboarding_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/applications")
+async def list_applications(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/applications",
+        target_base=settings.application_onboarding_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/applications/{application_id}")
+async def get_application(
+    application_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/applications/{application_id}",
+        target_base=settings.application_onboarding_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.put("/applications/{application_id}")
+async def update_application(
+    application_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="PUT",
+        path=f"/applications/{application_id}",
+        target_base=settings.application_onboarding_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.delete("/applications/{application_id}")
+async def delete_application(
+    application_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="DELETE",
+        path=f"/applications/{application_id}",
+        target_base=settings.application_onboarding_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/applications/{application_id}/history")
+async def get_application_history(
+    application_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/applications/{application_id}/history",
+        target_base=settings.application_onboarding_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/applications/{application_id}/validations")
+async def get_application_validations(
+    application_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/applications/{application_id}/validations",
+        target_base=settings.application_onboarding_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/applications/{application_id}/dashboards")
+async def get_application_dashboards(
+    application_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/applications/{application_id}/dashboards",
+        target_base=settings.application_onboarding_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/alerts")
 async def alerts_help() -> dict[str, Any]:
     return {
@@ -426,6 +554,56 @@ async def get_all_alerts(
     return await guarded_proxy(
         request=request,
         method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/alerts/severity-overrides")
+async def get_alert_severity_overrides(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/alerts/severity-overrides",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.put("/alerts/severity-overrides")
+async def put_alert_severity_override(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="PUT",
+        path="/alerts/severity-overrides",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.delete("/alerts/severity-overrides")
+async def delete_alert_severity_override(
+    request: Request,
+    name: str,
+    service: str = "",
+    environment: str = "",
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/alerts/severity-overrides?{urlencode({'name': name, 'service': service, 'environment': environment})}"
+    return await guarded_proxy(
+        request=request,
+        method="DELETE",
         path=path,
         target_base=settings.monitoring_adapter_url,
         payload={},
@@ -776,6 +954,385 @@ async def post_onboarding_complete(
     )
 
 
+@app.get("/monitoring/providers")
+async def get_monitoring_providers(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/monitoring/providers",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/monitoring/integrations")
+async def get_monitoring_integrations(
+    request: Request,
+    tenant_id: str = "default",
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/monitoring/integrations?{urlencode({'tenant_id': tenant_id})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/monitoring/integrations")
+async def post_monitoring_integrations(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/monitoring/integrations",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/monitoring/integrations/{integration_id}")
+async def get_monitoring_integration(
+    integration_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/monitoring/integrations/{integration_id}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.put("/monitoring/integrations/{integration_id}")
+async def put_monitoring_integration(
+    integration_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="PUT",
+        path=f"/monitoring/integrations/{integration_id}",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.delete("/monitoring/integrations/{integration_id}")
+async def delete_monitoring_integration(
+    integration_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="DELETE",
+        path=f"/monitoring/integrations/{integration_id}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/monitoring/integrations/{integration_id}/validate")
+async def post_monitoring_integration_validate(
+    integration_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/monitoring/integrations/{integration_id}/validate",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/monitoring/integrations/{integration_id}/discover")
+async def post_monitoring_integration_discover(
+    integration_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/monitoring/integrations/{integration_id}/discover",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/monitoring/integrations/{integration_id}/register-webhook")
+async def post_monitoring_integration_register_webhook(
+    integration_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/monitoring/integrations/{integration_id}/register-webhook",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/monitoring/integrations/{integration_id}/mapping")
+async def get_monitoring_integration_mapping(
+    integration_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/monitoring/integrations/{integration_id}/mapping",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.put("/monitoring/integrations/{integration_id}/mapping")
+async def put_monitoring_integration_mapping(
+    integration_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="PUT",
+        path=f"/monitoring/integrations/{integration_id}/mapping",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/monitoring/integrations/{integration_id}/test-alert")
+async def post_monitoring_integration_test_alert(
+    integration_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/monitoring/integrations/{integration_id}/test-alert",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/monitoring/integrations/{integration_id}/activate")
+async def post_monitoring_integration_activate(
+    integration_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/monitoring/integrations/{integration_id}/activate",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/monitoring/integrations/{integration_id}/deactivate")
+async def post_monitoring_integration_deactivate(
+    integration_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/monitoring/integrations/{integration_id}/deactivate",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/monitoring/health")
+async def get_monitoring_health(
+    request: Request,
+    tenant_id: str = "default",
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/monitoring/health?{urlencode({'tenant_id': tenant_id})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/monitoring/audit")
+async def get_monitoring_audit(
+    request: Request,
+    tenant_id: str = "default",
+    limit: int = 100,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/monitoring/audit?{urlencode({'tenant_id': tenant_id, 'limit': str(limit)})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/api/v1/alerts/prometheus")
+async def post_provider_prometheus_alert(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/api/v1/alerts/prometheus",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/api/v1/alerts/datadog")
+async def post_provider_datadog_alert(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/api/v1/alerts/datadog",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/api/v1/alerts/newrelic")
+async def post_provider_newrelic_alert(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/api/v1/alerts/newrelic",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/api/v1/alerts/dynatrace")
+async def post_provider_dynatrace_alert(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/api/v1/alerts/dynatrace",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/api/v1/alerts/azure-monitor")
+async def post_provider_azure_monitor_alert(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/api/v1/alerts/azure-monitor",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/api/v1/alerts/splunk")
+async def post_provider_splunk_alert(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/api/v1/alerts/splunk",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/api/v1/alerts/generic")
+async def post_provider_generic_alert(
+    request: Request,
+    provider: str = "prometheus",
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/api/v1/alerts/generic?{urlencode({'provider': provider})}"
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.post("/sample/{flow_id}/workflow")
 async def sample_flow_workflow(
     flow_id: str,
@@ -859,6 +1416,22 @@ async def list_rag_documents(
         path="/rag/documents",
         target_base=settings.context_agent_url,
         payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.put("/rag/documents")
+async def update_rag_document(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="PUT",
+        path="/rag/documents",
+        target_base=settings.context_agent_url,
+        payload=payload,
         trace_id=trace_id_from_header(x_trace_id),
     )
 

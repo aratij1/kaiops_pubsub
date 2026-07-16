@@ -44,6 +44,41 @@ AGENT_EXECUTIONS = Counter(
     "Agent runtime execution outcomes",
     ["agent", "status"],
 )
+APPLICATIONS_ONBOARDED = Counter(
+    "applications_onboarded_total",
+    "Applications registered for monitoring onboarding",
+    ["tenant", "environment", "status"],
+)
+ONBOARDING_SUCCESS = Counter(
+    "onboarding_success_total",
+    "Successful monitoring onboarding executions",
+    ["service", "stage"],
+)
+ONBOARDING_FAILED = Counter(
+    "onboarding_failed_total",
+    "Failed monitoring onboarding executions",
+    ["service", "stage"],
+)
+APPLICATION_DISCOVERY_DURATION = Histogram(
+    "application_discovery_duration",
+    "Application discovery duration in seconds",
+    ["service", "provider"],
+)
+RULE_GENERATION_DURATION = Histogram(
+    "rule_generation_duration",
+    "Monitoring rule generation duration in seconds",
+    ["service", "provider"],
+)
+VALIDATION_DURATION = Histogram(
+    "validation_duration",
+    "Monitoring validation duration in seconds",
+    ["service", "provider"],
+)
+DASHBOARD_GENERATION_DURATION = Histogram(
+    "dashboard_generation_duration",
+    "Grafana dashboard generation duration in seconds",
+    ["service", "provider"],
+)
 
 
 def setup_tracing(app, settings: Settings) -> None:

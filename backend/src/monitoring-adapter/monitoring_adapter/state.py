@@ -14,6 +14,7 @@ from fastapi import HTTPException
 FLOW_CATALOG_FILE = "flows.json"
 SCENARIOS_TEXT_FILE = "scenarios.txt"
 ONBOARDING_CONNECTIVITY_FILE = "onboarding/connectivity.json"
+ALERT_SEVERITY_OVERRIDES_FILE = "onboarding/alert_severity_overrides.json"
 
 # Hardcoded scenarios are intentionally empty for now; the text file is the source of truth.
 SCENARIOS: dict[str, dict[str, Any]] = {}
@@ -27,6 +28,8 @@ _scenarios_cache: dict[str, Any] = {}
 _scenarios_cache_ts: float = 0.0
 _onboarding_cache: dict[str, Any] = {}
 _onboarding_cache_ts: float = 0.0
+_severity_override_cache: dict[str, Any] = {}
+_severity_override_cache_ts: float = 0.0
 
 
 def slugify(value: str) -> str:
@@ -59,6 +62,11 @@ def scenarios_text_path() -> Path:
 @lru_cache(maxsize=1)
 def onboarding_connectivity_path() -> Path:
     return rag_root_path() / ONBOARDING_CONNECTIVITY_FILE
+
+
+@lru_cache(maxsize=1)
+def alert_severity_overrides_path() -> Path:
+    return rag_root_path() / ALERT_SEVERITY_OVERRIDES_FILE
 
 
 def load_onboarding_connectivity() -> dict[str, Any]:
@@ -103,6 +111,109 @@ def save_onboarding_connectivity(payload: dict[str, Any]) -> dict[str, Any]:
     _onboarding_cache = dict(sanitized)
     _onboarding_cache_ts = _time.monotonic()
     return sanitized
+
+
+def _normalize_override_match_token(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalize_override_rule(rule: dict[str, Any]) -> dict[str, Any]:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    severity = _normalize_override_match_token(rule.get("severity"))
+    if severity not in {"info", "warning", "high", "critical"}:
+        raise HTTPException(status_code=400, detail="severity must be one of info|warning|high|critical")
+    name = _normalize_override_match_token(rule.get("name"))
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required for alert severity override")
+    return {
+        "name": name,
+        "service": _normalize_override_match_token(rule.get("service")),
+        "environment": _normalize_override_match_token(rule.get("environment")),
+        "severity": severity,
+        "requested_by": str(rule.get("requested_by") or "").strip(),
+        "requested_role": _normalize_override_match_token(rule.get("requested_role")),
+        "updated_at": str(rule.get("updated_at") or now_iso),
+    }
+
+
+def load_alert_severity_overrides() -> list[dict[str, Any]]:
+    global _severity_override_cache, _severity_override_cache_ts
+    now = _time.monotonic()
+    if _severity_override_cache and now - _severity_override_cache_ts < _ONBOARDING_CACHE_TTL:
+        rules = _severity_override_cache.get("rules")
+        return list(rules) if isinstance(rules, list) else []
+
+    path = alert_severity_overrides_path()
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    raw_rules = payload.get("rules") if isinstance(payload, dict) else payload
+    rules = []
+    if isinstance(raw_rules, list):
+        for item in raw_rules:
+            if isinstance(item, dict):
+                try:
+                    rules.append(_normalize_override_rule(item))
+                except HTTPException:
+                    continue
+    _severity_override_cache = {"rules": rules}
+    _severity_override_cache_ts = now
+    return list(rules)
+
+
+def save_alert_severity_overrides(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    global _severity_override_cache, _severity_override_cache_ts
+    path = alert_severity_overrides_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    normalized_rules = [_normalize_override_rule(item) for item in rules if isinstance(item, dict)]
+    payload = {
+        "rules": normalized_rules,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _severity_override_cache = {"rules": normalized_rules}
+    _severity_override_cache_ts = _time.monotonic()
+    return list(normalized_rules)
+
+
+def upsert_alert_severity_override(rule: dict[str, Any]) -> list[dict[str, Any]]:
+    normalized_rule = _normalize_override_rule(rule)
+    rules = load_alert_severity_overrides()
+    replaced = False
+    for index, item in enumerate(rules):
+        if (
+            _normalize_override_match_token(item.get("name")) == normalized_rule["name"]
+            and _normalize_override_match_token(item.get("service")) == normalized_rule["service"]
+            and _normalize_override_match_token(item.get("environment")) == normalized_rule["environment"]
+        ):
+            rules[index] = normalized_rule
+            replaced = True
+            break
+    if not replaced:
+        rules.append(normalized_rule)
+    return save_alert_severity_overrides(rules)
+
+
+def remove_alert_severity_override(*, name: str, service: str = "", environment: str = "") -> list[dict[str, Any]]:
+    name_token = _normalize_override_match_token(name)
+    service_token = _normalize_override_match_token(service)
+    environment_token = _normalize_override_match_token(environment)
+    if not name_token:
+        raise HTTPException(status_code=400, detail="name is required for deleting an alert severity override")
+    rules = load_alert_severity_overrides()
+    filtered = [
+        item for item in rules
+        if not (
+            _normalize_override_match_token(item.get("name")) == name_token
+            and _normalize_override_match_token(item.get("service")) == service_token
+            and _normalize_override_match_token(item.get("environment")) == environment_token
+        )
+    ]
+    return save_alert_severity_overrides(filtered)
 
 
 def severity_from_string(value: str | None) -> str:
