@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
+from uuid import UUID
 
 from common.agent_runtime import PolicyViolation
 from common.config import get_settings
@@ -23,6 +24,81 @@ engine = RemediationEngine()
 tasks: list[asyncio.Task] = []
 
 ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any, Any, None]]
+
+
+def _first_non_empty(*values: Any) -> str | None:
+    for value in values:
+        token = str(value or "").strip()
+        if token:
+            return token
+    return None
+
+
+def _looks_like_uuid(token: str | None) -> bool:
+    if not token:
+        return False
+    try:
+        UUID(str(token))
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _extract_resolution_context(source_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    recommendation = source_payload.get("recommendation", {}) if isinstance(source_payload.get("recommendation"), dict) else {}
+    decision = source_payload.get("decision", {}) if isinstance(source_payload.get("decision"), dict) else {}
+    incident = source_payload.get("incident", {}) if isinstance(source_payload.get("incident"), dict) else {}
+    metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
+    orchestration = metadata.get("orchestration_decision", {}) if isinstance(metadata.get("orchestration_decision"), dict) else {}
+    return recommendation, decision, incident, orchestration
+
+
+def _derive_remediation_target(source_payload: dict[str, Any], action: RemediationAction) -> str | None:
+    recommendation, _, incident, _ = _extract_resolution_context(source_payload)
+    metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
+
+    candidate_target = _first_non_empty(
+        action.target,
+        metadata.get("remediation_target"),
+        recommendation.get("target"),
+        recommendation.get("resource"),
+        incident.get("deployment"),
+        incident.get("service"),
+    )
+    if candidate_target and _looks_like_uuid(candidate_target):
+        return _first_non_empty(incident.get("service"), metadata.get("service"), candidate_target)
+    return candidate_target
+
+
+def _enrich_action_from_source_payload(action: RemediationAction, source_payload: dict[str, Any]) -> RemediationAction:
+    recommendation, _, incident, _ = _extract_resolution_context(source_payload)
+    metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
+
+    target = _derive_remediation_target(source_payload, action)
+    if target:
+        action.target = target
+
+    service = _first_non_empty(incident.get("service"), metadata.get("service"))
+    if service and not str(action.parameters.get("service") or "").strip():
+        action.parameters["service"] = service
+
+    environment = _first_non_empty(incident.get("environment"), metadata.get("environment"))
+    if environment and not str(action.parameters.get("environment") or "").strip():
+        action.parameters["environment"] = environment
+
+    recommended_action = _first_non_empty(recommendation.get("recommended_action"), recommendation.get("action"))
+    if recommended_action and not str(action.parameters.get("recommended_action") or "").strip():
+        action.parameters["recommended_action"] = recommended_action
+
+    root_cause = _first_non_empty(recommendation.get("root_cause"), recommendation.get("rationale"))
+    if root_cause and not str(action.parameters.get("root_cause") or "").strip():
+        action.parameters["root_cause"] = root_cause
+
+    impact = _first_non_empty(recommendation.get("impact"))
+    if impact and not str(action.parameters.get("impact") or "").strip():
+        action.parameters["impact"] = impact
+
+    return action
 
 
 def _extract_approval_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -82,10 +158,31 @@ async def _persist_remediation_event(
 ) -> None:
     if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
         return
-    recommendation = source_payload.get("recommendation", {}) if isinstance(source_payload.get("recommendation"), dict) else {}
-    decision = source_payload.get("decision", {}) if isinstance(source_payload.get("decision"), dict) else {}
+    recommendation, decision, incident, orchestration = _extract_resolution_context(source_payload)
     recommendation_metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
-    orchestration = recommendation_metadata.get("orchestration_decision", {}) if isinstance(recommendation_metadata.get("orchestration_decision"), dict) else {}
+    source_event_contract = source_payload.get("event_contract", {}) if isinstance(source_payload.get("event_contract"), dict) else {}
+    source_transport = source_event_contract.get("transport", {}) if isinstance(source_event_contract.get("transport"), dict) else {}
+
+    service_name = _first_non_empty(
+        action.parameters.get("service"),
+        incident.get("service"),
+        recommendation_metadata.get("service"),
+        action.target,
+        "unknown",
+    ) or "unknown"
+    if _looks_like_uuid(service_name):
+        service_name = _first_non_empty(incident.get("service"), recommendation_metadata.get("service"), "unknown") or "unknown"
+
+    severity_value = _first_non_empty(recommendation.get("severity"), incident.get("severity"), "warning") or "warning"
+    risk_tier_value = _first_non_empty(decision.get("risk_tier"), orchestration.get("risk_tier"), recommendation.get("risk"), "medium") or "medium"
+    execution_mode_value = _first_non_empty(decision.get("execution_mode"), orchestration.get("execution_mode"), "automated") or "automated"
+    transport_provider_value = _first_non_empty(
+        decision.get("message_bus_provider"),
+        orchestration.get("message_bus_provider"),
+        source_transport.get("provider"),
+        "rabbitmq",
+    ) or "rabbitmq"
+    source_channel_value = _first_non_empty(source_transport.get("channel"), source)
 
     action_status = str(action.status.value or "pending").lower()
     state_status = "remediating"
@@ -109,25 +206,25 @@ async def _persist_remediation_event(
                 },
                 scope={
                     "tenant_id": "default",
-                    "service": str(action.target or "unknown"),
-                    "environment": "prod",
+                    "service": str(service_name),
+                    "environment": str(_first_non_empty(incident.get("environment"), recommendation_metadata.get("environment"), "prod") or "prod"),
                     "region": None,
                     "team": None,
                 },
                 state={
-                    "severity": str(recommendation.get("severity") or "warning").lower(),
+                    "severity": str(severity_value).lower(),
                     "status": state_status,
                     "owner": None,
                 },
                 policy={
-                    "risk_tier": str(decision.get("risk_tier") or orchestration.get("risk_tier") or "unknown"),
-                    "execution_mode": str(decision.get("execution_mode") or orchestration.get("execution_mode") or "unknown"),
+                    "risk_tier": str(risk_tier_value).lower(),
+                    "execution_mode": str(execution_mode_value).lower(),
                     "requires_approval": decision.get("requires_approval") if "requires_approval" in decision else orchestration.get("requires_approval"),
                     "policy_version": action.parameters.get("policy_version") or decision.get("policy_version") or orchestration.get("policy_version") or recommendation_metadata.get("policy_version"),
                     "policy_reason": action.parameters.get("policy_reason") or decision.get("policy_reason") or orchestration.get("policy_reason") or recommendation_metadata.get("policy_reason"),
                 },
                 transport={
-                    "provider": str(decision.get("message_bus_provider") or orchestration.get("message_bus_provider") or "unknown"),
+                    "provider": str(transport_provider_value).lower(),
                     "channel": REMEDIATION_EVENTS,
                     "partition": None,
                     "offset": None,
@@ -135,6 +232,9 @@ async def _persist_remediation_event(
                 },
                 payload={
                     "source": source,
+                    "source_channel": source_channel_value,
+                    "source_event_contract": source_event_contract,
+                    "source_payload": source_payload,
                     "approval_id": str(action.approval_id) if action.approval_id else None,
                     "action_id": str(action.id),
                     "action_type": action.action_type,
@@ -172,6 +272,7 @@ async def startup(app: FastAPI) -> None:
     async def handle_approval(payload: dict) -> None:
         approval_payload = _extract_approval_payload(payload)
         approval = Approval.model_validate(approval_payload)
+        approval = _enrich_approval_from_payload(approval, payload)
         action = await execute_approval(approval)
         await _persist_remediation_event(app=app, action=action, source_payload=payload, source=APPROVAL_EVENTS)
         payload_out = _build_remediation_event_payload(action=action, source_payload=payload, source=APPROVAL_EVENTS)
@@ -199,6 +300,7 @@ async def startup(app: FastAPI) -> None:
         approval = _build_auto_approval(payload)
         if approval is None:
             return
+        approval = _enrich_approval_from_payload(approval, payload)
         action = await execute_approval(approval)
         await _persist_remediation_event(app=app, action=action, source_payload=payload, source=RESOLUTION_EVENTS)
         payload_out = _build_remediation_event_payload(action=action, source_payload=payload, source=RESOLUTION_EVENTS)
@@ -281,6 +383,7 @@ def _build_auto_approval(payload: dict[str, Any]) -> Approval | None:
         return None
 
     decision = payload.get("decision", {}) if isinstance(payload.get("decision"), dict) else {}
+    incident = payload.get("incident", {}) if isinstance(payload.get("incident"), dict) else {}
     recommendation_metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
 
     policy_version = str(
@@ -295,6 +398,29 @@ def _build_auto_approval(payload: dict[str, Any]) -> Approval | None:
         metadata["policy_version"] = policy_version
     if policy_reason:
         metadata["policy_reason"] = policy_reason
+    service = _first_non_empty(incident.get("service"), recommendation_metadata.get("service"))
+    environment = _first_non_empty(incident.get("environment"), recommendation_metadata.get("environment"))
+    remediation_target = _first_non_empty(
+        recommendation_metadata.get("remediation_target"),
+        recommendation.get("target"),
+        recommendation.get("resource"),
+        incident.get("deployment"),
+        service,
+    )
+    if service:
+        metadata["service"] = service
+        metadata["incident_service"] = service
+    if environment:
+        metadata["environment"] = environment
+    if remediation_target:
+        metadata["remediation_target"] = remediation_target
+        metadata["target"] = remediation_target
+    recommended_action = _first_non_empty(recommendation.get("recommended_action"), recommendation.get("action"))
+    recommended_commands = recommendation.get("commands") if isinstance(recommendation.get("commands"), list) else []
+    if recommended_action:
+        metadata["recommended_action"] = recommended_action
+    if recommended_commands:
+        metadata["recommended_commands"] = [str(item).strip() for item in recommended_commands if str(item).strip()]
 
     return Approval(
         incident_id=incident_id,
@@ -305,6 +431,48 @@ def _build_auto_approval(payload: dict[str, Any]) -> Approval | None:
         comment=str(recommendation.get("recommended_action") or "auto-approved remediation"),
         metadata=metadata,
     )
+
+
+def _enrich_approval_from_payload(approval: Approval, payload: dict[str, Any]) -> Approval:
+    recommendation, _, incident, _ = _extract_resolution_context(payload)
+    recommendation_metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
+
+    service = _first_non_empty(approval.metadata.get("service"), incident.get("service"), recommendation_metadata.get("service"))
+    environment = _first_non_empty(
+        approval.metadata.get("environment"),
+        incident.get("environment"),
+        recommendation_metadata.get("environment"),
+    )
+    remediation_target = _first_non_empty(
+        approval.metadata.get("remediation_target"),
+        approval.metadata.get("target"),
+        recommendation_metadata.get("remediation_target"),
+        recommendation.get("target"),
+        recommendation.get("resource"),
+        incident.get("deployment"),
+        service,
+    )
+    recommended_action = _first_non_empty(
+        approval.metadata.get("recommended_action"),
+        recommendation.get("recommended_action"),
+        recommendation.get("action"),
+    )
+    recommended_commands = recommendation.get("commands") if isinstance(recommendation.get("commands"), list) else []
+
+    if service:
+        approval.metadata["service"] = service
+        approval.metadata["incident_service"] = service
+    if environment:
+        approval.metadata["environment"] = environment
+    if remediation_target:
+        approval.metadata["remediation_target"] = remediation_target
+        approval.metadata["target"] = remediation_target
+    if recommended_action:
+        approval.metadata["recommended_action"] = recommended_action
+    if recommended_commands and not isinstance(approval.metadata.get("recommended_commands"), list):
+        approval.metadata["recommended_commands"] = [str(item).strip() for item in recommended_commands if str(item).strip()]
+
+    return approval
 
 
 def _validate_auto_execution_policy(payload: dict[str, Any]) -> None:

@@ -415,13 +415,6 @@ function elapsedSeconds(start, end) {
 }
 
 function normalizeTraceServiceName(event) {
-  const rawService = String(event?.service || "").trim();
-  if (!rawService) {
-    return "-";
-  }
-  if (!looksLikeUuid(rawService)) {
-    return rawService;
-  }
   const eventType = String(event?.event_type || "").trim().toLowerCase();
   if (eventType.includes("closure")) {
     return "closure-service";
@@ -437,6 +430,17 @@ function normalizeTraceServiceName(event) {
   }
   if (eventType.includes("workflow") || eventType.includes("orchestration")) {
     return "orchestrator";
+  }
+  if (eventType.includes("remediation")) {
+    return "remediation-engine";
+  }
+
+  const rawService = String(event?.service || "").trim();
+  if (!rawService) {
+    return "-";
+  }
+  if (!looksLikeUuid(rawService)) {
+    return rawService;
   }
   return "monitoring-adapter";
 }
@@ -620,6 +624,92 @@ function extractEventOutput(event) {
   return hit;
 }
 
+function buildPreviewExecutionPlan(workflow) {
+  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
+  const recommendation = typeof safeWorkflow.recommendation === "object" && safeWorkflow.recommendation ? safeWorkflow.recommendation : {};
+  const incident = typeof safeWorkflow.incident === "object" && safeWorkflow.incident ? safeWorkflow.incident : {};
+  const alert = typeof safeWorkflow.alert === "object" && safeWorkflow.alert ? safeWorkflow.alert : {};
+
+  const target = String(
+    recommendation?.metadata?.remediation_target
+    || recommendation?.target
+    || incident?.service
+    || alert?.service
+    || "unknown-target"
+  ).trim();
+  const environment = String(incident?.environment || alert?.environment || "prod").trim() || "prod";
+  const recommendationText = String(recommendation?.recommended_action || "rollback deployment").trim() || "rollback deployment";
+  const lowered = recommendationText.toLowerCase();
+
+  const actionType = lowered.includes("restart pod")
+    ? "restart_pod"
+    : lowered.includes("scale")
+      ? "scale_deployment"
+      : lowered.includes("restart service")
+        ? "restart_service"
+        : lowered.includes("cache")
+          ? "clear_cache"
+          : lowered.includes("failover") || lowered.includes("database")
+            ? "failover_database"
+            : lowered.includes("terraform")
+              ? "terraform_rollback"
+              : "rollback_deployment";
+
+  const preview = {
+    commands: [],
+    scripts: [],
+    queries: [],
+  };
+
+  if (actionType === "restart_pod") {
+    preview.commands = [
+      `kubectl rollout restart deployment/${target} -n ${environment}`,
+      `kubectl rollout status deployment/${target} -n ${environment} --timeout=180s`,
+    ];
+    preview.scripts = [`scripts/remediation/restart_pod.ps1 -Service ${target} -Namespace ${environment}`];
+    preview.queries = [`sum(rate(http_requests_total{service='${target}',status=~'5..'}[5m]))`];
+  } else if (actionType === "scale_deployment") {
+    preview.commands = [
+      `kubectl scale deployment/${target} --replicas=3 -n ${environment}`,
+      `kubectl rollout status deployment/${target} -n ${environment} --timeout=180s`,
+    ];
+    preview.scripts = [`scripts/remediation/scale_deployment.ps1 -Service ${target} -Namespace ${environment} -Replicas 3`];
+    preview.queries = [`avg_over_time(container_cpu_usage_seconds_total{pod=~'${target}.*'}[10m])`];
+  } else if (actionType === "restart_service") {
+    preview.commands = [`ansible-playbook playbooks/restart-service.yml -e service=${target} -e env=${environment}`];
+    preview.scripts = [`scripts/remediation/restart_service.ps1 -Service ${target} -Environment ${environment}`];
+    preview.queries = [`max_over_time(up{job='${target}'}[5m])`];
+  } else if (actionType === "clear_cache") {
+    preview.commands = [`redis-cli -h ${target}-redis -n 0 FLUSHDB`];
+    preview.scripts = [`scripts/remediation/clear_cache.ps1 -Service ${target}`];
+    preview.queries = [`sum(rate(cache_miss_total{service='${target}'}[5m]))`];
+  } else if (actionType === "failover_database") {
+    preview.commands = ["mysql -e \"CALL mysql.rds_failover();\""];
+    preview.scripts = ["scripts/remediation/failover_database.ps1"];
+    preview.queries = ["SHOW REPLICA STATUS;"];
+  } else if (actionType === "terraform_rollback") {
+    preview.commands = [
+      "terraform init",
+      `terraform apply -auto-approve -var service=${target} -var rollback=true`,
+    ];
+    preview.scripts = [`scripts/remediation/terraform_rollback.ps1 -Service ${target} -Environment ${environment}`];
+    preview.queries = [`sum(rate(terraform_apply_failures_total{service='${target}'}[15m]))`];
+  } else {
+    preview.commands = [
+      `kubectl rollout undo deployment/${target} -n ${environment}`,
+      `kubectl rollout status deployment/${target} -n ${environment} --timeout=180s`,
+    ];
+    preview.scripts = [`scripts/remediation/rollback_deployment.ps1 -Service ${target} -Namespace ${environment}`];
+    preview.queries = [`sum(rate(http_requests_total{service='${target}',status=~'5..'}[5m]))`];
+  }
+
+  return {
+    actionType,
+    recommendationText,
+    plan: preview,
+  };
+}
+
 function deriveExecutionCommands(workflow, traceRows) {
   const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
   const safeTraceRows = Array.isArray(traceRows) ? traceRows : [];
@@ -637,43 +727,365 @@ function deriveExecutionCommands(workflow, traceRows) {
     || (Array.isArray(remediationAction.commands) && remediationAction.commands)
     || (Array.isArray(decision.commands) && decision.commands)
     || [];
-  if (explicit.length) {
-    return explicit.map((item) => String(item || "").trim()).filter(Boolean);
-  }
-
   const derived = [];
-  safeTraceRows.forEach((row) => {
-    const payload = typeof row?.payload === "object" && row.payload ? row.payload : {};
-    const nextAction = String(payload?.next_action || "").trim();
-    if (nextAction) {
-      derived.push(`next_action: ${nextAction}`);
-    }
-    const recommendedAction = String(payload?.recommended_action || "").trim();
-    if (recommendedAction) {
-      derived.push(`recommended_action: ${recommendedAction}`);
-    }
-    const actionTaken = String(payload?.action_taken || "").trim();
-    if (actionTaken) {
-      derived.push(`action_taken: ${actionTaken}`);
-    }
-    const downstreamAgents = Array.isArray(payload?.downstream_agents) ? payload.downstream_agents : [];
-    downstreamAgents
-      .map((item) => String(item || "").trim())
-      .filter(Boolean)
-      .forEach((agent) => derived.push(`dispatch_to: ${agent}`));
-  });
-
-  const unique = [];
   const seen = new Set();
-  derived.forEach((item) => {
-    const key = String(item || "").trim().toLowerCase();
-    if (!key || seen.has(key)) {
+  const pushUnique = (value, prefix = "") => {
+    const token = String(value || "").trim();
+    if (!token) {
+      return;
+    }
+    const line = `${prefix}${token}`;
+    const key = line.toLowerCase();
+    if (seen.has(key)) {
       return;
     }
     seen.add(key);
-    unique.push(item);
+    derived.push(line);
+  };
+
+  const pushPlan = (plan) => {
+    if (!plan || typeof plan !== "object") {
+      return;
+    }
+    (Array.isArray(plan.commands) ? plan.commands : []).forEach((item) => pushUnique(item, "cmd: "));
+    (Array.isArray(plan.scripts) ? plan.scripts : []).forEach((item) => pushUnique(item, "script: "));
+    (Array.isArray(plan.queries) ? plan.queries : []).forEach((item) => pushUnique(item, "query: "));
+  };
+
+  explicit.forEach((item) => pushUnique(item, "cmd: "));
+
+  const remediationParams = typeof remediationAction.parameters === "object" && remediationAction.parameters
+    ? remediationAction.parameters
+    : {};
+  pushPlan(remediationParams.execution_plan);
+  (Array.isArray(remediationParams.commands) ? remediationParams.commands : []).forEach((item) => pushUnique(item, "cmd: "));
+
+  safeTraceRows.forEach((row) => {
+    const payload = typeof row?.payload === "object" && row.payload ? row.payload : {};
+    pushPlan(payload?.execution_plan);
+
+    const payloadAction = typeof payload?.remediation_action === "object" && payload.remediation_action ? payload.remediation_action : {};
+    const payloadParams = typeof payloadAction.parameters === "object" && payloadAction.parameters ? payloadAction.parameters : {};
+    pushPlan(payloadParams.execution_plan);
+    (Array.isArray(payloadParams.commands) ? payloadParams.commands : []).forEach((item) => pushUnique(item, "cmd: "));
+
+    const commands = Array.isArray(payload?.commands) ? payload.commands : [];
+    commands.forEach((item) => pushUnique(item, "cmd: "));
   });
-  return unique;
+
+  if (!derived.length) {
+    const preview = buildPreviewExecutionPlan(safeWorkflow);
+    pushUnique("preview only (awaiting approval/execution)", "cmd: ");
+    pushUnique(`# recommended_action: ${preview.recommendationText}`, "cmd: ");
+    (preview.plan.commands || []).forEach((item) => pushUnique(item, "cmd: "));
+    (preview.plan.scripts || []).forEach((item) => pushUnique(item, "script: "));
+    (preview.plan.queries || []).forEach((item) => pushUnique(item, "query: "));
+  }
+
+  return derived;
+}
+
+function firstTraceTimestamp(rows, predicate) {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const hit = safeRows.find((row) => {
+    if (!row || typeof row !== "object") {
+      return false;
+    }
+    return predicate(row);
+  });
+  return String(hit?.timestamp || "").trim();
+}
+
+function firstEventTimestamp(rows, predicate) {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const hit = safeRows.find((row) => {
+    if (!row || typeof row !== "object") {
+      return false;
+    }
+    return predicate(row);
+  });
+  return String(hit?.timestamp || "").trim();
+}
+
+function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, incidentCreatedAt }) {
+  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
+  const safeEvents = Array.isArray(events) ? events : [];
+  const safeTraceRows = Array.isArray(traceRows) ? traceRows : [];
+
+  const alert = typeof safeWorkflow.alert === "object" && safeWorkflow.alert ? safeWorkflow.alert : {};
+  const incident = typeof safeWorkflow.incident === "object" && safeWorkflow.incident ? safeWorkflow.incident : {};
+  const context = typeof safeWorkflow.context === "object" && safeWorkflow.context ? safeWorkflow.context : {};
+  const contextMetadata = typeof context.metadata === "object" && context.metadata ? context.metadata : {};
+  const recommendation = typeof safeWorkflow.recommendation === "object" && safeWorkflow.recommendation ? safeWorkflow.recommendation : {};
+  const recommendationMetadata = typeof recommendation.metadata === "object" && recommendation.metadata ? recommendation.metadata : {};
+  const remediationAction =
+    typeof safeWorkflow.remediation_action === "object" && safeWorkflow.remediation_action
+      ? safeWorkflow.remediation_action
+      : {};
+  const decision =
+    (typeof safeWorkflow.decision === "object" && safeWorkflow.decision)
+    || (typeof safeWorkflow.orchestration_decision === "object" && safeWorkflow.orchestration_decision)
+    || (typeof recommendationMetadata.orchestration_decision === "object" && recommendationMetadata.orchestration_decision)
+    || {};
+
+  const contextTraceRow = safeTraceRows
+    .slice()
+    .reverse()
+    .find((row) => String(row?.event_type || "").toLowerCase().includes("context"));
+  const contextEventPayload = (contextTraceRow && typeof contextTraceRow.payload === "object" && contextTraceRow.payload)
+    ? contextTraceRow.payload
+    : {};
+  const contextEventMetadata = typeof contextEventPayload?.metadata === "object" && contextEventPayload.metadata
+    ? contextEventPayload.metadata
+    : {};
+
+  const ragMatches =
+    (Array.isArray(contextMetadata.rag_matches) && contextMetadata.rag_matches)
+    || (Array.isArray(recommendationMetadata.rag_matches) && recommendationMetadata.rag_matches)
+    || (Array.isArray(contextEventMetadata.rag_matches) && contextEventMetadata.rag_matches)
+    || [];
+
+  const ragDocumentsRaw =
+    contextMetadata.rag_documents
+    ?? recommendationMetadata.rag_documents
+    ?? contextEventMetadata.rag_documents
+    ?? contextEventPayload.rag_document_count
+    ?? null;
+  const ragTopSimilarityRaw =
+    contextMetadata.rag_top_similarity
+    ?? recommendationMetadata.rag_top_similarity
+    ?? contextEventMetadata.rag_top_similarity
+    ?? null;
+  const ragDocuments = ragDocumentsRaw === null || ragDocumentsRaw === undefined || ragDocumentsRaw === ""
+    ? null
+    : Number(ragDocumentsRaw);
+  const ragTopSimilarity = ragTopSimilarityRaw === null || ragTopSimilarityRaw === undefined || ragTopSimilarityRaw === ""
+    ? null
+    : Number(ragTopSimilarityRaw);
+  const runbookFound =
+    Boolean(context.runbook)
+    || Boolean(recommendationMetadata.runbook_found)
+    || Boolean(contextEventPayload.document_available)
+    || Boolean(contextEventMetadata.document_available);
+  const executionCommands = deriveExecutionCommands(safeWorkflow, safeTraceRows);
+  const traceEventTypes = safeTraceRows
+    .map((row) => String(row?.event_type || "").trim())
+    .filter(Boolean);
+
+  const findTraceEvents = (needles) => {
+    const tokens = Array.isArray(needles) ? needles : [];
+    const matches = traceEventTypes.filter((eventType) => {
+      const normalized = eventType.toLowerCase();
+      return tokens.some((needle) => normalized.includes(String(needle || "").toLowerCase()));
+    });
+    return Array.from(new Set(matches));
+  };
+
+  const landingTimestamp =
+    String(ingestAt || "").trim()
+    || firstTraceTimestamp(safeTraceRows, (row) => {
+      const eventType = String(row?.event_type || "").toLowerCase();
+      const source = String(row?.source_channel || "").toLowerCase();
+      return eventType.includes("alert") || source.includes("raw-alert");
+    })
+    || String(incidentCreatedAt || "").trim();
+
+  const dedupeTimestamp =
+    firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("alert intelligence"))
+    || firstTraceTimestamp(safeTraceRows, (row) => String(row?.event_type || "").toLowerCase().includes("workflow"))
+    || landingTimestamp;
+
+  const contextTimestamp =
+    firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("context intelligence"))
+    || firstTraceTimestamp(safeTraceRows, (row) => String(row?.event_type || "").toLowerCase().includes("context"))
+    || dedupeTimestamp;
+
+  const routingTimestamp =
+    firstTraceTimestamp(safeTraceRows, (row) => {
+      const eventType = String(row?.event_type || "").toLowerCase();
+      return eventType.includes("workflow.selected") || eventType.includes("recommendation.generated");
+    })
+    || firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("orchestrator"))
+    || contextTimestamp;
+
+  const remediationTimestamp =
+    String(remediationAction.completed_at || remediationAction.started_at || "").trim()
+    || firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("remediation"))
+    || firstTraceTimestamp(safeTraceRows, (row) => String(row?.event_type || "").toLowerCase().includes("remediation"))
+    || routingTimestamp;
+
+  const rows = [];
+
+  if (landingTimestamp || hasMeaningfulValue(alert)) {
+    rows.push({
+      stage: "Alert Landed In Landing Pad",
+      agent: "Monitoring Adapter",
+      service: "monitoring-adapter",
+      consumes: "provider webhook",
+      publishes: "raw-alerts",
+      timestamp: landingTimestamp,
+      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, landingTimestamp),
+      detail: "Alert ingested from monitoring provider and staged for downstream workflow processing.",
+      tables: "incident_events",
+      inputValueText: stringifyTimelineValue({
+        source: alert.source,
+        name: alert.name,
+        service: alert.service,
+        severity: alert.severity,
+      }),
+      outputValueText: stringifyTimelineValue({
+        correlation_id: alert.correlation_id,
+        trace_id: alert.trace_id,
+      }),
+      errorValueText: "",
+      backendEvents: findTraceEvents(["alert", "incident.opened", "incident.created"]),
+    });
+  }
+
+  if (hasMeaningfulValue(alert.deduplicated_count) || dedupeTimestamp) {
+    rows.push({
+      stage: "Deduplication And Incident Correlation",
+      agent: "Alert Intelligence Agent",
+      service: "alert-intelligence",
+      consumes: "raw-alerts",
+      publishes: "enriched-alerts",
+      timestamp: dedupeTimestamp,
+      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, dedupeTimestamp),
+      detail: "Deduplication, severity classification, and incident correlation completed.",
+      tables: "alerts, incidents, incident_events",
+      inputValueText: stringifyTimelineValue({
+        deduplicated_count: alert.deduplicated_count,
+        correlation_id: alert.correlation_id,
+        incident_id: incident.id,
+      }),
+      outputValueText: stringifyTimelineValue({
+        incident_title: incident.title,
+        severity: incident.severity,
+        status: incident.status,
+      }),
+      errorValueText: "",
+      backendEvents: findTraceEvents(["workflow.selected", "context.collected"]),
+    });
+  }
+
+  if (ragDocuments > 0 || ragMatches.length || contextTimestamp) {
+    rows.push({
+      stage: "RAG Context Retrieval",
+      agent: "Context Intelligence Agent",
+      service: "context-agent",
+      consumes: "orchestration-events",
+      publishes: "context-events",
+      timestamp: contextTimestamp,
+      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, contextTimestamp),
+      detail: "Context built from RAG corpus, dependencies, recent changes, and observability connectors.",
+      tables: "incident_events, agent_work_items",
+      inputValueText: stringifyTimelineValue({
+        service: alert.service,
+        deployment: context.deployment,
+        related_incidents: Array.isArray(context.related_incidents) ? context.related_incidents.length : 0,
+      }),
+      outputValueText: stringifyTimelineValue({
+        rag_documents: ragDocuments ?? "-",
+        rag_matches: ragMatches,
+        runbook_found: runbookFound,
+      }),
+      errorValueText: "",
+      backendEvents: findTraceEvents(["context.collected"]),
+    });
+  }
+
+  if (ragMatches.length || (typeof ragTopSimilarity === "number" && ragTopSimilarity > 0)) {
+    rows.push({
+      stage: "Embedding And Semantic Search",
+      agent: "VectorDB Connector",
+      service: "context-agent",
+      consumes: "context query",
+      publishes: "ranked rag matches",
+      timestamp: contextTimestamp,
+      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, contextTimestamp),
+      detail: "Vector similarity and metadata ranking used to retrieve the most relevant runbook, incident, and deployment documents.",
+      tables: "rag corpus",
+      inputValueText: stringifyTimelineValue({
+        query: `${alert.service || ""} ${alert.name || ""} ${alert.description || ""}`.trim(),
+        rag_document_count: ragDocuments,
+      }),
+      outputValueText: stringifyTimelineValue({
+        rag_top_similarity: ragTopSimilarity ?? "-",
+        top_matches: ragMatches.slice(0, 5),
+      }),
+      errorValueText: "",
+      backendEvents: findTraceEvents(["context.collected", "recommendation.generated"]),
+    });
+  }
+
+  if (hasMeaningfulValue(decision) || routingTimestamp) {
+    rows.push({
+      stage: "Routing And Metadata Policy",
+      agent: "Orchestrator Agent",
+      service: "orchestrator",
+      consumes: "enriched-alerts",
+      publishes: "orchestration-events",
+      timestamp: routingTimestamp,
+      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, routingTimestamp),
+      detail: "Workflow routing policy selected with risk tier, execution mode, and transport provider metadata.",
+      tables: "incident_events, incident_projections",
+      inputValueText: stringifyTimelineValue({
+        workflow: decision.workflow,
+        next_action: decision.next_action,
+        requires_approval: decision.requires_approval,
+      }),
+      outputValueText: stringifyTimelineValue({
+        risk_tier: decision.risk_tier,
+        execution_mode: decision.execution_mode,
+        policy_version: decision.policy_version,
+        message_bus_provider: decision.message_bus_provider,
+      }),
+      errorValueText: "",
+      backendEvents: findTraceEvents(["workflow.selected", "recommendation.generated", "approval.recorded"]),
+    });
+  }
+
+  if (executionCommands.length || hasMeaningfulValue(remediationAction.output) || remediationTimestamp) {
+    const remediationParameters =
+      typeof remediationAction.parameters === "object" && remediationAction.parameters
+        ? remediationAction.parameters
+        : {};
+    const executionPlan =
+      typeof remediationParameters.execution_plan === "object" && remediationParameters.execution_plan
+        ? remediationParameters.execution_plan
+        : {};
+    const remediationExecuted = hasMeaningfulValue(remediationAction.status) || hasMeaningfulValue(remediationAction.output);
+    rows.push({
+      stage: "Remediation Command Execution",
+      agent: "Remediation Automation Engine",
+      service: "remediation-engine",
+      consumes: "approval-events",
+      publishes: "remediation-events",
+      timestamp: remediationTimestamp,
+      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, remediationTimestamp),
+      detail: remediationExecuted
+        ? "Approved remediation action executed with command/script payload and execution status captured."
+        : "Planned remediation command/script/query preview generated; awaiting approval or execution.",
+      tables: "actions, audit_logs, incident_events",
+      inputValueText: stringifyTimelineValue({
+        mode: remediationExecuted ? "executed" : "preview",
+        action_type: remediationAction.action_type,
+        target: remediationAction.target,
+        commands: Array.isArray(executionPlan.commands) ? executionPlan.commands : executionCommands,
+        scripts: Array.isArray(executionPlan.scripts) ? executionPlan.scripts : [],
+        queries: Array.isArray(executionPlan.queries) ? executionPlan.queries : [],
+      }),
+      outputValueText: stringifyTimelineValue({
+        status: remediationAction.status || (remediationExecuted ? "-" : "pending"),
+        output: remediationAction.output,
+        error: remediationAction.error,
+      }),
+      errorValueText: stringifyTimelineValue(remediationAction.error),
+      backendEvents: findTraceEvents(["remediation.executed", "closure.completed"]),
+    });
+  }
+
+  return rows;
 }
 
 function summarizeEventType(value) {
@@ -686,6 +1098,37 @@ function summarizeEventType(value) {
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" -> ");
+}
+
+function timelinePhaseOrder(row) {
+  const stage = String(row?.stage || "").toLowerCase();
+  const eventHints = Array.isArray(row?.backendEvents)
+    ? row.backendEvents.map((item) => String(item || "").toLowerCase())
+    : [];
+  const haystack = `${stage} ${eventHints.join(" ")}`;
+
+  if (haystack.includes("landing pad") || haystack.includes("alert received") || haystack.includes("alert landed") || haystack.includes("incident.alert")) {
+    return 0;
+  }
+  if (haystack.includes("dedup") || haystack.includes("correlation") || haystack.includes("enrich")) {
+    return 1;
+  }
+  if (haystack.includes("rag context") || haystack.includes("context retrieval") || haystack.includes("context intelligence") || haystack.includes("incident.context.collected")) {
+    return 2;
+  }
+  if (haystack.includes("embedding") || haystack.includes("semantic") || haystack.includes("vector")) {
+    return 3;
+  }
+  if (haystack.includes("routing") || haystack.includes("policy") || haystack.includes("workflow") || haystack.includes("recommendation")) {
+    return 4;
+  }
+  if (haystack.includes("approval")) {
+    return 5;
+  }
+  if (haystack.includes("remediation") || haystack.includes("command") || haystack.includes("execute") || haystack.includes("closure")) {
+    return 6;
+  }
+  return 99;
 }
 
 function buildAlertDocumentDrafts(alertRow, workflowPayload) {
@@ -953,11 +1396,209 @@ function FlowTimelineGraph({ rows }) {
   if (!timelineRows.length) {
     return <p className="subtitle">No timeline data found for selected alert.</p>;
   }
+
+  const parseMaybeJson = (value) => {
+    const text = String(value || "").trim();
+    if (!text) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(text);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch (_error) {
+      return null;
+    }
+  };
+
+  const classifyStage = (row) => {
+    const stage = String(row?.stage || "").toLowerCase();
+    if (stage.includes("landing pad") || stage.includes("alert received") || stage.includes("alert landed")) {
+      return { kind: "ingestion", short: "ING", label: "Landing Pad" };
+    }
+    if (stage.includes("dedup") || stage.includes("correlation") || stage.includes("enrich")) {
+      return { kind: "dedupe", short: "DED", label: "Dedup" };
+    }
+    if (stage.includes("rag context") || stage.includes("context retrieval") || stage.includes("context intelligence")) {
+      return { kind: "rag", short: "RAG", label: "RAG" };
+    }
+    if (stage.includes("embedding") || stage.includes("semantic") || stage.includes("vector")) {
+      return { kind: "semantic", short: "SEM", label: "Semantic" };
+    }
+    if (stage.includes("routing") || stage.includes("policy") || stage.includes("workflow")) {
+      return { kind: "policy", short: "POL", label: "Policy" };
+    }
+    if (stage.includes("remediation") || stage.includes("command") || stage.includes("execute")) {
+      return { kind: "execution", short: "CMD", label: "Execution" };
+    }
+    return { kind: "generic", short: "EVT", label: "Event" };
+  };
+
+  const getRowBackendEvents = (row) => {
+    const input = parseMaybeJson(row?.inputValueText);
+    const output = parseMaybeJson(row?.outputValueText);
+    const rawEvents = Array.from(
+      new Set(
+        [
+          ...(Array.isArray(row?.backendEvents) ? row.backendEvents : []),
+          String(input?.event_type || "").trim(),
+          String(output?.event_type || "").trim(),
+        ].filter(Boolean)
+      )
+    );
+
+    const orderHints = [
+      "incident.alert",
+      "incident.workflow.selected",
+      "incident.context.collected",
+      "incident.recommendation.generated",
+      "incident.approval.requested",
+      "incident.approval.recorded",
+      "incident.remediation.executed",
+      "incident.closure.completed",
+    ];
+
+    const eventWeight = (eventName) => {
+      const normalized = String(eventName || "").toLowerCase();
+      const index = orderHints.findIndex((hint) => normalized.includes(hint));
+      return index === -1 ? orderHints.length : index;
+    };
+
+    return rawEvents
+      .slice()
+      .sort((left, right) => {
+        const leftWeight = eventWeight(left);
+        const rightWeight = eventWeight(right);
+        if (leftWeight !== rightWeight) {
+          return leftWeight - rightWeight;
+        }
+        return String(left).localeCompare(String(right));
+      });
+  };
+
+  const explainBackground = (row, stageMeta) => {
+    const input = parseMaybeJson(row?.inputValueText);
+    const output = parseMaybeJson(row?.outputValueText);
+    const topicIn = String(row?.consumes || "-");
+    const topicOut = String(row?.publishes || "-");
+    const dbTables = String(row?.tables || "-");
+    const mergedBackendEvents = getRowBackendEvents(row);
+    const eventStage = String(output?.event_stage || input?.event_stage || row?.detail || "-").trim() || "-";
+    const eventStatus = String(output?.status || input?.status || "-").trim() || "-";
+    const traceId = String(output?.trace_id || input?.trace_id || "-").trim() || "-";
+
+    return [
+      `stage_kind: ${stageMeta.kind}`,
+      `backend_events: ${mergedBackendEvents.length ? mergedBackendEvents.join(" | ") : "none"}`,
+      `source_topic: ${topicIn}`,
+      `target_topic: ${topicOut}`,
+      `tables_touched: ${dbTables}`,
+      `event_stage: ${eventStage}`,
+      `event_status: ${eventStatus}`,
+      `trace_id: ${traceId}`,
+    ].join("\n");
+  };
+
+  const copyPlanStep = async (value) => {
+    const text = String(value || "").trim();
+    if (!text || typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (_error) {
+      // Best-effort copy for operator convenience.
+    }
+  };
+
+  const extractExecutionPlan = (row) => {
+    const input = parseMaybeJson(row?.inputValueText);
+    const commands = [];
+    const scripts = [];
+    const queries = [];
+
+    const classifyLine = (raw) => {
+      const token = String(raw || "").trim();
+      if (!token) {
+        return;
+      }
+      const lowered = token.toLowerCase();
+      if (lowered.startsWith("cmd:")) {
+        commands.push(token.slice(4).trim());
+        return;
+      }
+      if (lowered.startsWith("script:")) {
+        scripts.push(token.slice(7).trim());
+        return;
+      }
+      if (lowered.startsWith("query:")) {
+        queries.push(token.slice(6).trim());
+        return;
+      }
+      commands.push(token);
+    };
+
+    (Array.isArray(input?.commands) ? input.commands : []).forEach(classifyLine);
+    (Array.isArray(input?.scripts) ? input.scripts : []).forEach((item) => scripts.push(String(item || "").trim()));
+    (Array.isArray(input?.queries) ? input.queries : []).forEach((item) => queries.push(String(item || "").trim()));
+
+    return {
+      commands: commands.filter(Boolean),
+      scripts: scripts.filter(Boolean),
+      queries: queries.filter(Boolean),
+    };
+  };
+
+  const phaseBlueprint = [
+    { kind: "ingestion", label: "Landing" },
+    { kind: "dedupe", label: "Dedup" },
+    { kind: "rag", label: "RAG" },
+    { kind: "semantic", label: "Semantic" },
+    { kind: "policy", label: "Policy" },
+    { kind: "execution", label: "Execution" },
+  ];
+  const presentKinds = new Set(timelineRows.map((row) => classifyStage(row).kind));
+  const errorCount = timelineRows.filter((row) => hasMeaningfulValue(row?.errorValueText)).length;
+
   return (
     <div className="timeline-graph">
+      <div className="timeline-summary-strip">
+        <div className="timeline-summary-metric">
+          <strong>{timelineRows.length}</strong>
+          <span>Total Stages</span>
+        </div>
+        <div className="timeline-summary-metric">
+          <strong>{phaseBlueprint.filter((phase) => presentKinds.has(phase.kind)).length}/{phaseBlueprint.length}</strong>
+          <span>Pipeline Coverage</span>
+        </div>
+        <div className="timeline-summary-metric">
+          <strong>{Math.max(0, timelineRows.length - errorCount)}</strong>
+          <span>Successful Stages</span>
+        </div>
+        <div className="timeline-phase-strip">
+          {phaseBlueprint.map((phase) => {
+            const active = presentKinds.has(phase.kind);
+            return (
+              <span
+                key={`phase-${phase.kind}`}
+                className={`timeline-phase-pill phase-${phase.kind} ${active ? "is-active" : "is-missing"}`}
+                title={active ? `${phase.label} observed` : `${phase.label} not observed in this run`}
+              >
+                {phase.label}
+              </span>
+            );
+          })}
+        </div>
+      </div>
       {timelineRows.map((row, index) => (
+        (() => {
+          const stageMeta = classifyStage(row);
+          const backendEvents = getRowBackendEvents(row);
+          const executionPlan = extractExecutionPlan(row);
+          const hasExecutionPlan = stageMeta.kind === "execution"
+            && (executionPlan.commands.length || executionPlan.scripts.length || executionPlan.queries.length);
+          return (
         <article
-          className="timeline-node"
+          className={`timeline-node stage-${stageMeta.kind} ${hasMeaningfulValue(row?.errorValueText) ? "timeline-has-error" : ""}`}
           key={`timeline-node-${index}`}
           style={{ animationDelay: `${Math.min(index * 70, 560)}ms` }}
         >
@@ -967,7 +1608,11 @@ function FlowTimelineGraph({ rows }) {
           </div>
           <div className="timeline-body">
             <div className="timeline-headline">
-              <strong>{row.stage || "-"}</strong>
+              <strong>
+                <span className={`timeline-stage-badge stage-${stageMeta.kind}`}>{stageMeta.short}</span>
+                {" "}
+                {row.stage || "-"}
+              </strong>
               <span>{formatUtcTimestamp(row.timestamp)}</span>
             </div>
             <div className="timeline-meta">
@@ -988,19 +1633,67 @@ function FlowTimelineGraph({ rows }) {
                 <pre className="result">{row.outputValueText}</pre>
               </details>
             ) : null}
+            {hasExecutionPlan ? (
+              <details open>
+                <summary>Resolution Plan (Commands, Scripts, Queries)</summary>
+                <div className="timeline-plan-grid">
+                  <div className="timeline-plan-section">
+                    <h4>Commands</h4>
+                    {executionPlan.commands.length ? executionPlan.commands.map((step, stepIndex) => (
+                      <div className="timeline-plan-row" key={`cmd-${index}-${stepIndex}`}>
+                        <pre className="result">{step}</pre>
+                        <button type="button" className="timeline-copy-btn" onClick={() => copyPlanStep(step)}>Copy</button>
+                      </div>
+                    )) : <p className="subtitle">No command steps.</p>}
+                  </div>
+                  <div className="timeline-plan-section">
+                    <h4>Scripts</h4>
+                    {executionPlan.scripts.length ? executionPlan.scripts.map((step, stepIndex) => (
+                      <div className="timeline-plan-row" key={`script-${index}-${stepIndex}`}>
+                        <pre className="result">{step}</pre>
+                        <button type="button" className="timeline-copy-btn" onClick={() => copyPlanStep(step)}>Copy</button>
+                      </div>
+                    )) : <p className="subtitle">No script steps.</p>}
+                  </div>
+                  <div className="timeline-plan-section">
+                    <h4>Queries</h4>
+                    {executionPlan.queries.length ? executionPlan.queries.map((step, stepIndex) => (
+                      <div className="timeline-plan-row" key={`query-${index}-${stepIndex}`}>
+                        <pre className="result">{step}</pre>
+                        <button type="button" className="timeline-copy-btn" onClick={() => copyPlanStep(step)}>Copy</button>
+                      </div>
+                    )) : <p className="subtitle">No validation queries.</p>}
+                  </div>
+                </div>
+              </details>
+            ) : null}
             {row.errorValueText ? (
               <details open>
                 <summary>Error</summary>
                 <pre className="result">{row.errorValueText}</pre>
               </details>
             ) : null}
+            <details>
+              <summary>How This Worked In Background</summary>
+              <pre className="result">{explainBackground(row, stageMeta)}</pre>
+            </details>
             <div className="timeline-tags">
               <span className="timeline-tag">in: {row.consumes || "-"}</span>
               <span className="timeline-tag">out: {row.publishes || "-"}</span>
               <span className="timeline-tag">db: {row.tables || "-"}</span>
             </div>
+            <div className="timeline-backend-events">
+              <span className="timeline-backend-label">backend:</span>
+              {backendEvents.length ? backendEvents.map((eventName, eventIndex) => (
+                <span className="timeline-backend-chip" key={`backend-${index}-${eventIndex}`}>
+                  {eventName}
+                </span>
+              )) : <span className="timeline-backend-chip is-empty">none</span>}
+            </div>
           </div>
         </article>
+          );
+        })()
       ))}
     </div>
   );
@@ -1011,44 +1704,110 @@ function AgentEventsGraph({ rows }) {
   if (!eventRows.length) {
     return <p className="subtitle">No events found for selected alert.</p>;
   }
+
+  const flowNodes = [
+    { id: "alert-intelligence", label: "Alert Intelligence Agent", short: "A1" },
+    { id: "orchestrator", label: "Master Agent", short: "M" },
+    { id: "context-agent", label: "Context Intelligence Agent", short: "C" },
+    { id: "resolution-agent", label: "Resolution Intelligence Agent", short: "R" },
+    { id: "approval-service", label: "Human Approval Layer", short: "H" },
+    { id: "remediation-engine", label: "Remediation Automation Engine", short: "X" },
+    { id: "closure-service", label: "Validator Agent", short: "V" },
+  ];
+
+  const detectAgentId = (row) => {
+    const haystack = [row?.agent, row?.action, row?.backgroundDetailText]
+      .map((item) => String(item || "").toLowerCase())
+      .join(" | ");
+    if (haystack.includes("alert intelligence")) {
+      return "alert-intelligence";
+    }
+    if (haystack.includes("master agent") || haystack.includes("orchestrator")) {
+      return "orchestrator";
+    }
+    if (haystack.includes("context intelligence") || haystack.includes("context-agent")) {
+      return "context-agent";
+    }
+    if (haystack.includes("resolution intelligence") || haystack.includes("resolution-agent") || haystack.includes("recommendation")) {
+      return "resolution-agent";
+    }
+    if (haystack.includes("approval") || haystack.includes("human approval")) {
+      return "approval-service";
+    }
+    if (haystack.includes("remediation")) {
+      return "remediation-engine";
+    }
+    if (haystack.includes("validator") || haystack.includes("closure")) {
+      return "closure-service";
+    }
+    return "";
+  };
+
+  const groupedRows = new Map(flowNodes.map((node) => [node.id, []]));
+  eventRows.forEach((row) => {
+    const id = detectAgentId(row);
+    if (!id || !groupedRows.has(id)) {
+      return;
+    }
+    groupedRows.get(id).push(row);
+  });
+
   return (
-    <div className="agent-events-graph">
-      {eventRows.map((row, index) => (
-        <article
-          className="agent-event-card"
-          key={`agent-event-${index}`}
-          style={{ animationDelay: `${Math.min(index * 60, 480)}ms` }}
-        >
-          <div className="agent-event-step">{row.sequence || index + 1}</div>
-          <div className="agent-event-body">
-            <strong>{row.agent || "-"}</strong>
-            <p>{row.action || "-"}</p>
-            <div className="agent-event-kv">
-              <span>Decision: {compactText(row.decision, 120) || "-"}</span>
-              <span>Output: {compactText(row.output, 120) || "-"}</span>
-              <span>Next: {row.communicates_to || "-"}</span>
+    <div className="agent-dag-flow">
+      <div className="agent-dag-track">
+        {flowNodes.map((node, index) => {
+          const rowsForNode = (groupedRows.get(node.id) || [])
+            .slice()
+            .sort((a, b) => toFiniteNumber(a?.sequence) - toFiniteNumber(b?.sequence));
+          const latest = rowsForNode[rowsForNode.length - 1] || null;
+          const hasError = Boolean(String(latest?.errorValueText || "").trim());
+          const statusLabel = latest
+            ? (hasError ? "error" : "observed")
+            : "missing";
+
+          return (
+            <div key={`agent-dag-${node.id}`} className="agent-dag-segment" style={{ animationDelay: `${Math.min(index * 70, 560)}ms` }}>
+              <article className={`agent-dag-node status-${statusLabel}`}>
+                <div className="agent-dag-head">
+                  <span className="agent-dag-badge">{node.short}</span>
+                  <strong>{node.label}</strong>
+                  <span className={`agent-dag-status status-${statusLabel}`}>{statusLabel}</span>
+                </div>
+                <p>{latest?.action || "No agent event captured yet."}</p>
+                <div className="agent-event-kv">
+                  <span>Decision: {compactText(latest?.decision, 140) || "-"}</span>
+                  <span>Output: {compactText(latest?.output, 140) || "-"}</span>
+                  <span>Next: {latest?.communicates_to || "-"}</span>
+                  <span>Events: {rowsForNode.length}</span>
+                </div>
+                {latest?.backgroundDetailText ? (
+                  <details>
+                    <summary>Background Details</summary>
+                    <pre className="result">{latest.backgroundDetailText}</pre>
+                  </details>
+                ) : null}
+                {rowsForNode.length ? (
+                  <details>
+                    <summary>Agent Event Timeline ({rowsForNode.length})</summary>
+                    <div className="agent-event-rows">
+                      {rowsForNode.map((row, rowIndex) => (
+                        <div key={`agent-node-${node.id}-row-${rowIndex}`} className="agent-event-row timeline">
+                          <strong>{row.sequence || rowIndex + 1}.</strong>
+                          <span>{compactText(row.action, 120) || "-"}</span>
+                          <span>{compactText(row.decision, 120) || "-"}</span>
+                          <span>{formatUtcTimestamp(row.timestamp)}</span>
+                          <span>{row.eventType || "-"}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                ) : null}
+              </article>
+              {index < flowNodes.length - 1 ? <div className="agent-dag-arrow" aria-hidden="true">→</div> : null}
             </div>
-            {row.inputValueText ? (
-              <details>
-                <summary>Input Value</summary>
-                <pre className="result">{row.inputValueText}</pre>
-              </details>
-            ) : null}
-            {row.outputValueText ? (
-              <details>
-                <summary>Output Value</summary>
-                <pre className="result">{row.outputValueText}</pre>
-              </details>
-            ) : null}
-            {row.errorValueText ? (
-              <details open>
-                <summary>Error</summary>
-                <pre className="result">{row.errorValueText}</pre>
-              </details>
-            ) : null}
-          </div>
-        </article>
-      ))}
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -1136,7 +1895,7 @@ function renderHtmlTable(headers, rows) {
 }
 
 export default function App() {
-  const defaultMonitorApplications = ["payments", "checkout", "orders-db", "inventory", "kaiops-core"];
+  const defaultMonitorApplications = ["payments", "kaiops-core"];
   const [applicationToMonitor, setApplicationToMonitor] = useState("payments");
   const [monitorApplications, setMonitorApplications] = useState(defaultMonitorApplications);
   const [activeTab, setActiveTab] = useState("home");
@@ -1336,6 +2095,7 @@ export default function App() {
   const alertDetailsRef = useRef(null);
   const docPromptRef = useRef(null);
   const approvalQueueRef = useRef(null);
+  const monitoringInspectRef = useRef(null);
 
   const formValid = useMemo(() => {
     return [form.source, form.name, form.service, form.severity, form.description].every((v) => String(v || "").trim());
@@ -1475,6 +2235,15 @@ export default function App() {
     event.preventDefault();
     setMonitoringAppSubmit({ loading: true, error: "", success: "" });
     try {
+      const metricsEndpoint = String(monitoringAppForm.metrics_endpoint || "").trim() || "http://api-gateway:8000/metrics";
+      if (!/^https?:\/\//i.test(metricsEndpoint)) {
+        setMonitoringAppSubmit({
+          loading: false,
+          error: "Metrics Endpoint must start with http:// or https:// (for example, http://api-gateway:8000/metrics).",
+          success: "",
+        });
+        return;
+      }
       const labels = Object.fromEntries(
         String(monitoringAppForm.labels_text || "")
           .split(",")
@@ -1495,7 +2264,7 @@ export default function App() {
         namespace: monitoringAppForm.namespace,
         region: monitoringAppForm.region,
         technology: monitoringAppForm.technology,
-        metrics_endpoint: monitoringAppForm.metrics_endpoint || "http://api-gateway:8000/metrics",
+        metrics_endpoint: metricsEndpoint,
         monitoring_platform: "prometheus",
         labels,
       };
@@ -1814,6 +2583,7 @@ export default function App() {
           return base;
         })
         .filter(Boolean);
+<<<<<<< HEAD
       const isDisplayableMonitorApp = (value) => {
         const normalized = String(value || "").trim();
         if (!normalized) {
@@ -1833,6 +2603,14 @@ export default function App() {
       const unique = Array.from(
         new Set([...defaultMonitorApplications, ...projects, ...monitoringApplications, ...alertApplications].filter(isDisplayableMonitorApp)),
       );
+=======
+      const allowedMonitorApplication = (value) => {
+        const normalized = String(value || "").trim().toLowerCase();
+        return normalized === "payments" || normalized.startsWith("kaiops");
+      };
+      const unique = Array.from(new Set([...defaultMonitorApplications, ...projects, ...monitoringApplications, ...alertApplications]))
+        .filter((name) => allowedMonitorApplication(name));
+>>>>>>> 591f08d4c47fb4d45954c1902c8c3ea3f2913d43
       setMonitorApplications(unique.length ? unique : defaultMonitorApplications);
     } catch (_error) {
       setMonitorApplications(defaultMonitorApplications);
@@ -3275,6 +4053,25 @@ export default function App() {
   }, [selectedAlertWorkflow]);
 
   const selectedAlertEventsDisplay = useMemo(() => {
+    const buildBackgroundDetailText = (event) => {
+      const items = [
+        ["event_type", event?.event_type],
+        ["event_stage", event?.event_stage],
+        ["status", event?.status],
+        ["source_channel", event?.source_channel],
+        ["transport_channel", event?.transport_channel],
+        ["transport_provider", event?.transport_provider],
+        ["risk_tier", event?.risk_tier],
+        ["execution_mode", event?.execution_mode],
+        ["policy_reason", event?.policy_reason],
+        ["trace_id", event?.trace_id],
+      ]
+        .map(([key, value]) => [key, String(value || "").trim()])
+        .filter(([, value]) => value && value !== "-")
+        .map(([key, value]) => `${key}: ${value}`);
+      return items.join("\n");
+    };
+
     const mappedEvents = selectedAlertEvents.map((event, index) => {
       const decision = event?.decision;
       const inputValue = extractEventInput(event);
@@ -3284,12 +4081,15 @@ export default function App() {
         sequence: event?.sequence || index + 1,
         agent: displayAgentName(event?.agent || normalizeTraceServiceName(event) || "-"),
         action: event?.action || event?.event_type || event?.status || "-",
+        eventType: event?.event_type || "",
+        timestamp: event?.timestamp || "",
         decision: decision && typeof decision === "object" ? JSON.stringify(decision) : String(decision || "-"),
         output: stringifyTimelineValue(outputValue) || String(event?.event_type || "-"),
         communicates_to: event?.communicates_to || event?.transport_channel || input?.transport_channel || "-",
         inputValueText: stringifyTimelineValue(inputValue),
         outputValueText: stringifyTimelineValue(outputValue),
         errorValueText: extractEventError(event),
+        backgroundDetailText: buildBackgroundDetailText(event),
       };
     });
 
@@ -3300,23 +4100,41 @@ export default function App() {
         sequence: index + 1,
         agent: displayAgentName(normalizeTraceServiceName(row)),
         action: summarizeEventType(row?.event_type),
+        eventType: row?.event_type || "",
+        timestamp: row?.timestamp || "",
         decision: row?.policy_reason || row?.status || row?.event_stage || "-",
         output: stringifyTimelineValue(outputValue) || row?.event_type || "-",
         communicates_to: row?.transport_channel || "-",
         inputValueText: stringifyTimelineValue(inputValue),
         outputValueText: stringifyTimelineValue(outputValue),
         errorValueText: extractEventError(row),
+        backgroundDetailText: buildBackgroundDetailText(row),
       };
     });
 
-    if (traceRows.length) {
-      return traceRows;
+    if (!traceRows.length) {
+      return mappedEvents.map((row, index) => ({
+        ...row,
+        sequence: index + 1,
+      }));
     }
 
-    return mappedEvents.map((row, index) => ({
-      ...row,
-      sequence: index + 1,
-    }));
+    const mergedRows = [...mappedEvents];
+    const seen = new Set(
+      mappedEvents.map((row) => `${String(row.agent || "").toLowerCase()}|${String(row.action || "").toLowerCase()}|${String(row.decision || "").toLowerCase()}`)
+    );
+
+    traceRows.forEach((row) => {
+      const key = `${String(row.agent || "").toLowerCase()}|${String(row.action || "").toLowerCase()}|${String(row.decision || "").toLowerCase()}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        mergedRows.push(row);
+      }
+    });
+
+    return mergedRows
+      .map((row, index) => ({ ...row, sequence: index + 1 }))
+      .slice(0, 300);
   }, [selectedAlertEvents, selectedAlertEventTrace]);
 
   const selectedAlertUsage = useMemo(() => {
@@ -3328,19 +4146,67 @@ export default function App() {
       candidate.forEach((item) => rows.push(normalizeUsageRow(item)));
     };
 
+    const appendErrorUsage = (candidate) => {
+      if (!Array.isArray(candidate)) {
+        return;
+      }
+      candidate
+        .filter((item) => item && typeof item === "object")
+        .forEach((item) => {
+          rows.push(normalizeUsageRow({
+            task: item.task || item.agent || "llm-error",
+            provider: item.provider || item.model_provider || "router",
+            model: item.model || item.model_name || "-",
+            note: item.error || item.message || item.reason || JSON.stringify(item),
+            estimated: true,
+          }));
+        });
+    };
+
     appendUsage(selectedAlertWorkflow?.recommendation?.metadata?.model_usage);
     appendUsage(selectedAlertWorkflow?.finops?.calls);
     appendUsage(selectedAlertWorkflow?.recommendation?.metadata?.llm_calls);
+    appendErrorUsage(selectedAlertWorkflow?.finops?.errors);
 
     selectedAlertEventTrace.forEach((event) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
       appendUsage(payload?.model_usage);
       appendUsage(payload?.llm_calls);
       appendUsage(payload?.finops?.calls);
+      appendErrorUsage(payload?.finops?.errors);
     });
 
     return rows.filter((row) => isMeaningfulUsageRow(row));
   }, [selectedAlertWorkflow, selectedAlertEventTrace]);
+
+  const selectedFinopsDiagnostics = useMemo(() => {
+    const workflowCalls = Array.isArray(selectedAlertWorkflow?.finops?.calls)
+      ? selectedAlertWorkflow.finops.calls.length
+      : 0;
+    const workflowErrors = Array.isArray(selectedAlertWorkflow?.finops?.errors)
+      ? selectedAlertWorkflow.finops.errors.length
+      : 0;
+    const recommendationUsage = Array.isArray(selectedAlertWorkflow?.recommendation?.metadata?.model_usage)
+      ? selectedAlertWorkflow.recommendation.metadata.model_usage.length
+      : 0;
+
+    let traceCalls = 0;
+    let traceErrors = 0;
+    selectedAlertEventTrace.forEach((row) => {
+      const payload = row?.payload && typeof row.payload === "object" ? row.payload : {};
+      traceCalls += Array.isArray(payload?.finops?.calls) ? payload.finops.calls.length : 0;
+      traceErrors += Array.isArray(payload?.finops?.errors) ? payload.finops.errors.length : 0;
+    });
+
+    return {
+      usageRows: selectedAlertUsage.length,
+      workflowCalls,
+      workflowErrors,
+      recommendationUsage,
+      traceCalls,
+      traceErrors,
+    };
+  }, [selectedAlertWorkflow, selectedAlertEventTrace, selectedAlertUsage]);
 
   const selectedAlertRouting = useMemo(() => extractObservedRoutingMetrics(selectedAlertWorkflow), [selectedAlertWorkflow]);
 
@@ -3462,6 +4328,7 @@ export default function App() {
 
         return {
           stage: stageName,
+          sequence: event.sequence || index + 1,
           agent: displayAgentName(event.agent || "-"),
           service: route?.service || event.service || "-",
           consumes,
@@ -3473,6 +4340,7 @@ export default function App() {
           inputValueText: stringifyTimelineValue(inputPayload),
           outputValueText: stringifyTimelineValue(outputPayload),
           errorValueText: extractEventError(event),
+          backendEvents: [String(event?.event_type || "").trim()].filter(Boolean),
         };
       });
 
@@ -3486,6 +4354,7 @@ export default function App() {
       ].filter(Boolean);
       return {
         stage: `${stageName}${index + 1 <= 9 ? ` (${index + 1})` : ""}`,
+        sequence: index + 1,
         agent: displayAgentName(normalizeTraceServiceName(event)),
         service: normalizeTraceServiceName(event),
         consumes: event.source_channel || "-",
@@ -3518,11 +4387,51 @@ export default function App() {
               }
         ),
         errorValueText: stringifyTimelineValue(event.error) || extractEventError(event),
+        backendEvents: [String(event?.event_type || "").trim()].filter(Boolean),
       };
     });
 
-    const sourceRows = traceRows.length ? traceRows : workflowRows;
-    const rows = sourceRows.filter(
+    const syntheticRows = buildSyntheticFlowRows({
+      workflow: selectedAlertWorkflow,
+      events: selectedAlertEvents,
+      traceRows: selectedAlertEventTrace,
+      ingestAt,
+      incidentCreatedAt,
+    });
+
+    const baseRows = traceRows.length ? traceRows : workflowRows;
+    const orderedRows = [...syntheticRows, ...baseRows]
+      .map((row, index) => ({ ...row, __rowIndex: index }))
+      .sort((left, right) => {
+        const leftPhase = timelinePhaseOrder(left);
+        const rightPhase = timelinePhaseOrder(right);
+        if (leftPhase !== rightPhase) {
+          return leftPhase - rightPhase;
+        }
+
+        const leftTime = parseUtcTimestamp(left.timestamp)?.getTime();
+        const rightTime = parseUtcTimestamp(right.timestamp)?.getTime();
+        const leftHasTime = Number.isFinite(leftTime);
+        const rightHasTime = Number.isFinite(rightTime);
+
+        if (leftHasTime && rightHasTime && leftTime !== rightTime) {
+          return leftTime - rightTime;
+        }
+
+        if (leftHasTime !== rightHasTime) {
+          return leftHasTime ? -1 : 1;
+        }
+
+        const leftSeq = Number(left.sequence || 0);
+        const rightSeq = Number(right.sequence || 0);
+        if (leftSeq && rightSeq && leftSeq !== rightSeq) {
+          return leftSeq - rightSeq;
+        }
+
+        return Number(left.__rowIndex || 0) - Number(right.__rowIndex || 0);
+      });
+
+    const rows = orderedRows.filter(
       (row, index, allRows) => {
         const stage = String(row.stage || "").trim();
         const agent = String(row.agent || "").trim();
@@ -3535,7 +4444,10 @@ export default function App() {
           return `${cStage}|${cAgent}|${cTime}` === key;
         }) === index;
       }
-    );
+    ).map((row) => {
+      const { __rowIndex, ...rest } = row;
+      return rest;
+    });
 
     if (rows.length) {
       return rows;
@@ -4592,6 +5504,18 @@ export default function App() {
   }, [selectedMonitoringAppId]);
 
   useEffect(() => {
+    if (!selectedMonitoringAppId || adminWorkspace !== "monitoring") {
+      return;
+    }
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      monitoringInspectRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }, [selectedMonitoringAppId, adminWorkspace]);
+
+  useEffect(() => {
     if (onboardingProjectMode === "new" || selectedOnboardingProject || !projectOnboardingRows.length) {
       return;
     }
@@ -5611,39 +6535,47 @@ export default function App() {
                   ) : null}
 
                   {homeDetailTab === "finops" ? (
-                    <div className="table-wrap">
-                      <table>
-                        <thead>
-                          <tr>
-                            <th>Task</th>
-                            <th>Provider</th>
-                            <th>Model</th>
-                            <th>Input</th>
-                            <th>Output</th>
-                            <th>Cost USD</th>
-                            <th>Notes</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {selectedAlertUsage.map((row, index) => (
-                            <tr key={`usage-${index}`}>
-                              <td>{row.task || "-"}</td>
-                              <td>{row.provider || "-"}</td>
-                              <td>{row.model || "-"}</td>
-                              <td>{row.input_tokens || "-"}</td>
-                              <td>{row.output_tokens || "-"}</td>
-                              <td>{row.total_cost_usd || "-"}</td>
-                              <td>{compactText(row.note || (row.estimated ? "estimated usage" : ""), 140) || "-"}</td>
-                            </tr>
-                          ))}
-                          {!selectedAlertUsage.length ? (
+                    <>
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
                             <tr>
-                              <td colSpan={7}>No FinOps usage found for selected alert.</td>
+                              <th>Task</th>
+                              <th>Provider</th>
+                              <th>Model</th>
+                              <th>Input</th>
+                              <th>Output</th>
+                              <th>Cost USD</th>
+                              <th>Notes</th>
                             </tr>
-                          ) : null}
-                        </tbody>
-                      </table>
-                    </div>
+                          </thead>
+                          <tbody>
+                            {selectedAlertUsage.map((row, index) => (
+                              <tr key={`usage-${index}`}>
+                                <td>{row.task || "-"}</td>
+                                <td>{row.provider || "-"}</td>
+                                <td>{row.model || "-"}</td>
+                                <td>{row.input_tokens || "-"}</td>
+                                <td>{row.output_tokens || "-"}</td>
+                                <td>{row.total_cost_usd || "-"}</td>
+                                <td>{compactText(row.note || (row.estimated ? "estimated usage" : ""), 140) || "-"}</td>
+                              </tr>
+                            ))}
+                            {!selectedAlertUsage.length ? (
+                              <tr>
+                                <td colSpan={7}>No FinOps usage rows rendered for selected alert.</td>
+                              </tr>
+                            ) : null}
+                          </tbody>
+                        </table>
+                      </div>
+                      <p className="subtitle">
+                        FinOps diagnostics: rendered={selectedFinopsDiagnostics.usageRows}, workflow_calls={selectedFinopsDiagnostics.workflowCalls}, workflow_errors={selectedFinopsDiagnostics.workflowErrors}, recommendation_usage={selectedFinopsDiagnostics.recommendationUsage}, trace_calls={selectedFinopsDiagnostics.traceCalls}, trace_errors={selectedFinopsDiagnostics.traceErrors}
+                      </p>
+                      {!selectedAlertUsage.length ? (
+                        <p className="subtitle">No usage rows means upstream services did not persist model usage/cost entries for this alert payload.</p>
+                      ) : null}
+                    </>
                   ) : null}
 
                   {homeDetailTab === "api" ? (
@@ -6610,7 +7542,7 @@ export default function App() {
                       </div>
                     </article>
 
-                    <article className="panel">
+                    <article className="panel" ref={monitoringInspectRef}>
                       <div className="panel-head">
                         <h3>Selected Application Timeline</h3>
                         <p className="subtitle">{selectedMonitoringAppId || "Select an application to inspect stage history, validations, and dashboards."}</p>
