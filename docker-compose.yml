@@ -48,13 +48,27 @@ x-service-env: &service-env
   RABBITMQ_CONSUMER_MAX_RETRIES: "3"
   RABBITMQ_DLQ_SUFFIX: .dlq
   DATABASE_ENABLED: "true"
-  GCP_PROJECT_ID: ${GCP_PROJECT_ID:-kaiops-local}
-  GCP_PUBSUB_ENABLED: ${GCP_PUBSUB_ENABLED:-true}
-  PUBSUB_EMULATOR_HOST: pubsub-emulator:8085
-  GCP_PUBSUB_TOPIC_PREFIX: kaiops
-  GCP_PUBSUB_SUBSCRIPTION_PREFIX: kaiops
-  GCP_PUBSUB_DLQ_SUFFIX: .dlq
-  GCP_PUBSUB_CONSUMER_MAX_RETRIES: "3"
+  AZURE_SERVICE_BUS_ENABLED: ${AZURE_SERVICE_BUS_ENABLED:-false}
+  AZURE_SERVICE_BUS_CONNECTION_STRING: ${AZURE_SERVICE_BUS_CONNECTION_STRING:-}
+  AZURE_SERVICE_BUS_TOPIC_PREFIX: kaiops
+  AZURE_SERVICE_BUS_SUBSCRIPTION_PREFIX: kaiops
+  AZURE_SERVICE_BUS_DLQ_SUFFIX: .dlq
+  AZURE_SERVICE_BUS_CONSUMER_MAX_RETRIES: "3"
+  AZURE_CONTENT_SAFETY_ENABLED: ${AZURE_CONTENT_SAFETY_ENABLED:-false}
+  AZURE_CONTENT_SAFETY_ENDPOINT: ${AZURE_CONTENT_SAFETY_ENDPOINT:-}
+  AZURE_CONTENT_SAFETY_API_KEY: ${AZURE_CONTENT_SAFETY_API_KEY:-}
+  AZURE_CONTENT_SAFETY_API_VERSION: ${AZURE_CONTENT_SAFETY_API_VERSION:-2024-09-01}
+  AZURE_CONTENT_SAFETY_SANITIZE_RESPONSES: ${AZURE_CONTENT_SAFETY_SANITIZE_RESPONSES:-false}
+  AZURE_OPENAI_EMBEDDINGS_ENABLED: ${AZURE_OPENAI_EMBEDDINGS_ENABLED:-false}
+  AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+  AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+  AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT: ${AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT:-}
+  AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-06-01}
+  AZURE_AI_EVALUATION_ENABLED: ${AZURE_AI_EVALUATION_ENABLED:-false}
+  AZURE_AI_EVALUATION_DEPLOYMENT: ${AZURE_AI_EVALUATION_DEPLOYMENT:-}
+  AZURE_AI_EVALUATION_METRIC: ${AZURE_AI_EVALUATION_METRIC:-coherence}
+  OBSERVABILITY_AZURE_MONITOR_ENABLED: ${OBSERVABILITY_AZURE_MONITOR_ENABLED:-false}
+  AZURE_MONITOR_CONNECTION_STRING: ${AZURE_MONITOR_CONNECTION_STRING:-}
 
 x-service-build: &service-build
   context: .
@@ -117,17 +131,6 @@ services:
       interval: 5s
       timeout: 10s
       retries: 20
-
-  pubsub-emulator:
-    image: gcr.io/google.com/cloudsdktool/cloud-sdk:emulators
-    command: ["gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085", "--project=${GCP_PROJECT_ID:-kaiops-local}"]
-    ports: ["8085:8085"]
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/8085'"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-      start_period: 15s
 
   mysql-exporter:
     image: prom/mysqld-exporter:v0.16.0
@@ -339,7 +342,6 @@ services:
       kafka: { condition: service_healthy }
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
-      pubsub-emulator: { condition: service_healthy }
 
   orchestrator:
     build: *service-build

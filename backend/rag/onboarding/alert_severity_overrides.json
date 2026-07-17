@@ -1,4 +1,14 @@
 {
-  "rules": [],
-  "updated_at": "2026-07-16T11:54:41.963865+00:00"
+  "rules": [
+    {
+      "name": "servicedown",
+      "service": "kaiops-core1",
+      "environment": "prod",
+      "severity": "critical",
+      "requested_by": "admin",
+      "requested_role": "administrator",
+      "updated_at": "2026-07-16T15:37:03.515Z"
+    }
+  ],
+  "updated_at": "2026-07-16T15:37:03.579389+00:00"
 }

@@ -65,12 +65,12 @@ class WorkflowEngine:
         message_bus = self.orchestration_config.get("message_bus", {})
         dynamic_enabled = bool(message_bus.get("dynamic_routing", True))
         default_provider = str(message_bus.get("default_provider", "rabbitmq")).strip().lower()
-        if default_provider not in {"kafka", "rabbitmq", "pubsub"}:
+        if default_provider not in {"kafka", "rabbitmq", "azure-service-bus", "servicebus", "azure"}:
             default_provider = "rabbitmq"
         provider = default_provider
         if dynamic_enabled:
-            if default_provider == "pubsub":
-                provider = "pubsub"
+            if default_provider in {"azure-service-bus", "servicebus", "azure"}:
+                provider = default_provider
             else:
                 provider = "kafka" if normalized_count > self.stream_threshold else "rabbitmq"
         return provider, normalized_count, self.stream_threshold

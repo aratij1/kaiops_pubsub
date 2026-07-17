@@ -228,6 +228,7 @@ async def proxy(
     target_base: str,
     payload: Any,
     trace_id: str,
+    params: dict[str, str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     target_url = f"{target_base.rstrip('/')}/{path.lstrip('/')}"
     headers = {"x-trace-id": trace_id}
@@ -236,7 +237,7 @@ async def proxy(
     async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(1, 6):
             try:
-                response = await client.request(method, target_url, json=payload or None, headers=headers)
+                response = await client.request(method, target_url, json=payload or None, headers=headers, params=params)
                 response.raise_for_status()
                 return response.status_code, response.json()
             except httpx.HTTPStatusError:
@@ -258,6 +259,7 @@ async def guarded_proxy(
     target_base: str,
     payload: Any,
     trace_id: str,
+    params: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     start = perf_counter()
     safety = analyzer.analyze({"path": path, "payload": payload})
@@ -304,6 +306,7 @@ async def guarded_proxy(
                 target_base=target_base,
                 payload=payload,
                 trace_id=trace_id,
+                params=params,
             )
             status = "ok"
         except httpx.HTTPStatusError as exc:
@@ -1417,6 +1420,23 @@ async def list_rag_documents(
         target_base=settings.context_agent_url,
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/rag/documents/content")
+async def get_rag_document_content(
+    request: Request,
+    path: str,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/rag/documents/content",
+        target_base=settings.context_agent_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+        params={"path": path},
     )
 
 

@@ -39,19 +39,20 @@ def valid_payload() -> dict:
     }
 
 
-def valid_gcp_payload() -> dict:
+def valid_azure_payload() -> dict:
     payload = valid_payload()
-    payload["deployment_mode"] = "gcp_cloud"
+    payload["deployment_mode"] = "azure_cloud"
     payload["prometheus_url"] = ""
     payload["new_relic_url"] = ""
     payload["datadog_url"] = ""
-    payload["gcp_project_id"] = "kaiops-prod"
-    payload["gcp_region"] = "us-central1"
-    payload["pubsub_topic"] = "kaiops-orchestration-events"
-    payload["pubsub_subscription"] = "kaiops-orchestration-sub"
-    payload["vertex_model_armor_enabled"] = True
-    payload["vertex_model_armor_template"] = "projects/kaiops-prod/locations/us-central1/templates/default"
-    payload["active_provider"] = "pubsub"
+    payload["azure_subscription_id"] = "00000000-0000-0000-0000-000000000000"
+    payload["azure_resource_group"] = "rg-kaiops-prod"
+    payload["azure_service_bus_namespace"] = "sb-kaiops-prod"
+    payload["azure_service_bus_topic"] = "kaiops-orchestration-events"
+    payload["azure_service_bus_subscription"] = "kaiops-orchestration-sub"
+    payload["azure_content_safety_enabled"] = True
+    payload["azure_content_safety_endpoint"] = "https://kaiops-cs.cognitiveservices.azure.com"
+    payload["active_provider"] = "azure_service_bus"
     return payload
 
 
@@ -155,7 +156,7 @@ async def test_onboarding_connectivity_rejects_invalid_project_and_skips_write(
 
 
 @pytest.mark.asyncio
-async def test_onboarding_connectivity_accepts_gcp_cloud_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_onboarding_connectivity_accepts_azure_cloud_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     module = load_monitoring_app_module()
 
     observed: dict[str, dict] = {}
@@ -170,16 +171,16 @@ async def test_onboarding_connectivity_accepts_gcp_cloud_payload(monkeypatch: py
     monkeypatch.setattr(module, "save_onboarding_connectivity", fake_save_onboarding_connectivity)
     monkeypatch.setattr(module, "persist_onboarding_connectivity", fake_persist_onboarding_connectivity)
 
-    payload = valid_gcp_payload()
+    payload = valid_azure_payload()
     response = await module.post_onboarding_connectivity(payload)
 
-    assert response.connectivity.deployment_mode == "gcp_cloud"
-    assert response.connectivity.gcp_project_id == "kaiops-prod"
-    assert observed["persisted"]["active_provider"] == "pubsub"
+    assert response.connectivity.deployment_mode == "azure_cloud"
+    assert response.connectivity.azure_subscription_id == "00000000-0000-0000-0000-000000000000"
+    assert observed["persisted"]["active_provider"] == "azure_service_bus"
 
 
 @pytest.mark.asyncio
-async def test_onboarding_connectivity_requires_gcp_project_in_cloud_mode(
+async def test_onboarding_connectivity_requires_azure_subscription_in_cloud_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_monitoring_app_module()
@@ -196,12 +197,12 @@ async def test_onboarding_connectivity_requires_gcp_project_in_cloud_mode(
     monkeypatch.setattr(module, "save_onboarding_connectivity", fake_save_onboarding_connectivity)
     monkeypatch.setattr(module, "persist_onboarding_connectivity", fake_persist_onboarding_connectivity)
 
-    payload = valid_gcp_payload()
-    payload["gcp_project_id"] = ""
+    payload = valid_azure_payload()
+    payload["azure_subscription_id"] = ""
 
     with pytest.raises(ValidationError) as exc:
         await module.post_onboarding_connectivity(payload)
 
-    assert "gcp_project_id is required for gcp_cloud mode" in str(exc.value)
+    assert "azure_subscription_id is required for azure_cloud mode" in str(exc.value)
     assert write_called["save"] is False
     assert write_called["persist"] is False

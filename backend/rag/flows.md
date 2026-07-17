@@ -182,6 +182,16 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Summary:** Real Prometheus-based service health monitoring for KaiOps microservices
 - **Recommended Action:** Investigate issue
 
+## KaiOpsServiceDown Incident Summary
+- **Service:** kaiops-core1
+- **Severity:** CRITICAL
+- **Alert Type:** KaiOpsServiceDown
+- **Alert ID:** c455c797-af5d-4abd-8c13-b44b53b5f0db
+- **Summary:** KaiOpsServiceDown detected for kaiops-core1. Impact: Kaiops-Core1 service impact requires immediate triage.
+- **Recommended Action:** Rollback deployment
+- **Root Cause:** Deployment 2.5
+- **Impact:** Kaiops-Core1 service impact requires immediate triage
+
 ## Late Arriving Data
 - **Service:** transaction-feed
 - **Severity:** HIGH

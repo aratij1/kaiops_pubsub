@@ -4,6 +4,7 @@ __pycache__/
 .mypy_cache/
 .venv/
 .env
+.env.azure
 *.pyc
 *.pyo
 *.pyd
@@ -14,6 +15,7 @@ build/
 *.egg-info/
 data/
 logs/local/*.log
+node_modules/
 
 # Generated UI and runtime artifacts
 .tmp-ui-bundle.js

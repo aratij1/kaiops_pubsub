@@ -1,23 +1,23 @@
 {
   "project": {
-    "name": "test",
-    "owner_team": "test",
+    "name": "kaiops-azure-smoke",
+    "owner_team": "platform-ops",
     "environment": "prod",
-    "region": "us-central1"
+    "region": "us-east-1"
   },
   "deployment_mode": "on_prem",
-  "prometheus_url": "",
+  "prometheus_url": "http://prometheus.local:9090/-/ready",
   "new_relic_url": "",
   "datadog_url": "",
   "gcp_project_id": "",
-  "gcp_region": "us-central1",
-  "pubsub_topic": "kaiops-orchestration-events",
-  "pubsub_subscription": "kaiops-orchestration-sub",
+  "gcp_region": "",
+  "pubsub_topic": "",
+  "pubsub_subscription": "",
   "vertex_model_armor_enabled": false,
   "vertex_model_armor_template": "",
   "user_assignments": {
-    "test": [
-      "test"
+    "admin": [
+      "kaiops-azure-smoke"
     ]
   },
   "updated_at": null
