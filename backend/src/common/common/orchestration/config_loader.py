@@ -71,7 +71,7 @@ DEFAULT_ORCHESTRATION_CONFIG: dict[str, Any] = {
     },
 }
 
-_ALLOWED_BUS_PROVIDERS = {"kafka", "rabbitmq", "pubsub"}
+_ALLOWED_BUS_PROVIDERS = {"kafka", "rabbitmq", "azure-service-bus", "servicebus", "azure"}
 
 
 def _default_config_path() -> Path:

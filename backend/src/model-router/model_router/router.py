@@ -438,15 +438,15 @@ class ModelRouter:
     evaluation_client: VertexEvaluationClient = field(default_factory=lambda: VertexEvaluationClient(get_settings()))
 
     async def _attach_evaluation(self, result: dict[str, Any]) -> dict[str, Any]:
-        """Best-effort: scores the response via Vertex AI Gen AI Evaluation.
-        No-op unless VERTEX_EVALUATION_ENABLED=true and GCP_PROJECT_ID is set."""
+        """Best-effort: scores the response via Azure AI evaluation path.
+        No-op unless Azure evaluation settings are enabled and configured."""
         if not self.evaluation_client.enabled:
             return result
         content = str(result.get("content") or "")
         if not content:
             return result
         evaluation = await asyncio.to_thread(
-            self.evaluation_client.evaluate, content, metric=self.settings.vertex_evaluation_metric
+            self.evaluation_client.evaluate, content, metric=self.settings.azure_ai_evaluation_metric
         )
         if evaluation is not None:
             result["evaluation"] = {
