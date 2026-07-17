@@ -6,12 +6,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 _LOCAL_AUTH_PLACEHOLDER_VALUES = {
-    "JWT_SECRET_KEY": "change-me-in-prod",
-    "ADMIN_USER_PASSWORD": "Admin@123456",
-    "EXECUTIVE_USER_PASSWORD": "Executive@123456",
-    "L3_USER_PASSWORD": "L3Engineer@123456",
-    "L2_USER_PASSWORD": "L2Engineer@123456",
-    "L1_USER_PASSWORD": "L1Operator@123456",
+    "JWT_SECRET_KEY": {"change-me-in-prod", "kaiops-local-demo-secret-key-change-me"},
+    "ADMIN_USER_PASSWORD": {"Admin@123456"},
+    "EXECUTIVE_USER_PASSWORD": {"Executive@123456"},
+    "L3_USER_PASSWORD": {"L3Engineer@123456"},
+    "L2_USER_PASSWORD": {"L2Engineer@123456"},
+    "L1_USER_PASSWORD": {"L1Operator@123456"},
 }
 
 _LOCAL_MYSQL_DEFAULT_URL = "mysql+aiomysql://kaiops:kaiops@localhost:3306/kaiops"
@@ -57,20 +57,31 @@ class Settings(BaseSettings):
     message_bus_dynamic_routing: bool = Field(default=True, alias="MESSAGE_BUS_DYNAMIC_ROUTING")
     message_bus_stream_threshold: int = Field(default=500, alias="MESSAGE_BUS_STREAM_THRESHOLD")
     message_bus_default_provider: str = Field(default="rabbitmq", alias="MESSAGE_BUS_DEFAULT_PROVIDER")
-    gcp_project_id: str = Field(default="", alias="GCP_PROJECT_ID")
-    gcp_region: str = Field(default="us-central1", alias="GCP_REGION")
-    gcp_pubsub_topic_prefix: str = Field(default="kaiops", alias="GCP_PUBSUB_TOPIC_PREFIX")
-    gcp_pubsub_enabled: bool = Field(default=False, alias="GCP_PUBSUB_ENABLED")
-    gcp_pubsub_subscription_prefix: str = Field(default="kaiops", alias="GCP_PUBSUB_SUBSCRIPTION_PREFIX")
-    gcp_pubsub_dlq_suffix: str = Field(default=".dlq", alias="GCP_PUBSUB_DLQ_SUFFIX")
-    gcp_pubsub_consumer_max_retries: int = Field(default=3, alias="GCP_PUBSUB_CONSUMER_MAX_RETRIES")
-    gcp_pubsub_pull_max_messages: int = Field(default=10, alias="GCP_PUBSUB_PULL_MAX_MESSAGES")
-    gcp_pubsub_startup_attempts: int = Field(default=30, alias="GCP_PUBSUB_STARTUP_ATTEMPTS")
-    gcp_pubsub_startup_retry_seconds: float = Field(default=2.0, alias="GCP_PUBSUB_STARTUP_RETRY_SECONDS")
-    vertex_model_armor_enabled: bool = Field(default=False, alias="VERTEX_MODEL_ARMOR_ENABLED")
-    vertex_model_armor_template: str = Field(default="", alias="VERTEX_MODEL_ARMOR_TEMPLATE")
-    vertex_model_armor_endpoint: str = Field(default="", alias="VERTEX_MODEL_ARMOR_ENDPOINT")
-    vertex_model_armor_timeout_seconds: float = Field(default=8.0, alias="VERTEX_MODEL_ARMOR_TIMEOUT_SECONDS")
+    azure_service_bus_enabled: bool = Field(default=False, alias="AZURE_SERVICE_BUS_ENABLED")
+    azure_service_bus_connection_string: str = Field(default="", alias="AZURE_SERVICE_BUS_CONNECTION_STRING")
+    azure_service_bus_topic_prefix: str = Field(default="kaiops", alias="AZURE_SERVICE_BUS_TOPIC_PREFIX")
+    azure_service_bus_subscription_prefix: str = Field(default="kaiops", alias="AZURE_SERVICE_BUS_SUBSCRIPTION_PREFIX")
+    azure_service_bus_dlq_suffix: str = Field(default=".dlq", alias="AZURE_SERVICE_BUS_DLQ_SUFFIX")
+    azure_service_bus_consumer_max_retries: int = Field(default=3, alias="AZURE_SERVICE_BUS_CONSUMER_MAX_RETRIES")
+    azure_service_bus_pull_max_messages: int = Field(default=10, alias="AZURE_SERVICE_BUS_PULL_MAX_MESSAGES")
+    azure_content_safety_enabled: bool = Field(default=False, alias="AZURE_CONTENT_SAFETY_ENABLED")
+    azure_content_safety_endpoint: str = Field(default="", alias="AZURE_CONTENT_SAFETY_ENDPOINT")
+    azure_content_safety_api_key: str | None = Field(default=None, alias="AZURE_CONTENT_SAFETY_API_KEY")
+    azure_content_safety_api_version: str = Field(default="2024-09-01", alias="AZURE_CONTENT_SAFETY_API_VERSION")
+    azure_content_safety_timeout_seconds: float = Field(default=8.0, alias="AZURE_CONTENT_SAFETY_TIMEOUT_SECONDS")
+    azure_content_safety_sanitize_responses: bool = Field(default=False, alias="AZURE_CONTENT_SAFETY_SANITIZE_RESPONSES")
+    azure_openai_embeddings_enabled: bool = Field(default=False, alias="AZURE_OPENAI_EMBEDDINGS_ENABLED")
+    azure_openai_endpoint: str = Field(default="", alias="AZURE_OPENAI_ENDPOINT")
+    azure_openai_api_key: str | None = Field(default=None, alias="AZURE_OPENAI_API_KEY")
+    azure_openai_embeddings_deployment: str = Field(default="", alias="AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT")
+    azure_openai_api_version: str = Field(default="2024-06-01", alias="AZURE_OPENAI_API_VERSION")
+    azure_openai_embeddings_timeout_seconds: float = Field(default=8.0, alias="AZURE_OPENAI_EMBEDDINGS_TIMEOUT_SECONDS")
+    azure_ai_evaluation_enabled: bool = Field(default=False, alias="AZURE_AI_EVALUATION_ENABLED")
+    azure_ai_evaluation_deployment: str = Field(default="", alias="AZURE_AI_EVALUATION_DEPLOYMENT")
+    azure_ai_evaluation_metric: str = Field(default="coherence", alias="AZURE_AI_EVALUATION_METRIC")
+    azure_ai_evaluation_timeout_seconds: float = Field(default=8.0, alias="AZURE_AI_EVALUATION_TIMEOUT_SECONDS")
+    observability_azure_monitor_enabled: bool = Field(default=False, alias="OBSERVABILITY_AZURE_MONITOR_ENABLED")
+    azure_monitor_connection_string: str = Field(default="", alias="AZURE_MONITOR_CONNECTION_STRING")
     orchestration_config_path: str = Field(default="", alias="ORCHESTRATION_CONFIG_PATH")
     message_bus_worker_count: int = Field(default=1, alias="MESSAGE_BUS_WORKER_COUNT")
     orchestration_llm_planner_enabled: bool = Field(default=False, alias="ORCHESTRATION_LLM_PLANNER_ENABLED")
@@ -132,7 +143,7 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def configure_database_url(self) -> "Settings":
         profile = str(self.deployment_profile or "onprem").strip().lower()
-        if profile not in {"onprem", "gcp-cloud"}:
+        if profile not in {"onprem", "azure-cloud"}:
             self.deployment_profile = "onprem"
         else:
             self.deployment_profile = profile
@@ -156,8 +167,8 @@ class Settings(BaseSettings):
 
         placeholder_fields = [
             field_name
-            for field_name, placeholder in _LOCAL_AUTH_PLACEHOLDER_VALUES.items()
-            if getattr(self, field_name.lower()) == placeholder
+            for field_name, placeholders in _LOCAL_AUTH_PLACEHOLDER_VALUES.items()
+            if getattr(self, field_name.lower()) in placeholders
         ]
         if placeholder_fields:
             fields = ", ".join(sorted(placeholder_fields))

@@ -30,10 +30,10 @@ def _extract_message_bus_provider(payload: dict[str, Any]) -> str:
     decision = payload.get("decision")
     if isinstance(decision, dict):
         provider = str(decision.get("message_bus_provider", "rabbitmq")).strip().lower()
-        if provider in {"kafka", "rabbitmq", "pubsub"}:
+        if provider in {"kafka", "rabbitmq", "azure-service-bus", "servicebus", "azure"}:
             return provider
     transport = str(payload.get("transport", "")).strip().lower()
-    if transport in {"kafka", "rabbitmq", "pubsub"}:
+    if transport in {"kafka", "rabbitmq", "azure-service-bus", "servicebus", "azure"}:
         return transport
     return "rabbitmq"
 
@@ -246,7 +246,7 @@ app = create_app(title="KaiMS Context Intelligence Agent", settings=settings, st
 
 
 class RagDocumentRequest(BaseModel):
-    kind: str = Field(pattern="^(runbook|incident|deployment|change|dependency)$")
+    kind: str = Field(pattern="^(runbook|incident|deployment|change|dependency|rule)$")
     alert_id: str | None = Field(default=None, max_length=80)
     alert_type: str | None = Field(default=None, max_length=80)
     severity: str | None = Field(default=None, max_length=32)
@@ -291,6 +291,7 @@ def kind_directory(kind: str) -> str:
         "deployment": "deployments",
         "change": "changes",
         "dependency": "dependencies",
+        "rule": "rules",
     }[kind]
 
 
@@ -540,6 +541,9 @@ async def update_rag_document(request: RagDocumentUpdateRequest) -> dict[str, An
     return {"status": "updated", "document_flag_updated": document_flag_updated, **result}
 
 
+_RAG_DOCUMENT_INTERNAL_FIELDS = {"_embedding", "_metadata_embedding", "_synthetic"}
+
+
 @app.get("/rag/documents")
 async def list_rag_documents() -> dict[str, Any]:
     connector = vector_connector()
@@ -547,18 +551,22 @@ async def list_rag_documents() -> dict[str, Any]:
     return {
         "document_count": len(documents),
         "documents": [
-            {
-                "kind": doc.get("kind"),
-                "title": doc.get("title"),
-                "alert_id": doc.get("alert_id"),
-                "alert_type": doc.get("alert_type"),
-                "severity": doc.get("severity"),
-                "services": doc.get("services", []),
-                "path": doc.get("path"),
-            }
+            {key: value for key, value in doc.items() if key not in _RAG_DOCUMENT_INTERNAL_FIELDS}
             for doc in documents
         ],
     }
+
+
+@app.get("/rag/documents/content")
+async def get_rag_document_content(path: str) -> dict[str, Any]:
+    connector = vector_connector()
+    known_paths = {str(doc.get("path", "")) for doc in connector.documents}
+    if path not in known_paths:
+        raise HTTPException(status_code=404, detail="document not found")
+    full_doc = connector._load_full_document(path)
+    if not full_doc:
+        raise HTTPException(status_code=404, detail="document not found")
+    return {key: value for key, value in full_doc.items() if key not in _RAG_DOCUMENT_INTERNAL_FIELDS}
 
 
 @app.post("/rag/reload")

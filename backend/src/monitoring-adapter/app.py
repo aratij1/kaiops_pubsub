@@ -112,8 +112,8 @@ WORKER_FAILURE_COUNTS: dict[str, int] = {
 WORKER_FAILURE_THRESHOLD = max(1, int(os.getenv("WORKER_FAILURE_THRESHOLD", "5") or 5))
 _ALLOWED_PROJECT_ENVIRONMENTS = {"dev", "staging", "prod"}
 _ALLOWED_ONBOARDING_PROVIDERS = {"prometheus", "new_relic", "datadog"}
-_ALLOWED_ACTIVE_PROVIDERS = {"prometheus", "new_relic", "datadog", "pubsub"}
-_ALLOWED_DEPLOYMENT_MODES = {"on_prem", "gcp_cloud"}
+_ALLOWED_ACTIVE_PROVIDERS = {"prometheus", "new_relic", "datadog", "azure_service_bus"}
+_ALLOWED_DEPLOYMENT_MODES = {"on_prem", "azure_cloud"}
 ONBOARDING_RULE_EVENTS = "onboarding-rule-events"
 
 
@@ -183,12 +183,13 @@ class OnboardingConnectivityPayload(BaseModel):
     prometheus_url: str = ""
     new_relic_url: str = ""
     datadog_url: str = ""
-    gcp_project_id: str = ""
-    gcp_region: str = ""
-    pubsub_topic: str = ""
-    pubsub_subscription: str = ""
-    vertex_model_armor_enabled: bool = False
-    vertex_model_armor_template: str = ""
+    azure_subscription_id: str = ""
+    azure_resource_group: str = ""
+    azure_service_bus_namespace: str = ""
+    azure_service_bus_topic: str = ""
+    azure_service_bus_subscription: str = ""
+    azure_content_safety_enabled: bool = False
+    azure_content_safety_endpoint: str = ""
     user_assignments: dict[str, list[str]] = Field(default_factory=dict)
     provider_statuses: dict[str, OnboardingProviderStatus] = Field(default_factory=dict)
     active_provider: str | None = None
@@ -242,12 +243,13 @@ class OnboardingConnectivityPayload(BaseModel):
         deployment_mode = str(normalized.get("deployment_mode", "on_prem")).strip().lower().replace("-", "_")
         normalized["deployment_mode"] = deployment_mode or "on_prem"
 
-        normalized["gcp_project_id"] = str(normalized.get("gcp_project_id", "")).strip()
-        normalized["gcp_region"] = str(normalized.get("gcp_region", "")).strip()
-        normalized["pubsub_topic"] = str(normalized.get("pubsub_topic", "")).strip()
-        normalized["pubsub_subscription"] = str(normalized.get("pubsub_subscription", "")).strip()
-        normalized["vertex_model_armor_enabled"] = bool(normalized.get("vertex_model_armor_enabled", False))
-        normalized["vertex_model_armor_template"] = str(normalized.get("vertex_model_armor_template", "")).strip()
+        normalized["azure_subscription_id"] = str(normalized.get("azure_subscription_id", "")).strip()
+        normalized["azure_resource_group"] = str(normalized.get("azure_resource_group", "")).strip()
+        normalized["azure_service_bus_namespace"] = str(normalized.get("azure_service_bus_namespace", "")).strip()
+        normalized["azure_service_bus_topic"] = str(normalized.get("azure_service_bus_topic", "")).strip()
+        normalized["azure_service_bus_subscription"] = str(normalized.get("azure_service_bus_subscription", "")).strip()
+        normalized["azure_content_safety_enabled"] = bool(normalized.get("azure_content_safety_enabled", False))
+        normalized["azure_content_safety_endpoint"] = str(normalized.get("azure_content_safety_endpoint", "")).strip()
 
         active_provider = str(normalized.get("active_provider", "")).strip().lower().replace(" ", "_")
         normalized["active_provider"] = active_provider or None
@@ -267,23 +269,30 @@ class OnboardingConnectivityPayload(BaseModel):
     def _validate_payload(self) -> "OnboardingConnectivityPayload":
         self.deployment_mode = str(self.deployment_mode or "on_prem").strip().lower().replace("-", "_")
         if self.deployment_mode not in _ALLOWED_DEPLOYMENT_MODES:
-            raise ValueError("deployment_mode must be one of on_prem, gcp_cloud")
+            raise ValueError("deployment_mode must be one of on_prem, azure_cloud")
 
         self.prometheus_url = self._normalize_endpoint(self.prometheus_url, "prometheus_url")
         self.new_relic_url = self._normalize_endpoint(self.new_relic_url, "new_relic_url")
         self.datadog_url = self._normalize_endpoint(self.datadog_url, "datadog_url")
-        self.gcp_project_id = str(self.gcp_project_id or "").strip()
-        self.gcp_region = str(self.gcp_region or "").strip()
-        self.pubsub_topic = str(self.pubsub_topic or "").strip()
-        self.pubsub_subscription = str(self.pubsub_subscription or "").strip()
-        self.vertex_model_armor_template = str(self.vertex_model_armor_template or "").strip()
+        self.azure_subscription_id = str(self.azure_subscription_id or "").strip()
+        self.azure_resource_group = str(self.azure_resource_group or "").strip()
+        self.azure_service_bus_namespace = str(self.azure_service_bus_namespace or "").strip()
+        self.azure_service_bus_topic = str(self.azure_service_bus_topic or "").strip()
+        self.azure_service_bus_subscription = str(self.azure_service_bus_subscription or "").strip()
+        self.azure_content_safety_endpoint = str(self.azure_content_safety_endpoint or "").strip()
 
-        if self.deployment_mode == "gcp_cloud":
-            if not self.gcp_project_id:
-                raise ValueError("gcp_project_id is required for gcp_cloud mode")
+        if self.deployment_mode == "azure_cloud":
+            if not self.azure_subscription_id:
+                raise ValueError("azure_subscription_id is required for azure_cloud mode")
+            if not self.azure_service_bus_namespace:
+                raise ValueError("azure_service_bus_namespace is required for azure_cloud mode")
+            if not self.azure_service_bus_topic:
+                raise ValueError("azure_service_bus_topic is required for azure_cloud mode")
+            if not self.azure_service_bus_subscription:
+                raise ValueError("azure_service_bus_subscription is required for azure_cloud mode")
 
         if self.active_provider and self.active_provider not in _ALLOWED_ACTIVE_PROVIDERS:
-            raise ValueError("active_provider must be one of prometheus, new_relic, datadog, pubsub")
+            raise ValueError("active_provider must be one of prometheus, new_relic, datadog, azure_service_bus")
         self.test_message = str(self.test_message or "").strip() or None
         self.tested_at = str(self.tested_at or "").strip() or None
         self.updated_at = str(self.updated_at or "").strip() or None
@@ -296,12 +305,13 @@ class OnboardingConnectivitySnapshot(BaseModel):
     prometheus_url: str = ""
     new_relic_url: str = ""
     datadog_url: str = ""
-    gcp_project_id: str = ""
-    gcp_region: str = ""
-    pubsub_topic: str = ""
-    pubsub_subscription: str = ""
-    vertex_model_armor_enabled: bool = False
-    vertex_model_armor_template: str = ""
+    azure_subscription_id: str = ""
+    azure_resource_group: str = ""
+    azure_service_bus_namespace: str = ""
+    azure_service_bus_topic: str = ""
+    azure_service_bus_subscription: str = ""
+    azure_content_safety_enabled: bool = False
+    azure_content_safety_endpoint: str = ""
     user_assignments: dict[str, list[str]] = Field(default_factory=dict)
     updated_at: str | None = None
 
@@ -634,7 +644,7 @@ def _build_onboarding_rule_seed(connectivity: OnboardingConnectivityPayload, sel
         "business_owner": "",
         "technical_owner": "",
         "technology_stack": [],
-        "cloud_provider": "gcp" if connectivity.deployment_mode == "gcp_cloud" else "on_prem",
+        "cloud_provider": "azure" if connectivity.deployment_mode == "azure_cloud" else "on_prem",
         "region": str(project.region or "").strip(),
         "monitoring_platforms": [selected_tool],
         "notification_platforms": ["slack", "teams", "pagerduty"],
@@ -1032,12 +1042,13 @@ async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
         "prometheus_url": str(payload.get("prometheus_url", "")).strip(),
         "new_relic_url": str(payload.get("new_relic_url", "")).strip(),
         "datadog_url": str(payload.get("datadog_url", "")).strip(),
-        "gcp_project_id": str(payload.get("gcp_project_id", "")).strip(),
-        "gcp_region": str(payload.get("gcp_region", "")).strip(),
-        "pubsub_topic": str(payload.get("pubsub_topic", "")).strip(),
-        "pubsub_subscription": str(payload.get("pubsub_subscription", "")).strip(),
-        "vertex_model_armor_enabled": bool(payload.get("vertex_model_armor_enabled", False)),
-        "vertex_model_armor_template": str(payload.get("vertex_model_armor_template", "")).strip(),
+        "azure_subscription_id": str(payload.get("azure_subscription_id", "")).strip(),
+        "azure_resource_group": str(payload.get("azure_resource_group", "")).strip(),
+        "azure_service_bus_namespace": str(payload.get("azure_service_bus_namespace", "")).strip(),
+        "azure_service_bus_topic": str(payload.get("azure_service_bus_topic", "")).strip(),
+        "azure_service_bus_subscription": str(payload.get("azure_service_bus_subscription", "")).strip(),
+        "azure_content_safety_enabled": bool(payload.get("azure_content_safety_enabled", False)),
+        "azure_content_safety_endpoint": str(payload.get("azure_content_safety_endpoint", "")).strip(),
         "user_assignments": payload.get("user_assignments", {}) if isinstance(payload.get("user_assignments"), dict) else {},
         "updated_at": payload.get("updated_at"),
         "active_provider": _normalize_provider_name(str(payload.get("active_provider", ""))) if payload.get("active_provider") else None,

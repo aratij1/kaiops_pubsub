@@ -193,7 +193,7 @@ def test_orchestrator_runtime_path_produces_workflow_decision() -> None:
 
     assert decision.workflow
     assert decision.next_action
-    assert decision.message_bus_provider in {"kafka", "rabbitmq", "pubsub"}
+    assert decision.message_bus_provider in {"kafka", "rabbitmq", "azure-service-bus", "servicebus", "azure"}
 
 
 def test_context_agent_runtime_path_collects_context() -> None:

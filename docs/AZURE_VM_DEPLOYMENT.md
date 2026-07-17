@@ -33,19 +33,31 @@ real GCP dependency). Only the environment file and network setup differ.
 1. Install Docker Engine + Docker Compose plugin (Linux) or Docker Desktop
    (Windows Server).
 2. Get this repository onto the VM (git clone, or copy the folder).
-3. Create the environment file from the Azure template:
+3. Create the environment file from the Azure template. `.env.azure` itself is
+   gitignored (never commit real secrets) — `.env.azure.example` is the
+   tracked, blank starting point:
    ```bash
-   cp .env.azure .env      # then edit .env and fill in every REQUIRED value
+   cp .env.azure.example .env.azure   # then edit .env.azure and fill in every REQUIRED value
    ```
    Required before others can reach the VM:
+   - `ENVIRONMENT=prod` (or any value other than `local`/`demo`/`test`) —
+     this is what actually turns on the checks below. Left unset, the app
+     assumes a trusted dev machine and skips secret-strength validation
+     entirely, even if you fill in every other field.
    - `MYSQL_ROOT_PASSWORD`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE`
-   - `RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS`
+   - `RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS` — avoid `@`, `:`, `/`
+     in the password; it's embedded directly into an `amqp://` connection
+     string with no escaping.
    - `JWT_SECRET_KEY` and the five `*_USER_PASSWORD` values
-     (12+ chars, upper/lower/number/special — enforced at startup)
+     (12+ chars, upper/lower/number/special — enforced at startup once
+     `ENVIRONMENT` is set to a non-local value: the app refuses to start if
+     any of these are still at their default/demo value)
    - `OPENAI_API_KEY` (the only LLM key actually used)
-4. Build and start:
+4. Build and start. `docker compose` only auto-loads a file literally named
+   `.env`, not `.env.azure`, so either point at it explicitly or copy it:
    ```bash
-   docker compose up -d --build
+   docker compose --env-file .env.azure up -d --build
+   # or: cp .env.azure .env && docker compose up -d --build
    ```
 5. Verify (same checks as local):
    ```bash

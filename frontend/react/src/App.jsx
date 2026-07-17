@@ -50,7 +50,7 @@ const TAB_SHORTCUT_MAP = {
 };
 const VALID_TABS = new Set(Object.values(TAB_SHORTCUT_MAP));
 const MONITORING_TOOL_OPTIONS = ["prometheus", "new_relic", "datadog"];
-const ALERT_DOC_KIND_OPTIONS = ["incident", "runbook", "deployment", "change", "dependency"];
+const ALERT_DOC_KIND_OPTIONS = ["incident", "runbook", "deployment", "change", "dependency", "rule"];
 
 const ROLE_ALLOWED_TABS = {
   administrator: ["home", "copilot", "approval", "executive", "admin", "trace", "safety", "rag", "finops", "closed", "summary"],
@@ -800,6 +800,25 @@ function buildAlertDocumentDrafts(alertRow, workflowPayload) {
       impact,
       recommended_action: suggestedAction,
     },
+    rule: {
+      kind: "rule",
+      title: `${alertName} Detection Rule`.slice(0, 160),
+      summary: `Detection rule reference for ${alertName} on ${service}.`,
+      content: [
+        commonHeader,
+        `Probable root cause: ${commonRoot}`,
+        "Detection logic: describe the alerting expression/condition and evaluation window that fires this alert.",
+        "Tuning notes: threshold rationale, known noisy conditions, and suppression/inhibition rules.",
+        "Verification: confirm this rule still reflects the current alerting configuration before relying on it.",
+      ].filter(Boolean).join("\n\n"),
+      services: service,
+      severity,
+      alert_type: alertName,
+      alert_id: alertId,
+      root_cause: rootCause,
+      impact,
+      recommended_action: suggestedAction,
+    },
   };
 }
 
@@ -1125,6 +1144,7 @@ export default function App() {
   const [uiTheme, setUiTheme] = useState("auto");
   const [health, setHealth] = useState({ loading: false, ok: false, message: "Not checked" });
   const [alerts, setAlerts] = useState({ loading: false, rows: [], error: "" });
+  const [alertsLimit, setAlertsLimit] = useState(50);
   const [alertSeverityOverrides, setAlertSeverityOverrides] = useState({ loading: false, rows: [], error: "", savingKey: "" });
   const [alertSeverityDrafts, setAlertSeverityDrafts] = useState({});
   const [incidentMetadata, setIncidentMetadata] = useState({ loading: false, rows: [], error: "" });
@@ -1794,7 +1814,25 @@ export default function App() {
           return base;
         })
         .filter(Boolean);
-      const unique = Array.from(new Set([...defaultMonitorApplications, ...projects, ...monitoringApplications, ...alertApplications]));
+      const isDisplayableMonitorApp = (value) => {
+        const normalized = String(value || "").trim();
+        if (!normalized) {
+          return false;
+        }
+        if (defaultMonitorApplications.includes(normalized)) {
+          return true;
+        }
+        // Drop URLs, host:port exporter/instance targets, and raw infra job
+        // names (node-exporter, blackbox, mysql, etc.) - keep only real
+        // kaiops-* application/service names.
+        if (/[:/]/.test(normalized)) {
+          return false;
+        }
+        return /^kaiops(-|$)/i.test(normalized);
+      };
+      const unique = Array.from(
+        new Set([...defaultMonitorApplications, ...projects, ...monitoringApplications, ...alertApplications].filter(isDisplayableMonitorApp)),
+      );
       setMonitorApplications(unique.length ? unique : defaultMonitorApplications);
     } catch (_error) {
       setMonitorApplications(defaultMonitorApplications);
@@ -2594,17 +2632,41 @@ export default function App() {
     };
   }
 
-  function setDocPromptDraftForKind(row, kind) {
+  async function setDocPromptDraftForKind(row, kind) {
     const normalizedKind = String(kind || "runbook").trim().toLowerCase();
     const alertId = String(row?.alert_id || row?.id || "").trim();
-    const selectedPayload = String(selectedAlertData?.alertId || "").trim() === alertId
-      ? (selectedAlertData.payload?.data || selectedAlertData.payload || {})
-      : {};
-    const draft = buildAlertDocumentDraft(row, selectedPayload, normalizedKind);
     const existingDoc = findMatchingRagDocument(row, normalizedKind);
     setDocPromptKind(normalizedKind);
     setDocPromptExistingDoc(existingDoc);
     setDocPromptMode(existingDoc?.path ? "update" : "create");
+
+    if (existingDoc?.path) {
+      // Show the real saved document instead of a freshly generated draft.
+      setAlertOnboardingState({ loading: true, result: null, error: "" });
+      try {
+        const full = unwrap(await fetchJson(`/api-gateway/rag/documents/content?path=${encodeURIComponent(existingDoc.path)}`));
+        setAlertOnboarding((curr) => ({
+          ...curr,
+          kind: normalizedKind,
+          title: String(full.title || existingDoc.title || "Alert Document").slice(0, 160),
+          summary: String(full.summary || "").trim(),
+          content: String(full.content || "").trim(),
+          services: Array.isArray(full.services) ? full.services.join(", ") : String(full.services || "").trim(),
+          severity: String(full.severity || "high").toLowerCase(),
+          alert_type: String(full.alert_type || "").trim(),
+          alert_id: alertId,
+        }));
+        setAlertOnboardingState({ loading: false, result: null, error: "" });
+      } catch (error) {
+        setAlertOnboardingState({ loading: false, result: null, error: error.message });
+      }
+      return;
+    }
+
+    const selectedPayload = String(selectedAlertData?.alertId || "").trim() === alertId
+      ? (selectedAlertData.payload?.data || selectedAlertData.payload || {})
+      : {};
+    const draft = buildAlertDocumentDraft(row, selectedPayload, normalizedKind);
     setAlertOnboarding((curr) => ({
       ...curr,
       kind: draft.kind,
@@ -2814,7 +2876,11 @@ export default function App() {
     });
     setDocPromptDocsByKind(byKind);
     setDocPromptAlert(row);
-    setDocPromptDraftForKind(row, "runbook");
+    // If documents already exist for this alert, open on the first available
+    // one so the real saved content is shown; otherwise default to runbook
+    // for creating a new document.
+    const initialKind = ALERT_DOC_KIND_OPTIONS.find((kind) => byKind[kind]) || "runbook";
+    setDocPromptDraftForKind(row, initialKind);
     const defaultRequirement = `Create a ${String(row?.severity || "high").toLowerCase()} alert rule for ${String(row?.service || "this service").trim()} based on ${String(row?.name || row?.alert_name || "service degradation").trim()} and route incidents to on-call.`;
     setAlertRuleDraft({ platform: String(onboardingForm.monitoring_tool || "prometheus").trim().toLowerCase(), requirement: defaultRequirement });
     setAlertRuleState({ loading: false, result: null, error: "" });
@@ -5228,7 +5294,16 @@ export default function App() {
                                     Provide Docs
                                   </button>
                                 ) : (
-                                  <span className="pill status-closed">Docs Ready</span>
+                                  <button
+                                    type="button"
+                                    className="button-secondary pill status-closed"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      openDocumentPrompt(row);
+                                    }}
+                                  >
+                                    Docs Ready
+                                  </button>
                                 )}
                               </div>
                             </td>
@@ -5250,6 +5325,57 @@ export default function App() {
                       {!visibleAlerts.length && !alerts.loading ? (
                         <tr>
                           <td colSpan={10}>No alerts available for {applicationToMonitor}.</td>
+                        </tr>
+                      ) : null}
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <article className="panel">
+                <div className="panel-head">
+                  <h2>Knowledge Base Documents</h2>
+                  <p>All RAG documents ingested from the backend, with full metadata.</p>
+                </div>
+                {ragDocs.error ? <p className="error">{ragDocs.error}</p> : null}
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Kind</th>
+                        <th>Title</th>
+                        <th>Alert ID</th>
+                        <th>Alert Type</th>
+                        <th>Services</th>
+                        <th>Severity</th>
+                        <th>Root Cause</th>
+                        <th>Impact</th>
+                        <th>Recommended Action</th>
+                        <th>Path</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(Array.isArray(ragDocs.rows) ? ragDocs.rows : []).map((doc, index) => {
+                        const services = Array.isArray(doc?.services) ? doc.services.join(", ") : String(doc?.services || "-");
+                        const severity = String(doc?.severity || "-").toLowerCase();
+                        return (
+                          <tr key={`${doc?.path || "doc"}-${index}`}>
+                            <td>{doc?.kind || "-"}</td>
+                            <td>{doc?.title || "-"}</td>
+                            <td>{doc?.alert_id || "-"}</td>
+                            <td>{doc?.alert_type || "-"}</td>
+                            <td>{services || "-"}</td>
+                            <td>{severity !== "-" ? <span className={`pill severity-${severity}`}>{severity}</span> : "-"}</td>
+                            <td>{doc?.root_cause || "-"}</td>
+                            <td>{doc?.impact || "-"}</td>
+                            <td>{doc?.recommended_action || "-"}</td>
+                            <td title={doc?.path || ""}>{doc?.path || "-"}</td>
+                          </tr>
+                        );
+                      })}
+                      {!ragDocs.rows.length && !ragDocs.loading ? (
+                        <tr>
+                          <td colSpan={10}>No RAG documents found.</td>
                         </tr>
                       ) : null}
                     </tbody>
@@ -5343,6 +5469,7 @@ export default function App() {
                           <option value="deployment">deployment</option>
                           <option value="change">change</option>
                           <option value="dependency">dependency</option>
+                          <option value="rule">rule</option>
                         </select>
                       </label>
                       <label>Title<input value={alertOnboarding.title} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, title: e.target.value }))} /></label>
@@ -6248,6 +6375,36 @@ export default function App() {
                         </label>
                       </div>
                       {onboardingRuleRunState.error ? <p className="error">{onboardingRuleRunState.error}</p> : null}
+                      {onboardingRuleRunState.result?.knowledge_documents?.length ? (
+                        <div className="table-wrap">
+                          <h4>Documents Saved To System</h4>
+                          <p className="subtitle">For transparency: every knowledge document persisted by this run, with its metadata.</p>
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>Title</th>
+                                <th>Project</th>
+                                <th>Platform</th>
+                                <th>Owner</th>
+                                <th>Created</th>
+                                <th>Document ID</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {onboardingRuleRunState.result.knowledge_documents.map((doc) => (
+                                <tr key={doc.document_id || doc.title}>
+                                  <td>{doc.title || "-"}</td>
+                                  <td>{doc.project || "-"}</td>
+                                  <td>{doc.platform || "-"}</td>
+                                  <td>{doc.owner || "-"}</td>
+                                  <td>{doc.created_at || "-"}</td>
+                                  <td>{doc.document_id || "-"}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : null}
                       {onboardingRuleRunState.result ? <pre className="result">{JSON.stringify(onboardingRuleRunState.result, null, 2)}</pre> : null}
                     </article>
 
