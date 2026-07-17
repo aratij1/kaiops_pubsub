@@ -56,6 +56,13 @@ def _slug(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]+", "-", str(value or "").strip().lower()).strip("-") or "application"
 
 
+def _metric_prefix(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_]+", "_", str(value or "").strip().lower()).strip("_") or "application"
+    if cleaned[0].isdigit():
+        return f"app_{cleaned}"
+    return cleaned
+
+
 def onboarding_root() -> Path:
     candidates = [
         Path("/app/rag/changes"),
@@ -332,10 +339,11 @@ class RuleGenerationAgent:
                 )
             )
 
+        metric_prefix = _metric_prefix(application.name)
         recording_rules = [
-            RecordingRuleSpec(name=f"{slug}:availability:ratio", expr=f'avg_over_time(up{{job="{slug}"}}[5m])', labels={"application": application.name}),
-            RecordingRuleSpec(name=f"{slug}:request_rate:sum", expr=f'sum(rate(http_requests_total{{job="{slug}"}}[5m]))', labels={"application": application.name}),
-            RecordingRuleSpec(name=f"{slug}:error_rate:sum", expr=f'sum(rate(http_requests_total{{job="{slug}",status=~"5.."}}[5m]))', labels={"application": application.name}),
+            RecordingRuleSpec(name=f"{metric_prefix}:availability:ratio", expr=f'avg_over_time(up{{job="{slug}"}}[5m])', labels={"application": application.name}),
+            RecordingRuleSpec(name=f"{metric_prefix}:request_rate:sum", expr=f'sum(rate(http_requests_total{{job="{slug}"}}[5m]))', labels={"application": application.name}),
+            RecordingRuleSpec(name=f"{metric_prefix}:error_rate:sum", expr=f'sum(rate(http_requests_total{{job="{slug}",status=~"5.."}}[5m]))', labels={"application": application.name}),
         ]
 
         governance_issues: list[str] = []

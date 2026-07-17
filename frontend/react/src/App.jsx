@@ -1117,7 +1117,7 @@ function renderHtmlTable(headers, rows) {
 }
 
 export default function App() {
-  const defaultMonitorApplications = ["payments", "checkout", "orders-db", "inventory", "kaiops-core"];
+  const defaultMonitorApplications = ["payments", "kaiops-core"];
   const [applicationToMonitor, setApplicationToMonitor] = useState("payments");
   const [monitorApplications, setMonitorApplications] = useState(defaultMonitorApplications);
   const [activeTab, setActiveTab] = useState("home");
@@ -1317,6 +1317,7 @@ export default function App() {
   const alertDetailsRef = useRef(null);
   const docPromptRef = useRef(null);
   const approvalQueueRef = useRef(null);
+  const monitoringInspectRef = useRef(null);
 
   const formValid = useMemo(() => {
     return [form.source, form.name, form.service, form.severity, form.description].every((v) => String(v || "").trim());
@@ -1456,6 +1457,15 @@ export default function App() {
     event.preventDefault();
     setMonitoringAppSubmit({ loading: true, error: "", success: "" });
     try {
+      const metricsEndpoint = String(monitoringAppForm.metrics_endpoint || "").trim() || "http://api-gateway:8000/metrics";
+      if (!/^https?:\/\//i.test(metricsEndpoint)) {
+        setMonitoringAppSubmit({
+          loading: false,
+          error: "Metrics Endpoint must start with http:// or https:// (for example, http://api-gateway:8000/metrics).",
+          success: "",
+        });
+        return;
+      }
       const labels = Object.fromEntries(
         String(monitoringAppForm.labels_text || "")
           .split(",")
@@ -1476,7 +1486,7 @@ export default function App() {
         namespace: monitoringAppForm.namespace,
         region: monitoringAppForm.region,
         technology: monitoringAppForm.technology,
-        metrics_endpoint: monitoringAppForm.metrics_endpoint || "http://api-gateway:8000/metrics",
+        metrics_endpoint: metricsEndpoint,
         monitoring_platform: "prometheus",
         labels,
       };
@@ -1794,7 +1804,12 @@ export default function App() {
           return base;
         })
         .filter(Boolean);
-      const unique = Array.from(new Set([...defaultMonitorApplications, ...projects, ...monitoringApplications, ...alertApplications]));
+      const allowedMonitorApplication = (value) => {
+        const normalized = String(value || "").trim().toLowerCase();
+        return normalized === "payments" || normalized.startsWith("kaiops");
+      };
+      const unique = Array.from(new Set([...defaultMonitorApplications, ...projects, ...monitoringApplications, ...alertApplications]))
+        .filter((name) => allowedMonitorApplication(name));
       setMonitorApplications(unique.length ? unique : defaultMonitorApplications);
     } catch (_error) {
       setMonitorApplications(defaultMonitorApplications);
@@ -4526,6 +4541,18 @@ export default function App() {
   }, [selectedMonitoringAppId]);
 
   useEffect(() => {
+    if (!selectedMonitoringAppId || adminWorkspace !== "monitoring") {
+      return;
+    }
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      monitoringInspectRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }, [selectedMonitoringAppId, adminWorkspace]);
+
+  useEffect(() => {
     if (onboardingProjectMode === "new" || selectedOnboardingProject || !projectOnboardingRows.length) {
       return;
     }
@@ -6453,7 +6480,7 @@ export default function App() {
                       </div>
                     </article>
 
-                    <article className="panel">
+                    <article className="panel" ref={monitoringInspectRef}>
                       <div className="panel-head">
                         <h3>Selected Application Timeline</h3>
                         <p className="subtitle">{selectedMonitoringAppId || "Select an application to inspect stage history, validations, and dashboards."}</p>
