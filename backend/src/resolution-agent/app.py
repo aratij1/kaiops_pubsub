@@ -161,6 +161,11 @@ async def startup(app: FastAPI) -> None:
         incident = Incident.model_validate(payload["incident"])
         decision_payload = payload.get("decision", {}) if isinstance(payload.get("decision"), dict) else {}
         recommendation = await agent.resolve_with_runtime(context)
+        recommendation.metadata["rag_documents"] = context.metadata.get("rag_documents", 0)
+        recommendation.metadata["rag_matches"] = context.metadata.get("rag_matches", [])
+        recommendation.metadata["rag_top_similarity"] = context.metadata.get("rag_top_similarity", 0.0)
+        recommendation.metadata["rag_service_tagged_match"] = context.metadata.get("rag_service_tagged_match", False)
+        recommendation.metadata["runbook_found"] = bool(context.runbook)
         policy_version = str(decision_payload.get("policy_version") or "").strip()
         policy_reason = str(decision_payload.get("policy_reason") or "").strip()
         if policy_version:
@@ -212,6 +217,11 @@ app = create_app(title="KaiMS Resolution Intelligence Agent", settings=settings,
 @app.post("/resolve", response_model=Recommendation)
 async def resolve(context: Context) -> Recommendation:
     recommendation = await agent.resolve_with_runtime(context)
+    recommendation.metadata["rag_documents"] = context.metadata.get("rag_documents", 0)
+    recommendation.metadata["rag_matches"] = context.metadata.get("rag_matches", [])
+    recommendation.metadata["rag_top_similarity"] = context.metadata.get("rag_top_similarity", 0.0)
+    recommendation.metadata["rag_service_tagged_match"] = context.metadata.get("rag_service_tagged_match", False)
+    recommendation.metadata["runbook_found"] = bool(context.runbook)
     synthetic_incident = Incident(
         id=context.incident_id,
         service=context.alert.service,
