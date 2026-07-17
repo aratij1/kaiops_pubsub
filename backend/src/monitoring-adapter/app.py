@@ -1280,6 +1280,7 @@ async def run_local_payment_workflow(
             "description": alert.description,
             "labels": alert.labels,
             "annotations": alert.annotations,
+            "trace_id": trace_id,
         },
         "decision": f"Severity classified as {enriched_alert.severity}; correlation ID {enriched_alert.correlation_id}",
         "output": "Created incident and enriched alert event",
@@ -1324,6 +1325,7 @@ async def run_local_payment_workflow(
             "severity": incident.severity.value,
             "title": incident.title,
             "workflow": decision.workflow,
+            "trace_id": trace_id,
         },
         "decision": decision.__dict__,
         "workflow": decision.workflow,
@@ -1555,6 +1557,7 @@ async def run_local_payment_workflow(
             "deployment": context.deployment,
             "related_incidents": len(context.related_incidents),
             "workflow": decision.workflow,
+            "trace_id": trace_id,
         },
         "decision": f"Root cause: {recommendation.root_cause}; action: {recommendation.recommended_action}",
         "output": "Recommendation with impact, rationale, commands, confidence, and risk",
@@ -1640,6 +1643,7 @@ async def run_local_payment_workflow(
                 "recommended_action": recommendation.recommended_action,
                 "channel": pending_approval.channel,
                 "workflow": decision.workflow,
+                "trace_id": trace_id,
             },
             "decision": pending_approval.decision.value,
             "output": "Awaiting explicit user decision in Approval Workbench",
@@ -1770,6 +1774,7 @@ async def run_local_payment_workflow(
             "recommended_action": recommendation.recommended_action,
             "channel": approval.channel,
             "workflow": decision.workflow,
+            "trace_id": trace_id,
         },
         "decision": approval.decision.value,
         "output": f"Approved by {approval.approver} on {approval.channel}",
@@ -1815,6 +1820,7 @@ async def run_local_payment_workflow(
             "comment": approval.comment,
             "action_type": action.action_type,
             "target": action.target,
+            "trace_id": trace_id,
         },
         "decision": f"Selected plugin action {action.action_type}",
         "output": action.output,
@@ -1856,6 +1862,7 @@ async def run_local_payment_workflow(
             "remediation_action_id": action.id,
             "status": action.status.value,
             "output": action.output,
+            "trace_id": trace_id,
         },
         "decision": "Health restored" if closure_report.health_restored else "Health not restored",
         "output": closure_report.knowledge_base_entry,
@@ -2177,6 +2184,7 @@ async def continue_pending_workflow(
             "recommendation_id": recommendation_id,
             "channel": approval.channel,
             "comment": approval.comment,
+            "trace_id": approval_trace_id,
         },
         "decision": approval.decision.value,
         "output": f"Decision by {approval.approver}",
@@ -2191,6 +2199,7 @@ async def continue_pending_workflow(
             "approval_id": str(approval.id),
             "action_type": action.action_type,
             "target": action.target,
+            "trace_id": approval_trace_id,
         },
         "decision": f"Selected plugin action {action.action_type}",
         "output": action.output,
@@ -2205,6 +2214,7 @@ async def continue_pending_workflow(
             "remediation_action_id": str(action.id),
             "status": action.status.value,
             "output": action.output,
+            "trace_id": approval_trace_id,
         },
         "decision": "Health restored" if closure_report.health_restored else "Health not restored",
         "output": closure_report.knowledge_base_entry,
@@ -2355,6 +2365,7 @@ def _record_closed_incident(
 
 
 def _build_alert_from_payload(payload: dict[str, Any], trace_id: str | None = None) -> Alert:
+    trace_id = trace_id or uuid.uuid4().hex
     labels = payload.get("labels", {}) if isinstance(payload.get("labels"), dict) else {}
     annotations = payload.get("annotations", {}) if isinstance(payload.get("annotations"), dict) else {}
     severity_value = severity_from_string(str(payload.get("severity", labels.get("severity", "warning"))))
