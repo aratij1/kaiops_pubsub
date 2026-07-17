@@ -270,6 +270,21 @@
     "source": "rag-incident"
   },
   {
+    "id": "b2f5ab95-99d2-4202-9f9b-17b453081676",
+    "alert_id": "b2f5ab95-99d2-4202-9f9b-17b453081676",
+    "alert_name": "KaiOpsServiceDown Incident Summary",
+    "alert_type": "KaiOpsServiceDown",
+    "title": "KaiOpsServiceDown Incident Summary",
+    "service": "kaiops-orchestrator",
+    "severity": "CRITICAL",
+    "summary": "KaiOpsServiceDown detected for kaiops-orchestrator. Impact: Kaiops-Orchestrator service impact requires immediate triage.",
+    "recommended_action": "Rollback deployment",
+    "description": "KaiOpsServiceDown detected for kaiops-orchestrator. Impact: Kaiops-Orchestrator service impact requires immediate triage.",
+    "root_cause": "Deployment 2.5",
+    "impact": "Kaiops-Orchestrator service impact requires immediate triage",
+    "source": "rag-incident"
+  },
+  {
     "id": "c455c797-af5d-4abd-8c13-b44b53b5f0db",
     "alert_id": "c455c797-af5d-4abd-8c13-b44b53b5f0db",
     "alert_name": "KaiOpsServiceDown Incident Summary",

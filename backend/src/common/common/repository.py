@@ -628,6 +628,46 @@ class IncidentRepository:
             if isinstance(recommendation_metadata.get("orchestration_decision"), dict)
             else {}
         )
+
+        context_payload: dict[str, Any] = {}
+        context_event_payload = next(
+            (
+                item.get("payload")
+                for item in reversed(event_trace)
+                if isinstance(item, dict)
+                and "context" in str(item.get("event_type") or "").lower()
+                and isinstance(item.get("payload"), dict)
+            ),
+            {},
+        )
+        if isinstance(context_event_payload, dict):
+            nested_context = context_event_payload.get("context")
+            if isinstance(nested_context, dict):
+                context_payload = dict(nested_context)
+            else:
+                context_payload = {
+                    "deployment": context_event_payload.get("deployment"),
+                    "related_incidents": context_event_payload.get("related_incidents"),
+                    "dependency_services": context_event_payload.get("dependency_services"),
+                    "document_available": context_event_payload.get("document_available"),
+                }
+
+        context_metadata = context_payload.get("metadata") if isinstance(context_payload.get("metadata"), dict) else {}
+        if recommendation_metadata.get("rag_documents") is not None:
+            context_metadata.setdefault("rag_documents", recommendation_metadata.get("rag_documents"))
+        if isinstance(recommendation_metadata.get("rag_matches"), list):
+            context_metadata.setdefault("rag_matches", recommendation_metadata.get("rag_matches"))
+        if recommendation_metadata.get("rag_top_similarity") is not None:
+            context_metadata.setdefault("rag_top_similarity", recommendation_metadata.get("rag_top_similarity"))
+        if recommendation_metadata.get("rag_service_tagged_match") is not None:
+            context_metadata.setdefault("rag_service_tagged_match", recommendation_metadata.get("rag_service_tagged_match"))
+        if context_event_payload.get("document_available") is not None:
+            context_metadata.setdefault("document_available", context_event_payload.get("document_available"))
+        if context_metadata:
+            context_payload["metadata"] = context_metadata
+        if recommendation_metadata.get("runbook_found") is not None and not context_payload.get("runbook"):
+            context_payload["runbook"] = "available" if bool(recommendation_metadata.get("runbook_found")) else ""
+
         model_usage = recommendation_metadata.get("model_usage", []) if isinstance(recommendation_metadata.get("model_usage"), list) else []
         finops_totals = {
             "input_tokens": sum(int(item.get("input_tokens", 0) or 0) for item in model_usage if isinstance(item, dict)),
@@ -684,6 +724,7 @@ class IncidentRepository:
                 "planner_model": None,
                 "planner_reason": "db-processed historical result",
             },
+            "context": context_payload,
             "recommendation": recommendation,
             "approval": approval,
             "remediation_action": remediation_action,
