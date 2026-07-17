@@ -50,7 +50,7 @@ const TAB_SHORTCUT_MAP = {
 };
 const VALID_TABS = new Set(Object.values(TAB_SHORTCUT_MAP));
 const MONITORING_TOOL_OPTIONS = ["prometheus", "new_relic", "datadog"];
-const ALERT_DOC_KIND_OPTIONS = ["incident", "runbook", "deployment", "change", "dependency"];
+const ALERT_DOC_KIND_OPTIONS = ["incident", "runbook", "deployment", "change", "dependency", "remediation"];
 
 const ROLE_ALLOWED_TABS = {
   administrator: ["home", "copilot", "approval", "executive", "admin", "trace", "safety", "rag", "finops", "closed", "summary"],
@@ -207,7 +207,7 @@ function normalizeMonitorToken(value) {
 
 function isKaiopsCoreSelection(value) {
   const token = normalizeMonitorToken(value);
-  return token === "kaiops-core" || token === "kaiops" || token === "core";
+  return token === "kaiops-core" || token === "kaiops-core1" || token === "kaiops" || token === "core";
 }
 
 function isKaiopsCoreAlert(row) {
@@ -1145,6 +1145,15 @@ function buildAlertDocumentDrafts(alertRow, workflowPayload) {
   const commonHeader = `Alert ${alertName} observed on ${service} with severity ${severity.toUpperCase()}.`;
   const fallbackRootCause = "Investigate recent deploys, dependency health, and resource saturation.";
   const commonRoot = rootCause || fallbackRootCause;
+  const remediationPreview = buildPreviewExecutionPlan(workflow);
+  const remediationCommands = Array.isArray(remediationPreview?.plan?.commands) ? remediationPreview.plan.commands : [];
+  const remediationScripts = Array.isArray(remediationPreview?.plan?.scripts) ? remediationPreview.plan.scripts : [];
+  const remediationQueries = Array.isArray(remediationPreview?.plan?.queries) ? remediationPreview.plan.queries : [];
+  const remediationPlanText = [
+    remediationCommands.length ? `Commands:\n${remediationCommands.map((item) => `- ${item}`).join("\n")}` : "",
+    remediationScripts.length ? `Scripts:\n${remediationScripts.map((item) => `- ${item}`).join("\n")}` : "",
+    remediationQueries.length ? `Queries:\n${remediationQueries.map((item) => `- ${item}`).join("\n")}` : "",
+  ].filter(Boolean).join("\n\n");
 
   return {
     incident: {
@@ -1242,6 +1251,28 @@ function buildAlertDocumentDrafts(alertRow, workflowPayload) {
       root_cause: rootCause,
       impact,
       recommended_action: suggestedAction,
+    },
+    remediation: {
+      kind: "remediation",
+      title: `${alertName} Remediation Command Plan`.slice(0, 160),
+      summary: `Auto-generated remediation commands/scripts/queries for ${service}.`,
+      content: [
+        commonHeader,
+        `Recommended remediation action: ${remediationPreview.recommendationText || suggestedAction || "Rollback deployment"}.`,
+        `Probable root cause: ${commonRoot}`,
+        remediationPlanText || "No remediation command plan was generated.",
+      ].filter(Boolean).join("\n\n"),
+      services: service,
+      severity,
+      alert_type: alertName,
+      alert_id: alertId,
+      root_cause: rootCause,
+      impact,
+      recommended_action: remediationPreview.recommendationText || suggestedAction,
+      execution_plan: remediationPlanText,
+      commands: remediationCommands,
+      scripts: remediationScripts,
+      queries: remediationQueries,
     },
   };
 }
@@ -1876,8 +1907,8 @@ function renderHtmlTable(headers, rows) {
 }
 
 export default function App() {
-  const defaultMonitorApplications = ["payments", "kaiops-core"];
-  const [applicationToMonitor, setApplicationToMonitor] = useState("payments");
+  const defaultMonitorApplications = ["kaiops-core1", "payments", "kaiops-core"];
+  const [applicationToMonitor, setApplicationToMonitor] = useState("kaiops-core1");
   const [monitorApplications, setMonitorApplications] = useState(defaultMonitorApplications);
   const [activeTab, setActiveTab] = useState("home");
   const [uiDensity, setUiDensity] = useState("comfortable");
@@ -2057,7 +2088,13 @@ export default function App() {
     severity: "high",
     alert_type: "availability",
     alert_id: "",
+    execution_plan: "",
+    remediation_commands_text: "",
+    remediation_scripts_text: "",
+    remediation_queries_text: "",
   });
+  const [alertKnowledgePrompt, setAlertKnowledgePrompt] = useState("");
+  const [alertKnowledgeView, setAlertKnowledgeView] = useState("onboarding");
   const [alertOnboardingState, setAlertOnboardingState] = useState({ loading: false, result: null, error: "" });
   const [docPromptAlert, setDocPromptAlert] = useState(null);
   const [docPromptKind, setDocPromptKind] = useState("runbook");
@@ -2077,6 +2114,7 @@ export default function App() {
   const docPromptRef = useRef(null);
   const approvalQueueRef = useRef(null);
   const monitoringInspectRef = useRef(null);
+  const alertKnowledgeRef = useRef(null);
 
   const formValid = useMemo(() => {
     return [form.source, form.name, form.service, form.severity, form.description].every((v) => String(v || "").trim());
@@ -3350,6 +3388,25 @@ export default function App() {
   }
 
   function buildDocPayloadFromDraft(draft) {
+    const toPlanLines = (value) => {
+      if (Array.isArray(value)) {
+        return value.map((item) => String(item || "").trim()).filter(Boolean);
+      }
+      return String(value || "")
+        .split(/\r?\n/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+    };
+
+    const commands = toPlanLines(draft.remediation_commands_text ?? draft.commands);
+    const scripts = toPlanLines(draft.remediation_scripts_text ?? draft.scripts);
+    const queries = toPlanLines(draft.remediation_queries_text ?? draft.queries);
+    const executionPlan = String(draft.execution_plan || "").trim() || [
+      commands.length ? `Commands:\n${commands.map((item) => `- ${item}`).join("\n")}` : "",
+      scripts.length ? `Scripts:\n${scripts.map((item) => `- ${item}`).join("\n")}` : "",
+      queries.length ? `Queries:\n${queries.map((item) => `- ${item}`).join("\n")}` : "",
+    ].filter(Boolean).join("\n\n");
+
     return {
       kind: draft.kind,
       title: draft.title,
@@ -3364,6 +3421,10 @@ export default function App() {
       alert_id: draft.alert_id || null,
       root_cause: draft.root_cause || null,
       impact: draft.impact || null,
+      execution_plan: executionPlan || null,
+      commands,
+      scripts,
+      queries,
       recommended_action: draft.recommended_action || null,
     };
   }
@@ -3389,7 +3450,281 @@ export default function App() {
       severity: String(draft.severity || "high").toLowerCase(),
       alert_type: String(draft.alert_type || "").trim(),
       alert_id: alertId,
+      execution_plan: String(draft.execution_plan || "").trim(),
+      remediation_commands_text: Array.isArray(draft.commands) ? draft.commands.join("\n") : "",
+      remediation_scripts_text: Array.isArray(draft.scripts) ? draft.scripts.join("\n") : "",
+      remediation_queries_text: Array.isArray(draft.queries) ? draft.queries.join("\n") : "",
     }));
+  }
+
+  async function autoGenerateRemediationPlan(alertRow = null) {
+    const sourceRow = alertRow && typeof alertRow === "object"
+      ? alertRow
+      : {
+          alert_id: alertOnboarding.alert_id,
+          name: alertOnboarding.alert_type || alertOnboarding.title || "Alert",
+          service: String(alertOnboarding.services || "").split(",")[0]?.trim() || "unknown-service",
+          severity: alertOnboarding.severity || "high",
+        };
+    const draft = alertRow && typeof alertRow === "object"
+      ? await buildAlertDocumentDraftWithAnalysis(sourceRow, "remediation")
+      : buildAlertDocumentDraft(sourceRow, {}, "remediation");
+    setAlertOnboarding((curr) => ({
+      ...curr,
+      kind: "remediation",
+      title: String(draft.title || curr.title || "Remediation Plan").slice(0, 160),
+      summary: String(draft.summary || curr.summary || "").trim(),
+      content: String(draft.content || curr.content || "").trim(),
+      services: String(draft.services || curr.services || "").trim(),
+      severity: String(draft.severity || curr.severity || "high").toLowerCase(),
+      alert_type: String(draft.alert_type || curr.alert_type || "").trim(),
+      alert_id: String(draft.alert_id || curr.alert_id || "").trim(),
+      execution_plan: String(draft.execution_plan || "").trim(),
+      remediation_commands_text: Array.isArray(draft.commands) ? draft.commands.join("\n") : "",
+      remediation_scripts_text: Array.isArray(draft.scripts) ? draft.scripts.join("\n") : "",
+      remediation_queries_text: Array.isArray(draft.queries) ? draft.queries.join("\n") : "",
+    }));
+  }
+
+  function parseAiDraftContent(content) {
+    const text = String(content || "").trim();
+    if (!text) {
+      return null;
+    }
+    const candidates = [text];
+    const fenced = text.match(/```json\s*([\s\S]*?)```/i);
+    if (fenced?.[1]) {
+      candidates.push(String(fenced[1]).trim());
+    }
+    const objectBlock = text.match(/\{[\s\S]*\}/);
+    if (objectBlock?.[0]) {
+      candidates.push(String(objectBlock[0]).trim());
+    }
+    for (const candidate of candidates) {
+      try {
+        const parsed = JSON.parse(candidate);
+        if (parsed && typeof parsed === "object") {
+          return parsed;
+        }
+      } catch (_error) {
+        // Try next extraction candidate.
+      }
+    }
+    return null;
+  }
+
+  function normalizeDraftList(value) {
+    if (Array.isArray(value)) {
+      return value.map((item) => String(item || "").trim()).filter(Boolean);
+    }
+    return String(value || "")
+      .split(/\r?\n/)
+      .map((item) => item.replace(/^[-*]\s*/, "").trim())
+      .filter(Boolean);
+  }
+
+  async function generateAlertKnowledgeDraftFromPrompt() {
+    const prompt = String(alertKnowledgePrompt || "").trim();
+    if (!prompt) {
+      setAlertOnboardingState({ loading: false, result: null, error: "Enter a prompt to generate the document draft." });
+      return;
+    }
+
+    const normalizedKind = String(alertOnboarding.kind || "incident").trim().toLowerCase();
+    const lines = prompt
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const sentences = prompt
+      .split(/(?<=[.!?])\s+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const summary = String(sentences[0] || lines[0] || prompt).slice(0, 260);
+    const titleSeed = String(lines[0] || prompt)
+      .replace(/^[-*#\d.\s]+/, "")
+      .split(/\s+/)
+      .slice(0, 8)
+      .join(" ")
+      .trim();
+    const fallbackTitle = `${normalizedKind[0]?.toUpperCase() || "D"}${normalizedKind.slice(1)} Doc`;
+    const generatedTitle = titleSeed ? titleSeed.slice(0, 160) : fallbackTitle;
+
+    const commandMatches = [];
+    const scriptMatches = [];
+    const queryMatches = [];
+
+    const cleanToken = (value) => String(value || "").trim().replace(/^[-*]\s*/, "");
+    const pushUnique = (target, value) => {
+      const normalized = cleanToken(value);
+      if (!normalized) {
+        return;
+      }
+      if (!target.some((item) => item.toLowerCase() === normalized.toLowerCase())) {
+        target.push(normalized);
+      }
+    };
+
+    const extractTaggedValues = (inputText, tagPattern) => {
+      const regex = new RegExp(`\\b(?:${tagPattern})\\s*[:\\-]\\s*([^\\n;|]+)`, "ig");
+      const values = [];
+      let match = regex.exec(inputText);
+      while (match) {
+        values.push(match[1]);
+        match = regex.exec(inputText);
+      }
+      return values;
+    };
+
+    const shellLike = /^(kubectl|kubeadm|helm|docker|docker-compose|compose|terraform|ansible|oc|az|aws|gcloud|systemctl|journalctl|curl|wget|psql|mysql|redis-cli|kafka-|python\s+|pip\s+|npm\s+|node\s+|pwsh\s+|powershell\s+|bash\s+)/i;
+    const sqlLike = /\b(select|update|delete|insert|with|merge|create\s+table|drop\s+table|alter\s+table)\b/i;
+
+    extractTaggedValues(prompt, "cmd|command").forEach((value) => pushUnique(commandMatches, value));
+    extractTaggedValues(prompt, "script|ps1|sh|bash").forEach((value) => pushUnique(scriptMatches, value));
+    extractTaggedValues(prompt, "query|sql").forEach((value) => pushUnique(queryMatches, value));
+
+    const codeFenceRegex = /```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g;
+    let fenceMatch = codeFenceRegex.exec(prompt);
+    while (fenceMatch) {
+      const lang = String(fenceMatch[1] || "").trim().toLowerCase();
+      const body = String(fenceMatch[2] || "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .join(" ; ");
+      if (body) {
+        if (lang.includes("sql") || sqlLike.test(body)) {
+          pushUnique(queryMatches, body);
+        } else if (lang.includes("bash") || lang.includes("sh") || lang.includes("ps") || lang.includes("powershell")) {
+          pushUnique(scriptMatches, body);
+        } else if (shellLike.test(body)) {
+          pushUnique(commandMatches, body);
+        }
+      }
+      fenceMatch = codeFenceRegex.exec(prompt);
+    }
+
+    const taggedSegment = /\b(cmd|command|script|query|sql|ps1|bash|sh)\s*[:\-]/i;
+    const fallbackSegments = prompt
+      .split(/[\r\n;]+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+
+    fallbackSegments.forEach((segment) => {
+      if (taggedSegment.test(segment)) {
+        return;
+      }
+      if (shellLike.test(segment)) {
+        pushUnique(commandMatches, segment);
+        return;
+      }
+      if (sqlLike.test(segment)) {
+        pushUnique(queryMatches, segment);
+      }
+    });
+
+    const narrativeSegments = fallbackSegments.filter((segment) => {
+      if (taggedSegment.test(segment)) {
+        return false;
+      }
+      if (shellLike.test(segment) || sqlLike.test(segment)) {
+        return false;
+      }
+      return true;
+    });
+
+    const sentenceTail = sentences
+      .slice(1, 4)
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .join(" ");
+
+    const narrativeDetail = [
+      ...narrativeSegments,
+      sentenceTail,
+    ]
+      .map((item) => String(item || "").trim())
+      .filter(Boolean)
+      .filter((item, index, arr) => arr.findIndex((other) => other.toLowerCase() === item.toLowerCase()) === index)
+      .join("\n");
+
+    const contentBody = [
+      summary,
+      narrativeDetail,
+    ].filter(Boolean).join("\n\n");
+
+    let aiDraft = null;
+    let aiUsage = null;
+    try {
+      const aiResponseRaw = await fetchJson("/api-gateway/model/route", {
+        method: "POST",
+        body: JSON.stringify({
+          severity: String(alertOnboarding.severity || "high").trim().toLowerCase(),
+          task: normalizedKind === "remediation" ? "fix" : "summarization",
+          prompt: [
+            `Generate a meaningful ${normalizedKind} document draft for SRE operations from user input.`,
+            "Return ONLY valid JSON with keys: title, summary, content, commands, scripts, queries, metadata.",
+            "Use commands/scripts/queries only when relevant and keep content actionable.",
+          ].join(" "),
+          payload: {
+            kind: normalizedKind,
+            alert_type: String(alertOnboarding.alert_type || "").trim(),
+            services: String(alertOnboarding.services || "").trim(),
+            user_prompt: prompt,
+          },
+        }),
+      });
+      const aiResponse = aiResponseRaw?.data && typeof aiResponseRaw.data === "object"
+        ? aiResponseRaw.data
+        : aiResponseRaw;
+      aiUsage = aiResponse?.usage || null;
+      aiDraft = parseAiDraftContent(aiResponse?.content || "");
+    } catch (_error) {
+      aiDraft = null;
+    }
+
+    const mergeUnique = (base, extra) => {
+      const out = [];
+      [...normalizeDraftList(base), ...normalizeDraftList(extra)].forEach((item) => {
+        if (!out.some((existing) => existing.toLowerCase() === item.toLowerCase())) {
+          out.push(item);
+        }
+      });
+      return out;
+    };
+
+    const aiCommands = normalizeDraftList(aiDraft?.commands);
+    const aiScripts = normalizeDraftList(aiDraft?.scripts);
+    const aiQueries = normalizeDraftList(aiDraft?.queries);
+    const mergedCommands = mergeUnique(aiCommands, commandMatches);
+    const mergedScripts = mergeUnique(aiScripts, scriptMatches);
+    const mergedQueries = mergeUnique(aiQueries, queryMatches);
+    const mergedExecutionPlan = [
+      mergedCommands.length ? `Commands:\n${mergedCommands.map((item) => `- ${item}`).join("\n")}` : "",
+      mergedScripts.length ? `Scripts:\n${mergedScripts.map((item) => `- ${item}`).join("\n")}` : "",
+      mergedQueries.length ? `Queries:\n${mergedQueries.map((item) => `- ${item}`).join("\n")}` : "",
+    ].filter(Boolean).join("\n\n");
+
+    setAlertOnboarding((curr) => ({
+      ...curr,
+      title: String(aiDraft?.title || generatedTitle).slice(0, 160),
+      summary: String(aiDraft?.summary || summary).trim(),
+      content: String(aiDraft?.content || contentBody || prompt).trim(),
+      execution_plan: normalizedKind === "remediation" ? mergedExecutionPlan : curr.execution_plan,
+      remediation_commands_text: normalizedKind === "remediation" ? mergedCommands.join("\n") : curr.remediation_commands_text,
+      remediation_scripts_text: normalizedKind === "remediation" ? mergedScripts.join("\n") : curr.remediation_scripts_text,
+      remediation_queries_text: normalizedKind === "remediation" ? mergedQueries.join("\n") : curr.remediation_queries_text,
+    }));
+
+    setAlertOnboardingState({
+      loading: false,
+      result: {
+        message: aiDraft
+          ? "Draft generated from prompt using AI + heuristics. Review and click Create Alert Onboarding Doc."
+          : "Draft generated from prompt using heuristics fallback. Review and click Create Alert Onboarding Doc.",
+        ai_usage: aiUsage,
+      },
+      error: "",
+    });
   }
 
   async function autoCreateAlertDocument(alertRow, preferredKind = "runbook") {
@@ -3533,17 +3868,11 @@ export default function App() {
     setAlertOnboardingState({ loading: true, result: null, error: "" });
     try {
       const payload = {
+        ...buildDocPayloadFromDraft(alertOnboarding),
         kind: String(alertOnboarding.kind || "incident").trim(),
         title: String(alertOnboarding.title || "").trim(),
-        summary: String(alertOnboarding.summary || "").trim() || null,
         content: String(alertOnboarding.content || "").trim(),
-        services: String(alertOnboarding.services || "")
-          .split(",")
-          .map((item) => item.trim())
-          .filter(Boolean),
         severity: String(alertOnboarding.severity || "").trim(),
-        alert_type: String(alertOnboarding.alert_type || "").trim(),
-        alert_id: String(alertOnboarding.alert_id || "").trim() || null,
       };
       const isUpdate = docPromptMode === "update" && Boolean(docPromptExistingDoc?.path);
       const response = await fetchJson("/api-gateway/rag/documents", {
@@ -3904,7 +4233,7 @@ export default function App() {
     if (monitorApplications.includes(applicationToMonitor)) {
       return;
     }
-    setApplicationToMonitor(monitorApplications[0] || "payments");
+    setApplicationToMonitor(monitorApplications[0] || "kaiops-core1");
   }, [alerts.rows, monitorApplications, applicationToMonitor]);
 
   useEffect(() => {
@@ -5414,8 +5743,8 @@ export default function App() {
 
   const adminWorkspaceCaptions = useMemo(() => ({
     users: "Manage users, roles, and credentials.",
-    monitoring: "Application monitoring onboarding and lifecycle timeline.",
-    project: "Project setup, onboarding path, and optional rule automation.",
+    monitoring: "Setup monitoring foundations, then continue alert knowledge onboarding.",
+    project: "Setup landing pad, routing path, and continue alert knowledge onboarding.",
     alerts: "Alert knowledge onboarding and bulk document ingestion.",
   }), []);
 
@@ -5444,6 +5773,18 @@ export default function App() {
       monitoringInspectRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
   }, [selectedMonitoringAppId, adminWorkspace]);
+
+  useEffect(() => {
+    if (activeTab !== "admin" || adminWorkspace !== "alerts") {
+      return;
+    }
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      alertKnowledgeRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }, [activeTab, adminWorkspace]);
 
   useEffect(() => {
     if (onboardingProjectMode === "new" || selectedOnboardingProject || !projectOnboardingRows.length) {
@@ -5481,6 +5822,7 @@ export default function App() {
       setAdminWorkspace("project");
     } else if (workspace === "alerts") {
       setAdminWorkspace("alerts");
+      setAlertKnowledgeView("onboarding");
     }
     setActiveTab("admin");
   }
@@ -6034,13 +6376,13 @@ export default function App() {
                 {canManageSeverityOverride ? (
                   <p className="subtitle">L2/L3/Admin can set future severity overrides by alert name + service + environment.</p>
                 ) : null}
-                <div className="table-wrap">
+                <div className="table-wrap table-wrap-scroll-x alert-stream-wrap">
                   <table className="alert-stream-table">
                     <thead>
                       <tr>
                         <th>Alert ID</th>
                         <th>Time (UTC)</th>
-                        <th>Name</th>
+                        <th className="alert-name-col">Name</th>
                         <th>Application</th>
                         <th>Service</th>
                         <th>Severity</th>
@@ -6066,6 +6408,7 @@ export default function App() {
                         const overrideRow = severityOverrideByKey.get(overrideKey);
                         const draftSeverity = String(alertSeverityDrafts[overrideKey] || overrideRow?.severity || String(row.severity || "warning").toLowerCase()).toLowerCase();
                         const overrideSaving = alertSeverityOverrides.savingKey === overrideKey;
+                        const alertClosed = isApprovalResolvedStatus(row.status || status);
                         return (
                           <tr
                             key={rowId}
@@ -6083,7 +6426,7 @@ export default function App() {
                           >
                             <td title={fullAlertId}>{compactAlertId}</td>
                             <td>{formatUtcTimestamp(row.created_at || row.starts_at)}</td>
-                            <td>{row.name || row.alert_name || "-"}</td>
+                            <td className="alert-name-col">{row.name || row.alert_name || "-"}</td>
                             <td>{application}</td>
                             <td>{row.service || "-"}</td>
                             <td><span className={`pill severity-${severity.toLowerCase()}`}>{severity}</span></td>
@@ -6134,9 +6477,11 @@ export default function App() {
                               )}
                             </td>
                             <td><span className={`pill status-${status.toLowerCase()}`}>{status}</span></td>
-                            <td>
-                              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                                {!documentAvailable ? (
+                            <td className="alert-doc-cell">
+                              <div className="alert-doc-actions">
+                                {alertClosed ? (
+                                  <span className="pill status-closed">Alert Closed</span>
+                                ) : !documentAvailable ? (
                                   <button
                                     type="button"
                                     className="button-secondary pill status-blocked"
@@ -6229,6 +6574,10 @@ export default function App() {
                             severity: draft.severity,
                             alert_type: draft.alert_type,
                             alert_id: draft.alert_id,
+                            execution_plan: String(draft.execution_plan || "").trim(),
+                            remediation_commands_text: Array.isArray(draft.commands) ? draft.commands.join("\n") : "",
+                            remediation_scripts_text: Array.isArray(draft.scripts) ? draft.scripts.join("\n") : "",
+                            remediation_queries_text: Array.isArray(draft.queries) ? draft.queries.join("\n") : "",
                           }));
                         }}
                         disabled={alertOnboardingState.loading}
@@ -6263,6 +6612,7 @@ export default function App() {
                           <option value="deployment">deployment</option>
                           <option value="change">change</option>
                           <option value="dependency">dependency</option>
+                          <option value="remediation">remediation</option>
                         </select>
                       </label>
                       <label>Title<input value={alertOnboarding.title} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, title: e.target.value }))} /></label>
@@ -6271,6 +6621,26 @@ export default function App() {
                     <label>Services (comma separated)<input value={alertOnboarding.services} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, services: e.target.value }))} /></label>
                     <label>Summary<textarea rows={2} value={alertOnboarding.summary} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, summary: e.target.value }))} /></label>
                     <label>Content<textarea rows={5} value={alertOnboarding.content} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, content: e.target.value }))} /></label>
+                    {String(alertOnboarding.kind || "").trim().toLowerCase() === "remediation" ? (
+                      <>
+                        <div style={{ display: "flex", alignItems: "end", gap: 8 }}>
+                          <button
+                            type="button"
+                            className="button-secondary"
+                            onClick={() => autoGenerateRemediationPlan(docPromptAlert)}
+                            disabled={alertOnboardingState.loading}
+                          >
+                            Auto-Generate Commands/Scripts/Queries
+                          </button>
+                        </div>
+                        <label>Execution Plan<textarea rows={4} value={alertOnboarding.execution_plan} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, execution_plan: e.target.value }))} /></label>
+                        <div className="filter-grid">
+                          <label>Remediation Commands (one per line)<textarea rows={5} value={alertOnboarding.remediation_commands_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_commands_text: e.target.value }))} /></label>
+                          <label>Remediation Scripts (one per line)<textarea rows={5} value={alertOnboarding.remediation_scripts_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_scripts_text: e.target.value }))} /></label>
+                          <label>Validation Queries (one per line)<textarea rows={5} value={alertOnboarding.remediation_queries_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_queries_text: e.target.value }))} /></label>
+                        </div>
+                      </>
+                    ) : null}
                     <button className="button-primary" type="submit" disabled={alertOnboardingState.loading}>
                       {alertOnboardingState.loading ? "Saving..." : docPromptMode === "update" && docPromptExistingDoc?.path ? "Update Document" : "Upload Document"}
                     </button>
@@ -6335,7 +6705,7 @@ export default function App() {
 
                   {homeDetailTab === "summary" ? (
                     <>
-                      <div className="table-wrap">
+                      <div className="table-wrap table-wrap-scroll-x">
                         <table>
                           <tbody>
                             <tr><th>Alert</th><td>{selectedAlertRow?.name || selectedAlertWorkflow?.alert?.name || "-"}</td></tr>
@@ -6405,7 +6775,7 @@ export default function App() {
 
                   {homeDetailTab === "finops" ? (
                     <>
-                      <div className="table-wrap">
+                      <div className="table-wrap table-wrap-scroll-x">
                         <table>
                           <thead>
                             <tr>
@@ -6512,7 +6882,7 @@ export default function App() {
                   <div className="copilot-summary-card copilot-tone-ops">
                     <strong>Project Onboarding</strong>
                     <span>Set project identity, environment, and monitoring endpoints.</span>
-                    <button type="button" className="button-primary" onClick={() => openCopilotWorkspace("monitoring")}>Open Onboarding</button>
+                    <button type="button" className="button-primary" onClick={() => openCopilotWorkspace("project")}>Open Setup Landing Pad</button>
                   </div>
                   <div className="copilot-summary-card copilot-tone-bus">
                     <strong>Alert Documents</strong>
@@ -6706,8 +7076,8 @@ export default function App() {
 
                 <div className="detail-tabs sticky-controls">
                   <button type="button" className={`detail-tab ${adminWorkspace === "users" ? "active" : ""}`} onClick={() => setAdminWorkspace("users")}>Users & Access</button>
-                  <button type="button" className={`detail-tab ${adminWorkspace === "monitoring" ? "active" : ""}`} onClick={() => setAdminWorkspace("monitoring")}>Monitoring</button>
-                  <button type="button" className={`detail-tab ${adminWorkspace === "project" ? "active" : ""}`} onClick={() => setAdminWorkspace("project")}>Project Setup</button>
+                  <button type="button" className={`detail-tab ${adminWorkspace === "monitoring" ? "active" : ""}`} onClick={() => setAdminWorkspace("monitoring")}>Setup Monitoring</button>
+                  <button type="button" className={`detail-tab ${adminWorkspace === "project" ? "active" : ""}`} onClick={() => setAdminWorkspace("project")}>Setup Landing Pad</button>
                   <button type="button" className={`detail-tab ${adminWorkspace === "alerts" ? "active" : ""}`} onClick={() => setAdminWorkspace("alerts")}>Alert Knowledge</button>
                 </div>
                 <p className="subtitle">{adminWorkspaceCaptions[adminWorkspace] || "Administrative workspace controls."}</p>
@@ -6726,7 +7096,7 @@ export default function App() {
                         <button className="button-secondary" type="button" onClick={loadAdminUsersAndRoles} disabled={!adminSession.accessToken || adminUsers.loading}>Refresh</button>
                       </div>
                       {adminUsers.error ? <p className="error">{adminUsers.error}</p> : null}
-                      <div className="table-wrap">
+                      <div className="table-wrap table-wrap-scroll-x">
                         <table>
                           <thead>
                             <tr><th>ID</th><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Actions</th></tr>
@@ -6820,7 +7190,7 @@ export default function App() {
                   <div className="grid single-col admin-flow-section admin-flow-project">
                     <article className="panel">
                       <div className="panel-head">
-                        <h3>Step 2: Project Setup And Rule Flow</h3>
+                        <h3>Step 2: Setup Landing Pad And Rule Flow</h3>
                         <div style={{ display: "flex", gap: 8 }}>
                           <button type="button" className="button-secondary" onClick={loadOnboardingAdminData}>Refresh</button>
                           <button
@@ -6857,6 +7227,10 @@ export default function App() {
                         </div>
                       </div>
                       <p className="subtitle">After application monitoring registration, configure project-level routing and optional rule automation.</p>
+                      <p className="subtitle">
+                        <strong>Alert Knowledge:</strong> After initial setup, onboard alert knowledge from the Alert Knowledge workspace.
+                        <button type="button" className="button-secondary" style={{ marginLeft: 8 }} onClick={() => setAdminWorkspace("alerts")}>Open Alert Knowledge</button>
+                      </p>
                       <p className="subtitle"><strong>Next Action:</strong> {onboardingNextAction}</p>
                       {onboardingDocumentSummary.total > 0 ? (
                         <p className="subtitle">
@@ -7329,10 +7703,14 @@ export default function App() {
                   <div className="grid single-col admin-flow-section admin-flow-monitoring">
                     <article className="panel">
                       <div className="panel-head">
-                        <h3>Application Monitoring Onboarding</h3>
+                        <h3>Setup Monitoring</h3>
                         <button className="button-secondary" type="button" onClick={loadMonitoringApplications} disabled={monitoringApps.loading}>Refresh</button>
                       </div>
                       <p className="subtitle">Start here. Register an application and inspect the end-to-end onboarding chain (discovery, validation, rules, Prometheus update, dashboard).</p>
+                      <p className="subtitle">
+                        <strong>Alert Knowledge:</strong> After initial monitoring setup, onboard alert knowledge documents.
+                        <button type="button" className="button-secondary" style={{ marginLeft: 8 }} onClick={() => setAdminWorkspace("alerts")}>Open Alert Knowledge</button>
+                      </p>
                       <form className="form" onSubmit={submitMonitoringApplication}>
                         <div className="filter-grid">
                           <label>Tenant<input value={monitoringAppForm.tenant_id} onChange={(e) => setMonitoringAppForm((curr) => ({ ...curr, tenant_id: e.target.value }))} /></label>
@@ -7452,9 +7830,60 @@ export default function App() {
                 {adminWorkspace === "alerts" ? (
                   <div className="grid single-col admin-flow-section admin-flow-knowledge">
                     <article className="panel">
+                      <div className="detail-tabs" style={{ marginBottom: 0 }}>
+                        <button
+                          type="button"
+                          className={alertKnowledgeView === "onboarding" ? "button-primary" : "button-secondary"}
+                          onClick={() => setAlertKnowledgeView("onboarding")}
+                        >
+                          Alert Knowledge Onboarding
+                        </button>
+                        <button
+                          type="button"
+                          className={alertKnowledgeView === "backend" ? "button-primary" : "button-secondary"}
+                          onClick={() => setAlertKnowledgeView("backend")}
+                        >
+                          Backend Docs & Metadata
+                        </button>
+                      </div>
+                    </article>
+
+                    {alertKnowledgeView === "onboarding" ? (
+                    <article className="panel" ref={alertKnowledgeRef}>
                       <h3>Alert Knowledge Onboarding</h3>
                       <p className="subtitle">Add monitoring/troubleshooting knowledge as part of the same onboarding flow.</p>
                       <form className="form" onSubmit={submitAlertOnboarding}>
+                        <label>
+                          Prompt For Document Generation
+                          <textarea
+                            rows={4}
+                            placeholder="Describe the alert scenario, triage steps, impact, and expected remediation. Optional prefixes: cmd:, script:, query:."
+                            value={alertKnowledgePrompt}
+                            onChange={(e) => setAlertKnowledgePrompt(e.target.value)}
+                          />
+                        </label>
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          <button
+                            type="button"
+                            className="button-secondary"
+                            onClick={generateAlertKnowledgeDraftFromPrompt}
+                            disabled={alertOnboardingState.loading}
+                          >
+                            Generate Draft From Prompt
+                          </button>
+                        </div>
+                        <div className="detail-tabs" style={{ marginBottom: 10 }}>
+                          {ALERT_DOC_KIND_OPTIONS.map((kind) => (
+                            <button
+                              key={`onboard-kind-${kind}`}
+                              type="button"
+                              className={String(alertOnboarding.kind || "").trim().toLowerCase() === kind ? "button-primary" : "button-secondary"}
+                              onClick={() => setAlertOnboarding((curr) => ({ ...curr, kind }))}
+                            >
+                              {kind}
+                            </button>
+                          ))}
+                        </div>
                         <div className="filter-grid">
                           <label>Kind
                             <select value={alertOnboarding.kind} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, kind: e.target.value }))}>
@@ -7463,6 +7892,7 @@ export default function App() {
                               <option value="deployment">deployment</option>
                               <option value="change">change</option>
                               <option value="dependency">dependency</option>
+                              <option value="remediation">remediation</option>
                             </select>
                           </label>
                           <label>Title<input value={alertOnboarding.title} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, title: e.target.value }))} /></label>
@@ -7472,12 +7902,34 @@ export default function App() {
                         <label>Services (comma separated)<input value={alertOnboarding.services} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, services: e.target.value }))} /></label>
                         <label>Summary<textarea rows={2} value={alertOnboarding.summary} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, summary: e.target.value }))} /></label>
                         <label>Content<textarea rows={5} value={alertOnboarding.content} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, content: e.target.value }))} /></label>
+                        {String(alertOnboarding.kind || "").trim().toLowerCase() === "remediation" ? (
+                          <>
+                            <div style={{ display: "flex", alignItems: "end", gap: 8 }}>
+                              <button
+                                type="button"
+                                className="button-secondary"
+                                onClick={() => autoGenerateRemediationPlan()}
+                                disabled={alertOnboardingState.loading}
+                              >
+                                Auto-Generate Commands/Scripts/Queries
+                              </button>
+                            </div>
+                            <label>Execution Plan<textarea rows={4} value={alertOnboarding.execution_plan} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, execution_plan: e.target.value }))} /></label>
+                            <div className="filter-grid">
+                              <label>Remediation Commands (one per line)<textarea rows={5} value={alertOnboarding.remediation_commands_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_commands_text: e.target.value }))} /></label>
+                              <label>Remediation Scripts (one per line)<textarea rows={5} value={alertOnboarding.remediation_scripts_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_scripts_text: e.target.value }))} /></label>
+                              <label>Validation Queries (one per line)<textarea rows={5} value={alertOnboarding.remediation_queries_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_queries_text: e.target.value }))} /></label>
+                            </div>
+                          </>
+                        ) : null}
                         <button className="button-primary" type="submit" disabled={alertOnboardingState.loading}>{alertOnboardingState.loading ? "Saving..." : "Create Alert Onboarding Doc"}</button>
                       </form>
                       {alertOnboardingState.error ? <p className="error">{alertOnboardingState.error}</p> : null}
                       {alertOnboardingState.result ? <pre className="result">{JSON.stringify(alertOnboardingState.result, null, 2)}</pre> : null}
                     </article>
+                    ) : null}
 
+                    {alertKnowledgeView === "onboarding" ? (
                     <article className="panel">
                       <h3>Bulk Insert From Excel</h3>
                       <p className="subtitle">Upload .xlsx, .xls, or .csv with columns: kind, title, summary, content, services, severity, alert_type.</p>
@@ -7539,6 +7991,64 @@ export default function App() {
                         </table>
                       </div>
                     </article>
+                    ) : null}
+
+                    {alertKnowledgeView === "backend" ? (
+                      <article className="panel">
+                        <div className="panel-head">
+                          <h3>Stored Backend Documents</h3>
+                          <button className="button-secondary" type="button" onClick={loadRagDocs}>Refresh</button>
+                        </div>
+                        <p className="subtitle">Documents currently stored in backend with metadata details.</p>
+                        {ragDocs.error ? <p className="error">{ragDocs.error}</p> : null}
+                        <div className="table-wrap">
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>Title</th>
+                                <th>Kind</th>
+                                <th>Alert Type</th>
+                                <th>Severity</th>
+                                <th>Services</th>
+                                <th>Path</th>
+                                <th>Updated</th>
+                                <th>Metadata</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {ragDocs.rows.map((doc, index) => (
+                                <tr key={`backend-doc-${doc.path || doc.title || index}`}>
+                                  <td>{doc.title || "-"}</td>
+                                  <td>{doc.kind || doc.document_kind || "-"}</td>
+                                  <td>{doc.alert_type || "-"}</td>
+                                  <td>{doc.severity || "-"}</td>
+                                  <td>{Array.isArray(doc.services) ? doc.services.join(", ") : (doc.services || "-")}</td>
+                                  <td>{doc.path || "-"}</td>
+                                  <td>{doc.updated_at || doc.modified_at || doc.created_at || "-"}</td>
+                                  <td>
+                                    <details>
+                                      <summary style={{ cursor: "pointer" }}>view</summary>
+                                      <pre className="result" style={{ marginTop: 8 }}>{JSON.stringify({
+                                        alert_id: doc.alert_id || null,
+                                        root_cause: doc.root_cause || null,
+                                        impact: doc.impact || null,
+                                        execution_plan: doc.execution_plan || null,
+                                        recommended_action: doc.recommended_action || null,
+                                        source_system: doc.source_system || null,
+                                        source_ref: doc.source_ref || null,
+                                        tags: doc.tags || null,
+                                        metadata: doc.metadata || null,
+                                      }, null, 2)}</pre>
+                                    </details>
+                                  </td>
+                                </tr>
+                              ))}
+                              {!ragDocs.rows.length && !ragDocs.loading ? <tr><td colSpan={8}>No documents found in backend.</td></tr> : null}
+                            </tbody>
+                          </table>
+                        </div>
+                      </article>
+                    ) : null}
                   </div>
                 ) : null}
               </article>

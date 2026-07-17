@@ -1484,6 +1484,22 @@ async def flow_catalog(
     )
 
 
+@app.post("/model/route")
+async def model_route(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/route",
+        target_base=settings.model_router_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/approval/incident/{incident_id}")
 async def get_incident(
     incident_id: str,
