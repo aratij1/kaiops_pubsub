@@ -102,6 +102,7 @@ scrape_configs:
       - targets: ["kafka-exporter:9308"]
 
   - job_name: kaiops-dynamic-applications
+    honor_labels: true
     file_sd_configs:
       - files:
           - /etc/prometheus/generated-targets/*.json
