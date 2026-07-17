@@ -277,6 +277,7 @@ def _build_approval_event_payload(approval: Approval) -> dict[str, Any]:
     pending = PENDING_INCIDENTS.get(incident_id, {})
     recommendation = pending.get("recommendation", {}) if isinstance(pending.get("recommendation"), dict) else {}
     decision = pending.get("decision", {}) if isinstance(pending.get("decision"), dict) else {}
+    incident = pending.get("incident", {}) if isinstance(pending.get("incident"), dict) else {}
     flow_id = str(decision.get("flow_id") or incident_id)
     recommendation_id = str(approval.recommendation_id)
 
@@ -306,6 +307,7 @@ def _build_approval_event_payload(approval: Approval) -> dict[str, Any]:
         "approval": approval,
         "recommendation": recommendation,
         "decision": decision,
+        "incident": incident,
         "event_contract": event_contract,
     }
 

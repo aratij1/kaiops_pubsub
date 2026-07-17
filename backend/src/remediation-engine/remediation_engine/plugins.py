@@ -23,7 +23,46 @@ class BasePlugin:
 
     async def _simulate(self, action: RemediationAction, command: str) -> RemediationAction:
         await asyncio.sleep(0)
-        action.output = f"executed {command} on {action.target}"
+        target = str(action.target or "unknown-target").strip() or "unknown-target"
+        service = str(action.parameters.get("service") or "").strip()
+        environment = str(action.parameters.get("environment") or "").strip()
+        root_cause = str(action.parameters.get("root_cause") or "").strip()
+        recommended_action = str(action.parameters.get("recommended_action") or "").strip()
+        trace_id = str(action.trace_id or "").strip()
+        execution_plan = action.parameters.get("execution_plan") if isinstance(action.parameters.get("execution_plan"), dict) else {}
+        commands = execution_plan.get("commands") if isinstance(execution_plan.get("commands"), list) else []
+        scripts = execution_plan.get("scripts") if isinstance(execution_plan.get("scripts"), list) else []
+        queries = execution_plan.get("queries") if isinstance(execution_plan.get("queries"), list) else []
+        first_step = next(
+            (
+                str(item).strip()
+                for item in [*commands, *scripts, *queries]
+                if str(item).strip()
+            ),
+            "",
+        )
+
+        segments = [f"executed {command}", f"target={target}"]
+        if first_step:
+            segments.append(f"step={first_step}")
+        if commands:
+            segments.append(f"commands={len(commands)}")
+        if scripts:
+            segments.append(f"scripts={len(scripts)}")
+        if queries:
+            segments.append(f"queries={len(queries)}")
+        if service:
+            segments.append(f"service={service}")
+        if environment:
+            segments.append(f"environment={environment}")
+        if recommended_action:
+            segments.append(f"recommended_action={recommended_action}")
+        if root_cause:
+            segments.append(f"root_cause={root_cause}")
+        if trace_id:
+            segments.append(f"trace_id={trace_id}")
+
+        action.output = "; ".join(segments)
         action.status = RemediationStatus.SUCCEEDED
         return action
 
@@ -34,7 +73,7 @@ class JenkinsRollbackPlugin(BasePlugin):
 
     @circuit_breaker(CircuitBreaker())
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        return await self._simulate(action, "jenkins rollback job")
+        return await self._simulate(action, "rollback_deployment")
 
 
 class KubernetesRestartPlugin(BasePlugin):
@@ -43,7 +82,7 @@ class KubernetesRestartPlugin(BasePlugin):
 
     @circuit_breaker(CircuitBreaker())
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        return await self._simulate(action, "kubectl rollout restart")
+        return await self._simulate(action, action.action_type)
 
 
 class AnsibleRemediationPlugin(BasePlugin):
@@ -51,7 +90,7 @@ class AnsibleRemediationPlugin(BasePlugin):
         super().__init__("restart_service")
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        return await self._simulate(action, "ansible-playbook remediation.yml")
+        return await self._simulate(action, action.action_type)
 
 
 class TerraformRollbackPlugin(BasePlugin):
@@ -59,7 +98,7 @@ class TerraformRollbackPlugin(BasePlugin):
         super().__init__("terraform_rollback")
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        return await self._simulate(action, "terraform apply previous plan")
+        return await self._simulate(action, action.action_type)
 
 
 class ApiExecutionPlugin(BasePlugin):
@@ -67,7 +106,7 @@ class ApiExecutionPlugin(BasePlugin):
         super().__init__("api_execution")
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        return await self._simulate(action, "REST API remediation")
+        return await self._simulate(action, action.action_type)
 
 
 @dataclass
@@ -139,20 +178,152 @@ class RemediationEngine(BaseAgent):
             action_type = "rollback_deployment"
         policy_version = str(approval.metadata.get("policy_version", "")).strip()
         policy_reason = str(approval.metadata.get("policy_reason", "")).strip()
+
+        target_candidates = [
+            approval.metadata.get("remediation_target"),
+            approval.metadata.get("target"),
+            approval.metadata.get("deployment"),
+            approval.metadata.get("resource"),
+            approval.metadata.get("service"),
+            approval.metadata.get("incident_service"),
+            approval.metadata.get("incident_id"),
+            approval.incident_id,
+        ]
+        target = str(next((value for value in target_candidates if value), approval.incident_id))
+        service = str(approval.metadata.get("service") or approval.metadata.get("incident_service") or "").strip()
+        environment = str(approval.metadata.get("environment") or "").strip()
+        recommended_action = str(approval.metadata.get("recommended_action") or "").strip()
+        recommended_commands = approval.metadata.get("recommended_commands") if isinstance(approval.metadata.get("recommended_commands"), list) else []
+
+        command_list = [str(item).strip() for item in recommended_commands if str(item).strip()]
+        execution_plan = self._build_execution_plan(
+            action_type=action_type,
+            target=target,
+            service=service,
+            environment=environment,
+            recommended_action=recommended_action,
+            recommended_commands=command_list,
+        )
+
         return RemediationAction(
             incident_id=approval.incident_id,
             approval_id=approval.id,
             action_type=action_type,
-            target=str(approval.incident_id),
+            target=target,
             parameters={
                 "approved_by": approval.approver,
                 "channel": approval.channel,
                 "policy_version": policy_version,
                 "policy_reason": policy_reason,
+                "service": service,
+                "environment": environment,
+                "recommended_action": recommended_action,
+                "commands": command_list,
+                "execution_plan": execution_plan,
             },
             started_at=utc_now(),
             status=RemediationStatus.RUNNING,
         )
+
+    def _build_execution_plan(
+        self,
+        *,
+        action_type: str,
+        target: str,
+        service: str,
+        environment: str,
+        recommended_action: str,
+        recommended_commands: list[str],
+    ) -> dict[str, list[str]]:
+        namespace = environment or "prod"
+        resolved_target = target or service or "unknown-target"
+
+        if action_type == "restart_pod":
+            commands = [
+                f"kubectl rollout restart deployment/{resolved_target} -n {namespace}",
+                f"kubectl rollout status deployment/{resolved_target} -n {namespace} --timeout=180s",
+            ]
+            scripts = [
+                f"scripts/remediation/restart_pod.ps1 -Service {resolved_target} -Namespace {namespace}",
+            ]
+            queries = [
+                f"sum(rate(http_requests_total{{service='{resolved_target}',status=~'5..'}}[5m]))",
+            ]
+        elif action_type == "scale_deployment":
+            commands = [
+                f"kubectl scale deployment/{resolved_target} --replicas=3 -n {namespace}",
+                f"kubectl rollout status deployment/{resolved_target} -n {namespace} --timeout=180s",
+            ]
+            scripts = [
+                f"scripts/remediation/scale_deployment.ps1 -Service {resolved_target} -Namespace {namespace} -Replicas 3",
+            ]
+            queries = [
+                f"avg_over_time(container_cpu_usage_seconds_total{{pod=~'{resolved_target}.*'}}[10m])",
+            ]
+        elif action_type == "restart_service":
+            commands = [
+                f"ansible-playbook playbooks/restart-service.yml -e service={resolved_target} -e env={namespace}",
+            ]
+            scripts = [
+                f"scripts/remediation/restart_service.ps1 -Service {resolved_target} -Environment {namespace}",
+            ]
+            queries = [
+                f"max_over_time(up{{job='{resolved_target}'}}[5m])",
+            ]
+        elif action_type == "clear_cache":
+            commands = [
+                f"redis-cli -h {resolved_target}-redis -n 0 FLUSHDB",
+            ]
+            scripts = [
+                f"scripts/remediation/clear_cache.ps1 -Service {resolved_target}",
+            ]
+            queries = [
+                f"sum(rate(cache_miss_total{{service='{resolved_target}'}}[5m]))",
+            ]
+        elif action_type == "failover_database":
+            commands = [
+                "mysql -e \"CALL mysql.rds_failover();\"",
+            ]
+            scripts = [
+                "scripts/remediation/failover_database.ps1",
+            ]
+            queries = [
+                "SHOW REPLICA STATUS;",
+                f"sum(rate(mysql_global_status_queries{{service='{resolved_target}'}}[5m]))",
+            ]
+        elif action_type == "terraform_rollback":
+            commands = [
+                "terraform init",
+                f"terraform apply -auto-approve -var service={resolved_target} -var rollback=true",
+            ]
+            scripts = [
+                f"scripts/remediation/terraform_rollback.ps1 -Service {resolved_target} -Environment {namespace}",
+            ]
+            queries = [
+                f"sum(rate(terraform_apply_failures_total{{service='{resolved_target}'}}[15m]))",
+            ]
+        else:
+            commands = [
+                f"kubectl rollout undo deployment/{resolved_target} -n {namespace}",
+                f"kubectl rollout status deployment/{resolved_target} -n {namespace} --timeout=180s",
+            ]
+            scripts = [
+                f"scripts/remediation/rollback_deployment.ps1 -Service {resolved_target} -Namespace {namespace}",
+            ]
+            queries = [
+                f"sum(rate(http_requests_total{{service='{resolved_target}',status=~'5..'}}[5m]))",
+            ]
+
+        if recommended_commands:
+            commands = recommended_commands + commands
+        if recommended_action:
+            commands = [f"# recommended_action: {recommended_action}", *commands]
+
+        return {
+            "commands": commands,
+            "scripts": scripts,
+            "queries": queries,
+        }
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
         action_type = action.action_type if action.action_type in self.tool_registry.tools else "api_execution"

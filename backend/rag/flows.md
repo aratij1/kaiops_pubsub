@@ -183,6 +183,16 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Recommended Action:** Investigate issue
 
 ## KaiOpsServiceDown Incident Summary
+- **Service:** kaiops-orchestrator
+- **Severity:** CRITICAL
+- **Alert Type:** KaiOpsServiceDown
+- **Alert ID:** b2f5ab95-99d2-4202-9f9b-17b453081676
+- **Summary:** KaiOpsServiceDown detected for kaiops-orchestrator. Impact: Kaiops-Orchestrator service impact requires immediate triage.
+- **Recommended Action:** Rollback deployment
+- **Root Cause:** Deployment 2.5
+- **Impact:** Kaiops-Orchestrator service impact requires immediate triage
+
+## KaiOpsServiceDown Incident Summary
 - **Service:** kaiops-core1
 - **Severity:** CRITICAL
 - **Alert Type:** KaiOpsServiceDown

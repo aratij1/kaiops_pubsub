@@ -1442,6 +1442,11 @@ async def run_local_payment_workflow(
         f"recommended action is {scenario['recommended_action']}."
     )
     recommendation.trace_id = trace_id
+    recommendation.metadata["rag_documents"] = context.metadata.get("rag_documents", 0)
+    recommendation.metadata["rag_matches"] = context.metadata.get("rag_matches", [])
+    recommendation.metadata["rag_top_similarity"] = context.metadata.get("rag_top_similarity", 0.0)
+    recommendation.metadata["rag_service_tagged_match"] = context.metadata.get("rag_service_tagged_match", False)
+    recommendation.metadata["runbook_found"] = bool(context.runbook)
     recommendation.metadata["policy_version"] = decision.policy_version
     recommendation.metadata["policy_reason"] = decision.policy_reason
     recommendation.metadata["orchestration_decision"] = {
