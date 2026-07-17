@@ -775,7 +775,7 @@ function deriveExecutionCommands(workflow, traceRows) {
 
   if (!derived.length) {
     const preview = buildPreviewExecutionPlan(safeWorkflow);
-    pushUnique("preview only (awaiting approval/execution)", "cmd: ");
+    pushUnique("SIMULATED - no real command is executed, before or after approval", "cmd: ");
     pushUnique(`# recommended_action: ${preview.recommendationText}`, "cmd: ");
     (preview.plan.commands || []).forEach((item) => pushUnique(item, "cmd: "));
     (preview.plan.scripts || []).forEach((item) => pushUnique(item, "script: "));
@@ -915,6 +915,7 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
     || routingTimestamp;
 
   const rows = [];
+  const traceId = alert.trace_id || incident.trace_id || context.trace_id || recommendation.trace_id || remediationAction.trace_id || "";
 
   if (landingTimestamp || hasMeaningfulValue(alert)) {
     rows.push({
@@ -935,7 +936,7 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
       }),
       outputValueText: stringifyTimelineValue({
         correlation_id: alert.correlation_id,
-        trace_id: alert.trace_id,
+        trace_id: traceId,
       }),
       errorValueText: "",
       backendEvents: findTraceEvents(["alert", "incident.opened", "incident.created"]),
@@ -962,6 +963,7 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
         incident_title: incident.title,
         severity: incident.severity,
         status: incident.status,
+        trace_id: traceId,
       }),
       errorValueText: "",
       backendEvents: findTraceEvents(["workflow.selected", "context.collected"]),
@@ -988,6 +990,7 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
         rag_documents: ragDocuments ?? "-",
         rag_matches: ragMatches,
         runbook_found: runbookFound,
+        trace_id: traceId,
       }),
       errorValueText: "",
       backendEvents: findTraceEvents(["context.collected"]),
@@ -1012,6 +1015,7 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
       outputValueText: stringifyTimelineValue({
         rag_top_similarity: ragTopSimilarity ?? "-",
         top_matches: ragMatches.slice(0, 5),
+        trace_id: traceId,
       }),
       errorValueText: "",
       backendEvents: findTraceEvents(["context.collected", "recommendation.generated"]),
@@ -1039,6 +1043,7 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
         execution_mode: decision.execution_mode,
         policy_version: decision.policy_version,
         message_bus_provider: decision.message_bus_provider,
+        trace_id: traceId,
       }),
       errorValueText: "",
       backendEvents: findTraceEvents(["workflow.selected", "recommendation.generated", "approval.recorded"]),
@@ -1064,11 +1069,11 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
       timestamp: remediationTimestamp,
       elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, remediationTimestamp),
       detail: remediationExecuted
-        ? "Approved remediation action executed with command/script payload and execution status captured."
-        : "Planned remediation command/script/query preview generated; awaiting approval or execution.",
+        ? "SIMULATED remediation completed - no real infrastructure was contacted; command/script payload and simulated status captured."
+        : "SIMULATED remediation command/script/query preview generated; will remain simulated even after approval.",
       tables: "actions, audit_logs, incident_events",
       inputValueText: stringifyTimelineValue({
-        mode: remediationExecuted ? "executed" : "preview",
+        mode: remediationExecuted ? "simulated_executed" : "simulated_preview",
         action_type: remediationAction.action_type,
         target: remediationAction.target,
         commands: Array.isArray(executionPlan.commands) ? executionPlan.commands : executionCommands,
@@ -1079,6 +1084,7 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
         status: remediationAction.status || (remediationExecuted ? "-" : "pending"),
         output: remediationAction.output,
         error: remediationAction.error,
+        trace_id: traceId,
       }),
       errorValueText: stringifyTimelineValue(remediationAction.error),
       backendEvents: findTraceEvents(["remediation.executed", "closure.completed"]),
@@ -1389,6 +1395,28 @@ function SuccessFailureDonut({ success, failure }) {
       </div>
     </article>
   );
+}
+
+const ONBOARDING_STEP_BACKGROUND = {
+  setup_monitoring: {
+    1: "Saved to the OnboardingStateRecord table (keyed by project_name) via POST /onboarding/complete on monitoring-adapter.",
+    2: "No backend call - determines which branch of the same request monitoring-adapter executes next (rule onboarding vs landing pad ingestion).",
+    3: "Your plain-English lines are sent to the new-rule-onboarding pipeline, which asks the model-router (LLM) to translate them into concrete Prometheus rule specs (metric, threshold, duration).",
+    4: "Generated rules are rendered into Prometheus rule YAML under backend/rag/changes/prometheus_rules, and Prometheus is asked to reload; a simulation check validates the rule behaves as expected.",
+    5: "For each generated rule, a runbook document is created and saved via POST /rag/documents - the same endpoint used by Alert Knowledge and the Dashboard's Provide Docs - so it appears under the Alert Knowledge tab.",
+  },
+  existing_monitoring: {
+    1: "Saved to the OnboardingStateRecord table (keyed by project_name) via POST /onboarding/complete on monitoring-adapter.",
+    2: "No backend call - determines which branch of the same request monitoring-adapter executes next (rule onboarding vs landing pad ingestion).",
+    3: "Saves the ingestion endpoint/connection profile you provide. This is the URL your monitoring tool's webhook (e.g. Alertmanager) should POST alerts to.",
+    4: "Incoming alerts hit monitoring-adapter's /alerts/alertmanager endpoint, are written to the landing pad, published to the raw-alerts topic, and consumed by alert-intelligence -> orchestrator -> the rest of the incident pipeline.",
+    5: "Optional. If rule onboarding was also enabled, documents are generated the same way as the Setup Monitoring path and appear under the Alert Knowledge tab.",
+  },
+};
+
+function explainOnboardingStepBackground(stepNumber, isSetupMonitoring) {
+  const table = ONBOARDING_STEP_BACKGROUND[isSetupMonitoring ? "setup_monitoring" : "existing_monitoring"];
+  return table[stepNumber] || "No background detail available for this step.";
 }
 
 function FlowTimelineGraph({ rows }) {
@@ -2583,7 +2611,6 @@ export default function App() {
           return base;
         })
         .filter(Boolean);
-<<<<<<< HEAD
       const isDisplayableMonitorApp = (value) => {
         const normalized = String(value || "").trim();
         if (!normalized) {
@@ -2603,14 +2630,12 @@ export default function App() {
       const unique = Array.from(
         new Set([...defaultMonitorApplications, ...projects, ...monitoringApplications, ...alertApplications].filter(isDisplayableMonitorApp)),
       );
-=======
       const allowedMonitorApplication = (value) => {
         const normalized = String(value || "").trim().toLowerCase();
         return normalized === "payments" || normalized.startsWith("kaiops");
       };
-      const unique = Array.from(new Set([...defaultMonitorApplications, ...projects, ...monitoringApplications, ...alertApplications]))
-        .filter((name) => allowedMonitorApplication(name));
->>>>>>> 591f08d4c47fb4d45954c1902c8c3ea3f2913d43
+      // const unique = Array.from(new Set([...defaultMonitorApplications, ...projects, ...monitoringApplications, ...alertApplications]))
+        // .filter((name) => allowedMonitorApplication(name));
       setMonitorApplications(unique.length ? unique : defaultMonitorApplications);
     } catch (_error) {
       setMonitorApplications(defaultMonitorApplications);
@@ -4376,7 +4401,7 @@ export default function App() {
         ),
         outputValueText: stringifyTimelineValue(
           hasMeaningfulValue(event.output_value)
-            ? event.output_value
+            ? { trace_id: event.trace_id, ...event.output_value }
             : {
                 event_type: event.event_type,
                 event_stage: event.event_stage,
@@ -4384,6 +4409,7 @@ export default function App() {
                 transport_channel: event.transport_channel,
                 table_hints: event.table_hints,
                 query_hint: event.query_hint,
+                trace_id: event.trace_id,
               }
         ),
         errorValueText: stringifyTimelineValue(event.error) || extractEventError(event),
@@ -5484,8 +5510,8 @@ export default function App() {
 
   const adminWorkspaceCaptions = useMemo(() => ({
     users: "Manage users, roles, and credentials.",
-    monitoring: "Application monitoring onboarding and lifecycle timeline.",
-    project: "Project setup, onboarding path, and optional rule automation.",
+    monitoring: "Application monitoring onboarding and lifecycle timeline. Generated runbooks appear under Alert Knowledge once rules are created.",
+    project: "Project setup, onboarding path, and optional rule automation. Generated and Landing Pad-linked documents appear under Alert Knowledge.",
     alerts: "Alert knowledge onboarding and bulk document ingestion.",
   }), []);
 
@@ -6837,7 +6863,7 @@ export default function App() {
 
                 <div className="detail-tabs sticky-controls">
                   <button type="button" className={`detail-tab ${adminWorkspace === "users" ? "active" : ""}`} onClick={() => setAdminWorkspace("users")}>Users & Access</button>
-                  <button type="button" className={`detail-tab ${adminWorkspace === "monitoring" ? "active" : ""}`} onClick={() => setAdminWorkspace("monitoring")}>Monitoring</button>
+                  <button type="button" className={`detail-tab ${adminWorkspace === "monitoring" ? "active" : ""}`} onClick={() => setAdminWorkspace("monitoring")}>Setup Monitoring</button>
                   <button type="button" className={`detail-tab ${adminWorkspace === "project" ? "active" : ""}`} onClick={() => setAdminWorkspace("project")}>Project Setup</button>
                   <button type="button" className={`detail-tab ${adminWorkspace === "alerts" ? "active" : ""}`} onClick={() => setAdminWorkspace("alerts")}>Alert Knowledge</button>
                 </div>
@@ -7072,7 +7098,7 @@ export default function App() {
                         <div className="panel" style={{ margin: "10px 0", borderStyle: "dashed" }}>
                           <div className="panel-head">
                             <h3>Landing Pad Details</h3>
-                            <p>Endpoint and payload guidance for alert ingestion into KaiOps workflow.</p>
+                            <p>Endpoint and payload guidance for alert ingestion into KaiOps workflow. Troubleshooting runbooks for ingested alerts are managed under Alert Knowledge.</p>
                           </div>
                           <div className="filter-grid">
                             <label>Ingestion Endpoint (UI/Gateway)
@@ -7255,40 +7281,51 @@ export default function App() {
                               <th>Step</th>
                               <th>Status</th>
                               <th>What Happened</th>
+                              <th>Background</th>
                             </tr>
                           </thead>
                           <tbody>
-                            {(onboardingWorkflowSteps.length ? onboardingWorkflowSteps : (
-                              String(onboardingForm.onboarding_path || "existing_monitoring").trim() === "setup_monitoring"
-                                ? [
-                                  { step: 1, title: "Create/Update Project", status: "pending", details: { message: "Start by creating or updating a project." } },
-                                  { step: 2, title: "Select Onboarding Path", status: "pending", details: { message: "Choose Setup Monitoring." } },
-                                  { step: 3, title: "Capture Rules In Plain English", status: "pending", details: { message: "Provide plain-English rule intent." } },
-                                  { step: 4, title: "Convert To YAML, Upload In Prometheus, Test", status: "pending", details: { message: "System will convert, attempt upload/reload, and test." } },
-                                  { step: 5, title: "Generate Monitoring/Troubleshooting/Resolution Docs", status: "pending", details: { message: "System will generate documentation payloads." } },
-                                ]
-                                : [
-                                  { step: 1, title: "Create/Update Project", status: "pending", details: { message: "Start by creating or updating a project." } },
-                                  { step: 2, title: "Select Onboarding Path", status: "pending", details: { message: "Choose Existing Monitoring." } },
-                                  { step: 3, title: "Configure Landing Pad Ingestion", status: "pending", details: { message: "Connect your monitoring tool and route alerts to landing pad." } },
-                                  { step: 4, title: "Ingest Alerts and Trigger Workflow", status: "pending", details: { message: "Incoming alerts will trigger downstream workflow stages." } },
-                                  { step: 5, title: "Generate Monitoring/Troubleshooting/Resolution Docs", status: "pending", details: { message: "Optional generated docs can be reviewed and approved." } },
-                                ]
-                            )).map((row) => {
-                              const message = row?.details?.message
-                                || row?.details?.summary
-                                || row?.details?.choice
-                                || row?.details?.path
-                                || row?.details?.workflow_id
-                                || `Requirements: ${Number(row?.details?.requirements_count || 0)}`;
-                              return (
-                                <tr key={`workflow-step-${row.step}-${row.title}`}>
-                                  <td>{row.step}. {row.title}</td>
-                                  <td>{row.status || "pending"}</td>
-                                  <td>{String(message || "-")}</td>
-                                </tr>
+                            {(() => {
+                              const isSetupMonitoring = String(onboardingForm.onboarding_path || "existing_monitoring").trim() === "setup_monitoring";
+                              const rows = onboardingWorkflowSteps.length ? onboardingWorkflowSteps : (
+                                isSetupMonitoring
+                                  ? [
+                                    { step: 1, title: "Create/Update Project", status: "pending", details: { message: "Start by creating or updating a project." } },
+                                    { step: 2, title: "Select Onboarding Path", status: "pending", details: { message: "Choose Setup Monitoring." } },
+                                    { step: 3, title: "Capture Rules In Plain English", status: "pending", details: { message: "Provide plain-English rule intent." } },
+                                    { step: 4, title: "Convert To YAML, Upload In Prometheus, Test", status: "pending", details: { message: "System will convert, attempt upload/reload, and test." } },
+                                    { step: 5, title: "Generate Monitoring/Troubleshooting/Resolution Docs", status: "pending", details: { message: "System will generate documentation payloads." } },
+                                  ]
+                                  : [
+                                    { step: 1, title: "Create/Update Project", status: "pending", details: { message: "Start by creating or updating a project." } },
+                                    { step: 2, title: "Select Onboarding Path", status: "pending", details: { message: "Choose Existing Monitoring." } },
+                                    { step: 3, title: "Configure Landing Pad Ingestion", status: "pending", details: { message: "Connect your monitoring tool and route alerts to landing pad." } },
+                                    { step: 4, title: "Ingest Alerts and Trigger Workflow", status: "pending", details: { message: "Incoming alerts will trigger downstream workflow stages." } },
+                                    { step: 5, title: "Generate Monitoring/Troubleshooting/Resolution Docs", status: "pending", details: { message: "Optional generated docs can be reviewed and approved." } },
+                                  ]
                               );
-                            })}
+                              return rows.map((row) => {
+                                const message = row?.details?.message
+                                  || row?.details?.summary
+                                  || row?.details?.choice
+                                  || row?.details?.path
+                                  || row?.details?.workflow_id
+                                  || `Requirements: ${Number(row?.details?.requirements_count || 0)}`;
+                                return (
+                                  <tr key={`workflow-step-${row.step}-${row.title}`}>
+                                    <td>{row.step}. {row.title}</td>
+                                    <td>{row.status || "pending"}</td>
+                                    <td>{String(message || "-")}</td>
+                                    <td>
+                                      <details>
+                                        <summary>How This Worked In Background</summary>
+                                        <pre className="result">{explainOnboardingStepBackground(row.step, isSetupMonitoring)}</pre>
+                                      </details>
+                                    </td>
+                                  </tr>
+                                );
+                              });
+                            })()}
                           </tbody>
                         </table>
                       </div>
