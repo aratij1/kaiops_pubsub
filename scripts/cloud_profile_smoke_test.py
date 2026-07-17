@@ -63,19 +63,21 @@ def run_smoke(
     owner_team: str,
     environment: str,
     region: str,
-    gcp_project_id: str,
-    gcp_region: str,
-    pubsub_topic: str,
-    pubsub_subscription: str,
-    vertex_enabled: bool,
-    vertex_template: str,
-    vertex_endpoint: str,
+    deployment_mode: str,
+    azure_subscription_id: str,
+    azure_resource_group: str,
+    azure_service_bus_namespace: str,
+    azure_service_bus_topic: str,
+    azure_service_bus_subscription: str,
+    content_safety_enabled: bool,
+    content_safety_endpoint: str,
     timeout_seconds: float,
     legacy_provider_endpoint_fallback: str,
 ) -> SmokeResult:
     base = gateway_url.rstrip("/")
     monitoring_base = monitoring_url.rstrip("/")
 
+    normalized_mode = str(deployment_mode or "on_prem").strip().lower()
     onboarding_payload = {
         "project": {
             "name": project_name,
@@ -83,20 +85,25 @@ def run_smoke(
             "environment": environment,
             "region": region,
         },
-        "deployment_mode": "gcp_cloud",
-        "prometheus_url": "",
+        "deployment_mode": normalized_mode,
+        "prometheus_url": "http://prometheus.local:9090/-/ready" if normalized_mode == "on_prem" else "",
         "new_relic_url": "",
         "datadog_url": "",
-        "gcp_project_id": gcp_project_id,
-        "gcp_region": gcp_region,
-        "pubsub_topic": pubsub_topic,
-        "pubsub_subscription": pubsub_subscription,
-        "vertex_model_armor_enabled": vertex_enabled,
-        "vertex_model_armor_template": vertex_template,
-        "vertex_model_armor_endpoint": vertex_endpoint,
-        "active_provider": "pubsub",
+        "azure_content_safety_enabled": content_safety_enabled,
+        "azure_content_safety_endpoint": content_safety_endpoint,
+        "active_provider": "prometheus" if normalized_mode == "on_prem" else "azure_service_bus",
         "user_assignments": {"admin": [project_name]},
     }
+    if normalized_mode == "azure_cloud":
+        onboarding_payload.update(
+            {
+                "azure_subscription_id": azure_subscription_id,
+                "azure_resource_group": azure_resource_group,
+                "azure_service_bus_namespace": azure_service_bus_namespace,
+                "azure_service_bus_topic": azure_service_bus_topic,
+                "azure_service_bus_subscription": azure_service_bus_subscription,
+            }
+        )
 
     benign_payload = {
         "source": "smoke-test",
@@ -155,11 +162,17 @@ def run_smoke(
     risky_decision = (risky_response.get("safety", {}) or {}).get("decision")
 
     onboarding_saved = bool(save_response)
-    connectivity_verified = (
-        str(connectivity.get("deployment_mode") or "") == "gcp_cloud"
-        and str(connectivity.get("gcp_project_id") or "") == gcp_project_id
-        and str(connectivity.get("pubsub_topic") or "") == pubsub_topic
-    )
+    if normalized_mode == "azure_cloud":
+        connectivity_verified = (
+            str(connectivity.get("deployment_mode") or "") == "azure_cloud"
+            and str(connectivity.get("azure_subscription_id") or "") == azure_subscription_id
+            and str(connectivity.get("azure_service_bus_topic") or "") == azure_service_bus_topic
+        )
+    else:
+        connectivity_verified = (
+            str(connectivity.get("deployment_mode") or "") == "on_prem"
+            and str(connectivity.get("prometheus_url") or "") != ""
+        )
 
     return SmokeResult(
         onboarding_saved=onboarding_saved,
@@ -170,20 +183,21 @@ def run_smoke(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Smoke test gcp_cloud onboarding + gateway safety path.")
+    parser = argparse.ArgumentParser(description="Smoke test azure_cloud onboarding + gateway safety path.")
     parser.add_argument("--gateway-url", default=os.getenv("GATEWAY_URL", "http://localhost:8010"))
     parser.add_argument("--monitoring-url", default=os.getenv("MONITORING_ADAPTER_URL", "http://localhost:8001"))
-    parser.add_argument("--project-name", default="kaiops-gcp-smoke")
+    parser.add_argument("--project-name", default="kaiops-azure-smoke")
     parser.add_argument("--owner-team", default="platform-ops")
     parser.add_argument("--environment", default="prod", choices=["dev", "staging", "prod"])
     parser.add_argument("--region", default="us-east-1")
-    parser.add_argument("--gcp-project-id", default=os.getenv("GCP_PROJECT_ID", ""))
-    parser.add_argument("--gcp-region", default=os.getenv("GCP_REGION", "us-central1"))
-    parser.add_argument("--pubsub-topic", default="kaiops-orchestration-events")
-    parser.add_argument("--pubsub-subscription", default="kaiops-orchestration-sub")
-    parser.add_argument("--vertex-enabled", action="store_true")
-    parser.add_argument("--vertex-template", default=os.getenv("VERTEX_MODEL_ARMOR_TEMPLATE", ""))
-    parser.add_argument("--vertex-endpoint", default=os.getenv("VERTEX_MODEL_ARMOR_ENDPOINT", ""))
+    parser.add_argument("--deployment-mode", default="on_prem", choices=["on_prem", "azure_cloud"])
+    parser.add_argument("--azure-subscription-id", default=os.getenv("AZURE_SUBSCRIPTION_ID", ""))
+    parser.add_argument("--azure-resource-group", default=os.getenv("AZURE_RESOURCE_GROUP", ""))
+    parser.add_argument("--azure-service-bus-namespace", default=os.getenv("AZURE_SERVICE_BUS_NAMESPACE", ""))
+    parser.add_argument("--azure-service-bus-topic", default="kaiops-orchestration-events")
+    parser.add_argument("--azure-service-bus-subscription", default="kaiops-orchestration-sub")
+    parser.add_argument("--content-safety-enabled", action="store_true")
+    parser.add_argument("--content-safety-endpoint", default=os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT", ""))
     parser.add_argument("--timeout-seconds", type=float, default=10.0)
     parser.add_argument("--legacy-provider-endpoint-fallback", default="http://prometheus:9090/-/ready")
     return parser.parse_args()
@@ -192,8 +206,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    if not str(args.gcp_project_id or "").strip():
-        print("Missing --gcp-project-id (or GCP_PROJECT_ID env var).", file=sys.stderr)
+    if str(args.deployment_mode or "").strip().lower() == "azure_cloud" and not str(args.azure_subscription_id or "").strip():
+        print("Missing --azure-subscription-id (or AZURE_SUBSCRIPTION_ID env var).", file=sys.stderr)
         return 2
 
     try:
@@ -204,13 +218,14 @@ def main() -> int:
             owner_team=args.owner_team,
             environment=args.environment,
             region=args.region,
-            gcp_project_id=args.gcp_project_id,
-            gcp_region=args.gcp_region,
-            pubsub_topic=args.pubsub_topic,
-            pubsub_subscription=args.pubsub_subscription,
-            vertex_enabled=bool(args.vertex_enabled),
-            vertex_template=str(args.vertex_template or ""),
-            vertex_endpoint=str(args.vertex_endpoint or ""),
+            deployment_mode=args.deployment_mode,
+            azure_subscription_id=args.azure_subscription_id,
+            azure_resource_group=args.azure_resource_group,
+            azure_service_bus_namespace=args.azure_service_bus_namespace,
+            azure_service_bus_topic=args.azure_service_bus_topic,
+            azure_service_bus_subscription=args.azure_service_bus_subscription,
+            content_safety_enabled=bool(args.content_safety_enabled),
+            content_safety_endpoint=str(args.content_safety_endpoint or ""),
             timeout_seconds=float(args.timeout_seconds),
             legacy_provider_endpoint_fallback=str(args.legacy_provider_endpoint_fallback or "http://prometheus:9090/-/ready"),
         )

@@ -30,10 +30,10 @@ def _extract_message_bus_provider(payload: dict[str, Any]) -> str:
     decision = payload.get("decision")
     if isinstance(decision, dict):
         provider = str(decision.get("message_bus_provider", "rabbitmq")).strip().lower()
-        if provider in {"kafka", "rabbitmq", "pubsub"}:
+        if provider in {"kafka", "rabbitmq", "azure-service-bus", "servicebus", "azure"}:
             return provider
     transport = str(payload.get("transport", "")).strip().lower()
-    if transport in {"kafka", "rabbitmq", "pubsub"}:
+    if transport in {"kafka", "rabbitmq", "azure-service-bus", "servicebus", "azure"}:
         return transport
     return "rabbitmq"
 

@@ -270,6 +270,21 @@
     "source": "rag-incident"
   },
   {
+    "id": "c455c797-af5d-4abd-8c13-b44b53b5f0db",
+    "alert_id": "c455c797-af5d-4abd-8c13-b44b53b5f0db",
+    "alert_name": "KaiOpsServiceDown Incident Summary",
+    "alert_type": "KaiOpsServiceDown",
+    "title": "KaiOpsServiceDown Incident Summary",
+    "service": "kaiops-core1",
+    "severity": "CRITICAL",
+    "summary": "KaiOpsServiceDown detected for kaiops-core1. Impact: Kaiops-Core1 service impact requires immediate triage.",
+    "recommended_action": "Rollback deployment",
+    "description": "KaiOpsServiceDown detected for kaiops-core1. Impact: Kaiops-Core1 service impact requires immediate triage.",
+    "root_cause": "Deployment 2.5",
+    "impact": "Kaiops-Core1 service impact requires immediate triage",
+    "source": "rag-incident"
+  },
+  {
     "id": "dw-1011",
     "alert_id": "DW-1011",
     "alert_name": "Late Arriving Data",

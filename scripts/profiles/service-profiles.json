@@ -1,0 +1,34 @@
+{
+  "onprem": {
+    "EVENT_BUS_PROVIDER": "rabbitmq",
+    "AZURE_SERVICE_BUS_ENABLED": "false",
+    "AZURE_CONTENT_SAFETY_ENABLED": "false",
+    "AZURE_OPENAI_EMBEDDINGS_ENABLED": "false",
+    "AZURE_AI_EVALUATION_ENABLED": "false",
+    "OBSERVABILITY_AZURE_MONITOR_ENABLED": "false"
+  },
+  "azure": {
+    "EVENT_BUS_PROVIDER": "azure-service-bus",
+    "AZURE_SERVICE_BUS_ENABLED": "true",
+    "AZURE_CONTENT_SAFETY_ENABLED": "true",
+    "AZURE_OPENAI_EMBEDDINGS_ENABLED": "true",
+    "AZURE_AI_EVALUATION_ENABLED": "true",
+    "OBSERVABILITY_AZURE_MONITOR_ENABLED": "true"
+  },
+  "aws": {
+    "EVENT_BUS_PROVIDER": "rabbitmq",
+    "AZURE_SERVICE_BUS_ENABLED": "false",
+    "AZURE_CONTENT_SAFETY_ENABLED": "false",
+    "AZURE_OPENAI_EMBEDDINGS_ENABLED": "false",
+    "AZURE_AI_EVALUATION_ENABLED": "false",
+    "OBSERVABILITY_AZURE_MONITOR_ENABLED": "false"
+  },
+  "gcp": {
+    "EVENT_BUS_PROVIDER": "kafka",
+    "AZURE_SERVICE_BUS_ENABLED": "false",
+    "AZURE_CONTENT_SAFETY_ENABLED": "false",
+    "AZURE_OPENAI_EMBEDDINGS_ENABLED": "false",
+    "AZURE_AI_EVALUATION_ENABLED": "false",
+    "OBSERVABILITY_AZURE_MONITOR_ENABLED": "false"
+  }
+}

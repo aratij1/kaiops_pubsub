@@ -86,29 +86,28 @@ def setup_tracing(app, settings: Settings) -> None:
     provider = TracerProvider(resource=resource)
     if settings.otlp_endpoint:
         provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.otlp_endpoint)))
-    if getattr(settings, "observability_gcp_trace_enabled", False):
-        _add_gcp_trace_exporter(provider, settings)
+    if getattr(settings, "observability_azure_monitor_enabled", False):
+        _add_azure_monitor_exporter(provider, settings)
     trace.set_tracer_provider(provider)
     FastAPIInstrumentor.instrument_app(app, tracer_provider=provider)
 
 
-def _add_gcp_trace_exporter(provider: TracerProvider, settings: Settings) -> None:
-    """Additive: exports spans to Cloud Trace alongside any OTLP exporter already
-    configured. Disabled by default (OBSERVABILITY_GCP_TRACE_ENABLED=false)."""
-    project_id = str(getattr(settings, "gcp_project_id", "") or "").strip()
-    if not project_id:
-        logger.warning("gcp cloud trace export requested but GCP_PROJECT_ID is not set; skipping")
+def _add_azure_monitor_exporter(provider: TracerProvider, settings: Settings) -> None:
+    """Additive Azure Monitor exporter alongside any OTLP exporter."""
+    connection_string = str(getattr(settings, "azure_monitor_connection_string", "") or "").strip()
+    if not connection_string:
+        logger.warning("azure monitor export requested but AZURE_MONITOR_CONNECTION_STRING is not set; skipping")
         return
     try:
-        from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
+        from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter
     except ImportError:
-        logger.warning("gcp cloud trace export requested but opentelemetry-exporter-gcp-trace is not installed")
+        logger.warning("azure monitor exporter requested but azure-monitor-opentelemetry-exporter is not installed")
         return
     try:
-        provider.add_span_processor(BatchSpanProcessor(CloudTraceSpanExporter(project_id=project_id)))
-        logger.info("connected gcp cloud trace exporter", extra={"project": project_id})
+        provider.add_span_processor(BatchSpanProcessor(AzureMonitorTraceExporter(connection_string=connection_string)))
+        logger.info("connected azure monitor trace exporter")
     except Exception as exc:
-        logger.warning("failed to initialize gcp cloud trace exporter", extra={"error": str(exc)})
+        logger.warning("failed to initialize azure monitor trace exporter", extra={"error": str(exc)})
 
 
 def metrics_response() -> Response:
