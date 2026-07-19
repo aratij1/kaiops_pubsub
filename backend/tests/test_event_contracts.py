@@ -282,6 +282,18 @@ def test_closure_payload_builder_and_action_extractor_compatibility() -> None:
     assert payload["event_contract"]["incident_id"] == str(action.incident_id)
 
 
+def test_closure_service_name_prefers_incident_service_over_action_target() -> None:
+    action = RemediationAction(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        action_type="validate_pipeline",
+        target="11111111-1111-1111-1111-111111111111",
+        output="health check failed",
+    )
+
+    assert closure_service_app._resolve_closure_service_name(action, {"service": "orders-pipeline"}) == "orders-pipeline"
+    assert closure_service_app._resolve_closure_service_name(action, {}) == str(action.target)
+
+
 def test_monitoring_raw_alert_payload_includes_event_contract() -> None:
     alert = Alert(
         source="prometheus",

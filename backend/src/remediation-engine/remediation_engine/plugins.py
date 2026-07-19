@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -160,22 +161,83 @@ class RemediationEngine(BaseAgent):
             return False
         return normalized in set(self.plugins.keys())
 
+    @staticmethod
+    def _looks_like_uuid(token: str) -> bool:
+        return bool(re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}", token.strip()))
+
+    @staticmethod
+    def _normalize_text(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    def _sanitize_recommended_commands(self, commands: list[str]) -> list[str]:
+        sanitized: list[str] = []
+        seen: set[str] = set()
+        for raw in commands:
+            token = str(raw or "").strip().strip("`")
+            if not token:
+                continue
+            token = re.sub(r"^\s*(cmd|command|script|query)\s*:\s*", "", token, flags=re.IGNORECASE).strip()
+            if not token or token.startswith("#"):
+                continue
+            lower = token.lower()
+            if lower.startswith("preview only") or lower.startswith("recommended_action"):
+                continue
+            if lower in seen:
+                continue
+            seen.add(lower)
+            sanitized.append(token)
+        return sanitized
+
+    def _infer_target_from_commands(self, commands: list[str]) -> str:
+        for command in commands:
+            token = str(command or "").strip()
+            if not token:
+                continue
+
+            deployment_match = re.search(r"deployment/([a-z0-9][a-z0-9_.-]*)", token, flags=re.IGNORECASE)
+            if deployment_match:
+                return deployment_match.group(1)
+
+            service_flag_match = re.search(r"-Service\s+([a-z0-9][a-z0-9_.-]*)", token, flags=re.IGNORECASE)
+            if service_flag_match:
+                return service_flag_match.group(1)
+
+            service_arg_match = re.search(r"service=([a-z0-9][a-z0-9_.-]*)", token, flags=re.IGNORECASE)
+            if service_arg_match:
+                return service_arg_match.group(1)
+
+            findstr_match = re.search(r"findstr\s+([a-z0-9][a-z0-9_.-]*)", token, flags=re.IGNORECASE)
+            if findstr_match:
+                return findstr_match.group(1)
+
+        return ""
+
+    def _infer_action_type(self, *, action_text: str, commands: list[str]) -> str:
+        text = self._normalize_text(action_text)
+        command_blob = " | ".join(self._normalize_text(item) for item in commands)
+        haystack = f"{text} | {command_blob}"
+
+        if any(keyword in haystack for keyword in ["restart pod", "rollout restart", "crashloop", "oom"]):
+            return "restart_pod"
+        if any(keyword in haystack for keyword in ["scale", "replicas", "hpa"]):
+            return "scale_deployment"
+        if any(keyword in haystack for keyword in ["restart service", "systemctl restart", "ansible"]):
+            return "restart_service"
+        if any(keyword in haystack for keyword in ["cache", "redis", "flushdb"]):
+            return "clear_cache"
+        if any(keyword in haystack for keyword in ["failover", "database", "replica", "mysql"]):
+            return "failover_database"
+        if any(keyword in haystack for keyword in ["terraform", "infrastructure rollback"]):
+            return "terraform_rollback"
+        return "rollback_deployment"
+
     def build_action(self, approval: Approval) -> RemediationAction:
-        action_text = (approval.modified_action or approval.comment or "rollback deployment").lower()
-        if "restart pod" in action_text:
-            action_type = "restart_pod"
-        elif "scale" in action_text:
-            action_type = "scale_deployment"
-        elif "restart service" in action_text:
-            action_type = "restart_service"
-        elif "cache" in action_text:
-            action_type = "clear_cache"
-        elif "failover" in action_text or "database" in action_text:
-            action_type = "failover_database"
-        elif "terraform" in action_text:
-            action_type = "terraform_rollback"
-        else:
-            action_type = "rollback_deployment"
+        recommended_action = str(approval.metadata.get("recommended_action") or "").strip()
+        recommended_commands = approval.metadata.get("recommended_commands") if isinstance(approval.metadata.get("recommended_commands"), list) else []
+        action_text = str(approval.modified_action or approval.comment or recommended_action or "rollback deployment").strip()
+        command_list = self._sanitize_recommended_commands([str(item) for item in recommended_commands])
+        inferred_target = self._infer_target_from_commands(command_list)
+        action_type = self._infer_action_type(action_text=action_text, commands=command_list)
         policy_version = str(approval.metadata.get("policy_version", "")).strip()
         policy_reason = str(approval.metadata.get("policy_reason", "")).strip()
 
@@ -186,16 +248,15 @@ class RemediationEngine(BaseAgent):
             approval.metadata.get("resource"),
             approval.metadata.get("service"),
             approval.metadata.get("incident_service"),
+            inferred_target,
             approval.metadata.get("incident_id"),
             approval.incident_id,
         ]
-        target = str(next((value for value in target_candidates if value), approval.incident_id))
-        service = str(approval.metadata.get("service") or approval.metadata.get("incident_service") or "").strip()
+        target = str(next((value for value in target_candidates if value), approval.incident_id)).strip()
+        service = str(approval.metadata.get("service") or approval.metadata.get("incident_service") or inferred_target or "").strip()
         environment = str(approval.metadata.get("environment") or "").strip()
-        recommended_action = str(approval.metadata.get("recommended_action") or "").strip()
-        recommended_commands = approval.metadata.get("recommended_commands") if isinstance(approval.metadata.get("recommended_commands"), list) else []
-
-        command_list = [str(item).strip() for item in recommended_commands if str(item).strip()]
+        if self._looks_like_uuid(target) and service:
+            target = service
         execution_plan = self._build_execution_plan(
             action_type=action_type,
             target=target,
@@ -315,9 +376,15 @@ class RemediationEngine(BaseAgent):
             ]
 
         if recommended_commands:
-            commands = recommended_commands + commands
-        if recommended_action:
-            commands = [f"# recommended_action: {recommended_action}", *commands]
+            deduped = []
+            seen = set()
+            for item in [*recommended_commands, *commands]:
+                key = str(item or "").strip().lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(str(item).strip())
+            commands = deduped
 
         return {
             "commands": commands,

@@ -206,12 +206,19 @@ def _build_incident_context(base_payload: dict[str, Any], pending_workflow: dict
 async def _store_and_publish(approval: Approval) -> None:
     _attach_policy_metadata(approval)
     _enforce_high_risk_human_gate(approval)
-    PENDING_INCIDENTS[str(approval.incident_id)] = approval.model_dump(mode="json")
+    incident_id = str(approval.incident_id)
+    pending_context = PENDING_INCIDENTS.get(incident_id, {})
+    if not isinstance(pending_context, dict):
+        pending_context = {}
+    PENDING_INCIDENTS[incident_id] = {
+        **pending_context,
+        "approval": approval.model_dump(mode="json"),
+    }
     if settings.database_enabled:
         async with app.state.session_factory() as session:
             repo = IncidentRepository(session)
             await repo.save_approval(approval)
-            pending = PENDING_INCIDENTS.get(str(approval.incident_id), {})
+            pending = PENDING_INCIDENTS.get(incident_id, {})
             recommendation = pending.get("recommendation", {}) if isinstance(pending.get("recommendation"), dict) else {}
             decision = pending.get("decision", {}) if isinstance(pending.get("decision"), dict) else {}
             recommendation_id = str(approval.recommendation_id)

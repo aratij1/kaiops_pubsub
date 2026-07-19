@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import * as XLSX from "xlsx";
 
 const DEFAULT_ALERT = {
   source: "monitoring-adapter",
@@ -44,21 +43,39 @@ const TAB_SHORTCUT_MAP = {
   Digit5: "trace",
   Digit6: "safety",
   Digit7: "rag",
-  Digit8: "finops",
   Digit9: "closed",
   Digit0: "summary",
 };
 const VALID_TABS = new Set(Object.values(TAB_SHORTCUT_MAP));
 const MONITORING_TOOL_OPTIONS = ["prometheus", "new_relic", "datadog"];
 const ALERT_DOC_KIND_OPTIONS = ["incident", "runbook", "deployment", "change", "dependency", "remediation"];
+const ONBOARDING_SOURCE_DOC_EXTENSIONS = new Set(["txt", "md", "markdown", "json", "csv", "log", "yaml", "yml"]);
+const ONBOARDING_SOURCE_DOC_BUCKETS = [
+  { key: "ticket", label: "Past Tickets" },
+  { key: "troubleshooting", label: "Troubleshooting Docs" },
+  { key: "rca", label: "RCA / Postmortem Docs" },
+  { key: "resolution", label: "Resolution Docs" },
+  { key: "logs", label: "Logs" },
+  { key: "other", label: "Other Evidence" },
+];
+const ONBOARDING_SOURCE_DOC_SAMPLE_FILES = {
+  ticket: { href: "/source_doc_sample_past_ticket.md", label: "Download past ticket sample" },
+  troubleshooting: { href: "/source_doc_sample_troubleshooting.md", label: "Download troubleshooting sample" },
+  rca: { href: "/source_doc_sample_rca_and_logs.txt", label: "Download RCA and logs sample" },
+  resolution: { href: "/source_doc_sample_troubleshooting.md", label: "Download resolution sample" },
+  logs: { href: "/source_doc_sample_rca_and_logs.txt", label: "Download logs sample" },
+  other: { href: "/source_doc_sample_past_ticket.md", label: "Download evidence sample" },
+};
 
 const ROLE_ALLOWED_TABS = {
-  administrator: ["home", "copilot", "approval", "executive", "admin", "trace", "safety", "rag", "finops", "closed", "summary"],
+  administrator: ["home", "copilot", "approval", "executive", "admin", "trace", "safety", "rag", "closed", "summary"],
   l1_operator: ["home"],
-  l2_engineer: ["home", "copilot", "approval", "trace", "safety", "rag", "finops", "closed", "summary"],
-  l3_engineer: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "finops", "closed", "summary"],
-  executive: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "finops", "closed", "summary"],
+  l2_engineer: ["home", "copilot", "approval", "trace", "safety", "rag", "closed", "summary"],
+  l3_engineer: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "closed", "summary"],
+  executive: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "closed", "summary"],
 };
+
+const APPROVAL_NAV_PRIMARY_ROLES = new Set(["administrator"]);
 
 function normalizeRoleName(value) {
   return String(value || "")
@@ -100,6 +117,54 @@ function extractMonitoringToolAndUrl(source, fallbackTool = "prometheus", fallba
 function looksLikeUuid(value) {
   const token = String(value || "").trim();
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token);
+}
+
+function deriveMonitoringRequirementsFromDocument(name, text) {
+  const docName = String(name || "uploaded-document").trim() || "uploaded-document";
+  const docText = String(text || "").trim();
+  if (!docText) {
+    return [];
+  }
+  const lines = docText
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^[-*#]+\s*/, "").trim())
+    .filter((line) => line.length >= 8);
+  const scored = lines.filter((line) => /(alert|latency|error|cpu|memory|availability|throughput|slo|sla|queue|topic|dependency|restart|health|5xx|threshold|response)/i.test(line));
+  const selected = (scored.length ? scored : lines).slice(0, 6);
+  return selected.map((line) => `${docName}: ${line}`);
+}
+
+function summarizeUploadedDocument(text) {
+  const compact = String(text || "").replace(/\s+/g, " ").trim();
+  return compact ? compact.slice(0, 220) : "";
+}
+
+function classifyOnboardingDocumentType(name, text) {
+  const token = `${String(name || "")} ${String(text || "")}`.toLowerCase();
+  if (/(ticket|incident|case|jira)/i.test(token)) {
+    return "ticket";
+  }
+  if (/(troubleshoot|diagnostic|investigat|playbook)/i.test(token)) {
+    return "troubleshooting";
+  }
+  if (/(rca|postmortem|root cause)/i.test(token)) {
+    return "rca";
+  }
+  if (/(resolution|resolve|fix|remediation)/i.test(token)) {
+    return "resolution";
+  }
+  if (/(log|trace|stdout|stderr)/i.test(token)) {
+    return "logs";
+  }
+  return "other";
+}
+
+function extractOnboardingProjectName(row) {
+  if (!row || typeof row !== "object") {
+    return "";
+  }
+  const projectPayload = row.project_payload && typeof row.project_payload === "object" ? row.project_payload : {};
+  return String(row.project_name || projectPayload.name || "").trim();
 }
 
 function extractObservedRoutingMetrics(workflow) {
@@ -1552,9 +1617,21 @@ function FlowTimelineGraph({ rows }) {
 
   const extractExecutionPlan = (row) => {
     const input = parseMaybeJson(row?.inputValueText);
+    const output = parseMaybeJson(row?.outputValueText);
     const commands = [];
     const scripts = [];
     const queries = [];
+    const seenObjects = new WeakSet();
+
+    const pushUnique = (target, value) => {
+      const token = String(value || "").trim();
+      if (!token) {
+        return;
+      }
+      if (!target.some((item) => item.toLowerCase() === token.toLowerCase())) {
+        target.push(token);
+      }
+    };
 
     const classifyLine = (raw) => {
       const token = String(raw || "").trim();
@@ -1563,23 +1640,123 @@ function FlowTimelineGraph({ rows }) {
       }
       const lowered = token.toLowerCase();
       if (lowered.startsWith("cmd:")) {
-        commands.push(token.slice(4).trim());
+        pushUnique(commands, token.slice(4).trim());
         return;
       }
       if (lowered.startsWith("script:")) {
-        scripts.push(token.slice(7).trim());
+        pushUnique(scripts, token.slice(7).trim());
         return;
       }
       if (lowered.startsWith("query:")) {
-        queries.push(token.slice(6).trim());
+        pushUnique(queries, token.slice(6).trim());
         return;
       }
-      commands.push(token);
+      pushUnique(commands, token);
     };
 
-    (Array.isArray(input?.commands) ? input.commands : []).forEach(classifyLine);
-    (Array.isArray(input?.scripts) ? input.scripts : []).forEach((item) => scripts.push(String(item || "").trim()));
-    (Array.isArray(input?.queries) ? input.queries : []).forEach((item) => queries.push(String(item || "").trim()));
+    const collectFromPlanText = (value) => {
+      const text = String(value || "").trim();
+      if (!text) {
+        return;
+      }
+      let currentSection = "command";
+      text.split(/\r?\n/).forEach((line) => {
+        const token = String(line || "").trim();
+        if (!token) {
+          return;
+        }
+        if (/^commands?\s*:/i.test(token)) {
+          currentSection = "command";
+          const inline = token.replace(/^commands?\s*:/i, "").trim();
+          if (inline) {
+            classifyLine(`cmd: ${inline}`);
+          }
+          return;
+        }
+        if (/^scripts?\s*:/i.test(token)) {
+          currentSection = "script";
+          const inline = token.replace(/^scripts?\s*:/i, "").trim();
+          if (inline) {
+            classifyLine(`script: ${inline}`);
+          }
+          return;
+        }
+        if (/^(queries?|sql)\s*:/i.test(token)) {
+          currentSection = "query";
+          const inline = token.replace(/^(queries?|sql)\s*:/i, "").trim();
+          if (inline) {
+            classifyLine(`query: ${inline}`);
+          }
+          return;
+        }
+
+        const normalized = token.replace(/^[-*]\s*/, "").trim();
+        if (!normalized) {
+          return;
+        }
+        if (/^(cmd|command|script|query)\s*:/i.test(normalized)) {
+          classifyLine(normalized);
+          return;
+        }
+        if (currentSection === "script") {
+          pushUnique(scripts, normalized);
+          return;
+        }
+        if (currentSection === "query") {
+          pushUnique(queries, normalized);
+          return;
+        }
+        pushUnique(commands, normalized);
+      });
+    };
+
+    const collectFromValue = (value) => {
+      if (!hasMeaningfulValue(value)) {
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.forEach(collectFromValue);
+        return;
+      }
+      if (typeof value === "string") {
+        collectFromPlanText(value);
+        return;
+      }
+      if (typeof value !== "object" || value === null) {
+        return;
+      }
+      if (seenObjects.has(value)) {
+        return;
+      }
+      seenObjects.add(value);
+
+      (Array.isArray(value.commands) ? value.commands : []).forEach(classifyLine);
+      (Array.isArray(value.scripts) ? value.scripts : []).forEach((item) => pushUnique(scripts, item));
+      (Array.isArray(value.queries) ? value.queries : []).forEach((item) => pushUnique(queries, item));
+
+      if (hasMeaningfulValue(value.execution_plan)) {
+        collectFromValue(value.execution_plan);
+      }
+
+      [
+        value.parameters,
+        value.remediation_action,
+        value.source_payload,
+        value.recommendation,
+        value.decision,
+        value.payload,
+        value.input,
+        value.output,
+        value.result,
+      ].forEach((item) => {
+        if (item && typeof item === "object") {
+          collectFromValue(item);
+        }
+      });
+    };
+
+    collectFromValue(input);
+    collectFromValue(output);
 
     return {
       commands: commands.filter(Boolean),
@@ -1598,6 +1775,23 @@ function FlowTimelineGraph({ rows }) {
   ];
   const presentKinds = new Set(timelineRows.map((row) => classifyStage(row).kind));
   const errorCount = timelineRows.filter((row) => hasMeaningfulValue(row?.errorValueText)).length;
+  const compactRows = timelineRows.map((row, index) => {
+    const stageMeta = classifyStage(row);
+    return {
+      key: `compact-${index}`,
+      phase: stageMeta.label,
+      stage: row.stage || "-",
+      agent: row.agent || "-",
+      elapsed: row.elapsed !== "-" ? `${row.elapsed}s` : "-",
+      status: hasMeaningfulValue(row?.errorValueText) ? "error" : "ok",
+      detail: compactText(row.detail, 120) || "-",
+    };
+  });
+  const totalElapsedSeconds = timelineRows.reduce((sum, row) => {
+    const value = Number(row?.elapsed);
+    return Number.isFinite(value) ? sum + Math.max(0, value) : sum;
+  }, 0);
+  const totalElapsedDisplay = timelineRows.length ? `${totalElapsedSeconds.toFixed(3)}s` : "-";
 
   return (
     <div className="timeline-graph">
@@ -1735,6 +1929,44 @@ function FlowTimelineGraph({ rows }) {
           );
         })()
       ))}
+      <article className="panel" style={{ marginTop: 10 }}>
+        <div className="panel-head">
+          <h3>Stage Summary Table</h3>
+          <p>Compact timeline view with phase, ownership, and status.</p>
+        </div>
+        <div className="table-wrap table-wrap-scroll-x">
+          <table>
+            <thead>
+              <tr>
+                <th>Phase</th>
+                <th>Stage</th>
+                <th>Agent</th>
+                <th>Elapsed</th>
+                <th>Status</th>
+                <th>Detail</th>
+              </tr>
+            </thead>
+            <tbody>
+              {compactRows.map((row) => (
+                <tr key={row.key}>
+                  <td>{row.phase}</td>
+                  <td>{row.stage}</td>
+                  <td>{row.agent}</td>
+                  <td>{row.elapsed}</td>
+                  <td><span className={`pill ${row.status === "error" ? "status-failed" : "status-approved"}`}>{row.status}</span></td>
+                  <td>{row.detail}</td>
+                </tr>
+              ))}
+              <tr>
+                <td colSpan={3}><strong>Total Alert Time</strong></td>
+                <td><strong>{totalElapsedDisplay}</strong></td>
+                <td>-</td>
+                <td>Cumulative elapsed time across all listed stages.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
     </div>
   );
 }
@@ -1756,10 +1988,24 @@ function AgentEventsGraph({ rows }) {
   ];
 
   const detectAgentId = (row) => {
-    const haystack = [row?.agent, row?.action, row?.backgroundDetailText]
+    const haystack = [
+      row?.agent,
+      row?.action,
+      row?.eventType,
+      row?.detail,
+      row?.backgroundDetailText,
+      row?.inputValueText,
+      row?.outputValueText,
+    ]
       .map((item) => String(item || "").toLowerCase())
       .join(" | ");
-    if (haystack.includes("alert intelligence")) {
+    if (
+      haystack.includes("alert intelligence")
+      || haystack.includes("alert-intelligence")
+      || haystack.includes("incident.alert")
+      || haystack.includes("raw-alert")
+      || haystack.includes("enriched-alert")
+    ) {
       return "alert-intelligence";
     }
     if (haystack.includes("master agent") || haystack.includes("orchestrator")) {
@@ -1792,21 +2038,40 @@ function AgentEventsGraph({ rows }) {
     groupedRows.get(id).push(row);
   });
 
+  // Some runs persist sparse early-stage metadata; synthesize one Alert Intelligence row for visibility.
+  if (!(groupedRows.get("alert-intelligence") || []).length && eventRows.length) {
+    const seed = eventRows
+      .slice()
+      .sort((a, b) => toFiniteNumber(a?.sequence) - toFiniteNumber(b?.sequence))[0];
+    groupedRows.set("alert-intelligence", [
+      {
+        ...seed,
+        action: "Alert landed, deduped, and enriched for orchestration.",
+        decision: seed?.decision || "severity + correlation applied",
+        output: seed?.output || "enriched-alert emitted",
+        communicates_to: seed?.communicates_to || "orchestration-events",
+      },
+    ]);
+  }
+
+  const visibleFlowNodes = flowNodes.filter((node) => (groupedRows.get(node.id) || []).length > 0);
+  if (!visibleFlowNodes.length) {
+    return <p className="subtitle">No mapped agent events found for this alert yet.</p>;
+  }
+
   return (
     <div className="agent-dag-flow">
       <div className="agent-dag-track">
-        {flowNodes.map((node, index) => {
+        {visibleFlowNodes.map((node, index) => {
           const rowsForNode = (groupedRows.get(node.id) || [])
             .slice()
             .sort((a, b) => toFiniteNumber(a?.sequence) - toFiniteNumber(b?.sequence));
           const latest = rowsForNode[rowsForNode.length - 1] || null;
-          const hasError = Boolean(String(latest?.errorValueText || "").trim());
-          const statusLabel = latest
-            ? (hasError ? "error" : "observed")
-            : "missing";
+          const hasError = hasMeaningfulValue(latest?.errorValueText);
+          const statusLabel = hasError ? "error" : "observed";
 
           return (
-            <div key={`agent-dag-${node.id}`} className="agent-dag-segment" style={{ animationDelay: `${Math.min(index * 70, 560)}ms` }}>
+            <div key={`agent-dag-${node.id}`} className="agent-dag-segment">
               <article className={`agent-dag-node status-${statusLabel}`}>
                 <div className="agent-dag-head">
                   <span className="agent-dag-badge">{node.short}</span>
@@ -1889,6 +2154,22 @@ function TopicFlowGraph({ routing, timelineRows }) {
 function ExecutionPlanGraph({ plan }) {
   const safePlan = plan && typeof plan === "object" ? plan : {};
   const commands = Array.isArray(safePlan.commands) ? safePlan.commands : [];
+  const grouped = { commands: [], scripts: [], queries: [] };
+  commands.forEach((item) => {
+    const token = String(item || "").trim();
+    if (!token) {
+      return;
+    }
+    if (/^script\s*:/i.test(token)) {
+      grouped.scripts.push(token.replace(/^script\s*:/i, "").trim());
+      return;
+    }
+    if (/^query\s*:/i.test(token)) {
+      grouped.queries.push(token.replace(/^query\s*:/i, "").trim());
+      return;
+    }
+    grouped.commands.push(token.replace(/^cmd\s*:/i, "").trim());
+  });
 
   return (
     <div className="execution-graph">
@@ -1902,17 +2183,41 @@ function ExecutionPlanGraph({ plan }) {
           <span>Risk</span><strong>{safePlan.riskTier || "-"}</strong>
           <span>Provider</span><strong>{String(safePlan.provider || "-").toUpperCase()}</strong>
           <span>Approval</span><strong>{String(safePlan.requiresApproval)}</strong>
+          <span>Incident Status</span><strong>{safePlan.incidentStatus || "-"}</strong>
+          <span>Approval Status</span><strong>{safePlan.approvalStatus || "-"}</strong>
         </div>
       </article>
       <article className="execution-card">
-        <h4>Command Sequence</h4>
+        <h4>Remediation Plan</h4>
         <div className="execution-command-list">
-          {commands.length ? commands.map((command, index) => (
+          {grouped.commands.length ? grouped.commands.map((command, index) => (
             <div className="execution-command" key={`cmd-${index}`} style={{ animationDelay: `${Math.min(index * 80, 640)}ms` }}>
               <span>{index + 1}</span>
               <code>{String(command || "-")}</code>
             </div>
           )) : <p className="subtitle">No command sequence found.</p>}
+          {grouped.scripts.length ? (
+            <>
+              <h4>Scripts</h4>
+              {grouped.scripts.map((script, index) => (
+                <div className="execution-command" key={`script-${index}`}>
+                  <span>S{index + 1}</span>
+                  <code>{script}</code>
+                </div>
+              ))}
+            </>
+          ) : null}
+          {grouped.queries.length ? (
+            <>
+              <h4>Validation Queries</h4>
+              {grouped.queries.map((query, index) => (
+                <div className="execution-command" key={`query-${index}`}>
+                  <span>Q{index + 1}</span>
+                  <code>{query}</code>
+                </div>
+              ))}
+            </>
+          ) : null}
         </div>
       </article>
     </div>
@@ -1934,8 +2239,131 @@ function renderHtmlTable(headers, rows) {
   return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
 }
 
+function normalizeGeneratedRuleRows(source) {
+  const payload = source && typeof source === "object" ? source : {};
+  const candidates = [
+    payload.generated_rules,
+    payload.rules,
+    payload.rule_candidates,
+    payload.rule_set,
+    payload.output?.rules,
+    payload.result?.rules,
+    payload.data?.rules,
+  ];
+  const first = candidates.find((item) => Array.isArray(item) && item.length) || [];
+  return first.map((item, index) => {
+    const row = item && typeof item === "object" ? item : {};
+    return {
+      id: String(row.id || row.rule_id || row.name || `rule-${index + 1}`),
+      name: String(row.name || row.rule_name || row.alertname || `rule-${index + 1}`),
+      platform: String(row.platform || row.target_platform || row.provider || "prometheus"),
+      severity: String(row.severity || row.level || "-").toLowerCase(),
+      expression: String(row.expression || row.expr || row.query || row.condition || "-").trim(),
+      status: String(row.status || row.state || "generated"),
+    };
+  });
+}
+
+function summarizeAlertRuleContext(row, workflow = {}) {
+  const alertRow = row && typeof row === "object" ? row : {};
+  const alertLabels = typeof alertRow.labels === "object" && alertRow.labels ? alertRow.labels : {};
+  const alertAnnotations = typeof alertRow.annotations === "object" && alertRow.annotations ? alertRow.annotations : {};
+  const workflowPayload = workflow && typeof workflow === "object" ? workflow : {};
+  const recommendation = typeof workflowPayload.recommendation === "object" && workflowPayload.recommendation ? workflowPayload.recommendation : {};
+  const recommendationMetadata = typeof recommendation.metadata === "object" && recommendation.metadata ? recommendation.metadata : {};
+  const candidates = [
+    alertRow.rule_name,
+    alertRow.rule,
+    alertRow.alert_rule,
+    alertRow.rule_expression,
+    alertRow.rule_query,
+    alertLabels.rule_name,
+    alertLabels.alertname,
+    alertLabels.alert,
+    alertLabels.rule,
+    recommendationMetadata.rule_name,
+    recommendationMetadata.rule,
+    alertAnnotations.summary,
+    alertAnnotations.description,
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  const expressionCandidates = [
+    alertRow.expression,
+    alertRow.expr,
+    alertRow.query,
+    alertRow.rule_expression,
+    alertRow.rule_query,
+    recommendationMetadata.rule_expression,
+    recommendationMetadata.rule_query,
+    alertAnnotations.expression,
+    alertAnnotations.query,
+    alertAnnotations.description,
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+
+  const ruleName = candidates[0] || String(alertRow.name || alertRow.alert_name || alertLabels.alertname || "Alert Rule").trim();
+  const expression = expressionCandidates[0] || "No explicit rule expression was surfaced in the incident payload.";
+  const service = String(alertRow.service || alertLabels.service || recommendationMetadata.service || "").trim();
+  const environment = String(alertRow.environment || alertLabels.environment || recommendationMetadata.environment || "").trim();
+  const note = [service ? `service=${service}` : "", environment ? `environment=${environment}` : ""].filter(Boolean).join(" | ");
+
+  return {
+    ruleName,
+    expression,
+    note: note || "Derived from alert labels and workflow metadata.",
+    source: String(alertRow.source || alertRow.provider || alertLabels.job || "payload metadata").trim(),
+    severity: String(alertRow.severity || alertLabels.severity || recommendation?.severity || "warning").trim().toLowerCase(),
+  };
+}
+
+function buildWorkflowFlowStages(workflow, timelineRows = []) {
+  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
+  const safeRows = Array.isArray(timelineRows) ? timelineRows : [];
+  const findStage = (needle) => safeRows.find((row) => String(row?.stage || row?.agent || row?.detail || "").toLowerCase().includes(needle));
+  const hasParallelProcessing = safeRows.some((row) => {
+    const token = String(row?.agent || row?.service || row?.detail || "").toLowerCase();
+    return token.includes("alert intelligence") || token.includes("orchestrator") || token.includes("context") || token.includes("resolution");
+  });
+  return [
+    {
+      id: "landing-pad",
+      label: "Landing Pad",
+      detail: "Raw alerts are accepted, normalized, and added to the incident stream.",
+      status: findStage("landing") ? "done" : "active",
+    },
+    {
+      id: "parallel-processing",
+      label: "Parallel Processing",
+      detail: hasParallelProcessing
+        ? "Alert intelligence, orchestration, context, and resolution work the stream in parallel workers."
+        : "Backend workers fan out the alert stream through independent services for concurrent processing.",
+      status: hasParallelProcessing ? "done" : "active",
+    },
+    {
+      id: "approval",
+      label: "Approval Gate",
+      detail: String(safeWorkflow?.approval?.status || safeWorkflow?.decision?.status || "pending").trim(),
+      status: safeWorkflow?.approval?.status ? "done" : "active",
+    },
+    {
+      id: "remediation",
+      label: "Remediation Execution",
+      detail: `${Array.isArray(safeWorkflow?.remediation_action?.parameters?.execution_plan?.commands) ? safeWorkflow.remediation_action.parameters.execution_plan.commands.length : 0} commands captured for execution or review.`,
+      status: safeWorkflow?.remediation_action?.status ? "done" : "active",
+    },
+    {
+      id: "closure",
+      label: "Closure & Validation",
+      detail: String(safeWorkflow?.closure_report?.health_restored ? "Service restored and closure completed." : "Validation continues after remediation.").trim(),
+      status: safeWorkflow?.closure_report?.health_restored ? "done" : "active",
+    },
+  ];
+}
+
 export default function App() {
-  const defaultMonitorApplications = ["kaiops-core1", "payments", "kaiops-core"];
+  const defaultMonitorApplications = ["kaiops-core1", "kaiops-core"];
   const [applicationToMonitor, setApplicationToMonitor] = useState("kaiops-core1");
   const [monitorApplications, setMonitorApplications] = useState(defaultMonitorApplications);
   const [activeTab, setActiveTab] = useState("home");
@@ -1946,6 +2374,8 @@ export default function App() {
   const [alertsLimit, setAlertsLimit] = useState(50);
   const [alertSeverityOverrides, setAlertSeverityOverrides] = useState({ loading: false, rows: [], error: "", savingKey: "" });
   const [alertSeverityDrafts, setAlertSeverityDrafts] = useState({});
+  const [dashboardAlertQuery, setDashboardAlertQuery] = useState("");
+  const [dashboardAlertFocus, setDashboardAlertFocus] = useState("all");
   const [incidentMetadata, setIncidentMetadata] = useState({ loading: false, rows: [], error: "" });
   const [closedIncidents, setClosedIncidents] = useState({ loading: false, rows: [], error: "" });
   const [flows, setFlows] = useState({ loading: false, rows: [], error: "" });
@@ -1976,7 +2406,8 @@ export default function App() {
     error: "",
     incidentId: "",
   });
-  const [homeDetailTab, setHomeDetailTab] = useState("summary");
+  const [homeDetailTab, setHomeDetailTab] = useState("overview");
+  const [diagnosticsDetailTab, setDiagnosticsDetailTab] = useState("timeline");
   const [approvalForm, setApprovalForm] = useState({
     action: "approve",
     incident_id: "",
@@ -2077,6 +2508,8 @@ export default function App() {
   const [onboardingWorkflowSteps, setOnboardingWorkflowSteps] = useState([]);
   const [onboardingLandingPadSummary, setOnboardingLandingPadSummary] = useState({});
   const [onboardingGeneratedDocs, setOnboardingGeneratedDocs] = useState([]);
+  const [onboardingSourceDocs, setOnboardingSourceDocs] = useState({ loading: false, rows: [], error: "" });
+  const [onboardingReviewAck, setOnboardingReviewAck] = useState({ rules: false, docs: false, metadata: false });
   const [onboardingDocApprovalState, setOnboardingDocApprovalState] = useState({
     loading: false,
     error: "",
@@ -2123,6 +2556,8 @@ export default function App() {
   });
   const [alertKnowledgePrompt, setAlertKnowledgePrompt] = useState("");
   const [alertKnowledgeView, setAlertKnowledgeView] = useState("onboarding");
+  const [projectSetupStep, setProjectSetupStep] = useState("setup");
+  const [projectSetupShowAll, setProjectSetupShowAll] = useState(false);
   const [alertOnboardingState, setAlertOnboardingState] = useState({ loading: false, result: null, error: "" });
   const [docPromptAlert, setDocPromptAlert] = useState(null);
   const [docPromptKind, setDocPromptKind] = useState("runbook");
@@ -2131,18 +2566,12 @@ export default function App() {
   const [docPromptDocsByKind, setDocPromptDocsByKind] = useState({});
   const [alertRuleDraft, setAlertRuleDraft] = useState({ platform: "prometheus", requirement: "" });
   const [alertRuleState, setAlertRuleState] = useState({ loading: false, result: null, error: "" });
-  const [alertBulkState, setAlertBulkState] = useState({
-    fileName: "",
-    loading: false,
-    parsedRows: [],
-    results: [],
-    error: "",
-  });
   const alertDetailsRef = useRef(null);
   const docPromptRef = useRef(null);
   const approvalQueueRef = useRef(null);
   const monitoringInspectRef = useRef(null);
   const alertKnowledgeRef = useRef(null);
+  const approvalIncidentRequestRef = useRef({ incidentId: "", inFlight: false, lastFetchedAt: 0 });
 
   const formValid = useMemo(() => {
     return [form.source, form.name, form.service, form.severity, form.description].every((v) => String(v || "").trim());
@@ -2324,6 +2753,7 @@ export default function App() {
       setMonitoringAppForm((curr) => ({ ...curr, name: "", owner_email: "", metrics_endpoint: "http://api-gateway:8000/metrics" }));
       await loadMonitoringApplications();
       await loadMonitorApplications();
+      await refreshViewsAfterSubmit();
     } catch (error) {
       setMonitoringAppSubmit({ loading: false, error: error.message, success: "" });
     }
@@ -2386,7 +2816,7 @@ export default function App() {
     }
     setSelectedAlertId(String(alertId));
     setActiveTab("home");
-    setHomeDetailTab("summary");
+    setHomeDetailTab("overview");
     loadAlertDetails(alertId);
   }
 
@@ -2528,6 +2958,27 @@ export default function App() {
     }
   }
 
+  async function refreshApprovalDrivenViews(incidentId = "") {
+    const normalizedIncidentId = String(incidentId || "").trim();
+    const tasks = [
+      loadRecentAlerts(),
+      loadIncidentMetadata(),
+      loadGatewayRecent(),
+      loadGatewaySummary(),
+      loadClosedIncidents(),
+    ];
+
+    if (selectedAlertId) {
+      tasks.push(loadAlertDetails(selectedAlertId));
+    }
+
+    if (selectedApprovalIncidentId && (!normalizedIncidentId || selectedApprovalIncidentId === normalizedIncidentId)) {
+      tasks.push(loadApprovalIncidentContext(selectedApprovalIncidentId));
+    }
+
+    await Promise.all(tasks);
+  }
+
   async function loadFlows() {
     setFlows((prev) => ({ ...prev, loading: true, error: "" }));
     try {
@@ -2598,7 +3049,7 @@ export default function App() {
       const onboardingData = unwrap(onboardingPayload);
       const onboardingRows = Array.isArray(onboardingData?.rows) ? onboardingData.rows : [];
       const projects = onboardingRows
-        .map((row) => String(row?.project_name || "").trim())
+        .map((row) => extractOnboardingProjectName(row))
         .filter(Boolean);
       const monitoringRows = Array.isArray(unwrap(monitoringPayload)?.rows) ? unwrap(monitoringPayload).rows : [];
       const monitoringApplications = monitoringRows
@@ -2917,12 +3368,14 @@ export default function App() {
       ...curr,
       selected_tool: monitoring.tool,
     }));
+    setOnboardingSourceDocs({ loading: false, rows: [], error: "" });
   }
 
   function resetNewProjectOnboardingDraft() {
     setSelectedOnboardingProject("");
     setOnboardingWorkflowSteps([]);
     setOnboardingGeneratedDocs([]);
+    setOnboardingSourceDocs({ loading: false, rows: [], error: "" });
     setOnboardingDocApprovalState({ loading: false, error: "", success: "", approved: false });
     setOnboardingForm((curr) => ({
       ...curr,
@@ -2991,10 +3444,102 @@ export default function App() {
         success: `Approved and ingested ${summary.ingested}/${summary.total} document(s).`,
         approved: true,
       });
+      setOnboardingReviewAck((current) => ({ ...current, docs: true }));
       setOnboardingState((current) => ({ ...current, success: `Project onboarding saved. Documents approved: ${summary.ingested}/${summary.total}.` }));
     } catch (error) {
       setOnboardingDocApprovalState({ loading: false, error: error.message, success: "", approved: false });
     }
+  }
+
+  const onboardingDerivedRequirements = useMemo(() => {
+    const rows = Array.isArray(onboardingSourceDocs.rows) ? onboardingSourceDocs.rows : [];
+    const merged = [];
+    rows.forEach((row) => {
+      (Array.isArray(row?.derived_requirements) ? row.derived_requirements : []).forEach((item) => {
+        const token = String(item || "").trim();
+        if (token && !merged.some((existing) => existing.toLowerCase() === token.toLowerCase())) {
+          merged.push(token);
+        }
+      });
+    });
+    return merged;
+  }, [onboardingSourceDocs.rows]);
+
+  async function handleOnboardingSourceDocuments(files, category = "other") {
+    const rows = Array.from(files || []);
+    if (!rows.length) {
+      return;
+    }
+    setOnboardingSourceDocs((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const parsedRows = await Promise.all(rows.map(async (file) => {
+        const fileName = String(file?.name || "uploaded-document").trim() || "uploaded-document";
+        const extension = fileName.includes(".") ? fileName.split(".").pop().toLowerCase() : "";
+        if (!ONBOARDING_SOURCE_DOC_EXTENSIONS.has(extension)) {
+          return {
+            category,
+            name: fileName,
+            size: Number(file?.size || 0),
+            text: "",
+            excerpt: "",
+            derived_requirements: [],
+            warning: `Unsupported file type .${extension || "unknown"}. Use text-based docs such as .md, .txt, .json, .csv, .yaml.`,
+          };
+        }
+        const text = await file.text();
+        return {
+          category,
+          name: fileName,
+          size: Number(file?.size || 0),
+          text,
+          excerpt: summarizeUploadedDocument(text),
+          derived_requirements: deriveMonitoringRequirementsFromDocument(fileName, text),
+          warning: "",
+        };
+      }));
+      setOnboardingSourceDocs((current) => {
+        const existingRows = Array.isArray(current?.rows) ? current.rows : [];
+        const retainedRows = existingRows.filter((row) => String(row?.category || "other") !== category);
+        return {
+          loading: false,
+          rows: [...retainedRows, ...parsedRows],
+          error: "",
+        };
+      });
+      const derived = parsedRows.flatMap((row) => (Array.isArray(row.derived_requirements) ? row.derived_requirements : []));
+      if (derived.length) {
+        const manual = String(onboardingForm.rule_onboarding_plain_language || "")
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean);
+        const combined = [...manual, ...derived].filter(
+          (line, index, array) => array.findIndex((item) => item.toLowerCase() === line.toLowerCase()) === index,
+        );
+        const nextText = combined.join("\n");
+        setOnboardingForm((curr) => ({ ...curr, rule_onboarding_plain_language: nextText }));
+        setNewRulePipelineForm((curr) => ({ ...curr, requirements_text: nextText }));
+      }
+    } catch (error) {
+      setOnboardingSourceDocs((current) => ({
+        loading: false,
+        rows: Array.isArray(current?.rows) ? current.rows : [],
+        error: String(error?.message || "Failed to read uploaded documents."),
+      }));
+    }
+  }
+
+  function applyUploadedDocumentsToRuleIntent() {
+    if (!onboardingDerivedRequirements.length) {
+      return;
+    }
+    const manual = String(onboardingForm.rule_onboarding_plain_language || "").trim();
+    const combined = [
+      ...manual.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
+      ...onboardingDerivedRequirements,
+    ].filter((line, index, array) => array.findIndex((item) => item.toLowerCase() === line.toLowerCase()) === index);
+    const nextText = combined.join("\n");
+    setOnboardingForm((curr) => ({ ...curr, rule_onboarding_plain_language: nextText }));
+    setNewRulePipelineForm((curr) => ({ ...curr, requirements_text: nextText }));
   }
 
   function openRuleWorkflowEditor(row) {
@@ -3069,6 +3614,7 @@ export default function App() {
         method: "DELETE",
       });
       await loadOnboardingAdminData();
+      await refreshViewsAfterSubmit();
       setOnboardingState((current) => ({ ...current, success: "Project onboarding deleted." }));
     } catch (error) {
       setOnboardingState((current) => ({ ...current, loading: false, error: error.message, success: "" }));
@@ -3086,9 +3632,9 @@ export default function App() {
       const rows = statePayload?.data?.rows || statePayload?.rows || [];
       const project = connectivity?.project || {};
       const allRows = Array.isArray(rows) ? rows : [];
-      const projectRows = allRows.filter((row) => String(row?.provider_name || "").trim().toLowerCase() === "project");
+      const projectRows = allRows.filter((row) => extractOnboardingProjectName(row));
       const preferredProjectName = String(project?.name || selectedOnboardingProject || "").trim();
-      const preferredProjectRow = projectRows.find((row) => String(row?.project_name || "").trim() === preferredProjectName)
+      const preferredProjectRow = projectRows.find((row) => extractOnboardingProjectName(row) === preferredProjectName)
         || projectRows[0]
         || null;
       const monitoring = extractMonitoringToolAndUrl(connectivity);
@@ -3141,6 +3687,7 @@ export default function App() {
     setOnboardingState((current) => ({ ...current, loading: true, error: "", success: "" }));
     setOnboardingGeneratedDocs([]);
     setOnboardingDocApprovalState({ loading: false, error: "", success: "", approved: false });
+    setOnboardingReviewAck({ rules: false, docs: false, metadata: false });
     try {
       const selectedMonitoringTool = String(onboardingForm.monitoring_tool || "prometheus").trim().toLowerCase();
       const monitoringUrl = simplifyMonitoringUrl(onboardingForm.monitoring_url);
@@ -3172,11 +3719,14 @@ export default function App() {
       };
 
       const onboardingPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim().toLowerCase();
-      const plainLanguageRequirements = String(onboardingForm.rule_onboarding_plain_language || "")
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean);
-      const shouldStartRuleOnboarding = onboardingPath === "setup_monitoring" && plainLanguageRequirements.length > 0;
+      const plainLanguageRequirements = [
+        ...String(onboardingForm.rule_onboarding_plain_language || "")
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean),
+        ...onboardingDerivedRequirements,
+      ].filter((line, index, array) => array.findIndex((item) => item.toLowerCase() === line.toLowerCase()) === index);
+      const shouldStartRuleOnboarding = plainLanguageRequirements.length > 0;
 
       const response = await fetchJson("/api-gateway/onboarding/complete", {
         method: "POST",
@@ -3186,6 +3736,11 @@ export default function App() {
           connectivity: payload,
           start_rules_onboarding: shouldStartRuleOnboarding,
           plain_language_requirements: plainLanguageRequirements,
+          source_documents: onboardingSourceDocRows.map((row) => ({
+            name: String(row?.name || "uploaded-document").trim() || "uploaded-document",
+            kind: String(row?.category || classifyOnboardingDocumentType(row?.name, row?.text)).trim().toLowerCase() || "other",
+            excerpt: String(row?.excerpt || "").trim(),
+          })),
           selected_monitoring_tool: selectedMonitoringTool,
           generate_documents: true,
         }),
@@ -3225,16 +3780,25 @@ export default function App() {
         setOnboardingProjectMode("existing");
       }
       await loadOnboardingAdminData();
+      const knowledgeAutoGenerated = onboardingSourceDocCount > 0
+        ? await autoGenerateAlertKnowledgeFromSourceDocs({ projectName: payload.project.name, onboardingPath })
+        : false;
+      await refreshViewsAfterSubmit();
       setOnboardingState((current) => ({
         ...current,
         success: shouldStartRuleOnboarding
           ? generatedDocs.length
             ? `Workflow completed through step ${workflowSteps.length || 0}. Review generated documents and click Approve.`
             : `Workflow completed through step ${workflowSteps.length || 0}. No documents were generated.`
-          : onboardingPath === "existing_monitoring"
-            ? "Project onboarding saved. Send alerts to landing pad to trigger the downstream workflow."
-            : "Project onboarding saved.",
+          : onboardingSourceDocCount > 0
+            ? knowledgeAutoGenerated
+              ? "Project onboarding saved. Alert Knowledge Onboarding draft was auto-generated from uploaded source documents."
+              : "Project onboarding saved. Uploaded docs were detected, but Alert Knowledge auto-generation failed; use manual prompt flow below."
+            : "Project onboarding saved. No source docs uploaded; continue with manual Alert Knowledge prompt and click Create Alert Onboarding Doc.",
       }));
+      if (onboardingSourceDocCount === 0) {
+        setAlertKnowledgeView("onboarding");
+      }
     } catch (error) {
       setOnboardingState((current) => ({ ...current, loading: false, error: error.message, success: "" }));
       setOnboardingRuleRunState((current) => ({ ...current, loading: false }));
@@ -3968,8 +4532,80 @@ export default function App() {
       setDocPromptExistingDoc(mergedDoc);
       setDocPromptMode(mergedDoc?.path ? "update" : "create");
       await Promise.all([loadRagDocs(), loadRecentAlerts()]);
+      await refreshViewsAfterSubmit();
     } catch (error) {
       setAlertOnboardingState({ loading: false, result: null, error: error.message });
+    }
+  }
+
+  async function autoGenerateAlertKnowledgeFromSourceDocs({ projectName, onboardingPath }) {
+    const sourceRows = onboardingSourceDocRows;
+    if (!sourceRows.length) {
+      return false;
+    }
+
+    const safeProject = String(projectName || onboardingForm.name || "").trim() || "Project";
+    const summary = `Auto-generated from ${sourceRows.length} uploaded source document(s).`;
+    const evidenceLines = sourceRows.slice(0, 8).map((row) => {
+      const label = ONBOARDING_SOURCE_DOC_BUCKETS.find((bucket) => bucket.key === String(row?.category || "other"))?.label || "Other Evidence";
+      const excerpt = String(row?.excerpt || "").trim();
+      return `- [${label}] ${String(row?.name || "uploaded-document").trim()}${excerpt ? `: ${excerpt}` : ""}`;
+    });
+    const requirementLines = onboardingDerivedRequirements.slice(0, 8).map((line) => `- ${line}`);
+    const content = [
+      `Auto-generated alert onboarding for ${safeProject}.`,
+      "",
+      "Source evidence:",
+      ...evidenceLines,
+      "",
+      "Derived requirements:",
+      ...(requirementLines.length ? requirementLines : ["- No derived requirements captured."]),
+      "",
+      "Use this draft to refine final triage and remediation guidance.",
+    ].join("\n");
+
+    const autoDraft = {
+      kind: "runbook",
+      title: `${safeProject} Alert Knowledge Onboarding`,
+      summary,
+      content,
+      services: safeProject,
+      severity: "high",
+      alert_type: onboardingPath === "setup_monitoring" ? "configuration" : "availability",
+      alert_id: "",
+      root_cause: "",
+      impact: "",
+      execution_plan: "",
+      remediation_commands_text: "",
+      remediation_scripts_text: "",
+      remediation_queries_text: "",
+      recommended_action: "Review generated draft and finalize onboarding knowledge.",
+    };
+
+    try {
+      const response = await fetchJson("/api-gateway/rag/documents", {
+        method: "POST",
+        body: JSON.stringify(buildDocPayloadFromDraft(autoDraft)),
+      });
+      setAlertOnboarding((curr) => ({ ...curr, ...autoDraft }));
+      setAlertOnboardingState({
+        loading: false,
+        result: {
+          ...response,
+          message: "Alert Knowledge Onboarding auto-generated from uploaded source documents.",
+        },
+        error: "",
+      });
+      setAlertKnowledgeView("onboarding");
+      return true;
+    } catch (error) {
+      setAlertOnboardingState({
+        loading: false,
+        result: null,
+        error: `Automatic Alert Knowledge generation failed: ${String(error?.message || "Unknown error")}`,
+      });
+      setAlertKnowledgeView("onboarding");
+      return false;
     }
   }
 
@@ -4006,128 +4642,6 @@ export default function App() {
     setAlertRuleState({ loading: false, result: null, error: "" });
   }
 
-  function toText(value) {
-    return String(value == null ? "" : value).trim();
-  }
-
-  function findColumn(row, aliases) {
-    const keys = Object.keys(row || {});
-    const normalizedMap = new Map(keys.map((key) => [toText(key).toLowerCase().replace(/\s+/g, "_"), key]));
-    for (const alias of aliases) {
-      const resolved = normalizedMap.get(alias);
-      if (resolved) {
-        return row[resolved];
-      }
-    }
-    return "";
-  }
-
-  function normalizeBulkAlertRow(row, index) {
-    const line = index + 2;
-    const kind = toText(findColumn(row, ["kind"])) || alertOnboarding.kind;
-    const title = toText(findColumn(row, ["title", "name"]));
-    const summary = toText(findColumn(row, ["summary", "description"]));
-    const content = toText(findColumn(row, ["content", "details", "runbook", "body"]));
-    const severity = toText(findColumn(row, ["severity", "priority"])) || alertOnboarding.severity;
-    const alertType = toText(findColumn(row, ["alert_type", "alerttype", "type"])) || alertOnboarding.alert_type;
-    const servicesRaw = toText(findColumn(row, ["services", "service", "service_names"]));
-    const services = servicesRaw
-      .split(",")
-      .map((item) => toText(item))
-      .filter(Boolean);
-
-    const payload = {
-      kind,
-      title,
-      summary: summary || null,
-      content,
-      services,
-      severity,
-      alert_type: alertType,
-    };
-
-    const errors = [];
-    if (!title) {
-      errors.push("title is required");
-    }
-    if (!content || content.length < 20) {
-      errors.push("content must be at least 20 characters");
-    }
-    if (!kind) {
-      errors.push("kind is required");
-    }
-
-    return {
-      line,
-      payload,
-      valid: errors.length === 0,
-      errors,
-    };
-  }
-
-  async function onAlertBulkFileSelected(event) {
-    const file = event.target?.files?.[0];
-    if (!file) {
-      return;
-    }
-    setAlertBulkState({ fileName: file.name, loading: false, parsedRows: [], results: [], error: "" });
-
-    try {
-      const extension = toText(file.name.split(".").pop()).toLowerCase();
-      const workbook = extension === "csv"
-        ? XLSX.read(await file.text(), { type: "string" })
-        : XLSX.read(await file.arrayBuffer(), { type: "array" });
-      const firstSheetName = workbook.SheetNames[0];
-      const firstSheet = workbook.Sheets[firstSheetName];
-      const rows = XLSX.utils.sheet_to_json(firstSheet, { defval: "" });
-
-      if (!rows.length) {
-        setAlertBulkState((current) => ({ ...current, error: "Uploaded sheet has no rows." }));
-        return;
-      }
-
-      const parsedRows = rows.map((row, index) => normalizeBulkAlertRow(row, index));
-      setAlertBulkState((current) => ({ ...current, parsedRows, error: "", results: [] }));
-    } catch (error) {
-      setAlertBulkState((current) => ({ ...current, parsedRows: [], results: [], error: `Unable to parse spreadsheet: ${error.message}` }));
-    }
-  }
-
-  async function submitAlertOnboardingBulk() {
-    const rows = alertBulkState.parsedRows;
-    if (!rows.length) {
-      setAlertBulkState((current) => ({ ...current, error: "Upload an Excel file first." }));
-      return;
-    }
-
-    setAlertBulkState((current) => ({ ...current, loading: true, error: "", results: [] }));
-
-    const results = [];
-    for (const row of rows) {
-      if (!row.valid) {
-        results.push({
-          line: row.line,
-          status: "failed",
-          message: row.errors.join("; "),
-          title: row.payload.title || "-",
-        });
-        continue;
-      }
-
-      try {
-        await fetchJson("/api-gateway/rag/documents", {
-          method: "POST",
-          body: JSON.stringify(row.payload),
-        });
-        results.push({ line: row.line, status: "success", message: "Inserted", title: row.payload.title || "-" });
-      } catch (error) {
-        results.push({ line: row.line, status: "failed", message: error.message, title: row.payload.title || "-" });
-      }
-    }
-
-    setAlertBulkState((current) => ({ ...current, loading: false, results }));
-    await loadRagDocs();
-  }
 
   async function refreshAll() {
     await Promise.all([
@@ -4143,6 +4657,17 @@ export default function App() {
       loadClosedIncidents(),
       loadRagDocs(),
     ]);
+  }
+
+  async function refreshViewsAfterSubmit() {
+    await Promise.allSettled([
+      refreshAll(),
+      loadOnboardingAdminData(),
+      loadMonitoringApplications(),
+    ]);
+    if (selectedMonitoringAppId) {
+      await loadMonitoringApplicationDetails(selectedMonitoringAppId);
+    }
   }
 
   useEffect(() => {
@@ -4336,6 +4861,64 @@ export default function App() {
   const visibleAlerts = useMemo(() => {
     return monitorScopedAlerts;
   }, [monitorScopedAlerts]);
+
+  const dashboardAlertSummary = useMemo(() => {
+    const summary = { total: visibleAlerts.length, critical: 0, high: 0, awaiting: 0, active: 0 };
+    visibleAlerts.forEach((row) => {
+      const severity = String(row?.severity || "").toLowerCase();
+      const status = String(row?.status || row?.state || "open").toLowerCase();
+      if (severity === "critical") {
+        summary.critical += 1;
+      }
+      if (severity === "high") {
+        summary.high += 1;
+      }
+      if (status === "awaiting_approval") {
+        summary.awaiting += 1;
+      }
+      if (status === "open" || status === "pending" || status === "investigating") {
+        summary.active += 1;
+      }
+    });
+    return summary;
+  }, [visibleAlerts]);
+
+  const dashboardVisibleAlerts = useMemo(() => {
+    const query = String(dashboardAlertQuery || "").trim().toLowerCase();
+    return visibleAlerts.filter((row) => {
+      const severity = String(row?.severity || "").toLowerCase();
+      const status = String(row?.status || row?.state || "open").toLowerCase();
+      if (dashboardAlertFocus === "critical" && severity !== "critical") {
+        return false;
+      }
+      if (dashboardAlertFocus === "high" && severity !== "high") {
+        return false;
+      }
+      if (dashboardAlertFocus === "awaiting" && status !== "awaiting_approval") {
+        return false;
+      }
+      if (dashboardAlertFocus === "active" && !["open", "pending", "investigating"].includes(status)) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      const haystack = [
+        row?.alert_id,
+        row?.id,
+        row?.incident_id,
+        row?.name,
+        row?.alert_name,
+        row?.service,
+        row?.application,
+        row?.project_name,
+        row?.project,
+      ]
+        .map((value) => String(value || "").toLowerCase())
+        .join(" ");
+      return haystack.includes(query);
+    });
+  }, [visibleAlerts, dashboardAlertFocus, dashboardAlertQuery]);
 
   const monitorScopedIncidentMetadata = useMemo(() => {
     return filterRowsForMonitor(incidentMetadata.rows, applicationToMonitor);
@@ -4539,6 +5122,23 @@ export default function App() {
 
   const selectedAlertRouting = useMemo(() => extractObservedRoutingMetrics(selectedAlertWorkflow), [selectedAlertWorkflow]);
 
+  const selectedIncidentId = useMemo(() => {
+    return String(selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "").trim();
+  }, [selectedAlertWorkflow]);
+
+  const selectedIncidentMetadataRow = useMemo(() => {
+    if (!selectedIncidentId) {
+      return null;
+    }
+    const scoped = monitorScopedIncidentMetadata.find(
+      (row) => String(row?.incident_id || "").trim() === selectedIncidentId
+    );
+    if (scoped) {
+      return scoped;
+    }
+    return incidentMetadata.rows.find((row) => String(row?.incident_id || "").trim() === selectedIncidentId) || null;
+  }, [selectedIncidentId, monitorScopedIncidentMetadata, incidentMetadata.rows]);
+
   const selectedExecutionPlan = useMemo(() => {
     const recommendation =
       typeof selectedAlertWorkflow?.recommendation === "object" && selectedAlertWorkflow.recommendation
@@ -4581,26 +5181,44 @@ export default function App() {
       executionMode: selectedAlertRouting?.execution_mode || decision?.execution_mode || "-",
       riskTier: selectedAlertRouting?.risk_tier || decision?.risk_tier || "-",
       provider: selectedAlertRouting?.message_bus_provider || decision?.message_bus_provider || "-",
+      incidentStatus: selectedAlertWorkflow?.incident?.status || selectedIncidentMetadataRow?.status || "-",
+      approvalStatus: selectedAlertWorkflow?.approval?.status || "pending",
       commands,
     };
-  }, [selectedAlertWorkflow, selectedAlertRouting, selectedAlertEventTrace]);
-
-  const selectedIncidentId = useMemo(() => {
-    return String(selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "").trim();
-  }, [selectedAlertWorkflow]);
-
-  const selectedIncidentMetadataRow = useMemo(() => {
-    if (!selectedIncidentId) {
-      return null;
-    }
-    const scoped = monitorScopedIncidentMetadata.find(
-      (row) => String(row?.incident_id || "").trim() === selectedIncidentId
-    );
-    if (scoped) {
-      return scoped;
-    }
-    return incidentMetadata.rows.find((row) => String(row?.incident_id || "").trim() === selectedIncidentId) || null;
-  }, [selectedIncidentId, monitorScopedIncidentMetadata, incidentMetadata.rows]);
+  }, [selectedAlertWorkflow, selectedAlertRouting, selectedAlertEventTrace, selectedIncidentMetadataRow]);
+  const selectedExecutionBreakdown = useMemo(() => {
+    const grouped = { commands: [], scripts: [], queries: [] };
+    (Array.isArray(selectedExecutionPlan.commands) ? selectedExecutionPlan.commands : []).forEach((item) => {
+      const line = String(item || "").trim();
+      if (!line) {
+        return;
+      }
+      const normalized = line
+        .replace(/^\s*(cmd|command)\s*:/i, "")
+        .replace(/^\s*script\s*:/i, "script: ")
+        .replace(/^\s*query\s*:/i, "query: ")
+        .trim();
+      if (!normalized || /^#/.test(normalized) || /^preview only/i.test(normalized) || /^recommended_action/i.test(normalized)) {
+        return;
+      }
+      if (/^script\s*:/i.test(normalized)) {
+        grouped.scripts.push(normalized.replace(/^script\s*:/i, "").trim());
+        return;
+      }
+      if (/^query\s*:/i.test(normalized)) {
+        grouped.queries.push(normalized.replace(/^query\s*:/i, "").trim());
+        return;
+      }
+      grouped.commands.push(normalized);
+    });
+    const hasPlan = grouped.commands.length > 0 || grouped.scripts.length > 0 || grouped.queries.length > 0;
+    return {
+      ...grouped,
+      hasPlan,
+      incidentStatus: String(selectedExecutionPlan.incidentStatus || "-").trim().toLowerCase(),
+      approvalStatus: normalizeApprovalStatus(selectedExecutionPlan.approvalStatus || "pending"),
+    };
+  }, [selectedExecutionPlan]);
 
   const selectedAlertTimelineRows = useMemo(() => {
     const ingestAt =
@@ -4806,6 +5424,11 @@ export default function App() {
     ];
   }, [selectedAlertWorkflow, selectedAlertRow, selectedIncidentMetadataRow, selectedAlertEvents, selectedAlertEventTrace]);
 
+  const selectedWorkflowFlowStages = useMemo(
+    () => buildWorkflowFlowStages(selectedAlertWorkflow, selectedAlertTimelineRows),
+    [selectedAlertWorkflow, selectedAlertTimelineRows],
+  );
+
   const hasSelectedWorkflowData = useMemo(() => {
     if (!selectedAlertWorkflow || typeof selectedAlertWorkflow !== "object") {
       return false;
@@ -4882,11 +5505,11 @@ export default function App() {
   }, [panelWorkflowUsage, selectedAlertUsage, latestWorkflow, monitorScopedIncidentMetadata, gatewayRecent.rows]);
 
   useEffect(() => {
-    if (activeTab !== "home" || homeDetailTab !== "api") {
+    if (activeTab !== "home" || homeDetailTab !== "diagnostics" || diagnosticsDetailTab !== "api") {
       return;
     }
     loadGatewayRecent();
-  }, [activeTab, homeDetailTab]);
+  }, [activeTab, homeDetailTab, diagnosticsDetailTab]);
 
   const workflowEventRows = useMemo(() => {
     const mapped = panelWorkflowEvents
@@ -5193,17 +5816,42 @@ export default function App() {
     ).trim();
   }
 
-  async function loadApprovalIncidentContext(incidentId) {
+  async function loadApprovalIncidentContext(incidentId, options = {}) {
+    const forceRefresh = Boolean(options?.force);
     const normalized = String(incidentId || "").trim();
     if (!normalized) {
       return;
     }
-    setApprovalIncidentContext({ loading: true, incident_id: normalized, payload: null, error: "" });
+    const now = Date.now();
+    const requestState = approvalIncidentRequestRef.current;
+    if (requestState.inFlight && requestState.incidentId === normalized) {
+      return;
+    }
+    if (!forceRefresh && (
+      approvalIncidentContext.incident_id === normalized
+      && approvalIncidentContext.payload
+      && now - requestState.lastFetchedAt < 10000
+    )) {
+      return;
+    }
+
+    approvalIncidentRequestRef.current = { ...requestState, incidentId: normalized, inFlight: true };
+    setApprovalIncidentContext((current) => ({
+      loading: true,
+      incident_id: normalized,
+      payload: current.incident_id === normalized ? current.payload : null,
+      error: "",
+    }));
     try {
       const response = await fetchJson(`/api-gateway/approval/incident/${encodeURIComponent(normalized)}`);
       const payload = unwrap(response);
       const recommendationId = approvalRecommendationFromPayload(payload);
       setApprovalIncidentContext({ loading: false, incident_id: normalized, payload, error: "" });
+      approvalIncidentRequestRef.current = {
+        incidentId: normalized,
+        inFlight: false,
+        lastFetchedAt: Date.now(),
+      };
       if (recommendationId) {
         setApprovalForm((current) => ({
           ...current,
@@ -5216,6 +5864,11 @@ export default function App() {
       const brief = raw.includes("HTTP 502") || raw.includes("500 Internal Server Error")
         ? "Approval context service is temporarily unavailable. You can continue using selected incident details."
         : raw;
+      approvalIncidentRequestRef.current = {
+        incidentId: normalized,
+        inFlight: false,
+        lastFetchedAt: Date.now(),
+      };
       setApprovalIncidentContext({ loading: false, incident_id: normalized, payload: null, error: brief });
     }
   }
@@ -5255,6 +5908,72 @@ export default function App() {
     });
     return index;
   }, [pendingApprovals]);
+
+  const executiveInsights = useMemo(() => {
+    const openRows = monitorScopedIncidentMetadata.filter((row) => !isApprovalResolvedStatus(row?.status || row?.state));
+    const slaAtRisk = openRows.filter((row) => {
+      const risk = String(row?.risk_tier || row?.risk || row?.severity || "").toLowerCase();
+      const mode = String(row?.execution_mode || "").toLowerCase();
+      return risk === "high" || risk === "critical" || mode.includes("manual");
+    }).length;
+
+    const pendingApprovalAges = pendingApprovals
+      .map((row) => parseUtcTimestamp(row?.created_at || row?.updated_at || row?.timestamp)?.getTime() || 0)
+      .filter((value) => value > 0)
+      .map((time) => Math.max(0, (Date.now() - time) / 60000));
+    const avgApprovalWaitMinutes = pendingApprovalAges.length
+      ? pendingApprovalAges.reduce((sum, value) => sum + value, 0) / pendingApprovalAges.length
+      : 0;
+
+    const closedRows = Array.isArray(closedIncidents.rows) ? closedIncidents.rows : [];
+    const autoClosed = closedRows.filter((row) => String(row?.execution_mode || "").toLowerCase().includes("auto")).length;
+    const automationRate = closedRows.length ? (autoClosed / closedRows.length) * 100 : 0;
+
+    const dayBuckets = Array.from({ length: 7 }).map((_, idx) => {
+      const date = new Date();
+      date.setHours(0, 0, 0, 0);
+      date.setDate(date.getDate() - (6 - idx));
+      const key = date.toISOString().slice(0, 10);
+      return { key, label: date.toLocaleDateString(undefined, { month: "short", day: "numeric" }), open: 0, closed: 0 };
+    });
+    const bucketMap = new Map(dayBuckets.map((item) => [item.key, item]));
+
+    monitorScopedAlerts.forEach((row) => {
+      const parsed = parseUtcTimestamp(row?.created_at || row?.starts_at);
+      if (!parsed) {
+        return;
+      }
+      const key = parsed.toISOString().slice(0, 10);
+      const bucket = bucketMap.get(key);
+      if (bucket) {
+        bucket.open += 1;
+      }
+    });
+
+    closedRows.forEach((row) => {
+      const parsed = parseUtcTimestamp(row?.closed_at || row?.updated_at || row?.created_at);
+      if (!parsed) {
+        return;
+      }
+      const key = parsed.toISOString().slice(0, 10);
+      const bucket = bucketMap.get(key);
+      if (bucket) {
+        bucket.closed += 1;
+      }
+    });
+
+    const weeklyOpenTrend = dayBuckets.map((item) => ({ label: item.label, value: item.open, tone: "risk" }));
+    const weeklyClosedTrend = dayBuckets.map((item) => ({ label: item.label, value: item.closed, tone: "ops" }));
+
+    return {
+      openIncidents: openRows.length,
+      slaAtRisk,
+      avgApprovalWaitMinutes,
+      automationRate,
+      weeklyOpenTrend,
+      weeklyClosedTrend,
+    };
+  }, [monitorScopedIncidentMetadata, pendingApprovals, closedIncidents.rows, monitorScopedAlerts]);
 
   const selectedApprovalRow = useMemo(() => {
     return filteredPendingApprovals.find((row) => approvalIncidentId(row) === selectedApprovalIncidentId) || null;
@@ -5469,6 +6188,26 @@ export default function App() {
         },
       };
     });
+
+    setApprovalIncidentContext((prev) => {
+      if (String(prev?.incident_id || "").trim() !== normalizedIncidentId) {
+        return prev;
+      }
+      const root = prev?.payload && typeof prev.payload === "object" ? prev.payload : {};
+      const data = root?.data && typeof root.data === "object" ? root.data : root;
+      const patched = {
+        ...data,
+        status: normalizedStatus,
+        state: normalizedStatus,
+        approval_status: normalizedStatus,
+        updated_at: new Date().toISOString(),
+      };
+      return {
+        ...prev,
+        payload: root?.data ? { ...root, data: patched } : patched,
+        error: "",
+      };
+    });
   }
 
   const approvalReady = useMemo(() => {
@@ -5566,7 +6305,8 @@ export default function App() {
       }));
       applyApprovalResolutionToUi(incidentId, "approved", approvalForm.comment);
       setApprovalState({ loading: false, result: response, error: "" });
-      await Promise.all([loadIncidentMetadata(), loadGatewayRecent(), loadGatewaySummary()]);
+      await loadApprovalIncidentContext(incidentId, { force: true });
+      await refreshApprovalDrivenViews(incidentId);
     } catch (error) {
       const raw = String(error?.message || "");
       const concise = raw.includes("HTTP 422")
@@ -5603,7 +6343,8 @@ export default function App() {
       applyApprovalResolutionToUi(incidentId, "rejected", inlineRejectState.comment);
       setInlineRejectState({ incidentId: "", comment: "" });
       setApprovalState({ loading: false, result: response, error: "" });
-      await Promise.all([loadIncidentMetadata(), loadGatewayRecent(), loadGatewaySummary()]);
+      await loadApprovalIncidentContext(incidentId, { force: true });
+      await refreshApprovalDrivenViews(incidentId);
     } catch (error) {
       const raw = String(error?.message || "");
       const concise = raw.includes("HTTP 422")
@@ -5618,6 +6359,13 @@ export default function App() {
     setApprovalState({ loading: true, result: null, error: "" });
     try {
       const incidentId = String(approvalForm.incident_id || selectedApprovalIncidentId || "").trim();
+      const approver = String(approvalForm.approver || adminSession?.user?.username || "admin").trim();
+      if (!looksLikeUuid(incidentId)) {
+        throw new Error("Select a valid incident first (UUID). Use the incident row selector or Sync From Approval API.");
+      }
+      if (!approver) {
+        throw new Error("Approver is required.");
+      }
       const recommendationIdCandidate = String(
         approvalForm.recommendation_id
         || selectedApprovalRecommendationId
@@ -5629,7 +6377,7 @@ export default function App() {
         incidentId,
         recommendationId,
         action: approvalForm.action,
-        approver: approvalForm.approver,
+        approver,
         channel: approvalForm.channel,
         comment: approvalForm.comment,
         modifiedAction: approvalForm.modified_action,
@@ -5637,7 +6385,8 @@ export default function App() {
       const actionStatus = approvalForm.action === "reject" ? "rejected" : "approved";
       applyApprovalResolutionToUi(incidentId, actionStatus, approvalForm.comment);
       setApprovalState({ loading: false, result: response, error: "" });
-      await Promise.all([loadIncidentMetadata(), loadGatewayRecent(), loadGatewaySummary()]);
+      await loadApprovalIncidentContext(incidentId, { force: true });
+      await refreshApprovalDrivenViews(incidentId);
     } catch (error) {
       const raw = String(error?.message || "");
       const concise = raw.includes("HTTP 422")
@@ -5650,15 +6399,14 @@ export default function App() {
   const tabs = [
     { id: "home", label: "Dashboard" },
     { id: "copilot", label: "Copilot Studio" },
-    { id: "approval", label: "Human Approval" },
     { id: "executive", label: "Executive Dashboard" },
     { id: "admin", label: "Admin Center" },
     { id: "trace", label: "Agent Flow" },
     { id: "safety", label: "Gateway Safety" },
     { id: "rag", label: "Message Bus" },
-    { id: "finops", label: "FinOps" },
     { id: "closed", label: "Closed Tickets" },
     { id: "summary", label: "Incident Metadata Explorer" },
+    { id: "approval", label: "Approval Queue (Legacy)" },
   ];
 
   const sidebarSections = [
@@ -5666,7 +6414,6 @@ export default function App() {
     { id: "approval", icon: "AL", shortLabel: "Approval", label: "Human Approval", tone: "risk" },
     { id: "executive", icon: "EX", shortLabel: "Executive", label: "Executive Dashboard", tone: "meta" },
     { id: "admin", icon: "AD", shortLabel: "Admin", label: "Admin Center", tone: "bus" },
-    { id: "finops", icon: "FX", shortLabel: "FinOps", label: "FinOps", tone: "cost" },
   ];
 
   const currentRole = useMemo(() => normalizeRoleName(adminSession?.user?.role_name), [adminSession?.user?.role_name]);
@@ -5674,6 +6421,32 @@ export default function App() {
     () => (onboardingState.rows || []).filter((row) => String(row?.provider_name || "").trim().toLowerCase() === "project"),
     [onboardingState.rows],
   );
+  const onboardingProjectRowOptions = useMemo(() => {
+    const names = new Set();
+    (onboardingState.rows || []).forEach((row) => {
+      const name = extractOnboardingProjectName(row);
+      if (name) {
+        names.add(name);
+      }
+    });
+    return Array.from(names).sort((a, b) => a.localeCompare(b));
+  }, [onboardingState.rows]);
+  const monitoringProjectOptions = useMemo(() => {
+    const names = new Set();
+    (monitoringApps.rows || []).forEach((row) => {
+      const name = String(row?.name || "").trim();
+      if (name) {
+        names.add(name);
+      }
+    });
+    return Array.from(names).sort((a, b) => a.localeCompare(b));
+  }, [monitoringApps.rows]);
+  const onboardingProjectOptions = useMemo(() => {
+    const names = new Set();
+    onboardingProjectRowOptions.forEach((name) => names.add(name));
+    monitoringProjectOptions.forEach((name) => names.add(name));
+    return Array.from(names).sort((a, b) => a.localeCompare(b));
+  }, [onboardingProjectRowOptions, monitoringProjectOptions]);
   const ruleOnboardingRows = useMemo(
     () => (onboardingState.rows || []).filter((row) => {
       const provider = String(row?.provider_name || "").trim().toLowerCase();
@@ -5682,10 +6455,31 @@ export default function App() {
     [onboardingState.rows],
   );
   const allowedTabs = useMemo(() => ROLE_ALLOWED_TABS[currentRole] || ["home"], [currentRole]);
-  const visibleSidebarSections = useMemo(() => sidebarSections.filter((tab) => allowedTabs.includes(tab.id)), [sidebarSections, allowedTabs]);
+  const visibleSidebarSections = useMemo(
+    () => sidebarSections.filter((tab) => {
+      if (!allowedTabs.includes(tab.id)) {
+        return false;
+      }
+      if (tab.id === "approval" && !APPROVAL_NAV_PRIMARY_ROLES.has(currentRole)) {
+        return false;
+      }
+      return true;
+    }),
+    [sidebarSections, allowedTabs, currentRole],
+  );
   const isAuthenticated = Boolean(String(adminSession.accessToken || "").trim());
   const isAdministrator = currentRole === "administrator";
+  const canUseApprovalActions = allowedTabs.includes("approval");
   const canManageSeverityOverride = ["administrator", "l2_engineer", "l3_engineer", "p2", "p3"].includes(currentRole);
+  const onboardingSourceDocRows = useMemo(
+    () => (Array.isArray(onboardingSourceDocs.rows) ? onboardingSourceDocs.rows : []).filter((row) => {
+      const text = String(row?.text || "").trim();
+      const warning = String(row?.warning || "").trim();
+      return Boolean(text) && !warning;
+    }),
+    [onboardingSourceDocs.rows],
+  );
+  const onboardingSourceDocCount = onboardingSourceDocRows.length;
   const severityOverrideByKey = useMemo(() => {
     const map = new Map();
     (alertSeverityOverrides.rows || []).forEach((row) => {
@@ -5696,6 +6490,35 @@ export default function App() {
     });
     return map;
   }, [alertSeverityOverrides.rows]);
+  const selectedAlertActionContext = useMemo(() => {
+    if (!selectedAlertRow) {
+      return null;
+    }
+    const status = String(selectedAlertRow?.status || selectedAlertRow?.state || "open");
+    const alertName = String(selectedAlertRow?.name || selectedAlertRow?.alert_name || "").trim();
+    const service = String(selectedAlertRow?.service || "").trim();
+    const environment = String(selectedAlertRow?.environment || "").trim();
+    const overrideKey = severityOverrideKey(alertName, service, environment);
+    const overrideRow = severityOverrideByKey.get(overrideKey);
+    return {
+      status,
+      alertName,
+      overrideKey,
+      overrideRow,
+      documentAvailable: hasAlertDocuments(selectedAlertRow),
+      alertClosed: isApprovalResolvedStatus(status),
+      draftSeverity: String(
+        alertSeverityDrafts[overrideKey]
+          || overrideRow?.severity
+          || String(selectedAlertRow?.severity || "warning").toLowerCase()
+      ).toLowerCase(),
+      overrideSaving: alertSeverityOverrides.savingKey === overrideKey,
+    };
+  }, [selectedAlertRow, severityOverrideByKey, alertSeverityDrafts, alertSeverityOverrides.savingKey]);
+  const selectedAlertRuleSummary = useMemo(
+    () => summarizeAlertRuleContext(selectedAlertRow, selectedAlertWorkflow),
+    [selectedAlertRow, selectedAlertWorkflow],
+  );
   const onboardingValidationErrors = useMemo(() => {
     const errors = [];
     if (!String(onboardingForm.name || "").trim()) {
@@ -5711,8 +6534,15 @@ export default function App() {
       errors.push("GCP Project ID is required for Google Cloud deployment.");
     }
     const isSetupMonitoringPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim() === "setup_monitoring";
-    if (isSetupMonitoringPath && !String(onboardingForm.rule_onboarding_plain_language || "").trim()) {
-      errors.push("Add plain-English rule intent when the Setup Monitoring path is selected.");
+    const derivedRequirementCount = (Array.isArray(onboardingSourceDocs.rows) ? onboardingSourceDocs.rows : []).reduce(
+      (count, row) => count + (Array.isArray(row?.derived_requirements) ? row.derived_requirements.length : 0),
+      0,
+    );
+    if (isSetupMonitoringPath && !String(onboardingForm.rule_onboarding_plain_language || "").trim() && derivedRequirementCount === 0) {
+      errors.push("Add plain-English rule intent or upload source documents that produce derived requirements.");
+    }
+    if (isSetupMonitoringPath && !String(onboardingForm.monitoring_url || "").trim()) {
+      errors.push("Prometheus endpoint URL is required for Configure Prometheus Monitoring path.");
     }
     return errors;
   }, [
@@ -5722,12 +6552,15 @@ export default function App() {
     onboardingForm.deployment_mode,
     onboardingForm.gcp_project_id,
     onboardingForm.onboarding_path,
+    onboardingForm.monitoring_url,
     onboardingForm.rule_onboarding_plain_language,
+    onboardingSourceDocs.rows,
+    onboardingSourceDocCount,
   ]);
   const onboardingAdvisory = useMemo(() => {
     const onboardingPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim();
     if (onboardingPath === "existing_monitoring") {
-      return "Existing monitoring path: configure your tool and send alerts to /alerts/alertmanager to trigger workflow.";
+      return "Existing monitoring path: upload past tickets, troubleshooting docs, RCA/resolution docs, and logs; save project; then send alerts to /alerts/alertmanager to trigger workflow.";
     }
     if (String(onboardingForm.deployment_mode || "").trim() !== "on_prem") {
       return "";
@@ -5791,20 +6624,109 @@ export default function App() {
     }),
     [onboardingGeneratedDocs.length, onboardingDocApprovalState.approved],
   );
+  const onboardingWizardSteps = useMemo(() => {
+    const docsUploaded = onboardingSourceDocCount > 0;
+    const requirementsDerived = onboardingDerivedRequirements.length > 0
+      || String(onboardingForm.rule_onboarding_plain_language || "").trim().length > 0;
+    const ruleGenerated = Boolean(
+      onboardingRuleRunState?.result
+      || onboardingRuleLookup?.result
+      || String(onboardingRuleLookup?.workflow_id || "").trim(),
+    );
+    const docsApproved = Boolean(onboardingDocApprovalState.approved);
+    const metadataStored = String(onboardingState.success || "").toLowerCase().includes("saved")
+      || projectOnboardingRows.some((row) => {
+        const name = String(row?.project_name || "").trim();
+        return name && name === String(selectedOnboardingProject || onboardingForm.name || "").trim();
+      });
+
+    return [
+      { id: "docs_uploaded", label: "Docs Uploaded", complete: docsUploaded },
+      { id: "requirements", label: "Requirements Derived", complete: requirementsDerived },
+      { id: "rules", label: "Rules Generated", complete: ruleGenerated },
+      { id: "docs_approved", label: "Docs Approved", complete: docsApproved },
+      { id: "metadata", label: "Metadata Stored", complete: metadataStored },
+    ];
+  }, [
+    onboardingSourceDocCount,
+    onboardingDerivedRequirements.length,
+    onboardingForm.rule_onboarding_plain_language,
+    onboardingRuleRunState?.result,
+    onboardingRuleLookup?.result,
+    onboardingRuleLookup?.workflow_id,
+    onboardingDocApprovalState.approved,
+    onboardingState.success,
+    projectOnboardingRows,
+    selectedOnboardingProject,
+    onboardingForm.name,
+  ]);
+  const onboardingGeneratedRuleRows = useMemo(() => {
+    const primary = normalizeGeneratedRuleRows(onboardingRuleRunState?.result);
+    if (primary.length) {
+      return primary;
+    }
+    return normalizeGeneratedRuleRows(onboardingRuleLookup?.result);
+  }, [onboardingRuleRunState?.result, onboardingRuleLookup?.result]);
+  const onboardingRulePromptLines = useMemo(
+    () => String(onboardingForm.rule_onboarding_plain_language || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean),
+    [onboardingForm.rule_onboarding_plain_language],
+  );
+  const onboardingRulePromptVisible = String(onboardingForm.onboarding_path || "").trim() === "setup_monitoring"
+    && (onboardingSourceDocCount > 0 || onboardingRulePromptLines.length > 0 || onboardingGeneratedRuleRows.length > 0);
+  const onboardingMetadataRows = useMemo(() => {
+    const currentProject = String(selectedOnboardingProject || onboardingForm.name || "").trim();
+    const rows = Array.isArray(onboardingState.rows) ? onboardingState.rows : [];
+    return rows
+      .filter((row) => {
+        const projectName = String(row?.project_name || "").trim();
+        return currentProject ? projectName === currentProject : true;
+      })
+      .map((row, index) => ({
+        id: `${String(row?.provider_name || "provider")}-${index}`,
+        provider: String(row?.provider_name || "-").trim(),
+        project: String(row?.project_name || "-").trim(),
+        status: String(row?.test_status || row?.status || "-").trim(),
+        updated_at: String(row?.updated_at || row?.created_at || "-").trim(),
+      }));
+  }, [onboardingState.rows, selectedOnboardingProject, onboardingForm.name]);
+  const onboardingReviewGate = useMemo(() => {
+    const needsRules = onboardingGeneratedRuleRows.length > 0;
+    const needsDocs = onboardingGeneratedDocs.length > 0;
+    const needsMetadata = onboardingMetadataRows.length > 0;
+    const rulesOk = !needsRules || onboardingReviewAck.rules;
+    const docsOk = !needsDocs || onboardingReviewAck.docs;
+    const metadataOk = !needsMetadata || onboardingReviewAck.metadata;
+    return {
+      needsRules,
+      needsDocs,
+      needsMetadata,
+      allReviewed: rulesOk && docsOk && metadataOk,
+    };
+  }, [
+    onboardingGeneratedRuleRows.length,
+    onboardingGeneratedDocs.length,
+    onboardingMetadataRows.length,
+    onboardingReviewAck.rules,
+    onboardingReviewAck.docs,
+    onboardingReviewAck.metadata,
+  ]);
   const onboardingNextAction = useMemo(() => {
     const onboardingPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim();
     if (onboardingState.loading) {
-      return "Step 2/4: Saving project and generating workflow artifacts...";
+      return "Saving setup and generating onboarding artifacts...";
     }
     if (onboardingHasPendingDocumentApproval) {
-      return "Step 3/4: Review generated documents below, then click Approve Documents.";
+      return "Review generated documents below, then click Approve Documents.";
     }
     if (onboardingDocumentSummary.approved) {
-      return "Step 4/4: Documents approved. You can continue with another update or proceed to advanced workflow management.";
+      return "Documents approved. You can continue with another update or proceed to advanced workflow management.";
     }
     return onboardingPath === "setup_monitoring"
-      ? "Step 1/4: Complete project and monitoring-rule setup details, then click Create Project or Update Project."
-      : "Step 1/4: Complete project details, save, then ingest alerts into landing pad.";
+      ? "Step 1: choose Project Mode, Step 2: choose Setup Path, Step 3: upload source docs (optional), then save."
+      : "Step 1: choose Project Mode, Step 2: choose Setup Path, Step 3: upload source docs (optional), then save.";
   }, [
     onboardingState.loading,
     onboardingHasPendingDocumentApproval,
@@ -5814,15 +6736,197 @@ export default function App() {
 
   const adminWorkspaceCaptions = useMemo(() => ({
     users: "Manage users, roles, and credentials.",
-    monitoring: "Setup monitoring foundations, then continue alert knowledge onboarding.",
-    //  Generated runbooks appear under Alert Knowledge once rules are created.",
-    project: "Setup landing pad, routing path, and continue alert knowledge onboarding.",
-    // Generated and Landing Pad-linked documents appear under Alert Knowledge.",
-    alerts: "Alert knowledge onboarding and bulk document ingestion."
+    monitoring: "Setup monitoring foundations, landing pad routing, and rule/doc generation.",
+    project: "Unified setup: monitoring registration, landing pad routing, and generated artifact review.",
+    alerts: "Alert knowledge onboarding and bulk document ingestion.",
   }), []);
+  const adminJourneyStep = useMemo(() => {
+    if (adminWorkspace === "users") {
+      return "access";
+    }
+    if (adminWorkspace === "alerts" || (adminWorkspace === "project" && projectSetupStep === "knowledge")) {
+      return "knowledge";
+    }
+    return "setup";
+  }, [adminWorkspace, projectSetupStep]);
+  const adminJourneyCards = useMemo(() => {
+    const setupSaved = Boolean(String(onboardingState.success || "").trim()) && !onboardingState.loading && !onboardingState.error;
+    const setupComplete = Boolean(onboardingDocumentSummary.approved) || setupSaved || onboardingWorkflowSteps.length > 0;
+    const knowledgeComplete = Boolean(alertOnboardingState.result);
+    const setupTone = onboardingState.error
+      ? "error"
+      : onboardingHasPendingDocumentApproval
+          ? "warning"
+          : setupComplete
+            ? "success"
+            : "info";
+    const knowledgeHasError = Boolean(alertOnboardingState.error);
+    const knowledgeTone = knowledgeHasError
+      ? "error"
+      : knowledgeComplete
+        ? "success"
+        : "info";
+    return [
+      {
+        id: "access",
+        title: "1. Access",
+        hint: "Users, roles, session security",
+        status: adminUsers.rows.length ? `${adminUsers.rows.length} users loaded` : "No users loaded",
+        complete: Boolean(adminUsers.rows.length),
+        tone: adminUsers.error ? "error" : adminUsers.rows.length ? "success" : "info",
+        cta: "Open access controls",
+      },
+      {
+        id: "setup",
+        title: "2. Setup",
+        hint: "Unified monitoring + landing pad",
+        status: onboardingHasPendingDocumentApproval
+          ? "Setup saved. Review generated documents to finalize."
+          : onboardingDocumentSummary.approved
+            ? "Project docs approved"
+            : (setupSaved || onboardingWorkflowSteps.length > 0)
+              ? "Project setup saved and synced."
+              : onboardingNextAction,
+        complete: setupComplete,
+        tone: setupTone,
+        cta: onboardingHasPendingDocumentApproval
+          ? "Review generated artifacts"
+          : setupComplete
+            ? "Open workflow status"
+            : "Continue setup",
+      },
+      {
+        id: "knowledge",
+        title: "3. Knowledge",
+        hint: "Alert docs onboarding",
+        status: knowledgeComplete ? "Knowledge artifacts created" : "Pending knowledge curation",
+        complete: knowledgeComplete,
+        tone: knowledgeTone,
+        cta: knowledgeComplete ? "Review stored knowledge" : "Open knowledge onboarding",
+      },
+    ];
+  }, [
+    adminUsers.rows.length,
+    adminUsers.error,
+    onboardingDocumentSummary.approved,
+    onboardingNextAction,
+    onboardingState.error,
+    onboardingState.loading,
+    onboardingState.success,
+    onboardingHasPendingDocumentApproval,
+    onboardingWorkflowSteps.length,
+    alertOnboardingState.result,
+    alertOnboardingState.error,
+  ]);
+  const projectStepCards = useMemo(() => {
+    const setupSaved = Boolean(String(onboardingState.success || "").trim()) && !onboardingState.loading && !onboardingState.error;
+    const setupDone = Boolean(String(onboardingForm.name || "").trim()) && (onboardingSourceDocCount > 0 || setupSaved || onboardingWorkflowSteps.length > 0);
+    const reviewDone = onboardingGeneratedDocs.length > 0 ? Boolean(onboardingDocApprovalState.approved) : setupDone;
+    const statusDone = Boolean(onboardingWorkflowSteps.length || onboardingRuleRunState.result || setupSaved);
+    return [
+      { id: "setup", label: "1. Setup Core", hint: "Project, landing pad, and source docs", complete: setupDone },
+      { id: "review", label: "2. Review & Approve", hint: "Review generated rules, docs, metadata", complete: reviewDone },
+      { id: "status", label: "3. Workflow Status", hint: "Validate generated workflow and outputs", complete: statusDone },
+      { id: "advanced", label: "4. Advanced Tools", hint: "Optional expert controls", complete: false },
+    ];
+  }, [
+    onboardingForm.name,
+    onboardingSourceDocCount,
+    onboardingState.success,
+    onboardingState.loading,
+    onboardingState.error,
+    onboardingGeneratedDocs.length,
+    onboardingDocApprovalState.approved,
+    onboardingWorkflowSteps.length,
+    onboardingRuleRunState.result,
+  ]);
+  const showProjectStep = (stepId) => adminWorkspace !== "project" || projectSetupShowAll || projectSetupStep === stepId;
+  const navigateAdminJourney = (stepId) => {
+    if (stepId === "access") {
+      setAdminWorkspace("users");
+      return;
+    }
+    if (stepId === "knowledge") {
+      setAdminWorkspace("project");
+      setProjectSetupStep("setup");
+      setProjectSetupShowAll(false);
+      setAlertKnowledgeView("onboarding");
+      return;
+    }
+    setAdminWorkspace("project");
+    setProjectSetupShowAll(false);
+  };
+  const triggerAdminJourneyCta = (stepId) => {
+    if (stepId === "setup") {
+      setAdminWorkspace("project");
+      setProjectSetupShowAll(false);
+      if (onboardingHasPendingDocumentApproval) {
+        setProjectSetupStep("review");
+        return;
+      }
+      if (onboardingDocumentSummary.approved) {
+        setProjectSetupStep("status");
+        return;
+      }
+      setProjectSetupStep("setup");
+      return;
+    }
+    navigateAdminJourney(stepId);
+  };
 
   useEffect(() => {
-    if (!isAuthenticated || adminWorkspace !== "monitoring") {
+    if (adminWorkspace !== "project" || projectSetupShowAll) {
+      return;
+    }
+    if (projectSetupStep !== "setup") {
+      return;
+    }
+    if (onboardingState.loading || onboardingState.error) {
+      return;
+    }
+    const success = String(onboardingState.success || "").trim();
+    if (!success) {
+      return;
+    }
+    if (success.toLowerCase().includes("documents approved")) {
+      return;
+    }
+    if (onboardingGeneratedDocs.length > 0) {
+      setProjectSetupStep("review");
+      return;
+    }
+    if (onboardingSourceDocCount === 0) {
+      setProjectSetupStep("setup");
+      setAlertKnowledgeView("onboarding");
+      alertKnowledgeRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    setProjectSetupStep("status");
+  }, [
+    adminWorkspace,
+    projectSetupShowAll,
+    projectSetupStep,
+    onboardingState.loading,
+    onboardingState.error,
+    onboardingState.success,
+    onboardingGeneratedDocs.length,
+    onboardingSourceDocCount,
+  ]);
+
+  useEffect(() => {
+    if (adminWorkspace !== "project" || projectSetupShowAll) {
+      return;
+    }
+    if (projectSetupStep !== "review") {
+      return;
+    }
+    if (onboardingDocApprovalState.approved) {
+      setProjectSetupStep("status");
+    }
+  }, [adminWorkspace, projectSetupShowAll, projectSetupStep, onboardingDocApprovalState.approved]);
+
+  useEffect(() => {
+    if (!isAuthenticated || (adminWorkspace !== "monitoring" && adminWorkspace !== "project")) {
       return;
     }
     loadMonitoringApplications();
@@ -5860,11 +6964,22 @@ export default function App() {
   }, [activeTab, adminWorkspace]);
 
   useEffect(() => {
-    if (onboardingProjectMode === "new" || selectedOnboardingProject || !projectOnboardingRows.length) {
+    if (onboardingProjectMode === "new" || selectedOnboardingProject || !onboardingProjectOptions.length) {
       return;
     }
-    applyProjectOnboardingRow(projectOnboardingRows[0]);
-  }, [onboardingProjectMode, selectedOnboardingProject, projectOnboardingRows]);
+    const firstProjectName = onboardingProjectRowOptions[0] || onboardingProjectOptions[0];
+    const firstProjectRow = (onboardingState.rows || []).find((row) => extractOnboardingProjectName(row) === firstProjectName);
+    if (firstProjectRow) {
+      applyProjectOnboardingRow(firstProjectRow);
+      return;
+    }
+    setSelectedOnboardingProject(firstProjectName);
+    setOnboardingForm((curr) => ({
+      ...curr,
+      name: firstProjectName,
+      assignment_project: firstProjectName,
+    }));
+  }, [onboardingProjectMode, selectedOnboardingProject, onboardingProjectOptions, onboardingProjectRowOptions, onboardingState.rows]);
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -5890,7 +7005,7 @@ export default function App() {
     if (workspace === "users") {
       setAdminWorkspace("users");
     } else if (workspace === "monitoring") {
-      setAdminWorkspace("monitoring");
+      setAdminWorkspace("project");
     } else if (workspace === "project") {
       setAdminWorkspace("project");
     } else if (workspace === "alerts") {
@@ -5935,6 +7050,9 @@ export default function App() {
           ],
           ["Closed Incidents", closedIncidents.rows.length],
           ["Health Restored", closedIncidents.rows.filter((row) => row?.health_restored === true).length],
+          ["SLA At Risk", executiveInsights.slaAtRisk],
+          ["Avg Approval Wait", `${executiveInsights.avgApprovalWaitMinutes.toFixed(1)} min`],
+          ["Auto Remediation Rate", `${executiveInsights.automationRate.toFixed(1)}%`],
           ["LLM Cost (USD)", executiveMetrics.finopsCost.toFixed(6)],
         ],
         refresh: refreshAll,
@@ -6069,7 +7187,67 @@ export default function App() {
     observedRouting,
     gatewaySummary.data,
     executiveMetrics.finopsCost,
+    executiveInsights.slaAtRisk,
+    executiveInsights.avgApprovalWaitMinutes,
+    executiveInsights.automationRate,
   ]);
+
+  const workflowGuide = useMemo(() => {
+    const unresolvedAlerts = monitorScopedAlerts.filter((row) => !isApprovalResolvedStatus(row?.status || row?.state));
+    const agentNames = new Set(
+      (selectedAlertEventsDisplay || []).map((row) => String(row?.agent || "").trim().toLowerCase()).filter(Boolean),
+    );
+    const resolutionSeen = Array.from(agentNames).some((name) => name.includes("resolution intelligence") || name.includes("resolution-agent"));
+    const remediationSeen = Array.from(agentNames).some((name) => name.includes("remediation automation") || name.includes("remediation-engine"));
+
+    const cards = [
+      {
+        id: "alerts",
+        label: "Alert Intake",
+        status: unresolvedAlerts.length ? "active" : "idle",
+        detail: unresolvedAlerts.length
+          ? `${unresolvedAlerts.length} open alerts ready for triage.`
+          : "No open alerts in the current monitoring scope.",
+      },
+      {
+        id: "approval",
+        label: "Approval Queue",
+        status: pendingApprovals.length ? "attention" : "clear",
+        detail: pendingApprovals.length
+          ? `${pendingApprovals.length} incidents are waiting for a user decision.`
+          : "No incidents are waiting for human approval.",
+      },
+      {
+        id: "resolution",
+        label: "Resolution Intelligence",
+        status: resolutionSeen ? "active" : "attention",
+        detail: resolutionSeen
+          ? "Root-cause and recommendation evidence found for selected alert."
+          : "No resolution trace detected for selected alert yet.",
+      },
+      {
+        id: "remediation",
+        label: "Remediation Automation",
+        status: remediationSeen ? "active" : "attention",
+        detail: remediationSeen
+          ? "Remediation execution trace detected in agent timeline."
+          : "No remediation execution trace detected yet.",
+      },
+    ];
+
+    let nextAction = "Open an alert row to inspect timeline, then route to approval if required.";
+    if (!unresolvedAlerts.length) {
+      nextAction = "Generate or ingest a fresh alert to validate the end-to-end agent workflow.";
+    } else if (pendingApprovals.length) {
+      nextAction = "Use Human Approval to approve or reject pending recommendations and unblock remediation.";
+    } else if (!resolutionSeen) {
+      nextAction = "Open Alert Details and review Agent Events for Resolution Intelligence output.";
+    } else if (!remediationSeen) {
+      nextAction = "Approve the recommendation or verify auto-execution policy to trigger remediation.";
+    }
+
+    return { cards, nextAction };
+  }, [monitorScopedAlerts, pendingApprovals.length, selectedAlertEventsDisplay]);
 
   function downloadFullHtmlReportPack() {
     const now = new Date();
@@ -6085,6 +7263,9 @@ export default function App() {
       ["Critical Open", monitorScopedAlerts.filter((row) => String(row?.severity || "").toLowerCase() === "critical").length],
       ["Closed Incidents", closedIncidents.rows.length],
       ["Health Restored", closedIncidents.rows.filter((row) => row?.health_restored === true).length],
+      ["SLA At Risk", executiveInsights.slaAtRisk],
+      ["Avg Approval Wait (min)", executiveInsights.avgApprovalWaitMinutes.toFixed(1)],
+      ["Auto Remediation Rate", `${executiveInsights.automationRate.toFixed(1)}%`],
     ];
     const safetyMetrics = [
       ["Total", gatewaySummary.data.total_events || 0],
@@ -6218,7 +7399,7 @@ export default function App() {
       `<section><h2>Message Bus</h2>${renderHtmlTable(["Service", "Consumed", "Published", "Provider", "Status"], busActualRows)}${renderHtmlTable(["Service", "Consumes", "Publishes"], busConfigRows)}<h3>Observed Topics</h3><p>Published: ${htmlEscape(messageBusActual.published.join(", ") || "none")}</p><p>Consumed: ${htmlEscape(messageBusActual.consumed.join(", ") || "none")}</p></section>`,
       `<section><h2>Gateway Safety</h2>${renderHtmlTable(["Metric", "Value"], safetyMetrics)}${renderHtmlTable(["Time", "Path", "Status", "Decision", "Trace"], gatewayRows)}</section>`,
       `<section><h2>Closed Incidents</h2>${renderHtmlTable(["Incident", "Service", "Severity", "Status", "Closed At"], closedRows)}</section>`,
-      `<section><h2>Admin Snapshot</h2>${renderHtmlTable(["Field", "Value"], [["Signed In User", adminSession?.user?.username || "-"], ["Users Loaded", adminUsers.rows.length], ["Onboarding Rows", onboardingState.rows.length], ["Bulk Upload Results", alertBulkState.results.length]])}</section>`,
+      `<section><h2>Admin Snapshot</h2>${renderHtmlTable(["Field", "Value"], [["Signed In User", adminSession?.user?.username || "-"], ["Users Loaded", adminUsers.rows.length], ["Onboarding Rows", onboardingState.rows.length]])}</section>`,
       `<section><h2>Workflow Raw Result</h2><pre>${htmlEscape(JSON.stringify(workflowState.result || {}, null, 2))}</pre></section>`,
     ];
 
@@ -6422,6 +7603,23 @@ export default function App() {
 
           {activeTab === "home" ? (
             <section className="grid single-col">
+              <article className="panel workflow-guide-panel">
+                <div className="panel-head">
+                  <h2>Workflow Health & Next Action</h2>
+                </div>
+                <p className="subtitle">Fast status across intake, resolution, approval, and remediation.</p>
+                <div className="workflow-guide-grid">
+                  {workflowGuide.cards.map((card) => (
+                    <div className="workflow-guide-card" key={card.id}>
+                      <strong>{card.label}</strong>
+                      <span className={`workflow-pill workflow-pill-${card.status}`}>{card.status.toUpperCase()}</span>
+                      <p>{card.detail}</p>
+                    </div>
+                  ))}
+                </div>
+                <p className="scope-note">Recommended next step: {workflowGuide.nextAction}</p>
+              </article>
+
               <article className="panel">
                 <div className="panel-head">
                   <h2>Alert Stream</h2>
@@ -6446,6 +7644,26 @@ export default function App() {
                 </div>
                 {alerts.error ? <p className="error">{alerts.error}</p> : null}
                 {alertSeverityOverrides.error ? <p className="error">{alertSeverityOverrides.error}</p> : null}
+                <div className="dashboard-alert-toolbar">
+                  <div className="dashboard-alert-focus" role="tablist" aria-label="Alert triage focus">
+                    <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "all" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("all")}>All {dashboardAlertSummary.total}</button>
+                    <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "critical" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("critical")}>Critical {dashboardAlertSummary.critical}</button>
+                    <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "high" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("high")}>High {dashboardAlertSummary.high}</button>
+                    <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "awaiting" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("awaiting")}>Awaiting {dashboardAlertSummary.awaiting}</button>
+                    <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "active" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("active")}>Active {dashboardAlertSummary.active}</button>
+                  </div>
+                  <div className="dashboard-alert-search">
+                    <input
+                      value={dashboardAlertQuery}
+                      onChange={(event) => setDashboardAlertQuery(event.target.value)}
+                      placeholder="Search alert name, service, app, id"
+                    />
+                    {dashboardAlertQuery ? (
+                      <button type="button" className="button-secondary" onClick={() => setDashboardAlertQuery("")}>Clear</button>
+                    ) : null}
+                  </div>
+                </div>
+                <p className="subtitle">Showing {dashboardVisibleAlerts.length} of {visibleAlerts.length} alerts for {applicationToMonitor}.</p>
                 {canManageSeverityOverride ? (
                   <p className="subtitle">L2/L3/Admin can set future severity overrides by alert name + service + environment.</p>
                 ) : null}
@@ -6456,32 +7674,31 @@ export default function App() {
                         <th>Alert ID</th>
                         <th>Time (UTC)</th>
                         <th className="alert-name-col">Name</th>
+                        <th>Rule</th>
                         <th>Application</th>
                         <th>Service</th>
                         <th>Severity</th>
-                        <th>Future Severity</th>
                         <th>Status</th>
-                        <th>Docs</th>
                         <th>Action</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {visibleAlerts.map((row, index) => {
+                      {dashboardVisibleAlerts.map((row, index) => {
                         const rowId = String(row.alert_id || row.id || row.incident_id || index);
                         const fullAlertId = String(row.alert_id || row.id || row.incident_id || "-");
                         const compactAlertId = fullAlertId.length > 16 ? `${fullAlertId.slice(0, 8)}...${fullAlertId.slice(-6)}` : fullAlertId;
                         const severity = String(row.severity || "-").toUpperCase();
                         const status = String(row.status || row.state || "open");
                         const application = row.application || row.project_name || row.project || row.service || "-";
-                        const documentAvailable = hasAlertDocuments(row);
-                        const alertName = String(row.name || row.alert_name || "").trim();
-                        const service = String(row.service || "").trim();
-                        const environment = String(row.environment || "").trim();
-                        const overrideKey = severityOverrideKey(alertName, service, environment);
-                        const overrideRow = severityOverrideByKey.get(overrideKey);
-                        const draftSeverity = String(alertSeverityDrafts[overrideKey] || overrideRow?.severity || String(row.severity || "warning").toLowerCase()).toLowerCase();
-                        const overrideSaving = alertSeverityOverrides.savingKey === overrideKey;
-                        const alertClosed = isApprovalResolvedStatus(row.status || status);
+                        const alertRuleName = String(
+                          row.rule_name
+                          || row.rule
+                          || row.alert_rule
+                          || row.labels?.alertname
+                          || row.name
+                          || row.alert_name
+                          || "-"
+                        ).trim();
                         return (
                           <tr
                             key={rowId}
@@ -6500,85 +7717,11 @@ export default function App() {
                             <td title={fullAlertId}>{compactAlertId}</td>
                             <td>{formatUtcTimestamp(row.created_at || row.starts_at)}</td>
                             <td className="alert-name-col">{row.name || row.alert_name || "-"}</td>
+                            <td title={String(row.expression || row.expr || row.query || row.description || row.annotations?.description || "").trim()}>{alertRuleName}</td>
                             <td>{application}</td>
                             <td>{row.service || "-"}</td>
                             <td><span className={`pill severity-${severity.toLowerCase()}`}>{severity}</span></td>
-                            <td>
-                              {canManageSeverityOverride ? (
-                                <div style={{ display: "grid", gap: 6 }}>
-                                  <select
-                                    value={draftSeverity}
-                                    onClick={(event) => event.stopPropagation()}
-                                    onChange={(event) => {
-                                      const next = String(event.target.value || "warning").toLowerCase();
-                                      setAlertSeverityDrafts((current) => ({ ...current, [overrideKey]: next }));
-                                    }}
-                                  >
-                                    <option value="info">info</option>
-                                    <option value="warning">warning</option>
-                                    <option value="high">high</option>
-                                    <option value="critical">critical</option>
-                                  </select>
-                                  <div style={{ display: "flex", gap: 6 }}>
-                                    <button
-                                      type="button"
-                                      className="button-secondary"
-                                      onClick={(event) => {
-                                        event.stopPropagation();
-                                        applyAlertSeverityOverrideRule(row);
-                                      }}
-                                      disabled={overrideSaving || alertSeverityOverrides.loading || !alertName}
-                                    >
-                                      {overrideSaving ? "Saving..." : "Apply"}
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="button-secondary"
-                                      onClick={(event) => {
-                                        event.stopPropagation();
-                                        clearAlertSeverityOverrideRule(row);
-                                      }}
-                                      disabled={overrideSaving || !overrideRow}
-                                    >
-                                      Clear
-                                    </button>
-                                  </div>
-                                  {overrideRow ? <span className="pill status-approved">future: {String(overrideRow.severity || "-").toUpperCase()}</span> : null}
-                                </div>
-                              ) : (
-                                <span>{overrideRow ? String(overrideRow.severity || "-").toUpperCase() : "-"}</span>
-                              )}
-                            </td>
                             <td><span className={`pill status-${status.toLowerCase()}`}>{status}</span></td>
-                            <td className="alert-doc-cell">
-                              <div className="alert-doc-actions">
-                                {alertClosed ? (
-                                  <span className="pill status-closed">Alert Closed</span>
-                                ) : !documentAvailable ? (
-                                  <button
-                                    type="button"
-                                    className="button-secondary pill status-blocked"
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      openDocumentPrompt(row);
-                                    }}
-                                  >
-                                    Provide Docs
-                                  </button>
-                                ) : (
-                                  <button
-                                    type="button"
-                                    className="button-secondary pill status-closed"
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      openDocumentPrompt(row);
-                                    }}
-                                  >
-                                    Docs Ready
-                                  </button>
-                                )}
-                              </div>
-                            </td>
                             <td>
                               <button
                                 type="button"
@@ -6594,9 +7737,9 @@ export default function App() {
                           </tr>
                         );
                       })}
-                      {!visibleAlerts.length && !alerts.loading ? (
+                      {!dashboardVisibleAlerts.length && !alerts.loading ? (
                         <tr>
-                          <td colSpan={10}>No alerts available for {applicationToMonitor}.</td>
+                          <td colSpan={9}>No alerts match current filters for {applicationToMonitor}.</td>
                         </tr>
                       ) : null}
                     </tbody>
@@ -6654,6 +7797,103 @@ export default function App() {
                   </table>
                 </div>
               </article>
+
+              {selectedAlertRow ? (
+                <article className="panel">
+                  <div className="panel-head">
+                    <h3>Selected Alert Actions</h3>
+                    <p>Triage-focused actions for the selected alert.</p>
+                  </div>
+                  <div className="filter-grid">
+                    <label>Alert
+                      <input value={String(selectedAlertRow?.name || selectedAlertRow?.alert_name || "-")} readOnly />
+                    </label>
+                    <label>Service
+                      <input value={String(selectedAlertRow?.service || "-")} readOnly />
+                    </label>
+                    <label>Status
+                      <input value={String(selectedAlertRow?.status || selectedAlertRow?.state || "open")} readOnly />
+                    </label>
+                    <label>Current Severity
+                      <input value={String(selectedAlertRow?.severity || "-").toUpperCase()} readOnly />
+                    </label>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+                    <button type="button" className="button-primary" onClick={() => openAlertDetails(selectedAlertRow)}>Open Alert Details</button>
+                    <button type="button" className="button-secondary" onClick={() => setActiveTab("approval")}>Open Approval Queue</button>
+                    <button type="button" className="button-secondary" onClick={() => setActiveTab("executive")}>Open Executive View</button>
+                    <button
+                      type="button"
+                      className="button-secondary"
+                      onClick={() => openDocumentPrompt(selectedAlertRow)}
+                      disabled={selectedAlertActionContext?.alertClosed}
+                    >
+                      {selectedAlertActionContext?.documentAvailable ? "Manage Docs" : "Provide Docs"}
+                    </button>
+                  </div>
+                  <div className="alert-rule-summary-grid">
+                    <article className="alert-rule-summary-card">
+                      <span>Raised By Rule</span>
+                      <strong>{selectedAlertRuleSummary.ruleName}</strong>
+                      <small>{selectedAlertRuleSummary.expression}</small>
+                    </article>
+                    <article className="alert-rule-summary-card">
+                      <span>Rule Source</span>
+                      <strong>{selectedAlertRuleSummary.source}</strong>
+                      <small>{selectedAlertRuleSummary.note}</small>
+                    </article>
+                    <article className="alert-rule-summary-card">
+                      <span>Rule Severity</span>
+                      <strong>{selectedAlertRuleSummary.severity.toUpperCase()}</strong>
+                      <small>This rule context stays visible beside the live remediation actions.</small>
+                    </article>
+                  </div>
+                  {selectedAlertActionContext ? (
+                    <>
+                      <p className="subtitle">
+                        Docs: {selectedAlertActionContext.alertClosed ? "Closed" : selectedAlertActionContext.documentAvailable ? "Ready" : "Missing"}
+                        {selectedAlertActionContext.overrideRow ? ` | Future Severity: ${String(selectedAlertActionContext.overrideRow.severity || "-").toUpperCase()}` : ""}
+                      </p>
+                      {canManageSeverityOverride ? (
+                        <div className="filter-grid">
+                          <label>Future Severity Override
+                            <select
+                              value={selectedAlertActionContext.draftSeverity}
+                              onChange={(event) => {
+                                const next = String(event.target.value || "warning").toLowerCase();
+                                setAlertSeverityDrafts((current) => ({ ...current, [selectedAlertActionContext.overrideKey]: next }));
+                              }}
+                            >
+                              <option value="info">info</option>
+                              <option value="warning">warning</option>
+                              <option value="high">high</option>
+                              <option value="critical">critical</option>
+                            </select>
+                          </label>
+                          <div style={{ display: "flex", alignItems: "end", gap: 8 }}>
+                            <button
+                              type="button"
+                              className="button-secondary"
+                              onClick={() => applyAlertSeverityOverrideRule(selectedAlertRow)}
+                              disabled={selectedAlertActionContext.overrideSaving || alertSeverityOverrides.loading || !selectedAlertActionContext.alertName}
+                            >
+                              {selectedAlertActionContext.overrideSaving ? "Saving..." : "Apply Override"}
+                            </button>
+                            <button
+                              type="button"
+                              className="button-secondary"
+                              onClick={() => clearAlertSeverityOverrideRule(selectedAlertRow)}
+                              disabled={selectedAlertActionContext.overrideSaving || !selectedAlertActionContext.overrideRow}
+                            >
+                              Clear Override
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : null}
+                </article>
+              ) : null}
 
               {docPromptAlert ? (
                 <article className="panel" role="dialog" aria-label="Provide documents for alert" ref={docPromptRef}>
@@ -6820,23 +8060,97 @@ export default function App() {
                     <span><strong>Severity:</strong> {String(selectedAlertRow?.severity || "-").toUpperCase()}</span>
                   </div>
 
+                  {(() => {
+                    const matchedApproval = resolvePendingApprovalFromAlertRow(selectedAlertRow);
+                    const incidentId = approvalIncidentId(matchedApproval);
+                    const status = normalizeApprovalStatus(matchedApproval?.status || selectedAlertRow?.status);
+                    const isResolved = isApprovalResolvedStatus(status);
+                    return (
+                      <article className="panel" style={{ marginBottom: 10, borderColor: "#ef9a9a", boxShadow: "0 10px 24px rgba(183, 28, 28, 0.14)" }}>
+                        <div className="panel-head">
+                          <h3>Approval Snapshot</h3>
+                        </div>
+                        <p className="subtitle">
+                          {matchedApproval
+                            ? `Matched incident ${incidentId || "-"} with status ${status || "pending"}.`
+                            : "No pending approval incident matched this alert yet."}
+                        </p>
+                        <div className="table-wrap">
+                          <table>
+                            <tbody>
+                              <tr><th>Incident</th><td>{incidentId || "-"}</td></tr>
+                              <tr><th>Status</th><td>{status || "pending"}</td></tr>
+                              <tr><th>Role Eligible</th><td>{canUseApprovalActions ? "yes" : "no"}</td></tr>
+                            </tbody>
+                          </table>
+                        </div>
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          <button
+                            type="button"
+                            className="button-secondary"
+                            onClick={() => {
+                              const matched = selectApprovalFromAlertRow(selectedAlertRow);
+                              if (matched) {
+                                setActiveTab("approval");
+                              }
+                            }}
+                          >
+                            Open Approval Queue
+                          </button>
+                          <button
+                            type="button"
+                            className="button-primary"
+                            onClick={() => setHomeDetailTab("approval")}
+                          >
+                            Open Approval Tab
+                          </button>
+                          {canUseApprovalActions && matchedApproval && !isResolved ? (
+                            <button
+                              type="button"
+                              className="button-secondary"
+                              onClick={() => selectApprovalIncident(matchedApproval)}
+                              disabled={approvalState.loading}
+                            >
+                              Load Into Approval Form
+                            </button>
+                          ) : null}
+                        </div>
+                      </article>
+                    );
+                  })()}
+
                   <div className="detail-tabs">
-                    {["summary", "timeline", "events", "finops", "api", "topics", "execution", "raw"].map((tab) => (
+                    {["overview", "approval", "remediation", "diagnostics"].map((tab) => (
                       <button
                         key={`detail-${tab}`}
                         type="button"
                         className={`detail-tab ${homeDetailTab === tab ? "active" : ""}`}
                         onClick={() => setHomeDetailTab(tab)}
                       >
-                        {tab === "summary" ? "Summary" : tab === "timeline" ? "Flow Timeline" : tab === "events" ? "Agent Events" : tab === "finops" ? "FinOps" : tab === "api" ? "API Gateway" : tab === "topics" ? "Message Bus Topics" : tab === "execution" ? "Execution Plan" : "Raw Payload"}
+                        {tab === "overview" ? "Overview" : tab === "approval" ? "Approval" : tab === "remediation" ? "Remediation" : "Diagnostics"}
                       </button>
                     ))}
                   </div>
 
+                  {homeDetailTab === "diagnostics" ? (
+                    <div className="detail-tabs" style={{ marginTop: 8 }}>
+                      {["timeline", "events", "finops", "api", "topics", "raw"].map((tab) => (
+                        <button
+                          key={`diag-${tab}`}
+                          type="button"
+                          className={`detail-tab ${diagnosticsDetailTab === tab ? "active" : ""}`}
+                          onClick={() => setDiagnosticsDetailTab(tab)}
+                        >
+                          {tab === "timeline" ? "Flow Timeline" : tab === "events" ? "Agent Events" : tab === "finops" ? "FinOps" : tab === "api" ? "API Gateway" : tab === "topics" ? "Message Bus" : "Raw Payload"}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+
                   {selectedAlertData.loading ? <p className="subtitle">Loading selected alert details...</p> : null}
                   {selectedAlertData.error ? <p className="error">{selectedAlertData.error}</p> : null}
 
-                  {homeDetailTab === "summary" ? (
+                  {homeDetailTab === "overview" ? (
                     <>
                       <div className="table-wrap table-wrap-scroll-x">
                         <table>
@@ -6898,15 +8212,64 @@ export default function App() {
                     </>
                   ) : null}
 
-                  {homeDetailTab === "timeline" ? (
+                  {homeDetailTab === "approval" ? (
+                    <article className="panel">
+                      <div className="panel-head">
+                        <h3>Approval Workspace</h3>
+                        <p>Directly approve/reject/modify for this alert incident.</p>
+                      </div>
+                      <div className="table-wrap">
+                        <table>
+                          <tbody>
+                            <tr><th>Incident</th><td>{approvalForm.incident_id || selectedAlertWorkflow?.incident?.id || "-"}</td></tr>
+                            <tr><th>Recommendation</th><td>{approvalForm.recommendation_id || "-"}</td></tr>
+                            <tr><th>Current Approval Status</th><td>{selectedAlertWorkflow?.approval?.status || "pending"}</td></tr>
+                            <tr><th>Role Eligible</th><td>{canUseApprovalActions ? "yes" : "no"}</td></tr>
+                          </tbody>
+                        </table>
+                      </div>
+                      {canUseApprovalActions ? (
+                        <form className="form" onSubmit={submitApproval}>
+                          <div className="filter-grid">
+                            <label>Action
+                              <select value={approvalForm.action} onChange={(e) => setApprovalForm({ ...approvalForm, action: e.target.value })}>
+                                <option value="approve">approve</option>
+                                <option value="reject">reject</option>
+                                <option value="modify">modify</option>
+                              </select>
+                            </label>
+                            <label>Channel
+                              <select value={approvalForm.channel} onChange={(e) => setApprovalForm({ ...approvalForm, channel: e.target.value })}>
+                                <option value="web">web</option>
+                                <option value="slack">slack</option>
+                                <option value="teams">teams</option>
+                                <option value="email">email</option>
+                              </select>
+                            </label>
+                          </div>
+                          {approvalForm.action === "modify" ? (
+                            <label>Modified Action<textarea rows={2} value={approvalForm.modified_action} onChange={(e) => setApprovalForm({ ...approvalForm, modified_action: e.target.value })} /></label>
+                          ) : null}
+                          <label>Comment<textarea rows={2} value={approvalForm.comment} onChange={(e) => setApprovalForm({ ...approvalForm, comment: e.target.value })} /></label>
+                          <button className="button-primary" type="submit" disabled={!approvalReady || approvalState.loading}>
+                            {approvalState.loading ? "Submitting..." : "Submit Approval Action"}
+                          </button>
+                        </form>
+                      ) : (
+                        <p className="subtitle">Login with an approval-eligible role to submit actions. You can still view full approval context here.</p>
+                      )}
+                    </article>
+                  ) : null}
+
+                  {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "timeline" ? (
                     <FlowTimelineGraph rows={selectedAlertTimelineRows} />
                   ) : null}
 
-                  {homeDetailTab === "events" ? (
+                  {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "events" ? (
                     <AgentEventsGraph rows={selectedAlertEventsDisplay} />
                   ) : null}
 
-                  {homeDetailTab === "finops" ? (
+                  {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "finops" ? (
                     <>
                       <div className="table-wrap table-wrap-scroll-x">
                         <table>
@@ -6950,7 +8313,7 @@ export default function App() {
                     </>
                   ) : null}
 
-                  {homeDetailTab === "api" ? (
+                  {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "api" ? (
                     <div className="table-wrap">
                       <table>
                         <thead>
@@ -6982,15 +8345,120 @@ export default function App() {
                     </div>
                   ) : null}
 
-                  {homeDetailTab === "topics" ? (
+                  {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "topics" ? (
                     <TopicFlowGraph routing={selectedAlertRouting} timelineRows={selectedAlertTimelineRows} />
                   ) : null}
 
-                  {homeDetailTab === "execution" ? (
-                    <ExecutionPlanGraph plan={selectedExecutionPlan} />
+                  {homeDetailTab === "remediation" ? (
+                    <>
+                      <article className="panel remediation-workspace">
+                        <div className="panel-head">
+                          <h3>Resolution & Remediation Workspace</h3>
+                          <p>Step 1: confirm incident + approval status. Step 2: execute approved remediation steps.</p>
+                        </div>
+                        <div className="workflow-guide-grid remediation-flow-grid">
+                          {selectedWorkflowFlowStages.map((stage) => (
+                            <div className="workflow-guide-card remediation-flow-card" key={stage.id}>
+                              <strong>{stage.label}</strong>
+                              <span className={`workflow-pill workflow-pill-${stage.status}`}>{stage.status.toUpperCase()}</span>
+                              <p>{stage.detail}</p>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="table-wrap table-wrap-scroll-x remediation-service-flow">
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>Backend Service</th>
+                                <th>Consumes</th>
+                                <th>Publishes</th>
+                                <th>Processing Agent</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {SERVICE_TOPIC_FLOW.map((stage) => (
+                                <tr key={`service-flow-${stage.service}`}>
+                                  <td>{stage.service}</td>
+                                  <td>{stage.consumes}</td>
+                                  <td>{stage.publishes}</td>
+                                  <td>{stage.agent}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        <div className="filter-grid remediation-kpi-grid">
+                          <div className="remediation-kpi">
+                            <span>Incident</span>
+                            <p>
+                              <span className={`pill ${statusPillClass(selectedExecutionBreakdown.incidentStatus)}`}>
+                                {selectedExecutionPlan.incidentStatus || "-"}
+                              </span>
+                            </p>
+                          </div>
+                          <div className="remediation-kpi">
+                            <span>Approval</span>
+                            <p>
+                              <span className={`pill ${statusPillClass(selectedExecutionBreakdown.approvalStatus)}`}>
+                                {selectedExecutionPlan.approvalStatus || "pending"}
+                              </span>
+                            </p>
+                          </div>
+                          <div className="remediation-kpi">
+                            <span>Commands</span>
+                            <p>{selectedExecutionBreakdown.commands.length}</p>
+                          </div>
+                          <div className="remediation-kpi">
+                            <span>Scripts</span>
+                            <p>{selectedExecutionBreakdown.scripts.length}</p>
+                          </div>
+                          <div className="remediation-kpi">
+                            <span>Queries</span>
+                            <p>{selectedExecutionBreakdown.queries.length}</p>
+                          </div>
+                        </div>
+                        <p className="subtitle">
+                          {selectedExecutionBreakdown.hasPlan
+                            ? "Plan is ready. Review steps below and execute through your approved run path."
+                            : "No remediation plan is available yet. Ensure recommendation and workflow events have been generated."}
+                        </p>
+                        <div className="table-wrap remediation-step-table" style={{ marginTop: 8 }}>
+                          <table>
+                            <thead>
+                              <tr><th>Type</th><th>Step</th><th>Action</th></tr>
+                            </thead>
+                            <tbody>
+                              {selectedExecutionBreakdown.commands.map((step, index) => (
+                                <tr key={`summary-command-${index}`}>
+                                  <td>Command</td>
+                                  <td>{step}</td>
+                                  <td><button type="button" className="button-secondary" onClick={() => copyPlanStep(step)}>Copy</button></td>
+                                </tr>
+                              ))}
+                              {selectedExecutionBreakdown.scripts.map((step, index) => (
+                                <tr key={`summary-script-${index}`}>
+                                  <td>Script</td>
+                                  <td>{step}</td>
+                                  <td><button type="button" className="button-secondary" onClick={() => copyPlanStep(step)}>Copy</button></td>
+                                </tr>
+                              ))}
+                              {selectedExecutionBreakdown.queries.map((step, index) => (
+                                <tr key={`summary-query-${index}`}>
+                                  <td>Query</td>
+                                  <td>{step}</td>
+                                  <td><button type="button" className="button-secondary" onClick={() => copyPlanStep(step)}>Copy</button></td>
+                                </tr>
+                              ))}
+                              {!selectedExecutionBreakdown.hasPlan ? <tr><td colSpan={3}>No remediation steps available.</td></tr> : null}
+                            </tbody>
+                          </table>
+                        </div>
+                      </article>
+                      <ExecutionPlanGraph plan={selectedExecutionPlan} />
+                    </>
                   ) : null}
 
-                  {homeDetailTab === "raw" ? (
+                  {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "raw" ? (
                     <pre className="result">{JSON.stringify(selectedAlertData.payload || {}, null, 2)}</pre>
                   ) : null}
                 </article>
@@ -7015,7 +8483,7 @@ export default function App() {
                   <div className="copilot-summary-card copilot-tone-ops">
                     <strong>Project Onboarding</strong>
                     <span>Set project identity, environment, and monitoring endpoints.</span>
-                    <button type="button" className="button-primary" onClick={() => openCopilotWorkspace("project")}>Open Setup Landing Pad</button>
+                    <button type="button" className="button-primary" onClick={() => openCopilotWorkspace("project")}>Open Unified Setup</button>
                   </div>
                   <div className="copilot-summary-card copilot-tone-bus">
                     <strong>Alert Documents</strong>
@@ -7054,8 +8522,7 @@ export default function App() {
                 </div>
 
                 <div className="copilot-shortcuts">
-                  <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("monitoring")}>Monitoring Onboarding</button>
-                  <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("project")}>Project Onboarding</button>
+                  <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("project")}>Monitoring + Landing Pad Setup</button>
                   <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("alerts")}>Alert Documents</button>
                   <button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("users")} disabled={!isAdministrator}>User Management</button>
                   <button type="button" className="button-secondary" onClick={() => setActiveTab("summary")}>Incident Metadata</button>
@@ -7079,6 +8546,9 @@ export default function App() {
                   <div className="stat-card"><strong>Closed Tickets</strong><span>{executiveClosedSummary.total}</span></div>
                   <div className="stat-card"><strong>Closure Rate</strong><span>{executiveClosedSummary.closureRate.toFixed(1)}%</span></div>
                   <div className="stat-card"><strong>Pending Approvals</strong><span>{pendingApprovals.length}</span></div>
+                  <div className="stat-card"><strong>SLA At Risk</strong><span>{executiveInsights.slaAtRisk}</span></div>
+                  <div className="stat-card"><strong>Avg Approval Wait</strong><span>{executiveInsights.avgApprovalWaitMinutes.toFixed(1)} min</span></div>
+                  <div className="stat-card"><strong>Auto Remediation</strong><span>{executiveInsights.automationRate.toFixed(1)}%</span></div>
                   <div className="stat-card"><strong>LLM Cost</strong><span>${executiveMetrics.finopsCost.toFixed(6)}</span></div>
                 </div>
 
@@ -7125,6 +8595,111 @@ export default function App() {
                     subtitle="How incidents were handled"
                     items={executiveClosedSummary.modeItems}
                   />
+                  <HorizontalBarChart
+                    title="Weekly Open Incident Trend"
+                    subtitle="Open incidents observed per day (7-day window)"
+                    items={executiveInsights.weeklyOpenTrend}
+                  />
+                  <HorizontalBarChart
+                    title="Weekly Closed Incident Trend"
+                    subtitle="Closed incidents per day (7-day window)"
+                    items={executiveInsights.weeklyClosedTrend}
+                  />
+                </div>
+
+                <article className="panel executive-flow-panel">
+                  <div className="panel-head">
+                    <h3>End-to-End Processing + FinOps</h3>
+                    <p>Landing pad ingestion, parallel worker processing, remediation execution, and cost visibility in one leadership view.</p>
+                  </div>
+                  <div className="workflow-guide-grid executive-flow-grid">
+                    {selectedWorkflowFlowStages.map((stage) => (
+                      <div className="workflow-guide-card executive-flow-card" key={`exec-flow-${stage.id}`}>
+                        <strong>{stage.label}</strong>
+                        <span className={`workflow-pill workflow-pill-${stage.status}`}>{stage.status.toUpperCase()}</span>
+                        <p>{stage.detail}</p>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="table-wrap table-wrap-scroll-x">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Backend Service</th>
+                          <th>Consumes</th>
+                          <th>Publishes</th>
+                          <th>Processing Agent</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {SERVICE_TOPIC_FLOW.map((stage) => (
+                          <tr key={`exec-service-flow-${stage.service}`}>
+                            <td>{stage.service}</td>
+                            <td>{stage.consumes}</td>
+                            <td>{stage.publishes}</td>
+                            <td>{stage.agent}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Provider</th>
+                          <th>Calls</th>
+                          <th>Tokens</th>
+                          <th>Cost USD</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {finopsByProvider.map((row, index) => (
+                          <tr key={`exec-finops-${row.provider}-${index}`}>
+                            <td>{row.provider}</td>
+                            <td>{row.calls}</td>
+                            <td>{row.total_tokens}</td>
+                            <td>{Number(row.total_cost_usd || 0).toFixed(6)}</td>
+                          </tr>
+                        ))}
+                        {!finopsByProvider.length ? (
+                          <tr>
+                            <td colSpan={4}>No model calls recorded yet.</td>
+                          </tr>
+                        ) : null}
+                      </tbody>
+                    </table>
+                  </div>
+                </article>
+
+                <h3>Executive Risk & Operations Report</h3>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Metric</th>
+                        <th>Value</th>
+                        <th>Interpretation</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td>SLA At Risk</td>
+                        <td>{executiveInsights.slaAtRisk}</td>
+                        <td>Open high/critical or manual-mode incidents that may affect business SLO/SLA outcomes.</td>
+                      </tr>
+                      <tr>
+                        <td>Average Approval Wait</td>
+                        <td>{executiveInsights.avgApprovalWaitMinutes.toFixed(1)} min</td>
+                        <td>Mean time pending in approval queue; useful for governance and response speed tracking.</td>
+                      </tr>
+                      <tr>
+                        <td>Auto Remediation Rate</td>
+                        <td>{executiveInsights.automationRate.toFixed(1)}%</td>
+                        <td>Share of closed incidents resolved using automatic execution modes.</td>
+                      </tr>
+                    </tbody>
+                  </table>
                 </div>
 
                 <div className="table-wrap">
@@ -7204,16 +8779,37 @@ export default function App() {
               <article className="panel admin-center-panel">
                 <div className="panel-head">
                   <h2>Admin Center</h2>
-                  <p>Simplified workspace for onboarding and operations.</p>
+                  <p>Three-step workspace for access, setup, and alert knowledge.</p>
                 </div>
 
-                <div className="detail-tabs sticky-controls">
-                  <button type="button" className={`detail-tab ${adminWorkspace === "users" ? "active" : ""}`} onClick={() => setAdminWorkspace("users")}>Users & Access</button>
-                  <button type="button" className={`detail-tab ${adminWorkspace === "monitoring" ? "active" : ""}`} onClick={() => setAdminWorkspace("monitoring")}>Setup Monitoring</button>
-                  <button type="button" className={`detail-tab ${adminWorkspace === "project" ? "active" : ""}`} onClick={() => setAdminWorkspace("project")}>Setup Landing Pad</button>
-                  <button type="button" className={`detail-tab ${adminWorkspace === "alerts" ? "active" : ""}`} onClick={() => setAdminWorkspace("alerts")}>Alert Knowledge</button>
+                <div className="admin-journey-grid">
+                  {adminJourneyCards.map((step) => (
+                    <article
+                      key={`admin-journey-${step.id}`}
+                      className={`admin-journey-card ${adminJourneyStep === step.id ? "active" : ""}`}
+                    >
+                      <strong>{step.title}</strong>
+                      <span>{step.hint}</span>
+                      <small>{step.status}</small>
+                      <div className="admin-journey-meta">
+                        <span className={`admin-journey-chip admin-journey-chip-${step.tone || "info"}`}>{step.tone || "info"}</span>
+                        <span className={`workflow-pill ${step.complete ? "workflow-pill-active" : "workflow-pill-idle"}`}>
+                          {step.complete ? "done" : "pending"}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="button-secondary admin-journey-cta"
+                        onClick={() => triggerAdminJourneyCta(step.id)}
+                      >
+                        {step.cta}
+                      </button>
+                    </article>
+                  ))}
                 </div>
-                <p className="subtitle">{adminWorkspaceCaptions[adminWorkspace] || "Administrative workspace controls."}</p>
+
+                <p className="subtitle">Navigate by stage: Access handles identity, Setup covers landing pad and approvals, Knowledge stores alert intelligence.</p>
+                <p className="subtitle"><strong>Current Stage:</strong> {adminWorkspaceCaptions[adminWorkspace] || "Administrative workspace controls."}</p>
 
                 {adminWorkspace === "users" ? (
                   <div className="grid single-col">
@@ -7249,71 +8845,80 @@ export default function App() {
 
                     <article className="panel">
                       <h3>Create User</h3>
-                      <form className="form" onSubmit={createAdminUser}>
-                        <div className="filter-grid">
-                          <label>Username<input value={adminCreateUser.username} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, username: e.target.value }))} /></label>
-                          <label>Email<input value={adminCreateUser.email} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, email: e.target.value }))} /></label>
-                          <label>First Name<input value={adminCreateUser.first_name} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, first_name: e.target.value }))} /></label>
-                          <label>Last Name<input value={adminCreateUser.last_name} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, last_name: e.target.value }))} /></label>
-                        </div>
-                        <div className="filter-grid">
-                          <label>Password<input type="password" value={adminCreateUser.password} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, password: e.target.value }))} /></label>
-                          <label>Role
-                            <select value={adminCreateUser.role_id} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, role_id: Number(e.target.value) }))}>
-                              {(adminRoles.length ? adminRoles : [{ id: 1, name: "administrator" }]).map((role) => (
-                                <option key={`role-${role.id}`} value={role.id}>{role.name}</option>
-                              ))}
-                            </select>
-                          </label>
-                          <label>Status<input value={adminCreateUser.status} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, status: e.target.value }))} /></label>
-                          <label>Active
-                            <select value={String(adminCreateUser.is_active)} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, is_active: e.target.value === "true" }))}>
-                              <option value="true">true</option><option value="false">false</option>
-                            </select>
-                          </label>
-                        </div>
-                        <button className="button-primary" type="submit" disabled={!adminSession.accessToken || adminUsers.loading}>Create User</button>
-                      </form>
+                      <details className="admin-collapsible" open>
+                        <summary>Create New User</summary>
+                        <form className="form" onSubmit={createAdminUser}>
+                          <div className="filter-grid">
+                            <label>Username<input value={adminCreateUser.username} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, username: e.target.value }))} /></label>
+                            <label>Email<input value={adminCreateUser.email} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, email: e.target.value }))} /></label>
+                            <label>First Name<input value={adminCreateUser.first_name} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, first_name: e.target.value }))} /></label>
+                            <label>Last Name<input value={adminCreateUser.last_name} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, last_name: e.target.value }))} /></label>
+                          </div>
+                          <div className="filter-grid">
+                            <label>Password<input type="password" value={adminCreateUser.password} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, password: e.target.value }))} /></label>
+                            <label>Role
+                              <select value={adminCreateUser.role_id} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, role_id: Number(e.target.value) }))}>
+                                {(adminRoles.length ? adminRoles : [{ id: 1, name: "administrator" }]).map((role) => (
+                                  <option key={`role-${role.id}`} value={role.id}>{role.name}</option>
+                                ))}
+                              </select>
+                            </label>
+                            <label>Status<input value={adminCreateUser.status} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, status: e.target.value }))} /></label>
+                            <label>Active
+                              <select value={String(adminCreateUser.is_active)} onChange={(e) => setAdminCreateUser((curr) => ({ ...curr, is_active: e.target.value === "true" }))}>
+                                <option value="true">true</option><option value="false">false</option>
+                              </select>
+                            </label>
+                          </div>
+                          <button className="button-primary" type="submit" disabled={!adminSession.accessToken || adminUsers.loading}>Create User</button>
+                        </form>
+                      </details>
                     </article>
 
                     <article className="panel">
                       <h3>Modify User</h3>
-                      <form className="form" onSubmit={updateAdminUser}>
-                        <div className="filter-grid">
-                          <label>User ID<input value={adminEditUser.id || ""} readOnly /></label>
-                          <label>Username<input value={adminEditUser.username} readOnly /></label>
-                          <label>Email<input value={adminEditUser.email} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, email: e.target.value }))} /></label>
-                          <label>Role
-                            <select value={adminEditUser.role_id} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, role_id: Number(e.target.value) }))}>
-                              {(adminRoles.length ? adminRoles : [{ id: 1, name: "Administrator" }]).map((role) => (
-                                <option key={`edit-role-${role.id}`} value={role.id}>{role.name}</option>
-                              ))}
-                            </select>
-                          </label>
-                        </div>
-                        <div className="filter-grid">
-                          <label>First Name<input value={adminEditUser.first_name} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, first_name: e.target.value }))} /></label>
-                          <label>Last Name<input value={adminEditUser.last_name} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, last_name: e.target.value }))} /></label>
-                          <label>Status<input value={adminEditUser.status} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, status: e.target.value }))} /></label>
-                          <label>Active
-                            <select value={String(adminEditUser.is_active)} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, is_active: e.target.value === "true" }))}>
-                              <option value="true">true</option><option value="false">false</option>
-                            </select>
-                          </label>
-                        </div>
-                        <button className="button-primary" type="submit" disabled={!adminSession.accessToken || adminUsers.loading || !adminEditUser.id}>Update User</button>
-                      </form>
+                      <details className="admin-collapsible">
+                        <summary>Edit Existing User</summary>
+                        <form className="form" onSubmit={updateAdminUser}>
+                          <div className="filter-grid">
+                            <label>User ID<input value={adminEditUser.id || ""} readOnly /></label>
+                            <label>Username<input value={adminEditUser.username} readOnly /></label>
+                            <label>Email<input value={adminEditUser.email} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, email: e.target.value }))} /></label>
+                            <label>Role
+                              <select value={adminEditUser.role_id} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, role_id: Number(e.target.value) }))}>
+                                {(adminRoles.length ? adminRoles : [{ id: 1, name: "Administrator" }]).map((role) => (
+                                  <option key={`edit-role-${role.id}`} value={role.id}>{role.name}</option>
+                                ))}
+                              </select>
+                            </label>
+                          </div>
+                          <div className="filter-grid">
+                            <label>First Name<input value={adminEditUser.first_name} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, first_name: e.target.value }))} /></label>
+                            <label>Last Name<input value={adminEditUser.last_name} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, last_name: e.target.value }))} /></label>
+                            <label>Status<input value={adminEditUser.status} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, status: e.target.value }))} /></label>
+                            <label>Active
+                              <select value={String(adminEditUser.is_active)} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, is_active: e.target.value === "true" }))}>
+                                <option value="true">true</option><option value="false">false</option>
+                              </select>
+                            </label>
+                          </div>
+                          <button className="button-primary" type="submit" disabled={!adminSession.accessToken || adminUsers.loading || !adminEditUser.id}>Update User</button>
+                        </form>
+                      </details>
                     </article>
 
                     <article className="panel">
                       <h3>Reset Password</h3>
-                      <form className="form" onSubmit={resetAdminUserPassword}>
-                        <div className="filter-grid">
-                          <label>User ID<input value={adminResetPasswordForm.user_id || ""} readOnly /></label>
-                          <label>New Password<input type="password" value={adminResetPasswordForm.new_password} onChange={(e) => setAdminResetPasswordForm((curr) => ({ ...curr, new_password: e.target.value }))} /></label>
-                        </div>
-                        <button className="button-primary" type="submit" disabled={!adminSession.accessToken || adminUsers.loading || !adminResetPasswordForm.user_id || !String(adminResetPasswordForm.new_password || "").trim()}>Reset Password</button>
-                      </form>
+                      <details className="admin-collapsible">
+                        <summary>Reset User Password</summary>
+                        <form className="form" onSubmit={resetAdminUserPassword}>
+                          <div className="filter-grid">
+                            <label>User ID<input value={adminResetPasswordForm.user_id || ""} readOnly /></label>
+                            <label>New Password<input type="password" value={adminResetPasswordForm.new_password} onChange={(e) => setAdminResetPasswordForm((curr) => ({ ...curr, new_password: e.target.value }))} /></label>
+                          </div>
+                          <button className="button-primary" type="submit" disabled={!adminSession.accessToken || adminUsers.loading || !adminResetPasswordForm.user_id || !String(adminResetPasswordForm.new_password || "").trim()}>Reset Password</button>
+                        </form>
+                      </details>
                     </article>
                   </div>
 
@@ -7321,9 +8926,45 @@ export default function App() {
 
                 {adminWorkspace === "project" ? (
                   <div className="grid single-col admin-flow-section admin-flow-project">
+                    <article className="panel project-stepper-panel">
+                      <div className="panel-head">
+                        <h3>Guided Setup Flow</h3>
+                        <button
+                          type="button"
+                          className="button-secondary"
+                          onClick={() => setProjectSetupShowAll((current) => !current)}
+                        >
+                          {projectSetupShowAll ? "Focus Current Step" : "Show All Steps"}
+                        </button>
+                      </div>
+                      <p className="subtitle">Use focused mode for step-by-step onboarding, or show all for full-page editing.</p>
+                      <div className="project-stepper-grid">
+                        {projectStepCards.map((card) => (
+                          <button
+                            key={`project-step-${card.id}`}
+                            type="button"
+                            className={`project-step-card ${projectSetupStep === card.id ? "active" : ""}`}
+                            onClick={() => {
+                              setProjectSetupStep(card.id);
+                              setProjectSetupShowAll(false);
+                              if (card.id === "knowledge") {
+                                setAlertKnowledgeView("onboarding");
+                              }
+                            }}
+                          >
+                            <strong>{card.label}</strong>
+                            <span>{card.hint}</span>
+                            <span className={`workflow-pill ${card.complete ? "workflow-pill-active" : "workflow-pill-idle"}`}>
+                              {card.complete ? "done" : "pending"}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </article>
+                    {showProjectStep("setup") ? (
                     <article className="panel">
                       <div className="panel-head">
-                        <h3>Step 2: Setup Landing Pad And Rule Flow</h3>
+                        <h3>Step 2: Setup (Choose One Path)</h3>
                         <div style={{ display: "flex", gap: 8 }}>
                           <button type="button" className="button-secondary" onClick={loadOnboardingAdminData}>Refresh</button>
                           <button
@@ -7359,17 +9000,9 @@ export default function App() {
                           </button>
                         </div>
                       </div>
-                      <p className="subtitle">After application monitoring registration, configure project-level routing and optional rule automation.</p>
-                      <p className="subtitle">
-                        <strong>Alert Knowledge:</strong> After initial setup, onboard alert knowledge from the Alert Knowledge workspace.
-                        <button type="button" className="button-secondary" style={{ marginLeft: 8 }} onClick={() => setAdminWorkspace("alerts")}>Open Alert Knowledge</button>
-                      </p>
-                      <p className="subtitle"><strong>Next Action:</strong> {onboardingNextAction}</p>
-                      {onboardingDocumentSummary.total > 0 ? (
-                        <p className="subtitle">
-                          <strong>Document Status:</strong> {onboardingDocumentSummary.total} generated, {onboardingDocumentSummary.approved ? "approved" : "pending approval"}.
-                        </p>
-                      ) : null}
+                      <p className="subtitle">Step 1: choose Project Mode. Step 2: choose Setup Path. Step 3: upload source docs (optional), then save.</p>
+                      <p className="subtitle"><strong>Next:</strong> {onboardingNextAction}</p>
+                      {onboardingDocumentSummary.total > 0 ? <p className="subtitle"><strong>Docs:</strong> {onboardingDocumentSummary.total} generated ({onboardingDocumentSummary.approved ? "approved" : "pending"}).</p> : null}
                       {onboardingProjectMode === "existing" ? (
                         <div className="filter-grid">
                         <label>
@@ -7379,17 +9012,22 @@ export default function App() {
                             onChange={(e) => {
                               const nextProjectName = e.target.value;
                               setSelectedOnboardingProject(nextProjectName);
-                              const row = projectOnboardingRows.find((item) => String(item?.project_name || "") === nextProjectName);
+                              const row = (onboardingState.rows || []).find((item) => extractOnboardingProjectName(item) === nextProjectName);
                               if (row) {
                                 applyProjectOnboardingRow(row);
+                                return;
                               }
+                              setOnboardingForm((curr) => ({
+                                ...curr,
+                                name: nextProjectName,
+                                assignment_project: nextProjectName,
+                              }));
                             }}
                           >
                             <option value="">Select project</option>
-                            {projectOnboardingRows.map((row, index) => {
-                              const name = String(row?.project_name || "").trim() || `project-${index + 1}`;
-                              return <option key={`project-select-${name}-${index}`} value={name}>{name}</option>;
-                            })}
+                            {onboardingProjectOptions.map((name, index) => (
+                              <option key={`project-select-${name}-${index}`} value={name}>{name}</option>
+                            ))}
                           </select>
                         </label>
                         </div>
@@ -7410,42 +9048,75 @@ export default function App() {
                           <label>Environment<select value={onboardingForm.environment} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, environment: e.target.value }))}><option value="dev">dev</option><option value="staging">staging</option><option value="prod">prod</option></select></label>
                           <label>Region *<input placeholder="ap-south-1" value={onboardingForm.region} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, region: e.target.value }))} /></label>
                         </div>
-                        <div className="filter-grid">
-                          <label>Deployment
-                            <select value={onboardingForm.deployment_mode} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, deployment_mode: e.target.value }))}>
-                              <option value="on_prem">On-Prem</option>
-                              <option value="gcp_cloud">Google Cloud</option>
-                            </select>
-                          </label>
-                        </div>
-                        {onboardingForm.deployment_mode === "gcp_cloud" ? (
-                          <div className="filter-grid">
-                            <label>GCP Project ID<input value={onboardingForm.gcp_project_id} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, gcp_project_id: e.target.value }))} /></label>
-                            <label>GCP Region<input value={onboardingForm.gcp_region} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, gcp_region: e.target.value }))} /></label>
-                            <label>Pub/Sub Topic<input value={onboardingForm.pubsub_topic} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, pubsub_topic: e.target.value }))} /></label>
-                            <label>Pub/Sub Subscription<input value={onboardingForm.pubsub_subscription} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, pubsub_subscription: e.target.value }))} /></label>
+                        <details className="panel" style={{ margin: "10px 0" }}>
+                          <summary style={{ cursor: "pointer" }}>Advanced Settings (Optional)</summary>
+                          <div className="filter-grid" style={{ marginTop: 10 }}>
+                            <label>Deployment
+                              <select value={onboardingForm.deployment_mode} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, deployment_mode: e.target.value }))}>
+                                <option value="on_prem">On-Prem</option>
+                                <option value="gcp_cloud">Google Cloud</option>
+                              </select>
+                            </label>
+                            <label>Assign User (optional)<input placeholder="username" value={onboardingForm.assignment_username} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, assignment_username: e.target.value }))} /></label>
                           </div>
-                        ) : null}
-                        <div className="filter-grid">
-                          <label>
-                            Onboarding Path
-                            <select
-                              value={onboardingForm.onboarding_path}
-                              onChange={(e) => {
-                                const nextPath = e.target.value;
+                          {onboardingForm.deployment_mode === "gcp_cloud" ? (
+                            <div className="filter-grid" style={{ marginTop: 10 }}>
+                              <label>GCP Project ID<input value={onboardingForm.gcp_project_id} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, gcp_project_id: e.target.value }))} /></label>
+                              <label>GCP Region<input value={onboardingForm.gcp_region} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, gcp_region: e.target.value }))} /></label>
+                              <label>Pub/Sub Topic<input value={onboardingForm.pubsub_topic} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, pubsub_topic: e.target.value }))} /></label>
+                              <label>Pub/Sub Subscription<input value={onboardingForm.pubsub_subscription} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, pubsub_subscription: e.target.value }))} /></label>
+                            </div>
+                          ) : null}
+                          {onboardingForm.deployment_mode === "gcp_cloud" ? (
+                            <div className="filter-grid" style={{ marginTop: 10 }}>
+                              <label>Vertex Model Armor
+                                <select value={String(onboardingForm.vertex_model_armor_enabled)} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, vertex_model_armor_enabled: e.target.value === "true" }))}>
+                                  <option value="false">disabled</option>
+                                  <option value="true">enabled</option>
+                                </select>
+                              </label>
+                              <label>Model Armor Template<input value={onboardingForm.vertex_model_armor_template} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, vertex_model_armor_template: e.target.value }))} /></label>
+                            </div>
+                          ) : null}
+                        </details>
+                        <div className="panel" style={{ margin: "10px 0" }}>
+                          <div className="panel-head">
+                            <h3>Step 2: Choose Setup Path</h3>
+                          </div>
+                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                            <button
+                              type="button"
+                              className={onboardingForm.onboarding_path === "setup_monitoring" ? "button-primary" : "button-secondary"}
+                              onClick={() => {
                                 setOnboardingForm((curr) => ({
                                   ...curr,
-                                  onboarding_path: nextPath,
-                                  start_rule_onboarding: nextPath === "setup_monitoring",
+                                  onboarding_path: "setup_monitoring",
+                                  start_rule_onboarding: true,
+                                  monitoring_tool: "prometheus",
+                                  prometheus_url: curr.monitoring_url,
                                 }));
+                                setNewRulePipelineForm((curr) => ({ ...curr, selected_tool: "prometheus" }));
+                                setExistingRulePipelineForm((curr) => ({ ...curr, platform: "prometheus" }));
                               }}
                             >
-                              <option value="existing_monitoring">Existing Monitoring -&gt; Ingest Alerts To Landing Pad</option>
-                              <option value="setup_monitoring">No Monitoring Yet -&gt; Create Rules &amp; Configure Prometheus</option>
-                            </select>
-                          </label>
+                              1) Configure Prometheus Monitoring
+                            </button>
+                            <button
+                              type="button"
+                              className={onboardingForm.onboarding_path === "existing_monitoring" ? "button-primary" : "button-secondary"}
+                              onClick={() => setOnboardingForm((curr) => ({ ...curr, onboarding_path: "existing_monitoring", start_rule_onboarding: false }))}
+                            >
+                              2) Existing Monitoring - Send Alerts To Landing Pad
+                            </button>
+                          </div>
+                          <p className="subtitle" style={{ marginTop: 8 }}>
+                            {onboardingForm.onboarding_path === "setup_monitoring"
+                              ? "Prometheus path: define rules and configure monitoring first, then route alerts."
+                              : "Existing monitoring path: keep your current tool and just send alert webhooks to KaiOps landing pad."}
+                          </p>
                         </div>
-                        <div className="panel" style={{ margin: "10px 0", borderStyle: "dashed" }}>
+                        <details className="panel" style={{ margin: "10px 0", borderStyle: "dashed" }}>
+                          <summary style={{ cursor: "pointer" }}>Landing Pad Details (Endpoint and Sample Payload)</summary>
                           <div className="panel-head">
                             <h3>Landing Pad Details</h3>
                             <p>Endpoint and payload guidance for alert ingestion into KaiOps workflow. Troubleshooting runbooks for ingested alerts are managed under Alert Knowledge.</p>
@@ -7463,12 +9134,16 @@ export default function App() {
                             <label>Content Type
                               <input value={onboardingLandingPadDetails.contentType} readOnly />
                             </label>
-                            <label>Selected Monitoring Tool
-                              <input value={onboardingLandingPadDetails.selectedTool} readOnly />
-                            </label>
-                            <label>Configured Tool Endpoint
-                              <input value={onboardingLandingPadDetails.configuredEndpoint} readOnly />
-                            </label>
+                            {onboardingForm.onboarding_path === "existing_monitoring" ? (
+                              <>
+                                <label>Selected Monitoring Tool
+                                  <input value={onboardingLandingPadDetails.selectedTool} readOnly />
+                                </label>
+                                <label>Configured Tool Endpoint
+                                  <input value={onboardingLandingPadDetails.configuredEndpoint} readOnly />
+                                </label>
+                              </>
+                            ) : null}
                           </div>
                           <p className="subtitle"><strong>Optional Header:</strong> {onboardingLandingPadDetails.traceHeader}</p>
                           <p className="subtitle"><strong>Required Body:</strong> JSON payload with an alerts array.</p>
@@ -7479,32 +9154,39 @@ export default function App() {
                             <p className="subtitle">Rule setup path is selected; this endpoint becomes active after rule and monitoring setup are completed.</p>
                           )}
                           <pre className="result">{onboardingLandingPadDetails.samplePayload}</pre>
-                        </div>
+                        </details>
                         <div className="filter-grid">
+                          {onboardingForm.onboarding_path === "existing_monitoring" ? (
+                            <label>
+                              Monitoring Tool
+                              <select
+                                value={onboardingForm.monitoring_tool}
+                                onChange={(e) => {
+                                  const nextTool = e.target.value;
+                                  setOnboardingForm((curr) => ({
+                                    ...curr,
+                                    monitoring_tool: nextTool,
+                                    prometheus_url: nextTool === "prometheus" ? curr.monitoring_url : "",
+                                    new_relic_url: nextTool === "new_relic" ? curr.monitoring_url : "",
+                                    datadog_url: nextTool === "datadog" ? curr.monitoring_url : "",
+                                  }));
+                                  setNewRulePipelineForm((curr) => ({ ...curr, selected_tool: nextTool }));
+                                  setExistingRulePipelineForm((curr) => ({ ...curr, platform: nextTool }));
+                                }}
+                              >
+                                <option value="prometheus">Prometheus</option>
+                                <option value="new_relic">New Relic</option>
+                                <option value="datadog">Datadog</option>
+                              </select>
+                            </label>
+                          ) : (
+                            <label>
+                              Monitoring Tool
+                              <input value="prometheus" readOnly />
+                            </label>
+                          )}
                           <label>
-                            Monitoring Tool
-                            <select
-                              value={onboardingForm.monitoring_tool}
-                              onChange={(e) => {
-                                const nextTool = e.target.value;
-                                setOnboardingForm((curr) => ({
-                                  ...curr,
-                                  monitoring_tool: nextTool,
-                                  prometheus_url: nextTool === "prometheus" ? curr.monitoring_url : "",
-                                  new_relic_url: nextTool === "new_relic" ? curr.monitoring_url : "",
-                                  datadog_url: nextTool === "datadog" ? curr.monitoring_url : "",
-                                }));
-                                setNewRulePipelineForm((curr) => ({ ...curr, selected_tool: nextTool }));
-                                setExistingRulePipelineForm((curr) => ({ ...curr, platform: nextTool }));
-                              }}
-                            >
-                              <option value="prometheus">Prometheus</option>
-                              <option value="new_relic">New Relic</option>
-                              <option value="datadog">Datadog</option>
-                            </select>
-                          </label>
-                          <label>
-                            Tool Endpoint URL (optional)
+                            {onboardingForm.onboarding_path === "setup_monitoring" ? "Prometheus Endpoint URL" : "Tool Endpoint URL (optional)"}
                             <input
                               value={onboardingForm.monitoring_url}
                               placeholder="http://prometheus:9090"
@@ -7521,48 +9203,175 @@ export default function App() {
                               }}
                               onChange={(e) => setOnboardingForm((curr) => ({ ...curr, monitoring_url: e.target.value }))}
                             />
-                            <span className="field-hint">In Docker Compose, use http://prometheus:9090 so the monitoring-adapter container can reach Prometheus.</span>
+                            <span className="field-hint">
+                              {onboardingForm.onboarding_path === "setup_monitoring"
+                                ? "Required for Prometheus rule setup. In Docker Compose, use http://prometheus:9090."
+                                : "Optional. If provided, KaiOps stores endpoint metadata for your existing monitoring tool."}
+                            </span>
                           </label>
-                          <label>Assign User (optional)<input placeholder="username" value={onboardingForm.assignment_username} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, assignment_username: e.target.value }))} /></label>
                         </div>
-                        {onboardingForm.deployment_mode === "gcp_cloud" ? (
-                          <div className="filter-grid">
-                            <label>Vertex Model Armor
-                              <select value={String(onboardingForm.vertex_model_armor_enabled)} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, vertex_model_armor_enabled: e.target.value === "true" }))}>
-                                <option value="false">disabled</option>
-                                <option value="true">enabled</option>
-                              </select>
-                            </label>
-                            <label>Model Armor Template<input value={onboardingForm.vertex_model_armor_template} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, vertex_model_armor_template: e.target.value }))} /></label>
-                          </div>
+                        {onboardingForm.onboarding_path !== "setup_monitoring" ? (
+                          <p className="subtitle">Alerts from your configured monitoring tool can be ingested into landing pad to trigger the remaining workflow.</p>
                         ) : null}
-                        <label>Assignment Project (auto)<input value={onboardingForm.name} readOnly /></label>
+                        <article className="panel setup-source-doc-panel">
+                          <div className="panel-head">
+                            <div>
+                              <h3>Step 3: Upload Source Documents</h3>
+                              <p>Upload operational evidence first. KaiOps derives the rule prompt after the docs are onboarded.</p>
+                            </div>
+                            <button
+                              type="button"
+                              className="button-secondary"
+                              onClick={applyUploadedDocumentsToRuleIntent}
+                              disabled={!onboardingDerivedRequirements.length}
+                            >
+                              Apply Derived Requirements
+                            </button>
+                          </div>
+                          <p className="subtitle">Provide past tickets, troubleshooting notes, RCA/postmortem docs, resolution docs, logs, and related evidence (.md, .txt, .json, .csv, .log, .yaml). On save, KaiOps uses them to infer rules, RCA steps, required docs, and metadata.</p>
+                          <div className="setup-flow-rail">
+                            <div className={`setup-flow-node ${onboardingSourceDocCount > 0 ? "complete" : "active"}`}>
+                              <strong>Upload</strong>
+                              <span>{onboardingSourceDocCount > 0 ? `${onboardingSourceDocCount} docs ready` : "Choose files"}</span>
+                            </div>
+                            <div className={`setup-flow-node ${onboardingDerivedRequirements.length > 0 ? "complete" : ""}`}>
+                              <strong>Derive</strong>
+                              <span>{onboardingDerivedRequirements.length > 0 ? `${onboardingDerivedRequirements.length} prompts found` : "Waiting for docs"}</span>
+                            </div>
+                            <div className={`setup-flow-node ${onboardingGeneratedRuleRows.length > 0 ? "complete" : ""}`}>
+                              <strong>Generate</strong>
+                              <span>{onboardingGeneratedRuleRows.length > 0 ? `${onboardingGeneratedRuleRows.length} rules` : "After save"}</span>
+                            </div>
+                          </div>
+                          <div className="approval-steps setup-source-categories">
+                            <div className="approval-step">
+                              <strong>Past Tickets</strong>
+                              <span>Incident and support cases that show repeat failure patterns.</span>
+                            </div>
+                            <div className="approval-step">
+                              <strong>Troubleshooting Docs</strong>
+                              <span>Playbooks, diagnostics, and investigation notes for rule discovery.</span>
+                            </div>
+                            <div className="approval-step">
+                              <strong>Logs and RCA Docs</strong>
+                              <span>Logs, postmortems, and resolution notes used to update metadata and RCA steps.</span>
+                            </div>
+                          </div>
+                          <p className="subtitle">Upload multiple files per category.</p>
+                          <div className="source-doc-upload-grid">
+                            {ONBOARDING_SOURCE_DOC_BUCKETS.map((bucket) => {
+                              const sample = ONBOARDING_SOURCE_DOC_SAMPLE_FILES[bucket.key];
+                              return (
+                                <label className="source-doc-upload-card" key={`source-bucket-${bucket.key}`}>
+                                  <span>{bucket.label}</span>
+                                  <input
+                                    type="file"
+                                    multiple
+                                    accept=".txt,.md,.markdown,.json,.csv,.log,.yaml,.yml"
+                                    onChange={(e) => handleOnboardingSourceDocuments(e.target.files, bucket.key)}
+                                  />
+                                  {sample ? (
+                                    <a className="source-doc-download" href={sample.href} download>
+                                      {sample.label}
+                                    </a>
+                                  ) : null}
+                                </label>
+                              );
+                            })}
+                          </div>
+                          {onboardingSourceDocs.loading ? <p className="subtitle">Reading uploaded documents...</p> : null}
+                          {onboardingSourceDocs.error ? <p className="error">{onboardingSourceDocs.error}</p> : null}
+                          {onboardingSourceDocs.rows.length ? (
+                            <div className="table-wrap" style={{ marginTop: 8 }}>
+                              <table>
+                                <thead>
+                                  <tr>
+                                    <th>Category</th>
+                                    <th>Document</th>
+                                    <th>Type</th>
+                                    <th>Derived Requirements</th>
+                                    <th>Excerpt</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {onboardingSourceDocs.rows.map((row, index) => (
+                                    <tr key={`onboarding-src-doc-${index}`}>
+                                      <td>{ONBOARDING_SOURCE_DOC_BUCKETS.find((bucket) => bucket.key === String(row?.category || "other"))?.label || "Other Evidence"}</td>
+                                      <td>{row.name || "-"}</td>
+                                      <td>{classifyOnboardingDocumentType(row.name, row.text)}</td>
+                                      <td>
+                                        {Array.isArray(row.derived_requirements) && row.derived_requirements.length
+                                          ? row.derived_requirements.join(" | ")
+                                          : "-"}
+                                        {row.warning ? <p className="error" style={{ margin: "6px 0 0" }}>{row.warning}</p> : null}
+                                      </td>
+                                      <td>{row.excerpt || "-"}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          ) : null}
+                        </article>
                         {onboardingForm.onboarding_path === "setup_monitoring" ? (
-                          <label>
-                            Rule Intent (Plain English)
-                            <textarea
-                              rows={5}
-                              placeholder="Example: Alert when checkout API 5xx is above 3% for 5 minutes and route to SRE."
-                              value={onboardingForm.rule_onboarding_plain_language}
-                              onChange={(e) => {
-                                const nextText = e.target.value;
-                                setOnboardingForm((curr) => ({ ...curr, rule_onboarding_plain_language: nextText }));
-                                setNewRulePipelineForm((curr) => ({ ...curr, requirements_text: nextText }));
-                              }}
-                            />
-                          </label>
-                        ) : <p className="subtitle">Alerts from your configured monitoring tool can be ingested into landing pad to trigger the remaining workflow.</p>}
+                          <article className={`panel rule-prompt-panel ${onboardingRulePromptVisible ? "ready" : "locked"}`}>
+                            <div className="panel-head">
+                              <div>
+                                <h3>Step 4: Review Rule Prompt</h3>
+                                <p>{onboardingRulePromptVisible ? "Generated from onboarded documents. Edit before saving if needed." : "Upload source documents to unlock the generated rule prompt."}</p>
+                              </div>
+                              <span className={`workflow-pill ${onboardingRulePromptVisible ? "workflow-pill-active" : "workflow-pill-idle"}`}>
+                                {onboardingRulePromptVisible ? "ready" : "waiting"}
+                              </span>
+                            </div>
+                            {onboardingRulePromptVisible ? (
+                              <>
+                                {onboardingRulePromptLines.length ? (
+                                  <div className="generated-rule-preview">
+                                    {onboardingRulePromptLines.slice(0, 4).map((line, index) => (
+                                      <span key={`rule-prompt-line-${index}`}>{line}</span>
+                                    ))}
+                                  </div>
+                                ) : null}
+                                {onboardingGeneratedRuleRows.length ? (
+                                  <div className="generated-rule-preview generated-rule-preview-compact">
+                                    {onboardingGeneratedRuleRows.slice(0, 3).map((row) => (
+                                      <span key={`setup-generated-rule-${row.id}`}>{row.name} - {row.severity}</span>
+                                    ))}
+                                  </div>
+                                ) : null}
+                                <label>
+                                  Rule Intent From Documents
+                                  <textarea
+                                    rows={5}
+                                    placeholder="Derived rule prompt will appear here after source documents are onboarded."
+                                    value={onboardingForm.rule_onboarding_plain_language}
+                                    onChange={(e) => {
+                                      const nextText = e.target.value;
+                                      setOnboardingForm((curr) => ({ ...curr, rule_onboarding_plain_language: nextText }));
+                                      setNewRulePipelineForm((curr) => ({ ...curr, requirements_text: nextText }));
+                                    }}
+                                  />
+                                </label>
+                              </>
+                            ) : (
+                              <p className="subtitle">Choose files above, then KaiOps will surface the generated prompt here before rule generation.</p>
+                            )}
+                          </article>
+                        ) : null}
                         <button className="button-primary" type="submit" disabled={onboardingState.loading || onboardingValidationErrors.length > 0 || onboardingHasPendingDocumentApproval}>
-                          {onboardingState.loading ? "Saving..." : onboardingProjectMode === "new" ? "Create Project" : "Update Project"}
+                          {onboardingState.loading ? "Saving..." : onboardingProjectMode === "new" ? "Create Project + Auto-Generate" : "Update Project + Auto-Generate"}
                         </button>
                       </form>
                       {onboardingState.error ? <p className="error">{onboardingState.error}</p> : null}
                       {onboardingState.success ? <p className="subtitle">{onboardingState.success}</p> : null}
                     </article>
+                    ) : null}
 
-                    <article className="panel">
+                    {showProjectStep("review") ? (
+                    <article className="panel onboarding-review-panel">
                       <div className="panel-head">
-                        <h3>Generated Documents Review</h3>
+                        <h3>Generated Rules, Docs, and Metadata Review (Required)</h3>
                         <div style={{ display: "flex", gap: 8 }}>
                           <button
                             type="button"
@@ -7579,13 +9388,43 @@ export default function App() {
                             type="button"
                             className="button-primary"
                             onClick={approveGeneratedOnboardingDocuments}
-                            disabled={!onboardingGeneratedDocs.length || onboardingDocApprovalState.loading || onboardingDocApprovalState.approved}
+                            disabled={!onboardingGeneratedDocs.length || onboardingDocApprovalState.loading || onboardingDocApprovalState.approved || !onboardingReviewGate.allReviewed}
                           >
                             {onboardingDocApprovalState.loading ? "Approving..." : onboardingDocApprovalState.approved ? "Approved" : "Approve Documents"}
                           </button>
                         </div>
                       </div>
-                      <p className="subtitle">After Create/Update Project, review all generated documents below, then approve to ingest them.</p>
+                      <p className="subtitle">After Create/Update Project: review generated artifacts, confirm each checklist item, then click Approve Documents.</p>
+                      <div className="filter-grid onboarding-review-checklist" style={{ marginBottom: 8 }}>
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={onboardingReviewAck.rules}
+                            onChange={(e) => setOnboardingReviewAck((current) => ({ ...current, rules: e.target.checked }))}
+                            disabled={!onboardingGeneratedRuleRows.length}
+                          />
+                          I reviewed generated rules
+                        </label>
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={onboardingReviewAck.docs}
+                            onChange={(e) => setOnboardingReviewAck((current) => ({ ...current, docs: e.target.checked }))}
+                            disabled={!onboardingGeneratedDocs.length}
+                          />
+                          I reviewed generated docs
+                        </label>
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={onboardingReviewAck.metadata}
+                            onChange={(e) => setOnboardingReviewAck((current) => ({ ...current, metadata: e.target.checked }))}
+                            disabled={!onboardingMetadataRows.length}
+                          />
+                          I reviewed generated metadata
+                        </label>
+                      </div>
+                      {!onboardingReviewGate.allReviewed ? <p className="subtitle onboarding-review-warning">Approval is locked until all available review checkboxes are confirmed.</p> : null}
                       {onboardingDocApprovalState.error ? <p className="error">{onboardingDocApprovalState.error}</p> : null}
                       {onboardingDocApprovalState.success ? <p className="subtitle">{onboardingDocApprovalState.success}</p> : null}
                       {!onboardingGeneratedDocs.length ? (
@@ -7618,8 +9457,67 @@ export default function App() {
                           <pre className="result">{JSON.stringify(onboardingGeneratedDocs, null, 2)}</pre>
                         </details>
                       ) : null}
+                      <details className="onboarding-review-details" style={{ marginTop: 12 }}>
+                        <summary style={{ cursor: "pointer" }}>Generated Rules Review ({onboardingGeneratedRuleRows.length})</summary>
+                        <div className="table-wrap" style={{ marginTop: 8 }}>
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>Name</th>
+                                <th>Platform</th>
+                                <th>Severity</th>
+                                <th>Status</th>
+                                <th>Expression / Query</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {onboardingGeneratedRuleRows.map((row) => (
+                                <tr key={`generated-rule-${row.id}`}>
+                                  <td>{row.name}</td>
+                                  <td>{row.platform}</td>
+                                  <td>{row.severity}</td>
+                                  <td>{row.status}</td>
+                                  <td>{row.expression || "-"}</td>
+                                </tr>
+                              ))}
+                              {!onboardingGeneratedRuleRows.length ? <tr><td colSpan={5}>No generated rule rows found in latest workflow payload.</td></tr> : null}
+                            </tbody>
+                          </table>
+                        </div>
+                      </details>
+                      <details className="onboarding-review-details" style={{ marginTop: 12 }}>
+                        <summary style={{ cursor: "pointer" }}>Generated Metadata Review ({onboardingMetadataRows.length})</summary>
+                        <div className="table-wrap" style={{ marginTop: 8 }}>
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>Provider</th>
+                                <th>Project</th>
+                                <th>Status</th>
+                                <th>Updated</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {onboardingMetadataRows.map((row) => (
+                                <tr key={`generated-meta-${row.id}`}>
+                                  <td>{row.provider}</td>
+                                  <td>{row.project}</td>
+                                  <td>{row.status}</td>
+                                  <td>{row.updated_at}</td>
+                                </tr>
+                              ))}
+                              {!onboardingMetadataRows.length ? <tr><td colSpan={4}>No metadata rows found for selected project yet.</td></tr> : null}
+                            </tbody>
+                          </table>
+                        </div>
+                      </details>
+                      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 10 }}>
+                        <button type="button" className="button-secondary" onClick={() => setProjectSetupStep("status")}>Next: Workflow Status</button>
+                      </div>
                     </article>
+                    ) : null}
 
+                    {showProjectStep("status") ? (
                     <article className="panel">
                       <h3>Rule Onboarding Status</h3>
                       <p className="subtitle">Rule onboarding is optional. If enabled above, plain-language requirements are converted into tool-specific rules and documentation automatically.</p>
@@ -7725,8 +9623,13 @@ export default function App() {
                         </div>
                       ) : null}
                       {onboardingRuleRunState.result ? <pre className="result">{JSON.stringify(onboardingRuleRunState.result, null, 2)}</pre> : null}
+                      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 10 }}>
+                        <button type="button" className="button-secondary" onClick={() => setProjectSetupStep("advanced")}>Next: Advanced Tools</button>
+                      </div>
                     </article>
+                    ) : null}
 
+                    {showProjectStep("advanced") ? (
                     <article className="panel">
                       <h3>Advanced Rule Workflow Management</h3>
                       <details>
@@ -7749,7 +9652,7 @@ export default function App() {
                         </form>
                         {onboardingRuleLookup.error ? <p className="error">{onboardingRuleLookup.error}</p> : null}
                         {onboardingRuleLookup.result ? <pre className="result">{JSON.stringify(onboardingRuleLookup.result, null, 2)}</pre> : null}
-
+                            disabled={!onboardingGeneratedDocs.length || onboardingDocApprovalState.loading || onboardingDocApprovalState.approved || !onboardingReviewGate.allReviewed}
                         <div className="table-wrap" style={{ marginTop: 12 }}>
                           <table>
                             <thead>
@@ -7869,6 +9772,7 @@ export default function App() {
                         </div>
                       </details>
                     </article>
+                    ) : null}
                   </div>
 
                 ) : null}
@@ -7881,10 +9785,7 @@ export default function App() {
                         <button className="button-secondary" type="button" onClick={loadMonitoringApplications} disabled={monitoringApps.loading}>Refresh</button>
                       </div>
                       <p className="subtitle">Start here. Register an application and inspect the end-to-end onboarding chain (discovery, validation, rules, Prometheus update, dashboard).</p>
-                      <p className="subtitle">
-                        <strong>Alert Knowledge:</strong> After initial monitoring setup, onboard alert knowledge documents.
-                        <button type="button" className="button-secondary" style={{ marginLeft: 8 }} onClick={() => setAdminWorkspace("alerts")}>Open Alert Knowledge</button>
-                      </p>
+                      <p className="subtitle"><strong>Alert Knowledge:</strong> Included in Setup Monitoring + Landing Pad. Use the unified setup tab for one continuous workflow.</p>
                       <form className="form" onSubmit={submitMonitoringApplication}>
                         <div className="filter-grid">
                           <label>Tenant<input value={monitoringAppForm.tenant_id} onChange={(e) => setMonitoringAppForm((curr) => ({ ...curr, tenant_id: e.target.value }))} /></label>
@@ -7904,6 +9805,34 @@ export default function App() {
                       </form>
                       {monitoringAppSubmit.error ? <p className="error">{monitoringAppSubmit.error}</p> : null}
                       {monitoringAppSubmit.success ? <p className="subtitle">{monitoringAppSubmit.success}</p> : null}
+                      <article className="panel monitoring-doc-gate" style={{ marginTop: 10, borderStyle: "dashed" }}>
+                        <div className="panel-head">
+                          <h3>Post-Setup Source Documents</h3>
+                          <button type="button" className="button-secondary" onClick={applyUploadedDocumentsToRuleIntent} disabled={!onboardingDerivedRequirements.length}>Apply Derived Requirements</button>
+                        </div>
+                        <p className="subtitle">After project and monitoring setup, upload past tickets, troubleshooting notes, RCA/postmortem docs, resolution docs, logs, and related evidence so KaiOps can infer rules, RCA steps, required docs, and metadata mappings.</p>
+                        <div className="approval-steps" style={{ marginTop: 10 }}>
+                          <div className="approval-step">
+                            <strong>Tickets and Incidents</strong>
+                            <span>Shows repeat patterns and the alert history that should become rules.</span>
+                          </div>
+                          <div className="approval-step">
+                            <strong>Troubleshooting and Resolution Docs</strong>
+                            <span>Feeds the rule discovery path, validation commands, and recommended fixes.</span>
+                          </div>
+                          <div className="approval-step">
+                            <strong>Logs and RCA Evidence</strong>
+                            <span>Used to update metadata, root-cause steps, and onboarding documentation.</span>
+                          </div>
+                        </div>
+                        <label>
+                          Documents
+                          <input type="file" multiple accept=".txt,.md,.markdown,.json,.csv,.log,.yaml,.yml" onChange={(e) => handleOnboardingSourceDocuments(e.target.files)} />
+                        </label>
+                        {onboardingSourceDocs.loading ? <p className="subtitle">Reading uploaded documents...</p> : null}
+                        {onboardingSourceDocs.error ? <p className="error">{onboardingSourceDocs.error}</p> : null}
+                        <p className="subtitle monitoring-doc-gate-count">Uploaded docs: <strong>{onboardingSourceDocCount}</strong></p>
+                      </article>
                     </article>
 
                     <article className="panel">
@@ -8001,23 +9930,27 @@ export default function App() {
                   </div>
                 ) : null}
 
-                {adminWorkspace === "alerts" ? (
+                {(adminWorkspace === "alerts" || (adminWorkspace === "project" && showProjectStep("setup"))) ? (
                   <div className="grid single-col admin-flow-section admin-flow-knowledge">
                     <article className="panel">
+                      <div className="panel-head">
+                        <h3>{adminWorkspace === "project" ? "Setup: Alert Knowledge Onboarding" : "Alert Knowledge Onboarding"}</h3>
+                        <p>{adminWorkspace === "project" ? "Create and review alert knowledge here in the same setup workspace." : "Standalone alert knowledge workspace for focused onboarding and review."}</p>
+                      </div>
                       <div className="detail-tabs" style={{ marginBottom: 0 }}>
                         <button
                           type="button"
                           className={alertKnowledgeView === "onboarding" ? "button-primary" : "button-secondary"}
                           onClick={() => setAlertKnowledgeView("onboarding")}
                         >
-                          Alert Knowledge Onboarding
+                          Guided Onboarding
                         </button>
                         <button
                           type="button"
                           className={alertKnowledgeView === "backend" ? "button-primary" : "button-secondary"}
                           onClick={() => setAlertKnowledgeView("backend")}
                         >
-                          Backend Docs & Metadata
+                          Stored Docs & Metadata
                         </button>
                       </div>
                     </article>
@@ -8100,70 +10033,6 @@ export default function App() {
                       </form>
                       {alertOnboardingState.error ? <p className="error">{alertOnboardingState.error}</p> : null}
                       {alertOnboardingState.result ? <pre className="result">{JSON.stringify(alertOnboardingState.result, null, 2)}</pre> : null}
-                    </article>
-                    ) : null}
-
-                    {alertKnowledgeView === "onboarding" ? (
-                    <article className="panel">
-                      <h3>Bulk Insert From Excel</h3>
-                      <p className="subtitle">Upload .xlsx, .xls, or .csv with columns: kind, title, summary, content, services, severity, alert_type.</p>
-                      <div className="search-row">
-                        <a className="button-secondary" href="/alerts_onboarding_bulk_template.csv" download>
-                          Download Template
-                        </a>
-                      </div>
-                      <label>
-                        Excel File
-                        <input type="file" accept=".xlsx,.xls,.csv" onChange={onAlertBulkFileSelected} />
-                      </label>
-                      {alertBulkState.fileName ? <p className="subtitle">Loaded: {alertBulkState.fileName}</p> : null}
-                      {alertBulkState.error ? <p className="error">{alertBulkState.error}</p> : null}
-
-                      <div className="panel-head">
-                        <h3>Parsed Rows</h3>
-                        <button className="button-primary" type="button" onClick={submitAlertOnboardingBulk} disabled={alertBulkState.loading || !alertBulkState.parsedRows.length}>
-                          {alertBulkState.loading ? "Uploading..." : "Upload Parsed Rows"}
-                        </button>
-                      </div>
-                      <div className="table-wrap">
-                        <table>
-                          <thead>
-                            <tr><th>Line</th><th>Title</th><th>Kind</th><th>Status</th><th>Validation</th></tr>
-                          </thead>
-                          <tbody>
-                            {alertBulkState.parsedRows.map((row) => (
-                              <tr key={`bulk-parse-${row.line}`}>
-                                <td>{row.line}</td>
-                                <td>{row.payload.title || "-"}</td>
-                                <td>{row.payload.kind || "-"}</td>
-                                <td><span className={`pill ${row.valid ? "status-closed" : "status-failed"}`}>{row.valid ? "Ready" : "Invalid"}</span></td>
-                                <td>{row.errors.length ? row.errors.join("; ") : "OK"}</td>
-                              </tr>
-                            ))}
-                            {!alertBulkState.parsedRows.length ? <tr><td colSpan={5}>No file parsed yet.</td></tr> : null}
-                          </tbody>
-                        </table>
-                      </div>
-
-                      <h3>Upload Results</h3>
-                      <div className="table-wrap">
-                        <table>
-                          <thead>
-                            <tr><th>Line</th><th>Title</th><th>Status</th><th>Message</th></tr>
-                          </thead>
-                          <tbody>
-                            {alertBulkState.results.map((row, index) => (
-                              <tr key={`bulk-result-${index}`}>
-                                <td>{row.line}</td>
-                                <td>{row.title}</td>
-                                <td><span className={`pill ${row.status === "success" ? "status-closed" : "status-failed"}`}>{row.status}</span></td>
-                                <td>{row.message}</td>
-                              </tr>
-                            ))}
-                            {!alertBulkState.results.length ? <tr><td colSpan={4}>No upload attempted yet.</td></tr> : null}
-                          </tbody>
-                        </table>
-                      </div>
                     </article>
                     ) : null}
 
@@ -8344,10 +10213,10 @@ export default function App() {
             <section className="grid single-col">
               <article className="panel">
                 <div className="panel-head">
-                  <h2>Human Approval & Alerts</h2>
-                  <p>Pending approvals, recent alerts, and quick docs decision workspace.</p>
+                  <h2>Human Approval Queue (Legacy)</h2>
+                  <p>Primary approval actions now run inside Alert Details Workspace on Dashboard for eligible roles.</p>
                 </div>
-                <p className="subtitle">Unified approval queue: use the single table below to Open, Approve, or Reject incidents.</p>
+                <p className="subtitle">Use this queue for cross-incident triage, bulk-style review, or manual fallback operations.</p>
 
                 <div className="search-row sticky-controls">
                   <label>
