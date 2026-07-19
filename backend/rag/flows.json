@@ -343,6 +343,19 @@
     "source": "rag-incident"
   },
   {
+    "id": "new-alert-onboarding",
+    "alert_id": "NEW-ALERT-ONBOARDING",
+    "alert_name": "New Alert Onboarding",
+    "alert_type": "availability",
+    "title": "New Alert Onboarding",
+    "service": "payments",
+    "severity": "HIGH",
+    "summary": "create rule for checking the alerts are getting ingested  every 10 mins",
+    "recommended_action": "Investigate issue",
+    "description": "create rule for checking the alerts are getting ingested  every 10 mins",
+    "source": "rag-incident"
+  },
+  {
     "id": "orders-replica-lag",
     "alert_id": "ORDERS-REPLICA-LAG",
     "alert_name": "Orders database replica lag",

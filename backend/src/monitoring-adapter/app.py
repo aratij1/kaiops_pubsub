@@ -929,6 +929,7 @@ async def _generate_upload_and_test_prometheus_rules(
                         ]
                     )
             except Exception:
+                logger.exception("failed to count active alerts for rule group %s", expected_group_name)
                 active_alert_count = 0
 
             details["test"]["loaded_rule_groups"] = loaded_group_count

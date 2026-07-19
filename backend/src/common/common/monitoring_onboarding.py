@@ -282,7 +282,7 @@ class RuleGenerationAgent:
         alert_rules = [
             PrometheusRuleSpec(
                 name=f"{slug}-target-down",
-                expr=f'up{{job="{slug}"}} == 0',
+                expr=f'(up{{job="{slug}"}} == 0) or absent(up{{job="{slug}"}})',
                 duration="2m",
                 severity="critical",
                 labels={"team": application.owner_team, "namespace": application.namespace},
@@ -290,7 +290,7 @@ class RuleGenerationAgent:
             ),
             PrometheusRuleSpec(
                 name=f"{slug}-cpu-high",
-                expr=(f'rate({cpu_metric}[5m]) > 0.85' if cpu_metric != "up" else f'up{{job="{slug}"}} == 0'),
+                expr=(f'rate({cpu_metric}{{job="{slug}"}}[5m]) > 0.85' if cpu_metric != "up" else f'(up{{job="{slug}"}} == 0) or absent(up{{job="{slug}"}})'),
                 duration="5m",
                 severity="warning",
                 labels={"team": application.owner_team},
@@ -298,7 +298,7 @@ class RuleGenerationAgent:
             ),
             PrometheusRuleSpec(
                 name=f"{slug}-memory-high",
-                expr=(f'{mem_metric} > 5e+08' if mem_metric != "up" else f'up{{job="{slug}"}} == 0'),
+                expr=(f'{mem_metric}{{job="{slug}"}} > 5e+08' if mem_metric != "up" else f'(up{{job="{slug}"}} == 0) or absent(up{{job="{slug}"}})'),
                 duration="10m",
                 severity="warning",
                 labels={"team": application.owner_team},
@@ -309,7 +309,7 @@ class RuleGenerationAgent:
             alert_rules.append(
                 PrometheusRuleSpec(
                     name=f"{slug}-latency-p95-high",
-                    expr=f'histogram_quantile(0.95, sum(rate({latency_metric}[5m])) by (le)) > 1',
+                    expr=f'histogram_quantile(0.95, sum(rate({latency_metric}{{job="{slug}"}}[5m])) by (le)) > 1',
                     duration="5m",
                     severity="critical",
                     labels={"team": application.owner_team},
@@ -320,7 +320,7 @@ class RuleGenerationAgent:
             alert_rules.append(
                 PrometheusRuleSpec(
                     name=f"{slug}-http-5xx-rate",
-                    expr=f'sum(rate({five_xx_metric}{{status=~"5.."}}[5m])) > 0.05',
+                    expr=f'sum(rate({five_xx_metric}{{job="{slug}",status=~"5.."}}[5m])) > 0.05',
                     duration="5m",
                     severity="critical",
                     labels={"team": application.owner_team},

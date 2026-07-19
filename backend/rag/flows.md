@@ -230,6 +230,14 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Summary:** Real Prometheus-based MySQL exporter and DB signal monitoring
 - **Recommended Action:** Investigate issue
 
+## New Alert Onboarding
+- **Service:** payments
+- **Severity:** HIGH
+- **Alert Type:** availability
+- **Alert ID:** NEW-ALERT-ONBOARDING
+- **Summary:** create rule for checking the alerts are getting ingested  every 10 mins
+- **Recommended Action:** Investigate issue
+
 ## Orders database replica lag
 - **Service:** orders-db
 - **Severity:** CRITICAL
