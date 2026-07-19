@@ -3,7 +3,10 @@ param(
     [string]$MonitoringBase = "http://localhost:8000",
     [int]$TotalAlerts = 20000,
     [int]$BatchSize = 500,
-    [int]$DetailWrites = 200
+    [int]$DetailWrites = 200,
+    [ValidateRange(0, 300)]
+    [int]$PostIngestSettleSeconds = 15,
+    [string]$MysqlContainer = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,6 +15,42 @@ if ($TotalAlerts -le 0) { throw "TotalAlerts must be > 0" }
 if ($BatchSize -le 0) { throw "BatchSize must be > 0" }
 if (($TotalAlerts % $BatchSize) -ne 0) { throw "TotalAlerts must be divisible by BatchSize" }
 if ($DetailWrites -le 0) { throw "DetailWrites must be > 0" }
+
+function Resolve-MySqlContainer {
+    param([string]$RequestedContainer)
+
+    if ($RequestedContainer.Trim()) {
+        $state = docker inspect -f "{{.State.Running}}" $RequestedContainer 2>$null
+        if ($LASTEXITCODE -eq 0 -and $state -eq "true") {
+            return $RequestedContainer
+        }
+        throw "MySQL container '$RequestedContainer' was not found or is not running"
+    }
+
+    $runningNames = @(docker ps --filter "name=mysql" --format "{{.Names}}" 2>$null)
+    if (-not $runningNames -or $runningNames.Count -eq 0) {
+        throw "Unable to find a running MySQL container. Start the Docker Compose stack or pass -MysqlContainer <name>."
+    }
+
+    $preferred = @(
+        "kaiops_pubsub-mysql-1",
+        "kaiops-mysql-1"
+    )
+    foreach ($candidate in $preferred) {
+        if ($runningNames -contains $candidate) {
+            return $candidate
+        }
+    }
+
+    $composeMysql = @($runningNames | Where-Object { $_ -match "(^|[-_])mysql-1$" })
+    if ($composeMysql.Count -gt 0) {
+        return [string]$composeMysql[0]
+    }
+
+    return [string]$runningNames[0]
+}
+
+$ResolvedMysqlContainer = Resolve-MySqlContainer -RequestedContainer $MysqlContainer
 
 function Get-DbCounts {
     $query = @"
@@ -26,16 +65,16 @@ SELECT JSON_OBJECT(
 ) AS payload;
 "@
 
-    $json = docker exec kaiops-mysql-1 mysql -ukaiops -pkaiops -D kaiops -N -s -e $query
+    $json = docker exec $ResolvedMysqlContainer mysql -ukaiops -pkaiops -D kaiops -N -s -e $query
     if (-not $json) {
-        throw "Unable to fetch DB counts from MySQL container"
+        throw "Unable to fetch DB counts from MySQL container '$ResolvedMysqlContainer'"
     }
     return ($json | ConvertFrom-Json)
 }
 
 function Get-ProjectionStatusCountsSince([string]$sinceUtc) {
     $query = "SELECT status, COUNT(*) AS c FROM incident_projections WHERE updated_at >= '$sinceUtc' GROUP BY status ORDER BY c DESC;"
-    $rows = docker exec kaiops-mysql-1 mysql -ukaiops -pkaiops -D kaiops -N -s -e $query
+    $rows = docker exec $ResolvedMysqlContainer mysql -ukaiops -pkaiops -D kaiops -N -s -e $query
     $map = @{}
     foreach ($line in $rows) {
         $parts = $line -split "`t"
@@ -52,7 +91,7 @@ $runId = [DateTime]::UtcNow.ToString("yyyyMMddHHmmss")
 $runStartUtc = [DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm:ss")
 $newProjectName = "stress-onboard-$runId"
 
-Write-Host "[1/6] Capturing baseline DB counts..."
+Write-Host "[1/6] Capturing baseline DB counts from $ResolvedMysqlContainer..."
 $baseline = Get-DbCounts
 
 Write-Host "[2/6] Onboarding new project: $newProjectName"
@@ -195,9 +234,14 @@ for ($batch = 1; $batch -le $batchCount; $batch++) {
         $ingestFailures += 1
     }
 
-    if (($i % 25) -eq 0) {
-        Write-Host "  detail writes complete: $i / $DetailWrites"
+    if (($batch % 25) -eq 0) {
+        Write-Host "  ingest batches complete: $batch / $batchCount"
     }
+}
+
+if ($PostIngestSettleSeconds -gt 0) {
+    Write-Host "  waiting $PostIngestSettleSeconds seconds for async DB projection workers..."
+    Start-Sleep -Seconds $PostIngestSettleSeconds
 }
 
 Write-Host "[5/6] Capturing post-run DB counts and status distributions..."

@@ -206,3 +206,38 @@ async def test_onboarding_connectivity_requires_azure_subscription_in_cloud_mode
     assert "azure_subscription_id is required for azure_cloud mode" in str(exc.value)
     assert write_called["save"] is False
     assert write_called["persist"] is False
+
+
+def test_generated_onboarding_documents_use_rag_metadata_contract() -> None:
+    module = load_monitoring_app_module()
+    connectivity = module.OnboardingConnectivityPayload.model_validate(valid_payload())
+    workflow_result = {
+        "workflow_id": "workflow-1",
+        "onboarding_id": "onboarding-1",
+        "trace_id": "trace-1",
+        "generated_rules": [
+            {
+                "name": "payments-null-customer-id-critical-prometheus",
+                "platform": "prometheus",
+                "expression": "null_customer_id_ratio > 2",
+            }
+        ],
+    }
+
+    documents = module._build_onboarding_rag_documents(
+        connectivity=connectivity,
+        selected_tool="prometheus",
+        workflow_result=workflow_result,
+        requirements=["Generate a critical data quality alert for null customer IDs"],
+        source_documents=[
+            {
+                "kind": "rca",
+                "name": "dq-rca.md",
+                "excerpt": "Null customer ID ratio exceeded threshold.",
+            }
+        ],
+    )
+
+    assert {document["kind"] for document in documents} == {"incident", "runbook", "dependency", "change"}
+    for document in documents:
+        assert all(isinstance(value, str) for value in document.get("metadata", {}).values())

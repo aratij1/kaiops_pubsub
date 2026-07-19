@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     rabbitmq_queue_prefix: str = Field(default="kaiops", alias="RABBITMQ_QUEUE_PREFIX")
     rabbitmq_consumer_max_retries: int = Field(default=3, alias="RABBITMQ_CONSUMER_MAX_RETRIES")
     rabbitmq_dlq_suffix: str = Field(default=".dlq", alias="RABBITMQ_DLQ_SUFFIX")
+    rabbitmq_startup_attempts: int = Field(default=30, alias="RABBITMQ_STARTUP_ATTEMPTS")
+    rabbitmq_startup_retry_seconds: float = Field(default=2.0, alias="RABBITMQ_STARTUP_RETRY_SECONDS")
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     database_url: str = Field(
         default=_LOCAL_MYSQL_DEFAULT_URL,

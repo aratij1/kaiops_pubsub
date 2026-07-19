@@ -72,6 +72,14 @@ def _build_closure_event_payload(
     }
 
 
+def _resolve_closure_service_name(action: RemediationAction, incident_payload: dict[str, Any] | None) -> str:
+    payload = incident_payload if isinstance(incident_payload, dict) else {}
+    service = str(payload.get("service") or "").strip()
+    if service:
+        return service
+    return str(action.target or "unknown").strip() or "unknown"
+
+
 async def _persist_closure_event(
     *,
     app: FastAPI,
@@ -89,10 +97,11 @@ async def _persist_closure_event(
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
         incident_payload = await repo.get_incident(str(action.incident_id)) or {}
+        service_name = _resolve_closure_service_name(action, incident_payload)
         final_incident_payload = {
             **(incident_payload if isinstance(incident_payload, dict) else {}),
             "id": str(action.incident_id),
-            "service": str((incident_payload or {}).get("service") or action.target or "unknown"),
+            "service": service_name,
             "title": str((incident_payload or {}).get("title") or f"Incident {action.incident_id}"),
             "environment": str((incident_payload or {}).get("environment") or "prod"),
             "severity": str((incident_payload or {}).get("severity") or recommendation.get("severity") or "warning").lower(),
@@ -114,7 +123,7 @@ async def _persist_closure_event(
                 },
                 scope={
                     "tenant_id": "default",
-                    "service": str(action.target or "unknown"),
+                    "service": service_name,
                     "environment": "prod",
                     "region": None,
                     "team": None,

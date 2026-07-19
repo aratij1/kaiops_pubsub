@@ -3,8 +3,10 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .venv/
+.tmp/
 .env
 .env.azure
+.env.*.generated
 *.pyc
 *.pyo
 *.pyd

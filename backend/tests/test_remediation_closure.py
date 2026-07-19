@@ -20,7 +20,7 @@ async def test_remediation_engine_executes_rollback_strategy() -> None:
 
     assert action.action_type == "rollback_deployment"
     assert completed.status == RemediationStatus.SUCCEEDED
-    assert "jenkins rollback" in completed.output
+    assert "executed rollback_deployment" in completed.output
 
 
 @pytest.mark.asyncio

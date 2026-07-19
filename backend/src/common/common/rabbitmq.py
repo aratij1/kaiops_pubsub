@@ -36,17 +36,36 @@ class RabbitMQProducer:
     async def start(self) -> None:
         if self._connection is not None:
             return
-        self._connection = await aio_pika.connect_robust(self._settings.rabbitmq_url)
-        self._channel = await self._connection.channel()
-        self._exchange = await self._channel.declare_exchange(
-            self._settings.rabbitmq_exchange,
-            ExchangeType.TOPIC,
-            durable=True,
-        )
-        logger.info(
-            "connected rabbitmq producer",
-            extra={"url": self._settings.rabbitmq_url, "exchange": self._settings.rabbitmq_exchange},
-        )
+        attempts = max(1, int(self._settings.rabbitmq_startup_attempts or 1))
+        retry_seconds = max(0.1, float(self._settings.rabbitmq_startup_retry_seconds or 0.1))
+        for attempt in range(1, attempts + 1):
+            try:
+                self._connection = await aio_pika.connect_robust(self._settings.rabbitmq_url)
+                self._channel = await self._connection.channel()
+                self._exchange = await self._channel.declare_exchange(
+                    self._settings.rabbitmq_exchange,
+                    ExchangeType.TOPIC,
+                    durable=True,
+                )
+                logger.info(
+                    "connected rabbitmq producer",
+                    extra={"url": self._settings.rabbitmq_url, "exchange": self._settings.rabbitmq_exchange},
+                )
+                return
+            except Exception:
+                await self.stop()
+                logger.warning(
+                    "rabbitmq producer connect retry",
+                    extra={
+                        "attempt": attempt,
+                        "max_attempts": attempts,
+                        "retry_seconds": retry_seconds,
+                    },
+                    exc_info=True,
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(retry_seconds)
+        raise RuntimeError("rabbitmq producer failed to connect after retries")
 
     async def stop(self) -> None:
         if self._connection is not None:
@@ -92,29 +111,49 @@ class RabbitMQConsumer:
     async def start(self) -> None:
         if self._connection is not None:
             return
-        self._connection = await aio_pika.connect_robust(self._settings.rabbitmq_url)
-        self._channel = await self._connection.channel()
-        self._exchange = await self._channel.declare_exchange(
-            self._settings.rabbitmq_exchange,
-            ExchangeType.TOPIC,
-            durable=True,
-        )
-        queue_name = f"{self._settings.rabbitmq_queue_prefix}.{self._settings.service_name}.{self._topic}"
-        self._queue = await self._channel.declare_queue(queue_name, durable=True)
-        await self._queue.bind(self._exchange, routing_key=self._topic)
-        self._dlq_routing_key = f"{self._topic}{self._settings.rabbitmq_dlq_suffix}"
-        dlq_queue_name = f"{queue_name}.dlq"
-        dlq_queue = await self._channel.declare_queue(dlq_queue_name, durable=True)
-        await dlq_queue.bind(self._exchange, routing_key=self._dlq_routing_key)
-        logger.info(
-            "connected rabbitmq consumer",
-            extra={
-                "topic": self._topic,
-                "queue": queue_name,
-                "dlq_queue": dlq_queue_name,
-                "exchange": self._settings.rabbitmq_exchange,
-            },
-        )
+        attempts = max(1, int(self._settings.rabbitmq_startup_attempts or 1))
+        retry_seconds = max(0.1, float(self._settings.rabbitmq_startup_retry_seconds or 0.1))
+        for attempt in range(1, attempts + 1):
+            try:
+                self._connection = await aio_pika.connect_robust(self._settings.rabbitmq_url)
+                self._channel = await self._connection.channel()
+                self._exchange = await self._channel.declare_exchange(
+                    self._settings.rabbitmq_exchange,
+                    ExchangeType.TOPIC,
+                    durable=True,
+                )
+                queue_name = f"{self._settings.rabbitmq_queue_prefix}.{self._settings.service_name}.{self._topic}"
+                self._queue = await self._channel.declare_queue(queue_name, durable=True)
+                await self._queue.bind(self._exchange, routing_key=self._topic)
+                self._dlq_routing_key = f"{self._topic}{self._settings.rabbitmq_dlq_suffix}"
+                dlq_queue_name = f"{queue_name}.dlq"
+                dlq_queue = await self._channel.declare_queue(dlq_queue_name, durable=True)
+                await dlq_queue.bind(self._exchange, routing_key=self._dlq_routing_key)
+                logger.info(
+                    "connected rabbitmq consumer",
+                    extra={
+                        "topic": self._topic,
+                        "queue": queue_name,
+                        "dlq_queue": dlq_queue_name,
+                        "exchange": self._settings.rabbitmq_exchange,
+                    },
+                )
+                return
+            except Exception:
+                await self.stop()
+                logger.warning(
+                    "rabbitmq consumer connect retry",
+                    extra={
+                        "topic": self._topic,
+                        "attempt": attempt,
+                        "max_attempts": attempts,
+                        "retry_seconds": retry_seconds,
+                    },
+                    exc_info=True,
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(retry_seconds)
+        raise RuntimeError(f"rabbitmq consumer failed to connect after retries for topic {self._topic}")
 
     async def stop(self) -> None:
         if self._connection is not None:

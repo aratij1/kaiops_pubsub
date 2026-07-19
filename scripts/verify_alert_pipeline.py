@@ -131,6 +131,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-seconds", type=float, default=45.0)
     parser.add_argument("--poll-interval-seconds", type=float, default=5.0)
     parser.add_argument("--request-timeout-seconds", type=float, default=8.0)
+    parser.add_argument("--mode", choices=["strict", "sanity"], default="strict")
+    parser.add_argument("--minimum-metric-value", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -152,20 +154,27 @@ def main() -> int:
             time.sleep(max(0.1, float(args.poll_interval_seconds)))
             continue
 
-        ok = snapshot.metric_found and snapshot.prometheus_alert_found and snapshot.alertmanager_found and snapshot.gateway_found
+        strict_ok = snapshot.metric_found and snapshot.prometheus_alert_found and snapshot.alertmanager_found and snapshot.gateway_found
+        metric_value_ok = snapshot.metric_value is not None and snapshot.metric_value >= args.minimum_metric_value
+        sanity_ok = snapshot.metric_found and metric_value_ok and snapshot.gateway_rows_count > 0
+        ok = strict_ok if args.mode == "strict" else sanity_ok
         print(
             json.dumps(
                 {
                     "ok": ok,
+                    "mode": args.mode,
                     "alert_name": args.alert_name,
                     "metric_found": snapshot.metric_found,
                     "metric_value": snapshot.metric_value,
+                    "minimum_metric_value": args.minimum_metric_value,
                     "prometheus_alert_found": snapshot.prometheus_alert_found,
                     "prometheus_states": snapshot.prometheus_states,
                     "alertmanager_found": snapshot.alertmanager_found,
                     "gateway_found": snapshot.gateway_found,
                     "gateway_rows_count": snapshot.gateway_rows_count,
                     "gateway_match": snapshot.gateway_match,
+                    "strict_ok": strict_ok,
+                    "sanity_ok": sanity_ok,
                 },
                 indent=2,
             )

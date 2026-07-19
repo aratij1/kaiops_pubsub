@@ -64,7 +64,7 @@ def test_rule_generation_creates_prometheus_artifacts_shape() -> None:
     assert result.scrape_config.job_name == "checkout-api"
     assert result.alert_rules
     assert any(rule.name == "checkout-api-target-down" for rule in result.alert_rules)
-    assert any(rule.name == "checkout-api:availability:ratio" for rule in result.recording_rules)
+    assert any(rule.name == "checkout_api:availability:ratio" for rule in result.recording_rules)
     assert result.governance["decision"] in {"approved", "requires_approval"}
 
 

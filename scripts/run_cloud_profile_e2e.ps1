@@ -16,6 +16,9 @@ param(
     [string]$PrometheusUrl = 'http://localhost:9090',
     [Parameter(Mandatory = $false)]
     [string]$AlertmanagerUrl = 'http://localhost:9093'
+    ,[Parameter(Mandatory = $false)]
+    [ValidateSet('strict', 'sanity')]
+    [string]$PipelineVerificationMode = 'sanity'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,8 +39,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if (-not $SkipPipelineCheck) {
-    Write-Host "[3/4] Verifying alert pipeline signal propagation"
-    & $PythonExe scripts/verify_alert_pipeline.py --prometheus-url $PrometheusUrl --alertmanager-url $AlertmanagerUrl --gateway-url $GatewayUrl
+    Write-Host "[3/4] Verifying alert pipeline signal propagation (mode=$PipelineVerificationMode)"
+    & $PythonExe scripts/verify_alert_pipeline.py --prometheus-url $PrometheusUrl --alertmanager-url $AlertmanagerUrl --gateway-url $GatewayUrl --mode $PipelineVerificationMode
     if ($LASTEXITCODE -ne 0) {
         throw "verify_alert_pipeline failed"
     }
@@ -47,7 +50,7 @@ if (-not $SkipPipelineCheck) {
 
 if (-not $SkipWorkflowRounds) {
     Write-Host "[4/4] Running full async workflow e2e rounds"
-    .\scripts\run_e2e_rounds.ps1 -Rounds $Rounds -AlertmanagerUrl $AlertmanagerUrl -GatewayUrl $GatewayUrl -MonitoringAdapterUrl $MonitoringUrl
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_e2e_rounds.ps1 -Rounds $Rounds -AlertmanagerUrl $AlertmanagerUrl -GatewayUrl $GatewayUrl -MonitoringAdapterUrl $MonitoringUrl
     if ($LASTEXITCODE -ne 0) {
         throw "run_e2e_rounds failed"
     }

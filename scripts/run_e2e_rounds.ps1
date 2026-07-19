@@ -127,8 +127,8 @@ $results = for ($roundIndex = 1; $roundIndex -le $Rounds; $roundIndex++) {
 
 $summary = [pscustomobject]@{
     results = @($results)
-    passed = (@($results) | Where-Object { $_.status -eq 'pass' }).Count
-    failed = (@($results) | Where-Object { $_.status -eq 'fail' }).Count
+    passed = @(@($results) | Where-Object { $_.status -eq 'pass' }).Count
+    failed = @(@($results) | Where-Object { $_.status -eq 'fail' }).Count
 }
 
 $summary | ConvertTo-Json -Depth 8

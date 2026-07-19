@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, TypedDict
 
 from common.agent_runtime import AgentRuntime, ContextFailure, ValidationError
@@ -25,6 +26,7 @@ class ResolutionState(TypedDict, total=False):
     recommended_action: str
     confidence: float
     rationale: str
+    commands: list[str]
     model_usage: list[dict[str, Any]]
     model_calls: list[dict[str, Any]]
 
@@ -46,6 +48,120 @@ class ResolutionIntelligenceAgent(BaseAgent):
         # Bound each model call so a single blocked provider cannot stall event consumption.
         self.model_step_timeout_seconds = 20.0
         self.graph = self._build_graph()
+
+    @staticmethod
+    def _norm(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    @staticmethod
+    def _extract_runbook_commands(runbook: str, *, max_items: int = 4) -> list[str]:
+        if not str(runbook or "").strip():
+            return []
+        commands: list[str] = []
+        for line in str(runbook).splitlines():
+            token = line.strip().lstrip("- ").strip().strip("`")
+            if not token:
+                continue
+            token = re.sub(r"^\s*(cmd|command|script|query)\s*:\s*", "", token, flags=re.IGNORECASE).strip()
+            if token.startswith("#"):
+                continue
+            # Capture command-like steps while avoiding prose-heavy runbook lines.
+            if (
+                token.startswith(("kubectl ", "helm ", "terraform ", "ansible-playbook ", "redis-cli ", "mysql "))
+                or token.startswith("scripts/")
+                or token.startswith("./")
+                or token.startswith("Invoke-")
+                or token.startswith("Get-")
+            ):
+                commands.append(token)
+            if len(commands) >= max_items:
+                break
+        return commands
+
+    @staticmethod
+    def _sanitize_commands(commands: list[str], *, max_items: int = 4) -> list[str]:
+        sanitized: list[str] = []
+        seen: set[str] = set()
+        for raw in commands:
+            token = str(raw or "").strip().strip("`")
+            if not token:
+                continue
+            token = re.sub(r"^\s*(cmd|command|script|query)\s*:\s*", "", token, flags=re.IGNORECASE).strip()
+            if not token or token.startswith("#"):
+                continue
+            if token.lower().startswith("preview only"):
+                continue
+            if token.lower().startswith("recommended_action"):
+                continue
+            key = token.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            sanitized.append(token)
+            if len(sanitized) >= max_items:
+                break
+        return sanitized
+
+    def _infer_root_cause(self, context: Context, model_root_cause: str) -> str:
+        deployment = str(context.deployment or "").strip()
+        description = self._norm(context.alert.description)
+        if deployment and any(keyword in description for keyword in ["deploy", "release", "rollout", "version"]):
+            return deployment
+
+        for change in context.recent_changes[:5]:
+            message = self._norm(change.get("message") or change.get("title"))
+            if any(keyword in message for keyword in ["deploy", "release", "rollback", "config", "schema"]):
+                return str(change.get("message") or change.get("title") or model_root_cause).strip()
+
+        return str(model_root_cause or f"Likely degradation in {context.alert.service}").strip()
+
+    def _infer_action_and_commands(self, context: Context, root_cause: str, model_action: str) -> tuple[str, list[str], str]:
+        description = self._norm(context.alert.description)
+        root = self._norm(root_cause)
+        runbook = str(context.runbook or "")
+        runbook_commands = self._sanitize_commands(self._extract_runbook_commands(runbook), max_items=4)
+
+        if any(keyword in root for keyword in ["deploy", "release", "rollout", "version"]):
+            target = str(context.kubernetes.get("deployment") or context.alert.service or "service").strip()
+            return (
+                "Rollback deployment",
+                runbook_commands or [f"kubectl rollout undo deployment/{target} -n prod"],
+                target,
+            )
+
+        if "pod" in description or "oom" in description or "crashloop" in description:
+            target = str(context.kubernetes.get("deployment") or context.alert.service or "service").strip()
+            return (
+                "Restart pod",
+                runbook_commands or [f"kubectl rollout restart deployment/{target} -n prod"],
+                target,
+            )
+
+        if "latency" in description or "timeout" in description:
+            target = str(context.alert.service or "service").strip()
+            return (
+                "Scale deployment and validate latency reduction",
+                runbook_commands or [f"kubectl scale deployment/{target} --replicas=3 -n prod"],
+                target,
+            )
+
+        if "database" in description or "replica" in description:
+            target = str(context.alert.service or "database").strip()
+            return (
+                "Fail over database and validate replication health",
+                runbook_commands or ["mysql -e \"SHOW REPLICA STATUS;\""],
+                target,
+            )
+
+        target = str(context.alert.service or "service").strip()
+        action = str(model_action or "Investigate service and apply runbook remediation").strip()
+        if runbook_commands:
+            return action, runbook_commands, target
+        fallback_commands = [
+            f"kubectl rollout status deployment/{target} -n prod --timeout=180s",
+            f"kubectl get pods -n prod | findstr {target}",
+        ]
+        return action, self._sanitize_commands(fallback_commands, max_items=4), target
 
     async def _generate_with_fallback(
         self,
@@ -159,8 +275,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
             payload=payload,
             fallback_content=f"Likely service degradation in {context.alert.service}",
         )
-        deployment = context.deployment or "unknown change"
-        state["root_cause"] = deployment if "Deployment" in deployment else response["content"]
+        state["root_cause"] = self._infer_root_cause(context, str(response["content"]))
         state["rationale"] = f"Model {response['model']} linked symptoms to {state['root_cause']}"
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
@@ -221,59 +336,67 @@ class ResolutionIntelligenceAgent(BaseAgent):
 
     async def generate_fix(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
-        root_cause = state["root_cause"].lower()
-        if "deployment" in root_cause:
-            action = "Rollback deployment"
-            commands = [f"rollback:{context.kubernetes.get('deployment', context.alert.service)}"]
-        elif "pod" in context.alert.description.lower():
-            action = "Restart pod"
-            commands = [f"restart-pod:{context.alert.service}"]
-        else:
-            prompt = PROMPT_RECOMMEND_REMEDIATION
-            payload = {"service": context.alert.service, "runbook": context.runbook}
-            response = await self._generate_with_fallback(
-                context=context,
-                task=ModelTask.FIX,
-                prompt=prompt,
-                payload=payload,
-                fallback_content=f"Investigate {context.alert.service} health and apply documented runbook remediation",
-            )
-            action = response["content"]
-            commands = []
-            state.setdefault("model_usage", []).append(response["usage"])
-            state.setdefault("model_calls", []).append(
-                {
-                    "task": ModelTask.FIX.value,
-                    "provider": response["model"],
-                    "model": response["usage"].get("model"),
-                    "prompt": prompt,
-                    "payload": payload,
-                    "response": {
-                        "text": response["content"],
-                        "parameters": {
-                            "provider": response["model"],
-                            "model": response["usage"].get("model"),
-                            "task": ModelTask.FIX.value,
-                        },
+        prompt = PROMPT_RECOMMEND_REMEDIATION
+        payload = {"service": context.alert.service, "runbook": context.runbook, "root_cause": state.get("root_cause", "")}
+        response = await self._generate_with_fallback(
+            context=context,
+            task=ModelTask.FIX,
+            prompt=prompt,
+            payload=payload,
+            fallback_content=f"Investigate {context.alert.service} health and apply documented runbook remediation",
+        )
+        action, commands, remediation_target = self._infer_action_and_commands(
+            context,
+            str(state.get("root_cause") or ""),
+            str(response["content"]),
+        )
+        state["remediation_target"] = remediation_target
+        state.setdefault("model_usage", []).append(response["usage"])
+        state.setdefault("model_calls", []).append(
+            {
+                "task": ModelTask.FIX.value,
+                "provider": response["model"],
+                "model": response["usage"].get("model"),
+                "prompt": prompt,
+                "payload": payload,
+                "response": {
+                    "text": response["content"],
+                    "parameters": {
+                        "provider": response["model"],
+                        "model": response["usage"].get("model"),
+                        "task": ModelTask.FIX.value,
                     },
-                    "usage": response["usage"],
-                }
-            )
+                },
+                "usage": response["usage"],
+            }
+        )
         state["recommended_action"] = action
         state["commands"] = commands
         return state
 
     async def confidence_scoring(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
-        score = 0.55
+        score = 0.5
         if context.deployment:
-            score += 0.2
+            score += 0.18
         if context.related_incidents:
-            score += 0.1
+            score += 0.12
         if context.runbook:
-            score += 0.06
+            score += 0.1
         if context.alert.severity in {AlertSeverity.HIGH, AlertSeverity.CRITICAL}:
             score += 0.05
+        if state.get("commands"):
+            score += 0.05
+
+        fallback_hits = 0
+        for usage in state.get("model_usage", []):
+            provider = self._norm((usage or {}).get("provider"))
+            model = self._norm((usage or {}).get("model"))
+            if provider == "fallback" or model == "fallback" or "error" in usage:
+                fallback_hits += 1
+        if fallback_hits:
+            score -= min(0.2, 0.08 * fallback_hits)
+
         state["confidence"] = min(score, 0.99)
         return state
 
@@ -314,6 +437,10 @@ class ResolutionIntelligenceAgent(BaseAgent):
         recommendation.metadata["evidence"] = [item.model_dump(mode="json") for item in evidence]
         recommendation.metadata["evidence_ids"] = [item.id for item in evidence]
         recommendation.metadata["reasoning"] = state.get("rationale", "")
+        recommendation.metadata["service"] = str(context.alert.service or "")
+        recommendation.metadata["environment"] = str(context.alert.environment or "prod")
+        recommendation.metadata["remediation_target"] = str(state.get("remediation_target") or context.alert.service or "")
+        recommendation.metadata["recommended_commands"] = state.get("commands", [])
         recommendation.metadata["citations"] = [
             f"runbook://{context.alert.service}",
             f"incident://{context.incident_id}",
