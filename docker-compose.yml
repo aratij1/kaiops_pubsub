@@ -1,13 +1,13 @@
 x-service-env: &service-env
   KAFKA_BOOTSTRAP_SERVERS: kafka:9092
   REDIS_URL: redis://redis:6379/0
-  DATABASE_URL: mysql+aiomysql://kaiops:kaiops@mysql:3306/kaiops
+  DATABASE_URL: mysql+aiomysql://${DB_USER:-kaiops}:${DB_PASSWORD:-kaiops}@mysql:3306/${DB_DATABASE:-kaiops}
   DB: mysql
   DB_HOST: mysql
   DB_PORT: 3306
-  DB_USER: kaiops
-  DB_PASSWORD: kaiops
-  DB_DATABASE: kaiops
+  DB_USER: ${DB_USER:-kaiops}
+  DB_PASSWORD: ${DB_PASSWORD:-kaiops}
+  DB_DATABASE: ${DB_DATABASE:-kaiops}
   JWT_SECRET_KEY: ${JWT_SECRET_KEY:-kaiops-local-demo-secret-key-change-me}
   ADMIN_USER_PASSWORD: ${ADMIN_USER_PASSWORD:-Admin@123456}
   EXECUTIVE_USER_PASSWORD: ${EXECUTIVE_USER_PASSWORD:-Executive@123456}
@@ -42,7 +42,7 @@ x-service-env: &service-env
   MESSAGE_BUS_WORKER_COUNT: "1"
   KAFKA_CONSUMER_MAX_RETRIES: "3"
   KAFKA_DLQ_SUFFIX: .dlq
-  RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+  RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672/
   RABBITMQ_EXCHANGE: kaiops.events
   RABBITMQ_QUEUE_PREFIX: kaiops
   RABBITMQ_CONSUMER_MAX_RETRIES: "3"
@@ -77,23 +77,27 @@ x-service-build: &service-build
 services:
   mysql:
     image: mysql:8.4
+    restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: kaiops
-      MYSQL_USER: kaiops
-      MYSQL_PASSWORD: kaiops
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-kaiops}
+      MYSQL_USER: ${MYSQL_USER:-kaiops}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-kaiops}
     ports: ["${MYSQL_HOST_PORT:-3306}:3306"]
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -ukaiops -pkaiops"]
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u${MYSQL_USER:-kaiops} -p${MYSQL_PASSWORD:-kaiops}"]
       interval: 5s
       timeout: 5s
       retries: 20
 
   redis:
     image: redis:7
+    restart: unless-stopped
     ports: ["6379:6379"]
+    volumes:
+      - redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -102,11 +106,16 @@ services:
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.7.1
+    restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
 
   kafka:
     image: confluentinc/cp-kafka:7.7.1
+    restart: unless-stopped
     depends_on: [zookeeper]
     ports: ["9092:9092"]
     environment:
@@ -116,6 +125,8 @@ services:
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD-SHELL", "kafka-topics --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
       interval: 5s
@@ -125,7 +136,13 @@ services:
 
   rabbitmq:
     image: rabbitmq:3.13-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
     ports: ["5672:5672", "15672:15672"]
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 5s
@@ -134,17 +151,19 @@ services:
 
   mysql-exporter:
     image: prom/mysqld-exporter:v0.16.0
+    restart: unless-stopped
     command:
       - --mysqld.address=mysql:3306
-      - --mysqld.username=kaiops
+      - --mysqld.username=${MYSQL_USER:-kaiops}
     environment:
-      MYSQLD_EXPORTER_PASSWORD: kaiops
+      MYSQLD_EXPORTER_PASSWORD: ${MYSQL_PASSWORD:-kaiops}
     ports: ["9104:9104"]
     depends_on:
       mysql: { condition: service_healthy }
 
   node-exporter:
     image: prom/node-exporter:v1.8.1
+    restart: unless-stopped
     command:
       - --path.procfs=/host/proc
       - --path.sysfs=/host/sys
@@ -158,6 +177,7 @@ services:
 
   blackbox-exporter:
     image: prom/blackbox-exporter:v0.25.0
+    restart: unless-stopped
     command:
       - --config.file=/etc/blackbox_exporter/config.yml
     volumes:
@@ -166,6 +186,7 @@ services:
 
   kafka-exporter:
     image: danielqsj/kafka-exporter:v1.7.0
+    restart: unless-stopped
     command:
       - --kafka.server=kafka:9092
     ports: ["9308:9308"]
@@ -174,6 +195,7 @@ services:
 
   alertmanager:
     image: prom/alertmanager:v0.27.0
+    restart: unless-stopped
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
       - --storage.path=/alertmanager
@@ -185,6 +207,7 @@ services:
 
   prometheus:
     image: prom/prometheus:v2.54.1
+    restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
@@ -207,13 +230,14 @@ services:
 
   monitoring-adapter:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: monitoring-adapter }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/monitoring-adapter
     ports: ["8001:8000"]
     volumes:
       - ./backend/rag:/app/rag
-      - ./backend/ingested_alerts:/app/ingested_alerts
+      - ${INGESTED_ALERTS_HOST_PATH:-./backend/ingested_alerts}:/app/ingested_alerts
     depends_on:
       kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
@@ -222,6 +246,7 @@ services:
 
   application-onboarding:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: application-onboarding }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/application-onboarding
@@ -232,6 +257,7 @@ services:
 
   discovery-service:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: discovery-service }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/discovery-service
@@ -243,6 +269,7 @@ services:
 
   metrics-validation-agent:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: metrics-validation-agent }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/metrics-validation-agent
@@ -254,6 +281,7 @@ services:
 
   rule-generation-agent:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: rule-generation-agent }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/rule-generation-agent
@@ -265,6 +293,7 @@ services:
 
   prometheus-config-service:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: prometheus-config-service }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/prometheus-config-service
@@ -279,6 +308,7 @@ services:
 
   validation-agent:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: validation-agent }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/validation-agent
@@ -291,6 +321,7 @@ services:
 
   dashboard-generator:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: dashboard-generator }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/dashboard-generator
@@ -302,6 +333,7 @@ services:
 
   audit-service:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: audit-service }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/audit-service
@@ -312,6 +344,7 @@ services:
 
   api-gateway:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: api-gateway }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/api-gateway
@@ -334,6 +367,7 @@ services:
 
   alert-intelligence:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: alert-intelligence }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/alert-intelligence
@@ -345,6 +379,7 @@ services:
 
   orchestrator:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: orchestrator }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/orchestrator
@@ -357,6 +392,7 @@ services:
 
   context-agent:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: context-agent }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/context-agent
@@ -370,6 +406,7 @@ services:
 
   model-router:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: model-router }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/model-router
@@ -380,6 +417,7 @@ services:
 
   resolution-agent:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: resolution-agent }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/resolution-agent
@@ -391,6 +429,7 @@ services:
 
   approval-service:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: approval-service }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/approval-service
@@ -402,6 +441,7 @@ services:
 
   remediation-engine:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: remediation-engine }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/remediation-engine
@@ -412,6 +452,7 @@ services:
 
   closure-service:
     build: *service-build
+    restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: closure-service }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/closure-service
@@ -434,3 +475,8 @@ services:
 volumes:
   mysql-data:
   prometheus-data:
+  redis-data:
+  zookeeper-data:
+  zookeeper-log:
+  kafka-data:
+  rabbitmq-data:

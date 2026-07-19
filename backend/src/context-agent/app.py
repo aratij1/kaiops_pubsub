@@ -246,7 +246,7 @@ app = create_app(title="KaiMS Context Intelligence Agent", settings=settings, st
 
 
 class RagDocumentRequest(BaseModel):
-    kind: str = Field(pattern="^(runbook|incident|deployment|change|dependency|rule)$")
+    kind: str = Field(pattern="^(runbook|incident|deployment|change|dependency|remediation)$")
     alert_id: str | None = Field(default=None, max_length=80)
     alert_type: str | None = Field(default=None, max_length=80)
     severity: str | None = Field(default=None, max_length=32)
@@ -260,6 +260,9 @@ class RagDocumentRequest(BaseModel):
     root_cause: str | None = None
     impact: str | None = None
     execution_plan: str | None = None
+    commands: list[str] = Field(default_factory=list)
+    scripts: list[str] = Field(default_factory=list)
+    queries: list[str] = Field(default_factory=list)
     recommended_action: str | None = None
     source_system: str | None = None
     source_ref: str | None = None
@@ -291,7 +294,7 @@ def kind_directory(kind: str) -> str:
         "deployment": "deployments",
         "change": "changes",
         "dependency": "dependencies",
-        "rule": "rules",
+        "remediation": "remediations",
     }[kind]
 
 
@@ -343,6 +346,12 @@ def render_document(request: RagDocumentRequest) -> str:
         body_lines.extend(["", "## Impact", request.impact.strip()])
     if request.execution_plan:
         body_lines.extend(["", "## Execution Plan", request.execution_plan.strip()])
+    if request.commands:
+        body_lines.extend(["", "## Commands", *[f"- {item}" for item in request.commands if str(item).strip()]])
+    if request.scripts:
+        body_lines.extend(["", "## Scripts", *[f"- {item}" for item in request.scripts if str(item).strip()]])
+    if request.queries:
+        body_lines.extend(["", "## Queries", *[f"- {item}" for item in request.queries if str(item).strip()]])
     return f"{header}\n\n" + "\n".join(body_lines).rstrip() + "\n"
 
 
