@@ -111,6 +111,8 @@ function New-SourceArchive {
     $excludeArgs = @(
         "--exclude=.git",
         "--exclude=.venv",
+        "--exclude=.tmp",
+        "--exclude=.tmp/**",
         "--exclude=logs",
         "--exclude=__pycache__",
         "--exclude=.pytest_cache",
