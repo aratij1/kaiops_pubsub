@@ -335,6 +335,16 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Deployment:** Not explicitly documented.
 - **Execution Plan:** Increase executor memory
 
+## trace-id-fallback-verify Incident Summary
+- **Service:** payments
+- **Severity:** CRITICAL
+- **Alert Type:** trace-id-fallback-verify
+- **Alert ID:** 8f2e775f-839d-4fa0-b182-9568c249a55f
+- **Summary:** trace-id-fallback-verify detected for payments. Impact: Payments service impact requires immediate triage.
+- **Recommended Action:** Rollback deployment
+- **Root Cause:** Deployment 2.5
+- **Impact:** Payments service impact requires immediate triage
+
 ## Unauthorized Data Access Attempt
 - **Service:** data-warehouse
 - **Severity:** CRITICAL

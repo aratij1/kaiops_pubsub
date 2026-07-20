@@ -142,6 +142,21 @@ class Settings(BaseSettings):
     l2_user_password: str = Field(default="L2Engineer@123456", alias="L2_USER_PASSWORD")
     l1_user_password: str = Field(default="L1Operator@123456", alias="L1_USER_PASSWORD")
 
+    smtp_enabled: bool = Field(default=False, alias="SMTP_ENABLED")
+    smtp_host: str = Field(default="", alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, alias="SMTP_PORT")
+    smtp_username: str = Field(default="", alias="SMTP_USERNAME")
+    smtp_password: str = Field(default="", alias="SMTP_PASSWORD")
+    smtp_use_tls: bool = Field(default=True, alias="SMTP_USE_TLS")
+    smtp_from_address: str = Field(default="kaiops-alerts@kaiops.local", alias="SMTP_FROM_ADDRESS")
+    notification_recipient_emails: str = Field(default="", alias="NOTIFICATION_RECIPIENT_EMAILS")
+    teams_enabled: bool = Field(default=False, alias="TEAMS_ENABLED")
+    teams_webhook_url: str = Field(default="", alias="TEAMS_WEBHOOK_URL")
+    notification_min_alert_severity: str = Field(default="high", alias="NOTIFICATION_MIN_ALERT_SEVERITY")
+    notification_incident_poll_interval_seconds: float = Field(
+        default=15.0, alias="NOTIFICATION_INCIDENT_POLL_INTERVAL_SECONDS"
+    )
+
     @model_validator(mode="after")
     def configure_database_url(self) -> "Settings":
         profile = str(self.deployment_profile or "onprem").strip().lower()

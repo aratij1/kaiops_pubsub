@@ -503,6 +503,21 @@
     "source": "rag-incident"
   },
   {
+    "id": "8f2e775f-839d-4fa0-b182-9568c249a55f",
+    "alert_id": "8f2e775f-839d-4fa0-b182-9568c249a55f",
+    "alert_name": "trace-id-fallback-verify Incident Summary",
+    "alert_type": "trace-id-fallback-verify",
+    "title": "trace-id-fallback-verify Incident Summary",
+    "service": "payments",
+    "severity": "CRITICAL",
+    "summary": "trace-id-fallback-verify detected for payments. Impact: Payments service impact requires immediate triage.",
+    "recommended_action": "Rollback deployment",
+    "description": "trace-id-fallback-verify detected for payments. Impact: Payments service impact requires immediate triage.",
+    "root_cause": "Deployment 2.5",
+    "impact": "Payments service impact requires immediate triage",
+    "source": "rag-incident"
+  },
+  {
     "id": "dw-1019",
     "alert_id": "DW-1019",
     "alert_name": "Unauthorized Data Access Attempt",

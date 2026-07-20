@@ -55,6 +55,7 @@ where = [
     "backend/src/validation-agent",
     "backend/src/audit-service",
     "backend/src/monitoring-adapter",
+    "backend/src/notification-service",
 ]
 include = [
     "common*",
@@ -75,6 +76,7 @@ include = [
     "validation_agent*",
     "audit_service*",
     "monitoring_adapter*",
+    "notification_service*",
 ]
 
 [project.optional-dependencies]
@@ -106,6 +108,7 @@ pythonpath = [
     "backend/src/validation-agent",
     "backend/src/audit-service",
     "backend/src/monitoring-adapter",
+    "backend/src/notification-service",
 ]
 testpaths = ["backend/tests"]
 
