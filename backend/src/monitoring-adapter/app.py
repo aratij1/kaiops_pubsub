@@ -3811,10 +3811,34 @@ async def post_onboarding_complete(payload: OnboardingCompletePayload = Body(...
         ),
     }
 
+    requirements = [item for item in payload.plain_language_requirements if str(item or "").strip()]
+
     if not should_start_rules_onboarding:
+        if payload.generate_documents and payload.source_documents:
+            response["rag_documents"] = _build_onboarding_rag_documents(
+                connectivity=connectivity,
+                selected_tool=selected_tool,
+                workflow_result={
+                    "workflow_id": f"{connectivity.project.name}-service-knowledge",
+                    "onboarding_id": f"{connectivity.project.name}-onboarding",
+                    "trace_id": "",
+                    "generated_rules": [],
+                },
+                requirements=requirements,
+                source_documents=payload.source_documents,
+            )
+            response["workflow_steps"] = _build_onboarding_steps_response(
+                onboarding_path=payload.onboarding_path,
+                project_mode=payload.project_mode,
+                start_rules_onboarding=False,
+                requirements=requirements,
+                rules_result=None,
+                prometheus_result=None,
+                rag_documents=response.get("rag_documents", []),
+                landing_pad_summary=landing_pad_summary,
+            )
         return response
 
-    requirements = [item for item in payload.plain_language_requirements if str(item or "").strip()]
     endpoint_url = _selected_tool_url(connectivity, selected_tool)
 
     project_seed = _build_onboarding_rule_seed(connectivity, selected_tool)

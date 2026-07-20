@@ -53,6 +53,7 @@ from common.models import (
     RemediationAction,
     RulesGeneratedResult,
     ResolutionReport,
+    utc_now,
 )
 
 
@@ -929,6 +930,31 @@ class IncidentRepository:
         record = result.scalar_one_or_none()
         return record.payload if record else None
 
+    async def get_latest_recommendation_for_incident(self, incident_id: Any) -> dict[str, Any] | None:
+        incident_uuid = self._parse_uuid(incident_id)
+        if incident_uuid is None:
+            return None
+        audit_stmt = (
+            select(AuditLogRecord)
+            .where(AuditLogRecord.resource_type == "incident")
+            .where(AuditLogRecord.resource_id == str(incident_uuid))
+            .where(AuditLogRecord.action == "recommendation.generated")
+            .order_by(AuditLogRecord.updated_at.desc(), AuditLogRecord.created_at.desc())
+            .limit(1)
+        )
+        audit_result = await self.session.execute(audit_stmt)
+        audit_record = audit_result.scalar_one_or_none()
+        if audit_record is not None and isinstance(audit_record.payload, dict):
+            return audit_record.payload
+
+        projection_result = await self.session.execute(
+            select(IncidentProjectionRecord).where(IncidentProjectionRecord.incident_id == incident_uuid)
+        )
+        projection = projection_result.scalar_one_or_none()
+        if projection is not None and projection.recommendation_id is not None:
+            return {"id": str(projection.recommendation_id), "incident_id": str(incident_uuid)}
+        return None
+
     async def save_approval(self, approval: Approval) -> None:
         await self.session.merge(
             ApprovalRecord(
@@ -940,6 +966,69 @@ class IncidentRepository:
                 payload=approval.model_dump(mode="json"),
             )
         )
+
+    async def update_incident_approval_status(
+        self,
+        incident_id: Any,
+        *,
+        status: str,
+        approval: Approval | None = None,
+    ) -> bool:
+        incident_uuid = self._parse_uuid(incident_id)
+        normalized_status = str(status or "").strip().lower()
+        if incident_uuid is None or not normalized_status:
+            return False
+
+        updated = False
+        now = utc_now()
+
+        incident = await self.session.get(IncidentRecord, incident_uuid)
+        if incident is not None:
+            incident.status = normalized_status
+            payload = dict(incident.payload or {})
+            payload["status"] = normalized_status
+            payload["state"] = normalized_status
+            if approval is not None:
+                payload["approval"] = approval.model_dump(mode="json")
+                payload["approval_status"] = normalized_status
+            incident.payload = payload
+            incident.updated_at = now
+            await self.session.merge(incident)
+            updated = True
+
+        projection = await self.session.get(IncidentProjectionRecord, incident_uuid)
+        if projection is not None:
+            projection.status = normalized_status
+            if approval is not None:
+                projection.owner = str(approval.approver or "") or projection.owner
+                projection.recommendation_id = self._parse_uuid(approval.recommendation_id) or projection.recommendation_id
+            projection.latest_event_type = "incident.approval.recorded"
+            projection.latest_event_at = now
+            projection.updated_at = now
+            projection_payload = dict(projection.projection_payload or {})
+            projection_payload["status"] = normalized_status
+            projection_payload["state"] = normalized_status
+            projection_payload["approval_status"] = normalized_status
+            if approval is not None:
+                projection_payload["approval"] = approval.model_dump(mode="json")
+            projection.projection_payload = projection_payload
+            await self.session.merge(projection)
+            updated = True
+
+        pending = await self.session.get(PendingWorkflowRecord, incident_uuid)
+        if pending is not None:
+            pending.status = normalized_status
+            pending.updated_at = now
+            pending_payload = dict(pending.payload or {})
+            pending_payload["status"] = normalized_status
+            pending_payload["approval_status"] = normalized_status
+            if approval is not None:
+                pending_payload["approval"] = approval.model_dump(mode="json")
+            pending.payload = pending_payload
+            await self.session.merge(pending)
+            updated = True
+
+        return updated
 
     async def save_action(self, action: RemediationAction) -> None:
         await self.session.merge(

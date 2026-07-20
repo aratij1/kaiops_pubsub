@@ -1,7 +1,22 @@
 from api_gateway import SafetyAnalyzer
+import importlib.util
+import json
+import sys
+from pathlib import Path
 from common.models import SafetyDecision
 from common.model_evaluation import build_quality_evaluation
 from api_gateway.auth_policy import route_auth_rule
+
+
+def load_api_gateway_app_module():
+    module_path = Path("backend/src/api-gateway/app.py")
+    spec = importlib.util.spec_from_file_location("api_gateway_app", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_safety_analyzer_allows_normal_alert_payload() -> None:
@@ -132,6 +147,14 @@ def test_gateway_operational_auth_policy_marks_admin_routes() -> None:
     assert route_auth_rule("POST", "/rag/documents") == {"Administrator", "L2 Engineer", "L3 Engineer"}
     assert route_auth_rule("POST", "/approval/approve") is None
     assert route_auth_rule("POST", "/api/v1/alerts/prometheus") is False
+
+
+def test_gateway_accepts_json_string_for_knowledge_pack_payload() -> None:
+    module = load_api_gateway_app_module()
+    payload = {"service": "checkout-api", "documents": [{"name": "runbook.md", "text": "Alert: latency high"}]}
+
+    assert module.require_object_payload(json.dumps(payload), "Knowledge Pack draft payload") == payload
+    assert module.require_object_payload(json.dumps(json.dumps(payload)), "Knowledge Pack draft payload") == payload
 
 
 def test_quality_evaluation_exposes_grounding_and_hallucination_metrics() -> None:

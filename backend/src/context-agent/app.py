@@ -275,6 +275,25 @@ class RagDocumentUpdateRequest(RagDocumentRequest):
     path: str = Field(min_length=3)
 
 
+class KnowledgePackSourceDocument(BaseModel):
+    name: str = Field(default="uploaded-document", max_length=240)
+    category: str | None = Field(default=None, max_length=80)
+    text: str = Field(default="", max_length=200_000)
+    excerpt: str | None = Field(default=None, max_length=1000)
+
+
+class KnowledgePackRequest(BaseModel):
+    service: str | None = Field(default=None, max_length=128)
+    environment: str | None = Field(default=None, max_length=64)
+    owner_team: str | None = Field(default=None, max_length=160)
+    documents: list[KnowledgePackSourceDocument] = Field(default_factory=list)
+
+
+class KnowledgePackApproveRequest(KnowledgePackRequest):
+    accepted_facts: dict[str, Any] = Field(default_factory=dict)
+    approved_by: str | None = Field(default=None, max_length=160)
+
+
 def vector_connector() -> VectorDBConnector:
     for connector in agent.connectors:
         if isinstance(connector, VectorDBConnector):
@@ -296,6 +315,196 @@ def kind_directory(kind: str) -> str:
         "dependency": "dependencies",
         "remediation": "remediations",
     }[kind]
+
+
+def _first_match(patterns: list[str], text: str) -> str:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
+        if match:
+            return str(match.group(1) if match.groups() else match.group(0)).strip(" :-\t\r\n")
+    return ""
+
+
+def _unique_tokens(values: list[str], *, limit: int = 12) -> list[str]:
+    rows: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        token = re.sub(r"\s+", " ", str(value or "").strip(" ,.;:-\n\r\t"))
+        key = token.lower()
+        if not token or key in seen:
+            continue
+        seen.add(key)
+        rows.append(token)
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _fact(value: Any, confidence: float, sources: list[str], status: str | None = None) -> dict[str, Any]:
+    present = bool(value if not isinstance(value, list) else len(value))
+    return {
+        "value": value,
+        "confidence": round(float(confidence if present else 0.0), 3),
+        "sources": _unique_tokens(sources, limit=8),
+        "status": status or ("accepted" if present and confidence >= 0.78 else "needs_review"),
+    }
+
+
+def _classify_pack_document(name: str, text: str, category: str | None = None) -> str:
+    haystack = f"{category or ''} {name} {text}".lower()
+    if re.search(r"\b(rca|postmortem|root cause)\b", haystack):
+        return "incident"
+    if re.search(r"\b(dependency|topology|upstream|downstream|service map)\b", haystack):
+        return "dependency"
+    if re.search(r"\b(change|deployment|release|rollback)\b", haystack):
+        return "change"
+    if re.search(r"\b(remediation|restart|failover|scale|script|command|query)\b", haystack):
+        return "remediation"
+    return "runbook"
+
+
+def build_knowledge_pack(request: KnowledgePackRequest) -> dict[str, Any]:
+    docs = [doc for doc in request.documents if str(doc.text or "").strip()]
+    combined = "\n\n".join(f"# {doc.name}\n{doc.text}" for doc in docs)
+    source_names = [doc.name for doc in docs]
+    service = str(request.service or "").strip() or _first_match(
+        [r"\bservice\s*[:=-]\s*([a-zA-Z0-9_.-]+)", r"\bapplication\s*[:=-]\s*([a-zA-Z0-9_.-]+)"],
+        combined,
+    )
+    environment = str(request.environment or "").strip() or _first_match(
+        [r"\benvironment\s*[:=-]\s*(prod|production|stage|staging|dev|test)", r"\benv\s*[:=-]\s*(prod|production|stage|staging|dev|test)"],
+        combined,
+    )
+    owner = str(request.owner_team or "").strip() or _first_match(
+        [r"\bowner(?:_team|\s+team)?\s*[:=-]\s*([a-zA-Z0-9_.@ -]+)", r"\bteam\s*[:=-]\s*([a-zA-Z0-9_.@ -]+)"],
+        combined,
+    )
+    dependencies = _unique_tokens(
+        re.findall(r"(?:depends on|dependency|upstream|downstream)\s*[:=-]\s*([a-zA-Z0-9_.-]+)", combined, flags=re.IGNORECASE)
+        + re.findall(r"\b(redis|mysql|postgres|kafka|rabbitmq|servicebus|ledger|fraud|checkout|prometheus|grafana)\b", combined, flags=re.IGNORECASE),
+        limit=12,
+    )
+    alert_patterns = _unique_tokens(
+        re.findall(r"(?:alert|monitor|rule)\s*[:=-]\s*([^\n]{8,160})", combined, flags=re.IGNORECASE)
+        + re.findall(r"([^\n]*(?:latency|availability|error rate|5xx|cpu|memory|queue|replication|timeout)[^\n]{0,140})", combined, flags=re.IGNORECASE),
+        limit=10,
+    )
+    commands = _unique_tokens(
+        re.findall(r"^\s*(?:cmd|command|script|query)?\s*:?\s*((?:kubectl|helm|terraform|ansible-playbook|mysql|redis-cli|curl|powershell|scripts/|\./)[^\n`]+)", combined, flags=re.IGNORECASE | re.MULTILINE),
+        limit=10,
+    )
+    rollback = _unique_tokens(
+        re.findall(r"(rollback[^\n]{6,180}|failback[^\n]{6,180}|restore[^\n]{6,180})", combined, flags=re.IGNORECASE),
+        limit=6,
+    )
+    validation_checks = _unique_tokens(
+        re.findall(r"(validate[^\n]{6,180}|verify[^\n]{6,180}|check[^\n]{6,180})", combined, flags=re.IGNORECASE),
+        limit=8,
+    )
+    detected_docs = [
+        {
+            "name": doc.name,
+            "category": doc.category or _classify_pack_document(doc.name, doc.text),
+            "detected_kind": _classify_pack_document(doc.name, doc.text, doc.category),
+            "excerpt": (doc.excerpt or re.sub(r"\s+", " ", doc.text).strip()[:220]),
+        }
+        for doc in docs
+    ]
+    facts = {
+        "service": _fact(service, 0.96 if request.service else 0.78, source_names),
+        "environment": _fact(environment or "prod", 0.92 if request.environment else 0.68, source_names, status="accepted" if environment else "needs_review"),
+        "owner_team": _fact(owner, 0.92 if request.owner_team else 0.7, source_names),
+        "dependencies": _fact(dependencies, 0.82 if dependencies else 0.0, source_names),
+        "alert_patterns": _fact(alert_patterns, 0.84 if alert_patterns else 0.0, source_names),
+        "commands": _fact(commands, 0.8 if commands else 0.0, source_names),
+        "rollback_plan": _fact(rollback, 0.78 if rollback else 0.0, source_names),
+        "validation_checks": _fact(validation_checks, 0.8 if validation_checks else 0.0, source_names),
+    }
+    required = ["service", "environment", "owner_team", "alert_patterns"]
+    recommended = ["dependencies", "commands", "rollback_plan", "validation_checks"]
+    missing_required = [key for key in required if not facts[key]["value"]]
+    missing_recommended = [key for key in recommended if not facts[key]["value"]]
+    low_confidence = [key for key, value in facts.items() if float(value.get("confidence") or 0.0) < 0.7]
+    overall_confidence = round(
+        sum(float(value.get("confidence") or 0.0) for value in facts.values()) / max(1, len(facts)),
+        3,
+    )
+    return {
+        "contract_version": "kaiops.knowledge-pack.v1",
+        "status": "ready" if not missing_required and not low_confidence[:1] else "needs_review",
+        "document_count": len(docs),
+        "detected_documents": detected_docs,
+        "facts": facts,
+        "validation": {
+            "missing_required": missing_required,
+            "missing_recommended": missing_recommended,
+            "low_confidence": low_confidence,
+            "overall_confidence": overall_confidence,
+        },
+        "next_questions": [
+            question
+            for key, question in {
+                "service": "Which service/application is this knowledge pack for?",
+                "owner_team": "Who owns this service?",
+                "alert_patterns": "Which alert pattern or monitor should KaiOps use for this service?",
+                "rollback_plan": "What rollback or failback plan should be used if remediation fails?",
+                "validation_checks": "How should KaiOps verify recovery after remediation?",
+            }.items()
+            if key in missing_required or key in missing_recommended or key in low_confidence
+        ][:5],
+    }
+
+
+def _knowledge_pack_to_rag_request(pack: dict[str, Any], approved_by: str | None = None) -> RagDocumentRequest:
+    facts = pack.get("facts") if isinstance(pack.get("facts"), dict) else {}
+
+    def fact_value(key: str, default: Any = "") -> Any:
+        row = facts.get(key) if isinstance(facts.get(key), dict) else {}
+        value = row.get("value", default)
+        return value if value not in (None, "") else default
+
+    service = str(fact_value("service", "unknown-service")).strip() or "unknown-service"
+    environment = str(fact_value("environment", "prod")).strip() or "prod"
+    owner = str(fact_value("owner_team", approved_by or "unassigned")).strip() or "unassigned"
+    dependencies = fact_value("dependencies", [])
+    commands = fact_value("commands", [])
+    validation = fact_value("validation_checks", [])
+    rollback = fact_value("rollback_plan", [])
+    alert_patterns = fact_value("alert_patterns", [])
+    content = "\n".join(
+        [
+            f"Knowledge pack for {service} in {environment}.",
+            "",
+            "Alert patterns:",
+            *[f"- {item}" for item in (alert_patterns if isinstance(alert_patterns, list) else [alert_patterns]) if str(item).strip()],
+            "",
+            "Dependencies:",
+            *[f"- {item}" for item in (dependencies if isinstance(dependencies, list) else [dependencies]) if str(item).strip()],
+            "",
+            "Validation checks:",
+            *[f"- {item}" for item in (validation if isinstance(validation, list) else [validation]) if str(item).strip()],
+            "",
+            "Rollback plan:",
+            *[f"- {item}" for item in (rollback if isinstance(rollback, list) else [rollback]) if str(item).strip()],
+        ]
+    ).strip()
+    return RagDocumentRequest(
+        kind="runbook",
+        title=f"{service} Knowledge Pack",
+        summary=f"Approved KaiOps knowledge pack for {service}.",
+        content=content or f"Approved KaiOps knowledge pack for {service}.",
+        services=[service],
+        dependencies=dependencies if isinstance(dependencies, list) else [],
+        commands=commands if isinstance(commands, list) else [],
+        queries=validation if isinstance(validation, list) else [],
+        source_system="knowledge-pack",
+        resolved_by=owner,
+        metadata={
+            "environment": environment,
+            "knowledge_pack_status": str(pack.get("status") or "approved"),
+            "knowledge_pack_confidence": str((pack.get("validation") or {}).get("overall_confidence", "")),
+        },
+    )
 
 
 def render_document(request: RagDocumentRequest) -> str:
@@ -533,6 +742,44 @@ async def ingest_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
             document_flag_updated = await repo.update_projection_document_flag(request.alert_id, True)
             await session.commit()
     return {"status": "ingested", "document_flag_updated": document_flag_updated, **result}
+
+
+@app.post("/knowledge-pack/draft")
+async def draft_knowledge_pack(request: KnowledgePackRequest) -> dict[str, Any]:
+    pack = build_knowledge_pack(request)
+    return {"status": "drafted", "knowledge_pack": pack}
+
+
+@app.post("/knowledge-pack/validate")
+async def validate_knowledge_pack(request: KnowledgePackRequest) -> dict[str, Any]:
+    pack = build_knowledge_pack(request)
+    return {
+        "status": pack.get("status", "needs_review"),
+        "knowledge_pack": pack,
+        "validation": pack.get("validation", {}),
+        "next_questions": pack.get("next_questions", []),
+    }
+
+
+@app.post("/knowledge-pack/approve")
+async def approve_knowledge_pack(request: KnowledgePackApproveRequest) -> dict[str, Any]:
+    pack = build_knowledge_pack(request)
+    facts = pack.get("facts") if isinstance(pack.get("facts"), dict) else {}
+    for key, value in request.accepted_facts.items():
+        fact = facts.get(key) if isinstance(facts.get(key), dict) else None
+        if fact is None:
+            facts[key] = _fact(value, 0.9, ["manual-review"], status="accepted")
+            continue
+        fact["value"] = value
+        fact["status"] = "accepted"
+        fact["confidence"] = max(float(fact.get("confidence") or 0.0), 0.9)
+        sources = fact.get("sources") if isinstance(fact.get("sources"), list) else []
+        fact["sources"] = _unique_tokens([*sources, "manual-review"], limit=8)
+    pack["facts"] = facts
+    pack["status"] = "approved"
+    rag_request = _knowledge_pack_to_rag_request(pack, request.approved_by)
+    result = write_rag_document(rag_request)
+    return {"status": "approved", "knowledge_pack": pack, "rag_document": result}
 
 
 @app.put("/rag/documents")

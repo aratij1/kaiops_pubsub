@@ -241,3 +241,43 @@ def test_generated_onboarding_documents_use_rag_metadata_contract() -> None:
     assert {document["kind"] for document in documents} == {"incident", "runbook", "dependency", "change"}
     for document in documents:
         assert all(isinstance(value, str) for value in document.get("metadata", {}).values())
+
+
+@pytest.mark.asyncio
+async def test_existing_monitoring_onboarding_generates_documents_from_service_knowledge(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_monitoring_app_module()
+
+    def fake_save_onboarding_connectivity(payload: dict) -> dict:
+        return payload
+
+    async def fake_persist_onboarding_connectivity(payload: dict) -> None:
+        return None
+
+    monkeypatch.setattr(module, "save_onboarding_connectivity", fake_save_onboarding_connectivity)
+    monkeypatch.setattr(module, "persist_onboarding_connectivity", fake_persist_onboarding_connectivity)
+
+    payload = module.OnboardingCompletePayload.model_validate(
+        {
+            "project_mode": "existing",
+            "onboarding_path": "existing_monitoring",
+            "connectivity": valid_payload(),
+            "start_rules_onboarding": True,
+            "plain_language_requirements": ["Alert when mysql exporter availability drops"],
+            "source_documents": [
+                {
+                    "kind": "knowledge_pack",
+                    "name": "mysql-exporter.md",
+                    "excerpt": "Validate exporter container and DB connection pressure.",
+                    "content": "Alert: mysql exporter down. Validate exporter container. Rollback by restoring telemetry config.",
+                }
+            ],
+            "selected_monitoring_tool": "prometheus",
+            "generate_documents": True,
+        }
+    )
+
+    response = await module.post_onboarding_complete(payload)
+
+    assert response["rules_onboarding"]["started"] is False
+    assert len(response["rag_documents"]) == 4
+    assert response["workflow_steps"][-1]["status"] == "completed"

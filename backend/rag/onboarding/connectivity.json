@@ -1,25 +1,21 @@
 {
   "project": {
-    "name": "stress-onboard-20260720053305",
-    "owner_team": "stress-platform",
+    "name": "test",
+    "owner_team": "sr",
     "environment": "prod",
     "region": "us-east-1"
   },
   "deployment_mode": "on_prem",
-  "prometheus_url": "http://prometheus.local:9090",
-  "new_relic_url": "http://newrelic.local:443",
-  "datadog_url": "http://datadog.local:443",
+  "prometheus_url": "",
+  "new_relic_url": "",
+  "datadog_url": "",
   "azure_subscription_id": "",
   "azure_resource_group": "",
   "azure_service_bus_namespace": "",
-  "azure_service_bus_topic": "",
-  "azure_service_bus_subscription": "",
+  "azure_service_bus_topic": "kaiops-orchestration-events",
+  "azure_service_bus_subscription": "kaiops-orchestration-sub",
   "azure_content_safety_enabled": false,
   "azure_content_safety_endpoint": "",
-  "user_assignments": {
-    "stress-admin": [
-      "stress-onboard-20260720053305"
-    ]
-  },
+  "user_assignments": {},
   "updated_at": null
 }
