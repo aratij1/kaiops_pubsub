@@ -1,8 +1,10 @@
 import importlib.util
 from pathlib import Path
 
+from common.config import Settings
+from common.embeddings import HashingEmbeddingModel
 from context_agent import ContextIntelligenceAgent
-from context_agent.connectors import VectorDBConnector
+from context_agent.connectors import AzureAISearchVectorStore, VectorDBConnector
 
 
 def load_context_app_module():
@@ -30,7 +32,132 @@ def test_rag_ingestion_writes_reloads_and_searches(tmp_path) -> None:
     result = module.write_rag_document(request)
 
     assert result["document_count"] == 1
+    assert result["index"]["vector_store"]["provider"] == "file-backed-memory"
+    assert result["index"]["embedding_model"]["model"] == "hashing-token-counter-v1"
+    assert result["index"]["metadata_embedding_count"] == 1
     assert Path(result["path"]).exists()
     matches = connector.search("payments cache warmup", limit=3)
     assert matches[0]["title"] == "Payments cache warmup"
     assert matches[0]["kind"] == "runbook"
+
+    public_doc = module._public_rag_document(connector.documents[0], connector)
+    assert public_doc["embedding_status"] in {"embedded", "metadata-only"}
+    assert public_doc["vector_store"]["provider"] == "file-backed-memory"
+
+
+def test_azure_ai_search_vector_store_builds_hybrid_search_request(monkeypatch) -> None:
+    captured = {}
+    store = AzureAISearchVectorStore(
+        settings=Settings(
+            AZURE_AI_SEARCH_ENABLED=True,
+            AZURE_AI_SEARCH_ENDPOINT="https://search.example.net",
+            AZURE_AI_SEARCH_API_KEY="key",
+            AZURE_AI_SEARCH_INDEX_NAME="kaiops-rag",
+        ),
+        embedding_model=HashingEmbeddingModel(),
+    )
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "value": [
+                    {
+                        "@search.score": 0.91,
+                        "kind": "runbook",
+                        "title": "Payments triage",
+                        "content": "Investigate payments latency",
+                        "services": ["payments"],
+                    }
+                ]
+            }
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return _FakeResponse()
+
+    import context_agent.connectors as connectors_module
+
+    monkeypatch.setattr(connectors_module.httpx, "Client", _FakeClient)
+
+    matches = store.search(
+        query="payments latency",
+        query_vector=[0.1, 0.2, 0.3],
+        limit=3,
+        preferred_kinds={"runbook"},
+        service="payments",
+    )
+
+    assert matches[0]["title"] == "Payments triage"
+    assert matches[0]["_vector_store"] == "azure-ai-search"
+    assert "/indexes/kaiops-rag/docs/search" in captured["url"]
+    assert captured["json"]["vectorQueries"][0]["fields"] == "content_vector"
+    assert "kind eq 'runbook'" in captured["json"]["filter"]
+    assert "services/any" in captured["json"]["filter"]
+
+
+def test_azure_ai_search_vector_store_chunks_and_uploads(monkeypatch) -> None:
+    captured = {}
+    store = AzureAISearchVectorStore(
+        settings=Settings(
+            AZURE_AI_SEARCH_ENABLED=True,
+            AZURE_AI_SEARCH_ENDPOINT="https://search.example.net",
+            AZURE_AI_SEARCH_API_KEY="key",
+            AZURE_AI_SEARCH_INDEX_NAME="kaiops-rag",
+        ),
+        embedding_model=HashingEmbeddingModel(),
+    )
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            captured["url"] = url
+            captured["json"] = json
+            return _FakeResponse()
+
+    import context_agent.connectors as connectors_module
+
+    monkeypatch.setattr(connectors_module.httpx, "Client", _FakeClient)
+
+    result = store.upsert_documents(
+        [
+            {
+                "path": "/tmp/rag/runbooks/payments.md",
+                "kind": "runbook",
+                "title": "Payments runbook",
+                "services": ["payments"],
+                "content": "A" * 2200,
+            }
+        ]
+    )
+
+    assert result["indexed"] >= 2
+    assert "/indexes/kaiops-rag/docs/index" in captured["url"]
+    assert captured["json"]["value"][0]["@search.action"] == "mergeOrUpload"
+    assert captured["json"]["value"][0]["content_vector"]

@@ -1,5 +1,11 @@
 from common.config import Settings
-from common.embeddings import AzureOpenAIEmbeddingModel, HashingEmbeddingModel, VertexAIEmbeddingModel, get_embedding_model
+from common.embeddings import (
+    AzureOpenAIEmbeddingModel,
+    HashingEmbeddingModel,
+    VertexAIEmbeddingModel,
+    describe_embedding_model,
+    get_embedding_model,
+)
 from common.model_evaluation import VertexEvaluationClient
 
 
@@ -10,6 +16,13 @@ def _settings(**overrides) -> Settings:
 def test_get_embedding_model_defaults_to_hashing() -> None:
     model = get_embedding_model(_settings())
     assert isinstance(model, HashingEmbeddingModel)
+    assert describe_embedding_model(model) == {
+        "provider": "local",
+        "model": "hashing-token-counter-v1",
+        "dimensions": 128,
+        "fallback_supported": False,
+        "fallback_model": None,
+    }
 
 
 def test_get_embedding_model_returns_azure_when_enabled() -> None:
@@ -22,6 +35,9 @@ def test_get_embedding_model_returns_azure_when_enabled() -> None:
         )
     )
     assert isinstance(model, AzureOpenAIEmbeddingModel)
+    assert describe_embedding_model(model)["provider"] == "azure-openai"
+    assert describe_embedding_model(model)["model"] == "text-embedding-3-large"
+    assert describe_embedding_model(model)["fallback_model"] == "hashing-token-counter-v1"
 
 
 def test_azure_embedding_compat_alias_points_to_azure_implementation() -> None:
