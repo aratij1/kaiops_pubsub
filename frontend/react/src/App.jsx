@@ -314,19 +314,24 @@ function onboardingSourceDocCategoryLabel(category) {
 async function fetchJson(path, options = {}) {
   const maxAttempts = 4;
   let lastError = null;
+  const { authenticated, onUnauthorized, ...fetchOptions } = options || {};
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       const response = await fetch(path, {
-        ...options,
+        ...fetchOptions,
         headers: {
           "Content-Type": "application/json",
-          ...(options.headers || {}),
+          ...(fetchOptions.headers || {}),
         },
       });
 
       if (!response.ok) {
         const text = await response.text();
+        if (response.status === 401 && authenticated && typeof onUnauthorized === "function") {
+          onUnauthorized(text, path);
+          throw new Error("Session expired. Please sign in again.");
+        }
         const shouldRetry = response.status >= 500 && attempt < maxAttempts;
         if (shouldRetry) {
           await new Promise((resolve) => setTimeout(resolve, attempt * 500));
@@ -3420,6 +3425,18 @@ export default function App() {
     const headers = adminHeaders();
     return {
       ...options,
+      authenticated: true,
+      onUnauthorized: () => {
+        setAdminSession({
+          loading: false,
+          accessToken: "",
+          refreshToken: "",
+          user: null,
+          error: "Session expired. Please sign in again.",
+        });
+        setAdminUsers({ loading: false, rows: [], error: "" });
+        setActiveTab("home");
+      },
       headers: {
         ...headers,
         ...(options.headers || {}),
