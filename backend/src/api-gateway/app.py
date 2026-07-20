@@ -1820,6 +1820,36 @@ async def reload_rag(
     )
 
 
+@app.get("/rag/index")
+async def get_rag_index(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/rag/index",
+        target_base=settings.context_agent_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/rag/index/sync")
+async def sync_rag_index(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/rag/index/sync",
+        target_base=settings.context_agent_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/rag/search")
 async def search_rag(
     query: str,

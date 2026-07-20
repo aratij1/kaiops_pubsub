@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypedDict
 
+import httpx
 from langchain_core.embeddings import Embeddings
 from langgraph.graph import END, StateGraph
 
 from common.agent_runtime import AgentRuntime, ContextFailure
 from common.agentic import AgentContext, BaseAgent
 from common.config import get_settings
-from common.embeddings import get_embedding_model, cosine_similarity
+from common.embeddings import describe_embedding_model, get_embedding_model, cosine_similarity
 from common.models import Alert, Context, Incident
 from common.resilience import retry_async
 from common.tool_registry import ToolRegistry, ToolSpec
@@ -77,6 +79,186 @@ class CMDBConnector(BaseConnector):
         }
 
 
+class AzureAISearchVectorStore:
+    """REST-backed Azure AI Search adapter for production RAG retrieval."""
+
+    def __init__(self, *, settings: Any, embedding_model: Embeddings) -> None:
+        self._endpoint = str(getattr(settings, "azure_ai_search_endpoint", "") or "").strip().rstrip("/")
+        self._api_key = str(getattr(settings, "azure_ai_search_api_key", "") or "").strip()
+        self._index_name = str(getattr(settings, "azure_ai_search_index_name", "kaiops-rag") or "kaiops-rag").strip()
+        self._api_version = str(getattr(settings, "azure_ai_search_api_version", "2024-07-01") or "2024-07-01")
+        self._content_field = str(getattr(settings, "azure_ai_search_content_field", "content") or "content")
+        self._vector_field = str(getattr(settings, "azure_ai_search_vector_field", "content_vector") or "content_vector")
+        self._timeout_seconds = float(getattr(settings, "azure_ai_search_timeout_seconds", 8.0) or 8.0)
+        self._embedding_model = embedding_model
+        self.enabled = bool(getattr(settings, "azure_ai_search_enabled", False))
+        self.last_error: str = ""
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.enabled and self._endpoint and self._api_key and self._index_name)
+
+    def info(self) -> dict[str, Any]:
+        return {
+            "provider": "azure-ai-search" if self.configured else "file-backed-memory",
+            "engine": "AzureAISearchVectorStore" if self.configured else "VectorDBConnector",
+            "persistent_index": bool(self.configured),
+            "storage": "azure-ai-search-index" if self.configured else "markdown-files",
+            "endpoint": self._endpoint if self.configured else "",
+            "index_name": self._index_name if self.configured else "",
+            "content_field": self._content_field if self.configured else "",
+            "vector_field": self._vector_field if self.configured else "",
+            "last_error": self.last_error,
+        }
+
+    def _headers(self) -> dict[str, str]:
+        return {"api-key": self._api_key, "Content-Type": "application/json"}
+
+    def _url(self, path: str) -> str:
+        return f"{self._endpoint}/indexes/{self._index_name}{path}?api-version={self._api_version}"
+
+    def _odata_literal(self, value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _filter(self, *, preferred_kinds: set[str] | None, service: str | None) -> str | None:
+        filters: list[str] = []
+        kinds = sorted({str(item).strip().lower() for item in (preferred_kinds or set()) if str(item).strip()})
+        if kinds:
+            filters.append("(" + " or ".join(f"kind eq {self._odata_literal(kind)}" for kind in kinds) + ")")
+        normalized_service = str(service or "").strip().lower()
+        if normalized_service:
+            filters.append(f"services/any(service: search.in(service, {self._odata_literal(normalized_service)}, ','))")
+        return " and ".join(filters) if filters else None
+
+    def _chunk_text(self, text: str, *, max_chars: int = 1800, overlap_chars: int = 240) -> list[str]:
+        normalized = re.sub(r"\n{3,}", "\n\n", str(text or "").strip())
+        if not normalized:
+            return []
+        chunks: list[str] = []
+        start = 0
+        while start < len(normalized):
+            end = min(len(normalized), start + max_chars)
+            if end < len(normalized):
+                paragraph_break = normalized.rfind("\n\n", start, end)
+                if paragraph_break > start + 400:
+                    end = paragraph_break
+            chunk = normalized[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            if end >= len(normalized):
+                break
+            start = max(0, end - overlap_chars)
+        return chunks
+
+    def search(
+        self,
+        *,
+        query: str,
+        query_vector: list[float],
+        limit: int,
+        preferred_kinds: set[str] | None = None,
+        service: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not self.configured:
+            return []
+        payload: dict[str, Any] = {
+            "search": query or "*",
+            "top": max(1, min(limit, 50)),
+            "select": (
+                "id,document_id,chunk_id,kind,title,content,services,deployment,dependencies,change_id,"
+                "alert_id,incident_id,source_system,source_ref,owner,version,freshness_score,embedding_model,path"
+            ),
+            "vectorQueries": [
+                {
+                    "kind": "vector",
+                    "vector": query_vector,
+                    "fields": self._vector_field,
+                    "k": max(1, min(limit * 3, 50)),
+                }
+            ],
+        }
+        filter_expression = self._filter(preferred_kinds=preferred_kinds, service=service)
+        if filter_expression:
+            payload["filter"] = filter_expression
+        try:
+            with httpx.Client(timeout=self._timeout_seconds) as client:
+                response = client.post(self._url("/docs/search"), headers=self._headers(), json=payload)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            self.last_error = str(exc)
+            return []
+        rows = data.get("value") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return []
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            doc = dict(row)
+            doc["_similarity"] = float(doc.pop("@search.score", 0.0) or 0.0)
+            doc["_vector_store"] = "azure-ai-search"
+            services = doc.get("services", [])
+            if isinstance(services, str):
+                doc["services"] = [item.strip() for item in services.split(",") if item.strip()]
+            results.append(doc)
+        return results
+
+    def upsert_documents(self, documents: list[dict[str, Any]]) -> dict[str, Any]:
+        if not self.configured:
+            return {"attempted": False, "indexed": 0, "reason": "azure ai search is not configured"}
+        rows = []
+        for doc in documents:
+            content = str(doc.get("content") or "").strip()
+            if not content:
+                continue
+            doc_id = re.sub(r"[^a-zA-Z0-9_-]", "-", str(doc.get("path") or doc.get("title") or "document"))[:512]
+            chunks = self._chunk_text(content)
+            services = doc.get("services", [])
+            if isinstance(services, str):
+                services = [item.strip() for item in services.split(",") if item.strip()]
+            elif not isinstance(services, list):
+                services = []
+            for index, chunk in enumerate(chunks or [content]):
+                chunk_id = f"chunk-{index + 1}"
+                rows.append(
+                    {
+                        "@search.action": "mergeOrUpload",
+                        "id": f"{doc_id}-{chunk_id}"[:512],
+                        "document_id": str(doc.get("path") or doc_id),
+                        "chunk_id": chunk_id,
+                        "kind": str(doc.get("kind") or "document").strip().lower(),
+                        "title": str(doc.get("title") or doc_id),
+                        self._content_field: chunk,
+                        self._vector_field: self._embedding_model.embed(chunk),
+                        "services": [str(item).strip().lower() for item in services if str(item).strip()],
+                        "deployment": str(doc.get("deployment") or ""),
+                        "dependencies": doc.get("dependencies", []) if isinstance(doc.get("dependencies"), list) else [],
+                        "change_id": str(doc.get("change_id") or ""),
+                        "alert_id": str(doc.get("alert_id") or ""),
+                        "incident_id": str(doc.get("incident_id") or ""),
+                        "source_system": str(doc.get("source_system") or ""),
+                        "source_ref": str(doc.get("source_ref") or ""),
+                        "owner": str(doc.get("owner") or doc.get("resolved_by") or "unassigned"),
+                        "version": str(doc.get("version") or "v1"),
+                        "freshness_score": float(doc.get("freshness_score") or 0.75),
+                        "embedding_model": str(describe_embedding_model(self._embedding_model).get("model") or ""),
+                        "path": str(doc.get("path") or ""),
+                    }
+                )
+        if not rows:
+            return {"attempted": True, "indexed": 0, "reason": "no documents with content"}
+        try:
+            with httpx.Client(timeout=self._timeout_seconds) as client:
+                response = client.post(self._url("/docs/index"), headers=self._headers(), json={"value": rows})
+            response.raise_for_status()
+        except Exception as exc:
+            self.last_error = str(exc)
+            return {"attempted": True, "indexed": 0, "error": str(exc)}
+        self.last_error = ""
+        return {"attempted": True, "indexed": len(rows), "index_name": self._index_name}
+
+
 @dataclass
 class VectorDBConnector(BaseConnector):
     name: str = "vector-db"
@@ -84,6 +266,7 @@ class VectorDBConnector(BaseConnector):
     rag_root: Path | None = None
     documents: list[dict[str, Any]] = field(default_factory=list)
     _document_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _remote_store: AzureAISearchVectorStore | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if not self.documents:
@@ -91,9 +274,9 @@ class VectorDBConnector(BaseConnector):
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
-        query_vector = self.embedding_model.embed(f"{alert.service} {alert.name} {alert.description}")
-        ranked = self._rank_documents(
-            query_vector=query_vector,
+        query = f"{alert.service} {alert.name} {alert.description}"
+        ranked = self.search(
+            query,
             limit=8,
             preferred_kinds={"runbook", "incident", "deployment", "dependency", "change"},
             service=str(alert.service or "").strip(),
@@ -164,7 +347,71 @@ class VectorDBConnector(BaseConnector):
 
     def reload(self) -> int:
         self.documents = self.load_documents()
+        self.sync_remote_index()
         return len(self.documents)
+
+    def embedding_info(self) -> dict[str, Any]:
+        return describe_embedding_model(self.embedding_model)
+
+    def vector_store_info(self) -> dict[str, Any]:
+        remote = self.remote_store()
+        if remote.configured:
+            return remote.info()
+        return {
+            "provider": "file-backed-memory",
+            "engine": self.__class__.__name__,
+            "persistent_index": False,
+            "storage": "markdown-files",
+            "root_path": str(self.root_path()),
+            "remote_configured": False,
+            "remote_last_error": remote.last_error,
+        }
+
+    def remote_store(self) -> AzureAISearchVectorStore:
+        if self._remote_store is None:
+            self._remote_store = AzureAISearchVectorStore(settings=get_settings(), embedding_model=self.embedding_model)
+        return self._remote_store
+
+    def sync_remote_index(self) -> dict[str, Any]:
+        remote = self.remote_store()
+        if not remote.configured:
+            return {"attempted": False, "indexed": 0, "reason": "azure ai search is not configured"}
+        full_docs = [
+            dict(doc) if doc.get("_synthetic") else self._load_full_document(str(doc.get("path", "")))
+            for doc in self.documents
+            if not doc.get("_synthetic")
+        ]
+        return remote.upsert_documents([doc for doc in full_docs if doc])
+
+    def index_info(self) -> dict[str, Any]:
+        docs = [doc for doc in self.documents if not doc.get("_synthetic")]
+        synthetic_docs = [doc for doc in self.documents if doc.get("_synthetic")]
+        by_kind: dict[str, int] = {}
+        embedded_metadata = 0
+        for doc in docs:
+            kind = str(doc.get("kind") or "unknown").strip().lower() or "unknown"
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+            if isinstance(doc.get("_metadata_embedding"), list):
+                embedded_metadata += 1
+        return {
+            "contract_version": "kaiops.rag-index.v1",
+            "status": "ready" if docs else "empty",
+            "vector_store": self.vector_store_info(),
+            "embedding_model": self.embedding_info(),
+            "remote_index_enabled": self.remote_store().configured,
+            "document_count": len(docs),
+            "synthetic_document_count": len(synthetic_docs),
+            "metadata_embedding_count": embedded_metadata,
+            "full_document_cache_count": len(self._document_cache),
+            "kinds": by_kind,
+            "index_strategy": {
+                "chunking": "chunk-level-for-remote-document-level-for-local",
+                "metadata_shortlist": True,
+                "full_document_rerank": True,
+                "service_filter": True,
+                "preferred_kinds": ["runbook", "incident", "deployment", "dependency", "change"],
+            },
+        }
 
     def search(
         self,
@@ -172,14 +419,28 @@ class VectorDBConnector(BaseConnector):
         limit: int = 8,
         *,
         preferred_kind: str | None = None,
+        preferred_kinds: set[str] | None = None,
         service: str | None = None,
     ) -> list[dict[str, Any]]:
         query_vector = self.embedding_model.embed(query)
-        preferred_kinds = {preferred_kind.strip().lower()} if preferred_kind and preferred_kind.strip() else None
+        kind_filter = (
+            {preferred_kind.strip().lower()}
+            if preferred_kind and preferred_kind.strip()
+            else ({str(item).strip().lower() for item in preferred_kinds if str(item).strip()} if preferred_kinds else None)
+        )
+        remote_matches = self.remote_store().search(
+            query=query,
+            query_vector=query_vector,
+            limit=limit,
+            preferred_kinds=kind_filter,
+            service=service,
+        )
+        if remote_matches:
+            return remote_matches
         return self._rank_documents(
             query_vector=query_vector,
             limit=limit,
-            preferred_kinds=preferred_kinds,
+            preferred_kinds=kind_filter,
             service=service,
         )
 
@@ -589,6 +850,7 @@ class ContextIntelligenceAgent(BaseAgent):
                 ],
                 "rag_top_similarity": max((doc.get("_similarity", 0.0) for doc in vector_matches), default=0.0),
                 "rag_service_tagged_match": service_tagged_match,
+                "rag_index": vector_connector.index_info() if vector_connector else {},
                 "context_graph": {
                     "enabled": True,
                     "stages": [*state.get("graph_stages", []), "assemble_context"],

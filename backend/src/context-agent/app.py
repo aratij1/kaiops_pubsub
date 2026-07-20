@@ -375,7 +375,7 @@ def write_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
             counter += 1
     target.write_text(render_document(request), encoding="utf-8")
     count = connector.reload()
-    return {"path": str(target), "document_count": count}
+    return {"path": str(target), "document_count": count, "index": connector.index_info()}
 
 
 def write_rag_document_to_path(request: RagDocumentRequest, path: str) -> dict[str, Any]:
@@ -389,7 +389,7 @@ def write_rag_document_to_path(request: RagDocumentRequest, path: str) -> dict[s
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(render_document(request), encoding="utf-8")
     count = connector.reload()
-    return {"path": str(target), "document_count": count}
+    return {"path": str(target), "document_count": count, "index": connector.index_info()}
 
 
 def _normalize_list(value: Any) -> list[str]:
@@ -553,16 +553,29 @@ async def update_rag_document(request: RagDocumentUpdateRequest) -> dict[str, An
 _RAG_DOCUMENT_INTERNAL_FIELDS = {"_embedding", "_metadata_embedding", "_synthetic"}
 
 
+def _public_rag_document(doc: dict[str, Any], connector: VectorDBConnector) -> dict[str, Any]:
+    public = {key: value for key, value in doc.items() if key not in _RAG_DOCUMENT_INTERNAL_FIELDS}
+    full_doc = connector._load_full_document(str(doc.get("path", "")))
+    embedding_status = "embedded" if isinstance(doc.get("_metadata_embedding"), list) else "pending"
+    if full_doc and not isinstance(full_doc.get("_embedding"), list):
+        embedding_status = "metadata-only"
+    public.setdefault("owner", str(public.get("resolved_by") or public.get("source_system") or "unassigned"))
+    public.setdefault("version", str(public.get("version") or "v1"))
+    public.setdefault("freshness_score", 1.0 if public.get("closed_at") or public.get("source_ref") else 0.75)
+    public["embedding_status"] = embedding_status
+    public["embedding_model"] = connector.embedding_info()
+    public["vector_store"] = connector.vector_store_info()
+    return public
+
+
 @app.get("/rag/documents")
 async def list_rag_documents() -> dict[str, Any]:
     connector = vector_connector()
     documents = [doc for doc in connector.documents if not doc.get("_synthetic")]
     return {
         "document_count": len(documents),
-        "documents": [
-            {key: value for key, value in doc.items() if key not in _RAG_DOCUMENT_INTERNAL_FIELDS}
-            for doc in documents
-        ],
+        "index": connector.index_info(),
+        "documents": [_public_rag_document(doc, connector) for doc in documents],
     }
 
 
@@ -583,7 +596,20 @@ async def reload_rag() -> dict[str, Any]:
     connector = vector_connector()
     count = connector.reload()
     rebuild_flow_catalog_from_rag(connector)
-    return {"status": "reloaded", "document_count": count}
+    return {"status": "reloaded", "document_count": count, "index": connector.index_info()}
+
+
+@app.get("/rag/index")
+async def get_rag_index() -> dict[str, Any]:
+    connector = vector_connector()
+    return connector.index_info()
+
+
+@app.post("/rag/index/sync")
+async def sync_rag_index() -> dict[str, Any]:
+    connector = vector_connector()
+    result = connector.sync_remote_index()
+    return {"status": "synced" if result.get("indexed", 0) else "skipped", "result": result, "index": connector.index_info()}
 
 
 @app.get("/rag/search")
@@ -595,6 +621,7 @@ async def search_rag(query: str, limit: int = 8, kind: str | None = None) -> dic
     )
     return {
         "query": query,
+        "index": vector_connector().index_info(),
         "matches": [
             {
                 "kind": match.get("kind"),
@@ -602,6 +629,9 @@ async def search_rag(query: str, limit: int = 8, kind: str | None = None) -> dic
                 "services": match.get("services", []),
                 "deployment": match.get("deployment"),
                 "path": match.get("path"),
+                "score": match.get("_similarity", 0.0),
+                "embedding_model": vector_connector().embedding_info(),
+                "vector_store": vector_connector().vector_store_info(),
                 "preview": str(match.get("content", ""))[:300],
             }
             for match in matches
