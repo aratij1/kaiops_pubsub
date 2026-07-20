@@ -68,6 +68,17 @@ x-service-env: &service-env
   AZURE_AI_EVALUATION_DEPLOYMENT: ${AZURE_AI_EVALUATION_DEPLOYMENT:-}
   AZURE_AI_EVALUATION_METRIC: ${AZURE_AI_EVALUATION_METRIC:-coherence}
   OBSERVABILITY_AZURE_MONITOR_ENABLED: ${OBSERVABILITY_AZURE_MONITOR_ENABLED:-false}
+  SMTP_ENABLED: ${SMTP_ENABLED:-false}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_USERNAME: ${SMTP_USERNAME:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+  SMTP_FROM_ADDRESS: ${SMTP_FROM_ADDRESS:-kaiops-alerts@kaiops.local}
+  NOTIFICATION_RECIPIENT_EMAILS: ${NOTIFICATION_RECIPIENT_EMAILS:-}
+  TEAMS_ENABLED: ${TEAMS_ENABLED:-false}
+  TEAMS_WEBHOOK_URL: ${TEAMS_WEBHOOK_URL:-}
+  NOTIFICATION_MIN_ALERT_SEVERITY: ${NOTIFICATION_MIN_ALERT_SEVERITY:-high}
   AZURE_MONITOR_CONNECTION_STRING: ${AZURE_MONITOR_CONNECTION_STRING:-}
 
 x-service-build: &service-build
@@ -434,6 +445,18 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/approval-service
     ports: ["8007:8000"]
+    depends_on:
+      kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  notification-service:
+    build: *service-build
+    restart: unless-stopped
+    environment: { <<: *service-env, SERVICE_NAME: notification-service }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/notification-service
+    ports: ["8019:8000"]
     depends_on:
       kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }

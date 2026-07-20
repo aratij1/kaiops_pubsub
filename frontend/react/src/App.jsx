@@ -9652,7 +9652,6 @@ export default function App() {
                         </form>
                         {onboardingRuleLookup.error ? <p className="error">{onboardingRuleLookup.error}</p> : null}
                         {onboardingRuleLookup.result ? <pre className="result">{JSON.stringify(onboardingRuleLookup.result, null, 2)}</pre> : null}
-                            disabled={!onboardingGeneratedDocs.length || onboardingDocApprovalState.loading || onboardingDocApprovalState.approved || !onboardingReviewGate.allReviewed}
                         <div className="table-wrap" style={{ marginTop: 12 }}>
                           <table>
                             <thead>
