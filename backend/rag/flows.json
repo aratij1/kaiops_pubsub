@@ -1,5 +1,19 @@
 [
   {
+    "id": "admin-ui-doc-flow-20260719221735-rule-onboarding",
+    "alert_id": "admin-ui-doc-flow-20260719221735-rule-onboarding",
+    "alert_name": "admin-ui-doc-flow-20260719221735 Monitoring Rule Onboarding",
+    "alert_type": "monitoring-rule-onboarding",
+    "title": "admin-ui-doc-flow-20260719221735 Monitoring Rule Onboarding",
+    "service": "admin-ui-doc-flow-20260719221735",
+    "severity": "HIGH",
+    "summary": "Plain-language monitoring requirements were converted to prometheus rules.",
+    "recommended_action": "Review generated rules and approve production deployment.",
+    "description": "Plain-language monitoring requirements were converted to prometheus rules.",
+    "deployment": "prod",
+    "source": "rag-incident"
+  },
+  {
     "id": "dw-1014",
     "alert_id": "DW-1014",
     "alert_name": "Airflow Scheduler Down",
@@ -473,6 +487,20 @@
     "source": "rag-incident"
   },
   {
+    "id": "setup-doc-e2e-20260719163442-rule-onboarding",
+    "alert_id": "setup-doc-e2e-20260719163442-rule-onboarding",
+    "alert_name": "setup-doc-e2e-20260719163442 Monitoring Rule Onboarding",
+    "alert_type": "monitoring-rule-onboarding",
+    "title": "setup-doc-e2e-20260719163442 Monitoring Rule Onboarding",
+    "service": "setup-doc-e2e-20260719163442",
+    "severity": "HIGH",
+    "summary": "Plain-language monitoring requirements were converted to prometheus rules.",
+    "recommended_action": "Review generated rules and approve production deployment.",
+    "description": "Plain-language monitoring requirements were converted to prometheus rules.",
+    "deployment": "prod",
+    "source": "rag-incident"
+  },
+  {
     "id": "dw-1003",
     "alert_id": "DW-1003",
     "alert_name": "Source System Unavailable",
@@ -500,6 +528,20 @@
     "description": "Service: spark-cluster",
     "execution_plan": "Increase executor memory",
     "deployment": "Not explicitly documented.",
+    "source": "rag-incident"
+  },
+  {
+    "id": "test-rule-onboarding",
+    "alert_id": "test-rule-onboarding",
+    "alert_name": "test Monitoring Rule Onboarding",
+    "alert_type": "monitoring-rule-onboarding",
+    "title": "test Monitoring Rule Onboarding",
+    "service": "test",
+    "severity": "HIGH",
+    "summary": "Plain-language monitoring requirements were converted to prometheus rules.",
+    "recommended_action": "Review generated rules and approve production deployment.",
+    "description": "Plain-language monitoring requirements were converted to prometheus rules.",
+    "deployment": "prod",
     "source": "rag-incident"
   },
   {
