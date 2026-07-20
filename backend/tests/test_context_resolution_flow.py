@@ -65,6 +65,13 @@ async def test_context_agent_returns_requested_shape() -> None:
     assert context.recent_changes
     assert context.metadata["rag_documents"] >= 1
     assert any(match["kind"] == "runbook" for match in context.metadata["rag_matches"])
+    assert context.metadata["rag_index"]["vector_store"]["provider"] == "file-backed-memory"
+    assert context.metadata["rag_index"]["embedding_model"]["model"] == "hashing-token-counter-v1"
+    assert context.metadata["context_graph"] == {
+        "enabled": True,
+        "stages": ["validate_event", "collect_connector_evidence", "assemble_context"],
+        "connector_count": 7,
+    }
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,9 @@ class HashingEmbeddingModel(Embeddings):
 
     def __init__(self, dimensions: int = 128) -> None:
         self.dimensions = dimensions
+        self.provider = "local"
+        self.model_name = "hashing-token-counter-v1"
+        self.fallback = False
 
     def embed(self, text: str) -> list[float]:
         vector = [0.0] * self.dimensions
@@ -50,6 +53,9 @@ class AzureOpenAIEmbeddingModel(Embeddings):
         self._api_version = str(getattr(settings, "azure_openai_api_version", "2024-06-01") or "2024-06-01").strip()
         self._timeout_seconds = float(getattr(settings, "azure_openai_embeddings_timeout_seconds", 8.0) or 8.0)
         self._fallback = HashingEmbeddingModel()
+        self.provider = "azure-openai"
+        self.model_name = self._deployment or "unconfigured-azure-openai-embedding-deployment"
+        self.fallback = False
 
     def _embeddings_endpoint(self) -> str:
         return (
@@ -99,6 +105,29 @@ class AzureOpenAIEmbeddingModel(Embeddings):
 
 class VertexAIEmbeddingModel(AzureOpenAIEmbeddingModel):
     """Compatibility alias retained for existing imports."""
+
+
+def describe_embedding_model(model: Embeddings) -> dict[str, object]:
+    provider = str(getattr(model, "provider", "") or "").strip()
+    model_name = str(getattr(model, "model_name", "") or "").strip()
+    dimensions = getattr(model, "dimensions", None)
+    if isinstance(model, HashingEmbeddingModel):
+        provider = provider or "local"
+        model_name = model_name or "hashing-token-counter-v1"
+        dimensions = model.dimensions
+    elif isinstance(model, AzureOpenAIEmbeddingModel):
+        provider = provider or "azure-openai"
+        model_name = model_name or model._deployment or "unconfigured-azure-openai-embedding-deployment"
+    else:
+        provider = provider or model.__class__.__name__
+        model_name = model_name or model.__class__.__name__
+    return {
+        "provider": provider,
+        "model": model_name,
+        "dimensions": dimensions,
+        "fallback_supported": isinstance(model, AzureOpenAIEmbeddingModel),
+        "fallback_model": "hashing-token-counter-v1" if isinstance(model, AzureOpenAIEmbeddingModel) else None,
+    }
 
 
 def get_embedding_model(settings: Settings) -> Embeddings:

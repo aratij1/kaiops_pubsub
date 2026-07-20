@@ -8,6 +8,8 @@ from time import perf_counter
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi import HTTPException
+from sqlalchemy import text
 
 from common.config import Settings
 from common.database import create_engine, create_schema, create_session_factory
@@ -158,6 +160,15 @@ def create_app(
 
     @app.get("/readyz")
     async def readyz() -> dict[str, str]:
+        if settings.database_enabled:
+            engine = getattr(app.state, "db_engine", None)
+            if engine is None:
+                raise HTTPException(status_code=503, detail="database engine is not configured")
+            try:
+                async with engine.connect() as connection:
+                    await connection.execute(text("SELECT 1"))
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail="database is not ready") from exc
         return {"status": "ready", "service": settings.service_name}
 
     @app.get("/metrics")
