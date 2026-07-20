@@ -2633,6 +2633,7 @@ export default function App() {
     status: "active",
     is_active: true,
   });
+  const [adminEditPanelOpen, setAdminEditPanelOpen] = useState(false);
   const [adminResetPasswordForm, setAdminResetPasswordForm] = useState({ user_id: null, new_password: "" });
   const [onboardingForm, setOnboardingForm] = useState({
     name: "kaiops-project",
@@ -3483,6 +3484,7 @@ export default function App() {
     setAdminSession({ loading: false, accessToken: "", refreshToken: "", user: null, error: "" });
     setAdminUsers({ loading: false, rows: [], error: "" });
     setAdminEditUser({ id: null, username: "", email: "", first_name: "", last_name: "", role_id: 1, status: "active", is_active: true });
+    setAdminEditPanelOpen(false);
     setAdminResetPasswordForm({ user_id: null, new_password: "" });
     setActiveTab("home");
   }
@@ -3554,6 +3556,7 @@ export default function App() {
       status: String(row?.status || "active").trim(),
       is_active: Boolean(row?.is_active),
     });
+    setAdminEditPanelOpen(true);
     setAdminResetPasswordForm((current) => ({ ...current, user_id: selectedId, new_password: "" }));
   }
 
@@ -3578,6 +3581,7 @@ export default function App() {
         }),
       }));
       await loadAdminUsersAndRoles();
+      setAdminEditPanelOpen(false);
     } catch (error) {
       setAdminUsers((current) => ({ ...current, loading: false, error: error.message }));
     }
@@ -10258,18 +10262,18 @@ export default function App() {
                       <div className="table-wrap table-wrap-scroll-x">
                         <table>
                           <thead>
-                            <tr><th>ID</th><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Actions</th></tr>
+                            <tr><th>ID</th><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Active</th><th>Actions</th></tr>
                           </thead>
                           <tbody>
                             {adminUsers.rows.map((row, index) => (
                               <tr key={`admin-user-${row.id || index}`}>
-                                <td>{row.id || "-"}</td><td>{row.username || "-"}</td><td>{row.email || "-"}</td><td>{row.role_name || row.role_id || "-"}</td><td>{row.status || "-"}</td>
+                                <td>{row.id || "-"}</td><td>{row.username || "-"}</td><td>{row.email || "-"}</td><td>{row.role_name || row.role_id || "-"}</td><td>{row.status || "-"}</td><td>{row.is_active ? "yes" : "no"}</td>
                                 <td><button type="button" className="button-secondary" onClick={() => selectAdminUserForEdit(row)}>Edit</button></td>
                               </tr>
                             ))}
-                            {!adminUsers.rows.length && adminUsers.loading ? <tr><td colSpan={6}>Loading users...</td></tr> : null}
-                            {!adminUsers.rows.length && !adminUsers.loading && adminUsers.error ? <tr><td colSpan={6}>Unable to load users. Review the error above.</td></tr> : null}
-                            {!adminUsers.rows.length && !adminUsers.loading && !adminUsers.error ? <tr><td colSpan={6}>No users returned yet. Use Refresh Users or create a user.</td></tr> : null}
+                            {!adminUsers.rows.length && adminUsers.loading ? <tr><td colSpan={7}>Loading users...</td></tr> : null}
+                            {!adminUsers.rows.length && !adminUsers.loading && adminUsers.error ? <tr><td colSpan={7}>Unable to load users. Review the error above.</td></tr> : null}
+                            {!adminUsers.rows.length && !adminUsers.loading && !adminUsers.error ? <tr><td colSpan={7}>No users returned yet. Use Refresh Users or create a user.</td></tr> : null}
                           </tbody>
                         </table>
                       </div>
@@ -10309,7 +10313,7 @@ export default function App() {
 
                     <article className="panel">
                       <h3>Modify User</h3>
-                      <details className="admin-collapsible">
+                      <details className="admin-collapsible" open={adminEditPanelOpen} onToggle={(event) => setAdminEditPanelOpen(event.currentTarget.open)}>
                         <summary>Edit Existing User</summary>
                         <form className="form" onSubmit={updateAdminUser}>
                           <div className="filter-grid">
@@ -10327,9 +10331,18 @@ export default function App() {
                           <div className="filter-grid">
                             <label>First Name<input value={adminEditUser.first_name} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, first_name: e.target.value }))} /></label>
                             <label>Last Name<input value={adminEditUser.last_name} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, last_name: e.target.value }))} /></label>
-                            <label>Status<input value={adminEditUser.status} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, status: e.target.value }))} /></label>
+                            <label>Status
+                              <select value={adminEditUser.status} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, status: e.target.value, is_active: e.target.value === "active" }))}>
+                                <option value="active">active</option>
+                                <option value="inactive">inactive</option>
+                                <option value="suspended">suspended</option>
+                              </select>
+                            </label>
                             <label>Active
-                              <select value={String(adminEditUser.is_active)} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, is_active: e.target.value === "true" }))}>
+                              <select value={String(adminEditUser.is_active)} onChange={(e) => {
+                                const isActive = e.target.value === "true";
+                                setAdminEditUser((curr) => ({ ...curr, is_active: isActive, status: isActive ? "active" : "inactive" }));
+                              }}>
                                 <option value="true">true</option><option value="false">false</option>
                               </select>
                             </label>
