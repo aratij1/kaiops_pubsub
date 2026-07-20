@@ -4,9 +4,10 @@ import asyncio
 import heapq
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from langchain_core.embeddings import Embeddings
+from langgraph.graph import END, StateGraph
 
 from common.agent_runtime import AgentRuntime, ContextFailure
 from common.agentic import AgentContext, BaseAgent
@@ -202,6 +203,28 @@ class VectorDBConnector(BaseConnector):
         metadata["_metadata_embedding"] = self.embedding_model.embed(self._metadata_text(metadata))
         return metadata
 
+    def _resolve_document_path(self, path: str) -> Path | None:
+        if not path:
+            return None
+        file_path = Path(path)
+        if file_path.exists():
+            return file_path
+
+        root = self.root_path()
+        raw = str(path).replace("\\", "/")
+        for marker in ("/rag/", "rag/"):
+            if marker not in raw:
+                continue
+            relative = raw.split(marker, 1)[1]
+            candidate = root / relative
+            if candidate.exists():
+                return candidate
+        candidate = root / file_path.name
+        if candidate.exists():
+            return candidate
+        matches = list(root.rglob(file_path.name))
+        return matches[0] if matches else None
+
     def _load_full_document(self, path: str) -> dict[str, Any]:
         cached = self._document_cache.get(path)
         if cached is not None:
@@ -210,8 +233,8 @@ class VectorDBConnector(BaseConnector):
         if not path:
             return {}
 
-        file_path = Path(path)
-        if not file_path.exists():
+        file_path = self._resolve_document_path(path)
+        if file_path is None:
             return {}
         raw = file_path.read_text(encoding="utf-8")
         metadata: dict[str, Any] = {"path": path, "kind": file_path.parent.name.rstrip("s")}
@@ -417,6 +440,14 @@ class VectorDBConnector(BaseConnector):
         return results
 
 
+class ContextGraphState(TypedDict, total=False):
+    alert: Alert
+    incident: Incident
+    connector_results: dict[str, dict[str, Any]]
+    context: Context
+    graph_stages: list[str]
+
+
 @dataclass
 class ContextIntelligenceAgent(BaseAgent):
     connectors: list[BaseConnector] = field(
@@ -433,31 +464,42 @@ class ContextIntelligenceAgent(BaseAgent):
     name: str = "context-agent"
     runtime: AgentRuntime = field(default_factory=AgentRuntime)
     tool_registry: ToolRegistry = field(default_factory=ToolRegistry)
+    graph: Any = field(init=False)
 
     def __post_init__(self) -> None:
-        if self.tool_registry.tools:
-            return
+        if not self.tool_registry.tools:
+            for connector in self.connectors:
+                tool_name = f"connector.{connector.name}"
 
-        for connector in self.connectors:
-            tool_name = f"connector.{connector.name}"
+                async def _handler(payload: dict[str, Any], _connector: BaseConnector = connector) -> dict[str, Any]:
+                    alert_payload = payload.get("alert")
+                    incident_payload = payload.get("incident")
+                    if not isinstance(alert_payload, dict) or not isinstance(incident_payload, dict):
+                        raise ValueError("connector payload must include alert and incident objects")
+                    alert = Alert.model_validate(alert_payload)
+                    incident = Incident.model_validate(incident_payload)
+                    return await _connector.fetch(alert, incident)
 
-            async def _handler(payload: dict[str, Any], _connector: BaseConnector = connector) -> dict[str, Any]:
-                alert_payload = payload.get("alert")
-                incident_payload = payload.get("incident")
-                if not isinstance(alert_payload, dict) or not isinstance(incident_payload, dict):
-                    raise ValueError("connector payload must include alert and incident objects")
-                alert = Alert.model_validate(alert_payload)
-                incident = Incident.model_validate(incident_payload)
-                return await _connector.fetch(alert, incident)
-
-            self.tool_registry.register(
-                ToolSpec(
-                    name=tool_name,
-                    handler=_handler,
-                    timeout_seconds=10.0,
-                    permissions={"context-agent"},
+                self.tool_registry.register(
+                    ToolSpec(
+                        name=tool_name,
+                        handler=_handler,
+                        timeout_seconds=10.0,
+                        permissions={"context-agent"},
+                    )
                 )
-            )
+        self.graph = self._build_graph()
+
+    def _build_graph(self):
+        workflow = StateGraph(ContextGraphState)
+        workflow.add_node("validate_event", self.validate_event)
+        workflow.add_node("collect_connector_evidence", self.collect_connector_evidence)
+        workflow.add_node("assemble_context", self.assemble_context)
+        workflow.set_entry_point("validate_event")
+        workflow.add_edge("validate_event", "collect_connector_evidence")
+        workflow.add_edge("collect_connector_evidence", "assemble_context")
+        workflow.add_edge("assemble_context", END)
+        return workflow.compile()
 
     async def _run_connector(self, connector: BaseConnector, alert: Alert, incident: Incident) -> dict[str, Any]:
         return await self.tool_registry.execute(
@@ -472,14 +514,31 @@ class ContextIntelligenceAgent(BaseAgent):
     async def can_execute(self, context: AgentContext) -> bool:
         return context.alert is not None and context.incident is not None
 
-    async def collect(self, alert: Alert, incident: Incident) -> Context:
+    async def validate_event(self, state: ContextGraphState) -> ContextGraphState:
+        if not isinstance(state.get("alert"), Alert) or not isinstance(state.get("incident"), Incident):
+            raise ContextFailure("context graph requires alert and incident")
+        state["graph_stages"] = [*state.get("graph_stages", []), "validate_event"]
+        return state
+
+    async def collect_connector_evidence(self, state: ContextGraphState) -> ContextGraphState:
+        alert = state["alert"]
+        incident = state["incident"]
         results = await asyncio.gather(
             *[
                 retry_async(lambda connector=connector: self._run_connector(connector, alert, incident))
                 for connector in self.connectors
             ]
         )
-        by_name = {connector.name: result for connector, result in zip(self.connectors, results, strict=True)}
+        state["connector_results"] = {
+            connector.name: result for connector, result in zip(self.connectors, results, strict=True)
+        }
+        state["graph_stages"] = [*state.get("graph_stages", []), "collect_connector_evidence"]
+        return state
+
+    async def assemble_context(self, state: ContextGraphState) -> ContextGraphState:
+        alert = state["alert"]
+        incident = state["incident"]
+        by_name = state["connector_results"]
         vector_matches = by_name["vector-db"]["matches"]
         vector_connector = next((c for c in self.connectors if isinstance(c, VectorDBConnector)), None)
         service_tagged_match = bool(vector_connector and vector_connector.has_service_tagged_match(alert))
@@ -511,7 +570,7 @@ class ContextIntelligenceAgent(BaseAgent):
                 for doc in change_docs
             ]
         )
-        return Context(
+        context = Context(
             incident_id=incident.id,
             alert=alert,
             deployment=deployment,
@@ -530,8 +589,23 @@ class ContextIntelligenceAgent(BaseAgent):
                 ],
                 "rag_top_similarity": max((doc.get("_similarity", 0.0) for doc in vector_matches), default=0.0),
                 "rag_service_tagged_match": service_tagged_match,
+                "context_graph": {
+                    "enabled": True,
+                    "stages": [*state.get("graph_stages", []), "assemble_context"],
+                    "connector_count": len(self.connectors),
+                },
             },
         )
+        state["context"] = context
+        state["graph_stages"] = [*state.get("graph_stages", []), "assemble_context"]
+        return state
+
+    async def collect(self, alert: Alert, incident: Incident) -> Context:
+        state = await self.graph.ainvoke({"alert": alert, "incident": incident, "graph_stages": []})
+        context = state.get("context")
+        if not isinstance(context, Context):
+            raise ContextFailure("context graph produced non-context output")
+        return context
 
     async def execute(self, context: AgentContext) -> Context:
         if context.alert is None or context.incident is None:

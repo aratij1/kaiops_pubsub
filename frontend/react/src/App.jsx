@@ -1,4 +1,26 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  ALERT_DOC_KIND_OPTIONS,
+  APPROVAL_NAV_PRIMARY_ROLES,
+  DOCUMENT_PROVIDER_ROLES,
+  MONITORING_TOOL_OPTIONS,
+  ONBOARDING_SOURCE_DOC_BUCKETS,
+  ONBOARDING_SOURCE_DOC_EXTENSIONS,
+  ONBOARDING_SOURCE_DOC_SAMPLE_FILES,
+  ROLE_ALLOWED_TABS,
+} from "./onboardingConfig";
+import {
+  classifyOnboardingDocumentType,
+  deriveMonitoringRequirementsFromDocument,
+  extractMonitoringToolAndUrl,
+  extractOnboardingProjectName,
+  looksLikeUuid,
+  normalizeMatchToken,
+  normalizeRoleName,
+  severityOverrideKey,
+  simplifyMonitoringUrl,
+  summarizeUploadedDocument,
+} from "./onboardingUtils";
 
 const DEFAULT_ALERT = {
   source: "monitoring-adapter",
@@ -47,126 +69,6 @@ const TAB_SHORTCUT_MAP = {
   Digit0: "summary",
 };
 const VALID_TABS = new Set(Object.values(TAB_SHORTCUT_MAP));
-const MONITORING_TOOL_OPTIONS = ["prometheus", "new_relic", "datadog"];
-const ALERT_DOC_KIND_OPTIONS = ["incident", "runbook", "deployment", "change", "dependency", "remediation"];
-const ONBOARDING_SOURCE_DOC_EXTENSIONS = new Set(["txt", "md", "markdown", "json", "csv", "log", "yaml", "yml"]);
-const ONBOARDING_SOURCE_DOC_BUCKETS = [
-  { key: "ticket", label: "Past Tickets" },
-  { key: "troubleshooting", label: "Troubleshooting Docs" },
-  { key: "rca", label: "RCA / Postmortem Docs" },
-  { key: "resolution", label: "Resolution Docs" },
-  { key: "logs", label: "Logs" },
-  { key: "other", label: "Other Evidence" },
-];
-const ONBOARDING_SOURCE_DOC_SAMPLE_FILES = {
-  ticket: { href: "/source_doc_sample_past_ticket.md", label: "Download past ticket sample" },
-  troubleshooting: { href: "/source_doc_sample_troubleshooting.md", label: "Download troubleshooting sample" },
-  rca: { href: "/source_doc_sample_rca_and_logs.txt", label: "Download RCA and logs sample" },
-  resolution: { href: "/source_doc_sample_troubleshooting.md", label: "Download resolution sample" },
-  logs: { href: "/source_doc_sample_rca_and_logs.txt", label: "Download logs sample" },
-  other: { href: "/source_doc_sample_past_ticket.md", label: "Download evidence sample" },
-};
-
-const ROLE_ALLOWED_TABS = {
-  administrator: ["home", "copilot", "approval", "executive", "admin", "trace", "safety", "rag", "closed", "summary"],
-  l1_operator: ["home"],
-  l2_engineer: ["home", "copilot", "approval", "trace", "safety", "rag", "closed", "summary"],
-  l3_engineer: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "closed", "summary"],
-  executive: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "closed", "summary"],
-};
-
-const APPROVAL_NAV_PRIMARY_ROLES = new Set(["administrator"]);
-
-function normalizeRoleName(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "_");
-}
-
-function simplifyMonitoringUrl(value) {
-  const raw = String(value || "").trim();
-  if (!raw) {
-    return "";
-  }
-  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
-  return withScheme.replace(/\/+$/, "");
-}
-
-function normalizeMatchToken(value) {
-  return String(value || "").trim().toLowerCase();
-}
-
-function severityOverrideKey(name, service = "", environment = "") {
-  return [normalizeMatchToken(name), normalizeMatchToken(service), normalizeMatchToken(environment)].join("|");
-}
-
-function extractMonitoringToolAndUrl(source, fallbackTool = "prometheus", fallbackUrl = "") {
-  const payload = source && typeof source === "object" ? source : {};
-  const provider = String(payload.selected_provider || payload.provider || fallbackTool || "prometheus").trim().toLowerCase();
-  const tool = MONITORING_TOOL_OPTIONS.includes(provider) ? provider : fallbackTool;
-  const urlsByTool = {
-    prometheus: simplifyMonitoringUrl(payload.prometheus_url),
-    new_relic: simplifyMonitoringUrl(payload.new_relic_url),
-    datadog: simplifyMonitoringUrl(payload.datadog_url),
-  };
-  const url = urlsByTool[tool] || urlsByTool.prometheus || urlsByTool.new_relic || urlsByTool.datadog || simplifyMonitoringUrl(fallbackUrl);
-  return { tool, url };
-}
-
-function looksLikeUuid(value) {
-  const token = String(value || "").trim();
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token);
-}
-
-function deriveMonitoringRequirementsFromDocument(name, text) {
-  const docName = String(name || "uploaded-document").trim() || "uploaded-document";
-  const docText = String(text || "").trim();
-  if (!docText) {
-    return [];
-  }
-  const lines = docText
-    .split(/\r?\n/)
-    .map((line) => line.replace(/^[-*#]+\s*/, "").trim())
-    .filter((line) => line.length >= 8);
-  const scored = lines.filter((line) => /(alert|latency|error|cpu|memory|availability|throughput|slo|sla|queue|topic|dependency|restart|health|5xx|threshold|response)/i.test(line));
-  const selected = (scored.length ? scored : lines).slice(0, 6);
-  return selected.map((line) => `${docName}: ${line}`);
-}
-
-function summarizeUploadedDocument(text) {
-  const compact = String(text || "").replace(/\s+/g, " ").trim();
-  return compact ? compact.slice(0, 220) : "";
-}
-
-function classifyOnboardingDocumentType(name, text) {
-  const token = `${String(name || "")} ${String(text || "")}`.toLowerCase();
-  if (/(ticket|incident|case|jira)/i.test(token)) {
-    return "ticket";
-  }
-  if (/(troubleshoot|diagnostic|investigat|playbook)/i.test(token)) {
-    return "troubleshooting";
-  }
-  if (/(rca|postmortem|root cause)/i.test(token)) {
-    return "rca";
-  }
-  if (/(resolution|resolve|fix|remediation)/i.test(token)) {
-    return "resolution";
-  }
-  if (/(log|trace|stdout|stderr)/i.test(token)) {
-    return "logs";
-  }
-  return "other";
-}
-
-function extractOnboardingProjectName(row) {
-  if (!row || typeof row !== "object") {
-    return "";
-  }
-  const projectPayload = row.project_payload && typeof row.project_payload === "object" ? row.project_payload : {};
-  return String(row.project_name || projectPayload.name || "").trim();
-}
-
 function extractObservedRoutingMetrics(workflow) {
   if (!workflow || typeof workflow !== "object") {
     return {};
@@ -383,6 +285,24 @@ function filterRowsForMonitor(rows, applicationToMonitor) {
   });
 }
 
+function isGeneratedOrTestAlert(row) {
+  const tokens = [
+    row?.name,
+    row?.alert_name,
+    row?.rule_name,
+    row?.rule,
+    row?.alert_rule,
+    row?.labels?.alertname,
+    row?.service,
+    row?.application,
+    row?.project_name,
+    row?.project,
+  ].map((value) => String(value || "").toLowerCase()).join(" ");
+  return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test)([-_\s]|$)/i.test(tokens)
+    || tokens.includes("stresspipelinealert")
+    || tokens.includes("onboarding-smoke-test");
+}
+
 async function fetchJson(path, options = {}) {
   const maxAttempts = 4;
   let lastError = null;
@@ -467,6 +387,66 @@ function parseUtcTimestamp(value) {
 function formatUtcTimestamp(value) {
   const parsed = parseUtcTimestamp(value);
   return parsed ? parsed.toISOString() : "-";
+}
+
+function clampQualityScore(value, fallback = 0) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.min(Math.max(numeric, 0), 1);
+}
+
+function formatQualityPercent(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "-";
+  }
+  return `${Math.round(clampQualityScore(numeric) * 100)}%`;
+}
+
+function qualityToneFromScore(value, inverse = false) {
+  const score = clampQualityScore(value, inverse ? 1 : 0);
+  const effective = inverse ? 1 - score : score;
+  if (effective >= 0.82) {
+    return "success";
+  }
+  if (effective >= 0.62) {
+    return "warning";
+  }
+  return "error";
+}
+
+function normalizeEvaluationEnvelope(source = {}, fallback = {}) {
+  const raw = source && typeof source === "object" ? source : {};
+  const fallbackConfidence = clampQualityScore(fallback.confidence, 0);
+  const ragMatchScore = clampQualityScore(raw.rag_match_score ?? fallback.ragMatchScore, 0);
+  const citationCoverage = clampQualityScore(raw.citation_coverage ?? fallback.citationCoverage, 0);
+  const evidenceCoverage = clampQualityScore(raw.evidence_coverage ?? fallback.evidenceCoverage, 0);
+  const groundingScore = clampQualityScore(raw.grounding_score ?? ((ragMatchScore * 0.45) + (citationCoverage * 0.25) + (evidenceCoverage * 0.3)), 0);
+  const confidenceScore = clampQualityScore(raw.confidence_score ?? fallbackConfidence, fallbackConfidence);
+  const hallucinationRisk = clampQualityScore(raw.hallucination_risk ?? (1 - ((groundingScore * 0.55) + (confidenceScore * 0.25) + (citationCoverage * 0.2))), 0);
+  const hallucinationScore = clampQualityScore(raw.hallucination_score ?? (1 - hallucinationRisk), 0);
+  const overallScore = clampQualityScore(
+    raw.overall_score ?? ((confidenceScore * 0.3) + (groundingScore * 0.3) + (hallucinationScore * 0.2) + (citationCoverage * 0.1) + (evidenceCoverage * 0.1)),
+    0,
+  );
+  return {
+    contractVersion: raw.contract_version || "kaiops.evaluation.v1",
+    provider: raw.provider || "ui-derived-quality-gate",
+    confidenceScore,
+    groundingScore,
+    hallucinationRisk,
+    hallucinationScore,
+    citationCoverage,
+    evidenceCoverage,
+    ragMatchScore,
+    overallScore,
+    qualityLabel: raw.quality_label || (overallScore >= 0.82 ? "high" : overallScore >= 0.62 ? "medium" : "low"),
+    requiresReview: Boolean(raw.requires_review ?? (hallucinationRisk >= 0.45 || groundingScore < 0.55 || confidenceScore < 0.65)),
+    externalJudge: raw.external_judge && typeof raw.external_judge === "object" ? raw.external_judge : {},
+    signals: raw.signals && typeof raw.signals === "object" ? raw.signals : {},
+  };
 }
 
 function elapsedSeconds(start, end) {
@@ -2119,33 +2099,195 @@ function AgentEventsGraph({ rows }) {
 
 function TopicFlowGraph({ routing, timelineRows }) {
   const safeRouting = routing && typeof routing === "object" ? routing : {};
-  const channels = Array.from(new Set(
-    (Array.isArray(timelineRows) ? timelineRows : [])
-      .flatMap((row) => [row?.consumes, row?.publishes])
-      .map((item) => String(item || "").trim())
+  const safeRows = Array.isArray(timelineRows) ? timelineRows : [];
+  const published = Array.from(new Set(
+    safeRows
+      .map((row) => String(row?.publishes || "").trim())
       .filter((item) => item && item !== "-" && item.toLowerCase() !== "unknown")
   ));
+  const consumed = Array.from(new Set(
+    safeRows
+      .map((row) => String(row?.consumes || "").trim())
+      .filter((item) => item && item !== "-" && item.toLowerCase() !== "unknown")
+  ));
+  const provider = String(safeRouting?.message_bus_provider || "rabbitmq").trim().toUpperCase();
+  const actualRows = SERVICE_TOPIC_FLOW.map((row) => {
+    const hasTopicActivity = published.includes(row.publishes) || consumed.includes(row.consumes);
+    return {
+      service: row.service,
+      consumed: hasTopicActivity ? row.consumes : "-",
+      published: hasTopicActivity ? row.publishes : "-",
+      provider,
+      status: hasTopicActivity ? "Observed" : "Configured",
+    };
+  });
+  const configuredRows = SERVICE_TOPIC_FLOW.map((row) => ({
+    service: row.service,
+    consumes: row.consumes === "-" ? "-" : `${row.consumes} (enabled transports)`,
+    publishes: row.publishes,
+  }));
 
   return (
-    <div className="topic-flow-graph">
-      <div className="topic-flow-pill">
-        <span>Provider</span>
-        <strong>{String(safeRouting?.message_bus_provider || "-").toUpperCase()}</strong>
+    <MessageBusTopology
+      actual={{ rows: actualRows, published, consumed }}
+      configuredRows={configuredRows}
+      routing={safeRouting}
+      primaryTopic={published[0] || "raw-alerts"}
+      compact
+    />
+  );
+}
+
+function MessageBusTopology({ actual, configuredRows, routing, primaryTopic, compact = false }) {
+  const safeActual = actual && typeof actual === "object" ? actual : {};
+  const safeRouting = routing && typeof routing === "object" ? routing : {};
+  const published = Array.isArray(safeActual.published) ? safeActual.published : [];
+  const consumed = Array.isArray(safeActual.consumed) ? safeActual.consumed : [];
+  const observedTopics = new Set([...published, ...consumed].map((topic) => String(topic || "").trim()).filter(Boolean));
+  const rows = Array.isArray(configuredRows) ? configuredRows : [];
+  const provider = String(safeRouting?.message_bus_provider || safeActual?.rows?.[0]?.provider || "Azure Service Bus").trim();
+  const workflow = String(safeRouting?.workflow || "alert-workflow").trim();
+  const executionMode = String(safeRouting?.execution_mode || "parallel-workers").trim();
+  const sourceTopic = String(primaryTopic || rows.find((row) => row?.publishes)?.publishes || "kaiops-orchestration-events").trim();
+  const workerNodes = [
+    { title: "Alert Intelligence", service: "alert-intelligence", topic: "enriched-alerts", lane: "worker" },
+    { title: "Context Worker", service: "context-agent", topic: "context-events", lane: "worker" },
+    { title: "Resolution Worker", service: "resolution-agent", topic: "resolution-events", lane: "worker" },
+    { title: "Approval Worker", service: "approval-service", topic: "approval-events", lane: "gate" },
+    { title: "Remediation Worker", service: "remediation-engine", topic: "remediation-events", lane: "worker" },
+    { title: "Closure Worker", service: "closure-service", topic: "closure-events", lane: "worker" },
+  ];
+
+  const isObserved = (topic) => observedTopics.has(String(topic || "").replace(" (enabled transports)", ""));
+
+  return (
+    <div className={`message-bus-topology ${compact ? "compact" : ""}`} aria-label="Message bus topology">
+      <div className="bus-summary-strip">
+        <div>
+          <span>Provider</span>
+          <strong>{provider}</strong>
+        </div>
+        <div>
+          <span>Workflow</span>
+          <strong>{workflow}</strong>
+        </div>
+        <div>
+          <span>Execution</span>
+          <strong>{executionMode}</strong>
+        </div>
+        <div>
+          <span>Primary Topic</span>
+          <strong>{sourceTopic}</strong>
+        </div>
       </div>
-      <div className="topic-flow-pill">
-        <span>Workflow</span>
-        <strong>{safeRouting?.workflow || "-"}</strong>
-      </div>
-      <div className="topic-flow-pill">
-        <span>Execution</span>
-        <strong>{safeRouting?.execution_mode || "-"}</strong>
-      </div>
-      <div className="topic-channel-rail">
-        {channels.length ? channels.map((channel, index) => (
-          <div key={`channel-${index}`} className="topic-channel-chip" style={{ animationDelay: `${Math.min(index * 70, 560)}ms` }}>
-            {channel}
+
+      <div className="bus-path-stage-grid">
+        <section className="bus-stage bus-stage-ingest">
+          <div className="bus-stage-head">
+            <span className="bus-node-icon">LP</span>
+            <div>
+              <strong>Landing Pad</strong>
+              <span>Alert intake and normalization</span>
+            </div>
           </div>
-        )) : <p className="subtitle">No observed channels for selected alert.</p>}
+          <div className="bus-endpoint-box">
+            <span>HTTP ingestion</span>
+            <code>/alerts/alertmanager</code>
+          </div>
+          <div className="bus-topic-pill active">raw-alerts</div>
+        </section>
+
+        <section className="bus-stage bus-stage-topic">
+          <div className="bus-stage-head">
+            <span className="bus-node-icon">TC</span>
+            <div>
+              <strong>Topic Creation</strong>
+              <span>Provisioned routing channels</span>
+            </div>
+          </div>
+          <div className="bus-topic-sequence" aria-label="Sequential topic creation flow">
+            {rows.map((row, index) => {
+              const topic = String(row?.publishes || "").trim();
+              const consumes = String(row?.consumes || "").replace(" (enabled transports)", "").trim();
+              const state = isObserved(topic) ? "created" : "configured";
+              return (
+                <div className="bus-topic-sequence-step" key={`${topic || "topic"}-${index}`}>
+                  <div className={`bus-topic-create-row ${state}`}>
+                    <span>{index + 1}</span>
+                    <div>
+                      <strong>{topic || "-"}</strong>
+                      <small>{consumes && consumes !== "-" ? `after ${consumes}` : "landing pad seed topic"}</small>
+                    </div>
+                    <em>{state}</em>
+                  </div>
+                  {index < rows.length - 1 ? (
+                    <div className="bus-topic-sequence-arrow" aria-hidden="true">
+                      <i />
+                      <span>next</span>
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className="bus-stage bus-stage-master">
+          <div className="bus-stage-head">
+            <span className="bus-node-icon">MN</span>
+            <div>
+              <strong>Master Node</strong>
+              <span>Orchestrator coordinates workers</span>
+            </div>
+          </div>
+          <div className="bus-master-node">
+            <strong>orchestrator</strong>
+            <span>Consumes enriched-alerts</span>
+            <span>Publishes orchestration-events</span>
+          </div>
+        </section>
+      </div>
+
+      <div className="bus-flow-arrow-row" aria-hidden="true">
+        <span>Landing Pad</span>
+        <i />
+        <span>Topics</span>
+        <i />
+        <span>Master Node</span>
+        <i />
+        <span>Parallel Workers</span>
+      </div>
+
+      <section className="bus-parallel-section">
+        <div className="bus-stage-head">
+          <span className="bus-node-icon">PW</span>
+          <div>
+            <strong>Parallel Processing Workers</strong>
+            <span>Independent consumers process topic events concurrently</span>
+          </div>
+        </div>
+        <div className="bus-worker-grid">
+          {workerNodes.map((worker) => (
+            <div className={`bus-worker-node ${worker.lane}`} key={worker.service}>
+              <span>{worker.service}</span>
+              <strong>{worker.title}</strong>
+              <em className={isObserved(worker.topic) ? "observed" : "pending"}>
+                {isObserved(worker.topic) ? "observed" : "ready"}
+              </em>
+              <code>{worker.topic}</code>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <div className="bus-observed-rail">
+        <strong>Observed Topics</strong>
+        <div>
+          {[...observedTopics].map((topic) => (
+            <span key={`observed-topic-${topic}`}>{topic}</span>
+          ))}
+          {!observedTopics.size ? <span>No live topic activity yet</span> : null}
+        </div>
       </div>
     </div>
   );
@@ -2257,6 +2399,8 @@ function normalizeGeneratedRuleRows(source) {
       id: String(row.id || row.rule_id || row.name || `rule-${index + 1}`),
       name: String(row.name || row.rule_name || row.alertname || `rule-${index + 1}`),
       platform: String(row.platform || row.target_platform || row.provider || "prometheus"),
+      contractMode: String(row.contract_mode || row.adapter_mode || "-"),
+      contractStatus: String(row.contract_status || row.adapter_status || "-"),
       severity: String(row.severity || row.level || "-").toLowerCase(),
       expression: String(row.expression || row.expr || row.query || row.condition || "-").trim(),
       status: String(row.status || row.state || "generated"),
@@ -2375,7 +2519,7 @@ export default function App() {
   const [alertSeverityOverrides, setAlertSeverityOverrides] = useState({ loading: false, rows: [], error: "", savingKey: "" });
   const [alertSeverityDrafts, setAlertSeverityDrafts] = useState({});
   const [dashboardAlertQuery, setDashboardAlertQuery] = useState("");
-  const [dashboardAlertFocus, setDashboardAlertFocus] = useState("all");
+  const [dashboardAlertFocus, setDashboardAlertFocus] = useState("ops");
   const [incidentMetadata, setIncidentMetadata] = useState({ loading: false, rows: [], error: "" });
   const [closedIncidents, setClosedIncidents] = useState({ loading: false, rows: [], error: "" });
   const [flows, setFlows] = useState({ loading: false, rows: [], error: "" });
@@ -2400,6 +2544,14 @@ export default function App() {
   const [selectedAlertId, setSelectedAlertId] = useState("");
   const [selectedApprovalIncidentId, setSelectedApprovalIncidentId] = useState("");
   const [selectedAlertData, setSelectedAlertData] = useState({ loading: false, payload: null, error: "", alertId: "" });
+  const [selectedAlertDocumentLinks, setSelectedAlertDocumentLinks] = useState({
+    loading: false,
+    alertId: "",
+    rows: [],
+    canonicalAlert: null,
+    contract: null,
+    error: "",
+  });
   const [selectedStageCompleteness, setSelectedStageCompleteness] = useState({
     loading: false,
     data: null,
@@ -2417,6 +2569,16 @@ export default function App() {
     comment: "",
     modified_action: "",
   });
+  const [remediationPlanEditor, setRemediationPlanEditor] = useState({
+    commands: "",
+    scripts: "",
+    queries: "",
+    connection_url: "",
+    connection_type: "application",
+    namespace: "",
+    notes: "",
+  });
+  const [remediationExecutionState, setRemediationExecutionState] = useState({ loading: false, result: null, error: "" });
   const [selectedFlow, setSelectedFlow] = useState("payment-latency");
   const [metadataFilters, setMetadataFilters] = useState({
     risk_tier: "all",
@@ -2464,12 +2626,13 @@ export default function App() {
     prometheus_url: "http://prometheus:9090",
     new_relic_url: "",
     datadog_url: "",
-    gcp_project_id: "",
-    gcp_region: "us-central1",
-    pubsub_topic: "kaiops-orchestration-events",
-    pubsub_subscription: "kaiops-orchestration-sub",
-    vertex_model_armor_enabled: false,
-    vertex_model_armor_template: "",
+    azure_subscription_id: "",
+    azure_resource_group: "",
+    azure_service_bus_namespace: "",
+    azure_service_bus_topic: "kaiops-orchestration-events",
+    azure_service_bus_subscription: "kaiops-orchestration-sub",
+    azure_content_safety_enabled: false,
+    azure_content_safety_endpoint: "",
     assignment_username: "",
     assignment_project: "",
     onboarding_path: "existing_monitoring",
@@ -2669,7 +2832,7 @@ export default function App() {
   async function loadMonitoringApplications() {
     setMonitoringApps((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/applications");
+      const payload = await fetchJson("/api-gateway/applications", authenticatedOptions());
       const data = unwrap(payload);
       const rows = Array.isArray(data?.rows) ? data.rows : [];
       setMonitoringApps({ loading: false, rows, error: "" });
@@ -2694,9 +2857,9 @@ export default function App() {
     setMonitoringAppDetails((prev) => ({ ...prev, loading: true, error: "" }));
     try {
       const [historyPayload, validationsPayload, dashboardsPayload] = await Promise.all([
-        fetchJson(`/api-gateway/applications/${normalized}/history`),
-        fetchJson(`/api-gateway/applications/${normalized}/validations`),
-        fetchJson(`/api-gateway/applications/${normalized}/dashboards`),
+        fetchJson(`/api-gateway/applications/${normalized}/history`, authenticatedOptions()),
+        fetchJson(`/api-gateway/applications/${normalized}/validations`, authenticatedOptions()),
+        fetchJson(`/api-gateway/applications/${normalized}/dashboards`, authenticatedOptions()),
       ]);
       const historyRows = Array.isArray(unwrap(historyPayload)?.rows) ? unwrap(historyPayload).rows : [];
       const validationRows = Array.isArray(unwrap(validationsPayload)?.rows) ? unwrap(validationsPayload).rows : [];
@@ -2744,11 +2907,10 @@ export default function App() {
         monitoring_platform: "prometheus",
         labels,
       };
-      await fetchJson("/api-gateway/applications", {
+      await fetchJson("/api-gateway/applications", authenticatedOptions({
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
-      });
+      }));
       setMonitoringAppSubmit({ loading: false, error: "", success: `Queued onboarding for ${monitoringAppForm.name}` });
       setMonitoringAppForm((curr) => ({ ...curr, name: "", owner_email: "", metrics_endpoint: "http://api-gateway:8000/metrics" }));
       await loadMonitoringApplications();
@@ -2779,6 +2941,52 @@ export default function App() {
           return prev;
         }
         return { loading: false, payload: null, error: error.message, alertId: normalized };
+      });
+    }
+  }
+
+  async function loadSelectedAlertDocumentLinks(alertId) {
+    const normalized = String(alertId || "").trim();
+    if (!normalized) {
+      setSelectedAlertDocumentLinks({ loading: false, alertId: "", rows: [], canonicalAlert: null, contract: null, error: "" });
+      return;
+    }
+    setSelectedAlertDocumentLinks((current) => ({
+      ...current,
+      loading: true,
+      alertId: normalized,
+      error: "",
+    }));
+    try {
+      const payload = await fetchJson(`/api-gateway/alerts/${encodeURIComponent(normalized)}/linked-documents?limit=${alertsLimit}`);
+      const data = unwrap(payload);
+      const rows = Array.isArray(data?.linked_documents) ? data.linked_documents : [];
+      setSelectedAlertDocumentLinks((current) => {
+        if (String(current.alertId || "") !== normalized) {
+          return current;
+        }
+        return {
+          loading: false,
+          alertId: normalized,
+          rows,
+          canonicalAlert: data?.canonical_alert || null,
+          contract: data || null,
+          error: "",
+        };
+      });
+    } catch (error) {
+      setSelectedAlertDocumentLinks((current) => {
+        if (String(current.alertId || "") !== normalized) {
+          return current;
+        }
+        return {
+          ...current,
+          loading: false,
+          rows: [],
+          canonicalAlert: null,
+          contract: null,
+          error: String(error?.message || "Unable to load linked documents"),
+        };
       });
     }
   }
@@ -2818,6 +3026,7 @@ export default function App() {
     setActiveTab("home");
     setHomeDetailTab("overview");
     loadAlertDetails(alertId);
+    loadSelectedAlertDocumentLinks(alertId);
   }
 
   function openAlertDetailsFromIncident(row) {
@@ -2889,10 +3098,13 @@ export default function App() {
       if (String(selectedAlertData.alertId || "") !== String(selectedAlertId || "")) {
         loadAlertDetails(selectedAlertId);
       }
+      if (String(selectedAlertDocumentLinks.alertId || "") !== String(selectedAlertId || "")) {
+        loadSelectedAlertDocumentLinks(selectedAlertId);
+      }
       return;
     }
     openAlertDetails(scopedRows[0]);
-  }, [activeTab, alerts.rows, applicationToMonitor, selectedAlertId, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId]);
+  }, [activeTab, alerts.rows, applicationToMonitor, selectedAlertId, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId, selectedAlertDocumentLinks.alertId]);
 
   async function loadIncidentMetadata() {
     setIncidentMetadata((prev) => ({ ...prev, loading: true, error: "" }));
@@ -2970,6 +3182,7 @@ export default function App() {
 
     if (selectedAlertId) {
       tasks.push(loadAlertDetails(selectedAlertId));
+      tasks.push(loadSelectedAlertDocumentLinks(selectedAlertId));
     }
 
     if (selectedApprovalIncidentId && (!normalizedIncidentId || selectedApprovalIncidentId === normalizedIncidentId)) {
@@ -3043,8 +3256,8 @@ export default function App() {
   async function loadMonitorApplications() {
     try {
       const [onboardingPayload, monitoringPayload] = await Promise.all([
-        fetchJson("/api-gateway/onboarding/state"),
-        fetchJson("/api-gateway/applications").catch(() => ({})),
+        fetchJson("/api-gateway/onboarding/state", authenticatedOptions()),
+        fetchJson("/api-gateway/applications", authenticatedOptions()).catch(() => ({})),
       ]);
       const onboardingData = unwrap(onboardingPayload);
       const onboardingRows = Array.isArray(onboardingData?.rows) ? onboardingData.rows : [];
@@ -3125,7 +3338,7 @@ export default function App() {
 
   async function reloadRagDocs() {
     try {
-      await fetchJson("/api-gateway/rag/reload", { method: "POST", body: JSON.stringify({}) });
+      await fetchJson("/api-gateway/rag/reload", authenticatedOptions({ method: "POST", body: JSON.stringify({}) }));
       await loadRagDocs();
     } catch (error) {
       setRagDocs((prev) => ({ ...prev, error: error.message }));
@@ -3168,6 +3381,17 @@ export default function App() {
   function adminHeaders() {
     const token = String(adminSession.accessToken || "").trim();
     return token ? { Authorization: `Bearer ${token}` } : {};
+  }
+
+  function authenticatedOptions(options = {}) {
+    const headers = adminHeaders();
+    return {
+      ...options,
+      headers: {
+        ...headers,
+        ...(options.headers || {}),
+      },
+    };
   }
 
   async function adminLogin(event) {
@@ -3350,12 +3574,13 @@ export default function App() {
       prometheus_url: monitoring.tool === "prometheus" ? monitoring.url : "",
       new_relic_url: monitoring.tool === "new_relic" ? monitoring.url : "",
       datadog_url: monitoring.tool === "datadog" ? monitoring.url : "",
-      gcp_project_id: String(connectivityPayload.gcp_project_id || curr.gcp_project_id || "").trim(),
-      gcp_region: String(connectivityPayload.gcp_region || curr.gcp_region || "").trim(),
-      pubsub_topic: String(connectivityPayload.pubsub_topic || curr.pubsub_topic || "").trim(),
-      pubsub_subscription: String(connectivityPayload.pubsub_subscription || curr.pubsub_subscription || "").trim(),
-      vertex_model_armor_enabled: Boolean(connectivityPayload.vertex_model_armor_enabled ?? curr.vertex_model_armor_enabled),
-      vertex_model_armor_template: String(connectivityPayload.vertex_model_armor_template || curr.vertex_model_armor_template || "").trim(),
+      azure_subscription_id: String(connectivityPayload.azure_subscription_id || curr.azure_subscription_id || "").trim(),
+      azure_resource_group: String(connectivityPayload.azure_resource_group || curr.azure_resource_group || "").trim(),
+      azure_service_bus_namespace: String(connectivityPayload.azure_service_bus_namespace || curr.azure_service_bus_namespace || "").trim(),
+      azure_service_bus_topic: String(connectivityPayload.azure_service_bus_topic || curr.azure_service_bus_topic || "").trim(),
+      azure_service_bus_subscription: String(connectivityPayload.azure_service_bus_subscription || curr.azure_service_bus_subscription || "").trim(),
+      azure_content_safety_enabled: Boolean(connectivityPayload.azure_content_safety_enabled ?? curr.azure_content_safety_enabled),
+      azure_content_safety_endpoint: String(connectivityPayload.azure_content_safety_endpoint || curr.azure_content_safety_endpoint || "").trim(),
       assignment_project: String(row.project_name || projectPayload.name || curr.name || "").trim(),
     }));
     setOnboardingProjectMode("existing");
@@ -3406,10 +3631,10 @@ export default function App() {
     let failed = 0;
     for (const row of rows) {
       try {
-        await fetchJson("/api-gateway/rag/documents", {
+        await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
           method: "POST",
           body: JSON.stringify(row),
-        });
+        }));
         ingested += 1;
       } catch (_error) {
         failed += 1;
@@ -3566,14 +3791,14 @@ export default function App() {
     setOnboardingRuleEditorState({ loading: true, error: "", success: "" });
     try {
       const parsedResult = JSON.parse(String(onboardingRuleEditor.payload_json || "{}").trim() || "{}");
-      await fetchJson(`/api-gateway/onboarding/rules/pipeline/${encodeURIComponent(workflowId)}`, {
+      await fetchJson(`/api-gateway/onboarding/rules/pipeline/${encodeURIComponent(workflowId)}`, authenticatedOptions({
         method: "PUT",
         body: JSON.stringify({
           project_name: projectName,
           result: parsedResult,
           status: "updated",
         }),
-      });
+      }));
       await loadOnboardingAdminData();
       setOnboardingRuleEditorState({ loading: false, error: "", success: "Rule workflow updated." });
     } catch (error) {
@@ -3588,9 +3813,9 @@ export default function App() {
     }
     setOnboardingRuleEditorState({ loading: true, error: "", success: "" });
     try {
-      await fetchJson(`/api-gateway/onboarding/rules/pipeline/${encodeURIComponent(normalizedWorkflowId)}`, {
+      await fetchJson(`/api-gateway/onboarding/rules/pipeline/${encodeURIComponent(normalizedWorkflowId)}`, authenticatedOptions({
         method: "DELETE",
-      });
+      }));
       await loadOnboardingAdminData();
       setOnboardingRuleEditor((current) => (
         String(current.workflow_id || "") === normalizedWorkflowId
@@ -3610,9 +3835,9 @@ export default function App() {
     }
     setOnboardingState((current) => ({ ...current, loading: true, error: "", success: "" }));
     try {
-      await fetchJson(`/api-gateway/onboarding/state/${encodeURIComponent(normalizedProject)}`, {
+      await fetchJson(`/api-gateway/onboarding/state/${encodeURIComponent(normalizedProject)}`, authenticatedOptions({
         method: "DELETE",
-      });
+      }));
       await loadOnboardingAdminData();
       await refreshViewsAfterSubmit();
       setOnboardingState((current) => ({ ...current, success: "Project onboarding deleted." }));
@@ -3625,8 +3850,8 @@ export default function App() {
     setOnboardingState((current) => ({ ...current, loading: true, error: "", success: "" }));
     try {
       const [connectivityPayload, statePayload] = await Promise.all([
-        fetchJson("/api-gateway/onboarding/connectivity"),
-        fetchJson("/api-gateway/onboarding/state"),
+        fetchJson("/api-gateway/onboarding/connectivity", authenticatedOptions()),
+        fetchJson("/api-gateway/onboarding/state", authenticatedOptions()),
       ]);
       const connectivity = connectivityPayload?.data?.connectivity || connectivityPayload?.connectivity || {};
       const rows = statePayload?.data?.rows || statePayload?.rows || [];
@@ -3650,12 +3875,13 @@ export default function App() {
         prometheus_url: monitoring.tool === "prometheus" ? monitoring.url : "",
         new_relic_url: monitoring.tool === "new_relic" ? monitoring.url : "",
         datadog_url: monitoring.tool === "datadog" ? monitoring.url : "",
-        gcp_project_id: String(connectivity?.gcp_project_id || curr.gcp_project_id || "").trim(),
-        gcp_region: String(connectivity?.gcp_region || curr.gcp_region || "").trim(),
-        pubsub_topic: String(connectivity?.pubsub_topic || curr.pubsub_topic || "").trim(),
-        pubsub_subscription: String(connectivity?.pubsub_subscription || curr.pubsub_subscription || "").trim(),
-        vertex_model_armor_enabled: Boolean(connectivity?.vertex_model_armor_enabled ?? curr.vertex_model_armor_enabled),
-        vertex_model_armor_template: String(connectivity?.vertex_model_armor_template || curr.vertex_model_armor_template || "").trim(),
+        azure_subscription_id: String(connectivity?.azure_subscription_id || curr.azure_subscription_id || "").trim(),
+        azure_resource_group: String(connectivity?.azure_resource_group || curr.azure_resource_group || "").trim(),
+        azure_service_bus_namespace: String(connectivity?.azure_service_bus_namespace || curr.azure_service_bus_namespace || "").trim(),
+        azure_service_bus_topic: String(connectivity?.azure_service_bus_topic || curr.azure_service_bus_topic || "").trim(),
+        azure_service_bus_subscription: String(connectivity?.azure_service_bus_subscription || curr.azure_service_bus_subscription || "").trim(),
+        azure_content_safety_enabled: Boolean(connectivity?.azure_content_safety_enabled ?? curr.azure_content_safety_enabled),
+        azure_content_safety_endpoint: String(connectivity?.azure_content_safety_endpoint || curr.azure_content_safety_endpoint || "").trim(),
         assignment_project: String(project?.name || curr.name || "").trim(),
       }));
       setExistingRulePipelineForm((curr) => ({ ...curr, platform: monitoring.tool, connection_url: monitoring.url }));
@@ -3708,12 +3934,13 @@ export default function App() {
         },
         deployment_mode: String(onboardingForm.deployment_mode || "on_prem").trim(),
         ...monitoringUrls,
-        gcp_project_id: String(onboardingForm.gcp_project_id || "").trim(),
-        gcp_region: String(onboardingForm.gcp_region || "").trim(),
-        pubsub_topic: String(onboardingForm.pubsub_topic || "").trim(),
-        pubsub_subscription: String(onboardingForm.pubsub_subscription || "").trim(),
-        vertex_model_armor_enabled: Boolean(onboardingForm.vertex_model_armor_enabled),
-        vertex_model_armor_template: String(onboardingForm.vertex_model_armor_template || "").trim(),
+        azure_subscription_id: String(onboardingForm.azure_subscription_id || "").trim(),
+        azure_resource_group: String(onboardingForm.azure_resource_group || "").trim(),
+        azure_service_bus_namespace: String(onboardingForm.azure_service_bus_namespace || "").trim(),
+        azure_service_bus_topic: String(onboardingForm.azure_service_bus_topic || "").trim(),
+        azure_service_bus_subscription: String(onboardingForm.azure_service_bus_subscription || "").trim(),
+        azure_content_safety_enabled: Boolean(onboardingForm.azure_content_safety_enabled),
+        azure_content_safety_endpoint: String(onboardingForm.azure_content_safety_endpoint || "").trim(),
         user_assignments: userAssignments,
         active_provider: selectedMonitoringTool,
       };
@@ -3728,7 +3955,7 @@ export default function App() {
       ].filter((line, index, array) => array.findIndex((item) => item.toLowerCase() === line.toLowerCase()) === index);
       const shouldStartRuleOnboarding = plainLanguageRequirements.length > 0;
 
-      const response = await fetchJson("/api-gateway/onboarding/complete", {
+      const response = await fetchJson("/api-gateway/onboarding/complete", authenticatedOptions({
         method: "POST",
         body: JSON.stringify({
           project_mode: onboardingProjectMode === "new" ? "new" : "existing",
@@ -3740,11 +3967,13 @@ export default function App() {
             name: String(row?.name || "uploaded-document").trim() || "uploaded-document",
             kind: String(row?.category || classifyOnboardingDocumentType(row?.name, row?.text)).trim().toLowerCase() || "other",
             excerpt: String(row?.excerpt || "").trim(),
+            content: String(row?.text || "").slice(0, 12000),
+            size: Number(row?.size || 0),
           })),
           selected_monitoring_tool: selectedMonitoringTool,
           generate_documents: true,
         }),
-      });
+      }));
 
       const completePayload = unwrap(response);
       const workflowSteps = Array.isArray(completePayload?.workflow_steps) ? completePayload.workflow_steps : [];
@@ -3819,7 +4048,7 @@ export default function App() {
       business_owner: "",
       technical_owner: "",
       technology_stack: [],
-      cloud_provider: onboardingForm.deployment_mode === "gcp_cloud" ? "gcp" : "on_prem",
+      cloud_provider: onboardingForm.deployment_mode === "azure_cloud" ? "azure" : "on_prem",
       region: String(onboardingForm.region || "").trim(),
       monitoring_platforms: MONITORING_TOOL_OPTIONS.includes(selectedMonitoringTool) ? [selectedMonitoringTool] : ["prometheus"],
       notification_platforms: ["slack", "teams", "pagerduty"],
@@ -3829,7 +4058,7 @@ export default function App() {
   async function loadOnboardingRuleCapabilities() {
     setOnboardingRuleCapabilities((current) => ({ ...current, loading: true, error: "" }));
     try {
-      const response = await fetchJson("/api-gateway/onboarding/rules/capabilities");
+      const response = await fetchJson("/api-gateway/onboarding/rules/capabilities", authenticatedOptions());
       const payload = unwrap(response);
       const rows = Array.isArray(payload?.rows) ? payload.rows : [];
       setOnboardingRuleCapabilities({ loading: false, rows, error: "" });
@@ -3862,10 +4091,10 @@ export default function App() {
         },
       };
 
-      const response = await fetchJson("/api-gateway/onboarding/rules/pipeline/existing", {
+      const response = await fetchJson("/api-gateway/onboarding/rules/pipeline/existing", authenticatedOptions({
         method: "POST",
         body: JSON.stringify(payload),
-      });
+      }));
       const result = unwrap(response);
       setOnboardingRuleRunState({ loading: false, result, error: "" });
       setOnboardingRuleLookup((current) => ({
@@ -3906,10 +4135,10 @@ export default function App() {
         discovery_inputs: discoveryInputs,
       };
 
-      const response = await fetchJson("/api-gateway/onboarding/rules/pipeline/new", {
+      const response = await fetchJson("/api-gateway/onboarding/rules/pipeline/new", authenticatedOptions({
         method: "POST",
         body: JSON.stringify(payload),
-      });
+      }));
       const result = unwrap(response);
       setOnboardingRuleRunState({ loading: false, result, error: "" });
       setOnboardingRuleLookup((current) => ({
@@ -3931,7 +4160,7 @@ export default function App() {
     }
     setOnboardingRuleLookup((current) => ({ ...current, loading: true, result: null, error: "" }));
     try {
-      const response = await fetchJson(`/api-gateway/onboarding/rules/pipeline/${encodeURIComponent(workflowId)}`);
+      const response = await fetchJson(`/api-gateway/onboarding/rules/pipeline/${encodeURIComponent(workflowId)}`, authenticatedOptions());
       const result = unwrap(response);
       setOnboardingRuleLookup((current) => ({ ...current, loading: false, result, error: "" }));
     } catch (error) {
@@ -3939,10 +4168,99 @@ export default function App() {
     }
   }
 
+  function normalizeDocumentToken(value) {
+    return String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[\s_]+/g, "-")
+      .replace(/-+/g, "-");
+  }
+
+  function collectDocumentTokens(...values) {
+    const tokens = new Set();
+    values.forEach((value) => {
+      if (Array.isArray(value)) {
+        value.forEach((item) => collectDocumentTokens(item).forEach((token) => tokens.add(token)));
+        return;
+      }
+      const raw = String(value || "").trim();
+      if (!raw) {
+        return;
+      }
+      const normalizedRaw = normalizeDocumentToken(raw);
+      if (normalizedRaw) {
+        tokens.add(normalizedRaw);
+      }
+      raw
+        .split(/[,;|\s]+/)
+        .map(normalizeDocumentToken)
+        .filter(Boolean)
+        .forEach((token) => tokens.add(token));
+    });
+    return tokens;
+  }
+
+  function getAlertDocumentMatchContext(alertRow) {
+    const labels = typeof alertRow?.labels === "object" && alertRow?.labels ? alertRow.labels : {};
+    const metadata = typeof alertRow?.metadata === "object" && alertRow?.metadata ? alertRow.metadata : {};
+    const ids = collectDocumentTokens(
+      alertRow?.alert_id,
+      alertRow?.id,
+      alertRow?.incident_id,
+      metadata?.alert_id,
+      metadata?.incident_id,
+      labels?.alert_id,
+    );
+    const alertTypes = collectDocumentTokens(
+      alertRow?.alert_type,
+      alertRow?.name,
+      alertRow?.alert_name,
+      alertRow?.alertname,
+      labels?.alertname,
+      labels?.alert_type,
+      labels?.rule,
+    );
+    const services = collectDocumentTokens(
+      alertRow?.service,
+      alertRow?.application,
+      alertRow?.project,
+      alertRow?.project_name,
+      alertRow?.component,
+      metadata?.service,
+      metadata?.application,
+      metadata?.project,
+      labels?.service,
+      labels?.job,
+      labels?.application,
+      labels?.project,
+      labels?.project_name,
+      labels?.deployment,
+      labels?.namespace,
+      labels?.instance,
+    );
+    const genericServiceDocsAllowed = alertRow?.document_available === true || Boolean(metadata?.runbook_hint);
+    return { ids, alertTypes, services, genericServiceDocsAllowed };
+  }
+
+  function ragDocumentMatchesAlert(doc, context) {
+    const docIds = collectDocumentTokens(doc?.alert_id, doc?.id, doc?.metadata?.alert_id, doc?.metadata?.incident_id);
+    if ([...context.ids].some((id) => docIds.has(id))) {
+      return true;
+    }
+    const docAlertTypes = collectDocumentTokens(doc?.alert_type, doc?.alert_name, doc?.alertname, doc?.metadata?.alert_type);
+    const docServices = collectDocumentTokens(doc?.services, doc?.service, doc?.metadata?.service, doc?.metadata?.services);
+    const hasAlertTypeMatch = [...context.alertTypes].some((type) => docAlertTypes.has(type));
+    const hasServiceMatch = [...context.services].some((service) => docServices.has(service));
+    if (hasAlertTypeMatch && hasServiceMatch) {
+      return true;
+    }
+    const docKind = String(doc?.kind || doc?.document_kind || "").trim().toLowerCase();
+    const isGenericServiceDoc = !docIds.size && hasServiceMatch && ["runbook", "incident", "sop", "onboarding"].includes(docKind);
+    return Boolean(context.genericServiceDocsAllowed && isGenericServiceDoc);
+  }
+
   function findMatchingRagDocument(alertRow, preferredKind = "") {
-    const alertId = String(alertRow?.alert_id || alertRow?.id || "").trim();
-    const alertType = String(alertRow?.name || alertRow?.alert_name || "").trim().toLowerCase();
-    const service = String(alertRow?.service || "").trim().toLowerCase();
+    const context = getAlertDocumentMatchContext(alertRow);
     const normalizedKind = String(preferredKind || "").trim().toLowerCase();
     const docs = Array.isArray(ragDocs.rows) ? ragDocs.rows : [];
     return docs.find((doc) => {
@@ -3950,14 +4268,49 @@ export default function App() {
       if (normalizedKind && docKind && docKind !== normalizedKind) {
         return false;
       }
-      const docAlertId = String(doc?.alert_id || "").trim();
-      if (alertId && docAlertId && docAlertId === alertId) {
-        return true;
-      }
-      const docAlertType = String(doc?.alert_type || "").trim().toLowerCase();
-      const docServices = Array.isArray(doc?.services) ? doc.services.map((item) => String(item || "").trim().toLowerCase()) : [];
-      return Boolean(alertType && docAlertType && alertType === docAlertType && service && docServices.includes(service));
+      return ragDocumentMatchesAlert(doc, context);
     }) || null;
+  }
+
+  function findAlertRagDocuments(alertRow) {
+    if (!alertRow || typeof alertRow !== "object") {
+      return [];
+    }
+    const context = getAlertDocumentMatchContext(alertRow);
+    const docs = Array.isArray(ragDocs.rows) ? ragDocs.rows : [];
+    return docs.filter((doc) => ragDocumentMatchesAlert(doc, context));
+  }
+
+  async function downloadRagDocument(doc) {
+    const path = String(doc?.path || "").trim();
+    if (!path) {
+      return;
+    }
+    try {
+      const full = unwrap(await fetchJson(`/api-gateway/rag/documents/content?path=${encodeURIComponent(path)}`, authenticatedOptions()));
+      const title = String(full?.title || doc?.title || path.split(/[\\/]/).pop() || "alert-document").trim();
+      const content = [
+        `# ${title}`,
+        "",
+        full?.summary ? `Summary: ${String(full.summary).trim()}` : "",
+        full?.kind || doc?.kind ? `Kind: ${String(full?.kind || doc?.kind).trim()}` : "",
+        full?.alert_id || doc?.alert_id ? `Alert ID: ${String(full?.alert_id || doc?.alert_id).trim()}` : "",
+        "",
+        String(full?.content || doc?.content || "").trim(),
+      ].filter((line) => line !== "").join("\n");
+      const safeName = `${title || "alert-document"}`.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "alert-document";
+      const blob = new Blob([content || JSON.stringify(full || doc, null, 2)], { type: "text/markdown;charset=utf-8" });
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = `${safeName}.md`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      setRagDocs((current) => ({ ...current, error: `Download failed: ${String(error?.message || "Unknown error")}` }));
+    }
   }
 
   function hasAlertDocuments(alertRow) {
@@ -4285,7 +4638,7 @@ export default function App() {
     let aiDraft = null;
     let aiUsage = null;
     try {
-      const aiResponseRaw = await fetchJson("/api-gateway/model/route", {
+      const aiResponseRaw = await fetchJson("/api-gateway/model/route", authenticatedOptions({
         method: "POST",
         body: JSON.stringify({
           severity: String(alertOnboarding.severity || "high").trim().toLowerCase(),
@@ -4302,7 +4655,7 @@ export default function App() {
             user_prompt: prompt,
           },
         }),
-      });
+      }));
       const aiResponse = aiResponseRaw?.data && typeof aiResponseRaw.data === "object"
         ? aiResponseRaw.data
         : aiResponseRaw;
@@ -4366,10 +4719,10 @@ export default function App() {
       const draft = await buildAlertDocumentDraftWithAnalysis(alertRow, preferredKind);
       const existingDoc = findMatchingRagDocument(alertRow, draft.kind);
       const payload = buildDocPayloadFromDraft(draft);
-      const response = await fetchJson("/api-gateway/rag/documents", {
+      const response = await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
         method: existingDoc?.path ? "PUT" : "POST",
         body: JSON.stringify(existingDoc?.path ? { ...payload, path: existingDoc.path } : payload),
-      });
+      }));
       const responseData = response?.data || response || {};
       setAlertOnboardingState({
         loading: false,
@@ -4412,10 +4765,10 @@ export default function App() {
         const draft = await buildAlertDocumentDraftWithAnalysis(alertRow, kind);
         const existingDoc = findMatchingRagDocument(alertRow, kind);
         const payload = buildDocPayloadFromDraft(draft);
-        const response = await fetchJson("/api-gateway/rag/documents", {
+        const response = await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
           method: existingDoc?.path ? "PUT" : "POST",
           body: JSON.stringify(existingDoc?.path ? { ...payload, path: existingDoc.path } : payload),
-        });
+        }));
         results.push({ kind, path: response?.data?.path || response?.path || existingDoc?.path || "" });
       }
       await Promise.all([loadRagDocs(), loadRecentAlerts()]);
@@ -4463,7 +4816,7 @@ export default function App() {
           criticality: String(row?.severity || "high").trim().toLowerCase() === "critical" ? "high" : "medium",
           support_team: String(onboardingForm.owner_team || "platform-ops").trim(),
           region: String(onboardingForm.region || "us-east-1").trim(),
-          cloud_provider: onboardingForm.deployment_mode === "gcp_cloud" ? "gcp" : "on_prem",
+          cloud_provider: onboardingForm.deployment_mode === "azure_cloud" ? "azure" : "on_prem",
           monitoring_platforms: [platform],
           notification_platforms: ["slack", "teams"],
         },
@@ -4478,10 +4831,10 @@ export default function App() {
           generated_from_alert_analysis: true,
         },
       };
-      const response = await fetchJson("/api-gateway/onboarding/rules/pipeline/create", {
+      const response = await fetchJson("/api-gateway/onboarding/rules/pipeline/create", authenticatedOptions({
         method: "POST",
         body: JSON.stringify(payload),
-      });
+      }));
       const data = unwrap(response);
       const workflowId = String(data?.workflow_id || "").trim();
       if (workflowId) {
@@ -4505,10 +4858,10 @@ export default function App() {
         severity: String(alertOnboarding.severity || "").trim(),
       };
       const isUpdate = docPromptMode === "update" && Boolean(docPromptExistingDoc?.path);
-      const response = await fetchJson("/api-gateway/rag/documents", {
+      const response = await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
         method: isUpdate ? "PUT" : "POST",
         body: JSON.stringify(isUpdate ? { ...payload, path: docPromptExistingDoc.path } : payload),
-      });
+      }));
       const responseData = response?.data || response || {};
       const normalizedKind = String(payload.kind || docPromptKind || "runbook").trim().toLowerCase();
       const mergedDoc = {
@@ -4583,10 +4936,10 @@ export default function App() {
     };
 
     try {
-      const response = await fetchJson("/api-gateway/rag/documents", {
+      const response = await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
         method: "POST",
         body: JSON.stringify(buildDocPayloadFromDraft(autoDraft)),
-      });
+      }));
       setAlertOnboarding((curr) => ({ ...curr, ...autoDraft }));
       setAlertOnboardingState({
         loading: false,
@@ -4610,6 +4963,10 @@ export default function App() {
   }
 
   function openDocumentPrompt(row) {
+    if (!canProvideAlertDocuments) {
+      setDocPromptAlert(null);
+      return;
+    }
     const byKind = {};
     ALERT_DOC_KIND_OPTIONS.forEach((kind) => {
       const doc = findMatchingRagDocument(row, kind);
@@ -4863,10 +5220,15 @@ export default function App() {
   }, [monitorScopedAlerts]);
 
   const dashboardAlertSummary = useMemo(() => {
-    const summary = { total: visibleAlerts.length, critical: 0, high: 0, awaiting: 0, active: 0 };
+    const summary = { total: visibleAlerts.length, ops: 0, test: 0, critical: 0, high: 0, awaiting: 0, active: 0 };
     visibleAlerts.forEach((row) => {
       const severity = String(row?.severity || "").toLowerCase();
       const status = String(row?.status || row?.state || "open").toLowerCase();
+      if (isGeneratedOrTestAlert(row)) {
+        summary.test += 1;
+      } else {
+        summary.ops += 1;
+      }
       if (severity === "critical") {
         summary.critical += 1;
       }
@@ -4888,6 +5250,13 @@ export default function App() {
     return visibleAlerts.filter((row) => {
       const severity = String(row?.severity || "").toLowerCase();
       const status = String(row?.status || row?.state || "open").toLowerCase();
+      const generatedOrTest = isGeneratedOrTestAlert(row);
+      if (dashboardAlertFocus === "ops" && generatedOrTest) {
+        return false;
+      }
+      if (dashboardAlertFocus === "test" && !generatedOrTest) {
+        return false;
+      }
       if (dashboardAlertFocus === "critical" && severity !== "critical") {
         return false;
       }
@@ -5049,6 +5418,31 @@ export default function App() {
       .slice(0, 300);
   }, [selectedAlertEvents, selectedAlertEventTrace]);
 
+  const selectedAlertRagDocuments = useMemo(
+    () => {
+      if (Array.isArray(selectedAlertDocumentLinks.rows) && selectedAlertDocumentLinks.rows.length) {
+        return selectedAlertDocumentLinks.rows;
+      }
+      return findAlertRagDocuments(selectedAlertRow);
+    },
+    [selectedAlertDocumentLinks.rows, selectedAlertRow, ragDocs.rows],
+  );
+
+  const selectedAlertDocumentContract = selectedAlertDocumentLinks.contract;
+
+  const selectedAlertDetailsSource = useMemo(() => {
+    if (selectedAlertData.loading) {
+      return "Loading processed result from monitoring adapter.";
+    }
+    if (selectedAlertData.payload) {
+      return "Processed workflow result from monitoring-adapter; no LLM call required for this view.";
+    }
+    if (selectedAlertData.error) {
+      return "Processed workflow result unavailable; showing alert-stream fallback fields only.";
+    }
+    return "Alert-stream row selected; processed workflow result has not loaded yet.";
+  }, [selectedAlertData.loading, selectedAlertData.payload, selectedAlertData.error]);
+
   const selectedAlertUsage = useMemo(() => {
     const rows = [];
     const appendUsage = (candidate) => {
@@ -5121,6 +5515,31 @@ export default function App() {
   }, [selectedAlertWorkflow, selectedAlertEventTrace, selectedAlertUsage]);
 
   const selectedAlertRouting = useMemo(() => extractObservedRoutingMetrics(selectedAlertWorkflow), [selectedAlertWorkflow]);
+
+  const selectedAlertEvaluation = useMemo(() => {
+    const recommendation = selectedAlertWorkflow?.recommendation && typeof selectedAlertWorkflow.recommendation === "object"
+      ? selectedAlertWorkflow.recommendation
+      : {};
+    const metadata = recommendation?.metadata && typeof recommendation.metadata === "object" ? recommendation.metadata : {};
+    const evaluation = metadata?.evaluation && typeof metadata.evaluation === "object" ? metadata.evaluation : {};
+    const ragMatches = Array.isArray(metadata.rag_matches) ? metadata.rag_matches : [];
+    const bestRagMatch = ragMatches.reduce((best, row) => {
+      const value = Number(row?.match_confidence ?? row?._similarity ?? row?.similarity ?? row?.score ?? 0);
+      return Number.isFinite(value) ? Math.max(best, value) : best;
+    }, Number(metadata.rag_top_similarity || 0) || 0);
+    const citations = Array.isArray(metadata.citations) ? metadata.citations : [];
+    return normalizeEvaluationEnvelope(evaluation, {
+      confidence: recommendation?.confidence,
+      ragMatchScore: bestRagMatch,
+      citationCoverage: Math.min(citations.length / 3, 1),
+      evidenceCoverage: Math.min(
+        (metadata.runbook_found ? 0.35 : 0)
+        + (ragMatches.length ? 0.4 : 0)
+        + (selectedAlertRagDocuments.length ? 0.25 : 0),
+        1,
+      ),
+    });
+  }, [selectedAlertWorkflow, selectedAlertRagDocuments.length]);
 
   const selectedIncidentId = useMemo(() => {
     return String(selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "").trim();
@@ -5219,6 +5638,97 @@ export default function App() {
       approvalStatus: normalizeApprovalStatus(selectedExecutionPlan.approvalStatus || "pending"),
     };
   }, [selectedExecutionPlan]);
+
+  const selectedApplicationConnection = useMemo(() => {
+    const workflowContext = typeof selectedAlertWorkflow?.context === "object" && selectedAlertWorkflow.context
+      ? selectedAlertWorkflow.context
+      : {};
+    const incident = typeof selectedAlertWorkflow?.incident === "object" && selectedAlertWorkflow.incident
+      ? selectedAlertWorkflow.incident
+      : {};
+    const recommendation = typeof selectedAlertWorkflow?.recommendation === "object" && selectedAlertWorkflow.recommendation
+      ? selectedAlertWorkflow.recommendation
+      : {};
+    const metadata = typeof recommendation?.metadata === "object" && recommendation.metadata ? recommendation.metadata : {};
+    const service = String(
+      selectedAlertRow?.service
+      || incident?.service
+      || selectedIncidentMetadataRow?.service
+      || metadata?.service
+      || workflowContext?.service
+      || ""
+    ).trim();
+    const application = String(
+      selectedAlertRow?.application
+      || selectedAlertRow?.project_name
+      || selectedAlertRow?.project
+      || selectedIncidentMetadataRow?.application
+      || applicationToMonitor
+      || ""
+    ).trim();
+    const appRow = monitoringApps.rows.find((row) => {
+      const rowName = String(row?.name || "").trim().toLowerCase();
+      const rowService = String(row?.service || row?.labels?.service || "").trim().toLowerCase();
+      return (application && rowName === application.toLowerCase()) || (service && rowService === service.toLowerCase());
+    }) || {};
+    const endpoint = String(
+      metadata?.connection_url
+      || metadata?.endpoint_url
+      || workflowContext?.deployment
+      || workflowContext?.observability?.metrics_endpoint
+      || appRow?.metrics_endpoint
+      || onboardingForm.monitoring_url
+      || onboardingForm.prometheus_url
+      || ""
+    ).trim();
+    const environment = String(
+      selectedAlertRow?.environment
+      || incident?.environment
+      || selectedIncidentMetadataRow?.environment
+      || metadata?.environment
+      || appRow?.environment
+      || "prod"
+    ).trim();
+    const namespace = String(metadata?.namespace || appRow?.namespace || environment || "prod").trim();
+    return {
+      application: application || "-",
+      service: service || "-",
+      environment: environment || "prod",
+      namespace,
+      endpoint: endpoint || "Not configured",
+      connection_type: endpoint ? "metrics/application endpoint" : "missing connection details",
+      source: endpoint ? "onboarding/application metadata" : "missing",
+    };
+  }, [
+    selectedAlertWorkflow,
+    selectedAlertRow,
+    selectedIncidentMetadataRow,
+    monitoringApps.rows,
+    onboardingForm.monitoring_url,
+    onboardingForm.prometheus_url,
+    applicationToMonitor,
+  ]);
+
+  useEffect(() => {
+    setRemediationPlanEditor({
+      commands: selectedExecutionBreakdown.commands.join("\n"),
+      scripts: selectedExecutionBreakdown.scripts.join("\n"),
+      queries: selectedExecutionBreakdown.queries.join("\n"),
+      connection_url: selectedApplicationConnection.endpoint === "Not configured" ? "" : selectedApplicationConnection.endpoint,
+      connection_type: selectedApplicationConnection.connection_type || "application",
+      namespace: selectedApplicationConnection.namespace || "",
+      notes: "",
+    });
+    setRemediationExecutionState({ loading: false, result: null, error: "" });
+  }, [
+    selectedAlertId,
+    selectedExecutionBreakdown.commands,
+    selectedExecutionBreakdown.scripts,
+    selectedExecutionBreakdown.queries,
+    selectedApplicationConnection.endpoint,
+    selectedApplicationConnection.connection_type,
+    selectedApplicationConnection.namespace,
+  ]);
 
   const selectedAlertTimelineRows = useMemo(() => {
     const ingestAt =
@@ -6250,10 +6760,10 @@ export default function App() {
       payload.modified_action = String(modifiedAction || "").trim();
     }
 
-    return fetchJson(`/api-gateway/approval/${normalizedAction}`, {
+    return fetchJson(`/api-gateway/approval/${normalizedAction}`, authenticatedOptions({
       method: "POST",
       body: JSON.stringify(payload),
-    });
+    }));
   }
 
   async function resolveRecommendationIdForIncident(incidentId, preferredRecommendationId = "") {
@@ -6396,6 +6906,88 @@ export default function App() {
     }
   }
 
+  async function executeApprovedRemediationPlan() {
+    const incidentId = String(approvalForm.incident_id || selectedIncidentId || selectedApprovalIncidentId || "").trim();
+    const recommendationIdCandidate = String(
+      approvalForm.recommendation_id
+      || selectedApprovalRecommendationId
+      || approvalRecommendationFromPayload(approvalIncidentContext.payload)
+      || selectedAlertWorkflow?.recommendation?.id
+      || ""
+    ).trim();
+    const approver = String(approvalForm.approver || adminSession?.user?.username || "admin").trim();
+    const approvalStatus = normalizeApprovalStatus(selectedExecutionPlan.approvalStatus || approvalForm.action);
+    const editedPlan = {
+      commands: toPlanLines(remediationPlanEditor.commands),
+      scripts: toPlanLines(remediationPlanEditor.scripts),
+      queries: toPlanLines(remediationPlanEditor.queries),
+    };
+    const hasPlan = editedPlan.commands.length || editedPlan.scripts.length || editedPlan.queries.length;
+
+    setRemediationExecutionState({ loading: true, result: null, error: "" });
+    try {
+      if (!looksLikeUuid(incidentId)) {
+        throw new Error("Remediation execution requires a valid incident_id. Select an alert with an incident or sync approval context.");
+      }
+      const recommendationId = await resolveRecommendationIdForIncident(incidentId, recommendationIdCandidate);
+      if (!looksLikeUuid(recommendationId)) {
+        throw new Error("Remediation execution requires a valid recommendation_id from the approved incident.");
+      }
+      if (!hasPlan) {
+        throw new Error("Add at least one command, script, or validation query before executing.");
+      }
+      if (!["approved", "modified"].includes(approvalStatus) && approvalForm.action !== "approve" && approvalForm.action !== "modify") {
+        throw new Error("Approve or modify the remediation first, then execute the approved plan.");
+      }
+
+      const planText = [
+        editedPlan.commands.length ? `Commands:\n${editedPlan.commands.map((item) => `- ${item}`).join("\n")}` : "",
+        editedPlan.scripts.length ? `Scripts:\n${editedPlan.scripts.map((item) => `- ${item}`).join("\n")}` : "",
+        editedPlan.queries.length ? `Queries:\n${editedPlan.queries.map((item) => `- ${item}`).join("\n")}` : "",
+      ].filter(Boolean).join("\n\n");
+      const payload = {
+        incident_id: incidentId,
+        recommendation_id: recommendationId,
+        decision: approvalForm.action === "modify" ? "modified" : "approved",
+        approver,
+        channel: approvalForm.channel || "web",
+        comment: String(approvalForm.comment || remediationPlanEditor.notes || "approved remediation execution").trim(),
+        modified_action: planText,
+        metadata: {
+          recommended_action: selectedExecutionPlan.action,
+          recommended_commands: [
+            ...editedPlan.commands,
+            ...editedPlan.scripts.map((item) => `script: ${item}`),
+            ...editedPlan.queries.map((item) => `query: ${item}`),
+          ],
+          execution_plan: editedPlan,
+          service: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : undefined,
+          environment: selectedApplicationConnection.environment,
+          remediation_target: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : selectedApplicationConnection.application,
+          connection_profile: {
+            application: selectedApplicationConnection.application,
+            service: selectedApplicationConnection.service,
+            environment: selectedApplicationConnection.environment,
+            namespace: String(remediationPlanEditor.namespace || selectedApplicationConnection.namespace || "").trim(),
+            endpoint_url: String(remediationPlanEditor.connection_url || "").trim(),
+            connection_type: String(remediationPlanEditor.connection_type || selectedApplicationConnection.connection_type || "").trim(),
+            source: selectedApplicationConnection.source,
+          },
+          ui_edited: true,
+        },
+      };
+      const response = await fetchJson("/api-gateway/remediation/execute", authenticatedOptions({
+        method: "POST",
+        body: JSON.stringify(payload),
+      }));
+      setRemediationExecutionState({ loading: false, result: response, error: "" });
+      applyApprovalResolutionToUi(incidentId, "remediating", approvalForm.comment);
+      await refreshApprovalDrivenViews(incidentId);
+    } catch (error) {
+      setRemediationExecutionState({ loading: false, result: null, error: String(error?.message || error) });
+    }
+  }
+
   const tabs = [
     { id: "home", label: "Dashboard" },
     { id: "copilot", label: "Copilot Studio" },
@@ -6471,6 +7063,7 @@ export default function App() {
   const isAdministrator = currentRole === "administrator";
   const canUseApprovalActions = allowedTabs.includes("approval");
   const canManageSeverityOverride = ["administrator", "l2_engineer", "l3_engineer", "p2", "p3"].includes(currentRole);
+  const canProvideAlertDocuments = DOCUMENT_PROVIDER_ROLES.has(currentRole);
   const onboardingSourceDocRows = useMemo(
     () => (Array.isArray(onboardingSourceDocs.rows) ? onboardingSourceDocs.rows : []).filter((row) => {
       const text = String(row?.text || "").trim();
@@ -6530,8 +7123,19 @@ export default function App() {
     if (!String(onboardingForm.region || "").trim()) {
       errors.push("Region is required.");
     }
-    if (String(onboardingForm.deployment_mode || "").trim() === "gcp_cloud" && !String(onboardingForm.gcp_project_id || "").trim()) {
-      errors.push("GCP Project ID is required for Google Cloud deployment.");
+    if (String(onboardingForm.deployment_mode || "").trim() === "azure_cloud") {
+      if (!String(onboardingForm.azure_subscription_id || "").trim()) {
+        errors.push("Azure Subscription ID is required for Azure Cloud deployment.");
+      }
+      if (!String(onboardingForm.azure_service_bus_namespace || "").trim()) {
+        errors.push("Azure Service Bus Namespace is required for Azure Cloud deployment.");
+      }
+      if (!String(onboardingForm.azure_service_bus_topic || "").trim()) {
+        errors.push("Azure Service Bus Topic is required for Azure Cloud deployment.");
+      }
+      if (!String(onboardingForm.azure_service_bus_subscription || "").trim()) {
+        errors.push("Azure Service Bus Subscription is required for Azure Cloud deployment.");
+      }
     }
     const isSetupMonitoringPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim() === "setup_monitoring";
     const derivedRequirementCount = (Array.isArray(onboardingSourceDocs.rows) ? onboardingSourceDocs.rows : []).reduce(
@@ -6550,7 +7154,10 @@ export default function App() {
     onboardingForm.owner_team,
     onboardingForm.region,
     onboardingForm.deployment_mode,
-    onboardingForm.gcp_project_id,
+    onboardingForm.azure_subscription_id,
+    onboardingForm.azure_service_bus_namespace,
+    onboardingForm.azure_service_bus_topic,
+    onboardingForm.azure_service_bus_subscription,
     onboardingForm.onboarding_path,
     onboardingForm.monitoring_url,
     onboardingForm.rule_onboarding_plain_language,
@@ -6725,8 +7332,8 @@ export default function App() {
       return "Documents approved. You can continue with another update or proceed to advanced workflow management.";
     }
     return onboardingPath === "setup_monitoring"
-      ? "Step 1: choose Project Mode, Step 2: choose Setup Path, Step 3: upload source docs (optional), then save."
-      : "Step 1: choose Project Mode, Step 2: choose Setup Path, Step 3: upload source docs (optional), then save.";
+      ? "Complete Setup Core: choose project mode, configure Prometheus, upload source docs, then save."
+      : "Complete Setup Core: choose project mode, choose landing-pad path, upload source docs, then save.";
   }, [
     onboardingState.loading,
     onboardingHasPendingDocumentApproval,
@@ -6771,9 +7378,15 @@ export default function App() {
         id: "access",
         title: "1. Access",
         hint: "Users, roles, session security",
-        status: adminUsers.rows.length ? `${adminUsers.rows.length} users loaded` : "No users loaded",
+        status: adminUsers.loading
+          ? "Loading users and roles..."
+          : adminUsers.error
+            ? "Unable to load users"
+            : adminUsers.rows.length
+              ? `${adminUsers.rows.length} users loaded`
+              : "No users returned yet. Click Refresh.",
         complete: Boolean(adminUsers.rows.length),
-        tone: adminUsers.error ? "error" : adminUsers.rows.length ? "success" : "info",
+        tone: adminUsers.error ? "error" : adminUsers.rows.length ? "success" : adminUsers.loading ? "warning" : "info",
         cta: "Open access controls",
       },
       {
@@ -6807,6 +7420,7 @@ export default function App() {
     ];
   }, [
     adminUsers.rows.length,
+    adminUsers.loading,
     adminUsers.error,
     onboardingDocumentSummary.approved,
     onboardingNextAction,
@@ -6823,11 +7437,13 @@ export default function App() {
     const setupDone = Boolean(String(onboardingForm.name || "").trim()) && (onboardingSourceDocCount > 0 || setupSaved || onboardingWorkflowSteps.length > 0);
     const reviewDone = onboardingGeneratedDocs.length > 0 ? Boolean(onboardingDocApprovalState.approved) : setupDone;
     const statusDone = Boolean(onboardingWorkflowSteps.length || onboardingRuleRunState.result || setupSaved);
+    const knowledgeDone = Boolean(alertOnboardingState.result || onboardingGeneratedDocs.length);
     return [
-      { id: "setup", label: "1. Setup Core", hint: "Project, landing pad, and source docs", complete: setupDone },
-      { id: "review", label: "2. Review & Approve", hint: "Review generated rules, docs, metadata", complete: reviewDone },
-      { id: "status", label: "3. Workflow Status", hint: "Validate generated workflow and outputs", complete: statusDone },
-      { id: "advanced", label: "4. Advanced Tools", hint: "Optional expert controls", complete: false },
+      { id: "setup", label: "1. Project Setup", hint: "Project, path, connection, and source docs", complete: setupDone },
+      { id: "review", label: "2. Review Artifacts", hint: "Generated rules, docs, and metadata", complete: reviewDone },
+      { id: "status", label: "3. Validate Flow", hint: "Workflow outputs and generated assets", complete: statusDone },
+      { id: "knowledge", label: "4. Knowledge", hint: "Alert docs and remediation guidance", complete: knowledgeDone },
+      { id: "advanced", label: "5. Advanced", hint: "Expert controls and adapter contracts", complete: false },
     ];
   }, [
     onboardingForm.name,
@@ -6839,6 +7455,7 @@ export default function App() {
     onboardingDocApprovalState.approved,
     onboardingWorkflowSteps.length,
     onboardingRuleRunState.result,
+    alertOnboardingState.result,
   ]);
   const showProjectStep = (stepId) => adminWorkspace !== "project" || projectSetupShowAll || projectSetupStep === stepId;
   const navigateAdminJourney = (stepId) => {
@@ -7241,7 +7858,7 @@ export default function App() {
     } else if (pendingApprovals.length) {
       nextAction = "Use Human Approval to approve or reject pending recommendations and unblock remediation.";
     } else if (!resolutionSeen) {
-      nextAction = "Open Alert Details and review Agent Events for Resolution Intelligence output.";
+      nextAction = "Inspect Cockpit and review Evidence or Timeline for Resolution Intelligence output.";
     } else if (!remediationSeen) {
       nextAction = "Approve the recommendation or verify auto-execution policy to trigger remediation.";
     }
@@ -7390,7 +8007,7 @@ export default function App() {
       `<section><h2>Report Context</h2>${renderHtmlTable(["Field", "Value"], [["Generated At", generatedAt], ["Application Scope", applicationToMonitor], ["Active Tab", activeTab], ["Health", health.message]])}</section>`,
       `<section><h2>Dashboard Metrics</h2>${renderHtmlTable(["Metric", "Value"], homeMetrics)}</section>`,
       `<section><h2>Alert Stream</h2>${renderHtmlTable(["Alert ID", "Time (UTC)", "Name", "Application", "Service", "Severity", "Status"], monitorAlertsRows)}</section>`,
-      `<section><h2>Alert Details Workspace</h2>${renderHtmlTable(["Field", "Value"], selectedSummaryRows)}${renderHtmlTable(["Step", "Agent", "Action", "Decision", "Output", "Communicates To"], selectedEventsRows)}${renderHtmlTable(["Task", "Provider", "Model", "Input", "Output", "Cost USD"], selectedUsageRows)}${renderHtmlTable(["Field", "Value"], selectedRoutingRows)}<h3>Raw Payload</h3><pre>${htmlEscape(JSON.stringify(selectedAlertData.payload || {}, null, 2))}</pre></section>`,
+      `<section><h2>Alert Details Cockpit</h2>${renderHtmlTable(["Field", "Value"], selectedSummaryRows)}${renderHtmlTable(["Step", "Agent", "Action", "Decision", "Output", "Communicates To"], selectedEventsRows)}${renderHtmlTable(["Task", "Provider", "Model", "Input", "Output", "Cost USD"], selectedUsageRows)}${renderHtmlTable(["Field", "Value"], selectedRoutingRows)}<h3>Raw Payload</h3><pre>${htmlEscape(JSON.stringify(selectedAlertData.payload || {}, null, 2))}</pre></section>`,
       `<section><h2>Executive Dashboard</h2>${renderHtmlTable(["Metric", "Value"], executiveMetrics)}${renderHtmlTable(["Incident", "Service", "Risk", "Execution Mode", "Provider", "Status"], metadataRows)}</section>`,
       `<section><h2>Incident Metadata Explorer</h2>${renderHtmlTable(["Incident", "Service", "Risk", "Execution Mode", "Provider", "Status"], metadataRows)}</section>`,
       `<section><h2>Alerts and Quick Docs</h2>${renderHtmlTable(["Incident", "Service", "Severity", "Execution Mode", "Status"], pendingApprovalRows)}${renderHtmlTable(["Kind", "Score", "Title", "Path"], guidanceRows)}</section>`,
@@ -7459,7 +8076,7 @@ export default function App() {
               <button className="button-primary" type="submit" disabled={adminSession.loading}>{adminSession.loading ? "Signing in..." : "Sign In"}</button>
             </form>
             {adminSession.error ? <p className="error">{adminSession.error}</p> : null}
-            <p className="subtitle">Role access: Admin = all screens, L3 = all except Admin Center, L2 = all except Admin Center and Executive, L1 = Dashboard only.</p>
+            <p className="subtitle">Role access: Admin = all screens and document provisioning, L3/L2 = investigations plus Provide Documents, L1 = monitoring dashboard and escalation.</p>
           </article>
         </section>
       </main>
@@ -7587,7 +8204,7 @@ export default function App() {
               </button>
               {activeTab === "home" ? (
                 <button className="button-secondary" type="button" onClick={downloadFullHtmlReportPack}>
-                  Download Full HTML Pack
+                  Export Incident Report
                 </button>
               ) : null}
             </div>
@@ -7599,6 +8216,15 @@ export default function App() {
                 </div>
               ))}
             </div>
+            {!health.ok ? (
+              <div className="health-advisory">
+                <strong>Health needs attention</strong>
+                <span>{health.message || "Gateway status is not available."}</span>
+                <button className="button-secondary" type="button" onClick={checkHealth} disabled={health.loading}>
+                  {health.loading ? "Checking..." : "Recheck"}
+                </button>
+              </div>
+            ) : null}
           </section>
 
           {activeTab === "home" ? (
@@ -7646,11 +8272,13 @@ export default function App() {
                 {alertSeverityOverrides.error ? <p className="error">{alertSeverityOverrides.error}</p> : null}
                 <div className="dashboard-alert-toolbar">
                   <div className="dashboard-alert-focus" role="tablist" aria-label="Alert triage focus">
+                    <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "ops" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("ops")}>Ops {dashboardAlertSummary.ops}</button>
                     <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "all" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("all")}>All {dashboardAlertSummary.total}</button>
                     <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "critical" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("critical")}>Critical {dashboardAlertSummary.critical}</button>
                     <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "high" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("high")}>High {dashboardAlertSummary.high}</button>
                     <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "awaiting" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("awaiting")}>Awaiting {dashboardAlertSummary.awaiting}</button>
                     <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "active" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("active")}>Active {dashboardAlertSummary.active}</button>
+                    <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "test" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("test")}>Test {dashboardAlertSummary.test}</button>
                   </div>
                   <div className="dashboard-alert-search">
                     <input
@@ -7663,7 +8291,10 @@ export default function App() {
                     ) : null}
                   </div>
                 </div>
-                <p className="subtitle">Showing {dashboardVisibleAlerts.length} of {visibleAlerts.length} alerts for {applicationToMonitor}.</p>
+                <p className="subtitle">
+                  Showing {dashboardVisibleAlerts.length} of {visibleAlerts.length} alerts for {applicationToMonitor}.
+                  {dashboardAlertFocus === "ops" && dashboardAlertSummary.test > 0 ? ` ${dashboardAlertSummary.test} smoke/stress alerts are hidden in Ops view.` : ""}
+                </p>
                 {canManageSeverityOverride ? (
                   <p className="subtitle">L2/L3/Admin can set future severity overrides by alert name + service + environment.</p>
                 ) : null}
@@ -7731,7 +8362,7 @@ export default function App() {
                                   openAlertDetails(row);
                                 }}
                               >
-                                Open
+                                Inspect
                               </button>
                             </td>
                           </tr>
@@ -7747,62 +8378,11 @@ export default function App() {
                 </div>
               </article>
 
-              <article className="panel">
-                <div className="panel-head">
-                  <h2>Knowledge Base Documents</h2>
-                  <p>All RAG documents ingested from the backend, with full metadata.</p>
-                </div>
-                {ragDocs.error ? <p className="error">{ragDocs.error}</p> : null}
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Kind</th>
-                        <th>Title</th>
-                        <th>Alert ID</th>
-                        <th>Alert Type</th>
-                        <th>Services</th>
-                        <th>Severity</th>
-                        <th>Root Cause</th>
-                        <th>Impact</th>
-                        <th>Recommended Action</th>
-                        <th>Path</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {(Array.isArray(ragDocs.rows) ? ragDocs.rows : []).map((doc, index) => {
-                        const services = Array.isArray(doc?.services) ? doc.services.join(", ") : String(doc?.services || "-");
-                        const severity = String(doc?.severity || "-").toLowerCase();
-                        return (
-                          <tr key={`${doc?.path || "doc"}-${index}`}>
-                            <td>{doc?.kind || "-"}</td>
-                            <td>{doc?.title || "-"}</td>
-                            <td>{doc?.alert_id || "-"}</td>
-                            <td>{doc?.alert_type || "-"}</td>
-                            <td>{services || "-"}</td>
-                            <td>{severity !== "-" ? <span className={`pill severity-${severity}`}>{severity}</span> : "-"}</td>
-                            <td>{doc?.root_cause || "-"}</td>
-                            <td>{doc?.impact || "-"}</td>
-                            <td>{doc?.recommended_action || "-"}</td>
-                            <td title={doc?.path || ""}>{doc?.path || "-"}</td>
-                          </tr>
-                        );
-                      })}
-                      {!ragDocs.rows.length && !ragDocs.loading ? (
-                        <tr>
-                          <td colSpan={10}>No RAG documents found.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-              </article>
-
               {selectedAlertRow ? (
                 <article className="panel">
                   <div className="panel-head">
-                    <h3>Selected Alert Actions</h3>
-                    <p>Triage-focused actions for the selected alert.</p>
+                    <h3>Guided Incident Cockpit</h3>
+                    <p>Selected alert actions, evidence, documents, approval, and remediation stay in one workspace.</p>
                   </div>
                   <div className="filter-grid">
                     <label>Alert
@@ -7819,17 +8399,24 @@ export default function App() {
                     </label>
                   </div>
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
-                    <button type="button" className="button-primary" onClick={() => openAlertDetails(selectedAlertRow)}>Open Alert Details</button>
-                    <button type="button" className="button-secondary" onClick={() => setActiveTab("approval")}>Open Approval Queue</button>
-                    <button type="button" className="button-secondary" onClick={() => setActiveTab("executive")}>Open Executive View</button>
-                    <button
-                      type="button"
-                      className="button-secondary"
-                      onClick={() => openDocumentPrompt(selectedAlertRow)}
-                      disabled={selectedAlertActionContext?.alertClosed}
-                    >
-                      {selectedAlertActionContext?.documentAvailable ? "Manage Docs" : "Provide Docs"}
-                    </button>
+                    <button type="button" className="button-primary" onClick={() => openAlertDetails(selectedAlertRow)}>Inspect Cockpit</button>
+                    <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("evidence")}>View Evidence</button>
+                    <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("documents")}>View Documents</button>
+                    <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("approval")}>Approval Decision</button>
+                    {canProvideAlertDocuments ? (
+                      <button
+                        type="button"
+                        className="button-secondary"
+                        onClick={() => openDocumentPrompt(selectedAlertRow)}
+                        disabled={selectedAlertActionContext?.alertClosed}
+                      >
+                        {selectedAlertActionContext?.documentAvailable ? "Manage Alert Docs" : "Provide Alert Docs"}
+                      </button>
+                    ) : (
+                      <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("approval")}>
+                        Escalate To L2/L3
+                      </button>
+                    )}
                   </div>
                   <div className="alert-rule-summary-grid">
                     <article className="alert-rule-summary-card">
@@ -7895,7 +8482,7 @@ export default function App() {
                 </article>
               ) : null}
 
-              {docPromptAlert ? (
+              {docPromptAlert && canProvideAlertDocuments ? (
                 <article className="panel" role="dialog" aria-label="Provide documents for alert" ref={docPromptRef}>
                   <div className="panel-head">
                     <h3>Provide Documents</h3>
@@ -8052,7 +8639,10 @@ export default function App() {
               {selectedAlertRow ? (
                 <article className="panel" ref={alertDetailsRef}>
                   <div className="panel-head">
-                    <h2>Alert Details Workspace</h2>
+                    <div>
+                      <h2>Alert Details Cockpit</h2>
+                      <p>One guided workspace for evidence, documents, approval, remediation, and timeline review.</p>
+                    </div>
                   </div>
                   <div className="detail-context">
                     <span><strong>ID:</strong> {selectedAlertId}</span>
@@ -8068,7 +8658,7 @@ export default function App() {
                     return (
                       <article className="panel" style={{ marginBottom: 10, borderColor: "#ef9a9a", boxShadow: "0 10px 24px rgba(183, 28, 28, 0.14)" }}>
                         <div className="panel-head">
-                          <h3>Approval Snapshot</h3>
+                          <h3>Decision Gate</h3>
                         </div>
                         <p className="subtitle">
                           {matchedApproval
@@ -8095,14 +8685,14 @@ export default function App() {
                               }
                             }}
                           >
-                            Open Approval Queue
+                            Open Queue
                           </button>
                           <button
                             type="button"
                             className="button-primary"
                             onClick={() => setHomeDetailTab("approval")}
                           >
-                            Open Approval Tab
+                            Review Decision
                           </button>
                           {canUseApprovalActions && matchedApproval && !isResolved ? (
                             <button
@@ -8111,7 +8701,7 @@ export default function App() {
                               onClick={() => selectApprovalIncident(matchedApproval)}
                               disabled={approvalState.loading}
                             >
-                              Load Into Approval Form
+                              Load Decision Form
                             </button>
                           ) : null}
                         </div>
@@ -8120,14 +8710,14 @@ export default function App() {
                   })()}
 
                   <div className="detail-tabs">
-                    {["overview", "approval", "remediation", "diagnostics"].map((tab) => (
+                    {["overview", "evidence", "documents", "approval", "remediation", "diagnostics"].map((tab) => (
                       <button
                         key={`detail-${tab}`}
                         type="button"
                         className={`detail-tab ${homeDetailTab === tab ? "active" : ""}`}
                         onClick={() => setHomeDetailTab(tab)}
                       >
-                        {tab === "overview" ? "Overview" : tab === "approval" ? "Approval" : tab === "remediation" ? "Remediation" : "Diagnostics"}
+                        {tab === "overview" ? "Overview" : tab === "evidence" ? "Evidence" : tab === "documents" ? "Documents" : tab === "approval" ? "Approval" : tab === "remediation" ? "Remediation" : "Timeline"}
                       </button>
                     ))}
                   </div>
@@ -8156,6 +8746,7 @@ export default function App() {
                         <table>
                           <tbody>
                             <tr><th>Alert</th><td>{selectedAlertRow?.name || selectedAlertWorkflow?.alert?.name || "-"}</td></tr>
+                            <tr><th>Details Source</th><td>{selectedAlertDetailsSource}</td></tr>
                             <tr><th>Incident</th><td>{selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "-"}</td></tr>
                             <tr>
                               <th>Persisted Incident Status</th>
@@ -8173,6 +8764,78 @@ export default function App() {
                           </tbody>
                         </table>
                       </div>
+
+                      <h3>AI Evaluation Metrics</h3>
+                      <div className="alert-rule-summary-grid">
+                        <article className="alert-rule-summary-card">
+                          <span>Overall Quality</span>
+                          <strong>{formatQualityPercent(selectedAlertEvaluation.overallScore)}</strong>
+                          <small>{selectedAlertEvaluation.qualityLabel} | {selectedAlertEvaluation.provider}</small>
+                        </article>
+                        <article className="alert-rule-summary-card">
+                          <span>Confidence</span>
+                          <strong>{formatQualityPercent(selectedAlertEvaluation.confidenceScore)}</strong>
+                          <small>Recommendation certainty</small>
+                        </article>
+                        <article className="alert-rule-summary-card">
+                          <span>Grounding</span>
+                          <strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong>
+                          <small>Evidence and context support</small>
+                        </article>
+                        <article className="alert-rule-summary-card">
+                          <span>Hallucination Risk</span>
+                          <strong>{formatQualityPercent(selectedAlertEvaluation.hallucinationRisk)}</strong>
+                          <small>{selectedAlertEvaluation.requiresReview ? "review recommended" : "within guardrail"}</small>
+                        </article>
+                        <article className="alert-rule-summary-card">
+                          <span>Citation Coverage</span>
+                          <strong>{formatQualityPercent(selectedAlertEvaluation.citationCoverage)}</strong>
+                          <small>{selectedAlertEvaluation.signals?.citations ?? "-"} citation(s)</small>
+                        </article>
+                        <article className="alert-rule-summary-card">
+                          <span>Evidence Coverage</span>
+                          <strong>{formatQualityPercent(selectedAlertEvaluation.evidenceCoverage)}</strong>
+                          <small>{selectedAlertEvaluation.signals?.rag_matches ?? selectedAlertRagDocuments.length} RAG match(es)</small>
+                        </article>
+                      </div>
+
+                      {selectedAlertDocumentContract ? (
+                        <>
+                          <h3>Enterprise Controls</h3>
+                          <div className="alert-rule-summary-grid">
+                            <article className="alert-rule-summary-card">
+                              <span>Canonical Contract</span>
+                              <strong>{selectedAlertDocumentContract.canonical_alert?.schema_version || "-"}</strong>
+                              <small>{selectedAlertDocumentContract.canonical_alert?.alert_uid || selectedAlertId}</small>
+                            </article>
+                            <article className="alert-rule-summary-card">
+                              <span>Governance</span>
+                              <strong>{selectedAlertDocumentContract.governance?.agent_contract_version || "-"}</strong>
+                              <small>Approval gate: {selectedAlertDocumentContract.governance?.approval_gate_required ? "required" : "not required"}</small>
+                            </article>
+                            <article className="alert-rule-summary-card">
+                              <span>RBAC</span>
+                              <strong>{selectedAlertDocumentContract.rbac?.risk_tier || "-"}</strong>
+                              <small>Tenant: {selectedAlertDocumentContract.rbac?.tenant || "default"} | Env: {selectedAlertDocumentContract.rbac?.environment || "-"}</small>
+                            </article>
+                            <article className="alert-rule-summary-card">
+                              <span>Trace Quality</span>
+                              <strong>{selectedAlertDocumentContract.observability?.trace_id || "-"}</strong>
+                              <small>{selectedAlertDocumentContract.observability?.quality_gate || "-"}</small>
+                            </article>
+                            <article className="alert-rule-summary-card">
+                              <span>RAG Quality</span>
+                              <strong>{selectedAlertDocumentContract.rag_quality?.contract_version || "-"}</strong>
+                              <small>Linked docs: {selectedAlertDocumentContract.document_link_summary?.count ?? 0}</small>
+                            </article>
+                            <article className="alert-rule-summary-card">
+                              <span>Remediation Safety</span>
+                              <strong>{selectedAlertDocumentContract.remediation_safety?.contract_version || "-"}</strong>
+                              <small>Dry run: {selectedAlertDocumentContract.remediation_safety?.dry_run_required ? "required" : "optional"}</small>
+                            </article>
+                          </div>
+                        </>
+                      ) : null}
 
                       <h3>Persisted Stage Completeness</h3>
                       {selectedStageCompleteness.loading ? <p className="subtitle">Loading stage completeness...</p> : null}
@@ -8212,6 +8875,37 @@ export default function App() {
                     </>
                   ) : null}
 
+                  {homeDetailTab === "evidence" ? (
+                    <article className="panel">
+                      <div className="panel-head">
+                        <h3>Evidence Workspace</h3>
+                        <p>Canonical alert identity, trace context, and document-link evidence.</p>
+                      </div>
+                      <div className="table-wrap table-wrap-scroll-x">
+                        <table>
+                          <tbody>
+                            <tr><th>Canonical Alert UID</th><td>{selectedAlertDocumentContract?.canonical_alert?.alert_uid || selectedAlertId || "-"}</td></tr>
+                            <tr><th>Alert Type</th><td>{selectedAlertDocumentContract?.canonical_alert?.alert_type || selectedAlertRow?.name || "-"}</td></tr>
+                            <tr><th>Service</th><td>{selectedAlertDocumentContract?.canonical_alert?.service || selectedAlertRow?.service || "-"}</td></tr>
+                            <tr><th>Tenant / Environment</th><td>{selectedAlertDocumentContract?.canonical_alert?.tenant || "default"} / {selectedAlertDocumentContract?.canonical_alert?.environment || selectedAlertRow?.environment || "-"}</td></tr>
+                            <tr><th>Trace ID</th><td>{selectedAlertDocumentContract?.observability?.trace_id || selectedAlertRow?.trace_id || "-"}</td></tr>
+                            <tr><th>Correlation ID</th><td>{selectedAlertDocumentContract?.canonical_alert?.correlation_id || selectedAlertRow?.correlation_id || "-"}</td></tr>
+                            <tr><th>Document Link Contract</th><td>{selectedAlertDocumentContract?.document_link_summary?.contract_version || "-"}</td></tr>
+                            <tr><th>Linked Document Count</th><td>{selectedAlertDocumentContract?.document_link_summary?.count ?? selectedAlertRagDocuments.length}</td></tr>
+                            <tr><th>Evaluation Contract</th><td>{selectedAlertEvaluation.contractVersion}</td></tr>
+                            <tr><th>Overall Evaluation</th><td>{formatQualityPercent(selectedAlertEvaluation.overallScore)} ({selectedAlertEvaluation.qualityLabel})</td></tr>
+                            <tr><th>Confidence Score</th><td>{formatQualityPercent(selectedAlertEvaluation.confidenceScore)}</td></tr>
+                            <tr><th>Grounding Score</th><td>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</td></tr>
+                            <tr><th>Hallucination Risk</th><td>{formatQualityPercent(selectedAlertEvaluation.hallucinationRisk)}</td></tr>
+                            <tr><th>Citation Coverage</th><td>{formatQualityPercent(selectedAlertEvaluation.citationCoverage)}</td></tr>
+                            <tr><th>Evidence Coverage</th><td>{formatQualityPercent(selectedAlertEvaluation.evidenceCoverage)}</td></tr>
+                            <tr><th>External Judge</th><td>{selectedAlertEvaluation.externalJudge?.metric ? `${selectedAlertEvaluation.externalJudge.metric}: ${formatQualityPercent(selectedAlertEvaluation.externalJudge.score)}` : "not configured"}</td></tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    </article>
+                  ) : null}
+
                   {homeDetailTab === "approval" ? (
                     <article className="panel">
                       <div className="panel-head">
@@ -8225,6 +8919,9 @@ export default function App() {
                             <tr><th>Recommendation</th><td>{approvalForm.recommendation_id || "-"}</td></tr>
                             <tr><th>Current Approval Status</th><td>{selectedAlertWorkflow?.approval?.status || "pending"}</td></tr>
                             <tr><th>Role Eligible</th><td>{canUseApprovalActions ? "yes" : "no"}</td></tr>
+                            <tr><th>Evaluation Quality</th><td>{formatQualityPercent(selectedAlertEvaluation.overallScore)} ({selectedAlertEvaluation.qualityLabel})</td></tr>
+                            <tr><th>Grounding / Hallucination Risk</th><td>{formatQualityPercent(selectedAlertEvaluation.groundingScore)} / {formatQualityPercent(selectedAlertEvaluation.hallucinationRisk)}</td></tr>
+                            <tr><th>Review Required</th><td>{selectedAlertEvaluation.requiresReview ? "yes" : "no"}</td></tr>
                           </tbody>
                         </table>
                       </div>
@@ -8257,6 +8954,113 @@ export default function App() {
                         </form>
                       ) : (
                         <p className="subtitle">Login with an approval-eligible role to submit actions. You can still view full approval context here.</p>
+                      )}
+                    </article>
+                  ) : null}
+
+                  {homeDetailTab === "documents" ? (
+                    <article className="panel alert-documents-panel">
+                      <div className="panel-head">
+                        <h3>Alert Documents</h3>
+                        <p>Download backend-linked documents for the selected alert.</p>
+                      </div>
+                      {ragDocs.error ? <p className="error">{ragDocs.error}</p> : null}
+                      {selectedAlertDocumentLinks.error ? (
+                        <p className="subtitle">Backend document-link contract unavailable; using local fallback matcher. {selectedAlertDocumentLinks.error}</p>
+                      ) : null}
+                      {selectedAlertDocumentLinks.loading ? <p className="subtitle">Resolving linked documents from backend contract...</p> : null}
+                      {selectedAlertDocumentContract?.document_link_summary ? (
+                        <p className="subtitle">
+                          Source: {selectedAlertDocumentContract.document_link_summary.source}
+                          {" | "}Matches: {selectedAlertDocumentContract.document_link_summary.count}
+                          {" | "}Reasons: {(selectedAlertDocumentContract.document_link_summary.match_reasons || []).join(", ") || "-"}
+                        </p>
+                      ) : null}
+                      {selectedAlertRagDocuments.length ? (
+                        <div className="alert-document-download-grid">
+                          {selectedAlertRagDocuments.map((doc, index) => {
+                            const services = Array.isArray(doc?.services) ? doc.services.join(", ") : String(doc?.services || "-");
+                            const severity = String(doc?.severity || "-").toLowerCase();
+                            const docScope = doc?.document_scope || (doc?.alert_id ? "alert-specific" : "service-level");
+                            const docMetadata = doc?.metadata && typeof doc.metadata === "object" ? doc.metadata : {};
+                            let docEvaluation = docMetadata.evaluation;
+                            if (typeof docEvaluation === "string" && docEvaluation.trim().startsWith("{")) {
+                              try {
+                                docEvaluation = JSON.parse(docEvaluation);
+                              } catch (_error) {
+                                docEvaluation = null;
+                              }
+                            }
+                            const normalizedDocEvaluation = docEvaluation && typeof docEvaluation === "object"
+                              ? normalizeEvaluationEnvelope(docEvaluation)
+                              : null;
+                            return (
+                              <article className="alert-document-download-card" key={`${doc?.path || "doc"}-${index}`}>
+                                <div>
+                                  <span className="workflow-pill workflow-pill-clear">{doc?.kind || doc?.document_kind || "document"}</span>
+                                  <span className="workflow-pill workflow-pill-idle" style={{ marginLeft: 6 }}>{docScope}</span>
+                                  <h4>{doc?.title || doc?.path || "Alert document"}</h4>
+                                  <p>{doc?.summary || doc?.recommended_action || "Document content is available for download."}</p>
+                                </div>
+                                <div className="alert-document-meta">
+                                  <span>Alert: {doc?.alert_id || selectedAlertId || "-"}</span>
+                                  <span>Service: {services || "-"}</span>
+                                  <span>Severity: {severity !== "-" ? severity : "-"}</span>
+                                  <span>Match: {doc?.match_reason || "local-fallback"} {doc?.match_confidence ? `(${Math.round(Number(doc.match_confidence) * 100)}%)` : ""}</span>
+                                  {normalizedDocEvaluation ? (
+                                    <span>Quality: {formatQualityPercent(normalizedDocEvaluation.overallScore)} | Grounding: {formatQualityPercent(normalizedDocEvaluation.groundingScore)}</span>
+                                  ) : null}
+                                  <span title={doc?.path || ""}>Path: {doc?.path || "-"}</span>
+                                </div>
+                                <button
+                                  type="button"
+                                  className="button-primary"
+                                  onClick={() => downloadRagDocument(doc)}
+                                  disabled={!doc?.path}
+                                >
+                                  Download
+                                </button>
+                              </article>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div className="alert-documents-empty">
+                          <div>
+                            <strong>No alert documents linked yet.</strong>
+                            <p className="subtitle">
+                              Use the same Provide Documents workflow for this alert to review the generated draft, upload content,
+                              and save downloadable documents back to this tab.
+                            </p>
+                          </div>
+                          <div className="alert-documents-kind-row">
+                            {ALERT_DOC_KIND_OPTIONS.map((kind) => (
+                              <span key={`empty-doc-kind-${kind}`}>{kind}</span>
+                            ))}
+                          </div>
+                          <div className="alert-documents-empty-actions">
+                            {canProvideAlertDocuments ? (
+                              <button
+                                type="button"
+                                className="button-primary"
+                                onClick={() => selectedAlertRow && openDocumentPrompt(selectedAlertRow)}
+                                disabled={!selectedAlertRow || selectedAlertActionContext?.alertClosed}
+                              >
+                                Provide Documents
+                              </button>
+                            ) : (
+                              <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("approval")}>
+                                Escalate To L2/L3
+                              </button>
+                            )}
+                          </div>
+                          {selectedAlertActionContext?.alertClosed ? (
+                            <p className="subtitle">This alert is closed, so document creation is disabled.</p>
+                          ) : null}
+                          {!canProvideAlertDocuments ? (
+                            <p className="subtitle">L1 operators can monitor and escalate this alert. L2, L3, and Admin users can provide alert documents.</p>
+                          ) : null}
+                        </div>
                       )}
                     </article>
                   ) : null}
@@ -8419,9 +9223,64 @@ export default function App() {
                         </div>
                         <p className="subtitle">
                           {selectedExecutionBreakdown.hasPlan
-                            ? "Plan is ready. Review steps below and execute through your approved run path."
+                            ? "Plan is ready. Modify commands, scripts, or validation queries before executing the approved run path."
                             : "No remediation plan is available yet. Ensure recommendation and workflow events have been generated."}
                         </p>
+                        <article className="panel remediation-connection-panel">
+                          <div className="panel-head">
+                            <h3>Application Connection Details</h3>
+                            <p>Execution target used for approval, dry-run context, and simulated remediation records.</p>
+                          </div>
+                          <div className="filter-grid">
+                            <label>Application<input value={selectedApplicationConnection.application} readOnly /></label>
+                            <label>Service<input value={selectedApplicationConnection.service} readOnly /></label>
+                            <label>Environment<input value={selectedApplicationConnection.environment} readOnly /></label>
+                            <label>Source<input value={selectedApplicationConnection.source} readOnly /></label>
+                            <label>Connection Type<input value={remediationPlanEditor.connection_type} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, connection_type: e.target.value }))} /></label>
+                            <label>Endpoint URL<input value={remediationPlanEditor.connection_url} placeholder="https://app-or-metrics-endpoint" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, connection_url: e.target.value }))} /></label>
+                            <label>Namespace / Runtime<input value={remediationPlanEditor.namespace} placeholder="prod / namespace / resource group" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, namespace: e.target.value }))} /></label>
+                          </div>
+                        </article>
+                        <article className="panel remediation-editor-panel">
+                          <div className="panel-head">
+                            <h3>Editable Remediation Command Plan</h3>
+                            <p>One item per line. The approved edited plan is submitted to the remediation engine.</p>
+                          </div>
+                          <div className="remediation-editor-grid">
+                            <label>Commands<textarea rows={6} value={remediationPlanEditor.commands} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, commands: e.target.value }))} /></label>
+                            <label>Scripts<textarea rows={6} value={remediationPlanEditor.scripts} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, scripts: e.target.value }))} /></label>
+                            <label>Validation Queries<textarea rows={6} value={remediationPlanEditor.queries} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, queries: e.target.value }))} /></label>
+                          </div>
+                          <label>Execution Notes<textarea rows={2} value={remediationPlanEditor.notes} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, notes: e.target.value }))} /></label>
+                          <div className="remediation-execute-row">
+                            <button
+                              type="button"
+                              className="button-primary"
+                              onClick={executeApprovedRemediationPlan}
+                              disabled={remediationExecutionState.loading || !canUseApprovalActions}
+                              title={canUseApprovalActions ? "Execute the approved edited plan through remediation-engine" : "Approval-eligible role required"}
+                            >
+                              {remediationExecutionState.loading ? "Executing..." : "Execute Approved Plan"}
+                            </button>
+                            <button
+                              type="button"
+                              className="button-secondary"
+                              onClick={() => setRemediationPlanEditor((curr) => ({
+                                ...curr,
+                                commands: selectedExecutionBreakdown.commands.join("\n"),
+                                scripts: selectedExecutionBreakdown.scripts.join("\n"),
+                                queries: selectedExecutionBreakdown.queries.join("\n"),
+                              }))}
+                              disabled={remediationExecutionState.loading}
+                            >
+                              Reset To Suggested Plan
+                            </button>
+                          </div>
+                          {remediationExecutionState.error ? <p className="error">{remediationExecutionState.error}</p> : null}
+                          {remediationExecutionState.result ? (
+                            <pre className="result">{JSON.stringify(unwrap(remediationExecutionState.result), null, 2)}</pre>
+                          ) : null}
+                        </article>
                         <div className="table-wrap remediation-step-table" style={{ marginTop: 8 }}>
                           <table>
                             <thead>
@@ -8825,6 +9684,16 @@ export default function App() {
                         <button className="button-secondary" type="button" onClick={loadAdminUsersAndRoles} disabled={!adminSession.accessToken || adminUsers.loading}>Refresh</button>
                       </div>
                       {adminUsers.error ? <p className="error">{adminUsers.error}</p> : null}
+                      {adminUsers.loading ? <p className="subtitle">Loading users and roles...</p> : null}
+                      {!adminUsers.loading && !adminUsers.error && !adminUsers.rows.length ? (
+                        <div className="empty-state-panel">
+                          <strong>No users are shown yet</strong>
+                          <span>Refresh access controls to load seeded users, or create a new user below.</span>
+                          <button className="button-secondary" type="button" onClick={loadAdminUsersAndRoles} disabled={!adminSession.accessToken}>
+                            Refresh Users
+                          </button>
+                        </div>
+                      ) : null}
                       <div className="table-wrap table-wrap-scroll-x">
                         <table>
                           <thead>
@@ -8837,7 +9706,9 @@ export default function App() {
                                 <td><button type="button" className="button-secondary" onClick={() => selectAdminUserForEdit(row)}>Edit</button></td>
                               </tr>
                             ))}
-                            {!adminUsers.rows.length ? <tr><td colSpan={6}>No users available.</td></tr> : null}
+                            {!adminUsers.rows.length && adminUsers.loading ? <tr><td colSpan={6}>Loading users...</td></tr> : null}
+                            {!adminUsers.rows.length && !adminUsers.loading && adminUsers.error ? <tr><td colSpan={6}>Unable to load users. Review the error above.</td></tr> : null}
+                            {!adminUsers.rows.length && !adminUsers.loading && !adminUsers.error ? <tr><td colSpan={6}>No users returned yet. Use Refresh Users or create a user.</td></tr> : null}
                           </tbody>
                         </table>
                       </div>
@@ -8928,16 +9799,36 @@ export default function App() {
                   <div className="grid single-col admin-flow-section admin-flow-project">
                     <article className="panel project-stepper-panel">
                       <div className="panel-head">
-                        <h3>Guided Setup Flow</h3>
+                        <div>
+                          <h3>Setup Wizard</h3>
+                          <p>Move left to right: define the project, generate artifacts, validate the flow, then add alert knowledge.</p>
+                        </div>
                         <button
                           type="button"
-                          className="button-secondary"
+                          className={`setup-section-icon-button ${projectSetupShowAll ? "active" : ""}`}
+                          aria-label={projectSetupShowAll ? "Focus current setup step" : "Show full setup"}
+                          title={projectSetupShowAll ? "Focus current step" : "Show full setup"}
                           onClick={() => setProjectSetupShowAll((current) => !current)}
-                        >
-                          {projectSetupShowAll ? "Focus Current Step" : "Show All Steps"}
-                        </button>
+                        />
                       </div>
-                      <p className="subtitle">Use focused mode for step-by-step onboarding, or show all for full-page editing.</p>
+                      <div className="setup-wizard-summary">
+                        <div>
+                          <span>Project</span>
+                          <strong>{String(onboardingForm.name || selectedOnboardingProject || "Not selected")}</strong>
+                        </div>
+                        <div>
+                          <span>Path</span>
+                          <strong>{onboardingForm.onboarding_path === "setup_monitoring" ? "Prometheus setup" : "Existing monitoring"}</strong>
+                        </div>
+                        <div>
+                          <span>Source Docs</span>
+                          <strong>{onboardingSourceDocCount}</strong>
+                        </div>
+                        <div>
+                          <span>Generated Rules</span>
+                          <strong>{onboardingGeneratedRuleRows.length}</strong>
+                        </div>
+                      </div>
                       <div className="project-stepper-grid">
                         {projectStepCards.map((card) => (
                           <button
@@ -8964,7 +9855,10 @@ export default function App() {
                     {showProjectStep("setup") ? (
                     <article className="panel">
                       <div className="panel-head">
-                        <h3>Step 2: Setup (Choose One Path)</h3>
+                        <div>
+                          <h3>Project Setup</h3>
+                          <p>Complete the required fields first. Optional details stay collapsed until needed.</p>
+                        </div>
                         <div style={{ display: "flex", gap: 8 }}>
                           <button type="button" className="button-secondary" onClick={loadOnboardingAdminData}>Refresh</button>
                           <button
@@ -9000,7 +9894,15 @@ export default function App() {
                           </button>
                         </div>
                       </div>
-                      <p className="subtitle">Step 1: choose Project Mode. Step 2: choose Setup Path. Step 3: upload source docs (optional), then save.</p>
+                      <div className="setup-linear-guide">
+                        <span>1 Project</span>
+                        <i />
+                        <span>2 Monitoring Path</span>
+                        <i />
+                        <span>3 Source Docs</span>
+                        <i />
+                        <span>4 Generate</span>
+                      </div>
                       <p className="subtitle"><strong>Next:</strong> {onboardingNextAction}</p>
                       {onboardingDocumentSummary.total > 0 ? <p className="subtitle"><strong>Docs:</strong> {onboardingDocumentSummary.total} generated ({onboardingDocumentSummary.approved ? "approved" : "pending"}).</p> : null}
                       {onboardingProjectMode === "existing" ? (
@@ -9042,46 +9944,57 @@ export default function App() {
                           <p className="error">Approve pending generated documents before submitting another Create/Update.</p>
                         ) : null}
                         {onboardingAdvisory ? <p className="subtitle">{onboardingAdvisory}</p> : null}
+                        <details className="setup-form-section" open>
+                          <summary>
+                            <span>Project Details</span>
+                            <small>Required identity fields</small>
+                          </summary>
                         <div className="filter-grid">
                           <label>Project Name *<input placeholder="example-payments" value={onboardingForm.name} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, name: e.target.value, assignment_project: e.target.value }))} /></label>
                           <label>Owner Team *<input placeholder="sre-platform" value={onboardingForm.owner_team} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, owner_team: e.target.value }))} /></label>
                           <label>Environment<select value={onboardingForm.environment} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, environment: e.target.value }))}><option value="dev">dev</option><option value="staging">staging</option><option value="prod">prod</option></select></label>
                           <label>Region *<input placeholder="ap-south-1" value={onboardingForm.region} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, region: e.target.value }))} /></label>
                         </div>
-                        <details className="panel" style={{ margin: "10px 0" }}>
-                          <summary style={{ cursor: "pointer" }}>Advanced Settings (Optional)</summary>
+                        <details className="setup-nested-details">
+                          <summary>Advanced Settings (Optional)</summary>
                           <div className="filter-grid" style={{ marginTop: 10 }}>
                             <label>Deployment
                               <select value={onboardingForm.deployment_mode} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, deployment_mode: e.target.value }))}>
                                 <option value="on_prem">On-Prem</option>
-                                <option value="gcp_cloud">Google Cloud</option>
+                                <option value="azure_cloud">Azure Cloud</option>
                               </select>
                             </label>
                             <label>Assign User (optional)<input placeholder="username" value={onboardingForm.assignment_username} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, assignment_username: e.target.value }))} /></label>
                           </div>
-                          {onboardingForm.deployment_mode === "gcp_cloud" ? (
+                          {onboardingForm.deployment_mode === "azure_cloud" ? (
                             <div className="filter-grid" style={{ marginTop: 10 }}>
-                              <label>GCP Project ID<input value={onboardingForm.gcp_project_id} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, gcp_project_id: e.target.value }))} /></label>
-                              <label>GCP Region<input value={onboardingForm.gcp_region} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, gcp_region: e.target.value }))} /></label>
-                              <label>Pub/Sub Topic<input value={onboardingForm.pubsub_topic} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, pubsub_topic: e.target.value }))} /></label>
-                              <label>Pub/Sub Subscription<input value={onboardingForm.pubsub_subscription} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, pubsub_subscription: e.target.value }))} /></label>
+                              <label>Azure Subscription ID<input value={onboardingForm.azure_subscription_id} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, azure_subscription_id: e.target.value }))} /></label>
+                              <label>Azure Resource Group<input value={onboardingForm.azure_resource_group} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, azure_resource_group: e.target.value }))} /></label>
+                              <label>Service Bus Namespace<input value={onboardingForm.azure_service_bus_namespace} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, azure_service_bus_namespace: e.target.value }))} /></label>
+                              <label>Service Bus Topic<input value={onboardingForm.azure_service_bus_topic} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, azure_service_bus_topic: e.target.value }))} /></label>
+                              <label>Service Bus Subscription<input value={onboardingForm.azure_service_bus_subscription} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, azure_service_bus_subscription: e.target.value }))} /></label>
                             </div>
                           ) : null}
-                          {onboardingForm.deployment_mode === "gcp_cloud" ? (
+                          {onboardingForm.deployment_mode === "azure_cloud" ? (
                             <div className="filter-grid" style={{ marginTop: 10 }}>
-                              <label>Vertex Model Armor
-                                <select value={String(onboardingForm.vertex_model_armor_enabled)} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, vertex_model_armor_enabled: e.target.value === "true" }))}>
+                              <label>Azure Content Safety
+                                <select value={String(onboardingForm.azure_content_safety_enabled)} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, azure_content_safety_enabled: e.target.value === "true" }))}>
                                   <option value="false">disabled</option>
                                   <option value="true">enabled</option>
                                 </select>
                               </label>
-                              <label>Model Armor Template<input value={onboardingForm.vertex_model_armor_template} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, vertex_model_armor_template: e.target.value }))} /></label>
+                              <label>Content Safety Endpoint<input value={onboardingForm.azure_content_safety_endpoint} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, azure_content_safety_endpoint: e.target.value }))} /></label>
                             </div>
                           ) : null}
                         </details>
-                        <div className="panel" style={{ margin: "10px 0" }}>
+                        </details>
+                        <details className="setup-form-section" open>
+                          <summary>
+                            <span>Setup Path</span>
+                            <small>Prometheus setup or landing-pad ingestion</small>
+                          </summary>
                           <div className="panel-head">
-                            <h3>Step 2: Choose Setup Path</h3>
+                            <h3>Choose Setup Path</h3>
                           </div>
                           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                             <button
@@ -9114,9 +10027,36 @@ export default function App() {
                               ? "Prometheus path: define rules and configure monitoring first, then route alerts."
                               : "Existing monitoring path: keep your current tool and just send alert webhooks to KaiOps landing pad."}
                           </p>
-                        </div>
-                        <details className="panel" style={{ margin: "10px 0", borderStyle: "dashed" }}>
-                          <summary style={{ cursor: "pointer" }}>Landing Pad Details (Endpoint and Sample Payload)</summary>
+                          <div className="setup-message-bus-preview">
+                            <div className="setup-route-strip" aria-label="Landing pad event route">
+                              <span>Monitoring Tool</span>
+                              <i />
+                              <span>Landing Pad</span>
+                              <i />
+                              <span>Alert Workflow</span>
+                              <i />
+                              <span>Workers</span>
+                            </div>
+                            <p className="subtitle">
+                              Routing is configured after this setup is saved.
+                            </p>
+                            <details className="setup-bus-details">
+                              <summary>Event Bus Topology</summary>
+                              <MessageBusTopology
+                                actual={messageBusActual}
+                                configuredRows={messageBusTopicRows}
+                                routing={observedRouting}
+                                primaryTopic={onboardingForm.azure_service_bus_topic || "raw-alerts"}
+                                compact
+                              />
+                            </details>
+                          </div>
+                        </details>
+                        <details className="setup-form-section">
+                          <summary>
+                            <span>Landing Pad Details</span>
+                            <small>Endpoint and sample payload for alert ingestion</small>
+                          </summary>
                           <div className="panel-head">
                             <h3>Landing Pad Details</h3>
                             <p>Endpoint and payload guidance for alert ingestion into KaiOps workflow. Troubleshooting runbooks for ingested alerts are managed under Alert Knowledge.</p>
@@ -9155,6 +10095,11 @@ export default function App() {
                           )}
                           <pre className="result">{onboardingLandingPadDetails.samplePayload}</pre>
                         </details>
+                        <details className="setup-form-section">
+                          <summary>
+                            <span>Connection Details</span>
+                            <small>Endpoint metadata</small>
+                          </summary>
                         <div className="filter-grid">
                           {onboardingForm.onboarding_path === "existing_monitoring" ? (
                             <label>
@@ -9213,10 +10158,15 @@ export default function App() {
                         {onboardingForm.onboarding_path !== "setup_monitoring" ? (
                           <p className="subtitle">Alerts from your configured monitoring tool can be ingested into landing pad to trigger the remaining workflow.</p>
                         ) : null}
-                        <article className="panel setup-source-doc-panel">
+                        </details>
+                        <details className="setup-form-section setup-source-doc-panel">
+                          <summary>
+                            <span>Source Documents</span>
+                            <small>Evidence for rules and knowledge</small>
+                          </summary>
                           <div className="panel-head">
                             <div>
-                              <h3>Step 3: Upload Source Documents</h3>
+                              <h3>Upload Source Documents</h3>
                               <p>Upload operational evidence first. KaiOps derives the rule prompt after the docs are onboarded.</p>
                             </div>
                             <button
@@ -9228,7 +10178,7 @@ export default function App() {
                               Apply Derived Requirements
                             </button>
                           </div>
-                          <p className="subtitle">Provide past tickets, troubleshooting notes, RCA/postmortem docs, resolution docs, logs, and related evidence (.md, .txt, .json, .csv, .log, .yaml). On save, KaiOps uses them to infer rules, RCA steps, required docs, and metadata.</p>
+                          <p className="subtitle">Upload evidence, review the derived prompt, then save.</p>
                           <div className="setup-flow-rail">
                             <div className={`setup-flow-node ${onboardingSourceDocCount > 0 ? "complete" : "active"}`}>
                               <strong>Upload</strong>
@@ -9243,21 +10193,23 @@ export default function App() {
                               <span>{onboardingGeneratedRuleRows.length > 0 ? `${onboardingGeneratedRuleRows.length} rules` : "After save"}</span>
                             </div>
                           </div>
-                          <div className="approval-steps setup-source-categories">
-                            <div className="approval-step">
-                              <strong>Past Tickets</strong>
-                              <span>Incident and support cases that show repeat failure patterns.</span>
+                          <details className="setup-help-details">
+                            <summary>What documents should I upload?</summary>
+                            <div className="approval-steps setup-source-categories">
+                              <div className="approval-step">
+                                <strong>Past Tickets</strong>
+                                <span>Incident and support cases that show repeat failure patterns.</span>
+                              </div>
+                              <div className="approval-step">
+                                <strong>Troubleshooting Docs</strong>
+                                <span>Playbooks, diagnostics, and investigation notes for rule discovery.</span>
+                              </div>
+                              <div className="approval-step">
+                                <strong>Logs and RCA Docs</strong>
+                                <span>Logs, postmortems, and resolution notes used to update metadata and RCA steps.</span>
+                              </div>
                             </div>
-                            <div className="approval-step">
-                              <strong>Troubleshooting Docs</strong>
-                              <span>Playbooks, diagnostics, and investigation notes for rule discovery.</span>
-                            </div>
-                            <div className="approval-step">
-                              <strong>Logs and RCA Docs</strong>
-                              <span>Logs, postmortems, and resolution notes used to update metadata and RCA steps.</span>
-                            </div>
-                          </div>
-                          <p className="subtitle">Upload multiple files per category.</p>
+                          </details>
                           <div className="source-doc-upload-grid">
                             {ONBOARDING_SOURCE_DOC_BUCKETS.map((bucket) => {
                               const sample = ONBOARDING_SOURCE_DOC_SAMPLE_FILES[bucket.key];
@@ -9312,12 +10264,16 @@ export default function App() {
                               </table>
                             </div>
                           ) : null}
-                        </article>
+                        </details>
                         {onboardingForm.onboarding_path === "setup_monitoring" ? (
-                          <article className={`panel rule-prompt-panel ${onboardingRulePromptVisible ? "ready" : "locked"}`}>
+                          <details className={`setup-form-section rule-prompt-panel ${onboardingRulePromptVisible ? "ready" : "locked"}`} open={onboardingRulePromptVisible}>
+                            <summary>
+                              <span>Generated Rule Prompt</span>
+                              <small>{onboardingRulePromptVisible ? "Review and edit before saving" : "Locked until source docs are uploaded"}</small>
+                            </summary>
                             <div className="panel-head">
                               <div>
-                                <h3>Step 4: Review Rule Prompt</h3>
+                                <h3>Review Generated Rule Prompt</h3>
                                 <p>{onboardingRulePromptVisible ? "Generated from onboarded documents. Edit before saving if needed." : "Upload source documents to unlock the generated rule prompt."}</p>
                               </div>
                               <span className={`workflow-pill ${onboardingRulePromptVisible ? "workflow-pill-active" : "workflow-pill-idle"}`}>
@@ -9357,7 +10313,7 @@ export default function App() {
                             ) : (
                               <p className="subtitle">Choose files above, then KaiOps will surface the generated prompt here before rule generation.</p>
                             )}
-                          </article>
+                          </details>
                         ) : null}
                         <button className="button-primary" type="submit" disabled={onboardingState.loading || onboardingValidationErrors.length > 0 || onboardingHasPendingDocumentApproval}>
                           {onboardingState.loading ? "Saving..." : onboardingProjectMode === "new" ? "Create Project + Auto-Generate" : "Update Project + Auto-Generate"}
@@ -9465,6 +10421,7 @@ export default function App() {
                               <tr>
                                 <th>Name</th>
                                 <th>Platform</th>
+                                <th>Adapter</th>
                                 <th>Severity</th>
                                 <th>Status</th>
                                 <th>Expression / Query</th>
@@ -9475,12 +10432,13 @@ export default function App() {
                                 <tr key={`generated-rule-${row.id}`}>
                                   <td>{row.name}</td>
                                   <td>{row.platform}</td>
+                                  <td>{row.contractMode !== "-" ? `${row.contractMode} / ${row.contractStatus}` : "-"}</td>
                                   <td>{row.severity}</td>
                                   <td>{row.status}</td>
                                   <td>{row.expression || "-"}</td>
                                 </tr>
                               ))}
-                              {!onboardingGeneratedRuleRows.length ? <tr><td colSpan={5}>No generated rule rows found in latest workflow payload.</td></tr> : null}
+                              {!onboardingGeneratedRuleRows.length ? <tr><td colSpan={6}>No generated rule rows found in latest workflow payload.</td></tr> : null}
                             </tbody>
                           </table>
                         </div>
@@ -9522,6 +10480,28 @@ export default function App() {
                       <h3>Rule Onboarding Status</h3>
                       <p className="subtitle">Rule onboarding is optional. If enabled above, plain-language requirements are converted into tool-specific rules and documentation automatically.</p>
                       <h3>Step-by-Step Workflow Progress</h3>
+                      <div className="monitoring-dashboard-cards">
+                        {monitoringAppDetails.dashboards.map((row, index) => (
+                          <article className="monitoring-dashboard-card" key={`monitoring-dashboard-card-${row.id || index}`}>
+                            <span>Generated Dashboard</span>
+                            <strong>{row.title || row.dashboard_uid || "Dashboard"}</strong>
+                            <small>UID: {row.dashboard_uid || "-"}</small>
+                            <small>Updated: {row.updated_at || "-"}</small>
+                            {row.url ? (
+                              <a className="button-secondary" href={row.url} target="_blank" rel="noreferrer">Open Dashboard</a>
+                            ) : (
+                              <em>No URL published yet</em>
+                            )}
+                          </article>
+                        ))}
+                        {!monitoringAppDetails.dashboards.length ? (
+                          <article className="monitoring-dashboard-card empty">
+                            <span>Dashboard Status</span>
+                            <strong>No dashboards generated yet</strong>
+                            <small>Register an application and validate metrics to generate dashboard references.</small>
+                          </article>
+                        ) : null}
+                      </div>
                       <div className="table-wrap">
                         <table>
                           <thead>
@@ -9748,6 +10728,7 @@ export default function App() {
                                 <th>Platform</th>
                                 <th>Pull Rules</th>
                                 <th>Push Rules</th>
+                                <th>Adapter</th>
                                 <th>Simulation</th>
                                 <th>Dashboards</th>
                               </tr>
@@ -9758,13 +10739,14 @@ export default function App() {
                                   <td>{row.platform || "-"}</td>
                                   <td>{String(Boolean(row.can_pull_rules))}</td>
                                   <td>{String(Boolean(row.can_push_rules))}</td>
+                                  <td title={row.contract_label || ""}>{row.contract_mode || "-"} / {row.contract_status || "-"}</td>
                                   <td>{String(Boolean(row.supports_simulation))}</td>
                                   <td>{String(Boolean(row.supports_dashboard_refs))}</td>
                                 </tr>
                               ))}
                               {!onboardingRuleCapabilities.rows.length && !onboardingRuleCapabilities.loading ? (
                                 <tr>
-                                  <td colSpan={5}>No capabilities loaded yet.</td>
+                                  <td colSpan={6}>No capabilities loaded yet.</td>
                                 </tr>
                               ) : null}
                             </tbody>
@@ -9930,11 +10912,11 @@ export default function App() {
                   </div>
                 ) : null}
 
-                {(adminWorkspace === "alerts" || (adminWorkspace === "project" && showProjectStep("setup"))) ? (
+                {(adminWorkspace === "alerts" || (adminWorkspace === "project" && showProjectStep("knowledge"))) ? (
                   <div className="grid single-col admin-flow-section admin-flow-knowledge">
                     <article className="panel">
                       <div className="panel-head">
-                        <h3>{adminWorkspace === "project" ? "Setup: Alert Knowledge Onboarding" : "Alert Knowledge Onboarding"}</h3>
+                        <h3>{adminWorkspace === "project" ? "Knowledge: Alert Documents" : "Alert Knowledge Onboarding"}</h3>
                         <p>{adminWorkspace === "project" ? "Create and review alert knowledge here in the same setup workspace." : "Standalone alert knowledge workspace for focused onboarding and review."}</p>
                       </div>
                       <div className="detail-tabs" style={{ marginBottom: 0 }}>
@@ -10214,7 +11196,7 @@ export default function App() {
               <article className="panel">
                 <div className="panel-head">
                   <h2>Human Approval Queue (Legacy)</h2>
-                  <p>Primary approval actions now run inside Alert Details Workspace on Dashboard for eligible roles.</p>
+                  <p>Primary approval actions now run inside the Alert Details Cockpit on Dashboard for eligible roles.</p>
                 </div>
                 <p className="subtitle">Use this queue for cross-incident triage, bulk-style review, or manual fallback operations.</p>
 
@@ -10630,6 +11612,13 @@ export default function App() {
                   <h2>Message Bus</h2>
                   <button className="button-secondary" onClick={() => runWorkflow(selectedFlow)}>Refresh Activity</button>
                 </div>
+
+                <MessageBusTopology
+                  actual={messageBusActual}
+                  configuredRows={messageBusTopicRows}
+                  routing={observedRouting}
+                  primaryTopic={onboardingForm.azure_service_bus_topic}
+                />
 
                 <h3>Latest Workflow Topic Activity</h3>
                 <div className="table-wrap">

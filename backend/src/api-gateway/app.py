@@ -11,6 +11,8 @@ from uuid import uuid4
 import httpx
 import pymysql
 from api_gateway import SafetyAnalyzer
+from api_gateway.auth_policy import route_auth_rule
+from api_gateway.modules.users.permissions import AuthContext
 from api_gateway.modules.users.router import router as user_management_router
 from api_gateway.modules.users.service import UserService
 from common.config import get_settings
@@ -21,6 +23,7 @@ from common.models import GatewayAuditEvent, SafetyDecision
 from common.service import create_app
 from common.telemetry import REQUEST_LATENCY
 from fastapi import Body, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from opentelemetry import trace
 from prometheus_client import Counter, Gauge
 from sqlalchemy import func, select
@@ -32,6 +35,33 @@ settings.service_name = "api-gateway"
 analyzer = SafetyAnalyzer()
 AUDIT_EVENTS: deque[GatewayAuditEvent] = deque(maxlen=200)
 logger = logging.getLogger("api-gateway")
+
+
+async def _auth_context_from_request(request: Request) -> AuthContext:
+    header = str(request.headers.get("authorization") or "").strip()
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="Bearer access token required")
+
+    user_service = getattr(request.app.state, "user_service", None)
+    if user_service is None:
+        raise HTTPException(status_code=500, detail="User service is not configured")
+
+    payload = user_service.decode_token(token.strip())
+    if str(payload.get("type") or "") != "access":
+        raise HTTPException(status_code=401, detail="Access token required")
+    session_jti = str(payload.get("sid") or "").strip()
+    if not session_jti:
+        raise HTTPException(status_code=401, detail="Access token is missing session binding")
+    user_id = int(payload.get("sub", "0"))
+    await user_service.ensure_active_session(session_jti=session_jti, user_id=user_id)
+    return AuthContext(
+        user_id=user_id,
+        role=str(payload.get("role") or ""),
+        jwt_id=str(payload.get("jti") or ""),
+        session_jti=session_jti,
+        token_type="access",
+    )
 
 
 async def _persist_gateway_audit_event(app: FastAPI, event: GatewayAuditEvent) -> None:
@@ -166,6 +196,25 @@ async def startup(app: FastAPI) -> None:
 app = create_app(title="KaiMS API Gateway", settings=settings, startup=startup)
 app.include_router(user_management_router)
 
+
+@app.middleware("http")
+async def enforce_operational_auth(request: Request, call_next):
+    if settings.environment.strip().lower() in {"local", "demo", "test"}:
+        return await call_next(request)
+
+    role_rule = route_auth_rule(request.method, request.url.path)
+    if role_rule is False:
+        return await call_next(request)
+
+    try:
+        auth = await _auth_context_from_request(request)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    if role_rule is not None and auth.role not in role_rule:
+        return JSONResponse(status_code=403, content={"detail": "Insufficient role permissions"})
+    request.state.auth = auth
+    return await call_next(request)
+
 GATEWAY_REQUESTS = Counter(
     "kaiops_gateway_requests_total",
     "API gateway requests by path and safety decision",
@@ -192,6 +241,216 @@ def preview(payload: Any) -> dict[str, Any]:
     if not isinstance(normalized, dict):
         return {"value": str(normalized)[:500]}
     return {key: normalized[key] for key in list(normalized)[:10]}
+
+
+def _normalize_contract_token(value: Any) -> str:
+    return "-".join(
+        part
+        for part in str(value or "").strip().lower().replace("_", "-").replace("/", "-").split("-")
+        if part
+    )
+
+
+def _collect_contract_tokens(*values: Any) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                tokens.update(_collect_contract_tokens(item))
+            continue
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        normalized = _normalize_contract_token(raw)
+        if normalized:
+            tokens.add(normalized)
+        for part in raw.replace(",", " ").replace(";", " ").replace("|", " ").split():
+            normalized_part = _normalize_contract_token(part)
+            if normalized_part:
+                tokens.add(normalized_part)
+    return tokens
+
+
+def _payload_data(payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    return data if isinstance(data, dict) else payload
+
+
+def _canonical_alert_contract(alert: dict[str, Any]) -> dict[str, Any]:
+    labels = alert.get("labels") if isinstance(alert.get("labels"), dict) else {}
+    metadata = alert.get("metadata") if isinstance(alert.get("metadata"), dict) else {}
+    alert_id = str(alert.get("alert_id") or alert.get("id") or "").strip()
+    incident_id = str(alert.get("incident_id") or "").strip()
+    service = str(
+        alert.get("service")
+        or labels.get("service")
+        or labels.get("job")
+        or metadata.get("service")
+        or ""
+    ).strip()
+    alert_type = str(
+        alert.get("alert_type")
+        or alert.get("name")
+        or alert.get("alert_name")
+        or alert.get("alertname")
+        or labels.get("alertname")
+        or labels.get("alert_type")
+        or ""
+    ).strip()
+    return {
+        "schema_version": "kaiops.alert.v1",
+        "alert_uid": alert_id or incident_id,
+        "alert_id": alert_id,
+        "incident_id": incident_id,
+        "correlation_id": str(alert.get("correlation_id") or "").strip(),
+        "trace_id": str(alert.get("trace_id") or "").strip(),
+        "fingerprint": str(alert.get("fingerprint") or labels.get("alert_fingerprint") or "").strip(),
+        "alert_type": alert_type,
+        "service": service,
+        "environment": str(alert.get("environment") or labels.get("environment") or "").strip() or "prod",
+        "tenant": str(labels.get("tenant") or metadata.get("tenant") or "default").strip(),
+        "severity": str(alert.get("severity") or labels.get("severity") or "").strip().lower(),
+        "status": str(alert.get("status") or alert.get("state") or labels.get("alert_status") or "").strip(),
+        "project": str(alert.get("project") or labels.get("project") or labels.get("application") or "").strip(),
+        "raw_id_fields": {
+            "id": alert.get("id"),
+            "alert_id": alert.get("alert_id"),
+            "incident_id": alert.get("incident_id"),
+            "correlation_id": alert.get("correlation_id"),
+        },
+    }
+
+
+def _document_match_context(alert: dict[str, Any], canonical: dict[str, Any]) -> dict[str, Any]:
+    labels = alert.get("labels") if isinstance(alert.get("labels"), dict) else {}
+    metadata = alert.get("metadata") if isinstance(alert.get("metadata"), dict) else {}
+    return {
+        "ids": _collect_contract_tokens(
+            canonical.get("alert_id"),
+            canonical.get("incident_id"),
+            canonical.get("correlation_id"),
+            labels.get("alert_id"),
+            metadata.get("alert_id"),
+            metadata.get("incident_id"),
+        ),
+        "alert_types": _collect_contract_tokens(
+            canonical.get("alert_type"),
+            alert.get("name"),
+            alert.get("alert_name"),
+            labels.get("alertname"),
+            labels.get("alert_type"),
+            labels.get("category"),
+        ),
+        "services": _collect_contract_tokens(
+            canonical.get("service"),
+            canonical.get("project"),
+            alert.get("application"),
+            labels.get("service"),
+            labels.get("job"),
+            labels.get("application"),
+            labels.get("project"),
+            labels.get("project_name"),
+            labels.get("deployment"),
+            labels.get("namespace"),
+            labels.get("instance"),
+            metadata.get("service"),
+            metadata.get("application"),
+            metadata.get("project"),
+        ),
+        "generic_service_docs_allowed": alert.get("document_available") is True or bool(metadata.get("runbook_hint")),
+    }
+
+
+def _link_document_to_alert(doc: dict[str, Any], context: dict[str, Any]) -> dict[str, Any] | None:
+    doc_ids = _collect_contract_tokens(doc.get("alert_id"), doc.get("id"), (doc.get("metadata") or {}).get("alert_id") if isinstance(doc.get("metadata"), dict) else None)
+    doc_types = _collect_contract_tokens(doc.get("alert_type"), doc.get("alert_name"), doc.get("alertname"))
+    doc_services = _collect_contract_tokens(doc.get("services"), doc.get("service"))
+    doc_kind = _normalize_contract_token(doc.get("kind") or doc.get("document_kind"))
+    if context["ids"] & doc_ids:
+        reason = "exact-alert-id"
+        confidence = 1.0
+    elif (context["alert_types"] & doc_types) and (context["services"] & doc_services):
+        reason = "alert-type-and-service"
+        confidence = 0.9
+    elif (
+        context["generic_service_docs_allowed"]
+        and not doc_ids
+        and (context["services"] & doc_services)
+        and doc_kind in {"runbook", "incident", "sop", "onboarding"}
+    ):
+        reason = "service-level-document"
+        confidence = 0.72
+    else:
+        return None
+    public_doc = {key: value for key, value in doc.items() if not str(key).startswith("_")}
+    public_doc.update(
+        {
+            "match_reason": reason,
+            "match_confidence": confidence,
+            "document_scope": "alert-specific" if doc.get("alert_id") else "service-level",
+        }
+    )
+    return public_doc
+
+
+def _enterprise_contract(canonical: dict[str, Any], trace_id: str) -> dict[str, Any]:
+    severity = str(canonical.get("severity") or "").lower()
+    risk_tier = "critical" if severity == "critical" else "high" if severity == "high" else "standard"
+    return {
+        "governance": {
+            "agent_contract_version": "kaiops.agent-contract.v1",
+            "required_agent_fields": ["input", "output", "confidence", "reasoning", "citations", "fallback_path"],
+            "approval_gate_required": severity in {"critical", "high"},
+            "allowed_actions": ["triage", "recommend", "request_approval", "dry_run_remediation"],
+            "audit_required": True,
+        },
+        "rbac": {
+            "policy_version": "kaiops.rbac.v1",
+            "tenant": canonical.get("tenant") or "default",
+            "environment": canonical.get("environment") or "prod",
+            "risk_tier": risk_tier,
+            "action_roles": {
+                "view": ["Administrator", "L3 Engineer", "L2 Engineer", "L1 Operator", "Executive"],
+                "provide_documents": ["Administrator", "L3 Engineer", "L2 Engineer"],
+                "approve": ["Administrator", "L3 Engineer"],
+                "execute_remediation": ["Administrator", "L3 Engineer"],
+            },
+        },
+        "observability": {
+            "trace_id": canonical.get("trace_id") or trace_id,
+            "correlation_id": canonical.get("correlation_id"),
+            "required_hops": ["alert-intake", "enrichment", "rag", "llm", "approval", "remediation", "closure", "ui"],
+            "quality_gate": "all persisted events should carry trace_id and correlation_id",
+        },
+        "rag_quality": {
+            "contract_version": "kaiops.rag-quality.v1",
+            "required_fields": ["kind", "title", "path", "services", "owner", "version", "freshness_score", "embedding_status"],
+            "approval_workflow_required": True,
+        },
+        "llm_reliability": {
+            "contract_version": "kaiops.llm-reliability.v1",
+            "fallback_required": True,
+            "deterministic_fallback": "workflow and alert-stream payload",
+            "required_audit_fields": ["prompt_version", "model", "provider", "cost", "token_usage", "validation_result"],
+            "cost_guardrail_required": True,
+            "required_evaluation_metrics": [
+                "confidence_score",
+                "grounding_score",
+                "hallucination_risk",
+                "citation_coverage",
+                "evidence_coverage",
+                "overall_score",
+            ],
+        },
+        "remediation_safety": {
+            "contract_version": "kaiops.remediation-safety.v1",
+            "dry_run_required": True,
+            "approval_required": severity in {"critical", "high"},
+            "required_fields": ["policy_result", "blast_radius", "rollback_plan", "post_checks", "execution_log"],
+        },
+    }
 
 
 def _build_gateway_audit_contract(event: GatewayAuditEvent) -> dict[str, Any]:
@@ -562,6 +821,80 @@ async def get_all_alerts(
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
+
+
+@app.get("/alerts/{alert_id}/linked-documents")
+async def get_alert_linked_documents(
+    alert_id: str,
+    request: Request,
+    limit: int = 500,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    trace_id = trace_id_from_header(x_trace_id)
+    safe_limit = max(1, min(int(limit), 1000))
+    alerts_path = f"/alerts/all?{urlencode({'limit': str(safe_limit)})}"
+    _, alerts_payload = await proxy(
+        method="GET",
+        path=alerts_path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id,
+    )
+    _, docs_payload = await proxy(
+        method="GET",
+        path="/rag/documents",
+        target_base=settings.context_agent_url,
+        payload={},
+        trace_id=trace_id,
+    )
+    alerts_data = _payload_data(alerts_payload)
+    docs_data = _payload_data(docs_payload)
+    rows = alerts_data.get("rows") or alerts_data.get("alerts") or []
+    documents = docs_data.get("documents") or []
+    if not isinstance(rows, list):
+        rows = []
+    if not isinstance(documents, list):
+        documents = []
+
+    normalized_id = str(alert_id or "").strip()
+    selected_alert = next(
+        (
+            row for row in rows
+            if isinstance(row, dict)
+            and normalized_id
+            in {
+                str(row.get("alert_id") or "").strip(),
+                str(row.get("id") or "").strip(),
+                str(row.get("incident_id") or "").strip(),
+                str(row.get("correlation_id") or "").strip(),
+            }
+        ),
+        None,
+    )
+    if selected_alert is None:
+        raise HTTPException(status_code=404, detail={"message": "alert not found", "alert_id": normalized_id, "trace_id": trace_id})
+
+    canonical = _canonical_alert_contract(selected_alert)
+    context = _document_match_context(selected_alert, canonical)
+    linked_documents = [
+        linked
+        for linked in (_link_document_to_alert(doc, context) for doc in documents if isinstance(doc, dict))
+        if linked is not None
+    ]
+    linked_documents.sort(key=lambda doc: (-float(doc.get("match_confidence") or 0), str(doc.get("kind") or ""), str(doc.get("title") or "")))
+    contract = _enterprise_contract(canonical, trace_id)
+    return {
+        "trace_id": trace_id,
+        "canonical_alert": canonical,
+        "linked_documents": linked_documents,
+        "document_link_summary": {
+            "count": len(linked_documents),
+            "source": "api-gateway.alert-linked-documents",
+            "contract_version": "kaiops.alert-document-link.v1",
+            "match_reasons": sorted({str(doc.get("match_reason") or "") for doc in linked_documents if doc.get("match_reason")}),
+        },
+        **contract,
+    }
 
 
 @app.get("/alerts/severity-overrides")
@@ -1387,6 +1720,22 @@ async def approval_action(
         method="POST",
         path=f"/{action}",
         target_base=settings.approval_service_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/remediation/execute")
+async def remediation_execute(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/execute",
+        target_base=settings.remediation_engine_url,
         payload=payload,
         trace_id=trace_id_from_header(x_trace_id),
     )
