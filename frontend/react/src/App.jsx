@@ -343,6 +343,9 @@ async function fetchJson(path, options = {}) {
       return response.json();
     } catch (error) {
       const message = String(error?.message || "");
+      if (message === "Session expired. Please sign in again.") {
+        throw error;
+      }
       lastError = message === "Failed to fetch"
         ? new Error(`Failed to reach ${path}. Open the UI through http://localhost:8501 with Docker/nginx running, or use the Vite proxy with api-gateway on http://localhost:8010.`)
         : error;
@@ -3492,8 +3495,8 @@ export default function App() {
     setAdminUsers((current) => ({ ...current, loading: true, error: "" }));
     try {
       const [usersPayload, rolesPayload] = await Promise.all([
-        fetchJson("/api-gateway/users?page=1&page_size=50", { headers }),
-        fetchJson("/api-gateway/roles", { headers }),
+        fetchJson("/api-gateway/users?page=1&page_size=50", authenticatedOptions()),
+        fetchJson("/api-gateway/roles", authenticatedOptions()),
       ]);
       const usersRows = usersPayload?.rows || usersPayload?.data?.rows || [];
       const rolesRows = rolesPayload?.data || rolesPayload || [];
@@ -3513,14 +3516,13 @@ export default function App() {
     }
     setAdminUsers((current) => ({ ...current, loading: true, error: "" }));
     try {
-      await fetchJson("/api-gateway/users", {
+      await fetchJson("/api-gateway/users", authenticatedOptions({
         method: "POST",
-        headers,
         body: JSON.stringify({
           ...adminCreateUser,
           role_id: Number(adminCreateUser.role_id || 1),
         }),
-      });
+      }));
       setAdminCreateUser({
         username: "",
         email: "",
@@ -3564,9 +3566,8 @@ export default function App() {
     }
     setAdminUsers((current) => ({ ...current, loading: true, error: "" }));
     try {
-      await fetchJson(`/api-gateway/users/${adminEditUser.id}`, {
+      await fetchJson(`/api-gateway/users/${adminEditUser.id}`, authenticatedOptions({
         method: "PUT",
-        headers,
         body: JSON.stringify({
           email: String(adminEditUser.email || "").trim(),
           first_name: String(adminEditUser.first_name || "").trim(),
@@ -3575,7 +3576,7 @@ export default function App() {
           status: String(adminEditUser.status || "active").trim(),
           is_active: Boolean(adminEditUser.is_active),
         }),
-      });
+      }));
       await loadAdminUsersAndRoles();
     } catch (error) {
       setAdminUsers((current) => ({ ...current, loading: false, error: error.message }));
@@ -3592,11 +3593,10 @@ export default function App() {
     }
     setAdminUsers((current) => ({ ...current, loading: true, error: "" }));
     try {
-      await fetchJson(`/api-gateway/users/${selectedUserId}/reset-password`, {
+      await fetchJson(`/api-gateway/users/${selectedUserId}/reset-password`, authenticatedOptions({
         method: "PATCH",
-        headers,
         body: JSON.stringify({ new_password: String(adminResetPasswordForm.new_password || "") }),
-      });
+      }));
       setAdminResetPasswordForm((current) => ({ ...current, new_password: "" }));
       await loadAdminUsersAndRoles();
     } catch (error) {
@@ -6895,7 +6895,8 @@ export default function App() {
       error: "",
     }));
     try {
-      const response = await fetchJson(`/api-gateway/approval/incident/${encodeURIComponent(normalized)}`);
+      const options = adminHeaders().Authorization ? authenticatedOptions() : {};
+      const response = await fetchJson(`/api-gateway/approval/incident/${encodeURIComponent(normalized)}`, options);
       const payload = unwrap(response);
       const recommendationId = approvalRecommendationFromPayload(payload);
       setApprovalIncidentContext({ loading: false, incident_id: normalized, payload, error: "" });
@@ -7323,7 +7324,8 @@ export default function App() {
       }
     }
 
-    const response = await fetchJson(`/api-gateway/approval/incident/${encodeURIComponent(normalizedIncidentId)}`);
+    const options = adminHeaders().Authorization ? authenticatedOptions() : {};
+    const response = await fetchJson(`/api-gateway/approval/incident/${encodeURIComponent(normalizedIncidentId)}`, options);
     const payload = unwrap(response);
     const resolved = approvalRecommendationFromPayload(payload);
     if (looksLikeUuid(resolved)) {
