@@ -234,8 +234,17 @@ class RemediationEngine(BaseAgent):
     def build_action(self, approval: Approval) -> RemediationAction:
         recommended_action = str(approval.metadata.get("recommended_action") or "").strip()
         recommended_commands = approval.metadata.get("recommended_commands") if isinstance(approval.metadata.get("recommended_commands"), list) else []
+        approved_execution_plan = approval.metadata.get("execution_plan") if isinstance(approval.metadata.get("execution_plan"), dict) else {}
         action_text = str(approval.modified_action or approval.comment or recommended_action or "rollback deployment").strip()
-        command_list = self._sanitize_recommended_commands([str(item) for item in recommended_commands])
+        plan_commands = approved_execution_plan.get("commands") if isinstance(approved_execution_plan.get("commands"), list) else []
+        plan_scripts = approved_execution_plan.get("scripts") if isinstance(approved_execution_plan.get("scripts"), list) else []
+        plan_queries = approved_execution_plan.get("queries") if isinstance(approved_execution_plan.get("queries"), list) else []
+        command_list = self._sanitize_recommended_commands([
+            *[str(item) for item in recommended_commands],
+            *[str(item) for item in plan_commands],
+            *[f"script: {item}" for item in plan_scripts],
+            *[f"query: {item}" for item in plan_queries],
+        ])
         inferred_target = self._infer_target_from_commands(command_list)
         action_type = self._infer_action_type(action_text=action_text, commands=command_list)
         policy_version = str(approval.metadata.get("policy_version", "")).strip()
@@ -257,7 +266,7 @@ class RemediationEngine(BaseAgent):
         environment = str(approval.metadata.get("environment") or "").strip()
         if self._looks_like_uuid(target) and service:
             target = service
-        execution_plan = self._build_execution_plan(
+        generated_execution_plan = self._build_execution_plan(
             action_type=action_type,
             target=target,
             service=service,
@@ -265,6 +274,12 @@ class RemediationEngine(BaseAgent):
             recommended_action=recommended_action,
             recommended_commands=command_list,
         )
+        execution_plan = {
+            "commands": [str(item).strip() for item in (plan_commands or generated_execution_plan.get("commands", [])) if str(item).strip()],
+            "scripts": [str(item).strip() for item in (plan_scripts or generated_execution_plan.get("scripts", [])) if str(item).strip()],
+            "queries": [str(item).strip() for item in (plan_queries or generated_execution_plan.get("queries", [])) if str(item).strip()],
+        }
+        connection_profile = approval.metadata.get("connection_profile") if isinstance(approval.metadata.get("connection_profile"), dict) else {}
 
         return RemediationAction(
             incident_id=approval.incident_id,
@@ -281,6 +296,7 @@ class RemediationEngine(BaseAgent):
                 "recommended_action": recommended_action,
                 "commands": command_list,
                 "execution_plan": execution_plan,
+                "connection_profile": connection_profile,
             },
             started_at=utc_now(),
             status=RemediationStatus.RUNNING,

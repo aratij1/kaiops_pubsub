@@ -18,6 +18,7 @@ from common.config import get_settings
 from common.database import create_engine, create_schema, create_session_factory
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.logging import get_logger
+from common.model_evaluation import build_quality_evaluation
 from common.models import (
     Alert,
     AlertSeverity,
@@ -696,14 +697,20 @@ def _build_onboarding_rag_documents(
     normalized_sources = [item for item in (source_documents or []) if isinstance(item, dict)]
     source_doc_types: list[str] = []
     source_doc_lines: list[str] = []
+    source_text_lines: list[str] = []
     for item in normalized_sources:
         kind = str(item.get("kind") or "reference").strip().lower() or "reference"
         name = str(item.get("name") or "uploaded-document").strip() or "uploaded-document"
         excerpt = str(item.get("excerpt") or "").strip()
+        content = str(item.get("content") or item.get("text") or "").strip()
+        source_preview = (content or excerpt)[:2000]
         if kind not in source_doc_types:
             source_doc_types.append(kind)
         source_doc_lines.append(f"- {kind}: {name}{f' | {excerpt}' if excerpt else ''}")
+        if source_preview:
+            source_text_lines.append(f"### {kind}: {name}\n{source_preview}")
     source_doc_summary = "\n".join(source_doc_lines) or "- No explicit source documents supplied"
+    source_text_summary = "\n\n".join(source_text_lines) or "No source document content supplied."
     required_doc_summary = [
         "past tickets or incidents that show repeated failure patterns",
         "troubleshooting or diagnostic notes that capture investigation steps",
@@ -750,6 +757,7 @@ def _build_onboarding_rag_documents(
             f"Project {project_name} onboarding completed in {environment}.\n"
             f"Selected tool: {selected_tool}.\n"
             f"Requirements:\n{requirements_summary}\n\nGenerated rules:\n{rules_summary}\n\nSource documents:\n{source_doc_summary}"
+            f"\n\nSource document previews:\n{source_text_summary}"
         ),
         "services": [project_name],
         "deployment": environment,
@@ -760,6 +768,7 @@ def _build_onboarding_rag_documents(
             **shared_metadata,
             "document_class": "onboarding-incident",
             "required_documents": required_doc_summary,
+            "source_document_count": len(normalized_sources),
         }),
     }
 
@@ -839,7 +848,32 @@ def _build_onboarding_rag_documents(
         }),
     }
 
-    return [incident_doc, runbook_doc, dependency_doc, change_doc]
+    docs = [incident_doc, runbook_doc, dependency_doc, change_doc]
+    for doc in docs:
+        doc["metadata"] = metadata_payload({
+            **(doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}),
+            "evaluation": build_quality_evaluation(
+                prediction={
+                    "title": doc.get("title"),
+                    "summary": doc.get("summary"),
+                    "content": doc.get("content"),
+                    "recommended_action": doc.get("recommended_action"),
+                },
+                context={
+                    "requirements": requirements_summary,
+                    "generated_rules": rules_summary,
+                    "source_documents": source_doc_summary,
+                    "source_previews": source_text_summary,
+                },
+                confidence=0.82 if normalized_sources else 0.68,
+                citations=[source_ref] if source_ref else [],
+                rag_matches=[],
+                runbook_found=bool(normalized_sources),
+                fallback_used=not bool(normalized_sources),
+            ),
+        })
+
+    return docs
 
 
 def _prometheus_rules_output_path(project_name: str, workflow_id: str) -> Path:
@@ -1532,6 +1566,27 @@ async def run_local_payment_workflow(
         "stream_count": decision.stream_count,
         "stream_threshold": decision.stream_threshold,
     }
+    recommendation.metadata["evaluation"] = build_quality_evaluation(
+        prediction={
+            "root_cause": recommendation.root_cause,
+            "impact": recommendation.impact,
+            "recommended_action": recommendation.recommended_action,
+            "rationale": recommendation.rationale,
+            "commands": recommendation.commands,
+        },
+        context={
+            "scenario": scenario,
+            "alert": enriched_alert.model_dump(mode="json"),
+            "incident": incident.model_dump(mode="json"),
+            "context_metadata": context.metadata,
+            "runbook": context.runbook,
+        },
+        confidence=float(recommendation.confidence),
+        citations=list(recommendation.metadata.get("citations", [])),
+        rag_matches=context.metadata.get("rag_matches", []) if isinstance(context.metadata, dict) else [],
+        runbook_found=bool(context.runbook),
+        fallback_used=bool(model_errors),
+    )
     await persist_step(lambda repo: repo.save_recommendation_as_audit(recommendation))
     model_usage = list(recommendation.metadata.get("model_usage", []))
     model_calls = list(recommendation.metadata.get("model_calls", []))

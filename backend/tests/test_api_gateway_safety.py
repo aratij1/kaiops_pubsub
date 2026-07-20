@@ -1,5 +1,7 @@
 from api_gateway import SafetyAnalyzer
 from common.models import SafetyDecision
+from common.model_evaluation import build_quality_evaluation
+from api_gateway.auth_policy import route_auth_rule
 
 
 def test_safety_analyzer_allows_normal_alert_payload() -> None:
@@ -122,3 +124,28 @@ def test_analyze_response_runs_local_rules_when_opted_in() -> None:
 
     assert result.decision in {SafetyDecision.REVIEW, SafetyDecision.BLOCK}
     assert result.provider == "local"
+
+
+def test_gateway_operational_auth_policy_marks_admin_routes() -> None:
+    assert route_auth_rule("POST", "/onboarding/complete") == {"Administrator"}
+    assert route_auth_rule("GET", "/monitoring/integrations") == {"Administrator"}
+    assert route_auth_rule("POST", "/rag/documents") == {"Administrator", "L2 Engineer", "L3 Engineer"}
+    assert route_auth_rule("POST", "/approval/approve") is None
+    assert route_auth_rule("POST", "/api/v1/alerts/prometheus") is False
+
+
+def test_quality_evaluation_exposes_grounding_and_hallucination_metrics() -> None:
+    evaluation = build_quality_evaluation(
+        prediction="Restart checkout-api pods after p95 latency alert and verify Prometheus latency recovers.",
+        context="checkout-api runbook says restart pods after latency alert and validate Prometheus p95 latency.",
+        confidence=0.86,
+        citations=["runbook://checkout-api", "incident://123"],
+        rag_matches=[{"match_confidence": 0.91}],
+        runbook_found=True,
+    )
+
+    assert evaluation["contract_version"] == "kaiops.evaluation.v1"
+    assert evaluation["confidence_score"] >= 0.86
+    assert evaluation["grounding_score"] > 0.7
+    assert evaluation["hallucination_risk"] < 0.4
+    assert evaluation["overall_score"] > 0.7
