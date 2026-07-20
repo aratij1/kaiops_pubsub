@@ -3,6 +3,7 @@ import json
 
 from common.models import ApplicationRegistration
 from common.monitoring_onboarding import RuleGenerationAgent, write_prometheus_artifacts
+from monitoring_adapter.onboarding_pipelines import capabilities_catalog, run_new_rule_pipeline, NewRuleOnboardingRequest
 
 
 def make_application() -> ApplicationRegistration:
@@ -113,3 +114,33 @@ def test_write_prometheus_artifacts_writes_rule_and_target_files(tmp_path, monke
     assert target_payload[0]["labels"]["job"] == "checkout-api"
     assert (tmp_path / "prometheus_rules" / "checkout-api-alerts.yml").exists()
     assert (tmp_path / "prometheus_targets" / "checkout-api.json").exists()
+
+
+def test_monitoring_adapter_capabilities_label_real_and_simulated_contracts() -> None:
+    rows = {row["platform"]: row for row in capabilities_catalog()}
+
+    assert rows["prometheus"]["contract_mode"] == "real"
+    assert rows["prometheus"]["contract_status"] == "partial"
+    assert rows["datadog"]["contract_mode"] == "simulated"
+    assert rows["datadog"]["contract_status"] == "stub"
+
+
+def test_new_rule_pipeline_includes_adapter_contract_on_generated_rules() -> None:
+    payload = NewRuleOnboardingRequest.model_validate(
+        {
+            "project": {
+                "project_name": "checkout-api",
+                "environment": "prod",
+                "criticality": "high",
+                "monitoring_platforms": ["prometheus", "datadog"],
+            },
+            "target_platforms": ["prometheus", "datadog"],
+            "monitoring_requirements": ["alert when checkout availability drops below 99 for 5m"],
+        }
+    )
+
+    result = run_new_rule_pipeline(payload)
+    rows = {row["platform"]: row for row in result["generated_rules"]}
+
+    assert rows["prometheus"]["contract_mode"] == "real"
+    assert rows["datadog"]["contract_mode"] == "simulated"

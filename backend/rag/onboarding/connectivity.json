@@ -1,23 +1,24 @@
 {
   "project": {
-    "name": "kaiops-azure-smoke",
-    "owner_team": "platform-ops",
+    "name": "stress-onboard-20260720053305",
+    "owner_team": "stress-platform",
     "environment": "prod",
     "region": "us-east-1"
   },
   "deployment_mode": "on_prem",
-  "prometheus_url": "http://prometheus.local:9090/-/ready",
-  "new_relic_url": "",
-  "datadog_url": "",
-  "gcp_project_id": "",
-  "gcp_region": "",
-  "pubsub_topic": "",
-  "pubsub_subscription": "",
-  "vertex_model_armor_enabled": false,
-  "vertex_model_armor_template": "",
+  "prometheus_url": "http://prometheus.local:9090",
+  "new_relic_url": "http://newrelic.local:443",
+  "datadog_url": "http://datadog.local:443",
+  "azure_subscription_id": "",
+  "azure_resource_group": "",
+  "azure_service_bus_namespace": "",
+  "azure_service_bus_topic": "",
+  "azure_service_bus_subscription": "",
+  "azure_content_safety_enabled": false,
+  "azure_content_safety_endpoint": "",
   "user_assignments": {
-    "admin": [
-      "kaiops-azure-smoke"
+    "stress-admin": [
+      "stress-onboard-20260720053305"
     ]
   },
   "updated_at": null

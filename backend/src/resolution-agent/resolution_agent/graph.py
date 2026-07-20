@@ -7,6 +7,7 @@ from typing import Any, TypedDict
 from common.agent_runtime import AgentRuntime, ContextFailure, ValidationError
 from common.agentic import AgentContext, BaseAgent
 from common.memory_store import InMemoryStore, MemoryStore
+from common.model_evaluation import build_quality_evaluation
 from common.model_gateway import GenerationRequest, ModelGateway, RouterModelGateway
 from common.models import AlertSeverity, Context, Evidence, Recommendation
 from common.prompts import (
@@ -445,6 +446,31 @@ class ResolutionIntelligenceAgent(BaseAgent):
             f"runbook://{context.alert.service}",
             f"incident://{context.incident_id}",
         ]
+        recommendation.metadata["evaluation"] = build_quality_evaluation(
+            prediction={
+                "root_cause": recommendation.root_cause,
+                "impact": recommendation.impact,
+                "recommended_action": recommendation.recommended_action,
+                "rationale": recommendation.rationale,
+                "commands": recommendation.commands,
+            },
+            context={
+                "alert": context.alert.model_dump(mode="json"),
+                "runbook": context.runbook,
+                "related_incidents": context.related_incidents,
+                "metadata": context.metadata,
+            },
+            confidence=recommendation.confidence,
+            citations=recommendation.metadata["citations"],
+            rag_matches=context.metadata.get("rag_matches", []) if isinstance(context.metadata, dict) else [],
+            runbook_found=runbook_present,
+            fallback_used=any(
+                str((usage or {}).get("provider") or "").lower() == "fallback"
+                or str((usage or {}).get("model") or "").lower() == "fallback"
+                or "error" in (usage or {})
+                for usage in state.get("model_usage", [])
+            ),
+        )
         return recommendation
 
     async def resolve_with_runtime(self, context: Context) -> Recommendation:

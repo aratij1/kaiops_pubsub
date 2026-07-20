@@ -72,6 +72,13 @@
 :root.dm-theme-dark .approval-step,
 :root.dm-theme-dark .sticky-controls,
 :root.dm-theme-dark .topic-flow-pill,
+:root.dm-theme-dark .bus-summary-strip > div,
+:root.dm-theme-dark .bus-stage,
+:root.dm-theme-dark .bus-parallel-section,
+:root.dm-theme-dark .bus-observed-rail,
+:root.dm-theme-dark .bus-worker-node,
+:root.dm-theme-dark .alert-document-download-card,
+:root.dm-theme-dark .alert-documents-empty,
 :root.dm-theme-dark .timeline-body,
 :root.dm-theme-dark .agent-event-card,
 :root.dm-theme-dark .execution-card,
@@ -86,12 +93,58 @@
 :root[data-ui-theme="dark"] .approval-step,
 :root[data-ui-theme="dark"] .sticky-controls,
 :root[data-ui-theme="dark"] .topic-flow-pill,
+:root[data-ui-theme="dark"] .bus-summary-strip > div,
+:root[data-ui-theme="dark"] .bus-stage,
+:root[data-ui-theme="dark"] .bus-parallel-section,
+:root[data-ui-theme="dark"] .bus-observed-rail,
+:root[data-ui-theme="dark"] .bus-worker-node,
+:root[data-ui-theme="dark"] .alert-document-download-card,
+:root[data-ui-theme="dark"] .alert-documents-empty,
 :root[data-ui-theme="dark"] .timeline-body,
 :root[data-ui-theme="dark"] .agent-event-card,
 :root[data-ui-theme="dark"] .execution-card {
   background: linear-gradient(180deg, #1a3757 0%, #1f446b 100%);
   border-color: var(--line);
   color: var(--ink);
+}
+
+:root.dm-theme-dark .alert-documents-empty,
+:root[data-ui-theme="dark"] .alert-documents-empty {
+  border-style: dashed;
+}
+
+:root.dm-theme-dark .bus-endpoint-box,
+:root.dm-theme-dark .bus-master-node,
+:root.dm-theme-dark .bus-topic-create-row,
+:root.dm-theme-dark .bus-observed-rail span,
+:root.dm-theme-dark .alert-documents-kind-row span,
+:root[data-ui-theme="dark"] .bus-endpoint-box,
+:root[data-ui-theme="dark"] .bus-master-node,
+:root[data-ui-theme="dark"] .bus-topic-create-row,
+:root[data-ui-theme="dark"] .bus-observed-rail span,
+:root[data-ui-theme="dark"] .alert-documents-kind-row span {
+  background: rgba(9, 24, 41, 0.36);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+:root.dm-theme-dark .bus-topic-pill,
+:root[data-ui-theme="dark"] .bus-topic-pill {
+  background: rgba(226, 168, 79, 0.16);
+  border-color: rgba(226, 168, 79, 0.52);
+  color: #ffe4b5;
+}
+
+:root.dm-theme-dark .bus-topic-pill.active,
+:root[data-ui-theme="dark"] .bus-topic-pill.active {
+  background: rgba(115, 196, 141, 0.16);
+  border-color: rgba(115, 196, 141, 0.55);
+  color: #c9f7d4;
+}
+
+:root.dm-theme-dark .bus-topic-create-row small,
+:root[data-ui-theme="dark"] .bus-topic-create-row small {
+  color: var(--muted);
 }
 
 :root.dm-theme-dark .table-wrap th,
@@ -229,12 +282,43 @@
   :root[data-ui-theme="auto"] .approval-step,
   :root[data-ui-theme="auto"] .sticky-controls,
   :root[data-ui-theme="auto"] .topic-flow-pill,
+  :root[data-ui-theme="auto"] .bus-summary-strip > div,
+  :root[data-ui-theme="auto"] .bus-stage,
+  :root[data-ui-theme="auto"] .bus-parallel-section,
+  :root[data-ui-theme="auto"] .bus-observed-rail,
+  :root[data-ui-theme="auto"] .bus-worker-node,
+  :root[data-ui-theme="auto"] .alert-document-download-card,
   :root[data-ui-theme="auto"] .timeline-body,
   :root[data-ui-theme="auto"] .agent-event-card,
   :root[data-ui-theme="auto"] .execution-card {
     background: linear-gradient(180deg, #1a3757 0%, #1f446b 100%);
     border-color: var(--line);
     color: var(--ink);
+  }
+
+  :root[data-ui-theme="auto"] .bus-endpoint-box,
+  :root[data-ui-theme="auto"] .bus-master-node,
+  :root[data-ui-theme="auto"] .bus-topic-create-row,
+  :root[data-ui-theme="auto"] .bus-observed-rail span {
+    background: rgba(9, 24, 41, 0.36);
+    border-color: var(--line);
+    color: var(--ink);
+  }
+
+  :root[data-ui-theme="auto"] .bus-topic-pill {
+    background: rgba(226, 168, 79, 0.16);
+    border-color: rgba(226, 168, 79, 0.52);
+    color: #ffe4b5;
+  }
+
+  :root[data-ui-theme="auto"] .bus-topic-pill.active {
+    background: rgba(115, 196, 141, 0.16);
+    border-color: rgba(115, 196, 141, 0.55);
+    color: #c9f7d4;
+  }
+
+  :root[data-ui-theme="auto"] .bus-topic-create-row small {
+    color: var(--muted);
   }
 
   :root[data-ui-theme="auto"] .table-wrap th {

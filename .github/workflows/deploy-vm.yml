@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      - kaiops_pubsub
+      - kaiops_azure
       - cursor/agentic-incident-platform-f631
   workflow_dispatch:
 

@@ -22,6 +22,29 @@ _SUPPORTED_PLATFORMS = {
     "azure_monitor",
 }
 
+_REAL_ADAPTER_PLATFORMS = {"prometheus"}
+
+
+def adapter_contract(platform: str) -> dict[str, str]:
+    normalized = _normalize_platform(platform)
+    if normalized in _REAL_ADAPTER_PLATFORMS:
+        return {
+            "contract_mode": "real",
+            "contract_status": "partial",
+            "contract_label": "Real adapter: file-backed Prometheus rule generation",
+            "validation_contract": "Accepts endpoint metadata and validates generated rule shape.",
+            "deployment_contract": "Generates Prometheus-compatible rule/target artifacts for downstream reload.",
+            "simulation_contract": "Uses deterministic local simulation before approval.",
+        }
+    return {
+        "contract_mode": "simulated",
+        "contract_status": "stub",
+        "contract_label": "Simulated adapter: generated rules are not pushed to the provider",
+        "validation_contract": "Validates KaiOps rule shape without calling the provider API.",
+        "deployment_contract": "Returns a simulated deployment receipt for workflow testing.",
+        "simulation_contract": "Uses deterministic local simulation before approval.",
+    }
+
 
 class ProjectSeed(BaseModel):
     project_name: str
@@ -129,6 +152,7 @@ class GenericMonitoringAdapter(MonitoringAdapter):
             "ok": bool(endpoint) or self.platform in {"prometheus", "grafana"},
             "message": "connection profile accepted" if endpoint else "using default connector profile",
             "platform": self.platform,
+            **adapter_contract(self.platform),
         }
 
     def pull_rules(self, project: ProjectSeed) -> list[dict[str, Any]]:
@@ -143,6 +167,7 @@ class GenericMonitoringAdapter(MonitoringAdapter):
                 "aggregation": "avg",
                 "labels": {"project": project.project_name, "platform": self.platform},
                 "platform": self.platform,
+                **adapter_contract(self.platform),
                 "expression": _expression_for_platform(self.platform, "cpu_usage_percent", 80, "5m", "avg"),
             },
             {
@@ -154,6 +179,7 @@ class GenericMonitoringAdapter(MonitoringAdapter):
                 "aggregation": "p95",
                 "labels": {"project": project.project_name, "platform": self.platform},
                 "platform": self.platform,
+                **adapter_contract(self.platform),
                 "expression": _expression_for_platform(self.platform, "request_latency_ms_p95", 2000, "5m", "p95"),
             },
         ]
@@ -164,6 +190,7 @@ class GenericMonitoringAdapter(MonitoringAdapter):
         return {
             "name": name,
             "platform": self.platform,
+            **adapter_contract(self.platform),
             "source_requirement": requirement,
             "metric": parsed["metric"],
             "threshold": parsed["threshold"],
@@ -203,6 +230,7 @@ class GenericMonitoringAdapter(MonitoringAdapter):
         return {
             "deployed": True,
             "platform": self.platform,
+            **adapter_contract(self.platform),
             "rule_name": str(rule.get("name") or ""),
             "project": project.project_name,
             "deployed_at": datetime.now(timezone.utc).isoformat(),
@@ -219,6 +247,7 @@ def capabilities_catalog() -> list[dict[str, Any]]:
         rows.append(
             {
                 "platform": platform,
+                **adapter_contract(platform),
                 "can_pull_rules": platform not in {"grafana"},
                 "can_push_rules": True,
                 "supports_simulation": True,
