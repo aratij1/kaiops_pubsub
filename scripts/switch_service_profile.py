@@ -7,7 +7,7 @@ from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate environment overrides for a selected cloud profile.")
-    parser.add_argument("--profile", required=True, choices=["onprem", "azure", "aws", "gcp"])
+    parser.add_argument("--profile", required=True, help="Profile name from scripts/profiles/service-profiles.json")
     parser.add_argument(
         "--profiles-file",
         default=str(Path("scripts/profiles/service-profiles.json")),
@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default=str(Path(".env.profile.generated")),
+        default=str(Path("config/env/.env.profile.generated")),
         help="Output env file with selected profile values",
     )
     return parser.parse_args()
@@ -28,7 +28,11 @@ def main() -> int:
         raise SystemExit(f"Profiles file not found: {profiles_path}")
 
     profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
-    if not isinstance(profiles, dict) or args.profile not in profiles:
+    if not isinstance(profiles, dict):
+        raise SystemExit(f"Profiles file must be a JSON object: {profiles_path}")
+
+    available_profiles = sorted(str(key) for key in profiles.keys())
+    if args.profile not in profiles:
         raise SystemExit(f"Profile '{args.profile}' not found in {profiles_path}")
 
     selected = profiles[args.profile]
@@ -42,6 +46,7 @@ def main() -> int:
     output_path = Path(args.output)
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Wrote {output_path} for profile '{args.profile}'")
+    print(f"Available profiles: {', '.join(available_profiles)}")
     print("Load it with your launcher or merge into runtime env before deployment.")
     return 0
 

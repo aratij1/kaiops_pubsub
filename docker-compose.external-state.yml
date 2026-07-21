@@ -1,0 +1,69 @@
+# Optional overlay for cloud/multi-VM deployments that use managed/shared state.
+# It moves bundled stateful services behind the `local-state` profile so app
+# nodes do not start their own MySQL/Redis/Kafka/RabbitMQ copies.
+#
+# Usage for app VMs:
+#   docker compose --env-file .env.cloud -f docker-compose.yml -f docker-compose.external-state.yml up -d --build
+#
+# Usage for a single all-in-one VM:
+#   docker compose --profile local-state --env-file .env.cloud -f docker-compose.yml -f docker-compose.external-state.yml up -d --build
+
+services:
+  mysql:
+    profiles: ["local-state"]
+  redis:
+    profiles: ["local-state"]
+  zookeeper:
+    profiles: ["local-state"]
+  kafka:
+    profiles: ["local-state"]
+  rabbitmq:
+    profiles: ["local-state"]
+  mysql-exporter:
+    profiles: ["local-state"]
+  kafka-exporter:
+    profiles: ["local-state"]
+  prometheus:
+    depends_on: !reset []
+  monitoring-adapter:
+    depends_on: !reset []
+  application-onboarding:
+    depends_on: !reset []
+  discovery-service:
+    depends_on: !reset []
+  metrics-validation-agent:
+    depends_on: !reset []
+  rule-generation-agent:
+    depends_on: !reset []
+  prometheus-config-service:
+    depends_on: !reset []
+  validation-agent:
+    depends_on: !reset []
+  dashboard-generator:
+    depends_on: !reset []
+  audit-service:
+    depends_on: !reset []
+  api-gateway:
+    depends_on: !reset []
+  alert-intelligence:
+    depends_on: !reset []
+  orchestrator:
+    depends_on: !reset []
+  context-agent:
+    depends_on: !reset []
+  model-router:
+    depends_on: !reset []
+  resolution-agent:
+    depends_on: !reset []
+  approval-service:
+    depends_on: !reset []
+  notification-service:
+    depends_on: !reset []
+  evaluation-service:
+    depends_on: !reset []
+  remediation-engine:
+    depends_on: !reset []
+  closure-service:
+    depends_on: !reset []
+  ui:
+    depends_on: !reset []

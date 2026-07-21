@@ -17,7 +17,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $K8sDir = Join-Path $RepoRoot "k8s"
 $CreateSecretScript = Join-Path $K8sDir "create-secret.ps1"
-$Dockerfile = Join-Path $RepoRoot "Dockerfile.service"
+$Dockerfile = Join-Path $RepoRoot "deploy/docker/Dockerfile.service"
 
 $BackendDeployments = @(
     "monitoring-adapter",

@@ -110,6 +110,7 @@ class AzureAISearchVectorStore:
             "content_field": self._content_field if self.configured else "",
             "vector_field": self._vector_field if self.configured else "",
             "last_error": self.last_error,
+            "enterprise_ready": bool(self.configured),
         }
 
     def _headers(self) -> dict[str, str]:
@@ -359,12 +360,14 @@ class VectorDBConnector(BaseConnector):
         if remote.configured:
             return remote.info()
         return {
-            "provider": "file-backed-memory",
+            "provider": "local-hybrid-vector-index",
             "engine": self.__class__.__name__,
             "persistent_index": False,
-            "storage": "markdown-files",
+            "storage": "markdown-files-with-in-memory-vector-rerank",
             "root_path": str(self.root_path()),
             "remote_configured": False,
+            "enterprise_ready": False,
+            "recommended_enterprise_store": "azure-ai-search",
             "remote_last_error": remote.last_error,
         }
 
@@ -400,11 +403,19 @@ class VectorDBConnector(BaseConnector):
             "vector_store": self.vector_store_info(),
             "embedding_model": self.embedding_info(),
             "remote_index_enabled": self.remote_store().configured,
+            "enterprise_index_enabled": self.remote_store().configured,
             "document_count": len(docs),
             "synthetic_document_count": len(synthetic_docs),
             "metadata_embedding_count": embedded_metadata,
             "full_document_cache_count": len(self._document_cache),
             "kinds": by_kind,
+            "quality_gates": {
+                "semantic_embeddings": self.embedding_info().get("provider") in {"openai", "azure-openai"},
+                "persistent_vector_store": self.remote_store().configured,
+                "service_scoped_retrieval": True,
+                "metadata_prefilter": True,
+                "full_document_rerank": True,
+            },
             "index_strategy": {
                 "chunking": "chunk-level-for-remote-document-level-for-local",
                 "metadata_shortlist": True,

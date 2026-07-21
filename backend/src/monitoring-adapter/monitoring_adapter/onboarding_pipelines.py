@@ -551,7 +551,13 @@ def parse_requirement(requirement: str) -> dict[str, Any]:
     lowered = text.lower()
 
     metric = "cpu_usage_percent"
-    if "latency" in lowered or "response time" in lowered:
+    if any(token in lowered for token in ["null customer", "missing customer", "customer id ratio", "customer_id ratio"]):
+        metric = "etl_null_customer_ratio"
+    elif any(token in lowered for token in ["rejected row", "rejected etl", "dq_status", "data quality"]):
+        metric = "etl_rejected_rows"
+    elif "etl load latency" in lowered or "load latency" in lowered or "pipeline latency" in lowered:
+        metric = "etl_load_latency_seconds"
+    elif "latency" in lowered or "response time" in lowered:
         metric = "request_latency_ms_p95"
     elif "memory" in lowered:
         metric = "memory_usage_percent"
@@ -572,6 +578,8 @@ def parse_requirement(requirement: str) -> dict[str, Any]:
     threshold_match = re.search(r"(above|over|greater than|>|>=)\s*(\d+(?:\.\d+)?)", lowered)
     if threshold_match:
         threshold = float(threshold_match.group(2))
+    elif re.search(r"(above|over|greater than|>|>=)\s+zero\b", lowered):
+        threshold = 0.0
 
     duration = "5m"
     duration_match = re.search(r"for\s*(\d+)\s*(minute|minutes|min|m|hour|hours|h)", lowered)
@@ -581,7 +589,9 @@ def parse_requirement(requirement: str) -> dict[str, Any]:
         duration = f"{value}h" if unit.startswith("h") else f"{value}m"
 
     aggregation = "avg"
-    if "p95" in lowered or "95th" in lowered:
+    if metric == "etl_rejected_rows":
+        aggregation = "sum"
+    elif "p95" in lowered or "95th" in lowered:
         aggregation = "p95"
     elif "max" in lowered:
         aggregation = "max"

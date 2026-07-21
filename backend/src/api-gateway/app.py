@@ -1291,6 +1291,40 @@ async def get_landing_pad_recent(
     )
 
 
+@app.get("/landing-pad/input")
+async def get_landing_pad_input(
+    request: Request,
+    limit: int = 50,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/landing-pad/input?{urlencode({'limit': str(limit)})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/landing-pad/input/process")
+async def process_landing_pad_input(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    safe_payload = require_object_payload(payload, "Landing pad input replay payload")
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/landing-pad/input/process",
+        target_base=settings.monitoring_adapter_url,
+        payload=safe_payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.post("/onboarding/connectivity")
 async def post_onboarding_connectivity(
     request: Request,
@@ -1979,6 +2013,38 @@ async def model_route(
         path="/route",
         target_base=settings.model_router_url,
         payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/model/route/provider/{provider_name}")
+async def model_route_provider(
+    provider_name: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/route/provider/{provider_name}",
+        target_base=settings.model_router_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/model/providers/status")
+async def model_providers_status(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/providers/status",
+        target_base=settings.model_router_url,
+        payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
 
