@@ -6,6 +6,7 @@ import logging
 from typing import Any
 from uuid import UUID
 
+import httpx
 from common.config import get_settings
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
@@ -20,6 +21,7 @@ from pydantic import BaseModel, Field
 settings = get_settings()
 settings.service_name = "approval-service"
 tasks: list[asyncio.Task] = []
+_background_tasks: set[asyncio.Task] = set()
 
 ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any, Any, None]]
 
@@ -277,6 +279,31 @@ async def _store_and_publish(approval: Approval) -> None:
             await session.commit()
     payload = _build_approval_event_payload(approval)
     await app.state.producer.publish(APPROVAL_EVENTS, payload, key=str(approval.incident_id))
+    _publish_evaluation_feedback(approval)
+
+
+async def _post_evaluation_feedback(recommendation_id: str, body: dict[str, Any]) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(
+                f"{settings.evaluation_service_url.rstrip('/')}/evaluations/by-recommendation/{recommendation_id}/feedback",
+                json=body,
+            )
+        response.raise_for_status()
+    except Exception as exc:
+        logger.warning("evaluation_service_feedback_publish_failed", extra={"error": str(exc)})
+
+
+def _publish_evaluation_feedback(approval: Approval) -> None:
+    """Fire-and-forget: never awaited, never allowed to affect the approval flow."""
+    body = {
+        "decision": approval.decision.value,
+        "approver": approval.approver,
+        "comment": approval.comment,
+    }
+    task = asyncio.create_task(_post_evaluation_feedback(str(approval.recommendation_id), body))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def _build_approval_event_payload(approval: Approval) -> dict[str, Any]:

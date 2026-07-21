@@ -6,7 +6,7 @@ from typing import Any
 
 from opentelemetry import trace
 
-from common.agentic import AgentContext, AgentState, BaseAgent
+from ai_workbench_common.agentic import AgentContext, AgentState, BaseAgent
 from common.logging import get_logger
 from common.telemetry import AGENT_EXECUTIONS, AGENT_STAGE_LATENCY
 

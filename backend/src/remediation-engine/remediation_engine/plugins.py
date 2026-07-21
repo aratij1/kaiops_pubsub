@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from common.agentic import AgentContext, BaseAgent
+from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.models import Approval, RemediationAction, RemediationStatus, utc_now
 from common.resilience import CircuitBreaker, circuit_breaker
 from common.tool_registry import ToolRegistry, ToolSpec

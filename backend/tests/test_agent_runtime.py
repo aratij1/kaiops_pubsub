@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from common.agent_runtime import AgentRuntime, RetryableError
-from common.agentic import AgentContext, AgentState, BaseAgent
+from ai_workbench_common.agent_runtime import AgentRuntime, RetryableError
+from ai_workbench_common.agentic import AgentContext, AgentState, BaseAgent
 from common.models import Alert, AlertSeverity
 
 

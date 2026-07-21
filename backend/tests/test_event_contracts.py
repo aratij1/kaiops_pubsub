@@ -18,13 +18,13 @@ from common.models import (
 from orchestrator.message_bus import publish_orchestration_event
 from context_agent import ContextIntelligenceAgent
 
-_CONTEXT_APP_PATH = Path(__file__).resolve().parents[1] / "src" / "context-agent" / "app.py"
+_CONTEXT_APP_PATH = Path(__file__).resolve().parents[2] / "ai-workbench" / "src" / "context-agent" / "app.py"
 _CONTEXT_SPEC = importlib.util.spec_from_file_location("context_agent_app", _CONTEXT_APP_PATH)
 assert _CONTEXT_SPEC is not None and _CONTEXT_SPEC.loader is not None
 context_agent_app = importlib.util.module_from_spec(_CONTEXT_SPEC)
 _CONTEXT_SPEC.loader.exec_module(context_agent_app)
 
-_RESOLUTION_APP_PATH = Path(__file__).resolve().parents[1] / "src" / "resolution-agent" / "app.py"
+_RESOLUTION_APP_PATH = Path(__file__).resolve().parents[2] / "ai-workbench" / "src" / "resolution-agent" / "app.py"
 _RESOLUTION_SPEC = importlib.util.spec_from_file_location("resolution_agent_app", _RESOLUTION_APP_PATH)
 assert _RESOLUTION_SPEC is not None and _RESOLUTION_SPEC.loader is not None
 resolution_agent_app = importlib.util.module_from_spec(_RESOLUTION_SPEC)

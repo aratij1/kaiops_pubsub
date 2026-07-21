@@ -276,7 +276,7 @@ docker compose down
 docker compose up --build
 ```
 
-If your editor reports `import common.embeddings cannot be resolved`, make sure it
+If your editor reports `import ai_workbench_common.embeddings cannot be resolved`, make sure it
 is using the `.venv` interpreter created above. The repository also includes
 `pyrightconfig.json` with monorepo `extraPaths` for Cursor/Pylance.
 

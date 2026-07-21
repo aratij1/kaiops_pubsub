@@ -1,6 +1,6 @@
 from api_gateway import SafetyAnalyzer
 from common.models import SafetyDecision
-from common.model_evaluation import build_quality_evaluation
+from ai_workbench_common.model_evaluation import build_quality_evaluation
 from api_gateway.auth_policy import route_auth_rule
 
 

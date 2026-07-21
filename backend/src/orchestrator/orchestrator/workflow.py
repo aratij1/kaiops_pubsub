@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from common.agent_runtime import AgentRuntime, ContextFailure, ValidationError
-from common.agentic import AgentContext, BaseAgent
+from ai_workbench_common.agent_runtime import AgentRuntime, ContextFailure, ValidationError
+from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.models import Alert, Incident
 from common.orchestration import AgentOrchestrator, PolicyEngine
 from common.orchestration.execution_plan import resolve_execution_plan

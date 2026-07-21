@@ -1,5 +1,5 @@
 import pytest
-from common.memory_store import InMemoryStore
+from ai_workbench_common.memory_store import InMemoryStore
 from common.models import Alert, AlertSeverity, Incident
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import VectorDBConnector

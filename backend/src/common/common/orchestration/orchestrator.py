@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from common.agentic import AgentContext, BaseAgent
+from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.models import Alert, Incident
 from common.orchestration.policy_engine import PolicyEngine
 from common.orchestration.state_machine import WorkflowState, WorkflowStateMachine

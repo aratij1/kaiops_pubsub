@@ -11,11 +11,12 @@ import httpx
 from langchain_core.embeddings import Embeddings
 from langgraph.graph import END, StateGraph
 
-from common.agent_runtime import AgentRuntime, ContextFailure
-from common.agentic import AgentContext, BaseAgent
+from ai_workbench_common.agent_runtime import AgentRuntime, ContextFailure
+from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.config import get_settings
-from common.embeddings import describe_embedding_model, get_embedding_model, cosine_similarity
-from common.models import Alert, Context, Incident
+from ai_workbench_common.embeddings import describe_embedding_model, get_embedding_model, cosine_similarity
+from ai_workbench_common.models import Context
+from common.models import Alert, Incident
 from common.resilience import retry_async
 from common.tool_registry import ToolRegistry, ToolSpec
 
@@ -845,7 +846,12 @@ class ContextIntelligenceAgent(BaseAgent):
             metadata={
                 "rag_documents": by_name["vector-db"]["document_count"],
                 "rag_matches": [
-                    {"kind": doc.get("kind"), "title": doc.get("title"), "path": doc.get("path")}
+                    {
+                        "kind": doc.get("kind"),
+                        "title": doc.get("title"),
+                        "path": doc.get("path"),
+                        "similarity": float(doc.get("_similarity", 0.0) or 0.0),
+                    }
                     for doc in vector_matches
                 ],
                 "rag_top_similarity": max((doc.get("_similarity", 0.0) for doc in vector_matches), default=0.0),

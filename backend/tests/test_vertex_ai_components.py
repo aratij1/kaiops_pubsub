@@ -1,12 +1,12 @@
 from common.config import Settings
-from common.embeddings import (
+from ai_workbench_common.embeddings import (
     AzureOpenAIEmbeddingModel,
     HashingEmbeddingModel,
     VertexAIEmbeddingModel,
     describe_embedding_model,
     get_embedding_model,
 )
-from common.model_evaluation import VertexEvaluationClient
+from ai_workbench_common.model_evaluation import VertexEvaluationClient
 
 
 def _settings(**overrides) -> Settings:
@@ -88,7 +88,7 @@ def test_azure_embedding_model_parses_response(monkeypatch) -> None:
             assert json == {"input": ["hello"]}
             return _FakeResponse()
 
-    import common.embeddings as embeddings_module
+    import ai_workbench_common.embeddings as embeddings_module
 
     original_client = embeddings_module.httpx.Client
     embeddings_module.httpx.Client = _FakeClient
@@ -154,7 +154,7 @@ def test_azure_evaluation_client_parses_json_result(monkeypatch) -> None:
         def post(self, url, headers=None, json=None):
             return _FakeResponse()
 
-    import common.model_evaluation as evaluation_module
+    import ai_workbench_common.model_evaluation as evaluation_module
 
     original_client = evaluation_module.httpx.Client
     evaluation_module.httpx.Client = _FakeClient

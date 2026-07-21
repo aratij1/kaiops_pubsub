@@ -9,7 +9,8 @@ from typing import Any
 from common.config import get_settings
 from common.event_publishers import EventPublisher, RabbitMQPublisher, build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
-from common.models import Alert, Context, Incident
+from ai_workbench_common.models import Context
+from common.models import Alert, Incident
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app

@@ -5,9 +5,9 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
-from common.agentic import AgentContext, BaseAgent
+from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.config import get_settings
-from common.embeddings import HashingEmbeddingModel, cosine_similarity
+from ai_workbench_common.embeddings import HashingEmbeddingModel, cosine_similarity
 from common.models import Alert, AlertSeverity, Incident, IncidentStatus, utc_now
 from common.repository_interfaces import AlertHistoryRepository, InMemoryAlertHistoryRepository
 

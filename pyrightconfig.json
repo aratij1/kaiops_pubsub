@@ -1,12 +1,14 @@
 {
-  "include": ["backend"],
+  "include": ["backend", "ai-workbench"],
   "extraPaths": [
     "backend/src/common",
+    "ai-workbench/src",
     "backend/src/api-gateway",
     "backend/src/alert-intelligence",
-    "backend/src/context-agent",
-    "backend/src/model-router",
-    "backend/src/resolution-agent",
+    "ai-workbench/src/context-agent",
+    "ai-workbench/src/model-router",
+    "ai-workbench/src/resolution-agent",
+    "ai-workbench/src/evaluation-service",
     "backend/src/orchestrator",
     "backend/src/approval-service",
     "backend/src/remediation-engine",

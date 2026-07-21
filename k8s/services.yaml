@@ -197,7 +197,7 @@ spec:
       containers:
         - name: context-agent
           image: ghcr.io/example/kaiops/context-agent:latest
-          workingDir: /app/backend/src/context-agent
+          workingDir: /app/ai-workbench/src/context-agent
           command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
           envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
           env: [{ name: SERVICE_NAME, value: context-agent }]
@@ -241,7 +241,7 @@ spec:
       containers:
         - name: model-router
           image: ghcr.io/example/kaiops/model-router:latest
-          workingDir: /app/backend/src/model-router
+          workingDir: /app/ai-workbench/src/model-router
           command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
           envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
           env: [{ name: SERVICE_NAME, value: model-router }]
@@ -285,7 +285,7 @@ spec:
       containers:
         - name: resolution-agent
           image: ghcr.io/example/kaiops/resolution-agent:latest
-          workingDir: /app/backend/src/resolution-agent
+          workingDir: /app/ai-workbench/src/resolution-agent
           command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
           envFrom: [{ configMapRef: { name: kaiops-config } }, { secretRef: { name: kaiops-secrets } }]
           env: [{ name: SERVICE_NAME, value: resolution-agent }]
