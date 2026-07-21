@@ -113,6 +113,42 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Deployment:** ETL workflow / DAG changes for sales_etl
 - **Execution Plan:** airflow dags trigger sales_etl; validate DAG logs; re-run workflow if safe
 
+## etl-orders-dq-20260721130504 Monitoring Rule Onboarding
+- **Service:** etl-orders-dq-20260721130504
+- **Severity:** HIGH
+- **Alert Type:** monitoring-rule-onboarding
+- **Alert ID:** etl-orders-dq-20260721130504-rule-onboarding
+- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
+- **Recommended Action:** Review generated rules and approve production deployment.
+- **Deployment:** prod
+
+## etl-orders-dq-20260721131241 Monitoring Rule Onboarding
+- **Service:** etl-orders-dq-20260721131241
+- **Severity:** HIGH
+- **Alert Type:** monitoring-rule-onboarding
+- **Alert ID:** etl-orders-dq-20260721131241-rule-onboarding
+- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
+- **Recommended Action:** Review generated rules and approve production deployment.
+- **Deployment:** prod
+
+## etl-orders-dq-20260721131727 Monitoring Rule Onboarding
+- **Service:** etl-orders-dq-20260721131727
+- **Severity:** HIGH
+- **Alert Type:** monitoring-rule-onboarding
+- **Alert ID:** etl-orders-dq-20260721131727-rule-onboarding
+- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
+- **Recommended Action:** Review generated rules and approve production deployment.
+- **Deployment:** prod
+
+## etl-orders-dq-20260721131834 Monitoring Rule Onboarding
+- **Service:** etl-orders-dq-20260721131834
+- **Severity:** HIGH
+- **Alert Type:** monitoring-rule-onboarding
+- **Alert ID:** etl-orders-dq-20260721131834-rule-onboarding
+- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
+- **Recommended Action:** Review generated rules and approve production deployment.
+- **Deployment:** prod
+
 ## Fact Table Record Count Mismatch
 - **Service:** sales-fact
 - **Severity:** CRITICAL
@@ -361,6 +397,16 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
 - **Recommended Action:** Review generated rules and approve production deployment.
 - **Deployment:** prod
+
+## trace-id-fallback-verify Incident Summary
+- **Service:** payments
+- **Severity:** CRITICAL
+- **Alert Type:** trace-id-fallback-verify
+- **Alert ID:** 8f2e775f-839d-4fa0-b182-9568c249a55f
+- **Summary:** trace-id-fallback-verify detected for payments. Impact: Payments service impact requires immediate triage.
+- **Recommended Action:** Rollback deployment
+- **Root Cause:** Deployment 2.5
+- **Impact:** Payments service impact requires immediate triage
 
 ## Unauthorized Data Access Attempt
 - **Service:** data-warehouse

@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from common.config import Settings
+from common.connection_config import connector_catalog_from_connection_config, load_connection_config
 from common.models import Alert
 
 
@@ -23,13 +25,41 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
-def _execution_catalogs() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+def _merge_connector_catalogs(legacy: dict[str, Any], central: dict[str, Any]) -> dict[str, Any]:
+    legacy_connectors = legacy.get("connectors", {}) if isinstance(legacy.get("connectors"), dict) else {}
+    central_connectors = central.get("connectors", {}) if isinstance(central.get("connectors"), dict) else {}
+    connectors = {
+        **{
+            str(key).strip().lower(): value
+            for key, value in legacy_connectors.items()
+            if str(key).strip() and isinstance(value, dict)
+        },
+        **{
+            str(key).strip().lower(): value
+            for key, value in central_connectors.items()
+            if str(key).strip() and isinstance(value, dict)
+        },
+    }
+    default_connector = str(
+        central.get("default_connector") or legacy.get("default_connector") or "generic-api"
+    ).strip()
+    return {
+        "version": str(central.get("version") or legacy.get("version") or "connectors-v1"),
+        "default_connector": default_connector,
+        "connectors": connectors,
+    }
+
+
+def _execution_catalogs() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     root = _repo_root() / "backend" / "rag"
-    connectors = _read_json(root / "execution" / "connectors.json")
+    legacy_connectors = _read_json(root / "execution" / "connectors.json")
+    connection_config = load_connection_config(Settings())
+    central_connectors = connector_catalog_from_connection_config(connection_config)
+    connectors = _merge_connector_catalogs(legacy_connectors, central_connectors)
     actions = _read_json(root / "execution" / "action_catalog.json")
     playbooks = _read_json(root / "execution" / "playbooks.json")
     connectivity = _read_json(root / "onboarding" / "connectivity.json")
-    return connectors, actions, playbooks, connectivity
+    return connectors, actions, playbooks, connectivity, connection_config
 
 
 def _match_playbook(*, alert: Alert, playbooks: dict[str, Any]) -> dict[str, Any]:
@@ -109,7 +139,7 @@ def resolve_execution_plan(
     risk_tier: str,
     execution_mode: str,
 ) -> dict[str, Any]:
-    connectors, actions, playbooks, connectivity = _execution_catalogs()
+    connectors, actions, playbooks, connectivity, connection_config = _execution_catalogs()
     playbook = _match_playbook(alert=alert, playbooks=playbooks)
     connector = _connector_for_service(service=str(alert.service or ""), connectors=connectors)
 
@@ -163,6 +193,10 @@ def resolve_execution_plan(
         "execution_mode": str(execution_mode or "unknown").lower(),
         "approval_required": bool(requires_approval),
         "connection": {
+            "architecture": connection_config.get("connection_architecture", {})
+            if isinstance(connection_config.get("connection_architecture"), dict)
+            else {},
+            "platform": connection_config.get("platform", {}) if isinstance(connection_config.get("platform"), dict) else {},
             "project": {
                 "name": str(project.get("name") or "unknown"),
                 "environment": str(project.get("environment") or "unknown"),

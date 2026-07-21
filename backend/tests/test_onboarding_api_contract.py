@@ -243,6 +243,17 @@ def test_generated_onboarding_documents_use_rag_metadata_contract() -> None:
         assert all(isinstance(value, str) for value in document.get("metadata", {}).values())
 
 
+def test_simplified_admin_setup_uses_owner_team_as_required_rule_owners() -> None:
+    module = load_monitoring_app_module()
+    connectivity = module.OnboardingConnectivityPayload.model_validate(valid_payload())
+
+    seed = module._build_onboarding_rule_seed(connectivity, "prometheus")
+
+    assert seed["support_team"] == "platform-ops"
+    assert seed["business_owner"] == "platform-ops"
+    assert seed["technical_owner"] == "platform-ops"
+
+
 @pytest.mark.asyncio
 async def test_existing_monitoring_onboarding_generates_documents_from_service_knowledge(monkeypatch: pytest.MonkeyPatch) -> None:
     module = load_monitoring_app_module()

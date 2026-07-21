@@ -144,3 +144,38 @@ def test_new_rule_pipeline_includes_adapter_contract_on_generated_rules() -> Non
 
     assert rows["prometheus"]["contract_mode"] == "real"
     assert rows["datadog"]["contract_mode"] == "simulated"
+
+
+def test_new_rule_pipeline_maps_etl_data_quality_requirements_to_etl_metrics() -> None:
+    payload = NewRuleOnboardingRequest.model_validate(
+        {
+            "project": {
+                "project_name": "etl-orders-dq",
+                "environment": "prod",
+                "criticality": "high",
+                "support_team": "data-platform",
+                "business_owner": "data-platform",
+                "technical_owner": "data-platform",
+                "region": "us-east-1",
+                "monitoring_platforms": ["prometheus"],
+                "notification_platforms": ["slack"],
+            },
+            "target_platforms": ["prometheus"],
+            "monitoring_requirements": [
+                "Create a critical Prometheus alert when null customer ID ratio is above 20 percent for 5 minutes.",
+                "Create a high Prometheus alert when rejected ETL rows are greater than zero.",
+                "Create a warning Prometheus alert when ETL load latency is above 120 seconds.",
+            ],
+        }
+    )
+
+    result = run_new_rule_pipeline(payload)
+    rules = {row["metric"]: row for row in result["generated_rules"]}
+
+    assert result["status"] == "ready-for-approval"
+    assert {
+        "etl_null_customer_ratio",
+        "etl_rejected_rows",
+        "etl_load_latency_seconds",
+    }.issubset(rules)
+    assert rules["etl_rejected_rows"]["threshold"] == 0.0

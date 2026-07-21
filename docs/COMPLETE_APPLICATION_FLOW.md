@@ -72,20 +72,25 @@ Connection resolution is explicit and catalog-driven.
 
 Primary sources:
 
+- [backend/config/kaiops-connections.json](backend/config/kaiops-connections.json)
 - [backend/rag/execution/connectors.json](backend/rag/execution/connectors.json)
 - [backend/rag/onboarding/connectivity.json](backend/rag/onboarding/connectivity.json)
 
 Resolution behavior:
 
 1. Use alert service (for example `orders-db`, `payments`) as connector key.
-2. Load connector profile:
+2. Load the central connection catalog from `CONNECTION_CONFIG_PATH`.
+3. Resolve connector profile:
    - connector_id
    - type (`api`, `kubernetes`, etc.)
    - endpoint or cluster/namespace
    - auth_method
    - secret_ref
+   - timeout_seconds
+   - retry
+   - health_check
    - allowed_operations
-3. If no exact connector exists, fall back to `default_connector` (`generic-api`).
+4. If no exact connector exists, fall back to `default_connector` (`generic-api`).
 
 This logic is implemented in:
 
@@ -180,7 +185,7 @@ Primary UI file:
 
 To avoid missing pieces, each critical service should have:
 
-1. Connector profile in [backend/rag/execution/connectors.json](backend/rag/execution/connectors.json)
+1. Connector profile in [backend/config/kaiops-connections.json](backend/config/kaiops-connections.json)
 2. Allowed operations mapped for that connector
 3. Command entries in [backend/rag/execution/action_catalog.json](backend/rag/execution/action_catalog.json)
 4. Playbook entries in [backend/rag/execution/playbooks.json](backend/rag/execution/playbooks.json)

@@ -28,8 +28,11 @@ async def test_remediation_engine_executes_via_tool_registry() -> None:
 
     result = await engine.execute(action)
 
-    assert result.status == RemediationStatus.SUCCEEDED
-    assert "executed" in result.output
+    assert result.status == RemediationStatus.SKIPPED
+    assert result.parameters["execution_result"]["executed"] is False
+    assert result.parameters["execution_result"]["executor"] == "kubernetes"
+    assert "No real kubernetes executor is configured" in str(result.error)
+    assert "simulat" not in result.output.lower()
 
 
 @pytest.mark.asyncio

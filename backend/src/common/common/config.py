@@ -22,6 +22,7 @@ class Settings(BaseSettings):
 
     service_name: str = Field(default="kaiops-service", alias="SERVICE_NAME")
     environment: str = Field(default="local", alias="ENVIRONMENT")
+    cloud_provider: str = Field(default="local", alias="CLOUD_PROVIDER")
     deployment_profile: str = Field(default="onprem", alias="DEPLOYMENT_PROFILE")
     kafka_bootstrap_servers: str = Field(default="localhost:9092", alias="KAFKA_BOOTSTRAP_SERVERS")
     kafka_group_id: str = Field(default="kaiops", alias="KAFKA_GROUP_ID")
@@ -48,12 +49,16 @@ class Settings(BaseSettings):
     otlp_endpoint: str | None = Field(default=None, alias="OTEL_EXPORTER_OTLP_ENDPOINT")
     model_router_url: str = Field(default="http://model-router:8000", alias="MODEL_ROUTER_URL")
     context_agent_url: str = Field(default="http://context-agent:8000", alias="CONTEXT_AGENT_URL")
+    resolution_agent_url: str = Field(default="http://resolution-agent:8000", alias="RESOLUTION_AGENT_URL")
     approval_service_url: str = Field(default="http://approval-service:8000", alias="APPROVAL_SERVICE_URL")
     remediation_engine_url: str = Field(default="http://remediation-engine:8000", alias="REMEDIATION_ENGINE_URL")
     monitoring_adapter_url: str = Field(default="http://monitoring-adapter:8000", alias="MONITORING_ADAPTER_URL")
     evaluation_service_url: str = Field(default="http://evaluation-service:8000", alias="EVALUATION_SERVICE_URL")
     api_gateway_url: str = Field(default="http://api-gateway:8000", alias="API_GATEWAY_URL")
     application_onboarding_url: str = Field(default="http://application-onboarding:8000", alias="APPLICATION_ONBOARDING_URL")
+    ai_layer_mode: str = Field(default="endpoint", alias="AI_LAYER_MODE")
+    ai_layer_request_timeout_seconds: float = Field(default=120.0, alias="AI_LAYER_REQUEST_TIMEOUT_SECONDS")
+    ai_layer_auth_token: str = Field(default="", alias="AI_LAYER_AUTH_TOKEN")
     prometheus_url: str = Field(default="http://prometheus:9090", alias="PROMETHEUS_URL")
     grafana_url: str = Field(default="http://grafana:3000", alias="GRAFANA_URL")
     kafka_enabled: bool = Field(default=True, alias="KAFKA_ENABLED")
@@ -80,6 +85,9 @@ class Settings(BaseSettings):
     azure_openai_embeddings_deployment: str = Field(default="", alias="AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT")
     azure_openai_api_version: str = Field(default="2024-06-01", alias="AZURE_OPENAI_API_VERSION")
     azure_openai_embeddings_timeout_seconds: float = Field(default=8.0, alias="AZURE_OPENAI_EMBEDDINGS_TIMEOUT_SECONDS")
+    rag_embedding_provider: str = Field(default="auto", alias="RAG_EMBEDDING_PROVIDER")
+    openai_embedding_model: str = Field(default="text-embedding-3-large", alias="OPENAI_EMBEDDING_MODEL")
+    openai_embeddings_timeout_seconds: float = Field(default=15.0, alias="OPENAI_EMBEDDINGS_TIMEOUT_SECONDS")
     azure_ai_search_enabled: bool = Field(default=False, alias="AZURE_AI_SEARCH_ENABLED")
     azure_ai_search_endpoint: str = Field(default="", alias="AZURE_AI_SEARCH_ENDPOINT")
     azure_ai_search_api_key: str | None = Field(default=None, alias="AZURE_AI_SEARCH_API_KEY")
@@ -96,6 +104,7 @@ class Settings(BaseSettings):
     observability_azure_monitor_enabled: bool = Field(default=False, alias="OBSERVABILITY_AZURE_MONITOR_ENABLED")
     azure_monitor_connection_string: str = Field(default="", alias="AZURE_MONITOR_CONNECTION_STRING")
     orchestration_config_path: str = Field(default="", alias="ORCHESTRATION_CONFIG_PATH")
+    connection_config_path: str = Field(default="backend/config/kaiops-connections.json", alias="CONNECTION_CONFIG_PATH")
     message_bus_worker_count: int = Field(default=1, alias="MESSAGE_BUS_WORKER_COUNT")
     orchestration_llm_planner_enabled: bool = Field(default=False, alias="ORCHESTRATION_LLM_PLANNER_ENABLED")
     kafka_startup_attempts: int = Field(default=30, alias="KAFKA_STARTUP_ATTEMPTS")
@@ -130,6 +139,9 @@ class Settings(BaseSettings):
     model_router_prompt_cache_enabled: bool = Field(default=True, alias="MODEL_ROUTER_PROMPT_CACHE_ENABLED")
     model_router_prompt_cache_ttl_seconds: float = Field(default=300.0, alias="MODEL_ROUTER_PROMPT_CACHE_TTL_SECONDS")
     model_router_prompt_cache_max_entries: int = Field(default=512, alias="MODEL_ROUTER_PROMPT_CACHE_MAX_ENTRIES")
+    model_router_critical_provider: str = Field(default="gpt-5", alias="MODEL_ROUTER_CRITICAL_PROVIDER")
+    model_router_rca_provider: str = Field(default="gpt-4o", alias="MODEL_ROUTER_RCA_PROVIDER")
+    model_router_default_provider: str = Field(default="gpt-4o", alias="MODEL_ROUTER_DEFAULT_PROVIDER")
     gateway_request_timeout_seconds: float = Field(default=180.0, alias="GATEWAY_REQUEST_TIMEOUT_SECONDS")
     openai_gpt5_input_cost_per_million: float = Field(default=1.25, alias="OPENAI_GPT5_INPUT_COST_PER_MILLION")
     openai_gpt5_output_cost_per_million: float = Field(default=10.0, alias="OPENAI_GPT5_OUTPUT_COST_PER_MILLION")
@@ -171,10 +183,29 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def configure_database_url(self) -> "Settings":
         profile = str(self.deployment_profile or "onprem").strip().lower()
-        if profile not in {"onprem", "azure-cloud"}:
+        profile_aliases = {
+            "azure": "azure-cloud",
+            "aws-cloud": "aws",
+            "gcp-cloud": "gcp",
+            "multi-cloud": "cloud-neutral",
+            "cloud": "cloud-neutral",
+        }
+        profile = profile_aliases.get(profile, profile)
+        if profile not in {"onprem", "local", "azure-cloud", "aws", "gcp", "cloud-neutral"}:
             self.deployment_profile = "onprem"
         else:
             self.deployment_profile = profile
+        provider = str(self.cloud_provider or "").strip().lower() or "local"
+        provider_aliases = {
+            "azure-cloud": "azure",
+            "aws-cloud": "aws",
+            "gcp-cloud": "gcp",
+            "onprem": "onprem",
+            "on-prem": "onprem",
+            "multi-cloud": "cloud-neutral",
+            "cloud": "cloud-neutral",
+        }
+        self.cloud_provider = provider_aliases.get(provider, provider)
 
         if self.database_url and self.database_url != _LOCAL_MYSQL_DEFAULT_URL:
             self._validate_auth_secrets()

@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from common.ai_layer_client import AiLayerClient
 from common.config import Settings, get_settings
 from common.models import AlertSeverity
 from common.orchestration.config_loader import load_orchestration_config
@@ -140,11 +141,6 @@ class WorkflowEngine:
         stream_count: int,
         stream_threshold: int,
     ) -> tuple[str | None, str | None, str]:
-        try:
-            from model_router import ModelRouter, ModelTask
-        except Exception:
-            return None, None, "planner unavailable: model_router import failed"
-
         prompt = (
             "Select exactly one workflow for incident orchestration. "
             "Allowed workflows: critical-auto-remediation, guided-remediation, triage-only. "
@@ -159,10 +155,9 @@ class WorkflowEngine:
         }
 
         try:
-            router = ModelRouter()
-            response = await router.route(
+            response = await AiLayerClient(self.settings).route_model(
                 severity=severity,
-                task=ModelTask.GENERAL,
+                task="general",
                 prompt=prompt,
                 payload=payload,
             )
