@@ -119,3 +119,32 @@ async def route(request: RouteRequest) -> dict[str, Any]:
                 "fallback": True,
             },
         }
+
+
+@app.post("/route/provider/{provider_name}")
+async def route_provider(provider_name: str, request: RouteRequest) -> dict[str, Any]:
+    try:
+        return await router.route_provider(
+            provider_name=provider_name,
+            task=request.task,
+            prompt=request.prompt,
+            payload=request.payload,
+        )
+    except Exception as exc:
+        return {
+            "model": "provider-error",
+            "content": "",
+            "error": str(exc),
+            "usage": {
+                "provider": provider_name,
+                "model": "provider-error",
+                "task": request.task.value,
+                "estimated": True,
+                "fallback": False,
+            },
+        }
+
+
+@app.get("/providers/status")
+async def providers_status() -> dict[str, Any]:
+    return router.provider_status()

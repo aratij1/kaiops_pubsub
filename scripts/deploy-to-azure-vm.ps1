@@ -3,7 +3,7 @@ param(
     [string]$SshUser = "azureuser",
     [string]$SshPrivateKey,
     [string]$RemoteDir = "~/kaiops_pubsub",
-    [string]$EnvFile = ".env.azure.foundry.generated",
+    [string]$EnvFile = "config/env/.env.azure.foundry.generated",
     [bool]$ForceAzureFlags = $true,
     [switch]$SkipBuild,
     [switch]$SkipHealthCheck,

@@ -1,5 +1,5 @@
 param(
-    [string]$OutputFile = ".env.azure.foundry.generated",
+    [string]$OutputFile = "config/env/.env.azure.foundry.generated",
     [bool]$AllowEmpty = $false
 )
 

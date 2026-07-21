@@ -28,7 +28,7 @@ param(
     [bool]$CreateAppInsights = $true,
 
     [bool]$GetAksCredentials = $true,
-    [string]$OutputEnvFile = ".env.azure.foundry.generated",
+    [string]$OutputEnvFile = "config/env/.env.azure.foundry.generated",
     [switch]$DryRun
 )
 

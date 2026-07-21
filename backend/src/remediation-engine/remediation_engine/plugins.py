@@ -22,49 +22,34 @@ class BasePlugin:
     action_type: str
     breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
 
-    async def _simulate(self, action: RemediationAction, command: str) -> RemediationAction:
+    async def _not_configured(self, action: RemediationAction, executor_name: str) -> RemediationAction:
         await asyncio.sleep(0)
         target = str(action.target or "unknown-target").strip() or "unknown-target"
         service = str(action.parameters.get("service") or "").strip()
         environment = str(action.parameters.get("environment") or "").strip()
-        root_cause = str(action.parameters.get("root_cause") or "").strip()
-        recommended_action = str(action.parameters.get("recommended_action") or "").strip()
-        trace_id = str(action.trace_id or "").strip()
         execution_plan = action.parameters.get("execution_plan") if isinstance(action.parameters.get("execution_plan"), dict) else {}
         commands = execution_plan.get("commands") if isinstance(execution_plan.get("commands"), list) else []
         scripts = execution_plan.get("scripts") if isinstance(execution_plan.get("scripts"), list) else []
         queries = execution_plan.get("queries") if isinstance(execution_plan.get("queries"), list) else []
-        first_step = next(
-            (
-                str(item).strip()
-                for item in [*commands, *scripts, *queries]
-                if str(item).strip()
-            ),
-            "",
+
+        action.status = RemediationStatus.SKIPPED
+        action.error = f"No real {executor_name} executor is configured for action_type={action.action_type}"
+        action.output = (
+            f"Execution not performed; target={target}; service={service or '-'}; environment={environment or '-'}; "
+            f"commands={len(commands)}; scripts={len(scripts)}; queries={len(queries)}. "
+            "Configure a connector executor and secret_ref before enabling live remediation."
         )
-
-        segments = [f"executed {command}", f"target={target}"]
-        if first_step:
-            segments.append(f"step={first_step}")
-        if commands:
-            segments.append(f"commands={len(commands)}")
-        if scripts:
-            segments.append(f"scripts={len(scripts)}")
-        if queries:
-            segments.append(f"queries={len(queries)}")
-        if service:
-            segments.append(f"service={service}")
-        if environment:
-            segments.append(f"environment={environment}")
-        if recommended_action:
-            segments.append(f"recommended_action={recommended_action}")
-        if root_cause:
-            segments.append(f"root_cause={root_cause}")
-        if trace_id:
-            segments.append(f"trace_id={trace_id}")
-
-        action.output = "; ".join(segments)
-        action.status = RemediationStatus.SUCCEEDED
+        action.parameters["execution_result"] = {
+            "executed": False,
+            "executor": executor_name,
+            "reason": action.error,
+            "target": target,
+            "service": service,
+            "environment": environment,
+            "commands": commands,
+            "scripts": scripts,
+            "queries": queries,
+        }
         return action
 
 
@@ -74,7 +59,7 @@ class JenkinsRollbackPlugin(BasePlugin):
 
     @circuit_breaker(CircuitBreaker())
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        return await self._simulate(action, "rollback_deployment")
+        return await self._not_configured(action, "jenkins")
 
 
 class KubernetesRestartPlugin(BasePlugin):
@@ -83,7 +68,7 @@ class KubernetesRestartPlugin(BasePlugin):
 
     @circuit_breaker(CircuitBreaker())
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        return await self._simulate(action, action.action_type)
+        return await self._not_configured(action, "kubernetes")
 
 
 class AnsibleRemediationPlugin(BasePlugin):
@@ -91,7 +76,7 @@ class AnsibleRemediationPlugin(BasePlugin):
         super().__init__("restart_service")
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        return await self._simulate(action, action.action_type)
+        return await self._not_configured(action, "ansible")
 
 
 class TerraformRollbackPlugin(BasePlugin):
@@ -99,7 +84,7 @@ class TerraformRollbackPlugin(BasePlugin):
         super().__init__("terraform_rollback")
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        return await self._simulate(action, action.action_type)
+        return await self._not_configured(action, "terraform")
 
 
 class ApiExecutionPlugin(BasePlugin):
@@ -107,7 +92,7 @@ class ApiExecutionPlugin(BasePlugin):
         super().__init__("api_execution")
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        return await self._simulate(action, action.action_type)
+        return await self._not_configured(action, "api")
 
 
 @dataclass

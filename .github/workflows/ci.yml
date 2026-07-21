@@ -50,10 +50,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build ${{ matrix.service }} (backend)
         if: matrix.service != 'ui'
-        run: docker build -f Dockerfile.service -t kaiops/${{ matrix.service }}:${{ github.sha }} .
+        run: docker build -f deploy/docker/Dockerfile.service -t kaiops/${{ matrix.service }}:${{ github.sha }} .
       - name: Build ui (frontend)
         if: matrix.service == 'ui'
-        run: docker build -f frontend/react/Dockerfile -t kaiops/ui:${{ github.sha }} frontend/react
+        run: docker build -f deploy/docker/Dockerfile.ui -t kaiops/ui:${{ github.sha }} .
 
   kube-validate:
     runs-on: ubuntu-latest

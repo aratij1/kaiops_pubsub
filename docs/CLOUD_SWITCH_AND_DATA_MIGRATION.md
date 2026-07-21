@@ -12,7 +12,7 @@ python scripts/switch_service_profile.py --profile azure
 
 Supported profiles are in [scripts/profiles/service-profiles.json](../scripts/profiles/service-profiles.json).
 
-The generated file `.env.profile.generated` contains service toggles such as message bus, safety provider, embeddings, evaluation, and observability sink.
+The generated file `config/env/.env.profile.generated` contains service toggles such as message bus, safety provider, embeddings, evaluation, and observability sink.
 
 ## 2. E2E validation after profile switch
 

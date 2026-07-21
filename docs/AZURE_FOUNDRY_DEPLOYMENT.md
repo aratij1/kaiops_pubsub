@@ -52,7 +52,7 @@ This script can create:
 - Azure AI Content Safety account
 - Application Insights
 
-It also writes `.env.azure.foundry.generated` containing:
+It also writes `config/env/.env.azure.foundry.generated` containing:
 
 - `AZURE_SERVICE_BUS_CONNECTION_STRING`
 - `AZURE_OPENAI_ENDPOINT`
@@ -80,7 +80,7 @@ Use this when you want to deploy on Ubuntu VMs instead of AKS.
 	-Targets "20.193.131.47","20.69.233.125" `
 	-SshUser azureuser `
 	-SshPrivateKey "C:/path/to/private_key.pem" `
-	-EnvFile .env.azure.foundry.generated `
+	-EnvFile config/env/.env.azure.foundry.generated `
 	-StopExisting
 ```
 

@@ -71,6 +71,11 @@ def _configured_evaluation_metrics(settings: Settings) -> list[str]:
     return metrics or [str(getattr(settings, "azure_ai_evaluation_metric", "coherence") or "coherence").strip().lower()]
 
 
+def _configured_provider_name(value: str, fallback: str) -> str:
+    normalized = str(value or "").strip()
+    return normalized or fallback
+
+
 def _mark_usage_as_cached(result: dict[str, Any]) -> dict[str, Any]:
     usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
     cached_usage = dict(usage)
@@ -438,7 +443,7 @@ class ModelRouter:
         default_factory=lambda: {
             "gpt-5": ["gpt-4o", "gemini", "groq", "local-llama"],
             "gpt-4o": ["gpt-5", "gemini", "groq", "local-llama"],
-            "gemini": ["gpt-4o", "groq", "local-llama"],
+            "gemini": ["gpt-4o", "gpt-5", "groq", "local-llama"],
             "groq": ["gpt-4o", "gemini", "local-llama"],
             "local-llama": ["gpt-4o", "gemini", "groq"],
         }
@@ -446,6 +451,38 @@ class ModelRouter:
     prompt_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = field(default_factory=OrderedDict)
     evaluation_client: VertexEvaluationClient = field(default_factory=lambda: VertexEvaluationClient(get_settings()))
     _background_tasks: set[asyncio.Task[None]] = field(default_factory=set, repr=False, compare=False)
+
+    def provider_status(self) -> dict[str, Any]:
+        providers: dict[str, dict[str, Any]] = {}
+        for name, provider in self.providers.items():
+            breaker = provider.breaker
+            configured = not isinstance(provider, UnconfiguredModelProvider)
+            if hasattr(provider, "api_key"):
+                configured = configured and bool(str(getattr(provider, "api_key") or "").strip())
+            if hasattr(provider, "endpoint"):
+                configured = configured and bool(str(getattr(provider, "endpoint") or "").strip())
+            providers[name] = {
+                "configured": configured,
+                "healthy": bool(provider.healthy),
+                "model": str(getattr(provider, "model", name) or name),
+                "base_url": str(getattr(provider, "base_url", getattr(provider, "endpoint", "")) or ""),
+                "circuit_open": not breaker.allow(),
+                "failure_count": int(getattr(breaker, "_failures", 0) or 0),
+                "reason": str(getattr(provider, "reason", "") or "") or None,
+            }
+        return {
+            "providers": providers,
+            "selected": {
+                "critical": self.select_model(severity=AlertSeverity.CRITICAL, task=ModelTask.RCA),
+                "rca": self.select_model(severity=AlertSeverity.WARNING, task=ModelTask.RCA),
+                "default": self.select_model(severity=AlertSeverity.WARNING, task=ModelTask.GENERAL),
+            },
+            "prompt_cache": {
+                "enabled": bool(self.settings.model_router_prompt_cache_enabled),
+                "entries": len(self.prompt_cache),
+                "ttl_seconds": self.settings.model_router_prompt_cache_ttl_seconds,
+            },
+        }
 
     async def _attach_evaluation(self, result: dict[str, Any], *, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Best-effort: scores the response via Azure AI evaluation path.
@@ -507,10 +544,10 @@ class ModelRouter:
 
     def select_model(self, *, severity: AlertSeverity, task: ModelTask) -> str:
         if severity == AlertSeverity.CRITICAL:
-            return "gpt-5"
+            return _configured_provider_name(self.settings.model_router_critical_provider, "gpt-5")
         if task == ModelTask.RCA:
-            return "gpt-4o"
-        return "gpt-4o"
+            return _configured_provider_name(self.settings.model_router_rca_provider, "gpt-4o")
+        return _configured_provider_name(self.settings.model_router_default_provider, "gpt-4o")
 
     async def route(
         self,
