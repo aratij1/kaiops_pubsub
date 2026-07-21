@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from common.agentic import AgentContext, BaseAgent
+from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.models import RemediationAction, RemediationStatus, ResolutionReport
 
 

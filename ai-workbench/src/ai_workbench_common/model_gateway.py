@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
+
 from common.models import AlertSeverity
 
 
@@ -61,6 +63,30 @@ class RouterModelGateway(ModelGateway):
                 payload=request.payload,
             )
         raise RuntimeError("Configured model gateway router does not implement route()")
+
+
+class HttpModelGateway(ModelGateway):
+    """Calls the model-router service's POST /route API instead of importing it in-process."""
+
+    def __init__(self, base_url: str, *, timeout_seconds: float = 30.0) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._timeout_seconds = timeout_seconds
+
+    async def generate(self, request: GenerationRequest) -> dict[str, Any]:
+        severity_value = getattr(request.severity, "value", request.severity)
+        task_value = getattr(request.task, "value", request.task)
+        async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
+            response = await client.post(
+                f"{self._base_url}/route",
+                json={
+                    "severity": severity_value,
+                    "task": task_value,
+                    "prompt": request.prompt,
+                    "payload": request.payload,
+                },
+            )
+            response.raise_for_status()
+            return response.json()
 
 
 class OpenAIProvider(MockProvider):

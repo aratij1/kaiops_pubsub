@@ -1,22 +1,39 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
+from enum import StrEnum
 from typing import Any, TypedDict
 
-from common.agent_runtime import AgentRuntime, ContextFailure, ValidationError
-from common.agentic import AgentContext, BaseAgent
-from common.memory_store import InMemoryStore, MemoryStore
-from common.model_evaluation import build_quality_evaluation
-from common.model_gateway import GenerationRequest, ModelGateway, RouterModelGateway
-from common.models import AlertSeverity, Context, Evidence, Recommendation
-from common.prompts import (
+import httpx
+
+from ai_workbench_common.agent_runtime import AgentRuntime, ContextFailure, ValidationError
+from ai_workbench_common.agentic import AgentContext, BaseAgent
+from ai_workbench_common.memory_store import InMemoryStore, MemoryStore
+from ai_workbench_common.model_evaluation import AzureAIEvaluationClient, EvaluationResult, build_quality_evaluation
+from ai_workbench_common.model_gateway import GenerationRequest, HttpModelGateway, ModelGateway, RouterModelGateway
+from ai_workbench_common.models import Context, Evidence
+from common.config import get_settings
+from common.models import AlertSeverity, Recommendation
+from ai_workbench_common.prompts import (
     PROMPT_ASSESS_IMPACT,
     PROMPT_IDENTIFY_ROOT_CAUSE,
     PROMPT_RECOMMEND_REMEDIATION,
 )
 from langgraph.graph import END, StateGraph
-from model_router import ModelRouter, ModelTask
+
+logger = logging.getLogger("kaiops.resolution_agent")
+
+
+class ModelTask(StrEnum):
+    """Mirrors model_router.ModelTask's wire values without importing that service's package."""
+
+    RCA = "rca"
+    IMPACT = "impact"
+    FIX = "fix"
+    SUMMARIZATION = "summarization"
+    GENERAL = "general"
 
 
 class ResolutionState(TypedDict, total=False):
@@ -37,17 +54,33 @@ class ResolutionIntelligenceAgent(BaseAgent):
 
     def __init__(
         self,
-        model_router: ModelRouter | None = None,
+        model_router: Any | None = None,
         model_gateway: ModelGateway | None = None,
         runtime: AgentRuntime | None = None,
         memory_store: MemoryStore | None = None,
+        evaluation_client: AzureAIEvaluationClient | None = None,
     ) -> None:
-        self.model_router = model_router or ModelRouter()
-        self.model_gateway = model_gateway or RouterModelGateway(self.model_router)
+        settings = get_settings()
+        self.model_router = model_router
+        if model_gateway is not None:
+            self.model_gateway = model_gateway
+        elif model_router is not None:
+            # Allows tests/tools to inject an in-process ModelRouter-like object directly.
+            self.model_gateway = RouterModelGateway(model_router)
+        else:
+            self.model_gateway = HttpModelGateway(
+                settings.model_router_url,
+                timeout_seconds=settings.llm_request_timeout_seconds,
+            )
         self.runtime = runtime or AgentRuntime(max_attempts=2)
         self.memory_store = memory_store or InMemoryStore()
+        self.evaluation_client = evaluation_client or AzureAIEvaluationClient(settings)
+        self.evaluation_service_url = settings.evaluation_service_url
         # Bound each model call so a single blocked provider cannot stall event consumption.
         self.model_step_timeout_seconds = 20.0
+        # Keeps strong references to fire-and-forget evaluation-publish tasks so they
+        # aren't garbage-collected mid-flight; discarded automatically once done.
+        self._background_tasks: set[asyncio.Task[None]] = set()
         self.graph = self._build_graph()
 
     @staticmethod
@@ -217,6 +250,47 @@ class ResolutionIntelligenceAgent(BaseAgent):
                     "error": str(exc),
                 },
             }
+
+    async def _judge_groundedness(self, *, prediction: str, context_text: str) -> EvaluationResult | None:
+        """Best-effort LLM-judge groundedness score. Never raises, never blocks resolve()."""
+        if not self.evaluation_client.enabled or not context_text.strip():
+            return None
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.evaluation_client.evaluate,
+                    prediction,
+                    metric="groundedness",
+                    context=context_text,
+                ),
+                timeout=self.model_step_timeout_seconds,
+            )
+        except Exception:
+            return None
+
+    async def _post_evaluation(self, payload: dict[str, Any]) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(f"{self.evaluation_service_url.rstrip('/')}/evaluations", json=payload)
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning("evaluation_service_publish_failed", extra={"error": str(exc)})
+
+    def _publish_evaluation(self, *, recommendation: Recommendation, report: dict[str, Any]) -> None:
+        """Fire-and-forget: never awaited, never allowed to affect resolve()'s result."""
+        model_calls = recommendation.metadata.get("model_calls")
+        last_call = model_calls[-1] if isinstance(model_calls, list) and model_calls else {}
+        payload = {
+            "report": report,
+            "agent": self.name,
+            "incident_id": str(recommendation.incident_id),
+            "recommendation_id": str(recommendation.id),
+            "model_provider": str(last_call.get("provider") or "") or None,
+            "model_name": str(last_call.get("model") or "") or None,
+        }
+        task = asyncio.create_task(self._post_evaluation(payload))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def can_execute(self, context: AgentContext) -> bool:
         return "context-agent" in context.previous_agent_results or "context" in context.previous_agent_results
@@ -446,6 +520,10 @@ class ResolutionIntelligenceAgent(BaseAgent):
             f"runbook://{context.alert.service}",
             f"incident://{context.incident_id}",
         ]
+        external_judge = await self._judge_groundedness(
+            prediction=f"{recommendation.root_cause} {recommendation.recommended_action} {recommendation.rationale}",
+            context_text=context.runbook or "",
+        )
         recommendation.metadata["evaluation"] = build_quality_evaluation(
             prediction={
                 "root_cause": recommendation.root_cause,
@@ -470,7 +548,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 or "error" in (usage or {})
                 for usage in state.get("model_usage", [])
             ),
+            external=external_judge,
         )
+        self._publish_evaluation(recommendation=recommendation, report=recommendation.metadata["evaluation"])
         return recommendation
 
     async def resolve_with_runtime(self, context: Context) -> Recommendation:

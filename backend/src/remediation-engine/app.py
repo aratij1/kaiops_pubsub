@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 from uuid import UUID
 
-from common.agent_runtime import PolicyViolation
+from ai_workbench_common.agent_runtime import PolicyViolation
 from common.config import get_settings
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever

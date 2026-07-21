@@ -1,7 +1,7 @@
-from common.agentic import AgentContext
+from ai_workbench_common.agentic import AgentContext
 from common.config import Settings
 from common.event_publishers import KafkaPublisher, NoOpPublisher, build_event_publisher
-from common.model_gateway import GenerationRequest, MockProvider
+from ai_workbench_common.model_gateway import GenerationRequest, MockProvider
 from common.models import Alert, AlertSeverity, Incident, IncidentStatus
 from common.orchestration import AgentOrchestrator, PolicyEngine, WorkflowEngine, WorkflowState, WorkflowStateMachine
 from alert_intelligence import AlertIntelligenceAgent

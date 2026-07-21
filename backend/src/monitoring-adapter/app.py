@@ -18,7 +18,7 @@ from common.config import get_settings
 from common.database import create_engine, create_schema, create_session_factory
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.logging import get_logger
-from common.model_evaluation import build_quality_evaluation
+from ai_workbench_common.model_evaluation import build_quality_evaluation
 from common.models import (
     Alert,
     AlertSeverity,
@@ -44,7 +44,7 @@ from common.topics import (
     RAW_ALERTS,
     RESOLUTION_GENERATED,
 )
-from common.prompts import PROMPT_SUMMARIZE_RCA
+from ai_workbench_common.prompts import PROMPT_SUMMARIZE_RCA
 import httpx
 from fastapi import Body, Header, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator

@@ -17,6 +17,7 @@ from common.database import (
     ApplicationRecord,
     ApprovalRecord,
     AuditLogRecord,
+    EvaluationRecord,
     GrafanaDashboardRecord,
     IncidentEventRecord,
     IncidentRecord,
@@ -2233,3 +2234,153 @@ class IncidentRepository:
                 }
             )
         return response_rows
+
+
+class EvaluationRepository:
+    """Persistence for AI Workbench evaluation reports.
+
+    Kept separate from IncidentRepository so this new, additive capability
+    can never change existing incident/alert/approval persistence behavior.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    @staticmethod
+    def _require(name: str, value: Any) -> Any:
+        if value is None:
+            raise ValueError(f"{name} is required")
+        if isinstance(value, str) and not value.strip():
+            raise ValueError(f"{name} is required")
+        return value
+
+    @staticmethod
+    def _to_uuid(value: UUID | str | None) -> UUID | None:
+        if value is None:
+            return None
+        return value if isinstance(value, UUID) else UUID(str(value))
+
+    @staticmethod
+    def _row_to_dict(row: EvaluationRecord) -> dict[str, Any]:
+        return {
+            "id": str(row.id),
+            "incident_id": str(row.incident_id) if row.incident_id else None,
+            "recommendation_id": str(row.recommendation_id) if row.recommendation_id else None,
+            "agent": row.agent,
+            "model_provider": row.model_provider,
+            "model_name": row.model_name,
+            "overall_score": row.overall_score,
+            "quality_label": row.quality_label,
+            "requires_review": row.requires_review,
+            "report": row.report_payload,
+            "feedback": row.feedback_payload,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
+
+    async def save_evaluation(
+        self,
+        *,
+        report: dict[str, Any],
+        agent: str,
+        incident_id: UUID | str | None = None,
+        recommendation_id: UUID | str | None = None,
+        model_provider: str | None = None,
+        model_name: str | None = None,
+        evaluation_id: UUID | str | None = None,
+    ) -> str:
+        record_id = self._to_uuid(evaluation_id) or uuid4()
+        await self.session.merge(
+            EvaluationRecord(
+                id=record_id,
+                incident_id=self._to_uuid(incident_id),
+                recommendation_id=self._to_uuid(recommendation_id),
+                agent=self._require("agent", agent),
+                model_provider=model_provider,
+                model_name=model_name,
+                overall_score=report.get("overall_score"),
+                quality_label=report.get("quality_label"),
+                requires_review=bool(report.get("requires_review", False)),
+                report_payload=report,
+            )
+        )
+        return str(record_id)
+
+    async def get_evaluation(self, evaluation_id: UUID | str) -> dict[str, Any] | None:
+        result = await self.session.execute(
+            select(EvaluationRecord).where(EvaluationRecord.id == self._to_uuid(evaluation_id))
+        )
+        row = result.scalar_one_or_none()
+        return self._row_to_dict(row) if row is not None else None
+
+    async def list_evaluations(
+        self,
+        *,
+        incident_id: UUID | str | None = None,
+        agent: str | None = None,
+        min_score: float | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 1000))
+        stmt = select(EvaluationRecord)
+        if incident_id:
+            stmt = stmt.where(EvaluationRecord.incident_id == self._to_uuid(incident_id))
+        if agent:
+            stmt = stmt.where(EvaluationRecord.agent == str(agent))
+        if min_score is not None:
+            stmt = stmt.where(EvaluationRecord.overall_score >= float(min_score))
+        stmt = stmt.order_by(EvaluationRecord.created_at.desc()).limit(safe_limit)
+        result = await self.session.execute(stmt)
+        return [self._row_to_dict(row) for row in result.scalars().all()]
+
+    async def summarize_evaluations(self, *, agent: str | None = None, limit: int = 1000) -> dict[str, Any]:
+        safe_limit = max(1, min(int(limit), 5000))
+        stmt = select(EvaluationRecord).order_by(EvaluationRecord.created_at.desc()).limit(safe_limit)
+        if agent:
+            stmt = stmt.where(EvaluationRecord.agent == str(agent))
+        result = await self.session.execute(stmt)
+        rows = result.scalars().all()
+
+        total = len(rows)
+        if total == 0:
+            return {
+                "total_evaluations": 0,
+                "average_overall_score": 0.0,
+                "requires_review_rate": 0.0,
+                "quality_label_counts": {},
+            }
+
+        scores = [row.overall_score for row in rows if row.overall_score is not None]
+        review_count = sum(1 for row in rows if row.requires_review)
+        label_counts: dict[str, int] = {}
+        for row in rows:
+            label = row.quality_label or "unknown"
+            label_counts[label] = label_counts.get(label, 0) + 1
+
+        return {
+            "total_evaluations": total,
+            "average_overall_score": round(sum(scores) / len(scores), 4) if scores else 0.0,
+            "requires_review_rate": round(review_count / total, 4),
+            "quality_label_counts": label_counts,
+        }
+
+    async def attach_feedback_by_recommendation(
+        self, recommendation_id: UUID | str, feedback: dict[str, Any]
+    ) -> bool:
+        """Attaches human feedback to the most recent evaluation for a recommendation.
+
+        Returns False (not an error) when no evaluation exists for that
+        recommendation yet -- e.g. evaluation-service was unreachable when
+        the recommendation was generated.
+        """
+        result = await self.session.execute(
+            select(EvaluationRecord)
+            .where(EvaluationRecord.recommendation_id == self._to_uuid(recommendation_id))
+            .order_by(EvaluationRecord.created_at.desc())
+            .limit(1)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return False
+        row.feedback_payload = feedback
+        return True

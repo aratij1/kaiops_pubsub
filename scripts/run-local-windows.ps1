@@ -86,11 +86,12 @@ if (-not (Test-Path $Python)) {
 
 $ServicePaths = @(
     "backend\src\common",
+    "ai-workbench\src",
     "backend\src\api-gateway",
     "backend\src\alert-intelligence",
-    "backend\src\context-agent",
-    "backend\src\model-router",
-    "backend\src\resolution-agent",
+    "ai-workbench\src\context-agent",
+    "ai-workbench\src\model-router",
+    "ai-workbench\src\resolution-agent",
     "backend\src\orchestrator",
     "backend\src\approval-service",
     "backend\src\remediation-engine",
@@ -249,7 +250,7 @@ Start-KaiMSWindow `
 
 Start-KaiMSWindow `
     -Title "KaiMS context-agent :8004" `
-    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8004 --app-dir backend/src/context-agent"
+    -Command "& '$Python' -m uvicorn app:app --host 127.0.0.1 --port 8004 --app-dir ai-workbench/src/context-agent"
 
 Start-KaiMSWindow `
     -Title "KaiMS api-gateway :8010" `

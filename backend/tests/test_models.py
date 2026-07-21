@@ -1,4 +1,5 @@
-from common.models import AgentEventContractV1, Alert, AlertSeverity, Evidence
+from ai_workbench_common.models import Evidence
+from common.models import AgentEventContractV1, Alert, AlertSeverity
 
 
 def test_alert_defaults_and_serialization() -> None:

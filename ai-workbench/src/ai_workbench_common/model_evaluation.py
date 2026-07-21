@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field
 
 from common.config import Settings
 from common.logging import get_logger
@@ -15,6 +16,51 @@ logger = get_logger(__name__)
 _SINGLE_INPUT_METRICS = {"coherence", "fluency", "safety", "hallucination"}
 _CONTEXT_METRICS = {"groundedness", "grounding", "relevance", "citation_coverage"}
 _SUPPORTED_METRICS = _SINGLE_INPUT_METRICS | _CONTEXT_METRICS
+
+
+class ExternalJudgeResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    metric: str = ""
+    score: float | None = None
+    confidence: float | None = None
+    explanation: str = ""
+
+
+class EvaluationSignals(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    citations: int = 0
+    rag_matches: int = 0
+    runbook_found: bool = False
+    fallback_used: bool = False
+    token_overlap: float = 0.0
+
+
+class EvaluationReport(BaseModel):
+    """Formal wire contract for a quality evaluation of an AI Workbench response.
+
+    Same field set `build_quality_evaluation()` has always returned as a plain
+    dict; this model exists so evaluation-service and other future consumers
+    have a typed contract to validate against instead of an untyped dict.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    contract_version: str = "kaiops.evaluation.v1"
+    provider: str = "deterministic-quality-gate"
+    confidence_score: float
+    grounding_score: float
+    hallucination_risk: float
+    hallucination_score: float
+    citation_coverage: float
+    evidence_coverage: float
+    rag_match_score: float
+    overall_score: float
+    quality_label: str
+    requires_review: bool
+    external_judge: ExternalJudgeResult = Field(default_factory=ExternalJudgeResult)
+    signals: EvaluationSignals = Field(default_factory=EvaluationSignals)
 
 
 @dataclass(slots=True)
@@ -52,7 +98,7 @@ def _best_match_score(rows: list[dict[str, Any]]) -> float:
     return best
 
 
-def build_quality_evaluation(
+def build_evaluation_report(
     *,
     prediction: Any,
     context: Any = "",
@@ -62,7 +108,7 @@ def build_quality_evaluation(
     runbook_found: bool = False,
     fallback_used: bool = False,
     external: EvaluationResult | dict[str, Any] | None = None,
-) -> dict[str, Any]:
+) -> EvaluationReport:
     """Build an always-available quality envelope for AIOps recommendations.
 
     The scores are deterministic guardrail signals, not a replacement for a
@@ -126,33 +172,55 @@ def build_quality_evaluation(
         overall_score = _clamp_score((0.7 * overall_score) + (0.3 * external_score))
 
     label = "high" if overall_score >= 0.82 and hallucination_risk <= 0.25 else "medium" if overall_score >= 0.62 else "low"
-    return {
-        "contract_version": "kaiops.evaluation.v1",
-        "provider": "deterministic-quality-gate",
-        "confidence_score": round(confidence_score, 4),
-        "grounding_score": round(grounding_score, 4),
-        "hallucination_risk": round(hallucination_risk, 4),
-        "hallucination_score": round(hallucination_score, 4),
-        "citation_coverage": round(citation_coverage, 4),
-        "evidence_coverage": round(evidence_coverage, 4),
-        "rag_match_score": round(rag_match_score, 4),
-        "overall_score": round(overall_score, 4),
-        "quality_label": label,
-        "requires_review": bool(hallucination_risk >= 0.45 or grounding_score < 0.55 or confidence_score < 0.65),
-        "external_judge": {
-            "metric": external_metric,
-            "score": round(external_score, 4) if external_score is not None else None,
-            "confidence": round(external_confidence, 4) if external_confidence is not None else None,
-            "explanation": external_explanation,
-        },
-        "signals": {
-            "citations": len(citation_rows),
-            "rag_matches": len(match_rows),
-            "runbook_found": bool(runbook_found),
-            "fallback_used": bool(fallback_used),
-            "token_overlap": round(token_grounding, 4),
-        },
-    }
+    return EvaluationReport(
+        confidence_score=round(confidence_score, 4),
+        grounding_score=round(grounding_score, 4),
+        hallucination_risk=round(hallucination_risk, 4),
+        hallucination_score=round(hallucination_score, 4),
+        citation_coverage=round(citation_coverage, 4),
+        evidence_coverage=round(evidence_coverage, 4),
+        rag_match_score=round(rag_match_score, 4),
+        overall_score=round(overall_score, 4),
+        quality_label=label,
+        requires_review=bool(hallucination_risk >= 0.45 or grounding_score < 0.55 or confidence_score < 0.65),
+        external_judge=ExternalJudgeResult(
+            metric=external_metric,
+            score=round(external_score, 4) if external_score is not None else None,
+            confidence=round(external_confidence, 4) if external_confidence is not None else None,
+            explanation=external_explanation,
+        ),
+        signals=EvaluationSignals(
+            citations=len(citation_rows),
+            rag_matches=len(match_rows),
+            runbook_found=bool(runbook_found),
+            fallback_used=bool(fallback_used),
+            token_overlap=round(token_grounding, 4),
+        ),
+    )
+
+
+def build_quality_evaluation(
+    *,
+    prediction: Any,
+    context: Any = "",
+    confidence: float | None = None,
+    citations: list[str] | None = None,
+    rag_matches: list[dict[str, Any]] | None = None,
+    runbook_found: bool = False,
+    fallback_used: bool = False,
+    external: EvaluationResult | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Backward-compatible dict-returning wrapper around build_evaluation_report()."""
+    return build_evaluation_report(
+        prediction=prediction,
+        context=context,
+        confidence=confidence,
+        citations=citations,
+        rag_matches=rag_matches,
+        runbook_found=runbook_found,
+        fallback_used=fallback_used,
+        external=external,
+    ).model_dump(mode="json")
 
 
 class AzureAIEvaluationClient:
@@ -251,6 +319,22 @@ class AzureAIEvaluationClient:
             explanation=str(body.get("explanation") or ""),
             confidence=confidence,
         )
+
+    def evaluate_many(
+        self, prediction: str, *, metrics: list[str], context: str | None = None
+    ) -> list[EvaluationResult]:
+        """Evaluate the same prediction against multiple metrics.
+
+        Sequential calls to evaluate() under the hood, so a metric that needs
+        context but doesn't get one (or fails independently) is simply
+        omitted from the result list rather than failing the whole batch.
+        """
+        results: list[EvaluationResult] = []
+        for metric in metrics:
+            result = self.evaluate(prediction, metric=metric, context=context)
+            if result is not None:
+                results.append(result)
+        return results
 
 
 class VertexEvaluationClient(AzureAIEvaluationClient):

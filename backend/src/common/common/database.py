@@ -518,6 +518,23 @@ class MonitoringConnectionAuditRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
+class EvaluationRecord(Base, TimestampMixin):
+    __tablename__ = "evaluation_records"
+    __table_args__ = (Index("idx_evaluation_records_incident_created", "incident_id", "created_at"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    incident_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    recommendation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    agent: Mapped[str] = mapped_column(String(128), index=True, default="unknown")
+    model_provider: Mapped[str | None] = mapped_column(String(64), index=True)
+    model_name: Mapped[str | None] = mapped_column(String(128), index=True)
+    overall_score: Mapped[float | None] = mapped_column()
+    quality_label: Mapped[str | None] = mapped_column(String(32), index=True)
+    requires_review: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    report_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    feedback_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+
+
 def create_engine(settings: Settings) -> AsyncEngine:
     return create_async_engine(settings.database_url, pool_pre_ping=True)
 

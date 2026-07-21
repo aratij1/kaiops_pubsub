@@ -4,7 +4,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
-from common.models import Alert, Context, Incident
+from ai_workbench_common.models import Context
+from common.models import Alert, Incident
 
 
 @dataclass(slots=True)

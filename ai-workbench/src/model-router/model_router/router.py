@@ -12,9 +12,9 @@ from typing import Any
 
 import httpx
 from common.config import Settings, get_settings
-from common.model_evaluation import VertexEvaluationClient
+from ai_workbench_common.model_evaluation import VertexEvaluationClient
 from common.models import AlertSeverity
-from common.prompts import SYSTEM_PROMPT_SRE, render_task_payload_prompt
+from ai_workbench_common.prompts import SYSTEM_PROMPT_SRE, render_task_payload_prompt
 from common.resilience import CircuitBreaker
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,15 @@ def _prompt_cache_set(
     cache.move_to_end(key)
     while len(cache) > max_entries:
         cache.popitem(last=False)
+
+
+def _configured_evaluation_metrics(settings: Settings) -> list[str]:
+    raw = str(getattr(settings, "azure_ai_evaluation_metrics", "") or "").strip()
+    if not raw:
+        # Backward-compatible default: behave exactly as the single-metric setting always has.
+        return [str(getattr(settings, "azure_ai_evaluation_metric", "coherence") or "coherence").strip().lower()]
+    metrics = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    return metrics or [str(getattr(settings, "azure_ai_evaluation_metric", "coherence") or "coherence").strip().lower()]
 
 
 def _mark_usage_as_cached(result: dict[str, Any]) -> dict[str, Any]:
@@ -436,8 +445,9 @@ class ModelRouter:
     )
     prompt_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = field(default_factory=OrderedDict)
     evaluation_client: VertexEvaluationClient = field(default_factory=lambda: VertexEvaluationClient(get_settings()))
+    _background_tasks: set[asyncio.Task[None]] = field(default_factory=set, repr=False, compare=False)
 
-    async def _attach_evaluation(self, result: dict[str, Any]) -> dict[str, Any]:
+    async def _attach_evaluation(self, result: dict[str, Any], *, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Best-effort: scores the response via Azure AI evaluation path.
         No-op unless Azure evaluation settings are enabled and configured."""
         if not self.evaluation_client.enabled:
@@ -445,17 +455,55 @@ class ModelRouter:
         content = str(result.get("content") or "")
         if not content:
             return result
-        evaluation = await asyncio.to_thread(
-            self.evaluation_client.evaluate, content, metric=self.settings.azure_ai_evaluation_metric
+        metrics = _configured_evaluation_metrics(self.settings)
+        evaluation_results = await asyncio.to_thread(
+            self.evaluation_client.evaluate_many, content, metrics=metrics, context=None
         )
-        if evaluation is not None:
-            result["evaluation"] = {
-                "metric": evaluation.metric,
-                "score": evaluation.score,
-                "explanation": evaluation.explanation,
-                "confidence": evaluation.confidence,
+        if not evaluation_results:
+            return result
+        evaluations = [
+            {
+                "metric": item.metric,
+                "score": item.score,
+                "explanation": item.explanation,
+                "confidence": item.confidence,
             }
+            for item in evaluation_results
+        ]
+        # Kept singular for backward compatibility with existing /route response consumers;
+        # "evaluations" (plural, full list) is new and additive.
+        result["evaluation"] = evaluations[0]
+        result["evaluations"] = evaluations
+        self._publish_evaluation(result=result, payload=payload or {})
         return result
+
+    async def _post_evaluation(self, body: dict[str, Any]) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(f"{self.settings.evaluation_service_url.rstrip('/')}/evaluations", json=body)
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning("evaluation_service_publish_failed", extra={"error": str(exc)})
+
+    def _publish_evaluation(self, *, result: dict[str, Any], payload: dict[str, Any]) -> None:
+        """Fire-and-forget: never awaited, never allowed to affect route()'s result."""
+        usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        report = {
+            "contract_version": "kaiops.evaluation.judge.v1",
+            "provider": "llm-judge",
+            "metrics": result.get("evaluations", []),
+        }
+        body = {
+            "report": report,
+            "agent": "model-router",
+            "incident_id": str(payload.get("incident_id")) if payload.get("incident_id") else None,
+            "recommendation_id": str(payload.get("recommendation_id")) if payload.get("recommendation_id") else None,
+            "model_provider": str(result.get("model") or "") or None,
+            "model_name": str(usage.get("model") or "") or None,
+        }
+        task = asyncio.create_task(self._post_evaluation(body))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     def select_model(self, *, severity: AlertSeverity, task: ModelTask) -> str:
         if severity == AlertSeverity.CRITICAL:
@@ -502,7 +550,7 @@ class ModelRouter:
                 usage = response.usage.as_dict()
                 usage["task"] = task.value
                 result = {"model": provider_name, "content": response.content, "usage": usage}
-                result = await self._attach_evaluation(result)
+                result = await self._attach_evaluation(result, payload=payload)
                 if self.settings.model_router_prompt_cache_enabled:
                     _prompt_cache_set(
                         cache_key,
@@ -547,7 +595,7 @@ class ModelRouter:
         usage = response.usage.as_dict()
         usage["task"] = task.value
         result = {"model": provider_name, "content": response.content, "usage": usage}
-        result = await self._attach_evaluation(result)
+        result = await self._attach_evaluation(result, payload=payload)
         if self.settings.model_router_prompt_cache_enabled:
             _prompt_cache_set(
                 cache_key,

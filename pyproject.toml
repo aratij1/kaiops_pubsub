@@ -38,15 +38,17 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = [
     "backend/src/common",
+    "ai-workbench/src",
     "backend/src/api-gateway",
     "backend/src/application-onboarding",
     "backend/src/alert-intelligence",
-    "backend/src/context-agent",
+    "ai-workbench/src/context-agent",
     "backend/src/dashboard-generator",
     "backend/src/discovery-service",
-    "backend/src/model-router",
+    "ai-workbench/src/model-router",
     "backend/src/metrics-validation-agent",
-    "backend/src/resolution-agent",
+    "ai-workbench/src/resolution-agent",
+    "ai-workbench/src/evaluation-service",
     "backend/src/orchestrator",
     "backend/src/prometheus-config-service",
     "backend/src/rule-generation-agent",
@@ -59,6 +61,7 @@ where = [
 ]
 include = [
     "common*",
+    "ai_workbench_common*",
     "api_gateway*",
     "application_onboarding*",
     "alert_intelligence*",
@@ -77,6 +80,7 @@ include = [
     "audit_service*",
     "monitoring_adapter*",
     "notification_service*",
+    "evaluation_service*",
 ]
 
 [project.optional-dependencies]
@@ -84,21 +88,24 @@ dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.25.0",
     "ruff>=0.8.0",
+    "aiosqlite>=0.20.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = [
     "backend/src/common",
+    "ai-workbench/src",
     "backend/src/api-gateway",
     "backend/src/application-onboarding",
     "backend/src/alert-intelligence",
-    "backend/src/context-agent",
+    "ai-workbench/src/context-agent",
     "backend/src/dashboard-generator",
     "backend/src/discovery-service",
-    "backend/src/model-router",
+    "ai-workbench/src/model-router",
     "backend/src/metrics-validation-agent",
-    "backend/src/resolution-agent",
+    "ai-workbench/src/resolution-agent",
+    "ai-workbench/src/evaluation-service",
     "backend/src/orchestrator",
     "backend/src/approval-service",
     "backend/src/prometheus-config-service",

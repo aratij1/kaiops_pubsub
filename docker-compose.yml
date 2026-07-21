@@ -18,6 +18,7 @@ x-service-env: &service-env
   APPROVAL_SERVICE_URL: http://approval-service:8000
   MODEL_ROUTER_URL: http://model-router:8000
   MONITORING_ADAPTER_URL: http://monitoring-adapter:8000
+  EVALUATION_SERVICE_URL: http://evaluation-service:8000
   API_GATEWAY_URL: http://api-gateway:8000
   APPLICATION_ONBOARDING_URL: http://application-onboarding:8000
   PROMETHEUS_URL: http://prometheus:9090
@@ -406,7 +407,7 @@ services:
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: context-agent }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/backend/src/context-agent
+    working_dir: /app/ai-workbench/src/context-agent
     ports: ["8004:8000"]
     volumes:
       - ./backend/rag:/app/rag
@@ -420,7 +421,7 @@ services:
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: model-router }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/backend/src/model-router
+    working_dir: /app/ai-workbench/src/model-router
     ports: ["8005:8000"]
     depends_on:
       kafka: { condition: service_healthy }
@@ -431,7 +432,7 @@ services:
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: resolution-agent }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/backend/src/resolution-agent
+    working_dir: /app/ai-workbench/src/resolution-agent
     ports: ["8006:8000"]
     depends_on:
       kafka: { condition: service_healthy }
@@ -459,6 +460,17 @@ services:
     ports: ["8019:8000"]
     depends_on:
       kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  evaluation-service:
+    build: *service-build
+    restart: unless-stopped
+    environment: { <<: *service-env, SERVICE_NAME: evaluation-service }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/ai-workbench/src/evaluation-service
+    ports: ["8020:8000"]
+    depends_on:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
