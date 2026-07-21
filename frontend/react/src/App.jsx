@@ -1970,6 +1970,191 @@ function FlowTimelineGraph({ rows }) {
   );
 }
 
+function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, documentContract }) {
+  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
+  const safeTimelineRows = Array.isArray(timelineRows) ? timelineRows : [];
+  const safeDocuments = Array.isArray(documents) ? documents : [];
+  const recommendation = safeWorkflow.recommendation && typeof safeWorkflow.recommendation === "object" ? safeWorkflow.recommendation : {};
+  const recommendationMetadata = recommendation.metadata && typeof recommendation.metadata === "object" ? recommendation.metadata : {};
+  const context = safeWorkflow.context && typeof safeWorkflow.context === "object" ? safeWorkflow.context : {};
+  const contextMetadata = context.metadata && typeof context.metadata === "object" ? context.metadata : {};
+  const contextTraceRow = safeTimelineRows
+    .slice()
+    .reverse()
+    .find((row) => {
+      const text = `${row?.stage || ""} ${row?.service || ""} ${row?.agent || ""} ${row?.outputValueText || ""}`.toLowerCase();
+      return text.includes("context") || text.includes("rag") || text.includes("semantic") || text.includes("vector");
+    });
+  const parseMaybeJson = (value) => {
+    const text = String(value || "").trim();
+    if (!text) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(text);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch (_error) {
+      return null;
+    }
+  };
+  const contextTraceOutput = parseMaybeJson(contextTraceRow?.outputValueText) || {};
+  const traceMetadata = contextTraceOutput.metadata && typeof contextTraceOutput.metadata === "object" ? contextTraceOutput.metadata : {};
+  const ragMatches =
+    (Array.isArray(contextMetadata.rag_matches) && contextMetadata.rag_matches)
+    || (Array.isArray(recommendationMetadata.rag_matches) && recommendationMetadata.rag_matches)
+    || (Array.isArray(traceMetadata.rag_matches) && traceMetadata.rag_matches)
+    || [];
+  const ragIndex =
+    (contextMetadata.rag_index && typeof contextMetadata.rag_index === "object" && contextMetadata.rag_index)
+    || (recommendationMetadata.rag_index && typeof recommendationMetadata.rag_index === "object" && recommendationMetadata.rag_index)
+    || (traceMetadata.rag_index && typeof traceMetadata.rag_index === "object" && traceMetadata.rag_index)
+    || {};
+  const firstDoc = safeDocuments[0] || {};
+  const embeddingModel =
+    (ragIndex.embedding_model && typeof ragIndex.embedding_model === "object" && ragIndex.embedding_model)
+    || (firstDoc.embedding_model && typeof firstDoc.embedding_model === "object" && firstDoc.embedding_model)
+    || {};
+  const vectorStore =
+    (ragIndex.vector_store && typeof ragIndex.vector_store === "object" && ragIndex.vector_store)
+    || (firstDoc.vector_store && typeof firstDoc.vector_store === "object" && firstDoc.vector_store)
+    || {};
+  const alert = safeWorkflow.alert && typeof safeWorkflow.alert === "object" ? safeWorkflow.alert : {};
+  const queryText = compactText(
+    [
+      alert.service || safeWorkflow.service,
+      alert.name || safeWorkflow.alert_name,
+      alert.description || safeWorkflow.description,
+      recommendation.title,
+    ].filter(Boolean).join(" "),
+    180
+  ) || "Selected alert service, name, severity, and description";
+  const topSimilarity = Number(
+    contextMetadata.rag_top_similarity
+    ?? recommendationMetadata.rag_top_similarity
+    ?? traceMetadata.rag_top_similarity
+    ?? 0
+  );
+  const linkedSummary = documentContract?.document_link_summary && typeof documentContract.document_link_summary === "object"
+    ? documentContract.document_link_summary
+    : {};
+  const docCount = Number(ragIndex.document_count ?? ragIndex.total_documents ?? linkedSummary.count ?? safeDocuments.length ?? 0);
+  const indexedCount = Number(ragIndex.embedded_document_count ?? ragIndex.metadata_embedding_count ?? 0);
+  const bestMatch = ragMatches[0] || safeDocuments[0] || {};
+  const contextQuality = evaluation && typeof evaluation === "object" ? evaluation : {};
+  const flowSteps = [
+    {
+      id: "receive",
+      label: "Query Received",
+      meta: "Context agent consumes orchestration-events",
+      detail: queryText,
+      status: safeWorkflow.incident || alert.name ? "observed" : "inferred",
+    },
+    {
+      id: "normalize",
+      label: "Signal Normalized",
+      meta: "service + severity + labels + incident id",
+      detail: compactText(`${alert.service || "-"} | ${alert.severity || recommendation.severity || "-"} | ${safeWorkflow?.incident?.id || safeWorkflow.incident_id || "-"}`, 160),
+      status: alert.service || safeWorkflow.incident_id ? "observed" : "inferred",
+    },
+    {
+      id: "index",
+      label: "Index Checked",
+      meta: `${docCount || safeDocuments.length || 0} document(s), ${indexedCount || "metadata"} indexed`,
+      detail: `Embedding: ${embeddingModel.model || "hashing-token-counter-v1"} | Store: ${vectorStore.provider || "file-backed-memory"}`,
+      status: docCount || safeDocuments.length ? "observed" : "warning",
+    },
+    {
+      id: "search",
+      label: "Search Ranked",
+      meta: `${ragMatches.length || safeDocuments.length || 0} match(es)`,
+      detail: `Top similarity: ${Number.isFinite(topSimilarity) && topSimilarity > 0 ? `${Math.round(topSimilarity * 100)}%` : "not reported"}`,
+      status: ragMatches.length || safeDocuments.length ? "observed" : "warning",
+    },
+    {
+      id: "touch",
+      label: "Documents Touched",
+      meta: bestMatch.title || bestMatch.path || "no linked document title",
+      detail: compactText(bestMatch.match_reason || bestMatch.summary || bestMatch.content || bestMatch.path || "Linked alert documents are used as context evidence.", 180),
+      status: safeDocuments.length || ragMatches.length ? "observed" : "warning",
+    },
+    {
+      id: "assemble",
+      label: "Context Prepared",
+      meta: "context-events published",
+      detail: `Grounding ${Math.round((contextQuality.groundingScore || 0) * 100)}% | Confidence ${Math.round((contextQuality.confidenceScore || recommendation.confidence || 0) * 100)}%`,
+      status: contextTraceRow || safeWorkflow.context || recommendation ? "observed" : "inferred",
+    },
+  ];
+  const touchedDocuments = safeDocuments.slice(0, 5);
+  const indexRows = [
+    ["Embedding Provider", embeddingModel.provider || "local"],
+    ["Embedding Model", embeddingModel.model || "hashing-token-counter-v1"],
+    ["Fallback Model", embeddingModel.fallback_model || "-"],
+    ["Vector Store", vectorStore.provider || "file-backed-memory"],
+    ["Vector Index", (vectorStore.index || vectorStore.index_name || vectorStore.configured) ? String(vectorStore.index || vectorStore.index_name || "configured") : "-"],
+    ["Documents Seen", String(docCount || safeDocuments.length || "-")],
+  ];
+
+  return (
+    <div className="context-flow-panel">
+      <div className="context-flow-header">
+        <div>
+          <h3>Context Retrieval Flow</h3>
+          <p>Query intake, document indexing, semantic search, document touchpoints, and context assembly for the selected alert.</p>
+        </div>
+        <div className="context-flow-scoreboard">
+          <span><strong>{ragMatches.length || safeDocuments.length}</strong> matches</span>
+          <span><strong>{Number.isFinite(topSimilarity) && topSimilarity > 0 ? `${Math.round(topSimilarity * 100)}%` : "-"}</strong> top score</span>
+          <span><strong>{Math.round((contextQuality.groundingScore || 0) * 100) || "-"}</strong> grounding</span>
+        </div>
+      </div>
+      <div className="context-flow-track">
+        {flowSteps.map((step, index) => (
+          <div className="context-flow-segment" key={step.id}>
+            <article className={`context-flow-node status-${step.status}`}>
+              <span className="context-flow-step">{index + 1}</span>
+              <strong>{step.label}</strong>
+              <small>{step.meta}</small>
+              <p>{step.detail}</p>
+            </article>
+            {index < flowSteps.length - 1 ? <span className="context-flow-arrow" aria-hidden="true">-&gt;</span> : null}
+          </div>
+        ))}
+      </div>
+      <div className="context-flow-grid">
+        <article className="context-flow-detail">
+          <h4>Index And Embedding</h4>
+          <div className="table-wrap table-wrap-scroll-x">
+            <table>
+              <tbody>
+                {indexRows.map(([label, value]) => (
+                  <tr key={`context-index-${label}`}><th>{label}</th><td>{value}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </article>
+        <article className="context-flow-detail">
+          <h4>Documents Touched</h4>
+          {touchedDocuments.length ? (
+            <div className="context-doc-list">
+              {touchedDocuments.map((doc, index) => (
+                <div className="context-doc-row" key={`${doc.document_id || doc.path || doc.title || index}`}>
+                  <strong>{doc.title || doc.path || `Document ${index + 1}`}</strong>
+                  <span>{doc.kind || doc.document_kind || "document"} | confidence {Math.round(Number(doc.match_confidence || doc._similarity || doc.score || 0) * 100) || "-"}%</span>
+                  <small>{compactText(doc.match_reason || doc.summary || doc.path, 160) || "-"}</small>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="subtitle">No linked documents are reported for this alert yet.</p>
+          )}
+        </article>
+      </div>
+    </div>
+  );
+}
+
 function AgentEventsGraph({ rows }) {
   const eventRows = Array.isArray(rows) ? rows : [];
   if (!eventRows.length) {
@@ -9293,14 +9478,14 @@ export default function App() {
 
                   {homeDetailTab === "diagnostics" ? (
                     <div className="detail-tabs" style={{ marginTop: 8 }}>
-                      {["timeline", "events", "finops", "api", "topics", "raw"].map((tab) => (
+                      {["timeline", "context", "events", "finops", "api", "topics", "raw"].map((tab) => (
                         <button
                           key={`diag-${tab}`}
                           type="button"
                           className={`detail-tab ${diagnosticsDetailTab === tab ? "active" : ""}`}
                           onClick={() => setDiagnosticsDetailTab(tab)}
                         >
-                          {tab === "timeline" ? "Flow Timeline" : tab === "events" ? "Agent Events" : tab === "finops" ? "FinOps" : tab === "api" ? "API Gateway" : tab === "topics" ? "Message Bus" : "Raw Payload"}
+                          {tab === "timeline" ? "Flow Timeline" : tab === "context" ? "Context Flow" : tab === "events" ? "Agent Events" : tab === "finops" ? "FinOps" : tab === "api" ? "API Gateway" : tab === "topics" ? "Message Bus" : "Raw Payload"}
                         </button>
                       ))}
                     </div>
@@ -9632,6 +9817,16 @@ export default function App() {
 
                   {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "timeline" ? (
                     <FlowTimelineGraph rows={selectedAlertTimelineRows} />
+                  ) : null}
+
+                  {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "context" ? (
+                    <ContextRetrievalGraph
+                      workflow={selectedAlertWorkflow}
+                      timelineRows={selectedAlertTimelineRows}
+                      documents={selectedAlertRagDocuments}
+                      evaluation={selectedAlertEvaluation}
+                      documentContract={selectedAlertDocumentContract}
+                    />
                   ) : null}
 
                   {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "events" ? (
