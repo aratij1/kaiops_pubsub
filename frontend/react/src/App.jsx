@@ -1970,7 +1970,8 @@ function FlowTimelineGraph({ rows }) {
   );
 }
 
-function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, documentContract }) {
+function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, documentContract, onLoadDocumentContent }) {
+  const [documentPreviewState, setDocumentPreviewState] = useState({ key: "", loading: false, content: null, error: "" });
   const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
   const safeTimelineRows = Array.isArray(timelineRows) ? timelineRows : [];
   const safeDocuments = Array.isArray(documents) ? documents : [];
@@ -2086,6 +2087,80 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
     },
   ];
   const touchedDocuments = safeDocuments.slice(0, 5);
+  const documentKey = (doc, index = 0) => String(doc?.path || doc?.document_id || doc?.title || `doc-${index}`).trim();
+  const viewDocument = async (doc, index) => {
+    const key = documentKey(doc, index);
+    if (!key) {
+      return;
+    }
+    if (documentPreviewState.key === key && documentPreviewState.content && !documentPreviewState.error) {
+      setDocumentPreviewState({ key: "", loading: false, content: null, error: "" });
+      return;
+    }
+    setDocumentPreviewState({ key, loading: true, content: null, error: "" });
+    try {
+      const loaded = typeof onLoadDocumentContent === "function"
+        ? await onLoadDocumentContent(doc)
+        : doc;
+      setDocumentPreviewState({
+        key,
+        loading: false,
+        content: loaded && typeof loaded === "object" ? loaded : doc,
+        error: "",
+      });
+    } catch (error) {
+      setDocumentPreviewState({
+        key,
+        loading: false,
+        content: doc,
+        error: String(error?.message || "Unable to load document content."),
+      });
+    }
+  };
+  const renderDocumentPreview = (doc, index) => {
+    const key = documentKey(doc, index);
+    if (documentPreviewState.key !== key) {
+      return null;
+    }
+    const full = documentPreviewState.content && typeof documentPreviewState.content === "object"
+      ? documentPreviewState.content
+      : doc;
+    const metadata = {
+      document_id: full?.document_id || doc?.document_id || "-",
+      kind: full?.kind || full?.document_kind || doc?.kind || doc?.document_kind || "-",
+      path: full?.path || doc?.path || "-",
+      services: full?.services || doc?.services || "-",
+      owner: full?.owner || doc?.owner || "-",
+      version: full?.version || doc?.version || "-",
+      freshness_score: full?.freshness_score ?? doc?.freshness_score ?? "-",
+      embedding_status: full?.embedding_status || doc?.embedding_status || "-",
+      match_reason: full?.match_reason || doc?.match_reason || "-",
+      match_confidence: full?.match_confidence ?? doc?.match_confidence ?? "-",
+    };
+    const body = String(
+      full?.content
+      || full?.text
+      || full?.summary
+      || full?.recommended_action
+      || doc?.content
+      || doc?.summary
+      || ""
+    ).trim();
+    return (
+      <div className="context-doc-preview">
+        {documentPreviewState.loading ? <p className="subtitle">Loading document content...</p> : null}
+        {documentPreviewState.error ? <p className="error">{documentPreviewState.error}</p> : null}
+        <details open>
+          <summary>Document Metadata</summary>
+          <pre className="result">{JSON.stringify(metadata, null, 2)}</pre>
+        </details>
+        <details open>
+          <summary>Document View</summary>
+          <pre className="result">{body || "No document body was returned. Metadata is shown above."}</pre>
+        </details>
+      </div>
+    );
+  };
   const indexRows = [
     ["Embedding Provider", embeddingModel.provider || "local"],
     ["Embedding Model", embeddingModel.model || "hashing-token-counter-v1"],
@@ -2143,6 +2218,12 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
                   <strong>{doc.title || doc.path || `Document ${index + 1}`}</strong>
                   <span>{doc.kind || doc.document_kind || "document"} | confidence {Math.round(Number(doc.match_confidence || doc._similarity || doc.score || 0) * 100) || "-"}%</span>
                   <small>{compactText(doc.match_reason || doc.summary || doc.path, 160) || "-"}</small>
+                  <div className="context-doc-actions">
+                    <button type="button" className="button-secondary" onClick={() => viewDocument(doc, index)}>
+                      {documentPreviewState.key === documentKey(doc, index) ? "Hide" : "View"} Document
+                    </button>
+                  </div>
+                  {renderDocumentPreview(doc, index)}
                 </div>
               ))}
             </div>
@@ -4880,6 +4961,19 @@ export default function App() {
     } catch (error) {
       setRagDocs((current) => ({ ...current, error: `Download failed: ${String(error?.message || "Unknown error")}` }));
     }
+  }
+
+  async function loadRagDocumentContent(doc) {
+    const path = String(doc?.path || "").trim();
+    if (!path) {
+      return doc;
+    }
+    const full = unwrap(await fetchJson(`/api-gateway/rag/documents/content?path=${encodeURIComponent(path)}`, authenticatedOptions()));
+    return {
+      ...doc,
+      ...(full && typeof full === "object" ? full : {}),
+      path: full?.path || doc?.path || path,
+    };
   }
 
   function backendDocumentPreview(doc) {
@@ -9826,6 +9920,7 @@ export default function App() {
                       documents={selectedAlertRagDocuments}
                       evaluation={selectedAlertEvaluation}
                       documentContract={selectedAlertDocumentContract}
+                      onLoadDocumentContent={loadRagDocumentContent}
                     />
                   ) : null}
 

@@ -2849,6 +2849,34 @@ th {
   font-size: 11px;
 }
 
+.context-doc-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.context-doc-preview {
+  border-top: 1px solid #dce8f5;
+  margin-top: 8px;
+  padding-top: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.context-doc-preview details {
+  background: #ffffff;
+  border: 1px solid #dce8f5;
+  border-radius: 8px;
+  padding: 6px;
+}
+
+.context-doc-preview summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .agent-dag-flow {
   overflow-x: auto;
   padding-bottom: 6px;
