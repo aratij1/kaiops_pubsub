@@ -2,6 +2,15 @@
 
 _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit the source incident docs and resubmit them — this file is overwritten on every rebuild and excluded from RAG document matching._
 
+## admin-ui-doc-flow-20260719221735 Monitoring Rule Onboarding
+- **Service:** admin-ui-doc-flow-20260719221735
+- **Severity:** HIGH
+- **Alert Type:** monitoring-rule-onboarding
+- **Alert ID:** admin-ui-doc-flow-20260719221735-rule-onboarding
+- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
+- **Recommended Action:** Review generated rules and approve production deployment.
+- **Deployment:** prod
+
 ## Airflow Scheduler Down
 - **Service:** airflow
 - **Severity:** CRITICAL
@@ -315,6 +324,15 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Root Cause:** Deployment 2.5
 - **Impact:** Kaiops-Resolution-Agent service impact requires immediate triage
 
+## setup-doc-e2e-20260719163442 Monitoring Rule Onboarding
+- **Service:** setup-doc-e2e-20260719163442
+- **Severity:** HIGH
+- **Alert Type:** monitoring-rule-onboarding
+- **Alert ID:** setup-doc-e2e-20260719163442-rule-onboarding
+- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
+- **Recommended Action:** Review generated rules and approve production deployment.
+- **Deployment:** prod
+
 ## Source System Unavailable
 - **Service:** oracle-source
 - **Severity:** CRITICAL
@@ -335,15 +353,14 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Deployment:** Not explicitly documented.
 - **Execution Plan:** Increase executor memory
 
-## trace-id-fallback-verify Incident Summary
-- **Service:** payments
-- **Severity:** CRITICAL
-- **Alert Type:** trace-id-fallback-verify
-- **Alert ID:** 8f2e775f-839d-4fa0-b182-9568c249a55f
-- **Summary:** trace-id-fallback-verify detected for payments. Impact: Payments service impact requires immediate triage.
-- **Recommended Action:** Rollback deployment
-- **Root Cause:** Deployment 2.5
-- **Impact:** Payments service impact requires immediate triage
+## test Monitoring Rule Onboarding
+- **Service:** test
+- **Severity:** HIGH
+- **Alert Type:** monitoring-rule-onboarding
+- **Alert ID:** test-rule-onboarding
+- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
+- **Recommended Action:** Review generated rules and approve production deployment.
+- **Deployment:** prod
 
 ## Unauthorized Data Access Attempt
 - **Service:** data-warehouse

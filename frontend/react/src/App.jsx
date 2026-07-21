@@ -303,22 +303,35 @@ function isGeneratedOrTestAlert(row) {
     || tokens.includes("onboarding-smoke-test");
 }
 
+function onboardingSourceDocCategoryLabel(category) {
+  const key = String(category || "other").trim();
+  if (key === "knowledge_pack") {
+    return "Service Knowledge";
+  }
+  return ONBOARDING_SOURCE_DOC_BUCKETS.find((bucket) => bucket.key === key)?.label || "Other Evidence";
+}
+
 async function fetchJson(path, options = {}) {
   const maxAttempts = 4;
   let lastError = null;
+  const { authenticated, onUnauthorized, ...fetchOptions } = options || {};
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       const response = await fetch(path, {
+        ...fetchOptions,
         headers: {
           "Content-Type": "application/json",
-          ...(options.headers || {}),
+          ...(fetchOptions.headers || {}),
         },
-        ...options,
       });
 
       if (!response.ok) {
         const text = await response.text();
+        if (response.status === 401 && authenticated && typeof onUnauthorized === "function") {
+          onUnauthorized(text, path);
+          throw new Error("Session expired. Please sign in again.");
+        }
         const shouldRetry = response.status >= 500 && attempt < maxAttempts;
         if (shouldRetry) {
           await new Promise((resolve) => setTimeout(resolve, attempt * 500));
@@ -329,7 +342,13 @@ async function fetchJson(path, options = {}) {
 
       return response.json();
     } catch (error) {
-      lastError = error;
+      const message = String(error?.message || "");
+      if (message === "Session expired. Please sign in again.") {
+        throw error;
+      }
+      lastError = message === "Failed to fetch"
+        ? new Error(`Failed to reach ${path}. Open the UI through http://localhost:8501 with Docker/nginx running, or use the Vite proxy with api-gateway on http://localhost:8010.`)
+        : error;
       if (attempt < maxAttempts) {
         await new Promise((resolve) => setTimeout(resolve, attempt * 500));
       }
@@ -2614,6 +2633,7 @@ export default function App() {
     status: "active",
     is_active: true,
   });
+  const [adminEditPanelOpen, setAdminEditPanelOpen] = useState(false);
   const [adminResetPasswordForm, setAdminResetPasswordForm] = useState({ user_id: null, new_password: "" });
   const [onboardingForm, setOnboardingForm] = useState({
     name: "kaiops-project",
@@ -2672,6 +2692,14 @@ export default function App() {
   const [onboardingLandingPadSummary, setOnboardingLandingPadSummary] = useState({});
   const [onboardingGeneratedDocs, setOnboardingGeneratedDocs] = useState([]);
   const [onboardingSourceDocs, setOnboardingSourceDocs] = useState({ loading: false, rows: [], error: "" });
+  const [knowledgePackState, setKnowledgePackState] = useState({
+    loading: false,
+    draft: null,
+    error: "",
+    success: "",
+    approved: false,
+  });
+  const [knowledgePackCorrections, setKnowledgePackCorrections] = useState({});
   const [onboardingReviewAck, setOnboardingReviewAck] = useState({ rules: false, docs: false, metadata: false });
   const [onboardingDocApprovalState, setOnboardingDocApprovalState] = useState({
     loading: false,
@@ -2718,6 +2746,14 @@ export default function App() {
     remediation_queries_text: "",
   });
   const [alertKnowledgePrompt, setAlertKnowledgePrompt] = useState("");
+  const [alertKnowledgeSourceDoc, setAlertKnowledgeSourceDoc] = useState({
+    loading: false,
+    name: "",
+    size: 0,
+    text: "",
+    excerpt: "",
+    error: "",
+  });
   const [alertKnowledgeView, setAlertKnowledgeView] = useState("onboarding");
   const [projectSetupStep, setProjectSetupStep] = useState("setup");
   const [projectSetupShowAll, setProjectSetupShowAll] = useState(false);
@@ -3192,6 +3228,12 @@ export default function App() {
     await Promise.all(tasks);
   }
 
+  function refreshApprovalDrivenViewsSoon(incidentId = "") {
+    window.setTimeout(() => {
+      refreshApprovalDrivenViews(incidentId);
+    }, 1200);
+  }
+
   async function loadFlows() {
     setFlows((prev) => ({ ...prev, loading: true, error: "" }));
     try {
@@ -3387,6 +3429,18 @@ export default function App() {
     const headers = adminHeaders();
     return {
       ...options,
+      authenticated: true,
+      onUnauthorized: () => {
+        setAdminSession({
+          loading: false,
+          accessToken: "",
+          refreshToken: "",
+          user: null,
+          error: "Session expired. Please sign in again.",
+        });
+        setAdminUsers({ loading: false, rows: [], error: "" });
+        setActiveTab("home");
+      },
       headers: {
         ...headers,
         ...(options.headers || {}),
@@ -3430,6 +3484,7 @@ export default function App() {
     setAdminSession({ loading: false, accessToken: "", refreshToken: "", user: null, error: "" });
     setAdminUsers({ loading: false, rows: [], error: "" });
     setAdminEditUser({ id: null, username: "", email: "", first_name: "", last_name: "", role_id: 1, status: "active", is_active: true });
+    setAdminEditPanelOpen(false);
     setAdminResetPasswordForm({ user_id: null, new_password: "" });
     setActiveTab("home");
   }
@@ -3442,8 +3497,8 @@ export default function App() {
     setAdminUsers((current) => ({ ...current, loading: true, error: "" }));
     try {
       const [usersPayload, rolesPayload] = await Promise.all([
-        fetchJson("/api-gateway/users?page=1&page_size=50", { headers }),
-        fetchJson("/api-gateway/roles", { headers }),
+        fetchJson("/api-gateway/users?page=1&page_size=50", authenticatedOptions()),
+        fetchJson("/api-gateway/roles", authenticatedOptions()),
       ]);
       const usersRows = usersPayload?.rows || usersPayload?.data?.rows || [];
       const rolesRows = rolesPayload?.data || rolesPayload || [];
@@ -3463,14 +3518,13 @@ export default function App() {
     }
     setAdminUsers((current) => ({ ...current, loading: true, error: "" }));
     try {
-      await fetchJson("/api-gateway/users", {
+      await fetchJson("/api-gateway/users", authenticatedOptions({
         method: "POST",
-        headers,
         body: JSON.stringify({
           ...adminCreateUser,
           role_id: Number(adminCreateUser.role_id || 1),
         }),
-      });
+      }));
       setAdminCreateUser({
         username: "",
         email: "",
@@ -3502,6 +3556,7 @@ export default function App() {
       status: String(row?.status || "active").trim(),
       is_active: Boolean(row?.is_active),
     });
+    setAdminEditPanelOpen(true);
     setAdminResetPasswordForm((current) => ({ ...current, user_id: selectedId, new_password: "" }));
   }
 
@@ -3514,9 +3569,8 @@ export default function App() {
     }
     setAdminUsers((current) => ({ ...current, loading: true, error: "" }));
     try {
-      await fetchJson(`/api-gateway/users/${adminEditUser.id}`, {
+      await fetchJson(`/api-gateway/users/${adminEditUser.id}`, authenticatedOptions({
         method: "PUT",
-        headers,
         body: JSON.stringify({
           email: String(adminEditUser.email || "").trim(),
           first_name: String(adminEditUser.first_name || "").trim(),
@@ -3525,8 +3579,9 @@ export default function App() {
           status: String(adminEditUser.status || "active").trim(),
           is_active: Boolean(adminEditUser.is_active),
         }),
-      });
+      }));
       await loadAdminUsersAndRoles();
+      setAdminEditPanelOpen(false);
     } catch (error) {
       setAdminUsers((current) => ({ ...current, loading: false, error: error.message }));
     }
@@ -3542,11 +3597,10 @@ export default function App() {
     }
     setAdminUsers((current) => ({ ...current, loading: true, error: "" }));
     try {
-      await fetchJson(`/api-gateway/users/${selectedUserId}/reset-password`, {
+      await fetchJson(`/api-gateway/users/${selectedUserId}/reset-password`, authenticatedOptions({
         method: "PATCH",
-        headers,
         body: JSON.stringify({ new_password: String(adminResetPasswordForm.new_password || "") }),
-      });
+      }));
       setAdminResetPasswordForm((current) => ({ ...current, new_password: "" }));
       await loadAdminUsersAndRoles();
     } catch (error) {
@@ -3621,6 +3675,47 @@ export default function App() {
     }));
   }
 
+  function currentOnboardedApplicationName() {
+    return String(selectedOnboardingProject || onboardingForm.name || monitoringAppForm.name || "").trim();
+  }
+
+  function findMonitoringApplicationForName(name) {
+    const normalized = String(name || "").trim().toLowerCase();
+    if (!normalized) {
+      return null;
+    }
+    return (Array.isArray(monitoringApps.rows) ? monitoringApps.rows : []).find((row) => {
+      const candidates = [
+        row?.id,
+        row?.name,
+        row?.application,
+        row?.project_name,
+        row?.service,
+      ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
+      return candidates.some((candidate) => candidate === normalized || candidate.includes(normalized) || normalized.includes(candidate));
+    }) || null;
+  }
+
+  async function openOnboardedApplicationDashboard(url = "") {
+    const appName = currentOnboardedApplicationName();
+    if (appName) {
+      setMonitorApplications((current) => current.includes(appName) ? current : [appName, ...current]);
+      setApplicationToMonitor(appName);
+      const row = findMonitoringApplicationForName(appName);
+      const appId = String(row?.id || "").trim();
+      if (appId) {
+        setSelectedMonitoringAppId(appId);
+        loadMonitoringApplicationDetails(appId);
+      }
+    }
+    setDashboardAlertFocus("all");
+    setDashboardAlertQuery("");
+    setActiveTab("home");
+    if (url && typeof window !== "undefined") {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+  }
+
   async function ingestGeneratedOnboardingDocuments(documents) {
     const rows = Array.isArray(documents) ? documents : [];
     if (!rows.length) {
@@ -3671,6 +3766,12 @@ export default function App() {
       });
       setOnboardingReviewAck((current) => ({ ...current, docs: true }));
       setOnboardingState((current) => ({ ...current, success: `Project onboarding saved. Documents approved: ${summary.ingested}/${summary.total}.` }));
+      const appName = currentOnboardedApplicationName();
+      if (appName) {
+        setMonitorApplications((current) => current.includes(appName) ? current : [appName, ...current]);
+        setApplicationToMonitor(appName);
+      }
+      setProjectSetupStep("status");
     } catch (error) {
       setOnboardingDocApprovalState({ loading: false, error: error.message, success: "", approved: false });
     }
@@ -3689,6 +3790,218 @@ export default function App() {
     });
     return merged;
   }, [onboardingSourceDocs.rows]);
+
+  const onboardingKnowledgePack = knowledgePackState.draft?.knowledge_pack || knowledgePackState.draft || null;
+  const onboardingKnowledgeFacts = onboardingKnowledgePack?.facts || {};
+  const onboardingKnowledgeValidation = onboardingKnowledgePack?.validation || {};
+  const KNOWLEDGE_LIST_FACTS = new Set(["dependencies", "alert_patterns", "commands", "rollback_plan", "validation_checks"]);
+  const KNOWLEDGE_FACT_LABELS = {
+    service: "Service",
+    environment: "Environment",
+    owner_team: "Owner team",
+    dependencies: "Dependencies",
+    alert_patterns: "Alert patterns",
+    commands: "Commands or queries",
+    rollback_plan: "Rollback or failback",
+    validation_checks: "Validation checks",
+  };
+  const KNOWLEDGE_FACT_HINTS = {
+    dependencies: "Example: mysql, redis, rabbitmq, kafka",
+    commands: "Example: kubectl logs deployment/service -n prod",
+    rollback_plan: "Example: rollback deployment to previous version and restore config",
+    validation_checks: "Example: verify /health, Prometheus target up, and error rate recovered",
+    alert_patterns: "Example: alert when exporter is down for 5m",
+    owner_team: "Example: platform-ops",
+  };
+
+  function normalizeKnowledgeCorrectionValue(key, value) {
+    const text = String(value || "").trim();
+    if (!text) {
+      return KNOWLEDGE_LIST_FACTS.has(key) ? [] : "";
+    }
+    if (KNOWLEDGE_LIST_FACTS.has(key)) {
+      return text.split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean);
+    }
+    return text;
+  }
+
+  const correctedKnowledgeFacts = useMemo(() => {
+    const next = {};
+    Object.entries(onboardingKnowledgeFacts).forEach(([key, fact]) => {
+      const correction = knowledgePackCorrections[key];
+      const hasCorrection = String(correction || "").trim().length > 0;
+      next[key] = hasCorrection
+        ? {
+          ...(fact || {}),
+          value: normalizeKnowledgeCorrectionValue(key, correction),
+          confidence: 0.95,
+          status: "accepted",
+          sources: [...(Array.isArray(fact?.sources) ? fact.sources : []), "user-confirmed"],
+        }
+        : fact;
+    });
+    return next;
+  }, [knowledgePackCorrections, onboardingKnowledgeFacts]);
+  const knowledgeReviewFields = useMemo(
+    () => Object.entries(correctedKnowledgeFacts).filter(([, fact]) => {
+      const value = fact?.value;
+      const empty = Array.isArray(value) ? value.length === 0 : !String(value || "").trim();
+      return empty || Number(fact?.confidence || 0) < 0.78 || String(fact?.status || "") === "needs_review";
+    }),
+    [correctedKnowledgeFacts],
+  );
+  const correctedKnowledgeConfidence = useMemo(() => {
+    const rows = Object.values(correctedKnowledgeFacts);
+    if (!rows.length) {
+      return Number(onboardingKnowledgeValidation.overall_confidence || 0);
+    }
+    return rows.reduce((sum, fact) => sum + Number(fact?.confidence || 0), 0) / rows.length;
+  }, [correctedKnowledgeFacts, onboardingKnowledgeValidation.overall_confidence]);
+
+  function buildKnowledgePackPayload(rows = onboardingSourceDocs.rows) {
+    const validRows = (Array.isArray(rows) ? rows : []).filter((row) => String(row?.text || "").trim() && !String(row?.warning || "").trim());
+    return {
+      service: String(onboardingForm.name || monitoringAppForm.name || "kaiops-project").trim(),
+      environment: String(onboardingForm.environment || monitoringAppForm.environment || "prod").trim(),
+      owner_team: String(onboardingForm.owner_team || monitoringAppForm.owner_team || "platform-ops").trim(),
+      documents: validRows.map((row) => ({
+        name: String(row?.name || "uploaded-document").trim(),
+        category: String(row?.category || "knowledge_pack").trim(),
+        text: String(row?.text || ""),
+        excerpt: String(row?.excerpt || ""),
+      })),
+    };
+  }
+
+  async function draftKnowledgePack(rows = onboardingSourceDocs.rows) {
+    const payload = buildKnowledgePackPayload(rows);
+    if (!payload.documents.length) {
+      setKnowledgePackState({ loading: false, draft: null, error: "", success: "", approved: false });
+      setKnowledgePackCorrections({});
+      return null;
+    }
+    setKnowledgePackState((current) => ({ ...current, loading: true, error: "", success: "", approved: false }));
+    try {
+      const response = unwrap(await fetchJson("/api-gateway/knowledge-pack/draft", authenticatedOptions({
+        method: "POST",
+        body: JSON.stringify(payload),
+      })));
+      setKnowledgePackCorrections({});
+      setKnowledgePackState({ loading: false, draft: response?.knowledge_pack ? response : { knowledge_pack: response }, error: "", success: "", approved: false });
+      return response;
+    } catch (error) {
+      setKnowledgePackState((current) => ({ ...current, loading: false, error: error.message, success: "", approved: false }));
+      return null;
+    }
+  }
+
+  async function approveKnowledgePack() {
+    const payload = buildKnowledgePackPayload(onboardingSourceDocs.rows);
+    if (!payload.documents.length) {
+      setKnowledgePackState((current) => ({ ...current, error: "Upload at least one knowledge document before approval.", success: "" }));
+      return;
+    }
+    setKnowledgePackState((current) => ({ ...current, loading: true, error: "", success: "" }));
+    try {
+      const acceptedFacts = Object.fromEntries(
+        Object.entries(correctedKnowledgeFacts).map(([key, fact]) => [key, fact?.value]),
+      );
+      const response = unwrap(await fetchJson("/api-gateway/knowledge-pack/approve", authenticatedOptions({
+        method: "POST",
+        body: JSON.stringify({
+          ...payload,
+          accepted_facts: acceptedFacts,
+          approved_by: currentRole || "administrator",
+        }),
+      })));
+      setKnowledgePackState({
+        loading: false,
+        draft: response?.knowledge_pack ? response : { knowledge_pack: response },
+        error: "",
+        success: "Service Knowledge approved and saved to Alert Knowledge. Next, click Generate Documents & Rules to create reviewable artifacts.",
+        approved: true,
+      });
+      setOnboardingReviewAck((current) => ({ ...current, docs: true }));
+    } catch (error) {
+      setKnowledgePackState((current) => ({ ...current, loading: false, error: error.message, success: "", approved: false }));
+    }
+  }
+
+  function buildServiceKnowledgeGeneratedDocs({ projectName, selectedTool }) {
+    if (!onboardingKnowledgePack || !onboardingSourceDocRows.length) {
+      return [];
+    }
+    const factValue = (key, fallback = "") => {
+      const value = correctedKnowledgeFacts?.[key]?.value;
+      return value == null || value === "" ? fallback : value;
+    };
+    const asList = (value) => Array.isArray(value) ? value.filter((item) => String(item || "").trim()) : [value].filter((item) => String(item || "").trim());
+    const service = String(factValue("service", projectName || onboardingForm.name || "service")).trim();
+    const environment = String(factValue("environment", onboardingForm.environment || "prod")).trim();
+    const owner = String(factValue("owner_team", onboardingForm.owner_team || "platform-ops")).trim();
+    const alertPatterns = asList(factValue("alert_patterns", []));
+    const dependencies = asList(factValue("dependencies", []));
+    const commands = asList(factValue("commands", []));
+    const rollback = asList(factValue("rollback_plan", []));
+    const checks = asList(factValue("validation_checks", []));
+    const sourceLines = onboardingSourceDocRows.map((row) => `- ${String(row?.name || "service-knowledge").trim()}: ${String(row?.excerpt || "").trim()}`).join("\n");
+    const bulletSection = (title, rows, empty = "Not provided") => `${title}:\n${rows.length ? rows.map((item) => `- ${item}`).join("\n") : `- ${empty}`}`;
+    const metadata = {
+      project_name: String(projectName || service).trim(),
+      owner_team: owner,
+      environment,
+      selected_monitoring_tool: String(selectedTool || onboardingForm.monitoring_tool || "prometheus").trim(),
+      source_system: "service-knowledge",
+      knowledge_confidence: String(correctedKnowledgeConfidence || ""),
+    };
+    return [
+      {
+        kind: "runbook",
+        alert_id: `${service}-service-knowledge-runbook`,
+        alert_type: "service-knowledge-onboarding",
+        severity: "high",
+        title: `${service} Service Knowledge Runbook`,
+        summary: "Generated from uploaded Service Knowledge for triage, RCA, and remediation.",
+        content: [
+          `Service ${service} in ${environment}.`,
+          bulletSection("Alert patterns", alertPatterns),
+          bulletSection("Dependencies", dependencies),
+          bulletSection("Validation checks", checks),
+          bulletSection("Rollback plan", rollback),
+          "Source evidence:",
+          sourceLines || "- Uploaded Service Knowledge",
+        ].join("\n\n"),
+        services: [service],
+        deployment: environment,
+        dependencies,
+        commands,
+        queries: checks,
+        recommended_action: "Use this runbook during alert triage and update it after the first live incident.",
+        source_system: "service-knowledge",
+        resolved_by: owner,
+        metadata,
+      },
+      {
+        kind: "incident",
+        alert_id: `${service}-service-knowledge-incident`,
+        alert_type: "service-knowledge-baseline",
+        severity: "warning",
+        title: `${service} Service Knowledge Incident Baseline`,
+        summary: "Incident baseline generated from uploaded Service Knowledge.",
+        content: [
+          `Baseline incident guidance for ${service}.`,
+          bulletSection("Expected alert patterns", alertPatterns),
+          bulletSection("Known dependencies", dependencies),
+          bulletSection("Evidence", [sourceLines].filter(Boolean), "Uploaded Service Knowledge"),
+        ].join("\n\n"),
+        services: [service],
+        deployment: environment,
+        source_system: "service-knowledge",
+        resolved_by: owner,
+        metadata,
+      },
+    ];
+  }
 
   async function handleOnboardingSourceDocuments(files, category = "other") {
     const rows = Array.from(files || []);
@@ -3722,15 +4035,11 @@ export default function App() {
           warning: "",
         };
       }));
-      setOnboardingSourceDocs((current) => {
-        const existingRows = Array.isArray(current?.rows) ? current.rows : [];
-        const retainedRows = existingRows.filter((row) => String(row?.category || "other") !== category);
-        return {
-          loading: false,
-          rows: [...retainedRows, ...parsedRows],
-          error: "",
-        };
-      });
+      const existingRows = Array.isArray(onboardingSourceDocs.rows) ? onboardingSourceDocs.rows : [];
+      const retainedRows = existingRows.filter((row) => String(row?.category || "other") !== category);
+      const nextRows = [...retainedRows, ...parsedRows];
+      setOnboardingSourceDocs({ loading: false, rows: nextRows, error: "" });
+      await draftKnowledgePack(nextRows);
       const derived = parsedRows.flatMap((row) => (Array.isArray(row.derived_requirements) ? row.derived_requirements : []));
       if (derived.length) {
         const manual = String(onboardingForm.rule_onboarding_plain_language || "")
@@ -3751,6 +4060,73 @@ export default function App() {
         error: String(error?.message || "Failed to read uploaded documents."),
       }));
     }
+  }
+
+  async function handleAlertKnowledgeSourceDocument(files) {
+    const file = Array.from(files || [])[0];
+    if (!file) {
+      return;
+    }
+    const fileName = String(file?.name || "uploaded-document").trim() || "uploaded-document";
+    const extension = fileName.includes(".") ? fileName.split(".").pop().toLowerCase() : "";
+    setAlertKnowledgeSourceDoc((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      if (!ONBOARDING_SOURCE_DOC_EXTENSIONS.has(extension)) {
+        setAlertKnowledgeSourceDoc({
+          loading: false,
+          name: fileName,
+          size: Number(file?.size || 0),
+          text: "",
+          excerpt: "",
+          error: `Unsupported file type .${extension || "unknown"}. Upload a text-based file such as .md, .txt, .json, .csv, .yaml, or .log.`,
+        });
+        return;
+      }
+      const text = await file.text();
+      const excerpt = summarizeUploadedDocument(text);
+      const derivedRequirements = deriveMonitoringRequirementsFromDocument(fileName, text);
+      setAlertKnowledgeSourceDoc({
+        loading: false,
+        name: fileName,
+        size: Number(file?.size || 0),
+        text,
+        excerpt,
+        error: "",
+      });
+      if (!String(alertKnowledgePrompt || "").trim() && derivedRequirements.length) {
+        setAlertKnowledgePrompt(derivedRequirements.slice(0, 6).join("\n"));
+      }
+    } catch (error) {
+      setAlertKnowledgeSourceDoc({
+        loading: false,
+        name: fileName,
+        size: Number(file?.size || 0),
+        text: "",
+        excerpt: "",
+        error: String(error?.message || "Failed to read the uploaded alert knowledge document."),
+      });
+    }
+  }
+
+  function buildAlertKnowledgePromptInput() {
+    const prompt = String(alertKnowledgePrompt || "").trim();
+    const sourceText = String(alertKnowledgeSourceDoc?.text || "").trim();
+    if (!sourceText) {
+      return prompt;
+    }
+    const sourceName = String(alertKnowledgeSourceDoc?.name || "uploaded alert knowledge document").trim();
+    const sourceExcerpt = String(alertKnowledgeSourceDoc?.excerpt || "").trim();
+    const sourceBlock = [
+      `Supporting document: ${sourceName}`,
+      sourceExcerpt ? `Extracted summary: ${sourceExcerpt}` : "",
+      "Document content:",
+      sourceText.slice(0, 12000),
+    ].filter(Boolean).join("\n");
+    return [prompt, sourceBlock].filter(Boolean).join("\n\n");
+  }
+
+  function clearAlertKnowledgeSourceDocument() {
+    setAlertKnowledgeSourceDoc({ loading: false, name: "", size: 0, text: "", excerpt: "", error: "" });
   }
 
   function applyUploadedDocumentsToRuleIntent() {
@@ -4001,7 +4377,10 @@ export default function App() {
       } else {
         setOnboardingRuleRunState((current) => ({ ...current, loading: false }));
       }
-      const generatedDocs = Array.isArray(completePayload?.rag_documents) ? completePayload.rag_documents : [];
+      const backendGeneratedDocs = Array.isArray(completePayload?.rag_documents) ? completePayload.rag_documents : [];
+      const generatedDocs = backendGeneratedDocs.length
+        ? backendGeneratedDocs
+        : buildServiceKnowledgeGeneratedDocs({ projectName: payload.project.name, selectedTool: selectedMonitoringTool });
       setOnboardingGeneratedDocs(generatedDocs);
 
       setSelectedOnboardingProject(String(payload.project.name || "").trim());
@@ -4018,13 +4397,18 @@ export default function App() {
         success: shouldStartRuleOnboarding
           ? generatedDocs.length
             ? `Workflow completed through step ${workflowSteps.length || 0}. Review generated documents and click Approve.`
-            : `Workflow completed through step ${workflowSteps.length || 0}. No documents were generated.`
+            : onboardingSourceDocCount > 0
+              ? `Workflow completed through step ${workflowSteps.length || 0}. Generated ${generatedDocs.length} Service Knowledge document(s) for review.`
+              : `Workflow completed through step ${workflowSteps.length || 0}. No Service Knowledge file was uploaded.`
           : onboardingSourceDocCount > 0
             ? knowledgeAutoGenerated
-              ? "Project onboarding saved. Alert Knowledge Onboarding draft was auto-generated from uploaded source documents."
-              : "Project onboarding saved. Uploaded docs were detected, but Alert Knowledge auto-generation failed; use manual prompt flow below."
-            : "Project onboarding saved. No source docs uploaded; continue with manual Alert Knowledge prompt and click Create Alert Onboarding Doc.",
+              ? "Project onboarding saved. Alert Knowledge Onboarding draft was auto-generated from Service Knowledge."
+              : "Project onboarding saved. Service Knowledge was detected, but Alert Knowledge auto-generation failed; use manual prompt flow below."
+            : "Project onboarding saved. No Service Knowledge uploaded; continue with manual Alert Knowledge prompt and click Create Alert Onboarding Doc.",
       }));
+      if (adminWorkspace === "project" && projectSetupStep === "setup") {
+        setProjectSetupStep("docs_rules");
+      }
       if (onboardingSourceDocCount === 0) {
         setAlertKnowledgeView("onboarding");
       }
@@ -4313,6 +4697,75 @@ export default function App() {
     }
   }
 
+  function backendDocumentPreview(doc) {
+    const summary = String(doc?.summary || "").trim();
+    const action = String(doc?.recommended_action || "").trim();
+    const content = String(doc?.content || "").trim();
+    const rootCause = String(doc?.root_cause || "").trim();
+    const impact = String(doc?.impact || "").trim();
+    const fallback = [rootCause, impact, action].filter(Boolean).join(" ");
+    return String(summary || content || fallback || "Open the document view to inspect backend metadata and download the document.")
+      .replace(/\s+/g, " ")
+      .slice(0, 240);
+  }
+
+  async function downloadConsolidatedAlertDocument(docs) {
+    const rows = Array.isArray(docs) ? docs.filter(Boolean) : [];
+    if (!rows.length) {
+      return;
+    }
+    const alertName = String(selectedAlertRow?.name || selectedAlertId || "alert").trim();
+    const service = String(selectedAlertRow?.service || rows[0]?.services?.[0] || rows[0]?.service || "service").trim();
+    try {
+      const sections = [];
+      for (const [index, doc] of rows.entries()) {
+        const path = String(doc?.path || "").trim();
+        let full = {};
+        if (path) {
+          try {
+            full = unwrap(await fetchJson(`/api-gateway/rag/documents/content?path=${encodeURIComponent(path)}`, authenticatedOptions()));
+          } catch (_error) {
+            full = {};
+          }
+        }
+        const title = String(full?.title || doc?.title || `Document ${index + 1}`).trim();
+        sections.push([
+          `## ${title}`,
+          "",
+          `Kind: ${String(full?.kind || doc?.kind || doc?.document_kind || "document").trim()}`,
+          doc?.match_reason ? `Match reason: ${String(doc.match_reason).trim()}` : "",
+          doc?.match_confidence ? `Match confidence: ${Math.round(Number(doc.match_confidence) * 100)}%` : "",
+          full?.summary || doc?.summary ? `Summary: ${String(full?.summary || doc?.summary).trim()}` : "",
+          "",
+          String(full?.content || doc?.content || doc?.recommended_action || "Document content is available in backend metadata.").trim(),
+        ].filter((line) => line !== "").join("\n"));
+      }
+      const content = [
+        `# ${service} Alert Knowledge Document`,
+        "",
+        `Alert: ${alertName}`,
+        `Service: ${service}`,
+        `Linked backend documents: ${rows.length}`,
+        "",
+        ...sections,
+      ].join("\n\n");
+      const safeName = `${service || "service"}-${alertName || "alert"}-knowledge`
+        .replace(/[^a-zA-Z0-9._-]+/g, "-")
+        .replace(/^-+|-+$/g, "") || "alert-knowledge";
+      const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = `${safeName}.md`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      setRagDocs((current) => ({ ...current, error: `Download failed: ${String(error?.message || "Unknown error")}` }));
+    }
+  }
+
   function hasAlertDocuments(alertRow) {
     if (!alertRow || typeof alertRow !== "object") {
       return false;
@@ -4507,13 +4960,14 @@ export default function App() {
   }
 
   async function generateAlertKnowledgeDraftFromPrompt() {
-    const prompt = String(alertKnowledgePrompt || "").trim();
+    const prompt = buildAlertKnowledgePromptInput();
     if (!prompt) {
-      setAlertOnboardingState({ loading: false, result: null, error: "Enter a prompt to generate the document draft." });
+      setAlertOnboardingState({ loading: false, result: null, error: "Enter a prompt or upload a supporting document to generate the document draft." });
       return;
     }
 
     const normalizedKind = String(alertOnboarding.kind || "incident").trim().toLowerCase();
+    const sourceDocName = String(alertKnowledgeSourceDoc?.name || "").trim();
     const lines = prompt
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -4653,6 +5107,7 @@ export default function App() {
             alert_type: String(alertOnboarding.alert_type || "").trim(),
             services: String(alertOnboarding.services || "").trim(),
             user_prompt: prompt,
+            source_document: sourceDocName || null,
           },
         }),
       }));
@@ -4702,8 +5157,9 @@ export default function App() {
       loading: false,
       result: {
         message: aiDraft
-          ? "Draft generated from prompt using AI + heuristics. Review and click Create Alert Onboarding Doc."
-          : "Draft generated from prompt using heuristics fallback. Review and click Create Alert Onboarding Doc.",
+          ? `Draft generated from ${sourceDocName ? "prompt + document" : "prompt"} using AI + heuristics. Review and click Create Alert Onboarding Doc.`
+          : `Draft generated from ${sourceDocName ? "prompt + document" : "prompt"} using heuristics fallback. Review and click Create Alert Onboarding Doc.`,
+        source_document: sourceDocName || null,
         ai_usage: aiUsage,
       },
       error: "",
@@ -4900,7 +5356,7 @@ export default function App() {
     const safeProject = String(projectName || onboardingForm.name || "").trim() || "Project";
     const summary = `Auto-generated from ${sourceRows.length} uploaded source document(s).`;
     const evidenceLines = sourceRows.slice(0, 8).map((row) => {
-      const label = ONBOARDING_SOURCE_DOC_BUCKETS.find((bucket) => bucket.key === String(row?.category || "other"))?.label || "Other Evidence";
+      const label = onboardingSourceDocCategoryLabel(row?.category);
       const excerpt = String(row?.excerpt || "").trim();
       return `- [${label}] ${String(row?.name || "uploaded-document").trim()}${excerpt ? `: ${excerpt}` : ""}`;
     });
@@ -4945,7 +5401,7 @@ export default function App() {
         loading: false,
         result: {
           ...response,
-          message: "Alert Knowledge Onboarding auto-generated from uploaded source documents.",
+          message: "Alert Knowledge Onboarding auto-generated from Service Knowledge.",
         },
         error: "",
       });
@@ -5427,6 +5883,47 @@ export default function App() {
     },
     [selectedAlertDocumentLinks.rows, selectedAlertRow, ragDocs.rows],
   );
+
+  const selectedAlertKnowledgeDocument = useMemo(() => {
+    const seen = new Set();
+    const docs = selectedAlertRagDocuments.filter((doc) => {
+      const key = String(doc?.path || doc?.title || doc?.document_id || "").trim().toLowerCase();
+      if (!key) {
+        return true;
+      }
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+    if (!docs.length) {
+      return null;
+    }
+    const first = docs[0] || {};
+    const service = Array.isArray(first.services) ? first.services.join(", ") : String(first.services || selectedAlertRow?.service || "-");
+    const severity = String(first.severity || selectedAlertRow?.severity || "-").toLowerCase();
+    const kinds = Array.from(new Set(docs.map((doc) => String(doc?.kind || doc?.document_kind || "document").trim()).filter(Boolean)));
+    const reasons = Array.from(new Set(docs.map((doc) => String(doc?.match_reason || "").trim()).filter(Boolean)));
+    const confidence = docs
+      .map((doc) => Number(doc?.match_confidence || 0))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .sort((a, b) => b - a)[0];
+    return {
+      title: docs.length === 1
+        ? String(first.title || first.path || "Alert Knowledge Document").trim()
+        : `${selectedAlertRow?.service || service || "Alert"} Knowledge Document`,
+      summary: docs.length === 1
+        ? String(first.summary || first.recommended_action || "Backend-linked document is available for download.").trim()
+        : `Single dashboard document composed from ${docs.length} backend-linked knowledge source(s).`,
+      service,
+      severity,
+      kinds,
+      reasons,
+      confidence,
+      docs,
+    };
+  }, [selectedAlertRagDocuments, selectedAlertRow]);
 
   const selectedAlertDocumentContract = selectedAlertDocumentLinks.contract;
 
@@ -6290,14 +6787,36 @@ export default function App() {
 
   function approvalRecommendationFromPayload(payload) {
     const normalized = payload && typeof payload === "object" ? payload : {};
+    const data = normalized.data && typeof normalized.data === "object" ? normalized.data : {};
     const recommendation = normalized.recommendation && typeof normalized.recommendation === "object"
       ? normalized.recommendation
+      : data.recommendation && typeof data.recommendation === "object"
+        ? data.recommendation
+        : {};
+    const approval = normalized.approval && typeof normalized.approval === "object"
+      ? normalized.approval
+      : data.approval && typeof data.approval === "object"
+        ? data.approval
+        : {};
+    const sourcePayload = normalized.source_payload && typeof normalized.source_payload === "object"
+      ? normalized.source_payload
+      : data.source_payload && typeof data.source_payload === "object"
+        ? data.source_payload
+        : {};
+    const sourceRecommendation = sourcePayload.recommendation && typeof sourcePayload.recommendation === "object"
+      ? sourcePayload.recommendation
       : {};
     const candidates = [
       normalized.recommendation_id,
+      data.recommendation_id,
       recommendation.id,
+      approval.recommendation_id,
       normalized.remediation_recommendation_id,
+      data.remediation_recommendation_id,
       normalized.recommended_action_id,
+      data.recommended_action_id,
+      sourcePayload.recommendation_id,
+      sourceRecommendation.id,
     ];
     for (const candidate of candidates) {
       const token = String(candidate || "").trim();
@@ -6306,6 +6825,33 @@ export default function App() {
       }
     }
     return "";
+  }
+
+  function mergeRecommendationIdIntoApprovalRow(incidentId, recommendationId) {
+    const normalizedIncidentId = String(incidentId || "").trim();
+    const normalizedRecommendationId = String(recommendationId || "").trim();
+    if (!normalizedIncidentId || !looksLikeUuid(normalizedRecommendationId)) {
+      return;
+    }
+    const patchRow = (row) => {
+      const rowIncidentId = approvalIncidentId(row);
+      if (rowIncidentId !== normalizedIncidentId) {
+        return row;
+      }
+      return {
+        ...row,
+        recommendation_id: normalizedRecommendationId,
+        remediation_recommendation_id: row?.remediation_recommendation_id || normalizedRecommendationId,
+      };
+    };
+    setIncidentMetadata((prev) => ({
+      ...prev,
+      rows: Array.isArray(prev.rows) ? prev.rows.map(patchRow) : prev.rows,
+    }));
+    setAlerts((prev) => ({
+      ...prev,
+      rows: Array.isArray(prev.rows) ? prev.rows.map(patchRow) : prev.rows,
+    }));
   }
 
   function approvalFlowFromPayload(payload) {
@@ -6353,7 +6899,8 @@ export default function App() {
       error: "",
     }));
     try {
-      const response = await fetchJson(`/api-gateway/approval/incident/${encodeURIComponent(normalized)}`);
+      const options = adminHeaders().Authorization ? authenticatedOptions() : {};
+      const response = await fetchJson(`/api-gateway/approval/incident/${encodeURIComponent(normalized)}`, options);
       const payload = unwrap(response);
       const recommendationId = approvalRecommendationFromPayload(payload);
       setApprovalIncidentContext({ loading: false, incident_id: normalized, payload, error: "" });
@@ -6363,6 +6910,7 @@ export default function App() {
         lastFetchedAt: Date.now(),
       };
       if (recommendationId) {
+        mergeRecommendationIdIntoApprovalRow(normalized, recommendationId);
         setApprovalForm((current) => ({
           ...current,
           incident_id: normalized || current.incident_id,
@@ -6721,7 +7269,7 @@ export default function App() {
   }
 
   const approvalReady = useMemo(() => {
-    const hasBase = String(approvalForm.incident_id || "").trim() && String(approvalForm.recommendation_id || "").trim() && String(approvalForm.approver || "").trim();
+    const hasBase = String(approvalForm.incident_id || selectedApprovalIncidentId || "").trim() && String(approvalForm.approver || "").trim();
     if (!hasBase) {
       return false;
     }
@@ -6780,11 +7328,18 @@ export default function App() {
       }
     }
 
-    const response = await fetchJson(`/api-gateway/approval/incident/${encodeURIComponent(normalizedIncidentId)}`);
+    const options = adminHeaders().Authorization ? authenticatedOptions() : {};
+    const response = await fetchJson(`/api-gateway/approval/incident/${encodeURIComponent(normalizedIncidentId)}`, options);
     const payload = unwrap(response);
     const resolved = approvalRecommendationFromPayload(payload);
     if (looksLikeUuid(resolved)) {
       setApprovalIncidentContext({ loading: false, incident_id: normalizedIncidentId, payload, error: "" });
+      mergeRecommendationIdIntoApprovalRow(normalizedIncidentId, resolved);
+      setApprovalForm((current) => ({
+        ...current,
+        incident_id: normalizedIncidentId || current.incident_id,
+        recommendation_id: resolved || current.recommendation_id,
+      }));
       return resolved;
     }
     return "";
@@ -6793,12 +7348,14 @@ export default function App() {
   async function approveIncidentRow(row) {
     const incidentId = approvalIncidentId(row);
     const rowRecommendationId = approvalRecommendationId(row);
-    const recommendationId = await resolveRecommendationIdForIncident(incidentId, rowRecommendationId);
-
     setSelectedApprovalIncidentId(incidentId);
     setApprovalState({ loading: true, result: null, error: "" });
 
     try {
+      const recommendationId = await resolveRecommendationIdForIncident(incidentId, rowRecommendationId);
+      if (!looksLikeUuid(recommendationId)) {
+        throw new Error("Recommendation ID is still unavailable after syncing approval context. Re-run the incident workflow or open the incident details to regenerate the recommendation.");
+      }
       const response = await executeApprovalAction({
         incidentId,
         recommendationId,
@@ -6813,14 +7370,14 @@ export default function App() {
         incident_id: incidentId || current.incident_id,
         recommendation_id: recommendationId || current.recommendation_id,
       }));
-      applyApprovalResolutionToUi(incidentId, "approved", approvalForm.comment);
+      applyApprovalResolutionToUi(incidentId, "remediating", approvalForm.comment);
       setApprovalState({ loading: false, result: response, error: "" });
-      await loadApprovalIncidentContext(incidentId, { force: true });
-      await refreshApprovalDrivenViews(incidentId);
+      loadApprovalIncidentContext(incidentId, { force: true });
+      refreshApprovalDrivenViewsSoon(incidentId);
     } catch (error) {
       const raw = String(error?.message || "");
       const concise = raw.includes("HTTP 422")
-        ? "Inline approve needs a valid recommendation_id. Use Sync From Approval API first if this row has not been enriched yet."
+        ? "Inline approve could not submit because the approval service rejected the recommendation_id. I synced the context automatically; if this persists, rerun the incident workflow."
         : raw;
       setApprovalState({ loading: false, result: null, error: concise });
     }
@@ -6829,12 +7386,14 @@ export default function App() {
   async function rejectIncidentRow(row) {
     const incidentId = approvalIncidentId(row);
     const rowRecommendationId = approvalRecommendationId(row);
-    const recommendationId = await resolveRecommendationIdForIncident(incidentId, rowRecommendationId);
-
     setSelectedApprovalIncidentId(incidentId);
     setApprovalState({ loading: true, result: null, error: "" });
 
     try {
+      const recommendationId = await resolveRecommendationIdForIncident(incidentId, rowRecommendationId);
+      if (!looksLikeUuid(recommendationId)) {
+        throw new Error("Recommendation ID is still unavailable after syncing approval context. Re-run the incident workflow or open the incident details to regenerate the recommendation.");
+      }
       const response = await executeApprovalAction({
         incidentId,
         recommendationId,
@@ -6850,15 +7409,15 @@ export default function App() {
         recommendation_id: recommendationId || current.recommendation_id,
         comment: inlineRejectState.comment || current.comment,
       }));
-      applyApprovalResolutionToUi(incidentId, "rejected", inlineRejectState.comment);
+      applyApprovalResolutionToUi(incidentId, "failed", inlineRejectState.comment);
       setInlineRejectState({ incidentId: "", comment: "" });
       setApprovalState({ loading: false, result: response, error: "" });
-      await loadApprovalIncidentContext(incidentId, { force: true });
-      await refreshApprovalDrivenViews(incidentId);
+      loadApprovalIncidentContext(incidentId, { force: true });
+      refreshApprovalDrivenViewsSoon(incidentId);
     } catch (error) {
       const raw = String(error?.message || "");
       const concise = raw.includes("HTTP 422")
-        ? "Inline reject needs a valid recommendation_id. Use Sync From Approval API first if this row has not been enriched yet."
+        ? "Inline reject could not submit because the approval service rejected the recommendation_id. I synced the context automatically; if this persists, rerun the incident workflow."
         : raw;
       setApprovalState({ loading: false, result: null, error: concise });
     }
@@ -6892,11 +7451,11 @@ export default function App() {
         comment: approvalForm.comment,
         modifiedAction: approvalForm.modified_action,
       });
-      const actionStatus = approvalForm.action === "reject" ? "rejected" : "approved";
+      const actionStatus = approvalForm.action === "reject" ? "failed" : "remediating";
       applyApprovalResolutionToUi(incidentId, actionStatus, approvalForm.comment);
       setApprovalState({ loading: false, result: response, error: "" });
-      await loadApprovalIncidentContext(incidentId, { force: true });
-      await refreshApprovalDrivenViews(incidentId);
+      loadApprovalIncidentContext(incidentId, { force: true });
+      refreshApprovalDrivenViewsSoon(incidentId);
     } catch (error) {
       const raw = String(error?.message || "");
       const concise = raw.includes("HTTP 422")
@@ -7143,7 +7702,7 @@ export default function App() {
       0,
     );
     if (isSetupMonitoringPath && !String(onboardingForm.rule_onboarding_plain_language || "").trim() && derivedRequirementCount === 0) {
-      errors.push("Add plain-English rule intent or upload source documents that produce derived requirements.");
+      errors.push("Add plain-English rule intent or upload one Service Knowledge file that produces derived requirements.");
     }
     if (isSetupMonitoringPath && !String(onboardingForm.monitoring_url || "").trim()) {
       errors.push("Prometheus endpoint URL is required for Configure Prometheus Monitoring path.");
@@ -7167,7 +7726,7 @@ export default function App() {
   const onboardingAdvisory = useMemo(() => {
     const onboardingPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim();
     if (onboardingPath === "existing_monitoring") {
-      return "Existing monitoring path: upload past tickets, troubleshooting docs, RCA/resolution docs, and logs; save project; then send alerts to /alerts/alertmanager to trigger workflow.";
+      return "Existing monitoring path: upload one Service Knowledge file, save project, then send alerts to /alerts/alertmanager to trigger workflow.";
     }
     if (String(onboardingForm.deployment_mode || "").trim() !== "on_prem") {
       return "";
@@ -7281,8 +7840,7 @@ export default function App() {
       .filter(Boolean),
     [onboardingForm.rule_onboarding_plain_language],
   );
-  const onboardingRulePromptVisible = String(onboardingForm.onboarding_path || "").trim() === "setup_monitoring"
-    && (onboardingSourceDocCount > 0 || onboardingRulePromptLines.length > 0 || onboardingGeneratedRuleRows.length > 0);
+  const onboardingRulePromptVisible = onboardingSourceDocCount > 0 || onboardingRulePromptLines.length > 0 || onboardingGeneratedRuleRows.length > 0;
   const onboardingMetadataRows = useMemo(() => {
     const currentProject = String(selectedOnboardingProject || onboardingForm.name || "").trim();
     const rows = Array.isArray(onboardingState.rows) ? onboardingState.rows : [];
@@ -7332,8 +7890,8 @@ export default function App() {
       return "Documents approved. You can continue with another update or proceed to advanced workflow management.";
     }
     return onboardingPath === "setup_monitoring"
-      ? "Complete Setup Core: choose project mode, configure Prometheus, upload source docs, then save."
-      : "Complete Setup Core: choose project mode, choose landing-pad path, upload source docs, then save.";
+      ? "Step 1: save monitoring setup. Step 2: add Service Knowledge and generate rules."
+      : "Step 1: save monitoring setup and landing pad. Step 2: add Service Knowledge and generate documents.";
   }, [
     onboardingState.loading,
     onboardingHasPendingDocumentApproval,
@@ -7344,7 +7902,7 @@ export default function App() {
   const adminWorkspaceCaptions = useMemo(() => ({
     users: "Manage users, roles, and credentials.",
     monitoring: "Setup monitoring foundations, landing pad routing, and rule/doc generation.",
-    project: "Unified setup: monitoring registration, landing pad routing, and generated artifact review.",
+    project: "Two-step setup: connect monitoring first, then add documents and rules.",
     alerts: "Alert knowledge onboarding and bulk document ingestion.",
   }), []);
   const adminJourneyStep = useMemo(() => {
@@ -7434,28 +7992,24 @@ export default function App() {
   ]);
   const projectStepCards = useMemo(() => {
     const setupSaved = Boolean(String(onboardingState.success || "").trim()) && !onboardingState.loading && !onboardingState.error;
-    const setupDone = Boolean(String(onboardingForm.name || "").trim()) && (onboardingSourceDocCount > 0 || setupSaved || onboardingWorkflowSteps.length > 0);
-    const reviewDone = onboardingGeneratedDocs.length > 0 ? Boolean(onboardingDocApprovalState.approved) : setupDone;
-    const statusDone = Boolean(onboardingWorkflowSteps.length || onboardingRuleRunState.result || setupSaved);
-    const knowledgeDone = Boolean(alertOnboardingState.result || onboardingGeneratedDocs.length);
+    const monitoringDone = Boolean(String(onboardingForm.name || "").trim())
+      && Boolean(String(onboardingForm.owner_team || "").trim())
+      && Boolean(String(onboardingForm.region || "").trim());
+    const docsRulesDone = Boolean(onboardingSourceDocCount > 0 || onboardingRulePromptLines.length > 0 || onboardingGeneratedDocs.length > 0 || setupSaved);
     return [
-      { id: "setup", label: "1. Project Setup", hint: "Project, path, connection, and source docs", complete: setupDone },
-      { id: "review", label: "2. Review Artifacts", hint: "Generated rules, docs, and metadata", complete: reviewDone },
-      { id: "status", label: "3. Validate Flow", hint: "Workflow outputs and generated assets", complete: statusDone },
-      { id: "knowledge", label: "4. Knowledge", hint: "Alert docs and remediation guidance", complete: knowledgeDone },
-      { id: "advanced", label: "5. Advanced", hint: "Expert controls and adapter contracts", complete: false },
+      { id: "setup", label: "1. Setup Monitoring", hint: "Project, tool, endpoint, landing pad", complete: monitoringDone },
+      { id: "docs_rules", label: "2. Documents & Rules", hint: "Service Knowledge, confidence, rule prompt", complete: docsRulesDone },
     ];
   }, [
     onboardingForm.name,
+    onboardingForm.owner_team,
+    onboardingForm.region,
     onboardingSourceDocCount,
+    onboardingRulePromptLines.length,
     onboardingState.success,
     onboardingState.loading,
     onboardingState.error,
     onboardingGeneratedDocs.length,
-    onboardingDocApprovalState.approved,
-    onboardingWorkflowSteps.length,
-    onboardingRuleRunState.result,
-    alertOnboardingState.result,
   ]);
   const showProjectStep = (stepId) => adminWorkspace !== "project" || projectSetupShowAll || projectSetupStep === stepId;
   const navigateAdminJourney = (stepId) => {
@@ -7464,8 +8018,7 @@ export default function App() {
       return;
     }
     if (stepId === "knowledge") {
-      setAdminWorkspace("project");
-      setProjectSetupStep("setup");
+      setAdminWorkspace("alerts");
       setProjectSetupShowAll(false);
       setAlertKnowledgeView("onboarding");
       return;
@@ -8400,23 +8953,9 @@ export default function App() {
                   </div>
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
                     <button type="button" className="button-primary" onClick={() => openAlertDetails(selectedAlertRow)}>Inspect Cockpit</button>
-                    <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("evidence")}>View Evidence</button>
-                    <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("documents")}>View Documents</button>
-                    <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("approval")}>Approval Decision</button>
-                    {canProvideAlertDocuments ? (
-                      <button
-                        type="button"
-                        className="button-secondary"
-                        onClick={() => openDocumentPrompt(selectedAlertRow)}
-                        disabled={selectedAlertActionContext?.alertClosed}
-                      >
-                        {selectedAlertActionContext?.documentAvailable ? "Manage Alert Docs" : "Provide Alert Docs"}
-                      </button>
-                    ) : (
-                      <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("approval")}>
-                        Escalate To L2/L3
-                      </button>
-                    )}
+                    <span className="cockpit-action-note">
+                      Evidence, documents, approval, remediation, and timeline are inside the cockpit.
+                    </span>
                   </div>
                   <div className="alert-rule-summary-grid">
                     <article className="alert-rule-summary-card">
@@ -8653,28 +9192,57 @@ export default function App() {
                   {(() => {
                     const matchedApproval = resolvePendingApprovalFromAlertRow(selectedAlertRow);
                     const incidentId = approvalIncidentId(matchedApproval);
-                    const status = normalizeApprovalStatus(matchedApproval?.status || selectedAlertRow?.status);
+                    const status = normalizeApprovalStatus(
+                      matchedApproval?.status
+                      || selectedAlertRow?.status
+                      || selectedAlertRow?.state
+                      || selectedAlertWorkflow?.incident?.status
+                    );
                     const isResolved = isApprovalResolvedStatus(status);
+                    const requiresApproval = Boolean(
+                      matchedApproval
+                      || selectedExecutionPlan?.requiresApproval
+                      || selectedAlertRouting?.requires_approval
+                      || selectedAlertWorkflow?.approval?.required
+                      || selectedAlertWorkflow?.decision?.requires_approval
+                      || isApprovalPendingStatus(status)
+                    );
+                    const hasActionableApproval = Boolean(matchedApproval && !isResolved);
+
+                    if (!requiresApproval) {
+                      return null;
+                    }
+
                     return (
-                      <article className="panel" style={{ marginBottom: 10, borderColor: "#ef9a9a", boxShadow: "0 10px 24px rgba(183, 28, 28, 0.14)" }}>
+                      <article
+                        className="panel"
+                        style={{
+                          marginBottom: 10,
+                          borderColor: hasActionableApproval ? "#ef9a9a" : "#c7d7ea",
+                          boxShadow: hasActionableApproval ? "0 10px 24px rgba(183, 28, 28, 0.14)" : "none",
+                        }}
+                      >
                         <div className="panel-head">
                           <h3>Decision Gate</h3>
                         </div>
                         <p className="subtitle">
-                          {matchedApproval
+                          {hasActionableApproval
                             ? `Matched incident ${incidentId || "-"} with status ${status || "pending"}.`
-                            : "No pending approval incident matched this alert yet."}
+                            : matchedApproval
+                              ? `Approval is already ${status || "resolved"} for this incident.`
+                              : "This workflow indicates approval may be required, but no active pending approval row is linked yet."}
                         </p>
                         <div className="table-wrap">
                           <table>
                             <tbody>
                               <tr><th>Incident</th><td>{incidentId || "-"}</td></tr>
-                              <tr><th>Status</th><td>{status || "pending"}</td></tr>
+                              <tr><th>Status</th><td>{status || (hasActionableApproval ? "pending" : "not active")}</td></tr>
                               <tr><th>Role Eligible</th><td>{canUseApprovalActions ? "yes" : "no"}</td></tr>
                             </tbody>
                           </table>
                         </div>
-                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        {hasActionableApproval ? (
+                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                           <button
                             type="button"
                             className="button-secondary"
@@ -8694,7 +9262,7 @@ export default function App() {
                           >
                             Review Decision
                           </button>
-                          {canUseApprovalActions && matchedApproval && !isResolved ? (
+                          {canUseApprovalActions ? (
                             <button
                               type="button"
                               className="button-secondary"
@@ -8704,7 +9272,8 @@ export default function App() {
                               Load Decision Form
                             </button>
                           ) : null}
-                        </div>
+                          </div>
+                        ) : null}
                       </article>
                     );
                   })()}
@@ -8976,54 +9545,50 @@ export default function App() {
                           {" | "}Reasons: {(selectedAlertDocumentContract.document_link_summary.match_reasons || []).join(", ") || "-"}
                         </p>
                       ) : null}
-                      {selectedAlertRagDocuments.length ? (
-                        <div className="alert-document-download-grid">
-                          {selectedAlertRagDocuments.map((doc, index) => {
-                            const services = Array.isArray(doc?.services) ? doc.services.join(", ") : String(doc?.services || "-");
-                            const severity = String(doc?.severity || "-").toLowerCase();
-                            const docScope = doc?.document_scope || (doc?.alert_id ? "alert-specific" : "service-level");
-                            const docMetadata = doc?.metadata && typeof doc.metadata === "object" ? doc.metadata : {};
-                            let docEvaluation = docMetadata.evaluation;
-                            if (typeof docEvaluation === "string" && docEvaluation.trim().startsWith("{")) {
-                              try {
-                                docEvaluation = JSON.parse(docEvaluation);
-                              } catch (_error) {
-                                docEvaluation = null;
-                              }
-                            }
-                            const normalizedDocEvaluation = docEvaluation && typeof docEvaluation === "object"
-                              ? normalizeEvaluationEnvelope(docEvaluation)
-                              : null;
-                            return (
-                              <article className="alert-document-download-card" key={`${doc?.path || "doc"}-${index}`}>
-                                <div>
-                                  <span className="workflow-pill workflow-pill-clear">{doc?.kind || doc?.document_kind || "document"}</span>
-                                  <span className="workflow-pill workflow-pill-idle" style={{ marginLeft: 6 }}>{docScope}</span>
-                                  <h4>{doc?.title || doc?.path || "Alert document"}</h4>
-                                  <p>{doc?.summary || doc?.recommended_action || "Document content is available for download."}</p>
-                                </div>
-                                <div className="alert-document-meta">
-                                  <span>Alert: {doc?.alert_id || selectedAlertId || "-"}</span>
-                                  <span>Service: {services || "-"}</span>
-                                  <span>Severity: {severity !== "-" ? severity : "-"}</span>
-                                  <span>Match: {doc?.match_reason || "local-fallback"} {doc?.match_confidence ? `(${Math.round(Number(doc.match_confidence) * 100)}%)` : ""}</span>
-                                  {normalizedDocEvaluation ? (
-                                    <span>Quality: {formatQualityPercent(normalizedDocEvaluation.overallScore)} | Grounding: {formatQualityPercent(normalizedDocEvaluation.groundingScore)}</span>
-                                  ) : null}
-                                  <span title={doc?.path || ""}>Path: {doc?.path || "-"}</span>
-                                </div>
-                                <button
-                                  type="button"
-                                  className="button-primary"
-                                  onClick={() => downloadRagDocument(doc)}
-                                  disabled={!doc?.path}
-                                >
-                                  Download
-                                </button>
-                              </article>
-                            );
-                          })}
-                        </div>
+                      {selectedAlertKnowledgeDocument ? (
+                        <article className="alert-document-download-card alert-document-download-card-single">
+                          <div>
+                            <span className="workflow-pill workflow-pill-clear">knowledge document</span>
+                            <span className="workflow-pill workflow-pill-idle" style={{ marginLeft: 6 }}>
+                              {selectedAlertKnowledgeDocument.docs.length} source{selectedAlertKnowledgeDocument.docs.length === 1 ? "" : "s"}
+                            </span>
+                            <h4>{selectedAlertKnowledgeDocument.title}</h4>
+                            <p>{selectedAlertKnowledgeDocument.summary}</p>
+                          </div>
+                          <div className="alert-document-meta">
+                            <span>Alert: {selectedAlertId || "-"}</span>
+                            <span>Service: {selectedAlertKnowledgeDocument.service || "-"}</span>
+                            <span>Severity: {selectedAlertKnowledgeDocument.severity !== "-" ? selectedAlertKnowledgeDocument.severity : "-"}</span>
+                            <span>Types: {selectedAlertKnowledgeDocument.kinds.join(", ") || "document"}</span>
+                            <span>Match: {selectedAlertKnowledgeDocument.reasons.join(", ") || "backend-linked"} {selectedAlertKnowledgeDocument.confidence ? `(${Math.round(Number(selectedAlertKnowledgeDocument.confidence) * 100)}%)` : ""}</span>
+                          </div>
+                          <details className="alert-document-source-list">
+                            <summary>Included backend document metadata</summary>
+                            <div className="table-wrap" style={{ marginTop: 8 }}>
+                              <table>
+                                <thead>
+                                  <tr><th>Type</th><th>Title</th><th>Path</th></tr>
+                                </thead>
+                                <tbody>
+                                  {selectedAlertKnowledgeDocument.docs.map((doc, index) => (
+                                    <tr key={`${doc?.path || doc?.title || "doc"}-${index}`}>
+                                      <td>{doc?.kind || doc?.document_kind || "document"}</td>
+                                      <td>{doc?.title || "-"}</td>
+                                      <td>{doc?.path || "-"}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </details>
+                          <button
+                            type="button"
+                            className="button-primary"
+                            onClick={() => downloadConsolidatedAlertDocument(selectedAlertKnowledgeDocument.docs)}
+                          >
+                            Download Single Document
+                          </button>
+                        </article>
                       ) : (
                         <div className="alert-documents-empty">
                           <div>
@@ -9697,18 +10262,18 @@ export default function App() {
                       <div className="table-wrap table-wrap-scroll-x">
                         <table>
                           <thead>
-                            <tr><th>ID</th><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Actions</th></tr>
+                            <tr><th>ID</th><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Active</th><th>Actions</th></tr>
                           </thead>
                           <tbody>
                             {adminUsers.rows.map((row, index) => (
                               <tr key={`admin-user-${row.id || index}`}>
-                                <td>{row.id || "-"}</td><td>{row.username || "-"}</td><td>{row.email || "-"}</td><td>{row.role_name || row.role_id || "-"}</td><td>{row.status || "-"}</td>
+                                <td>{row.id || "-"}</td><td>{row.username || "-"}</td><td>{row.email || "-"}</td><td>{row.role_name || row.role_id || "-"}</td><td>{row.status || "-"}</td><td>{row.is_active ? "yes" : "no"}</td>
                                 <td><button type="button" className="button-secondary" onClick={() => selectAdminUserForEdit(row)}>Edit</button></td>
                               </tr>
                             ))}
-                            {!adminUsers.rows.length && adminUsers.loading ? <tr><td colSpan={6}>Loading users...</td></tr> : null}
-                            {!adminUsers.rows.length && !adminUsers.loading && adminUsers.error ? <tr><td colSpan={6}>Unable to load users. Review the error above.</td></tr> : null}
-                            {!adminUsers.rows.length && !adminUsers.loading && !adminUsers.error ? <tr><td colSpan={6}>No users returned yet. Use Refresh Users or create a user.</td></tr> : null}
+                            {!adminUsers.rows.length && adminUsers.loading ? <tr><td colSpan={7}>Loading users...</td></tr> : null}
+                            {!adminUsers.rows.length && !adminUsers.loading && adminUsers.error ? <tr><td colSpan={7}>Unable to load users. Review the error above.</td></tr> : null}
+                            {!adminUsers.rows.length && !adminUsers.loading && !adminUsers.error ? <tr><td colSpan={7}>No users returned yet. Use Refresh Users or create a user.</td></tr> : null}
                           </tbody>
                         </table>
                       </div>
@@ -9748,7 +10313,7 @@ export default function App() {
 
                     <article className="panel">
                       <h3>Modify User</h3>
-                      <details className="admin-collapsible">
+                      <details className="admin-collapsible" open={adminEditPanelOpen} onToggle={(event) => setAdminEditPanelOpen(event.currentTarget.open)}>
                         <summary>Edit Existing User</summary>
                         <form className="form" onSubmit={updateAdminUser}>
                           <div className="filter-grid">
@@ -9766,9 +10331,18 @@ export default function App() {
                           <div className="filter-grid">
                             <label>First Name<input value={adminEditUser.first_name} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, first_name: e.target.value }))} /></label>
                             <label>Last Name<input value={adminEditUser.last_name} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, last_name: e.target.value }))} /></label>
-                            <label>Status<input value={adminEditUser.status} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, status: e.target.value }))} /></label>
+                            <label>Status
+                              <select value={adminEditUser.status} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, status: e.target.value, is_active: e.target.value === "active" }))}>
+                                <option value="active">active</option>
+                                <option value="inactive">inactive</option>
+                                <option value="suspended">suspended</option>
+                              </select>
+                            </label>
                             <label>Active
-                              <select value={String(adminEditUser.is_active)} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, is_active: e.target.value === "true" }))}>
+                              <select value={String(adminEditUser.is_active)} onChange={(e) => {
+                                const isActive = e.target.value === "true";
+                                setAdminEditUser((curr) => ({ ...curr, is_active: isActive, status: isActive ? "active" : "inactive" }));
+                              }}>
                                 <option value="true">true</option><option value="false">false</option>
                               </select>
                             </label>
@@ -9801,7 +10375,7 @@ export default function App() {
                       <div className="panel-head">
                         <div>
                           <h3>Setup Wizard</h3>
-                          <p>Move left to right: define the project, generate artifacts, validate the flow, then add alert knowledge.</p>
+                          <p>Use two main steps: set up monitoring first, then add documents and rules.</p>
                         </div>
                         <button
                           type="button"
@@ -9821,8 +10395,8 @@ export default function App() {
                           <strong>{onboardingForm.onboarding_path === "setup_monitoring" ? "Prometheus setup" : "Existing monitoring"}</strong>
                         </div>
                         <div>
-                          <span>Source Docs</span>
-                          <strong>{onboardingSourceDocCount}</strong>
+                          <span>Service Knowledge</span>
+                          <strong>{onboardingSourceDocCount > 0 ? "added" : "missing"}</strong>
                         </div>
                         <div>
                           <span>Generated Rules</span>
@@ -9856,8 +10430,8 @@ export default function App() {
                     <article className="panel">
                       <div className="panel-head">
                         <div>
-                          <h3>Project Setup</h3>
-                          <p>Complete the required fields first. Optional details stay collapsed until needed.</p>
+                          <h3>Setup Monitoring</h3>
+                          <p>Choose the monitoring path, enter the tool endpoint, and save the landing-pad setup.</p>
                         </div>
                         <div style={{ display: "flex", gap: 8 }}>
                           <button type="button" className="button-secondary" onClick={loadOnboardingAdminData}>Refresh</button>
@@ -9894,16 +10468,7 @@ export default function App() {
                           </button>
                         </div>
                       </div>
-                      <div className="setup-linear-guide">
-                        <span>1 Project</span>
-                        <i />
-                        <span>2 Monitoring Path</span>
-                        <i />
-                        <span>3 Source Docs</span>
-                        <i />
-                        <span>4 Generate</span>
-                      </div>
-                      <p className="subtitle"><strong>Next:</strong> {onboardingNextAction}</p>
+                      <p className="subtitle"><strong>Next:</strong> Save monitoring, then add Service Knowledge in Documents & Rules.</p>
                       {onboardingDocumentSummary.total > 0 ? <p className="subtitle"><strong>Docs:</strong> {onboardingDocumentSummary.total} generated ({onboardingDocumentSummary.approved ? "approved" : "pending"}).</p> : null}
                       {onboardingProjectMode === "existing" ? (
                         <div className="filter-grid">
@@ -9990,11 +10555,11 @@ export default function App() {
                         </details>
                         <details className="setup-form-section" open>
                           <summary>
-                            <span>Setup Path</span>
-                            <small>Prometheus setup or landing-pad ingestion</small>
+                            <span>Monitoring Option</span>
+                            <small>Choose one</small>
                           </summary>
                           <div className="panel-head">
-                            <h3>Choose Setup Path</h3>
+                            <h3>Monitoring Option</h3>
                           </div>
                           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                             <button
@@ -10012,20 +10577,20 @@ export default function App() {
                                 setExistingRulePipelineForm((curr) => ({ ...curr, platform: "prometheus" }));
                               }}
                             >
-                              1) Configure Prometheus Monitoring
+                              Configure Prometheus Rules
                             </button>
                             <button
                               type="button"
                               className={onboardingForm.onboarding_path === "existing_monitoring" ? "button-primary" : "button-secondary"}
                               onClick={() => setOnboardingForm((curr) => ({ ...curr, onboarding_path: "existing_monitoring", start_rule_onboarding: false }))}
                             >
-                              2) Existing Monitoring - Send Alerts To Landing Pad
+                              Use Existing Monitoring Tool
                             </button>
                           </div>
                           <p className="subtitle" style={{ marginTop: 8 }}>
                             {onboardingForm.onboarding_path === "setup_monitoring"
-                              ? "Prometheus path: define rules and configure monitoring first, then route alerts."
-                              : "Existing monitoring path: keep your current tool and just send alert webhooks to KaiOps landing pad."}
+                              ? "KaiOps will generate Prometheus rules from the Documents & Rules step."
+                              : "Keep your current monitoring tool and send alert webhooks to KaiOps landing pad."}
                           </p>
                           <div className="setup-message-bus-preview">
                             <div className="setup-route-strip" aria-label="Landing pad event route">
@@ -10159,164 +10724,8 @@ export default function App() {
                           <p className="subtitle">Alerts from your configured monitoring tool can be ingested into landing pad to trigger the remaining workflow.</p>
                         ) : null}
                         </details>
-                        <details className="setup-form-section setup-source-doc-panel">
-                          <summary>
-                            <span>Source Documents</span>
-                            <small>Evidence for rules and knowledge</small>
-                          </summary>
-                          <div className="panel-head">
-                            <div>
-                              <h3>Upload Source Documents</h3>
-                              <p>Upload operational evidence first. KaiOps derives the rule prompt after the docs are onboarded.</p>
-                            </div>
-                            <button
-                              type="button"
-                              className="button-secondary"
-                              onClick={applyUploadedDocumentsToRuleIntent}
-                              disabled={!onboardingDerivedRequirements.length}
-                            >
-                              Apply Derived Requirements
-                            </button>
-                          </div>
-                          <p className="subtitle">Upload evidence, review the derived prompt, then save.</p>
-                          <div className="setup-flow-rail">
-                            <div className={`setup-flow-node ${onboardingSourceDocCount > 0 ? "complete" : "active"}`}>
-                              <strong>Upload</strong>
-                              <span>{onboardingSourceDocCount > 0 ? `${onboardingSourceDocCount} docs ready` : "Choose files"}</span>
-                            </div>
-                            <div className={`setup-flow-node ${onboardingDerivedRequirements.length > 0 ? "complete" : ""}`}>
-                              <strong>Derive</strong>
-                              <span>{onboardingDerivedRequirements.length > 0 ? `${onboardingDerivedRequirements.length} prompts found` : "Waiting for docs"}</span>
-                            </div>
-                            <div className={`setup-flow-node ${onboardingGeneratedRuleRows.length > 0 ? "complete" : ""}`}>
-                              <strong>Generate</strong>
-                              <span>{onboardingGeneratedRuleRows.length > 0 ? `${onboardingGeneratedRuleRows.length} rules` : "After save"}</span>
-                            </div>
-                          </div>
-                          <details className="setup-help-details">
-                            <summary>What documents should I upload?</summary>
-                            <div className="approval-steps setup-source-categories">
-                              <div className="approval-step">
-                                <strong>Past Tickets</strong>
-                                <span>Incident and support cases that show repeat failure patterns.</span>
-                              </div>
-                              <div className="approval-step">
-                                <strong>Troubleshooting Docs</strong>
-                                <span>Playbooks, diagnostics, and investigation notes for rule discovery.</span>
-                              </div>
-                              <div className="approval-step">
-                                <strong>Logs and RCA Docs</strong>
-                                <span>Logs, postmortems, and resolution notes used to update metadata and RCA steps.</span>
-                              </div>
-                            </div>
-                          </details>
-                          <div className="source-doc-upload-grid">
-                            {ONBOARDING_SOURCE_DOC_BUCKETS.map((bucket) => {
-                              const sample = ONBOARDING_SOURCE_DOC_SAMPLE_FILES[bucket.key];
-                              return (
-                                <label className="source-doc-upload-card" key={`source-bucket-${bucket.key}`}>
-                                  <span>{bucket.label}</span>
-                                  <input
-                                    type="file"
-                                    multiple
-                                    accept=".txt,.md,.markdown,.json,.csv,.log,.yaml,.yml"
-                                    onChange={(e) => handleOnboardingSourceDocuments(e.target.files, bucket.key)}
-                                  />
-                                  {sample ? (
-                                    <a className="source-doc-download" href={sample.href} download>
-                                      {sample.label}
-                                    </a>
-                                  ) : null}
-                                </label>
-                              );
-                            })}
-                          </div>
-                          {onboardingSourceDocs.loading ? <p className="subtitle">Reading uploaded documents...</p> : null}
-                          {onboardingSourceDocs.error ? <p className="error">{onboardingSourceDocs.error}</p> : null}
-                          {onboardingSourceDocs.rows.length ? (
-                            <div className="table-wrap" style={{ marginTop: 8 }}>
-                              <table>
-                                <thead>
-                                  <tr>
-                                    <th>Category</th>
-                                    <th>Document</th>
-                                    <th>Type</th>
-                                    <th>Derived Requirements</th>
-                                    <th>Excerpt</th>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {onboardingSourceDocs.rows.map((row, index) => (
-                                    <tr key={`onboarding-src-doc-${index}`}>
-                                      <td>{ONBOARDING_SOURCE_DOC_BUCKETS.find((bucket) => bucket.key === String(row?.category || "other"))?.label || "Other Evidence"}</td>
-                                      <td>{row.name || "-"}</td>
-                                      <td>{classifyOnboardingDocumentType(row.name, row.text)}</td>
-                                      <td>
-                                        {Array.isArray(row.derived_requirements) && row.derived_requirements.length
-                                          ? row.derived_requirements.join(" | ")
-                                          : "-"}
-                                        {row.warning ? <p className="error" style={{ margin: "6px 0 0" }}>{row.warning}</p> : null}
-                                      </td>
-                                      <td>{row.excerpt || "-"}</td>
-                                    </tr>
-                                  ))}
-                                </tbody>
-                              </table>
-                            </div>
-                          ) : null}
-                        </details>
-                        {onboardingForm.onboarding_path === "setup_monitoring" ? (
-                          <details className={`setup-form-section rule-prompt-panel ${onboardingRulePromptVisible ? "ready" : "locked"}`} open={onboardingRulePromptVisible}>
-                            <summary>
-                              <span>Generated Rule Prompt</span>
-                              <small>{onboardingRulePromptVisible ? "Review and edit before saving" : "Locked until source docs are uploaded"}</small>
-                            </summary>
-                            <div className="panel-head">
-                              <div>
-                                <h3>Review Generated Rule Prompt</h3>
-                                <p>{onboardingRulePromptVisible ? "Generated from onboarded documents. Edit before saving if needed." : "Upload source documents to unlock the generated rule prompt."}</p>
-                              </div>
-                              <span className={`workflow-pill ${onboardingRulePromptVisible ? "workflow-pill-active" : "workflow-pill-idle"}`}>
-                                {onboardingRulePromptVisible ? "ready" : "waiting"}
-                              </span>
-                            </div>
-                            {onboardingRulePromptVisible ? (
-                              <>
-                                {onboardingRulePromptLines.length ? (
-                                  <div className="generated-rule-preview">
-                                    {onboardingRulePromptLines.slice(0, 4).map((line, index) => (
-                                      <span key={`rule-prompt-line-${index}`}>{line}</span>
-                                    ))}
-                                  </div>
-                                ) : null}
-                                {onboardingGeneratedRuleRows.length ? (
-                                  <div className="generated-rule-preview generated-rule-preview-compact">
-                                    {onboardingGeneratedRuleRows.slice(0, 3).map((row) => (
-                                      <span key={`setup-generated-rule-${row.id}`}>{row.name} - {row.severity}</span>
-                                    ))}
-                                  </div>
-                                ) : null}
-                                <label>
-                                  Rule Intent From Documents
-                                  <textarea
-                                    rows={5}
-                                    placeholder="Derived rule prompt will appear here after source documents are onboarded."
-                                    value={onboardingForm.rule_onboarding_plain_language}
-                                    onChange={(e) => {
-                                      const nextText = e.target.value;
-                                      setOnboardingForm((curr) => ({ ...curr, rule_onboarding_plain_language: nextText }));
-                                      setNewRulePipelineForm((curr) => ({ ...curr, requirements_text: nextText }));
-                                    }}
-                                  />
-                                </label>
-                              </>
-                            ) : (
-                              <p className="subtitle">Choose files above, then KaiOps will surface the generated prompt here before rule generation.</p>
-                            )}
-                          </details>
-                        ) : null}
                         <button className="button-primary" type="submit" disabled={onboardingState.loading || onboardingValidationErrors.length > 0 || onboardingHasPendingDocumentApproval}>
-                          {onboardingState.loading ? "Saving..." : onboardingProjectMode === "new" ? "Create Project + Auto-Generate" : "Update Project + Auto-Generate"}
+                          {onboardingState.loading ? "Saving..." : onboardingProjectMode === "new" ? "Create Monitoring Setup" : "Save Monitoring Setup"}
                         </button>
                       </form>
                       {onboardingState.error ? <p className="error">{onboardingState.error}</p> : null}
@@ -10324,7 +10733,195 @@ export default function App() {
                     </article>
                     ) : null}
 
-                    {showProjectStep("review") ? (
+                    {showProjectStep("docs_rules") ? (
+                    <article className="panel">
+                      <div className="panel-head">
+                        <div>
+                          <h3>Documents & Rules</h3>
+                          <p>Add Service Knowledge, improve confidence, then generate reviewable documents and rules.</p>
+                        </div>
+                        <button type="button" className="button-secondary" onClick={() => setProjectSetupStep("setup")}>Back To Monitoring</button>
+                      </div>
+                      <form className="form" onSubmit={saveOnboardingConnectivity}>
+                        {onboardingValidationErrors.length ? (
+                          <div>
+                            {onboardingValidationErrors.map((msg, index) => <p key={`docs-rules-error-${index}`} className="error">{msg}</p>)}
+                          </div>
+                        ) : null}
+                        {onboardingHasPendingDocumentApproval ? (
+                          <p className="error">Approve pending generated documents before submitting another update.</p>
+                        ) : null}
+                        <details className="setup-form-section setup-source-doc-panel" open>
+                          <summary>
+                            <span>Service Knowledge</span>
+                            <small>One file, validated details</small>
+                          </summary>
+                          <div className="panel-head">
+                            <div>
+                              <h3>Add Service Knowledge</h3>
+                              <p>Upload one runbook, ticket export, or notes file. KaiOps extracts the details and asks only for anything missing.</p>
+                            </div>
+                            <button
+                              type="button"
+                              className="button-secondary"
+                              onClick={applyUploadedDocumentsToRuleIntent}
+                              disabled={!onboardingDerivedRequirements.length}
+                            >
+                              Apply To Rules
+                            </button>
+                          </div>
+                          <div className="setup-flow-rail">
+                            <div className={`setup-flow-node ${onboardingSourceDocCount > 0 ? "complete" : "active"}`}>
+                              <strong>Add</strong>
+                              <span>{onboardingSourceDocCount > 0 ? "File ready" : "Choose one file"}</span>
+                            </div>
+                            <div className={`setup-flow-node ${onboardingKnowledgePack ? "complete" : ""}`}>
+                              <strong>Validate</strong>
+                              <span>{onboardingKnowledgePack ? `${Math.round(Number(correctedKnowledgeConfidence || 0) * 100)}% confidence` : "Waiting"}</span>
+                            </div>
+                            <div className={`setup-flow-node ${knowledgePackState.approved ? "complete" : ""}`}>
+                              <strong>Approve</strong>
+                              <span>{knowledgePackState.approved ? "Saved to knowledge" : "Review details"}</span>
+                            </div>
+                          </div>
+                          <div className="knowledge-pack-panel">
+                            <div className="knowledge-pack-upload">
+                              <label className="source-doc-upload-card source-doc-upload-card-wide">
+                                <span>Service Knowledge File</span>
+                                <input
+                                  type="file"
+                                  accept=".txt,.md,.markdown,.json,.csv,.log,.yaml,.yml"
+                                  onChange={(e) => handleOnboardingSourceDocuments(e.target.files, "knowledge_pack")}
+                                />
+                                <small>One file is enough. Include alerts, checks, commands, dependencies, and rollback details if available.</small>
+                              </label>
+                              <div className="knowledge-pack-samples">
+                                <a className="source-doc-download" href={ONBOARDING_SOURCE_DOC_SAMPLE_FILES.troubleshooting.href} download>
+                                  Download sample file
+                                </a>
+                              </div>
+                            </div>
+                            <div className="knowledge-pack-status">
+                              <span className={`workflow-pill ${onboardingKnowledgePack?.status === "ready" || knowledgePackState.approved ? "workflow-pill-active" : "workflow-pill-idle"}`}>
+                                {knowledgePackState.approved ? "approved" : onboardingKnowledgePack?.status || "waiting"}
+                              </span>
+                              <strong>{onboardingSourceDocCount > 0 ? "File uploaded" : "No file yet"}</strong>
+                              <small>Confidence {Math.round(Number(correctedKnowledgeConfidence || 0) * 100)}%</small>
+                            </div>
+                          </div>
+                          {onboardingSourceDocs.loading ? <p className="subtitle">Reading uploaded file...</p> : null}
+                          {onboardingSourceDocs.error ? <p className="error">{onboardingSourceDocs.error}</p> : null}
+                          {knowledgePackState.loading ? <p className="subtitle">Validating Service Knowledge...</p> : null}
+                          {knowledgePackState.error ? <p className="error">{knowledgePackState.error}</p> : null}
+                          {knowledgePackState.success ? <p className="subtitle">{knowledgePackState.success}</p> : null}
+                          {onboardingKnowledgePack ? (
+                            <div className="knowledge-pack-review">
+                              <div className="panel-head">
+                                <div>
+                                  <h3>Review Extracted Details</h3>
+                                  <p>Confirm or fill missing details before KaiOps stores this as trusted Alert Knowledge.</p>
+                                </div>
+                                <button
+                                  type="button"
+                                  className="button-primary"
+                                  onClick={approveKnowledgePack}
+                                  disabled={knowledgePackState.loading || !onboardingSourceDocCount}
+                                >
+                                  Approve Service Knowledge
+                                </button>
+                              </div>
+                              {knowledgeReviewFields.length ? (
+                                <div className="knowledge-pack-fix-panel">
+                                  <div>
+                                    <strong>Improve confidence</strong>
+                                    <span>Add only the missing details you know. KaiOps will mark them as user-confirmed.</span>
+                                  </div>
+                                  <div className="knowledge-pack-fix-grid">
+                                    {knowledgeReviewFields.map(([key, fact]) => (
+                                      <label key={`docs-rules-fix-${key}`}>
+                                        {KNOWLEDGE_FACT_LABELS[key] || key.replaceAll("_", " ")}
+                                        <textarea
+                                          rows={KNOWLEDGE_LIST_FACTS.has(key) ? 3 : 2}
+                                          placeholder={KNOWLEDGE_FACT_HINTS[key] || "Provide the correct value"}
+                                          value={knowledgePackCorrections[key] || ""}
+                                          onChange={(event) => setKnowledgePackCorrections((current) => ({
+                                            ...current,
+                                            [key]: event.target.value,
+                                          }))}
+                                        />
+                                        <small>Current: {Array.isArray(fact?.value) ? fact.value.join(", ") || "-" : String(fact?.value || "-")}</small>
+                                      </label>
+                                    ))}
+                                  </div>
+                                </div>
+                              ) : (
+                                <p className="subtitle">All required details are accepted. You can approve Service Knowledge.</p>
+                              )}
+                              <div className="table-wrap">
+                                <table>
+                                  <thead>
+                                    <tr><th>Detail</th><th>Value</th><th>Confidence</th><th>Status</th></tr>
+                                  </thead>
+                                  <tbody>
+                                    {Object.entries(correctedKnowledgeFacts).map(([key, fact]) => (
+                                      <tr key={`docs-rules-fact-${key}`}>
+                                        <td>{key.replaceAll("_", " ")}</td>
+                                        <td>{Array.isArray(fact?.value) ? fact.value.join(" | ") || "-" : String(fact?.value || "-")}</td>
+                                        <td>{Math.round(Number(fact?.confidence || 0) * 100)}%</td>
+                                        <td>{String(fact?.status || "needs_review").replaceAll("_", " ")}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+                          ) : null}
+                        </details>
+                        <details className={`setup-form-section rule-prompt-panel ${onboardingRulePromptVisible ? "ready" : "locked"}`} open={onboardingRulePromptVisible}>
+                          <summary>
+                            <span>Rules</span>
+                            <small>{onboardingRulePromptVisible ? "Review and edit before generating" : "Upload Service Knowledge or type rule intent"}</small>
+                          </summary>
+                          <div className="panel-head">
+                            <div>
+                              <h3>Rule Intent</h3>
+                              <p>Use extracted hints or type plain-English rules. Setup Monitoring path will generate Prometheus rules.</p>
+                            </div>
+                            <span className={`workflow-pill ${onboardingRulePromptVisible ? "workflow-pill-active" : "workflow-pill-idle"}`}>
+                              {onboardingRulePromptVisible ? "ready" : "optional"}
+                            </span>
+                          </div>
+                          {onboardingRulePromptLines.length ? (
+                            <div className="generated-rule-preview">
+                              {onboardingRulePromptLines.slice(0, 4).map((line, index) => (
+                                <span key={`docs-rules-prompt-line-${index}`}>{line}</span>
+                              ))}
+                            </div>
+                          ) : null}
+                          <label>
+                            Rule Intent
+                            <textarea
+                              rows={5}
+                              placeholder="Example: Alert when mysql exporter is down for 5 minutes."
+                              value={onboardingForm.rule_onboarding_plain_language}
+                              onChange={(e) => {
+                                const nextText = e.target.value;
+                                setOnboardingForm((curr) => ({ ...curr, rule_onboarding_plain_language: nextText }));
+                                setNewRulePipelineForm((curr) => ({ ...curr, requirements_text: nextText }));
+                              }}
+                            />
+                          </label>
+                        </details>
+                        <button className="button-primary" type="submit" disabled={onboardingState.loading || onboardingValidationErrors.length > 0 || onboardingHasPendingDocumentApproval}>
+                          {onboardingState.loading ? "Generating..." : "Generate Documents & Rules"}
+                        </button>
+                      </form>
+                      {onboardingState.error ? <p className="error">{onboardingState.error}</p> : null}
+                      {onboardingState.success ? <p className="subtitle">{onboardingState.success}</p> : null}
+                    </article>
+                    ) : null}
+
+                    {(showProjectStep("review") || (adminWorkspace === "project" && projectSetupStep === "docs_rules" && onboardingGeneratedDocs.length > 0)) ? (
                     <article className="panel onboarding-review-panel">
                       <div className="panel-head">
                         <h3>Generated Rules, Docs, and Metadata Review (Required)</h3>
@@ -10479,6 +11076,25 @@ export default function App() {
                     <article className="panel">
                       <h3>Rule Onboarding Status</h3>
                       <p className="subtitle">Rule onboarding is optional. If enabled above, plain-language requirements are converted into tool-specific rules and documentation automatically.</p>
+                      {onboardingDocApprovalState.approved || knowledgePackState.approved || onboardingWorkflowSteps.length > 0 ? (
+                        <div className="setup-complete-panel">
+                          <div>
+                            <span className="workflow-pill workflow-pill-active">ready</span>
+                            <h3>{currentOnboardedApplicationName() || "Application"} setup is ready</h3>
+                            <p>
+                              Monitoring setup, Service Knowledge, generated rules, and approved documents are now connected to the selected application workspace.
+                            </p>
+                          </div>
+                          <div className="setup-complete-actions">
+                            <button type="button" className="button-primary" onClick={() => openOnboardedApplicationDashboard()}>
+                              Open Application Dashboard
+                            </button>
+                            <button type="button" className="button-secondary" onClick={() => setProjectSetupStep("docs_rules")}>
+                              Back To Documents & Rules
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
                       <h3>Step-by-Step Workflow Progress</h3>
                       <div className="monitoring-dashboard-cards">
                         {monitoringAppDetails.dashboards.map((row, index) => (
@@ -10488,9 +11104,9 @@ export default function App() {
                             <small>UID: {row.dashboard_uid || "-"}</small>
                             <small>Updated: {row.updated_at || "-"}</small>
                             {row.url ? (
-                              <a className="button-secondary" href={row.url} target="_blank" rel="noreferrer">Open Dashboard</a>
+                              <button type="button" className="button-secondary" onClick={() => openOnboardedApplicationDashboard(row.url)}>Open Dashboard</button>
                             ) : (
-                              <em>No URL published yet</em>
+                              <button type="button" className="button-secondary" onClick={() => openOnboardedApplicationDashboard()}>Open Dashboard</button>
                             )}
                           </article>
                         ))}
@@ -10499,6 +11115,7 @@ export default function App() {
                             <span>Dashboard Status</span>
                             <strong>No dashboards generated yet</strong>
                             <small>Register an application and validate metrics to generate dashboard references.</small>
+                            <button type="button" className="button-secondary" onClick={() => openOnboardedApplicationDashboard()}>Open Application Dashboard</button>
                           </article>
                         ) : null}
                       </div>
@@ -10788,31 +11405,29 @@ export default function App() {
                       {monitoringAppSubmit.success ? <p className="subtitle">{monitoringAppSubmit.success}</p> : null}
                       <article className="panel monitoring-doc-gate" style={{ marginTop: 10, borderStyle: "dashed" }}>
                         <div className="panel-head">
-                          <h3>Post-Setup Source Documents</h3>
-                          <button type="button" className="button-secondary" onClick={applyUploadedDocumentsToRuleIntent} disabled={!onboardingDerivedRequirements.length}>Apply Derived Requirements</button>
+                          <h3>Service Knowledge Status</h3>
+                          <button type="button" className="button-secondary" onClick={applyUploadedDocumentsToRuleIntent} disabled={!onboardingDerivedRequirements.length}>Apply To Rules</button>
                         </div>
-                        <p className="subtitle">After project and monitoring setup, upload past tickets, troubleshooting notes, RCA/postmortem docs, resolution docs, logs, and related evidence so KaiOps can infer rules, RCA steps, required docs, and metadata mappings.</p>
+                        <p className="subtitle">Use the Service Knowledge upload above. KaiOps extracts and validates the important details in one flow.</p>
                         <div className="approval-steps" style={{ marginTop: 10 }}>
                           <div className="approval-step">
-                            <strong>Tickets and Incidents</strong>
-                            <span>Shows repeat patterns and the alert history that should become rules.</span>
+                            <strong>Extract</strong>
+                            <span>Service, owner, environment, dependencies, alerts, commands, rollback, and validation checks.</span>
                           </div>
                           <div className="approval-step">
-                            <strong>Troubleshooting and Resolution Docs</strong>
-                            <span>Feeds the rule discovery path, validation commands, and recommended fixes.</span>
+                            <strong>Validate</strong>
+                            <span>Flags missing or low-confidence fields before the details are trusted.</span>
                           </div>
                           <div className="approval-step">
-                            <strong>Logs and RCA Evidence</strong>
-                            <span>Used to update metadata, root-cause steps, and onboarding documentation.</span>
+                            <strong>Approve</strong>
+                            <span>Stores the reviewed pack in Alert Knowledge for RAG and future incidents.</span>
                           </div>
                         </div>
-                        <label>
-                          Documents
-                          <input type="file" multiple accept=".txt,.md,.markdown,.json,.csv,.log,.yaml,.yml" onChange={(e) => handleOnboardingSourceDocuments(e.target.files)} />
-                        </label>
-                        {onboardingSourceDocs.loading ? <p className="subtitle">Reading uploaded documents...</p> : null}
+                        {onboardingSourceDocs.loading ? <p className="subtitle">Reading uploaded file...</p> : null}
                         {onboardingSourceDocs.error ? <p className="error">{onboardingSourceDocs.error}</p> : null}
-                        <p className="subtitle monitoring-doc-gate-count">Uploaded docs: <strong>{onboardingSourceDocCount}</strong></p>
+                        <p className="subtitle monitoring-doc-gate-count">
+                          Uploaded file: <strong>{onboardingSourceDocCount > 0 ? "yes" : "no"}</strong> | Service Knowledge: <strong>{knowledgePackState.approved ? "approved" : onboardingKnowledgePack?.status || "waiting"}</strong>
+                        </p>
                       </article>
                     </article>
 
@@ -10950,6 +11565,34 @@ export default function App() {
                             onChange={(e) => setAlertKnowledgePrompt(e.target.value)}
                           />
                         </label>
+                        <div className="alert-knowledge-source">
+                          <label>
+                            Supporting Document
+                            <input
+                              type="file"
+                              accept=".md,.markdown,.txt,.json,.csv,.yaml,.yml,.log"
+                              onChange={(e) => handleAlertKnowledgeSourceDocument(e.target.files)}
+                            />
+                          </label>
+                          <div className="alert-knowledge-source-status">
+                            {alertKnowledgeSourceDoc.loading ? <span>Reading document...</span> : null}
+                            {alertKnowledgeSourceDoc.error ? <span className="error">{alertKnowledgeSourceDoc.error}</span> : null}
+                            {alertKnowledgeSourceDoc.name && !alertKnowledgeSourceDoc.error ? (
+                              <>
+                                <div>
+                                  <strong>{alertKnowledgeSourceDoc.name}</strong>
+                                  <small>{alertKnowledgeSourceDoc.size ? `${Math.ceil(alertKnowledgeSourceDoc.size / 1024)} KB` : "uploaded"}</small>
+                                </div>
+                                {alertKnowledgeSourceDoc.excerpt ? <p>{alertKnowledgeSourceDoc.excerpt}</p> : null}
+                                <button type="button" className="button-secondary" onClick={clearAlertKnowledgeSourceDocument}>
+                                  Clear Document
+                                </button>
+                              </>
+                            ) : !alertKnowledgeSourceDoc.loading && !alertKnowledgeSourceDoc.error ? (
+                              <span>Upload runbook, RCA, logs, support notes, or troubleshooting docs. The draft uses this together with the prompt.</span>
+                            ) : null}
+                          </div>
+                        </div>
                         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                           <button
                             type="button"
@@ -10957,7 +11600,7 @@ export default function App() {
                             onClick={generateAlertKnowledgeDraftFromPrompt}
                             disabled={alertOnboardingState.loading}
                           >
-                            Generate Draft From Prompt
+                            Generate Draft From Prompt + Document
                           </button>
                         </div>
                         <div className="detail-tabs" style={{ marginBottom: 10 }}>
@@ -11034,7 +11677,7 @@ export default function App() {
                                 <th>Alert Type</th>
                                 <th>Severity</th>
                                 <th>Services</th>
-                                <th>Path</th>
+                                <th>Document View</th>
                                 <th>Updated</th>
                                 <th>Metadata</th>
                               </tr>
@@ -11047,12 +11690,35 @@ export default function App() {
                                   <td>{doc.alert_type || "-"}</td>
                                   <td>{doc.severity || "-"}</td>
                                   <td>{Array.isArray(doc.services) ? doc.services.join(", ") : (doc.services || "-")}</td>
-                                  <td>{doc.path || "-"}</td>
+                                  <td>
+                                    <details className="backend-document-view">
+                                      <summary>
+                                        <span>{backendDocumentPreview(doc)}</span>
+                                      </summary>
+                                      <div>
+                                        <p>{doc.summary || doc.recommended_action || "Document details are available from backend metadata."}</p>
+                                        {doc.root_cause ? <p><strong>Root cause:</strong> {doc.root_cause}</p> : null}
+                                        {doc.impact ? <p><strong>Impact:</strong> {doc.impact}</p> : null}
+                                        {doc.execution_plan ? <pre className="result">{String(doc.execution_plan)}</pre> : null}
+                                        <div className="backend-document-actions">
+                                          <button
+                                            type="button"
+                                            className="button-secondary"
+                                            onClick={() => downloadRagDocument(doc)}
+                                            disabled={!doc.path}
+                                          >
+                                            Download
+                                          </button>
+                                        </div>
+                                      </div>
+                                    </details>
+                                  </td>
                                   <td>{doc.updated_at || doc.modified_at || doc.created_at || "-"}</td>
                                   <td>
                                     <details>
                                       <summary style={{ cursor: "pointer" }}>view</summary>
                                       <pre className="result" style={{ marginTop: 8 }}>{JSON.stringify({
+                                        path: doc.path || null,
                                         alert_id: doc.alert_id || null,
                                         root_cause: doc.root_cause || null,
                                         impact: doc.impact || null,
