@@ -81,6 +81,17 @@ def _first_recommendation_id(*payloads: Any) -> str:
     return ""
 
 
+def _recommendation_id_from_repository_payload(payload: Any) -> str:
+    token = _first_recommendation_id(payload)
+    if token:
+        return token
+    if isinstance(payload, dict):
+        direct_id = str(payload.get("id") or "").strip()
+        if _looks_like_uuid(direct_id):
+            return direct_id
+    return ""
+
+
 async def startup(app: FastAPI) -> None:
     workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
     consumers: list[tuple[str, Any, ConsumeRunner]] = []
@@ -114,7 +125,7 @@ app = create_app(title="KaiMS Approval Service", settings=settings, startup=star
 
 class ApprovalRequest(BaseModel):
     incident_id: UUID
-    recommendation_id: UUID
+    recommendation_id: UUID | None = None
     approver: str
     channel: str = Field(default="web", pattern="^(slack|teams|email|web)$")
     comment: str | None = None
@@ -126,45 +137,73 @@ class ModifyRequest(ApprovalRequest):
 
 @app.post("/approve", response_model=Approval)
 async def approve(request: ApprovalRequest) -> Approval:
-    approval = Approval(
-        incident_id=request.incident_id,
-        recommendation_id=request.recommendation_id,
-        decision=ApprovalDecision.APPROVED,
-        approver=request.approver,
-        channel=request.channel,
-        comment=request.comment,
-    )
+    approval = await _approval_from_request(request, ApprovalDecision.APPROVED)
     await _store_and_publish(approval)
     return approval
 
 
 @app.post("/reject", response_model=Approval)
 async def reject(request: ApprovalRequest) -> Approval:
-    approval = Approval(
-        incident_id=request.incident_id,
-        recommendation_id=request.recommendation_id,
-        decision=ApprovalDecision.REJECTED,
-        approver=request.approver,
-        channel=request.channel,
-        comment=request.comment,
-    )
+    approval = await _approval_from_request(request, ApprovalDecision.REJECTED)
     await _store_and_publish(approval)
     return approval
 
 
 @app.post("/modify", response_model=Approval)
 async def modify(request: ModifyRequest) -> Approval:
-    approval = Approval(
-        incident_id=request.incident_id,
-        recommendation_id=request.recommendation_id,
-        decision=ApprovalDecision.MODIFIED,
-        approver=request.approver,
-        channel=request.channel,
-        comment=request.comment,
+    approval = await _approval_from_request(
+        request,
+        ApprovalDecision.MODIFIED,
         modified_action=request.modified_action,
     )
     await _store_and_publish(approval)
     return approval
+
+
+async def _approval_from_request(
+    request: ApprovalRequest,
+    decision: ApprovalDecision,
+    *,
+    modified_action: str | None = None,
+) -> Approval:
+    recommendation_id = request.recommendation_id or await _resolve_recommendation_id(request.incident_id)
+    return Approval(
+        incident_id=request.incident_id,
+        recommendation_id=recommendation_id,
+        decision=decision,
+        approver=request.approver,
+        channel=request.channel,
+        comment=request.comment,
+        modified_action=modified_action,
+    )
+
+
+async def _resolve_recommendation_id(incident_id: UUID) -> UUID:
+    normalized_incident_id = str(incident_id)
+    memory_payload = PENDING_INCIDENTS.get(normalized_incident_id)
+    token = _first_recommendation_id(memory_payload)
+    if token:
+        return UUID(token)
+
+    if settings.database_enabled:
+        try:
+            async with app.state.session_factory() as session:
+                repo = IncidentRepository(session)
+                recommendation = await repo.get_latest_recommendation_for_incident(normalized_incident_id)
+                pending = await repo.get_pending_workflow(normalized_incident_id)
+                token = _recommendation_id_from_repository_payload(recommendation) or _first_recommendation_id(pending)
+                if token:
+                    return UUID(token)
+        except Exception:
+            logger.exception("failed to resolve approval recommendation", extra={"incident_id": normalized_incident_id})
+
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            "Approval requires a recommendation_id, and no recommendation is linked "
+            f"to incident {normalized_incident_id}."
+        ),
+    )
 
 
 @app.get("/incident/{incident_id}")
@@ -188,7 +227,7 @@ async def get_incident(incident_id: str) -> dict:
                     memory_payload = {
                         **(memory_payload if isinstance(memory_payload, dict) else {}),
                         "recommendation": recommendation,
-                        "recommendation_id": _first_recommendation_id(recommendation),
+                        "recommendation_id": _recommendation_id_from_repository_payload(recommendation),
                     }
                 if isinstance(incident, dict):
                     return _build_incident_context({**incident, **(memory_payload or {})}, pending)

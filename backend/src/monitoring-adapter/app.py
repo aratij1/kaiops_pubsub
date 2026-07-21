@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from uuid import UUID
 
 from common.config import get_settings
+from common.ai_layer_client import AiLayerClient
 from common.database import create_engine, create_schema, create_session_factory
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.logging import get_logger
@@ -107,8 +108,29 @@ CLOSED_INCIDENTS: deque[dict[str, Any]] = deque(maxlen=500)
 LANDING_PAD_INPUT_DIR = Path(os.getenv("LANDING_PAD_INPUT_DIR", "/app/ingested_alerts/input"))
 LANDING_PAD_PROCESSED_DIR = LANDING_PAD_INPUT_DIR.parent / "processed"
 LANDING_PAD_FAILED_DIR = LANDING_PAD_INPUT_DIR.parent / "failed"
+LANDING_PAD_INPUT_REPLAYED_DIR = LANDING_PAD_INPUT_DIR.parent / "input_replayed"
+LANDING_PAD_INPUT_FAILED_DIR = LANDING_PAD_INPUT_DIR.parent / "input_failed"
+LANDING_PAD_FILE_WATCHER_ENABLED = str(os.getenv("LANDING_PAD_FILE_WATCHER_ENABLED", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+LANDING_PAD_FILE_WATCHER_INTERVAL_SECONDS = max(
+    5.0,
+    float(os.getenv("LANDING_PAD_FILE_WATCHER_INTERVAL_SECONDS", "15") or 15),
+)
+LANDING_PAD_FILE_WATCHER_BATCH_SIZE = max(
+    1,
+    min(int(os.getenv("LANDING_PAD_FILE_WATCHER_BATCH_SIZE", "25") or 25), 200),
+)
+LANDING_PAD_FILE_WATCHER_STALE_HOURS = max(
+    0.0,
+    float(os.getenv("LANDING_PAD_FILE_WATCHER_STALE_HOURS", "24") or 24),
+)
 WORKER_FAILURE_COUNTS: dict[str, int] = {
     "incident_projection_worker": 0,
+    "landing_pad_file_watcher": 0,
 }
 WORKER_FAILURE_THRESHOLD = max(1, int(os.getenv("WORKER_FAILURE_THRESHOLD", "5") or 5))
 _ALLOWED_PROJECT_ENVIRONMENTS = {"dev", "staging", "prod"}
@@ -148,6 +170,191 @@ def _persist_alert_to_landing_pad(
     except Exception:
         logger.exception("failed to persist alert to landing pad %s", status)
         return None
+
+
+def _landing_pad_file_rows(source_dir: Path, limit: int) -> list[dict[str, Any]]:
+    source_dir.mkdir(parents=True, exist_ok=True)
+    files = sorted(
+        [path for path in source_dir.glob("*.json") if path.is_file()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[:limit]
+    rows: list[dict[str, Any]] = []
+    for path in files:
+        entry: dict[str, Any] = {
+            "file": path.name,
+            "path": str(path),
+            "modified_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+            "size_bytes": int(path.stat().st_size),
+        }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            alert = payload.get("alert") if isinstance(payload, dict) and isinstance(payload.get("alert"), dict) else payload
+            labels = alert.get("labels", {}) if isinstance(alert, dict) and isinstance(alert.get("labels"), dict) else {}
+            annotations = alert.get("annotations", {}) if isinstance(alert, dict) and isinstance(alert.get("annotations"), dict) else {}
+            entry.update(
+                {
+                    "received_at": payload.get("received_at") if isinstance(payload, dict) else None,
+                    "source": payload.get("source") if isinstance(payload, dict) else None,
+                    "name": alert.get("name") if isinstance(alert, dict) else None,
+                    "service": alert.get("service") if isinstance(alert, dict) else None,
+                    "severity": alert.get("severity") if isinstance(alert, dict) else None,
+                    "alert_status": labels.get("alert_status") or labels.get("status"),
+                    "alertname": labels.get("alertname"),
+                    "summary": annotations.get("summary"),
+                }
+            )
+        except Exception as exc:
+            entry["parse_error"] = str(exc)
+        rows.append(entry)
+    return rows
+
+
+def _landing_pad_input_files(limit: int) -> list[Path]:
+    LANDING_PAD_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    return sorted(
+        [path for path in LANDING_PAD_INPUT_DIR.glob("*.json") if path.is_file()],
+        key=lambda path: path.stat().st_mtime,
+    )[:limit]
+
+
+def _mapped_alerts_from_landing_pad_payload(payload: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    if isinstance(payload.get("alert"), dict):
+        raw_alert = payload.get("raw") if isinstance(payload.get("raw"), dict) else payload["alert"]
+        return [(payload["alert"], raw_alert)]
+
+    alerts_payload = payload.get("alerts") if isinstance(payload.get("alerts"), list) else None
+    if alerts_payload is None:
+        return [(payload, payload)]
+
+    common_labels = payload.get("commonLabels", {}) if isinstance(payload.get("commonLabels"), dict) else {}
+    common_annotations = payload.get("commonAnnotations", {}) if isinstance(payload.get("commonAnnotations"), dict) else {}
+    mapped: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for item in alerts_payload:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or payload.get("status") or "firing").strip().lower()
+        if status != "firing":
+            continue
+        labels = item.get("labels", {}) if isinstance(item.get("labels"), dict) else {}
+        annotations = item.get("annotations", {}) if isinstance(item.get("annotations"), dict) else {}
+        merged_labels = {**common_labels, **labels}
+        merged_annotations = {**common_annotations, **annotations}
+        mapped.append(
+            (
+                {
+                    "source": "prometheus-alertmanager",
+                    "name": str(merged_labels.get("alertname") or "prometheus-alert"),
+                    "service": str(
+                        merged_labels.get("service")
+                        or merged_labels.get("job")
+                        or merged_labels.get("instance")
+                        or "kaiops-platform"
+                    ),
+                    "environment": str(merged_labels.get("environment") or merged_labels.get("env") or "prod"),
+                    "severity": str(merged_labels.get("severity") or "warning").lower(),
+                    "description": str(
+                        merged_annotations.get("description")
+                        or merged_annotations.get("summary")
+                        or merged_labels.get("alertname")
+                        or "Prometheus alert"
+                    ),
+                    "labels": {
+                        **merged_labels,
+                        "alert_status": status,
+                        "alert_fingerprint": str(item.get("fingerprint") or ""),
+                    },
+                    "annotations": {
+                        **merged_annotations,
+                        "startsAt": str(item.get("startsAt") or ""),
+                        "endsAt": str(item.get("endsAt") or ""),
+                        "generatorURL": str(item.get("generatorURL") or ""),
+                    },
+                },
+                item,
+            )
+        )
+    return mapped
+
+
+def _archive_landing_pad_input_file(path: Path, target_dir: Path) -> str:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / path.name
+    if target_path.exists():
+        target_path = target_dir / f"{path.stem}_{uuid.uuid4().hex[:8]}{path.suffix}"
+    path.replace(target_path)
+    return str(target_path)
+
+
+def _landing_pad_input_is_stale(path: Path) -> bool:
+    if LANDING_PAD_FILE_WATCHER_STALE_HOURS <= 0:
+        return False
+    modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - modified_at).total_seconds()
+    return age_seconds > LANDING_PAD_FILE_WATCHER_STALE_HOURS * 3600
+
+
+def _processed_landing_pad_match_exists(mapped_payload: dict[str, Any]) -> bool:
+    labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
+    alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))
+    fingerprint = str(labels.get("alert_fingerprint") or "no-fingerprint").strip() or "no-fingerprint"
+    safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:24]
+    pattern = f"*_{alert_name}_{safe_fingerprint}.json"
+    return any(path.is_file() for path in LANDING_PAD_PROCESSED_DIR.glob(pattern))
+
+
+async def _process_landing_pad_input_file(path: Path) -> dict[str, Any]:
+    try:
+        if _landing_pad_input_is_stale(path):
+            archived_path = _archive_landing_pad_input_file(path, LANDING_PAD_INPUT_REPLAYED_DIR)
+            return {
+                "file": path.name,
+                "status": "archived_stale",
+                "archived_path": archived_path,
+                "reason": f"input file older than {LANDING_PAD_FILE_WATCHER_STALE_HOURS:g} hours",
+            }
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("landing pad input must be a JSON object")
+
+        ingested_rows: list[dict[str, Any]] = []
+        mapped_alerts = _mapped_alerts_from_landing_pad_payload(payload)
+        if not mapped_alerts:
+            raise ValueError("landing pad input did not contain a firing alert")
+
+        if all(_processed_landing_pad_match_exists(mapped_payload) for mapped_payload, _ in mapped_alerts):
+            archived_path = _archive_landing_pad_input_file(path, LANDING_PAD_INPUT_REPLAYED_DIR)
+            return {
+                "file": path.name,
+                "status": "skipped_duplicate",
+                "archived_path": archived_path,
+                "reason": "matching processed landing-pad audit already exists",
+            }
+
+        for mapped_payload, raw_alert in mapped_alerts:
+            alert = _build_alert_from_payload(mapped_payload)
+            await _publish_ingested_alert(alert)
+            landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, raw_alert, status="processed")
+            ingested_rows.append(
+                {
+                    "alert_id": str(alert.id),
+                    "name": alert.name,
+                    "service": alert.service,
+                    "severity": alert.severity.value,
+                    "landing_pad_file": landing_pad_file,
+                }
+            )
+
+        archived_path = _archive_landing_pad_input_file(path, LANDING_PAD_INPUT_REPLAYED_DIR)
+        return {"file": path.name, "status": "processed", "archived_path": archived_path, "alerts": ingested_rows}
+    except Exception as exc:
+        logger.exception("failed to replay landing pad input file %s", path)
+        try:
+            archived_path = _archive_landing_pad_input_file(path, LANDING_PAD_INPUT_FAILED_DIR)
+        except Exception:
+            archived_path = str(path)
+        return {"file": path.name, "status": "failed", "error": str(exc), "archived_path": archived_path}
 
 
 class OnboardingProviderStatus(BaseModel):
@@ -542,10 +749,28 @@ async def _incident_projection_worker() -> None:
             continue
 
 
+async def _landing_pad_file_watcher() -> None:
+    stop_event = app.state.monitoring_adapter_stop_event
+    while not stop_event.is_set():
+        try:
+            for path in _landing_pad_input_files(LANDING_PAD_FILE_WATCHER_BATCH_SIZE):
+                await _process_landing_pad_input_file(path)
+            _record_worker_success("landing_pad_file_watcher")
+        except Exception as exc:
+            _record_worker_failure("landing_pad_file_watcher", exc)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=float(LANDING_PAD_FILE_WATCHER_INTERVAL_SECONDS))
+        except asyncio.TimeoutError:
+            continue
+
+
 async def _on_startup(_: Any) -> None:
     app.state.monitoring_adapter_stop_event = asyncio.Event()
     if INCIDENT_PROJECTION_WORKER_ENABLED:
         app.state.incident_projection_task = asyncio.create_task(_incident_projection_worker())
+    if LANDING_PAD_FILE_WATCHER_ENABLED:
+        app.state.landing_pad_file_watcher_task = asyncio.create_task(_landing_pad_file_watcher())
 
 
 async def _on_shutdown(_: Any) -> None:
@@ -557,6 +782,13 @@ async def _on_shutdown(_: Any) -> None:
         projection_task.cancel()
         try:
             await projection_task
+        except asyncio.CancelledError:
+            pass
+    watcher_task = getattr(app.state, "landing_pad_file_watcher_task", None)
+    if watcher_task is not None:
+        watcher_task.cancel()
+        try:
+            await watcher_task
         except asyncio.CancelledError:
             pass
 
@@ -648,8 +880,8 @@ def _build_onboarding_rule_seed(connectivity: OnboardingConnectivityPayload, sel
         "criticality": "high",
         "sla": "",
         "support_team": str(project.owner_team or "").strip(),
-        "business_owner": "",
-        "technical_owner": "",
+        "business_owner": str(project.owner_team or "").strip(),
+        "technical_owner": str(project.owner_team or "").strip(),
         "technology_stack": [],
         "cloud_provider": "azure" if connectivity.deployment_mode == "azure_cloud" else "on_prem",
         "region": str(project.region or "").strip(),
@@ -1264,11 +1496,8 @@ async def run_local_payment_workflow(
     _ensure_workflow_import_paths()
     from alert_intelligence import AlertIntelligenceAgent
     from closure_service import ClosureValidationAgent
-    from context_agent import ContextIntelligenceAgent
-    from model_router import ModelRouter, ModelTask
     from orchestrator import OrchestratorAgent
     from remediation_engine import RemediationEngine
-    from resolution_agent import ResolutionIntelligenceAgent
 
     agent_order = [
         "Alert Intelligence Agent",
@@ -1337,7 +1566,7 @@ async def run_local_payment_workflow(
     scenarios = merged_scenarios()
     resolved_flow_id = resolve_flow_id(flow_id, scenarios)
     scenario = scenarios[resolved_flow_id]
-    router = model_router or ModelRouter()
+    ai_client = AiLayerClient(settings)
     alert = build_sample_alert(resolved_flow_id, trace_id=trace_id)
     enriched_alert, incident = await AlertIntelligenceAgent().process(alert)
     incident.trace_id = trace_id
@@ -1404,7 +1633,7 @@ async def run_local_payment_workflow(
             completed_at=datetime.now(timezone.utc),
         )
     )
-    context_task = asyncio.create_task(ContextIntelligenceAgent().collect(enriched_alert, incident))
+    context_task = asyncio.create_task(ai_client.collect_context(alert=enriched_alert, incident=incident))
     decision_task = asyncio.create_task(OrchestratorAgent().decide_workflow_async(enriched_alert, incident))
     context, decision = await asyncio.gather(context_task, decision_task)
     context.trace_id = trace_id
@@ -1489,6 +1718,13 @@ async def run_local_payment_workflow(
             "related_incidents": len(context.related_incidents),
             "dependency_services": len(context.dependency_services),
             "recent_changes": len(context.recent_changes),
+            "rag_documents": context.metadata.get("rag_documents", 0) if isinstance(context.metadata, dict) else 0,
+            "rag_matches": context.metadata.get("rag_matches", []) if isinstance(context.metadata, dict) else [],
+            "rag_top_similarity": context.metadata.get("rag_top_similarity", 0.0) if isinstance(context.metadata, dict) else 0.0,
+            "rag_service_tagged_match": context.metadata.get("rag_service_tagged_match", False)
+            if isinstance(context.metadata, dict)
+            else False,
+            "rag_index": context.metadata.get("rag_index", {}) if isinstance(context.metadata, dict) else {},
             "runbook_found": bool(context.runbook),
         },
     }
@@ -1515,7 +1751,7 @@ async def run_local_payment_workflow(
     )
     model_errors: list[dict[str, str]] = []
     try:
-        recommendation = await ResolutionIntelligenceAgent(model_router=router).resolve(context)
+        recommendation = await ai_client.resolve(context=context)
     except Exception as exc:
         recommendation = Recommendation(
             incident_id=incident.id,
@@ -1598,69 +1834,48 @@ async def run_local_payment_workflow(
             "recommended_action": scenario["recommended_action"],
         }
         comparison_prompt = PROMPT_SUMMARIZE_RCA
-        comparison_candidates = ["gpt-5", "gpt-4o"]
-        if settings.local_llm_enabled:
-            comparison_candidates.append("local-llama")
+        try:
+            result = await ai_client.route_model(
+                severity=enriched_alert.severity,
+                task="summarization",
+                prompt=comparison_prompt,
+                payload=comparison_payload,
+            )
+            usage = result.get("usage")
+            content = result.get("content")
+            if not isinstance(usage, dict):
+                raise TypeError("Comparison result missing usage payload")
 
-        comparison_calls = [
-            (provider_name, ModelTask.SUMMARIZATION, comparison_prompt)
-            for provider_name in comparison_candidates
-            if provider_name in router.providers
-        ]
-        comparison_results = await asyncio.gather(
-            *[
-                router.route_provider(
-                    provider_name=provider_name,
-                    task=task,
-                    prompt=prompt,
-                    payload=comparison_payload,
-                )
-                for provider_name, task, prompt in comparison_calls
-            ],
-            return_exceptions=True,
-        )
-        for (provider_name, task, _), result in zip(comparison_calls, comparison_results, strict=True):
-            try:
-                if isinstance(result, BaseException):
-                    raise result
-                if not isinstance(result, dict):
-                    raise TypeError("Unexpected comparison result payload")
-
-                usage = result.get("usage")
-                content = result.get("content")
-                if not isinstance(usage, dict):
-                    raise TypeError("Comparison result missing usage payload")
-
-                model_usage.append(usage)
-                selected_prompt = next(prompt for name, _, prompt in comparison_calls if name == provider_name)
-                model_calls.append(
-                    {
-                        "task": task.value,
-                        "provider": provider_name,
-                        "model": usage.get("model"),
-                        "prompt": selected_prompt,
-                        "payload": comparison_payload,
-                        "response": {
-                            "text": content,
-                            "parameters": {
-                                "provider": provider_name,
-                                "model": usage.get("model"),
-                                "task": task.value,
-                            },
+            provider_name = str(usage.get("provider") or result.get("model") or "model-router")
+            model_usage.append(usage)
+            model_calls.append(
+                {
+                    "task": "summarization",
+                    "provider": provider_name,
+                    "model": usage.get("model"),
+                    "prompt": comparison_prompt,
+                    "payload": comparison_payload,
+                    "response": {
+                        "text": content,
+                        "parameters": {
+                            "provider": provider_name,
+                            "model": usage.get("model"),
+                            "task": "summarization",
                         },
-                        "usage": usage,
-                    }
-                )
-            except Exception as exc:
-                model_errors.append(
-                    {
-                        "provider": provider_name,
-                        "task": task.value,
-                        "prompt": next(prompt for name, _, prompt in comparison_calls if name == provider_name),
-                        "payload": str(comparison_payload),
-                        "error": str(exc),
-                    }
-                )
+                    },
+                    "usage": usage,
+                }
+            )
+        except Exception as exc:
+            model_errors.append(
+                {
+                    "provider": "model-router-endpoint",
+                    "task": "summarization",
+                    "prompt": comparison_prompt,
+                    "payload": str(comparison_payload),
+                    "error": str(exc),
+                }
+            )
     resolution_event = {
         "sequence": 4,
         "agent": "Resolution Intelligence Agent",
@@ -3668,6 +3883,44 @@ async def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
         "failed_dir": str(LANDING_PAD_FAILED_DIR),
         "rows": rows,
         "count": len(rows),
+    }
+
+
+@app.get("/landing-pad/input")
+async def get_landing_pad_input(limit: int = 50) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit), 200))
+    pending_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_DIR, safe_limit)
+    replayed_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_REPLAYED_DIR, safe_limit)
+    failed_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_FAILED_DIR, safe_limit)
+    pending_count = len([path for path in LANDING_PAD_INPUT_DIR.glob("*.json") if path.is_file()])
+    return {
+        "input_dir": str(LANDING_PAD_INPUT_DIR),
+        "replayed_dir": str(LANDING_PAD_INPUT_REPLAYED_DIR),
+        "failed_dir": str(LANDING_PAD_INPUT_FAILED_DIR),
+        "watcher_enabled": LANDING_PAD_FILE_WATCHER_ENABLED,
+        "watcher_interval_seconds": LANDING_PAD_FILE_WATCHER_INTERVAL_SECONDS,
+        "watcher_batch_size": LANDING_PAD_FILE_WATCHER_BATCH_SIZE,
+        "watcher_stale_hours": LANDING_PAD_FILE_WATCHER_STALE_HOURS,
+        "pending_count": pending_count,
+        "pending_rows": pending_rows,
+        "replayed_rows": replayed_rows,
+        "failed_rows": failed_rows,
+    }
+
+
+@app.post("/landing-pad/input/process")
+async def process_landing_pad_input(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    requested_limit = payload.get("limit", LANDING_PAD_FILE_WATCHER_BATCH_SIZE) if isinstance(payload, dict) else LANDING_PAD_FILE_WATCHER_BATCH_SIZE
+    safe_limit = max(1, min(int(requested_limit or LANDING_PAD_FILE_WATCHER_BATCH_SIZE), 200))
+    results = [await _process_landing_pad_input_file(path) for path in _landing_pad_input_files(safe_limit)]
+    processed = len([row for row in results if row.get("status") == "processed"])
+    failed = len([row for row in results if row.get("status") == "failed"])
+    return {
+        "requested": safe_limit,
+        "processed": processed,
+        "failed": failed,
+        "remaining": len([path for path in LANDING_PAD_INPUT_DIR.glob("*.json") if path.is_file()]),
+        "rows": results,
     }
 
 

@@ -34,10 +34,10 @@ real GCP dependency). Only the environment file and network setup differ.
    (Windows Server).
 2. Get this repository onto the VM (git clone, or copy the folder).
 3. Create the environment file from the Azure template. `.env.azure` itself is
-   gitignored (never commit real secrets) — `.env.azure.example` is the
+   gitignored (never commit real secrets) — `config/env/.env.azure.example` is the
    tracked, blank starting point:
    ```bash
-   cp .env.azure.example .env.azure   # then edit .env.azure and fill in every REQUIRED value
+   cp config/env/.env.azure.example .env.azure   # then edit .env.azure and fill in every REQUIRED value
    ```
    Required before others can reach the VM:
    - `ENVIRONMENT=prod` (or any value other than `local`/`demo`/`test`) —

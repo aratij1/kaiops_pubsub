@@ -19,8 +19,10 @@ async def test_remediation_engine_executes_rollback_strategy() -> None:
     completed = await engine.execute(action)
 
     assert action.action_type == "rollback_deployment"
-    assert completed.status == RemediationStatus.SUCCEEDED
-    assert "executed rollback_deployment" in completed.output
+    assert completed.status == RemediationStatus.SKIPPED
+    assert completed.parameters["execution_result"]["executed"] is False
+    assert "No real jenkins executor is configured" in str(completed.error)
+    assert "Execution not performed" in completed.output
 
 
 @pytest.mark.asyncio
@@ -36,9 +38,9 @@ async def test_closure_validation_generates_report() -> None:
 
     report = await ClosureValidationAgent().validate(action)
 
-    assert report.health_restored is True
-    assert report.alerts_cleared is True
-    assert all(report.validation.values())
+    assert report.health_restored is False
+    assert report.alerts_cleared is False
+    assert not any(report.validation.values())
 
 
 def test_remediation_allowlist_blocks_unknown_action_type() -> None:

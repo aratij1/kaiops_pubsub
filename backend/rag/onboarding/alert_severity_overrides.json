@@ -17,7 +17,16 @@
       "requested_by": "admin",
       "requested_role": "administrator",
       "updated_at": "2026-07-17T13:45:47.280Z"
+    },
+    {
+      "name": "lowrequestthroughput",
+      "service": "kaiops-platform",
+      "environment": "prod",
+      "severity": "warning",
+      "requested_by": "admin",
+      "requested_role": "administrator",
+      "updated_at": "2026-07-21T04:29:03.575Z"
     }
   ],
-  "updated_at": "2026-07-21T04:47:47.865492+00:00"
+  "updated_at": "2026-07-21T04:29:03.610626+00:00"
 }

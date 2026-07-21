@@ -5,9 +5,17 @@ metadata:
   namespace: kaiops
 data:
   ENVIRONMENT: prod
+  CLOUD_PROVIDER: cloud-neutral
+  DEPLOYMENT_PROFILE: cloud-neutral
   KAFKA_BOOTSTRAP_SERVERS: kafka:9092
   REDIS_URL: redis://redis:6379/0
+  EVENT_BUS_PROVIDER: rabbitmq
+  MESSAGE_BUS_DEFAULT_PROVIDER: rabbitmq
+  MESSAGE_BUS_WORKER_COUNT: "2"
+  AI_LAYER_MODE: endpoint
+  AI_LAYER_REQUEST_TIMEOUT_SECONDS: "120"
   CONTEXT_AGENT_URL: http://context-agent:8000
+  RESOLUTION_AGENT_URL: http://resolution-agent:8000
   APPROVAL_SERVICE_URL: http://approval-service:8000
   MONITORING_ADAPTER_URL: http://monitoring-adapter:8000
   MODEL_ROUTER_URL: http://model-router:8000

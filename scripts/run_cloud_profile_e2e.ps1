@@ -29,7 +29,7 @@ if (-not (Test-Path $PythonExe)) {
 }
 
 Write-Host "[1/4] Generating service profile env override for $Profile"
-& $PythonExe scripts/switch_service_profile.py --profile $Profile --output .env.profile.generated
+& $PythonExe scripts/switch_service_profile.py --profile $Profile --output config/env/.env.profile.generated
 
 Write-Host "[2/4] Running cloud profile smoke test"
 $deploymentMode = if ($Profile -eq 'azure') { 'azure_cloud' } else { 'on_prem' }

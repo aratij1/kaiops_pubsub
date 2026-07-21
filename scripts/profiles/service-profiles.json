@@ -1,6 +1,10 @@
 {
   "onprem": {
+    "CLOUD_PROVIDER": "onprem",
+    "DEPLOYMENT_PROFILE": "onprem",
     "EVENT_BUS_PROVIDER": "rabbitmq",
+    "MESSAGE_BUS_DEFAULT_PROVIDER": "rabbitmq",
+    "KAFKA_ENABLED": "true",
     "AZURE_SERVICE_BUS_ENABLED": "false",
     "AZURE_CONTENT_SAFETY_ENABLED": "false",
     "AZURE_OPENAI_EMBEDDINGS_ENABLED": "false",
@@ -8,7 +12,11 @@
     "OBSERVABILITY_AZURE_MONITOR_ENABLED": "false"
   },
   "azure": {
+    "CLOUD_PROVIDER": "azure",
+    "DEPLOYMENT_PROFILE": "azure-cloud",
     "EVENT_BUS_PROVIDER": "azure-service-bus",
+    "MESSAGE_BUS_DEFAULT_PROVIDER": "azure-service-bus",
+    "KAFKA_ENABLED": "false",
     "AZURE_SERVICE_BUS_ENABLED": "true",
     "AZURE_CONTENT_SAFETY_ENABLED": "true",
     "AZURE_OPENAI_EMBEDDINGS_ENABLED": "true",
@@ -16,7 +24,11 @@
     "OBSERVABILITY_AZURE_MONITOR_ENABLED": "true"
   },
   "aws": {
-    "EVENT_BUS_PROVIDER": "rabbitmq",
+    "CLOUD_PROVIDER": "aws",
+    "DEPLOYMENT_PROFILE": "aws",
+    "EVENT_BUS_PROVIDER": "kafka",
+    "MESSAGE_BUS_DEFAULT_PROVIDER": "kafka",
+    "KAFKA_ENABLED": "true",
     "AZURE_SERVICE_BUS_ENABLED": "false",
     "AZURE_CONTENT_SAFETY_ENABLED": "false",
     "AZURE_OPENAI_EMBEDDINGS_ENABLED": "false",
@@ -24,7 +36,23 @@
     "OBSERVABILITY_AZURE_MONITOR_ENABLED": "false"
   },
   "gcp": {
+    "CLOUD_PROVIDER": "gcp",
+    "DEPLOYMENT_PROFILE": "gcp",
     "EVENT_BUS_PROVIDER": "kafka",
+    "MESSAGE_BUS_DEFAULT_PROVIDER": "kafka",
+    "KAFKA_ENABLED": "true",
+    "AZURE_SERVICE_BUS_ENABLED": "false",
+    "AZURE_CONTENT_SAFETY_ENABLED": "false",
+    "AZURE_OPENAI_EMBEDDINGS_ENABLED": "false",
+    "AZURE_AI_EVALUATION_ENABLED": "false",
+    "OBSERVABILITY_AZURE_MONITOR_ENABLED": "false"
+  },
+  "cloud-neutral": {
+    "CLOUD_PROVIDER": "cloud-neutral",
+    "DEPLOYMENT_PROFILE": "cloud-neutral",
+    "EVENT_BUS_PROVIDER": "rabbitmq",
+    "MESSAGE_BUS_DEFAULT_PROVIDER": "rabbitmq",
+    "KAFKA_ENABLED": "true",
     "AZURE_SERVICE_BUS_ENABLED": "false",
     "AZURE_CONTENT_SAFETY_ENABLED": "false",
     "AZURE_OPENAI_EMBEDDINGS_ENABLED": "false",
