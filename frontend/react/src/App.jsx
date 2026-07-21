@@ -2038,9 +2038,16 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
   const linkedSummary = documentContract?.document_link_summary && typeof documentContract.document_link_summary === "object"
     ? documentContract.document_link_summary
     : {};
-  const docCount = Number(ragIndex.document_count ?? ragIndex.total_documents ?? linkedSummary.count ?? safeDocuments.length ?? 0);
-  const indexedCount = Number(ragIndex.embedded_document_count ?? ragIndex.metadata_embedding_count ?? 0);
-  const bestMatch = ragMatches[0] || safeDocuments[0] || {};
+  const reportedDocCount = Number(ragIndex.document_count ?? ragIndex.total_documents ?? linkedSummary.count ?? safeDocuments.length ?? ragMatches.length ?? 0);
+  const docCount = Number.isFinite(reportedDocCount) && reportedDocCount > 0 ? reportedDocCount : 0;
+  const reportedIndexedCount = Number(ragIndex.embedded_document_count ?? ragIndex.metadata_embedding_count ?? 0);
+  const indexedCount = Number.isFinite(reportedIndexedCount) && reportedIndexedCount > 0 ? reportedIndexedCount : 0;
+  const touchedDocuments = (safeDocuments.length ? safeDocuments : ragMatches).slice(0, 8);
+  const bestMatch = touchedDocuments[0] || {};
+  const hasIndexInfo = hasMeaningfulValue(ragIndex) || hasMeaningfulValue(embeddingModel) || hasMeaningfulValue(vectorStore);
+  const embeddingProvider = embeddingModel.provider || (hasIndexInfo ? "local" : "not reported");
+  const embeddingName = embeddingModel.model || (hasIndexInfo ? "hashing-token-counter-v1" : "not reported");
+  const vectorProvider = vectorStore.provider || (hasIndexInfo ? "file-backed-memory" : "not reported");
   const contextQuality = evaluation && typeof evaluation === "object" ? evaluation : {};
   const flowSteps = [
     {
@@ -2060,23 +2067,23 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
     {
       id: "index",
       label: "Index Checked",
-      meta: `${docCount || safeDocuments.length || 0} document(s), ${indexedCount || "metadata"} indexed`,
-      detail: `Embedding: ${embeddingModel.model || "hashing-token-counter-v1"} | Store: ${vectorStore.provider || "file-backed-memory"}`,
-      status: docCount || safeDocuments.length ? "observed" : "warning",
+      meta: `${docCount || touchedDocuments.length || 0} document(s), ${indexedCount || "metadata"} indexed`,
+      detail: `Embedding: ${embeddingName} | Store: ${vectorProvider}`,
+      status: docCount || touchedDocuments.length || hasIndexInfo ? "observed" : "warning",
     },
     {
       id: "search",
       label: "Search Ranked",
-      meta: `${ragMatches.length || safeDocuments.length || 0} match(es)`,
+      meta: `${ragMatches.length || touchedDocuments.length || 0} match(es)`,
       detail: `Top similarity: ${Number.isFinite(topSimilarity) && topSimilarity > 0 ? `${Math.round(topSimilarity * 100)}%` : "not reported"}`,
-      status: ragMatches.length || safeDocuments.length ? "observed" : "warning",
+      status: ragMatches.length || touchedDocuments.length ? "observed" : "warning",
     },
     {
       id: "touch",
       label: "Documents Touched",
       meta: bestMatch.title || bestMatch.path || "no linked document title",
       detail: compactText(bestMatch.match_reason || bestMatch.summary || bestMatch.content || bestMatch.path || "Linked alert documents are used as context evidence.", 180),
-      status: safeDocuments.length || ragMatches.length ? "observed" : "warning",
+      status: touchedDocuments.length ? "observed" : "warning",
     },
     {
       id: "assemble",
@@ -2086,8 +2093,22 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
       status: contextTraceRow || safeWorkflow.context || recommendation ? "observed" : "inferred",
     },
   ];
-  const touchedDocuments = safeDocuments.slice(0, 5);
   const documentKey = (doc, index = 0) => String(doc?.path || doc?.document_id || doc?.title || `doc-${index}`).trim();
+  const documentMetadata = (doc) => ({
+    document_id: doc?.document_id || doc?.id || "-",
+    title: doc?.title || "-",
+    kind: doc?.kind || doc?.document_kind || "-",
+    path: doc?.path || "-",
+    services: doc?.services || doc?.service || "-",
+    owner: doc?.owner || "-",
+    version: doc?.version || "-",
+    freshness_score: doc?.freshness_score ?? "-",
+    embedding_status: doc?.embedding_status || "-",
+    vector_store: doc?._vector_store || doc?.vector_store?.provider || "-",
+    match_reason: doc?.match_reason || "-",
+    match_confidence: doc?.match_confidence ?? doc?._similarity ?? doc?.score ?? "-",
+    source_ref: doc?.source_ref || "-",
+  });
   const viewDocument = async (doc, index) => {
     const key = documentKey(doc, index);
     if (!key) {
@@ -2125,18 +2146,7 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
     const full = documentPreviewState.content && typeof documentPreviewState.content === "object"
       ? documentPreviewState.content
       : doc;
-    const metadata = {
-      document_id: full?.document_id || doc?.document_id || "-",
-      kind: full?.kind || full?.document_kind || doc?.kind || doc?.document_kind || "-",
-      path: full?.path || doc?.path || "-",
-      services: full?.services || doc?.services || "-",
-      owner: full?.owner || doc?.owner || "-",
-      version: full?.version || doc?.version || "-",
-      freshness_score: full?.freshness_score ?? doc?.freshness_score ?? "-",
-      embedding_status: full?.embedding_status || doc?.embedding_status || "-",
-      match_reason: full?.match_reason || doc?.match_reason || "-",
-      match_confidence: full?.match_confidence ?? doc?.match_confidence ?? "-",
-    };
+    const metadata = documentMetadata({ ...doc, ...full });
     const body = String(
       full?.content
       || full?.text
@@ -2162,12 +2172,12 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
     );
   };
   const indexRows = [
-    ["Embedding Provider", embeddingModel.provider || "local"],
-    ["Embedding Model", embeddingModel.model || "hashing-token-counter-v1"],
+    ["Embedding Provider", embeddingProvider],
+    ["Embedding Model", embeddingName],
     ["Fallback Model", embeddingModel.fallback_model || "-"],
-    ["Vector Store", vectorStore.provider || "file-backed-memory"],
+    ["Vector Store", vectorProvider],
     ["Vector Index", (vectorStore.index || vectorStore.index_name || vectorStore.configured) ? String(vectorStore.index || vectorStore.index_name || "configured") : "-"],
-    ["Documents Seen", String(docCount || safeDocuments.length || "-")],
+    ["Documents Seen", String(docCount || touchedDocuments.length || "-")],
   ];
 
   return (
@@ -2198,19 +2208,10 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
       </div>
       <div className="context-flow-grid">
         <article className="context-flow-detail">
-          <h4>Index And Embedding</h4>
-          <div className="table-wrap table-wrap-scroll-x">
-            <table>
-              <tbody>
-                {indexRows.map(([label, value]) => (
-                  <tr key={`context-index-${label}`}><th>{label}</th><td>{value}</td></tr>
-                ))}
-              </tbody>
-            </table>
+          <div className="panel-head">
+            <h4>Documents And Metadata Touched</h4>
+            <p>{safeDocuments.length ? "Backend linked documents for this alert." : ragMatches.length ? "RAG match metadata is shown because no backend linked-document rows were returned." : "No document match metadata was returned for this alert."}</p>
           </div>
-        </article>
-        <article className="context-flow-detail">
-          <h4>Documents Touched</h4>
           {touchedDocuments.length ? (
             <div className="context-doc-list">
               {touchedDocuments.map((doc, index) => (
@@ -2218,6 +2219,10 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
                   <strong>{doc.title || doc.path || `Document ${index + 1}`}</strong>
                   <span>{doc.kind || doc.document_kind || "document"} | confidence {Math.round(Number(doc.match_confidence || doc._similarity || doc.score || 0) * 100) || "-"}%</span>
                   <small>{compactText(doc.match_reason || doc.summary || doc.path, 160) || "-"}</small>
+                  <details>
+                    <summary>Metadata</summary>
+                    <pre className="result">{JSON.stringify(documentMetadata(doc), null, 2)}</pre>
+                  </details>
                   <div className="context-doc-actions">
                     <button type="button" className="button-secondary" onClick={() => viewDocument(doc, index)}>
                       {documentPreviewState.key === documentKey(doc, index) ? "Hide" : "View"} Document
@@ -2230,6 +2235,21 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
           ) : (
             <p className="subtitle">No linked documents are reported for this alert yet.</p>
           )}
+        </article>
+        <article className="context-flow-detail">
+          <h4>Index And Embedding</h4>
+          <div className="table-wrap table-wrap-scroll-x">
+            <table>
+              <tbody>
+                {indexRows.map(([label, value]) => (
+                  <tr key={`context-index-${label}`}><th>{label}</th><td>{value}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {!hasIndexInfo ? (
+            <p className="subtitle">The selected payload did not include full RAG index metadata. The context agent may still have used fallback matching or historical metadata.</p>
+          ) : null}
         </article>
       </div>
     </div>
