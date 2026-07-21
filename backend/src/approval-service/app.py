@@ -31,6 +31,56 @@ _NON_HUMAN_APPROVERS = {"", "system", "rca-agent", "automation-agent", "orchestr
 logger = logging.getLogger("kaiops.approval_service")
 
 
+def _looks_like_uuid(value: Any) -> bool:
+    try:
+        UUID(str(value or "").strip())
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _first_recommendation_id(*payloads: Any) -> str:
+    recommendation_keys = {
+        "recommendation_id",
+        "remediation_recommendation_id",
+        "recommended_action_id",
+    }
+    object_keys = {"recommendation", "approval", "source_payload", "data", "payload", "completed_payload"}
+
+    def visit(value: Any, *, depth: int = 0) -> str:
+        if depth > 6:
+            return ""
+        if isinstance(value, dict):
+            for key in recommendation_keys:
+                token = str(value.get(key) or "").strip()
+                if _looks_like_uuid(token):
+                    return token
+            recommendation = value.get("recommendation")
+            if isinstance(recommendation, dict):
+                token = str(recommendation.get("id") or "").strip()
+                if _looks_like_uuid(token):
+                    return token
+            for key in object_keys:
+                nested = value.get(key)
+                if isinstance(nested, dict):
+                    found = visit(nested, depth=depth + 1)
+                    if found:
+                        return found
+            return ""
+        if isinstance(value, list):
+            for item in value:
+                found = visit(item, depth=depth + 1)
+                if found:
+                    return found
+        return ""
+
+    for payload in payloads:
+        found = visit(payload)
+        if found:
+            return found
+    return ""
+
+
 async def startup(app: FastAPI) -> None:
     workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
     consumers: list[tuple[str, Any, ConsumeRunner]] = []
@@ -133,8 +183,15 @@ async def get_incident(incident_id: str) -> dict:
                 repo = IncidentRepository(session)
                 incident = await repo.get_incident(normalized_incident_id)
                 pending = await repo.get_pending_workflow(normalized_incident_id)
+                recommendation = await repo.get_latest_recommendation_for_incident(normalized_incident_id)
+                if isinstance(recommendation, dict):
+                    memory_payload = {
+                        **(memory_payload if isinstance(memory_payload, dict) else {}),
+                        "recommendation": recommendation,
+                        "recommendation_id": _first_recommendation_id(recommendation),
+                    }
                 if isinstance(incident, dict):
-                    return _build_incident_context(incident, pending)
+                    return _build_incident_context({**incident, **(memory_payload or {})}, pending)
                 if isinstance(pending, dict):
                     return _build_incident_context(memory_payload or {"incident_id": normalized_incident_id}, pending)
         except Exception:
@@ -179,11 +236,7 @@ def _build_incident_context(base_payload: dict[str, Any], pending_workflow: dict
         if _missing(context.get("status")):
             context["status"] = str(pending_workflow.get("status") or "awaiting_approval")
 
-    recommendation_id = (
-        context.get("recommendation_id")
-        or recommendation.get("id")
-        or context.get("recommended_action_id")
-    )
+    recommendation_id = _first_recommendation_id(context, recommendation, pending_workflow)
     if recommendation_id:
         context["recommendation_id"] = str(recommendation_id)
 
@@ -229,6 +282,11 @@ async def _store_and_publish(approval: Approval) -> None:
                 status = "remediating"
             elif approval.decision == ApprovalDecision.REJECTED:
                 status = "failed"
+            await repo.update_incident_approval_status(
+                approval.incident_id,
+                status=status,
+                approval=approval,
+            )
             await repo.save_incident_event(
                 build_event_envelope(
                     event_type="incident.approval.recorded",

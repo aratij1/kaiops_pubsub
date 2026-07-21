@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+import json
 import logging
 from time import perf_counter
 from typing import Any
@@ -35,6 +36,38 @@ settings.service_name = "api-gateway"
 analyzer = SafetyAnalyzer()
 AUDIT_EVENTS: deque[GatewayAuditEvent] = deque(maxlen=200)
 logger = logging.getLogger("api-gateway")
+
+
+def require_object_payload(payload: Any, label: str = "request body") -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, bytes | bytearray):
+        payload = payload.decode("utf-8", errors="ignore")
+    if isinstance(payload, str):
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=422, detail=f"{label} must be a JSON object, not a string.") from exc
+        if isinstance(decoded, dict):
+            return decoded
+        if isinstance(decoded, str):
+            try:
+                nested = json.loads(decoded)
+            except json.JSONDecodeError as exc:
+                raise HTTPException(status_code=422, detail=f"{label} must be a JSON object, not a string.") from exc
+            if isinstance(nested, dict):
+                return nested
+    raise HTTPException(status_code=422, detail=f"{label} must be a JSON object.")
+
+
+async def knowledge_pack_payload_from_request(request: Request, payload: Any, label: str) -> dict[str, Any]:
+    try:
+        return require_object_payload(payload, label)
+    except HTTPException:
+        raw_body = await request.body()
+        if raw_body:
+            return require_object_payload(raw_body, label)
+        raise
 
 
 async def _auth_context_from_request(request: Request) -> AuthContext:
@@ -1751,6 +1784,57 @@ async def ingest_rag_document(
         request=request,
         method="POST",
         path="/rag/documents",
+        target_base=settings.context_agent_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/knowledge-pack/draft")
+async def draft_knowledge_pack(
+    request: Request,
+    payload: Any = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    payload = await knowledge_pack_payload_from_request(request, payload, "Knowledge Pack draft payload")
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/knowledge-pack/draft",
+        target_base=settings.context_agent_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/knowledge-pack/validate")
+async def validate_knowledge_pack(
+    request: Request,
+    payload: Any = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    payload = await knowledge_pack_payload_from_request(request, payload, "Knowledge Pack validation payload")
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/knowledge-pack/validate",
+        target_base=settings.context_agent_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/knowledge-pack/approve")
+async def approve_knowledge_pack(
+    request: Request,
+    payload: Any = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    payload = await knowledge_pack_payload_from_request(request, payload, "Knowledge Pack approval payload")
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/knowledge-pack/approve",
         target_base=settings.context_agent_url,
         payload=payload,
         trace_id=trace_id_from_header(x_trace_id),
