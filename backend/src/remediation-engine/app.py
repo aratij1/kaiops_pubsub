@@ -188,7 +188,7 @@ async def _persist_remediation_event(
     state_status = "remediating"
     if action_status == "succeeded":
         state_status = "validating"
-    elif action_status in {"failed", "rejected"}:
+    elif action_status in {"failed", "rejected", "skipped"}:
         state_status = "failed"
 
     async with app.state.session_factory() as session:

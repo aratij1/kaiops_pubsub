@@ -1,0 +1,183 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1420" height="760" viewBox="0 0 1420 760">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#38465a"/>
+    </marker>
+    <style>
+      .bg { fill: #ffffff; }
+      .lane { fill: #f8fafc; stroke: #6b7280; stroke-width: 1.4; rx: 18; }
+      .lane-app { fill: #f5faff; stroke: #64748b; stroke-width: 1.4; rx: 18; }
+      .lane-ai { fill: #fbf7ff; stroke: #7c3aed; stroke-width: 1.4; rx: 18; }
+      .lane-out { fill: #fffaf2; stroke: #9a6700; stroke-width: 1.4; rx: 18; }
+      .box { fill: #ffffff; stroke: #475569; stroke-width: 1.2; rx: 8; }
+      .box-blue { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.2; rx: 8; }
+      .box-green { fill: #ecfdf5; stroke: #059669; stroke-width: 1.2; rx: 8; }
+      .box-purple { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.2; rx: 8; }
+      .box-orange { fill: #fff7ed; stroke: #ea580c; stroke-width: 1.2; rx: 8; }
+      .box-red { fill: #fff1f2; stroke: #e11d48; stroke-width: 1.2; rx: 8; }
+      .bus { fill: #eef2ff; stroke: #4338ca; stroke-width: 1.6; rx: 12; }
+      .title { font-family: Arial, sans-serif; font-size: 24px; font-weight: 700; fill: #111827; }
+      .lane-title { font-family: Arial, sans-serif; font-size: 16px; font-weight: 700; fill: #111827; }
+      .text { font-family: Arial, sans-serif; font-size: 13px; fill: #111827; }
+      .small { font-family: Arial, sans-serif; font-size: 11px; fill: #475569; }
+      .tiny { font-family: Arial, sans-serif; font-size: 10px; fill: #64748b; }
+      .arrow { stroke: #38465a; stroke-width: 1.7; fill: none; marker-end: url(#arrow); }
+      .arrow-soft { stroke: #64748b; stroke-width: 1.3; stroke-dasharray: 5 4; fill: none; marker-end: url(#arrow); }
+      .divider { stroke: #cbd5e1; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1420" height="760"/>
+  <text class="title" x="36" y="44">KaiOps Corrected Enterprise Architecture</text>
+  <text class="small" x="36" y="66">Alert intake, event orchestration, AI intelligence, approval, remediation, and notification flow</text>
+
+  <!-- Alert Sources -->
+  <rect class="lane" x="30" y="100" width="165" height="470"/>
+  <text class="lane-title" x="54" y="130">Alert Sources</text>
+  <rect class="box" x="55" y="154" width="115" height="42"/>
+  <text class="text" x="76" y="180">Prometheus</text>
+  <rect class="box" x="55" y="212" width="115" height="42"/>
+  <text class="text" x="74" y="238">Alertmanager</text>
+  <rect class="box" x="55" y="270" width="115" height="42"/>
+  <text class="text" x="80" y="296">File Watcher</text>
+  <rect class="box" x="55" y="328" width="115" height="42"/>
+  <text class="text" x="83" y="354">Cloud APIs</text>
+  <rect class="box" x="55" y="386" width="115" height="42"/>
+  <text class="text" x="74" y="412">External Apps</text>
+  <rect class="box" x="55" y="444" width="115" height="42"/>
+  <text class="text" x="80" y="470">Manual Test</text>
+  <rect class="box" x="55" y="502" width="115" height="42"/>
+  <text class="text" x="77" y="528">ETL Jobs</text>
+
+  <!-- Landing Pad -->
+  <rect class="box-green" x="245" y="260" width="150" height="100"/>
+  <text class="lane-title" x="276" y="290">Landing Pad</text>
+  <text class="small" x="266" y="316">validate</text>
+  <text class="small" x="266" y="334">normalize</text>
+  <text class="small" x="266" y="352">dedupe + persist</text>
+
+  <!-- Application layer -->
+  <rect class="lane-app" x="455" y="96" width="585" height="525"/>
+  <text class="lane-title" x="480" y="126">Application / Workflow Layer</text>
+
+  <rect class="box-blue" x="480" y="154" width="115" height="58"/>
+  <text class="text" x="501" y="178">API Gateway</text>
+  <text class="tiny" x="501" y="196">single entry</text>
+
+  <rect class="box" x="620" y="154" width="105" height="58"/>
+  <text class="text" x="644" y="178">Config</text>
+  <text class="tiny" x="640" y="196">cloud/profile</text>
+
+  <rect class="box" x="750" y="154" width="105" height="58"/>
+  <text class="text" x="776" y="178">RBAC</text>
+  <text class="tiny" x="766" y="196">users/roles</text>
+
+  <rect class="box" x="880" y="154" width="130" height="58"/>
+  <text class="text" x="904" y="178">Onboarding</text>
+  <text class="tiny" x="900" y="196">apps/docs/rules</text>
+
+  <rect class="box-green" x="480" y="250" width="165" height="82"/>
+  <text class="text" x="505" y="278">Monitoring Adapter</text>
+  <text class="tiny" x="506" y="298">alert intake API</text>
+  <text class="tiny" x="506" y="316">rules + targets</text>
+
+  <rect class="box-orange" x="675" y="250" width="170" height="82"/>
+  <text class="text" x="696" y="278">Workflow Orchestrator</text>
+  <text class="tiny" x="707" y="298">route + assign</text>
+  <text class="tiny" x="707" y="316">policy + retries</text>
+
+  <rect class="box-red" x="875" y="250" width="135" height="82"/>
+  <text class="text" x="898" y="278">Approval Service</text>
+  <text class="tiny" x="910" y="298">human gate</text>
+  <text class="tiny" x="910" y="316">audit decision</text>
+
+  <rect class="box-red" x="480" y="370" width="165" height="82"/>
+  <text class="text" x="505" y="398">Remediation Engine</text>
+  <text class="tiny" x="512" y="418">dry-run / execute</text>
+  <text class="tiny" x="512" y="436">connector-gated</text>
+
+  <rect class="box" x="675" y="370" width="170" height="82"/>
+  <text class="text" x="714" y="398">Operational DB</text>
+  <text class="tiny" x="704" y="418">alerts/incidents</text>
+  <text class="tiny" x="704" y="436">approvals/audit</text>
+
+  <rect class="box" x="875" y="370" width="135" height="82"/>
+  <text class="text" x="910" y="398">Cockpit UI</text>
+  <text class="tiny" x="900" y="418">dashboards</text>
+  <text class="tiny" x="900" y="436">timeline/docs</text>
+
+  <rect class="box" x="480" y="492" width="165" height="70"/>
+  <text class="text" x="514" y="520">Audit Timeline</text>
+  <text class="tiny" x="514" y="540">trace + events</text>
+
+  <rect class="box" x="675" y="492" width="170" height="70"/>
+  <text class="text" x="703" y="520">Policy / Governance</text>
+  <text class="tiny" x="708" y="540">risk + approval rules</text>
+
+  <rect class="box" x="875" y="492" width="135" height="70"/>
+  <text class="text" x="900" y="520">Reports</text>
+  <text class="tiny" x="895" y="540">SLA / MTTR / AI</text>
+
+  <!-- Message Bus -->
+  <rect class="bus" x="455" y="650" width="585" height="72"/>
+  <text class="lane-title" x="480" y="678">Message Bus Backbone</text>
+  <text class="small" x="480" y="700">raw-alerts | enriched-alerts | orchestration-events | context-events | resolution-events | approval-events | remediation-events | notification-events</text>
+
+  <!-- AI Layer -->
+  <rect class="lane-ai" x="1080" y="130" width="210" height="400"/>
+  <text class="lane-title" x="1104" y="160">AI Intelligence Layer</text>
+  <rect class="box-purple" x="1105" y="186" width="160" height="54"/>
+  <text class="text" x="1146" y="210">Context Agent</text>
+  <text class="tiny" x="1132" y="228">evidence pack</text>
+  <rect class="box-purple" x="1105" y="256" width="160" height="54"/>
+  <text class="text" x="1142" y="280">Resolution Agent</text>
+  <text class="tiny" x="1132" y="298">RCA + fix plan</text>
+  <rect class="box-purple" x="1105" y="326" width="160" height="54"/>
+  <text class="text" x="1144" y="350">Model Router</text>
+  <text class="tiny" x="1128" y="368">OpenAI/Gemini/Groq</text>
+  <rect class="box-purple" x="1105" y="396" width="160" height="54"/>
+  <text class="text" x="1140" y="420">Knowledge Router</text>
+  <text class="tiny" x="1132" y="438">RAG retrieval</text>
+  <rect class="box-purple" x="1105" y="466" width="160" height="44"/>
+  <text class="text" x="1120" y="492">Vector DB / RAG Index</text>
+
+  <!-- Outputs -->
+  <rect class="lane-out" x="1320" y="100" width="70" height="470"/>
+  <text class="lane-title" x="1332" y="130">Outputs</text>
+  <rect class="box" x="1330" y="158" width="50" height="44"/>
+  <text class="small" x="1338" y="184">Email</text>
+  <rect class="box" x="1330" y="220" width="50" height="44"/>
+  <text class="small" x="1338" y="246">Teams</text>
+  <rect class="box" x="1330" y="282" width="50" height="44"/>
+  <text class="small" x="1340" y="308">ITSM</text>
+  <rect class="box" x="1330" y="344" width="50" height="44"/>
+  <text class="small" x="1337" y="370">Slack</text>
+  <rect class="box" x="1330" y="406" width="50" height="44"/>
+  <text class="small" x="1335" y="432">Hooks</text>
+  <rect class="box" x="1330" y="468" width="50" height="44"/>
+  <text class="small" x="1335" y="494">Close</text>
+
+  <!-- Arrows -->
+  <path class="arrow" d="M 195 335 L 245 310"/>
+  <path class="arrow" d="M 395 310 L 480 290"/>
+  <path class="arrow" d="M 595 291 L 675 291"/>
+  <path class="arrow" d="M 845 291 L 875 291"/>
+  <path class="arrow" d="M 942 332 L 942 370"/>
+  <path class="arrow" d="M 875 411 L 645 411"/>
+  <path class="arrow" d="M 760 332 L 760 370"/>
+  <path class="arrow" d="M 1010 411 L 1320 335"/>
+
+  <path class="arrow-soft" d="M 760 332 C 830 590 890 650 748 650"/>
+  <path class="arrow-soft" d="M 565 332 C 565 600 600 650 650 650"/>
+  <path class="arrow-soft" d="M 940 332 C 940 596 900 650 840 650"/>
+  <path class="arrow-soft" d="M 1120 530 C 1120 650 1030 686 1040 686"/>
+  <path class="arrow-soft" d="M 1040 686 C 1100 686 1118 530 1180 530"/>
+
+  <path class="arrow" d="M 845 292 C 925 210 1015 190 1105 210"/>
+  <path class="arrow" d="M 1265 282 C 1300 290 1310 310 1320 335"/>
+  <path class="arrow" d="M 1265 488 L 1320 488"/>
+
+  <!-- Governance rail -->
+  <rect class="box-orange" x="455" y="34" width="835" height="38"/>
+  <text class="text" x="478" y="58">Cross-cutting governance: Auth/RBAC, tenant/env config, secrets, policy checks, audit trail, trace IDs, cost/quality guardrails</text>
+</svg>

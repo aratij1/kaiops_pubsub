@@ -1,31 +1,21 @@
 {
   "project": {
-    "name": "etl-orders-dq-20260721131834",
-    "owner_team": "data-platform",
+    "name": "kaiops-core1",
+    "owner_team": "kaiops-platform",
     "environment": "prod",
-    "region": "us-east-1"
+    "region": "ap-south-1"
   },
   "deployment_mode": "on_prem",
-  "prometheus_url": "http://prometheus:9090",
+  "prometheus_url": "http://pr",
   "new_relic_url": "",
   "datadog_url": "",
   "azure_subscription_id": "",
   "azure_resource_group": "",
   "azure_service_bus_namespace": "",
-  "azure_service_bus_topic": "",
-  "azure_service_bus_subscription": "",
+  "azure_service_bus_topic": "kaiops-orchestration-events",
+  "azure_service_bus_subscription": "kaiops-orchestration-sub",
   "azure_content_safety_enabled": false,
   "azure_content_safety_endpoint": "",
-  "user_assignments": {
-    "administrator": [
-      "etl-orders-dq-20260721131834"
-    ],
-    "l3.engineer": [
-      "etl-orders-dq-20260721131834"
-    ],
-    "l2.operator": [
-      "etl-orders-dq-20260721131834"
-    ]
-  },
+  "user_assignments": {},
   "updated_at": null
 }

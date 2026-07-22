@@ -41,6 +41,45 @@ const SERVICE_TOPIC_FLOW = [
   { service: "closure-service", consumes: "remediation-events", publishes: "closure-events", agent: "Closure & Validation" },
 ];
 
+const SCALE_CAPACITY_GUIDE = [
+  {
+    rate: "100/hr",
+    perSecond: "0.03/sec",
+    masters: "1 master",
+    workers: "1 worker per service",
+    vm: "1 VM: 2 vCPU / 8 GB RAM",
+    config: "MESSAGE_BUS_WORKER_COUNT=1",
+    state: "Local Compose state is acceptable for dev/smoke.",
+  },
+  {
+    rate: "500/hr",
+    perSecond: "0.14/sec",
+    masters: "1 master",
+    workers: "1 alert-intel, 2 context, 2 resolution, 1 remediation",
+    vm: "1 VM: 4 vCPU / 16 GB RAM",
+    config: "Use docker-compose.scale.yml; CONTEXT_AGENT_WORKERS=2, RESOLUTION_AGENT_WORKERS=2",
+    state: "Move Redis/MySQL to managed or dedicated VM if dashboards and approvals are active.",
+  },
+  {
+    rate: "1,000/hr",
+    perSecond: "0.28/sec",
+    masters: "2 orchestrators",
+    workers: "2 alert-intel, 3 context, 3 resolution, 2 closure, 1-2 remediation",
+    vm: "2 VMs: 4 vCPU / 16 GB each, or 1 VM: 8 vCPU / 32 GB",
+    config: "Enable Kafka/RabbitMQ; ORCHESTRATOR_WORKERS=2, ALERT_INTELLIGENCE_WORKERS=2",
+    state: "Use shared DB, shared cache, shared message bus, shared vector index.",
+  },
+  {
+    rate: "10,000/hr",
+    perSecond: "2.78/sec",
+    masters: "3+ orchestrators",
+    workers: "4+ alert-intel, 6-10 context, 6-10 resolution, 3+ remediation",
+    vm: "3-6 VMs: 8 vCPU / 32 GB each, or AKS/VMSS node pool",
+    config: "Externalize DB/Redis/bus/vector store; tune RAG_EMBEDDING_BATCH_SIZE and provider limits",
+    state: "Production HA required: load balancer, managed DB, Kafka/Event Hubs, vector DB, object storage.",
+  },
+];
+
 const AGENT_DISPLAY_ALIASES = {
   "orchestrator agent": "Master Agent",
   orchestrator: "Master Agent",
@@ -301,6 +340,72 @@ function isGeneratedOrTestAlert(row) {
   return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test)([-_\s]|$)/i.test(tokens)
     || tokens.includes("stresspipelinealert")
     || tokens.includes("onboarding-smoke-test");
+}
+
+function mapClosedIncidentToAlertStreamRow(row) {
+  const payload = row?.projection_payload && typeof row.projection_payload === "object" ? row.projection_payload : {};
+  const eventPayload = payload?.event_payload && typeof payload.event_payload === "object" ? payload.event_payload : {};
+  const service = String(row?.service || eventPayload.service || "-").trim();
+  const incidentId = String(row?.incident_id || row?.flow_id || "").trim();
+  const alertId = String(row?.alert_id || incidentId || "").trim();
+  const status = String(row?.status || "closed").trim();
+  const closedAt = String(row?.closed_at || row?.updated_at || "").trim();
+  const alertName = String(
+    row?.alert_name
+    || row?.name
+    || eventPayload.alert_name
+    || eventPayload.alert_type
+    || (service && service !== "-" ? `${service} closed incident` : "Closed incident")
+  ).trim();
+  return {
+    ...row,
+    alert_id: alertId,
+    id: alertId || incidentId,
+    incident_id: incidentId,
+    name: alertName,
+    alert_name: alertName,
+    rule_name: row?.rule_name || row?.alert_type || eventPayload.alert_type || alertName,
+    application: row?.application || row?.project_name || row?.project || service,
+    service,
+    severity: row?.severity || "info",
+    status,
+    state: status,
+    created_at: closedAt || row?.created_at || row?.updated_at,
+    starts_at: row?.starts_at || closedAt,
+    closed_at: closedAt,
+    source: row?.source || "closed-incidents",
+    _stream_kind: "recent_closed",
+    _closed_incident: true,
+    annotations: {
+      ...(row?.annotations || {}),
+      description: eventPayload.action_taken || row?.summary || "Recently closed incident.",
+    },
+  };
+}
+
+function mergeAlertStreamRows(openRows, recentClosedRows) {
+  const merged = [];
+  const seen = new Set();
+  const add = (row) => {
+    if (!row || typeof row !== "object") {
+      return;
+    }
+    const key = String(row.alert_id || row.id || row.incident_id || "").trim();
+    if (key && seen.has(key)) {
+      return;
+    }
+    if (key) {
+      seen.add(key);
+    }
+    merged.push(row);
+  };
+  (Array.isArray(openRows) ? openRows : []).forEach(add);
+  (Array.isArray(recentClosedRows) ? recentClosedRows : []).map(mapClosedIncidentToAlertStreamRow).forEach(add);
+  return merged.sort((a, b) => {
+    const aTime = parseUtcTimestamp(a?.created_at || a?.starts_at || a?.closed_at)?.getTime() || 0;
+    const bTime = parseUtcTimestamp(b?.created_at || b?.starts_at || b?.closed_at)?.getTime() || 0;
+    return bTime - aTime;
+  });
 }
 
 function onboardingSourceDocCategoryLabel(category) {
@@ -849,6 +954,79 @@ function deriveExecutionCommands(workflow, traceRows) {
   return derived;
 }
 
+function remediationOutcomeFromAction(action) {
+  const safeAction = action && typeof action === "object" ? action : {};
+  const status = String(safeAction.status || "").trim().toLowerCase();
+  const error = String(safeAction.error || "").trim();
+  const output = String(safeAction.output || "").trim();
+  const parameters = safeAction.parameters && typeof safeAction.parameters === "object" ? safeAction.parameters : {};
+  const executionResult = parameters.execution_result && typeof parameters.execution_result === "object"
+    ? parameters.execution_result
+    : {};
+  const executorError = String(executionResult.stderr || executionResult.error || "").trim();
+  const executorOutput = String(executionResult.stdout || "").trim();
+  const reason = error || executorError || output || executorOutput || "";
+
+  if (!status && !reason) {
+    return null;
+  }
+
+  let title = "Remediation status";
+  if (status === "succeeded") {
+    title = "Remediation executed successfully";
+  } else if (status === "skipped") {
+    title = "Remediation was approved but not executed";
+  } else if (status === "failed") {
+    title = "Remediation execution failed";
+  }
+
+  let detail = reason || `Remediation engine returned status ${status || "unknown"}.`;
+  if (/no real .*executor is configured/i.test(detail) || /configure a connector executor/i.test(detail)) {
+    detail = `${detail} Add a real remediation connector with executor settings and secret_ref, or edit the plan to use the approved local triage script.`;
+  }
+
+  return {
+    status: status || "unknown",
+    title,
+    detail,
+    actionType: safeAction.action_type || "-",
+    target: safeAction.target || "-",
+  };
+}
+
+function shellArg(value) {
+  const token = String(value || "").trim();
+  if (!token) {
+    return "''";
+  }
+  if (/^[a-zA-Z0-9_./:@=-]+$/.test(token)) {
+    return token;
+  }
+  return `'${token.replace(/'/g, "'\\''")}'`;
+}
+
+function buildKaiOpsRemediationScript({
+  service,
+  environment,
+  apiGatewayUrl,
+  prometheusUrl,
+  mysqlHost,
+  mysqlDatabase,
+  mysqlUser,
+} = {}) {
+  return [
+    "bash scripts/remediation/kaiops_alert_health_triage.sh",
+    "--service", shellArg(service || "kaiops-service"),
+    "--environment", shellArg(environment || "prod"),
+    "--api-gateway-url", shellArg(apiGatewayUrl || "http://api-gateway:8000"),
+    "--prometheus-url", shellArg(prometheusUrl || "http://prometheus:9090"),
+    "--mysql-host", shellArg(mysqlHost || "mysql"),
+    "--mysql-database", shellArg(mysqlDatabase || "kaiops"),
+    "--mysql-user", shellArg(mysqlUser || "kaiops"),
+    "--dry-run", "true",
+  ].join(" ");
+}
+
 function firstTraceTimestamp(rows, predicate) {
   const safeRows = Array.isArray(rows) ? rows : [];
   const hit = safeRows.find((row) => {
@@ -958,6 +1136,19 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
     });
     return Array.from(new Set(matches));
   };
+  const findTraceRows = (needles) => {
+    const tokens = Array.isArray(needles) ? needles : [];
+    return safeTraceRows.filter((row) => {
+      const haystack = [
+        row?.event_type,
+        row?.event_stage,
+        row?.source_channel,
+        row?.transport_channel,
+        row?.service_name,
+      ].map((item) => String(item || "").toLowerCase()).join(" ");
+      return tokens.some((needle) => haystack.includes(String(needle || "").toLowerCase()));
+    });
+  };
 
   const landingTimestamp =
     String(ingestAt || "").trim()
@@ -973,6 +1164,14 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
     || firstTraceTimestamp(safeTraceRows, (row) => String(row?.event_type || "").toLowerCase().includes("workflow"))
     || landingTimestamp;
 
+  const configTimestamp =
+    firstTraceTimestamp(safeTraceRows, (row) => {
+      const eventType = String(row?.event_type || "").toLowerCase();
+      const stage = String(row?.event_stage || "").toLowerCase();
+      return eventType.includes("config") || eventType.includes("connection") || stage.includes("config");
+    })
+    || dedupeTimestamp;
+
   const contextTimestamp =
     firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("context intelligence"))
     || firstTraceTimestamp(safeTraceRows, (row) => String(row?.event_type || "").toLowerCase().includes("context"))
@@ -986,17 +1185,75 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
     || firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("orchestrator"))
     || contextTimestamp;
 
+  const recommendationTimestamp =
+    firstTraceTimestamp(safeTraceRows, (row) => {
+      const eventType = String(row?.event_type || "").toLowerCase();
+      return eventType.includes("recommendation") || eventType.includes("resolution");
+    })
+    || firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("resolution"))
+    || routingTimestamp;
+
+  const approvalTimestamp =
+    firstTraceTimestamp(safeTraceRows, (row) => String(row?.event_type || "").toLowerCase().includes("approval"))
+    || firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("approval"))
+    || recommendationTimestamp;
+
   const remediationTimestamp =
     String(remediationAction.completed_at || remediationAction.started_at || "").trim()
     || firstEventTimestamp(safeEvents, (event) => String(event?.agent || "").toLowerCase().includes("remediation"))
     || firstTraceTimestamp(safeTraceRows, (row) => String(row?.event_type || "").toLowerCase().includes("remediation"))
-    || routingTimestamp;
+    || approvalTimestamp;
+
+  const closureTimestamp =
+    firstTraceTimestamp(safeTraceRows, (row) => {
+      const eventType = String(row?.event_type || "").toLowerCase();
+      return eventType.includes("closure") || eventType.includes("validation");
+    })
+    || String(safeWorkflow?.closure_report?.completed_at || safeWorkflow?.closure_report?.created_at || "").trim()
+    || "";
 
   const rows = [];
   const traceId = alert.trace_id || incident.trace_id || context.trace_id || recommendation.trace_id || remediationAction.trace_id || "";
+  const pushBusRow = ({ flowOrder, stage, consumes, publishes, timestamp, detail, payload = {}, backendEvents = [] }) => {
+    const observedBusRow = safeTraceRows
+      .slice()
+      .reverse()
+      .find((row) => {
+        const channel = String(row?.transport_channel || row?.source_channel || "").trim().toLowerCase();
+        return channel === String(publishes || "").trim().toLowerCase();
+      });
+    const observedProvider = String(observedBusRow?.transport_provider || "").trim();
+    const provider = observedProvider && observedProvider.toLowerCase() !== "unknown"
+      ? observedProvider
+      : (decision.message_bus_provider || "rabbitmq");
+    rows.push({
+      flowOrder,
+      stage,
+      agent: "Message Bus",
+      service: provider,
+      consumes,
+      publishes,
+      timestamp,
+      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, timestamp),
+      detail,
+      tables: "message_topics, incident_events",
+      inputValueText: stringifyTimelineValue({
+        provider,
+        trace_id: traceId,
+        ...payload,
+      }),
+      outputValueText: stringifyTimelineValue({
+        delivered_to: publishes,
+        trace_id: traceId,
+      }),
+      errorValueText: "",
+      backendEvents,
+    });
+  };
 
   if (landingTimestamp || hasMeaningfulValue(alert)) {
     rows.push({
+      flowOrder: 10,
       stage: "Alert Landed In Landing Pad",
       agent: "Monitoring Adapter",
       service: "monitoring-adapter",
@@ -1019,10 +1276,25 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
       errorValueText: "",
       backendEvents: findTraceEvents(["alert", "incident.opened", "incident.created"]),
     });
+    pushBusRow({
+      flowOrder: 20,
+      stage: "Raw Alert Topic Handoff",
+      consumes: "provider webhook",
+      publishes: "raw-alerts",
+      timestamp: landingTimestamp,
+      detail: "Landing pad publishes the normalized alert envelope onto the raw-alerts topic for alert intelligence workers.",
+      payload: {
+        source_service: "monitoring-adapter",
+        target_service: "alert-intelligence",
+        topic: "raw-alerts",
+      },
+      backendEvents: findTraceEvents(["alert", "raw-alerts"]),
+    });
   }
 
   if (hasMeaningfulValue(alert.deduplicated_count) || dedupeTimestamp) {
     rows.push({
+      flowOrder: 30,
       stage: "Deduplication And Incident Correlation",
       agent: "Alert Intelligence Agent",
       service: "alert-intelligence",
@@ -1046,10 +1318,98 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
       errorValueText: "",
       backendEvents: findTraceEvents(["workflow.selected", "context.collected"]),
     });
+    pushBusRow({
+      flowOrder: 40,
+      stage: "Enriched Alert Topic Handoff",
+      consumes: "raw-alerts",
+      publishes: "enriched-alerts",
+      timestamp: dedupeTimestamp,
+      detail: "Alert intelligence publishes the correlated incident signal for orchestration routing.",
+      payload: {
+        source_service: "alert-intelligence",
+        target_service: "orchestrator",
+        incident_id: incident.id,
+        topic: "enriched-alerts",
+      },
+      backendEvents: findTraceEvents(["workflow.selected", "enriched-alerts"]),
+    });
   }
+
+  if (hasMeaningfulValue(decision) || routingTimestamp) {
+    rows.push({
+      flowOrder: 50,
+      stage: "Orchestrator Workflow Selection",
+      agent: "Orchestrator Agent",
+      service: "orchestrator",
+      consumes: "enriched-alerts",
+      publishes: "workflow request",
+      timestamp: routingTimestamp,
+      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, routingTimestamp),
+      detail: "Orchestrator selects the incident workflow, worker route, approval requirement, and execution policy.",
+      tables: "incident_events, incident_projections, pending_workflows",
+      inputValueText: stringifyTimelineValue({
+        alert: alert.name,
+        service: alert.service || incident.service,
+        severity: alert.severity || incident.severity,
+        incident_id: incident.id,
+      }),
+      outputValueText: stringifyTimelineValue({
+        workflow: decision.workflow,
+        next_action: decision.next_action,
+        requires_approval: decision.requires_approval,
+        risk_tier: decision.risk_tier,
+        trace_id: traceId,
+      }),
+      errorValueText: "",
+      backendEvents: findTraceEvents(["workflow.selected"]),
+    });
+  }
+
+  rows.push({
+    flowOrder: 60,
+    stage: "Configuration And Connector Lookup",
+    agent: "Config Service",
+    service: "config",
+    consumes: "workflow request",
+    publishes: "connector profile",
+    timestamp: configTimestamp,
+    elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, configTimestamp),
+    detail: "Service, environment, monitoring, message bus, RAG, and remediation connector settings resolved before agent execution.",
+    tables: "kaiops-connections.json, service_profiles, connector registry",
+    inputValueText: stringifyTimelineValue({
+      service: alert.service || incident.service,
+      environment: alert.environment || incident.environment,
+      requested_profiles: ["monitoring", "message_bus", "rag", "remediation"],
+    }),
+    outputValueText: stringifyTimelineValue({
+      monitoring_provider: decision.monitoring_provider || decision.provider || "prometheus",
+      message_bus_provider: decision.message_bus_provider || "rabbitmq",
+      workflow: decision.workflow || "guided-remediation",
+      execution_mode: decision.execution_mode || "-",
+      trace_id: traceId,
+    }),
+    errorValueText: "",
+    backendEvents: findTraceEvents(["config", "connection", "workflow.selected"]),
+  });
+  pushBusRow({
+    flowOrder: 70,
+    stage: "Orchestration Event Topic Handoff",
+    consumes: "workflow request + connector profile",
+    publishes: "orchestration-events",
+    timestamp: routingTimestamp,
+    detail: "Orchestrator publishes the runnable work item for context-agent workers with config, policy, and trace metadata attached.",
+    payload: {
+      source_service: "orchestrator",
+      target_service: "context-agent",
+      topic: "orchestration-events",
+      workflow: decision.workflow || "guided-remediation",
+    },
+    backendEvents: findTraceEvents(["workflow.selected", "orchestration-events"]),
+  });
 
   if (ragDocuments > 0 || ragMatches.length || contextTimestamp) {
     rows.push({
+      flowOrder: 80,
       stage: "RAG Context Retrieval",
       agent: "Context Intelligence Agent",
       service: "context-agent",
@@ -1075,8 +1435,53 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
     });
   }
 
+  if (contextTimestamp || runbookFound || ragMatches.length) {
+    rows.push({
+      flowOrder: 90,
+      stage: "Context Merge And Evidence Assembly",
+      agent: "Context Intelligence Agent",
+      service: "context-agent",
+      consumes: "ranked rag matches + connector evidence",
+      publishes: "context-events",
+      timestamp: contextTimestamp,
+      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, contextTimestamp),
+      detail: "RAG matches, dependency evidence, recent incidents, deployment metadata, and observability signals merged into one context payload.",
+      tables: "incident_events, dependencies, changes, runbooks, agent_work_items",
+      inputValueText: stringifyTimelineValue({
+        documents_ranked: ragDocumentDisplay,
+        dependency_count: Array.isArray(context.dependencies) ? context.dependencies.length : "-",
+        related_incidents: Array.isArray(context.related_incidents) ? context.related_incidents.length : 0,
+        connector_events: findTraceRows(["connector", "context"]).length,
+      }),
+      outputValueText: stringifyTimelineValue({
+        runbook_found: runbookFound,
+        document_available: Boolean(contextEventPayload.document_available || runbookFound),
+        context_summary: context.summary || contextEventPayload.summary || "-",
+        trace_id: traceId,
+      }),
+      errorValueText: "",
+      backendEvents: findTraceEvents(["context.collected", "connector", "dependency"]),
+    });
+    pushBusRow({
+      flowOrder: 100,
+      stage: "Context Event Topic Handoff",
+      consumes: "orchestration-events",
+      publishes: "context-events",
+      timestamp: contextTimestamp,
+      detail: "Context-agent publishes the assembled incident context for resolution-agent workers.",
+      payload: {
+        source_service: "context-agent",
+        target_service: "resolution-agent",
+        topic: "context-events",
+        documents_ranked: ragDocumentDisplay,
+      },
+      backendEvents: findTraceEvents(["context.collected", "context-events"]),
+    });
+  }
+
   if (ragMatches.length || (typeof ragTopSimilarity === "number" && ragTopSimilarity > 0)) {
     rows.push({
+      flowOrder: 85,
       stage: "Embedding And Semantic Search",
       agent: "VectorDB Connector",
       service: "context-agent",
@@ -1100,31 +1505,92 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
     });
   }
 
-  if (hasMeaningfulValue(decision) || routingTimestamp) {
+  if (hasMeaningfulValue(recommendation) || recommendationTimestamp) {
     rows.push({
-      stage: "Routing And Metadata Policy",
-      agent: "Orchestrator Agent",
-      service: "orchestrator",
-      consumes: "enriched-alerts",
-      publishes: "orchestration-events",
-      timestamp: routingTimestamp,
-      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, routingTimestamp),
-      detail: "Workflow routing policy selected with risk tier, execution mode, and transport provider metadata.",
-      tables: "incident_events, incident_projections",
+      flowOrder: 110,
+      stage: "Resolution Recommendation Generated",
+      agent: "Resolution Intelligence Agent",
+      service: "resolution-agent",
+      consumes: "context-events",
+      publishes: "resolution-events",
+      timestamp: recommendationTimestamp,
+      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, recommendationTimestamp),
+      detail: "RCA, impact, recommended action, confidence, and operator-safe execution plan generated from the assembled context.",
+      tables: "incident_events, recommendations, evaluation_records",
       inputValueText: stringifyTimelineValue({
-        workflow: decision.workflow,
-        next_action: decision.next_action,
-        requires_approval: decision.requires_approval,
+        incident_id: incident.id || recommendation.incident_id,
+        service: incident.service || alert.service,
+        context_trace_id: context.trace_id || traceId,
       }),
       outputValueText: stringifyTimelineValue({
-        risk_tier: decision.risk_tier,
-        execution_mode: decision.execution_mode,
-        policy_version: decision.policy_version,
-        message_bus_provider: decision.message_bus_provider,
+        recommendation_id: recommendation.id,
+        root_cause: recommendation.root_cause,
+        confidence: recommendation.confidence,
+        grounding_score: recommendationMetadata.grounding_score,
+        hallucination_score: recommendationMetadata.hallucination_score,
         trace_id: traceId,
       }),
       errorValueText: "",
-      backendEvents: findTraceEvents(["workflow.selected", "recommendation.generated", "approval.recorded"]),
+      backendEvents: findTraceEvents(["recommendation.generated", "resolution"]),
+    });
+    pushBusRow({
+      flowOrder: 120,
+      stage: "Resolution Event Topic Handoff",
+      consumes: "context-events",
+      publishes: "resolution-events",
+      timestamp: recommendationTimestamp,
+      detail: "Resolution-agent publishes RCA, impact, confidence, and the editable remediation plan for approval routing.",
+      payload: {
+        source_service: "resolution-agent",
+        target_service: "approval-service",
+        topic: "resolution-events",
+        recommendation_id: recommendation.id,
+      },
+      backendEvents: findTraceEvents(["recommendation.generated", "resolution-events"]),
+    });
+  }
+
+  if (approvalTimestamp || hasMeaningfulValue(recommendation.id)) {
+    rows.push({
+      flowOrder: 130,
+      stage: "Human Approval Gate",
+      agent: "Approval Service",
+      service: "approval-service",
+      consumes: "resolution-events",
+      publishes: "approval-events",
+      timestamp: approvalTimestamp,
+      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, approvalTimestamp),
+      detail: "Recommendation and editable remediation plan presented for human approval before execution.",
+      tables: "approvals, pending_workflows, incident_events",
+      inputValueText: stringifyTimelineValue({
+        recommendation_id: recommendation.id,
+        risk_tier: decision.risk_tier,
+        requires_approval: decision.requires_approval ?? true,
+        approver_role: decision.approver_role || "L2/L3/Admin",
+      }),
+      outputValueText: stringifyTimelineValue({
+        approval_status: remediationAction.approval_id ? "approved" : "pending",
+        approval_id: remediationAction.approval_id,
+        editable_plan: true,
+        trace_id: traceId,
+      }),
+      errorValueText: "",
+      backendEvents: findTraceEvents(["approval.requested", "approval.recorded"]),
+    });
+    pushBusRow({
+      flowOrder: 140,
+      stage: "Approval Event Topic Handoff",
+      consumes: "resolution-events",
+      publishes: "approval-events",
+      timestamp: approvalTimestamp,
+      detail: "Approval-service publishes the human decision and edited execution plan for remediation-engine workers.",
+      payload: {
+        source_service: "approval-service",
+        target_service: "remediation-engine",
+        topic: "approval-events",
+        approval_id: remediationAction.approval_id,
+      },
+      backendEvents: findTraceEvents(["approval.recorded", "approval-events"]),
     });
   }
 
@@ -1145,6 +1611,7 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
     const executedLive = executionResult.executed === true || String(remediationAction.status || "").toLowerCase() === "succeeded";
     const skippedExecution = String(remediationAction.status || "").toLowerCase() === "skipped" || executionResult.executed === false;
     rows.push({
+      flowOrder: 150,
       stage: "Remediation Command Execution",
       agent: "Remediation Automation Engine",
       service: "remediation-engine",
@@ -1178,6 +1645,48 @@ function buildSyntheticFlowRows({ workflow, events, traceRows, ingestAt, inciden
       errorValueText: stringifyTimelineValue(remediationAction.error),
       backendEvents: findTraceEvents(["remediation.executed", "closure.completed"]),
     });
+    pushBusRow({
+      flowOrder: 160,
+      stage: "Remediation Event Topic Handoff",
+      consumes: "approval-events",
+      publishes: "remediation-events",
+      timestamp: remediationTimestamp,
+      detail: "Remediation-engine publishes execution status, output, and connector result for closure validation.",
+      payload: {
+        source_service: "remediation-engine",
+        target_service: "closure-service",
+        topic: "remediation-events",
+        action_id: remediationAction.id,
+        status: remediationAction.status,
+      },
+      backendEvents: findTraceEvents(["remediation.executed", "remediation-events"]),
+    });
+  }
+
+  if (closureTimestamp) {
+    rows.push({
+      flowOrder: 170,
+      stage: "Closure Validation And Incident Update",
+      agent: "Closure & Validation",
+      service: "closure-service",
+      consumes: "remediation-events",
+      publishes: "closure-events",
+      timestamp: closureTimestamp,
+      elapsed: elapsedSeconds(ingestAt || incidentCreatedAt, closureTimestamp),
+      detail: "Post-remediation validation updates incident status, evidence, audit trail, and cockpit projection.",
+      tables: "incident_events, incident_projections, actions, audit_logs",
+      inputValueText: stringifyTimelineValue({
+        remediation_status: remediationAction.status,
+        action_id: remediationAction.id,
+      }),
+      outputValueText: stringifyTimelineValue({
+        health_restored: safeWorkflow?.closure_report?.health_restored,
+        incident_status: incident.status,
+        trace_id: traceId,
+      }),
+      errorValueText: "",
+      backendEvents: findTraceEvents(["closure.completed", "validation"]),
+    });
   }
 
   return rows;
@@ -1196,6 +1705,10 @@ function summarizeEventType(value) {
 }
 
 function timelinePhaseOrder(row) {
+  const explicitOrder = Number(row?.flowOrder);
+  if (Number.isFinite(explicitOrder) && explicitOrder > 0) {
+    return explicitOrder;
+  }
   const stage = String(row?.stage || "").toLowerCase();
   const eventHints = Array.isArray(row?.backendEvents)
     ? row.backendEvents.map((item) => String(item || "").toLowerCase())
@@ -1203,25 +1716,61 @@ function timelinePhaseOrder(row) {
   const haystack = `${stage} ${eventHints.join(" ")}`;
 
   if (haystack.includes("landing pad") || haystack.includes("alert received") || haystack.includes("alert landed") || haystack.includes("incident.alert")) {
-    return 0;
+    return 10;
+  }
+  if (haystack.includes("raw alert topic")) {
+    return 20;
   }
   if (haystack.includes("dedup") || haystack.includes("correlation") || haystack.includes("enrich")) {
-    return 1;
+    return 30;
+  }
+  if (haystack.includes("enriched alert topic")) {
+    return 40;
+  }
+  if (haystack.includes("routing") || haystack.includes("orchestrator") || haystack.includes("workflow.selected")) {
+    return 50;
+  }
+  if (haystack.includes("config") || haystack.includes("connector lookup") || haystack.includes("connection")) {
+    return 60;
+  }
+  if (haystack.includes("orchestration event topic")) {
+    return 70;
   }
   if (haystack.includes("rag context") || haystack.includes("context retrieval") || haystack.includes("context intelligence") || haystack.includes("incident.context.collected")) {
-    return 2;
+    return 80;
   }
   if (haystack.includes("embedding") || haystack.includes("semantic") || haystack.includes("vector")) {
-    return 3;
+    return 85;
   }
-  if (haystack.includes("routing") || haystack.includes("policy") || haystack.includes("workflow") || haystack.includes("recommendation")) {
-    return 4;
+  if (haystack.includes("context merge") || haystack.includes("evidence assembly")) {
+    return 90;
+  }
+  if (haystack.includes("context event topic")) {
+    return 100;
+  }
+  if (haystack.includes("recommendation") || haystack.includes("resolution")) {
+    return 110;
+  }
+  if (haystack.includes("policy")) {
+    return 115;
+  }
+  if (haystack.includes("resolution event topic")) {
+    return 120;
   }
   if (haystack.includes("approval")) {
-    return 5;
+    return 130;
   }
-  if (haystack.includes("remediation") || haystack.includes("command") || haystack.includes("execute") || haystack.includes("closure")) {
-    return 6;
+  if (haystack.includes("approval event topic")) {
+    return 140;
+  }
+  if (haystack.includes("remediation") || haystack.includes("command") || haystack.includes("execute")) {
+    return 150;
+  }
+  if (haystack.includes("remediation event topic")) {
+    return 160;
+  }
+  if (haystack.includes("closure") || haystack.includes("validation")) {
+    return 170;
   }
   return 99;
 }
@@ -1410,6 +1959,8 @@ function normalizeUsageRow(row) {
     .map((item) => String(item || "").trim())
     .find((item) => item && item !== "-") || "";
   const estimated = Boolean(entry.estimated ?? usage.estimated);
+  const fallback = Boolean(entry.fallback ?? usage.fallback)
+    || ["fallback", "heuristic-fallback", "provider-error"].includes(String(entry.provider || usage.provider || entry.model || usage.model || "").trim().toLowerCase());
   return {
     task: entry.task || entry.agent || entry.service || entry.action || entry.event_type || "-",
     provider: entry.provider || entry.vendor || entry.model_provider || usage.provider || responseParams.provider || "-",
@@ -1420,6 +1971,7 @@ function normalizeUsageRow(row) {
     total_cost_usd: totalCostUsd,
     note,
     estimated,
+    fallback,
   };
 }
 
@@ -1434,6 +1986,32 @@ function isMeaningfulUsageRow(row) {
   const hasModel = !isPlaceholderUsageValue(row?.model);
   const hasErrorNote = Boolean(String(row?.note || "").trim());
   return hasUsage || hasProvider || hasModel || hasErrorNote;
+}
+
+function usageRowIdentity(row) {
+  return [
+    String(row?.task || "").trim().toLowerCase(),
+    String(row?.provider || "").trim().toLowerCase(),
+    String(row?.model || "").trim().toLowerCase(),
+    String(row?.note || "").trim().toLowerCase(),
+    Number(row?.input_tokens || 0),
+    Number(row?.output_tokens || 0),
+    Number(row?.total_tokens || 0),
+  ].join("|");
+}
+
+function dedupeUsageRows(rows) {
+  const seen = new Set();
+  const out = [];
+  rows.forEach((row) => {
+    const key = usageRowIdentity(row);
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    out.push(row);
+  });
+  return out;
 }
 
 function HorizontalBarChart({ title, subtitle, items }) {
@@ -1544,8 +2122,17 @@ function FlowTimelineGraph({ rows }) {
     if (stage.includes("landing pad") || stage.includes("alert received") || stage.includes("alert landed")) {
       return { kind: "ingestion", short: "ING", label: "Landing Pad" };
     }
+    if (stage.includes("topic handoff") || stage.includes("message bus")) {
+      return { kind: "bus", short: "BUS", label: "Message Bus" };
+    }
     if (stage.includes("dedup") || stage.includes("correlation") || stage.includes("enrich")) {
       return { kind: "dedupe", short: "DED", label: "Dedup" };
+    }
+    if (stage.includes("config") || stage.includes("connector lookup")) {
+      return { kind: "config", short: "CFG", label: "Config" };
+    }
+    if (stage.includes("routing") || stage.includes("orchestrator") || stage.includes("workflow")) {
+      return { kind: "orchestration", short: "ORC", label: "Orchestrator" };
     }
     if (stage.includes("rag context") || stage.includes("context retrieval") || stage.includes("context intelligence")) {
       return { kind: "rag", short: "RAG", label: "RAG" };
@@ -1553,11 +2140,23 @@ function FlowTimelineGraph({ rows }) {
     if (stage.includes("embedding") || stage.includes("semantic") || stage.includes("vector")) {
       return { kind: "semantic", short: "SEM", label: "Semantic" };
     }
-    if (stage.includes("routing") || stage.includes("policy") || stage.includes("workflow")) {
+    if (stage.includes("context merge") || stage.includes("evidence assembly")) {
+      return { kind: "context", short: "CTX", label: "Context" };
+    }
+    if (stage.includes("resolution") || stage.includes("recommendation")) {
+      return { kind: "resolution", short: "RCA", label: "Resolution" };
+    }
+    if (stage.includes("approval")) {
+      return { kind: "approval", short: "APR", label: "Approval" };
+    }
+    if (stage.includes("policy")) {
       return { kind: "policy", short: "POL", label: "Policy" };
     }
     if (stage.includes("remediation") || stage.includes("command") || stage.includes("execute")) {
       return { kind: "execution", short: "CMD", label: "Execution" };
+    }
+    if (stage.includes("closure") || stage.includes("validation")) {
+      return { kind: "closure", short: "CLS", label: "Closure" };
     }
     return { kind: "generic", short: "EVT", label: "Event" };
   };
@@ -1791,11 +2390,18 @@ function FlowTimelineGraph({ rows }) {
 
   const phaseBlueprint = [
     { kind: "ingestion", label: "Landing" },
+    { kind: "bus", label: "Bus" },
     { kind: "dedupe", label: "Dedup" },
+    { kind: "config", label: "Config" },
+    { kind: "orchestration", label: "Orchestrator" },
     { kind: "rag", label: "RAG" },
     { kind: "semantic", label: "Semantic" },
+    { kind: "context", label: "Context" },
+    { kind: "resolution", label: "Resolution" },
     { kind: "policy", label: "Policy" },
+    { kind: "approval", label: "Approval" },
     { kind: "execution", label: "Execution" },
+    { kind: "closure", label: "Closure" },
   ];
   const presentKinds = new Set(timelineRows.map((row) => classifyStage(row).kind));
   const errorCount = timelineRows.filter((row) => hasMeaningfulValue(row?.errorValueText)).length;
@@ -2055,9 +2661,24 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
     180
   ) || "Selected alert service, name, severity, and description";
   const topSimilarity = Number(
-    contextMetadata.rag_top_similarity
+    contextMetadata.rag_top_match_confidence
+    ?? recommendationMetadata.rag_top_match_confidence
+    ?? traceMetadata.rag_top_match_confidence
+    ?? contextMetadata.rag_top_similarity
     ?? recommendationMetadata.rag_top_similarity
     ?? traceMetadata.rag_top_similarity
+    ?? 0
+  );
+  const topSemanticScore = Number(
+    contextMetadata.rag_top_semantic_score
+    ?? recommendationMetadata.rag_top_semantic_score
+    ?? traceMetadata.rag_top_semantic_score
+    ?? 0
+  );
+  const topMetadataScore = Number(
+    contextMetadata.rag_top_metadata_match_score
+    ?? recommendationMetadata.rag_top_metadata_match_score
+    ?? traceMetadata.rag_top_metadata_match_score
     ?? 0
   );
   const linkedSummary = documentContract?.document_link_summary && typeof documentContract.document_link_summary === "object"
@@ -2100,7 +2721,7 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
       id: "search",
       label: "Search Ranked",
       meta: `${ragMatches.length || touchedDocuments.length || 0} match(es)`,
-      detail: `Top similarity: ${Number.isFinite(topSimilarity) && topSimilarity > 0 ? `${Math.round(topSimilarity * 100)}%` : "not reported"}`,
+      detail: `Confidence ${Number.isFinite(topSimilarity) && topSimilarity > 0 ? `${Math.round(topSimilarity * 100)}%` : "not reported"} | semantic ${Number.isFinite(topSemanticScore) && topSemanticScore > 0 ? `${Math.round(topSemanticScore * 100)}%` : "-"} | metadata ${Number.isFinite(topMetadataScore) && topMetadataScore > 0 ? `${Math.round(topMetadataScore * 100)}%` : "-"}`,
       status: ragMatches.length || touchedDocuments.length ? "observed" : "warning",
     },
     {
@@ -2132,6 +2753,8 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
     vector_store: doc?._vector_store || doc?.vector_store?.provider || "-",
     match_reason: doc?.match_reason || "-",
     match_confidence: doc?.match_confidence ?? doc?._similarity ?? doc?.score ?? "-",
+    semantic_score: doc?.semantic_score ?? doc?._semantic_score ?? "-",
+    metadata_match_score: doc?.metadata_match_score ?? doc?._metadata_match_score ?? "-",
     source_ref: doc?.source_ref || "-",
   });
   const viewDocument = async (doc, index) => {
@@ -2200,6 +2823,7 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
     ["Embedding Provider", embeddingProvider],
     ["Embedding Model", embeddingName],
     ["Fallback Model", embeddingModel.fallback_model || "-"],
+    ["Fallback Active", embeddingModel.fallback_active ? "yes" : "no"],
     ["Vector Store", vectorProvider],
     ["Enterprise Index", ragIndex.enterprise_index_enabled ? "enabled" : "not enabled"],
     ["Vector Index", (vectorStore.index || vectorStore.index_name || vectorStore.configured) ? String(vectorStore.index || vectorStore.index_name || "configured") : "-"],
@@ -2215,7 +2839,7 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
         </div>
         <div className="context-flow-scoreboard">
           <span><strong>{ragMatches.length || safeDocuments.length}</strong> matches</span>
-          <span><strong>{Number.isFinite(topSimilarity) && topSimilarity > 0 ? `${Math.round(topSimilarity * 100)}%` : "-"}</strong> top score</span>
+          <span><strong>{Number.isFinite(topSimilarity) && topSimilarity > 0 ? `${Math.round(topSimilarity * 100)}%` : "-"}</strong> confidence</span>
           <span><strong>{Math.round((contextQuality.groundingScore || 0) * 100) || "-"}</strong> grounding</span>
         </div>
       </div>
@@ -2244,6 +2868,7 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
                 <div className="context-doc-row" key={`${doc.document_id || doc.path || doc.title || index}`}>
                   <strong>{doc.title || doc.path || `Document ${index + 1}`}</strong>
                   <span>{doc.kind || doc.document_kind || "document"} | confidence {Math.round(Number(doc.match_confidence || doc._similarity || doc.score || 0) * 100) || "-"}%</span>
+                  <small>semantic {Math.round(Number(doc.semantic_score || doc._semantic_score || 0) * 100) || "-"}% | metadata {Math.round(Number(doc.metadata_match_score || doc._metadata_match_score || 0) * 100) || "-"}%</small>
                   <small>{compactText(doc.match_reason || doc.summary || doc.path, 160) || "-"}</small>
                   <details>
                     <summary>Metadata</summary>
@@ -2695,6 +3320,472 @@ function ApplicationSankeyFlow({ workflow, timelineRows, routing, alertRows, sel
   );
 }
 
+function ProcessingFlowMap({ workflow, timelineRows, routing, selectedAlert, selectedAlertId, onDrillTimeline }) {
+  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
+  const safeRows = Array.isArray(timelineRows) ? timelineRows : [];
+  const safeRouting = routing && typeof routing === "object" ? routing : {};
+  const safeAlert = selectedAlert && typeof selectedAlert === "object" ? selectedAlert : {};
+  const rowByOrder = (order) => safeRows.find((row) => Number(row?.flowOrder) === order) || {};
+  const firstRowMatching = (tokens) => {
+    const needles = Array.isArray(tokens) ? tokens : [];
+    return safeRows.find((row) => {
+      const haystack = `${row?.stage || ""} ${row?.service || ""} ${row?.agent || ""} ${row?.consumes || ""} ${row?.publishes || ""}`.toLowerCase();
+      return needles.some((token) => haystack.includes(String(token || "").toLowerCase()));
+    }) || {};
+  };
+  const alertName = String(
+    safeAlert.name
+    || safeAlert.alert_name
+    || safeWorkflow?.alert?.name
+    || safeWorkflow?.alert?.alertname
+    || selectedAlertId
+    || "selected alert"
+  ).trim();
+  const service = String(safeAlert.service || safeWorkflow?.alert?.service || safeWorkflow?.incident?.service || "-").trim();
+  const severity = String(safeAlert.severity || safeWorkflow?.alert?.severity || safeWorkflow?.incident?.severity || "-").trim();
+  const incidentId = String(safeWorkflow?.incident?.id || safeWorkflow?.incident_id || "-").trim();
+  const workflowName = String(safeRouting.workflow || safeWorkflow?.decision?.workflow || "guided-remediation").trim();
+  const busProvider = String(safeRouting.message_bus_provider || safeWorkflow?.decision?.message_bus_provider || "rabbitmq").trim();
+  const executionMode = String(safeRouting.execution_mode || safeWorkflow?.decision?.execution_mode || "parallel-workers").trim();
+  const traceId = String(
+    safeWorkflow?.alert?.trace_id
+    || safeWorkflow?.incident?.trace_id
+    || safeWorkflow?.context?.trace_id
+    || safeWorkflow?.recommendation?.trace_id
+    || ""
+  ).trim();
+  const recommendation = safeWorkflow?.recommendation && typeof safeWorkflow.recommendation === "object" ? safeWorkflow.recommendation : {};
+  const contextPayload = safeWorkflow?.context && typeof safeWorkflow.context === "object" ? safeWorkflow.context : {};
+  const contextMetadata = contextPayload?.metadata && typeof contextPayload.metadata === "object" ? contextPayload.metadata : {};
+  const recommendationMetadata = recommendation?.metadata && typeof recommendation.metadata === "object" ? recommendation.metadata : {};
+  const remediation = safeWorkflow?.remediation_action && typeof safeWorkflow.remediation_action === "object" ? safeWorkflow.remediation_action : {};
+  const documentsRow = firstRowMatching(["rag context", "semantic", "context merge"]);
+  const remediationPlan = remediation?.parameters?.execution_plan && typeof remediation.parameters.execution_plan === "object"
+    ? remediation.parameters.execution_plan
+    : {};
+  const parseFlowJson = (value) => {
+    const text = String(value || "").trim();
+    if (!text) {
+      return {};
+    }
+    try {
+      const parsed = JSON.parse(text);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (_error) {
+      return {};
+    }
+  };
+  const contextRetrievalRow = rowByOrder(80);
+  const semanticSearchRow = rowByOrder(85);
+  const contextMergeRow = rowByOrder(90);
+  const resolutionRow = rowByOrder(110);
+  const contextRetrievalOutput = parseFlowJson(contextRetrievalRow.outputValueText);
+  const semanticSearchOutput = parseFlowJson(semanticSearchRow.outputValueText);
+  const contextMergeOutput = parseFlowJson(contextMergeRow.outputValueText);
+  const resolutionOutput = parseFlowJson(resolutionRow.outputValueText);
+  const contextRetrievalInput = parseFlowJson(contextRetrievalRow.inputValueText);
+  const resolutionInput = parseFlowJson(resolutionRow.inputValueText);
+  const ragMatches = Array.isArray(contextRetrievalOutput.rag_matches)
+    ? contextRetrievalOutput.rag_matches
+    : Array.isArray(semanticSearchOutput.top_matches)
+      ? semanticSearchOutput.top_matches
+      : [];
+  const topRagMatches = ragMatches.slice(0, 5);
+  const ragIndex =
+    (contextMetadata.rag_index && typeof contextMetadata.rag_index === "object" && contextMetadata.rag_index)
+    || (recommendationMetadata.rag_index && typeof recommendationMetadata.rag_index === "object" && recommendationMetadata.rag_index)
+    || {};
+  const embeddingModel =
+    (ragIndex.embedding_model && typeof ragIndex.embedding_model === "object" && ragIndex.embedding_model)
+    || {};
+  const vectorStore =
+    (ragIndex.vector_store && typeof ragIndex.vector_store === "object" && ragIndex.vector_store)
+    || {};
+  const embeddingProvider = String(embeddingModel.provider || contextMetadata.embedding_provider || "not reported").trim();
+  const embeddingName = String(embeddingModel.model || contextMetadata.embedding_model || "not reported").trim();
+  const embeddingFallback = String(embeddingModel.fallback_active ? embeddingModel.fallback_model || "active" : embeddingModel.fallback_model || "-").trim();
+  const vectorProvider = String(vectorStore.provider || contextMetadata.vector_store || "not reported").trim();
+  const vectorIndexName = String(vectorStore.index || vectorStore.index_name || ragIndex.index_name || ragIndex.name || "-").trim();
+  const indexedDocuments = ragIndex.document_count ?? ragIndex.total_documents ?? ragIndex.embedded_document_count ?? contextRetrievalOutput.rag_documents ?? "-";
+  const modelUsage = Array.isArray(recommendationMetadata.model_usage)
+    ? recommendationMetadata.model_usage
+    : Array.isArray(recommendation.model_usage)
+      ? recommendation.model_usage
+      : [];
+  const primaryModelCall = modelUsage[0] || {};
+  const modelRouterProvider = String(primaryModelCall.provider || primaryModelCall.model_provider || recommendationMetadata.model_provider || "model-router").trim();
+  const modelRouterModel = String(primaryModelCall.model || primaryModelCall.model_name || recommendationMetadata.model_name || "not reported").trim();
+  const modelRouterTask = String(primaryModelCall.task || primaryModelCall.model_task || recommendationMetadata.model_task || "rca").trim();
+  const modelRouterCalls = modelUsage.length;
+  const modelRouterTokens = modelUsage.reduce((sum, row) => sum + Number(row.total_tokens || row.input_tokens || 0), 0);
+  const modelRouterFailed = modelUsage.some((row) => {
+    const safeRow = row && typeof row === "object" ? row : {};
+    return hasMeaningfulValue(safeRow.error) || String(safeRow.status || "").trim().toLowerCase() === "failed";
+  });
+  const modelRouterFallback = modelUsage.some((row) => {
+    const safeRow = row && typeof row === "object" ? row : {};
+    const provider = String(safeRow.provider || safeRow.model_provider || "").trim().toLowerCase();
+    const model = String(safeRow.model || safeRow.model_name || "").trim().toLowerCase();
+    return provider.includes("fallback") || model.includes("fallback");
+  });
+  const modelRouterStatus = modelRouterFailed
+    ? "failed"
+    : modelRouterFallback
+      ? "fallback"
+      : modelRouterCalls > 0
+        ? "observed"
+        : "waiting";
+  const contextDetailRows = [
+    ["Query", contextRetrievalInput.service || contextRetrievalInput.query || service],
+    ["Deployment", contextRetrievalInput.deployment || "-"],
+    ["Related Incidents", contextRetrievalInput.related_incidents ?? "-"],
+    ["RAG Documents", contextRetrievalOutput.rag_documents ?? "-"],
+    ["Index Name", vectorIndexName],
+    ["Vector Store", vectorProvider],
+    ["Embedding Model", `${embeddingProvider} / ${embeddingName}`],
+    ["Embedding Fallback", embeddingFallback || "-"],
+    ["Runbook Found", String(contextRetrievalOutput.runbook_found ?? contextMergeOutput.runbook_found ?? "-")],
+    ["Top Match Confidence", semanticSearchOutput.rag_top_match_confidence ?? semanticSearchOutput.rag_top_similarity ?? "-"],
+    ["Top Semantic Score", semanticSearchOutput.rag_top_semantic_score ?? "-"],
+    ["Top Metadata Score", semanticSearchOutput.rag_top_metadata_match_score ?? "-"],
+    ["Context Summary", contextMergeOutput.context_summary || "-"],
+  ];
+  const resolutionDetailRows = [
+    ["Incident", resolutionInput.incident_id || incidentId],
+    ["Recommendation ID", resolutionOutput.recommendation_id || recommendation.id || "-"],
+    ["Root Cause", resolutionOutput.root_cause || recommendation.root_cause || "-"],
+    ["Impact", recommendation.impact || "-"],
+    ["Recommended Action", recommendation.recommended_action || "-"],
+    ["Model Router", `${modelRouterProvider} / ${modelRouterModel}`],
+    ["Model Task", modelRouterTask],
+    ["LLM Calls", modelRouterCalls || "-"],
+    ["Tokens", modelRouterTokens || "-"],
+    ["Confidence", resolutionOutput.confidence ?? recommendation.confidence ?? "-"],
+    ["Grounding Score", resolutionOutput.grounding_score ?? recommendation?.metadata?.grounding_score ?? "-"],
+    ["Hallucination Score", resolutionOutput.hallucination_score ?? recommendation?.metadata?.hallucination_score ?? "-"],
+  ];
+  const incidentStatusText = String(safeWorkflow?.incident?.status || safeAlert.status || safeAlert.state || "").trim().toLowerCase();
+  const isClosed = ["closed", "resolved", "validated", "complete", "completed"].some((token) => incidentStatusText.includes(token));
+  const allTimelineText = safeRows
+    .map((row) => `${row?.stage || ""} ${row?.detail || ""} ${row?.errorValueText || ""} ${row?.inputValueText || ""} ${row?.outputValueText || ""}`)
+    .join(" ")
+    .toLowerCase();
+  const fallbackDetected = ["fallback", "skipped", "not executed", "no live executor", "no real", "blocked", "policy"].some((token) => allTimelineText.includes(token));
+  const failedCount = safeRows.filter((row) => hasMeaningfulValue(row?.errorValueText)).length;
+
+  const nodeStatus = (row, order, fallbackHint = "") => {
+    const statusText = [
+      row?.status,
+      row?.detail,
+      row?.errorValueText,
+      row?.inputValueText,
+      row?.outputValueText,
+      fallbackHint,
+    ].map((item) => String(item || "").toLowerCase()).join(" ");
+    if (statusText.includes("error") || statusText.includes("failed") || statusText.includes("exception")) {
+      return "failed";
+    }
+    if (
+      statusText.includes("fallback")
+      || statusText.includes("skipped")
+      || statusText.includes("not executed")
+      || statusText.includes("no live executor")
+      || statusText.includes("no real")
+      || statusText.includes("policy-blocked")
+    ) {
+      return "fallback";
+    }
+    if (isClosed && Number(order || 0) >= 170) {
+      return "closed";
+    }
+    if (hasMeaningfulValue(row) || safeRows.some((item) => Number(item?.flowOrder) === order)) {
+      return "observed";
+    }
+    return "waiting";
+  };
+
+  const makeNode = ({ key, title, meta, detail, type = "service", row = {}, order, fallbackHint = "", statusOverride = "" }) => {
+    const observed = hasMeaningfulValue(row) || safeRows.some((item) => Number(item?.flowOrder) === order);
+    const status = statusOverride || nodeStatus(row, order, fallbackHint);
+    return { key, title, meta, detail, type, row, order, observed, status };
+  };
+
+  const mainNodes = [
+    makeNode({ key: "source", title: "Alerts ingested by third party", meta: "Prometheus / Grafana / external tools", detail: alertName, order: 5, type: "source", row: safeAlert }),
+    makeNode({ key: "landing", title: "Alerts landed in Landing Pad", meta: "/input or /alerts/alertmanager", detail: `${service} | ${severity}`, order: 10, row: rowByOrder(10) }),
+    makeNode({ key: "normalize", title: "Alert normalized to canonical format", meta: "labels + annotations + trace id", detail: traceId || "trace generated by intake", order: 10, row: rowByOrder(10) }),
+    makeNode({ key: "raw-bus", title: "Raw alert message published", meta: `${busProvider}: raw-alerts`, detail: "Monitoring Adapter -> Alert Intelligence", order: 20, type: "bus", row: rowByOrder(20) }),
+    makeNode({ key: "alert-ai", title: "Alert Intelligence Service invoked", meta: "Consumes raw-alerts", detail: "severity, dedupe, correlation", order: 30, row: rowByOrder(30) }),
+  ];
+
+  const intelligenceBranches = [
+    makeNode({ key: "severity", title: "Severity classification", meta: "policy + labels", detail: severity, order: 30, row: rowByOrder(30) }),
+    makeNode({ key: "dedupe", title: "Alerts deduplicated", meta: "fingerprint + correlation id", detail: incidentId, order: 30, row: rowByOrder(30) }),
+    makeNode({ key: "correlate", title: "Incident correlation", meta: "service + environment", detail: `${service} -> ${incidentId}`, order: 30, row: rowByOrder(30) }),
+  ];
+
+  const orchestrationNodes = [
+    makeNode({ key: "enriched-bus", title: "Enriched alert message published", meta: `${busProvider}: enriched-alerts`, detail: "Alert Intelligence -> Orchestrator", order: 40, type: "bus", row: rowByOrder(40) }),
+    makeNode({ key: "orchestrator", title: "Orchestrator workflow selected", meta: workflowName, detail: `execution=${executionMode}`, order: 50, row: rowByOrder(50) }),
+    makeNode({ key: "config", title: "Config and connector lookup", meta: "connections + playbooks + action catalog", detail: "workflow, bus provider, risk, executor profile", order: 60, type: "config", row: rowByOrder(60) }),
+    makeNode({ key: "orch-bus", title: "Execution work item published", meta: `${busProvider}: orchestration-events`, detail: "Orchestrator -> Context Agent", order: 70, type: "bus", row: rowByOrder(70) }),
+  ];
+
+  const workerLanes = [
+    {
+      key: "context",
+      title: "Context",
+      nodes: [
+        makeNode({ key: "ctx-agent", title: "Context Agent consumes orchestration-events", meta: "query + signal + service", detail: service, order: 80, row: rowByOrder(80) }),
+        makeNode({ key: "index", title: "Checks index and documents", meta: `${vectorProvider} / ${vectorIndexName}`, detail: `${indexedDocuments} document(s), embedding ${embeddingProvider}/${embeddingName}`, order: 85, type: "store", row: documentsRow }),
+        makeNode({ key: "ranked", title: "Search ranked", meta: "semantic + metadata ranking", detail: `top similarity ${semanticSearchOutput.rag_top_similarity ?? "not reported"}`, order: 85, type: "store", row: rowByOrder(85) }),
+        makeNode({ key: "context-merge", title: "Context merged and evidence assembled", meta: "docs + deps + connector evidence", detail: "context-events payload prepared", order: 90, row: rowByOrder(90) }),
+        makeNode({ key: "context-bus", title: "Context message published", meta: `${busProvider}: context-events`, detail: "Context Agent -> Resolution Agent", order: 100, type: "bus", row: rowByOrder(100) }),
+      ],
+    },
+    {
+      key: "resolution",
+      title: "Resolution",
+      nodes: [
+        makeNode({
+          key: "model-router",
+          title: "Model Router LLM call",
+          meta: `${modelRouterProvider} / ${modelRouterModel}`,
+          detail: `${modelRouterTask} | ${modelRouterCalls || 0} call(s) | ${modelRouterTokens || 0} token(s)`,
+          order: 109,
+          type: "config",
+          row: modelUsage.length
+            ? {
+                inputValueText: stringifyTimelineValue({ task: modelRouterTask, provider: modelRouterProvider, model: modelRouterModel }),
+                outputValueText: stringifyTimelineValue({
+                  calls: modelRouterCalls,
+                  tokens: modelRouterTokens,
+                  status: modelRouterStatus,
+                  errors: modelUsage.map((row) => row?.error).filter(Boolean),
+                }),
+                errorValueText: modelRouterFailed ? stringifyTimelineValue(modelUsage.map((row) => row?.error).filter(Boolean)) : "",
+              }
+            : {},
+          fallbackHint: modelRouterFallback ? "fallback" : "",
+          statusOverride: modelRouterStatus,
+        }),
+        makeNode({ key: "resolution-agent", title: "Resolution Agent consumes context-events", meta: "RCA + impact + action", detail: recommendation.root_cause || "root cause analysis", order: 110, row: rowByOrder(110) }),
+        makeNode({ key: "impact", title: "Impact analysis", meta: "customer + dependency impact", detail: recommendation.impact || "-", order: 110, row: rowByOrder(110) }),
+        makeNode({ key: "action", title: "Recommendation action", meta: "safe next step", detail: recommendation.recommended_action || "-", order: 110, row: rowByOrder(110) }),
+        makeNode({ key: "confidence", title: "Confidence and grounding", meta: "quality guardrails", detail: `confidence ${recommendation.confidence ?? "-"}`, order: 110, row: rowByOrder(110) }),
+        makeNode({ key: "resolution-bus", title: "Resolution message published", meta: `${busProvider}: resolution-events`, detail: "Resolution Agent -> Approval Service", order: 120, type: "bus", row: rowByOrder(120) }),
+      ],
+    },
+    {
+      key: "remediation",
+      title: "Approval + Remediation",
+      nodes: [
+        makeNode({ key: "approval", title: "Human approval gate", meta: "L2/L3/Admin can edit plan", detail: remediation.approval_id || "pending decision", order: 130, row: rowByOrder(130) }),
+        makeNode({ key: "approval-bus", title: "Approval message published", meta: `${busProvider}: approval-events`, detail: "Approval Service -> Remediation Engine", order: 140, type: "bus", row: rowByOrder(140) }),
+        makeNode({ key: "execute", title: "Remediation Engine validates and executes", meta: "policy + executor + secret_ref", detail: remediation.status || "pending", order: 150, row: rowByOrder(150), fallbackHint: remediation?.error || remediation?.output || "" }),
+        ...(fallbackDetected ? [
+          makeNode({
+            key: "fallback",
+            title: "Fallback or safety gate applied",
+            meta: "plan preserved, live mutation blocked",
+            detail: remediation.error || remediation.output || "No live executor/connector was available, so the approved plan remains available for operator action.",
+            order: 151,
+            type: "config",
+            row: rowByOrder(150),
+            fallbackHint: "fallback",
+          }),
+        ] : []),
+        makeNode({ key: "script", title: "Execution plan script", meta: "editable before approval", detail: Array.isArray(remediationPlan.scripts) && remediationPlan.scripts.length ? remediationPlan.scripts[0] : "no script reported", order: 150, type: "config", row: rowByOrder(150) }),
+        makeNode({ key: "rem-bus", title: "Remediation message published", meta: `${busProvider}: remediation-events`, detail: "Remediation Engine -> Closure Service", order: 160, type: "bus", row: rowByOrder(160) }),
+      ],
+    },
+    {
+      key: "closure",
+      title: "Closure",
+      nodes: [
+        makeNode({ key: "closure-service", title: "Closure Service validates outcome", meta: "post-checks + incident projection", detail: safeWorkflow?.incident?.status || "-", order: 170, row: rowByOrder(170) }),
+        makeNode({ key: "closure-bus", title: "Closure message published", meta: `${busProvider}: closure-events`, detail: "Dashboard, reports, notifications", order: 180, type: "bus", row: firstRowMatching(["closure-events"]) }),
+      ],
+    },
+  ];
+
+  const statusLabel = (status) => {
+    if (status === "failed") return "Failed";
+    if (status === "fallback") return "Fallback";
+    if (status === "closed") return "Closed";
+    if (status === "observed") return "Observed";
+    return "Waiting";
+  };
+  const renderNode = (node) => (
+    <article className={`processing-flow-node node-${node.type} status-${node.status}`} key={node.key}>
+      <div className="processing-node-head">
+        <strong>{node.title}</strong>
+        <em>{statusLabel(node.status)}</em>
+      </div>
+      <span>{node.meta}</span>
+      <p>{compactText(node.detail, 150) || "-"}</p>
+      <small>
+        {node.status === "fallback"
+          ? "fallback or safety gate path used"
+          : node.status === "failed"
+            ? "error detected in selected alert flow"
+            : node.status === "closed"
+              ? "incident closure path completed"
+              : node.status === "observed"
+                ? "observed from selected alert flow"
+                : "configured path, not observed yet"}
+      </small>
+      {node.row?.inputValueText || node.row?.outputValueText ? (
+        <details>
+          <summary>Details</summary>
+          {node.row?.inputValueText ? <pre className="result">{node.row.inputValueText}</pre> : null}
+          {node.row?.outputValueText ? <pre className="result">{node.row.outputValueText}</pre> : null}
+        </details>
+      ) : null}
+    </article>
+  );
+
+  return (
+    <div className="processing-flow-map">
+      <div className="context-flow-header">
+        <div>
+          <h3>Complete Processing Flow</h3>
+          <p>Architecture-style view for the selected alert. Use Flow Timeline for full event payload details.</p>
+        </div>
+        <button type="button" className="button-secondary" onClick={onDrillTimeline}>Open Detailed Timeline</button>
+      </div>
+      <div className="processing-flow-status-strip">
+        <span><strong>{safeRows.length}</strong> timeline rows</span>
+        <span><strong>{failedCount}</strong> failures</span>
+        <span><strong>{fallbackDetected ? "yes" : "no"}</strong> fallback</span>
+        <span><strong>{isClosed ? "closed" : incidentStatusText || "open"}</strong> incident</span>
+      </div>
+      {fallbackDetected || failedCount ? (
+        <div className={`processing-flow-banner ${failedCount ? "is-failed" : "is-fallback"}`}>
+          <strong>{failedCount ? "Flow needs attention" : "Fallback path detected"}</strong>
+          <span>
+            {failedCount
+              ? "One or more stages reported errors. Open the detailed timeline to inspect exact payloads."
+              : "A safety gate, fallback, or skipped execution was detected. The plan is preserved and closure should reflect the guarded outcome."}
+          </span>
+        </div>
+      ) : null}
+      <div className="processing-flow-spine">
+        {mainNodes.map((node, index) => (
+          <div className="processing-flow-step" key={node.key}>
+            {renderNode(node)}
+            {index < mainNodes.length - 1 ? <span className="processing-flow-arrow" aria-hidden="true">v</span> : null}
+          </div>
+        ))}
+      </div>
+      <div className="processing-flow-branches">
+        {intelligenceBranches.map(renderNode)}
+      </div>
+      <div className="processing-flow-spine">
+        {orchestrationNodes.map((node, index) => (
+          <div className="processing-flow-step" key={node.key}>
+            {renderNode(node)}
+            {index < orchestrationNodes.length - 1 ? <span className="processing-flow-arrow" aria-hidden="true">v</span> : null}
+          </div>
+        ))}
+      </div>
+      <div className="processing-flow-lanes">
+        {workerLanes.map((lane) => (
+          <section className="processing-flow-lane" key={lane.key}>
+            <h4>{lane.title}</h4>
+            {lane.nodes.map((node, index) => (
+              <div className="processing-flow-step" key={node.key}>
+                {renderNode(node)}
+                {index < lane.nodes.length - 1 ? <span className="processing-flow-arrow" aria-hidden="true">v</span> : null}
+              </div>
+            ))}
+          </section>
+        ))}
+      </div>
+      <div className="processing-flow-detail-grid">
+        <article className="processing-flow-detail-card">
+          <div className="panel-head">
+            <h4>Context Details</h4>
+            <p>Same evidence path as Context Flow, shown inline for this processing map.</p>
+          </div>
+          <div className="table-wrap table-wrap-scroll-x">
+            <table>
+              <tbody>
+                {contextDetailRows.map(([label, value]) => (
+                  <tr key={`processing-context-${label}`}><th>{label}</th><td>{String(value ?? "-")}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <h4>Documents / Matches Touched</h4>
+          {topRagMatches.length ? (
+            <div className="processing-flow-match-list">
+              {topRagMatches.map((match, index) => (
+                <div className="processing-flow-match" key={`processing-match-${index}`}>
+                  <strong>{match.title || match.document_id || match.path || `Match ${index + 1}`}</strong>
+                  <span>{match.kind || match.document_kind || "document"} | confidence {Math.round(Number(match.match_confidence || match._similarity || match.score || 0) * 100) || "-"}%</span>
+                  <small>{compactText(match.match_reason || match.summary || match.path || JSON.stringify(match), 180)}</small>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="subtitle">No RAG match list was reported for this selected alert.</p>
+          )}
+        </article>
+        <article className="processing-flow-detail-card">
+          <div className="panel-head">
+          <h4>Resolution Details</h4>
+          <p>RCA, impact, recommendation, and quality scores from the Resolution Agent.</p>
+          </div>
+          <div className="table-wrap table-wrap-scroll-x">
+            <table>
+              <tbody>
+                {resolutionDetailRows.map(([label, value]) => (
+                  <tr key={`processing-resolution-${label}`}><th>{label}</th><td>{String(value ?? "-")}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <h4>LLM Calls Through Model Router</h4>
+          {modelUsage.length ? (
+            <div className="processing-flow-match-list">
+              {modelUsage.slice(0, 6).map((usage, index) => (
+                <div className="processing-flow-match" key={`processing-llm-${index}`}>
+                  <strong>{usage.provider || usage.model_provider || "model-router"}</strong>
+                  <span>{usage.model || usage.model_name || "-"} | task {usage.task || usage.model_task || "-"}</span>
+                  <small>
+                    input {usage.input_tokens ?? "-"} | output {usage.output_tokens ?? "-"} | total {usage.total_tokens ?? "-"} | cost {usage.total_cost_usd ?? "-"}
+                  </small>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="subtitle">No persisted model-router usage rows were reported for this selected alert.</p>
+          )}
+          <h4>Execution Plan Preview</h4>
+          <div className="processing-flow-match-list">
+            <div className="processing-flow-match">
+              <strong>Commands</strong>
+              <span>{Array.isArray(remediationPlan.commands) ? remediationPlan.commands.length : 0} item(s)</span>
+              <small>{Array.isArray(remediationPlan.commands) && remediationPlan.commands.length ? remediationPlan.commands.join(" | ") : "No command list reported."}</small>
+            </div>
+            <div className="processing-flow-match">
+              <strong>Scripts</strong>
+              <span>{Array.isArray(remediationPlan.scripts) ? remediationPlan.scripts.length : 0} item(s)</span>
+              <small>{Array.isArray(remediationPlan.scripts) && remediationPlan.scripts.length ? remediationPlan.scripts.join(" | ") : "No script reported."}</small>
+            </div>
+            <div className="processing-flow-match">
+              <strong>Queries</strong>
+              <span>{Array.isArray(remediationPlan.queries) ? remediationPlan.queries.length : 0} item(s)</span>
+              <small>{Array.isArray(remediationPlan.queries) && remediationPlan.queries.length ? remediationPlan.queries.join(" | ") : "No validation query reported."}</small>
+            </div>
+          </div>
+        </article>
+      </div>
+    </div>
+  );
+}
+
 function MessageBusTopology({ actual, configuredRows, routing, primaryTopic, compact = false }) {
   const safeActual = actual && typeof actual === "object" ? actual : {};
   const safeRouting = routing && typeof routing === "object" ? routing : {};
@@ -2965,6 +4056,105 @@ function normalizeGeneratedRuleRows(source) {
   });
 }
 
+function cleanRuleIntentLine(line) {
+  return String(line || "")
+    .replace(/^[^\n:]{1,180}\.(?:md|markdown|txt|log|json|ya?ml|csv)\s*:\s*/i, "")
+    .trim();
+}
+
+function slugForPrometheus(value) {
+  return String(value || "kaiops")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_:-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "kaiops";
+}
+
+function yamlQuote(value) {
+  return JSON.stringify(String(value ?? ""));
+}
+
+function inferPrometheusExpression(requirement, serviceName) {
+  const text = String(requirement || "").toLowerCase();
+  const service = String(serviceName || "service").trim() || "service";
+  const numberMatch = text.match(/(?:above|over|greater than|exceeds?|>=?)\s+([0-9]+(?:\.[0-9]+)?)/i);
+  const threshold = numberMatch ? Number(numberMatch[1]) : null;
+  if (text.includes("unavailable") || text.includes("down") || text.includes("not reachable") || text.includes("not available")) {
+    return `up{service="${service}"} == 0`;
+  }
+  if (text.includes("latency") || text.includes("p95") || text.includes("p99")) {
+    const metric = text.includes("p99") ? "request_latency_ms_p99" : "request_latency_ms_p95";
+    return `quantile_over_time(0.95, ${metric}{service="${service}"}[5m]) > ${threshold || 500}`;
+  }
+  if (text.includes("error rate") || text.includes("5xx") || text.includes("errors")) {
+    return `avg_over_time(error_rate_percent{service="${service}"}[5m]) > ${threshold || 5}`;
+  }
+  if (text.includes("row") || text.includes("table")) {
+    return `sum_over_time(mysql_table_rows{service="${service}"}[5m]) > ${threshold || 20}`;
+  }
+  if (text.includes("cpu")) {
+    return `avg_over_time(cpu_usage_percent{service="${service}"}[5m]) > ${threshold || 85}`;
+  }
+  if (text.includes("memory")) {
+    return `avg_over_time(memory_usage_percent{service="${service}"}[5m]) > ${threshold || 85}`;
+  }
+  return `vector(1)`;
+}
+
+function inferRuleDuration(requirement) {
+  const match = String(requirement || "").match(/for\s+([0-9]+)\s*(minutes?|mins?|m|hours?|hrs?|h)\b/i);
+  if (!match) {
+    return "5m";
+  }
+  const value = match[1];
+  const unit = String(match[2] || "m").toLowerCase();
+  return unit.startsWith("h") ? `${value}h` : `${value}m`;
+}
+
+function inferRuleSeverity(requirement) {
+  const text = String(requirement || "").toLowerCase();
+  if (text.includes("critical")) return "critical";
+  if (text.includes("high")) return "high";
+  if (text.includes("low")) return "low";
+  if (text.includes("info")) return "info";
+  return "warning";
+}
+
+function buildPrometheusRulePreview({ projectName, serviceName, environment, requirements }) {
+  const project = slugForPrometheus(projectName || serviceName || "kaiops-project");
+  const service = String(serviceName || project).trim() || project;
+  const env = String(environment || "prod").trim() || "prod";
+  const lines = (Array.isArray(requirements) ? requirements : [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  const ruleLines = lines.length ? lines : [`Alert when ${service} is unavailable for 5 minutes.`];
+  const rendered = ruleLines.map((line, index) => {
+    const severity = inferRuleSeverity(line);
+    const name = `${project}-${slugForPrometheus(line).slice(0, 52) || `rule-${index + 1}`}-${severity}`;
+    const expr = inferPrometheusExpression(line, service);
+    const duration = inferRuleDuration(line);
+    return [
+      `    - alert: ${name}`,
+      `      expr: ${expr}`,
+      `      for: ${duration}`,
+      "      labels:",
+      `        severity: ${severity}`,
+      `        project: ${project}`,
+      `        service: ${service}`,
+      `        environment: ${env}`,
+      "      annotations:",
+      `        summary: ${yamlQuote(line)}`,
+      `        description: ${yamlQuote(`Generated from KaiOps guided setup for ${project}.`)}`,
+    ].join("\n");
+  });
+  return [
+    "groups:",
+    `  - name: ${project}-generated-rules`,
+    "    rules:",
+    ...rendered,
+  ].join("\n");
+}
+
 function summarizeAlertRuleContext(row, workflow = {}) {
   const alertRow = row && typeof row === "object" ? row : {};
   const alertLabels = typeof alertRow.labels === "object" && alertRow.labels ? alertRow.labels : {};
@@ -3082,6 +4272,7 @@ export default function App() {
   const [flows, setFlows] = useState({ loading: false, rows: [], error: "" });
   const [gatewaySummary, setGatewaySummary] = useState({ loading: false, data: {}, error: "" });
   const [gatewayRecent, setGatewayRecent] = useState({ loading: false, rows: [], error: "" });
+  const [modelProviderStatus, setModelProviderStatus] = useState({ loading: false, data: null, error: "" });
   const [landingPadRecent, setLandingPadRecent] = useState({ loading: false, rows: [], error: "" });
   const [ragDocs, setRagDocs] = useState({ loading: false, rows: [], error: "" });
   const [guidanceQuery, setGuidanceQuery] = useState("");
@@ -3099,6 +4290,7 @@ export default function App() {
     error: "",
   });
   const [selectedAlertId, setSelectedAlertId] = useState("");
+  const alertStreamRefreshInFlight = useRef(false);
   const [selectedApprovalIncidentId, setSelectedApprovalIncidentId] = useState("");
   const [selectedAlertData, setSelectedAlertData] = useState({ loading: false, payload: null, error: "", alertId: "" });
   const [selectedAlertDocumentLinks, setSelectedAlertDocumentLinks] = useState({
@@ -3116,7 +4308,7 @@ export default function App() {
     incidentId: "",
   });
   const [homeDetailTab, setHomeDetailTab] = useState("overview");
-  const [diagnosticsDetailTab, setDiagnosticsDetailTab] = useState("application");
+  const [diagnosticsDetailTab, setDiagnosticsDetailTab] = useState("processing");
   const [approvalForm, setApprovalForm] = useState({
     action: "approve",
     incident_id: "",
@@ -3193,8 +4385,8 @@ export default function App() {
     azure_content_safety_endpoint: "",
     assignment_username: "",
     assignment_project: "",
-    onboarding_path: "existing_monitoring",
-    start_rule_onboarding: false,
+    onboarding_path: "setup_monitoring",
+    start_rule_onboarding: true,
     service_knowledge_prompt: "",
     rule_onboarding_plain_language: "",
   });
@@ -3294,7 +4486,7 @@ export default function App() {
     error: "",
   });
   const [alertKnowledgeView, setAlertKnowledgeView] = useState("onboarding");
-  const [projectSetupStep, setProjectSetupStep] = useState("setup");
+  const [projectSetupStep, setProjectSetupStep] = useState("docs_rules");
   const [projectSetupShowAll, setProjectSetupShowAll] = useState(false);
   const [alertOnboardingState, setAlertOnboardingState] = useState({ loading: false, result: null, error: "" });
   const [docPromptAlert, setDocPromptAlert] = useState(null);
@@ -3875,24 +5067,39 @@ export default function App() {
           return base;
         })
         .filter(Boolean);
-      const isDisplayableMonitorApp = (value) => {
+      const isValidMonitorProjectName = (value) => {
         const normalized = String(value || "").trim();
         if (!normalized) {
+          return false;
+        }
+        if (/[:/]/.test(normalized)) {
+          return false;
+        }
+        if (/^(unknown|default|prod|dev|staging|warning|critical|high|info)$/i.test(normalized)) {
+          return false;
+        }
+        return true;
+      };
+      const isDisplayableAlertApp = (value) => {
+        const normalized = String(value || "").trim();
+        if (!isValidMonitorProjectName(normalized)) {
           return false;
         }
         if (defaultMonitorApplications.includes(normalized)) {
           return true;
         }
-        // Drop URLs, host:port exporter/instance targets, and raw infra job
-        // names (node-exporter, blackbox, mysql, etc.) - keep only real
-        // kaiops-* application/service names.
-        if (/[:/]/.test(normalized)) {
-          return false;
-        }
+        // Alert labels can include infra jobs and exporter names. Keep the
+        // inferred alert-side list conservative, while allowing explicit
+        // onboarding/application rows above to show any valid project name.
         return /^kaiops(-|$)/i.test(normalized);
       };
       const unique = Array.from(
-        new Set([...defaultMonitorApplications, ...projects, ...monitoringApplications, ...alertApplications].filter(isDisplayableMonitorApp)),
+        new Set([
+          ...defaultMonitorApplications,
+          ...projects.filter(isValidMonitorProjectName),
+          ...monitoringApplications.filter(isValidMonitorProjectName),
+          ...alertApplications.filter(isDisplayableAlertApp),
+        ]),
       );
       setMonitorApplications(unique.length ? unique : defaultMonitorApplications);
     } catch (_error) {
@@ -4201,18 +5408,28 @@ export default function App() {
       owner_team: "",
       environment: "prod",
       region: curr.region || "us-east-1",
-      monitoring_tool: curr.monitoring_tool || "prometheus",
-      monitoring_url: "",
-      prometheus_url: "",
+      monitoring_tool: "prometheus",
+      monitoring_url: "http://prometheus:9090",
+      prometheus_url: "http://prometheus:9090",
       new_relic_url: "",
       datadog_url: "",
       assignment_username: "",
       assignment_project: "",
-      onboarding_path: "existing_monitoring",
-      start_rule_onboarding: false,
+      onboarding_path: "setup_monitoring",
+      start_rule_onboarding: true,
       service_knowledge_prompt: "",
       rule_onboarding_plain_language: "",
     }));
+  }
+
+  async function loadModelProviderStatus() {
+    setModelProviderStatus((curr) => ({ ...curr, loading: true, error: "" }));
+    try {
+      const payload = await fetchJson("/api-gateway/model/providers/status");
+      setModelProviderStatus({ loading: false, data: unwrap(payload), error: "" });
+    } catch (error) {
+      setModelProviderStatus({ loading: false, data: null, error: error.message });
+    }
   }
 
   function currentOnboardedApplicationName() {
@@ -4322,7 +5539,7 @@ export default function App() {
     const merged = [];
     rows.forEach((row) => {
       (Array.isArray(row?.derived_requirements) ? row.derived_requirements : []).forEach((item) => {
-        const token = String(item || "").trim();
+        const token = cleanRuleIntentLine(item);
         if (token && !merged.some((existing) => existing.toLowerCase() === token.toLowerCase())) {
           merged.push(token);
         }
@@ -4385,17 +5602,48 @@ export default function App() {
     return text;
   }
 
+  function knowledgeFactEditValue(key, fact) {
+    if (Object.prototype.hasOwnProperty.call(knowledgePackCorrections, key)) {
+      return knowledgePackCorrections[key] || "";
+    }
+    const value = fact?.value;
+    if (Array.isArray(value)) {
+      return value.join("\n");
+    }
+    return String(value || "");
+  }
+
+  function updateKnowledgeFactCorrection(key, value) {
+    setKnowledgePackCorrections((current) => ({
+      ...current,
+      [key]: value,
+    }));
+    if (key === "service") {
+      setOnboardingForm((current) => ({ ...current, name: value, assignment_project: value }));
+    }
+    if (key === "environment") {
+      setOnboardingForm((current) => ({ ...current, environment: value || current.environment }));
+    }
+    if (key === "owner_team") {
+      setOnboardingForm((current) => ({ ...current, owner_team: value }));
+    }
+  }
+
   const correctedKnowledgeFacts = useMemo(() => {
     const next = {};
     Object.entries(onboardingKnowledgeFacts).forEach(([key, fact]) => {
       const correction = knowledgePackCorrections[key];
-      const hasCorrection = String(correction || "").trim().length > 0;
+      const hasCorrection = Object.prototype.hasOwnProperty.call(knowledgePackCorrections, key);
+      const normalizedCorrection = normalizeKnowledgeCorrectionValue(key, correction);
+      const correctionEmpty = Array.isArray(normalizedCorrection)
+        ? normalizedCorrection.length === 0
+        : !String(normalizedCorrection || "").trim();
       next[key] = hasCorrection
         ? {
           ...(fact || {}),
-          value: normalizeKnowledgeCorrectionValue(key, correction),
-          confidence: 0.95,
-          status: "accepted",
+          value: normalizedCorrection,
+          confidence: correctionEmpty ? 0 : 0.95,
+          status: correctionEmpty ? "needs_review" : "accepted",
           sources: [...(Array.isArray(fact?.sources) ? fact.sources : []), "user-confirmed"],
         }
         : fact;
@@ -4433,6 +5681,37 @@ export default function App() {
     return `${knowledgeReviewFields.length} detail${knowledgeReviewFields.length === 1 ? "" : "s"} need input before validation can pass.`;
   }, [knowledgeReviewFields.length, knowledgeReviewReady, onboardingKnowledgePack]);
 
+  useEffect(() => {
+    if (!onboardingKnowledgePack || !Object.keys(onboardingKnowledgeFacts).length) {
+      return;
+    }
+    const factValue = (key) => {
+      const fact = onboardingKnowledgeFacts[key] || {};
+      const value = fact.value;
+      if (Array.isArray(value)) {
+        return String(value[0] || "").trim();
+      }
+      return String(value || "").trim();
+    };
+    const service = factValue("service");
+    const environment = factValue("environment");
+    const ownerTeam = factValue("owner_team");
+    setOnboardingForm((current) => {
+      const next = { ...current };
+      if (service && (!String(current.name || "").trim() || ["kaiops-project", "service"].includes(String(current.name || "").trim().toLowerCase()))) {
+        next.name = service;
+        next.assignment_project = service;
+      }
+      if (environment && (!String(current.environment || "").trim() || String(current.environment || "").trim() === "prod")) {
+        next.environment = environment;
+      }
+      if (ownerTeam && (!String(current.owner_team || "").trim() || String(current.owner_team || "").trim() === "platform-ops")) {
+        next.owner_team = ownerTeam;
+      }
+      return next;
+    });
+  }, [onboardingKnowledgeFacts, onboardingKnowledgePack]);
+
   function buildKnowledgePackPayload(rows = onboardingSourceDocs.rows) {
     const validRows = (Array.isArray(rows) ? rows : []).filter((row) => String(row?.text || "").trim() && !String(row?.warning || "").trim());
     return {
@@ -4467,7 +5746,7 @@ export default function App() {
       size: text.length,
       text,
       excerpt: summarizeUploadedDocument(text),
-      derived_requirements: deriveMonitoringRequirementsFromDocument(`${serviceName}-prompt-service-knowledge.md`, text),
+      derived_requirements: deriveMonitoringRequirementsFromDocument(`${serviceName}-prompt-service-knowledge.md`, text).map(cleanRuleIntentLine).filter(Boolean),
       warning: "",
       source: "prompt",
     };
@@ -4479,9 +5758,9 @@ export default function App() {
     if (promptRow.derived_requirements.length) {
       const manual = String(onboardingForm.rule_onboarding_plain_language || "")
         .split(/\r?\n/)
-        .map((line) => line.trim())
+        .map(cleanRuleIntentLine)
         .filter(Boolean);
-      const combined = [...manual, ...promptRow.derived_requirements].filter(
+      const combined = [...manual, ...promptRow.derived_requirements].map(cleanRuleIntentLine).filter(Boolean).filter(
         (line, index, array) => array.findIndex((item) => item.toLowerCase() === line.toLowerCase()) === index,
       );
       const nextText = combined.join("\n");
@@ -4539,6 +5818,8 @@ export default function App() {
         approved: true,
       });
       setOnboardingReviewAck((current) => ({ ...current, docs: true }));
+      applyUploadedDocumentsToRuleIntent();
+      await Promise.all([loadRagDocs(), loadRecentAlerts()]);
     } catch (error) {
       setKnowledgePackState((current) => ({ ...current, loading: false, error: error.message, success: "", approved: false }));
     }
@@ -4752,9 +6033,9 @@ export default function App() {
     }
     const manual = String(onboardingForm.rule_onboarding_plain_language || "").trim();
     const combined = [
-      ...manual.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
+      ...manual.split(/\r?\n/).map(cleanRuleIntentLine).filter(Boolean),
       ...onboardingDerivedRequirements,
-    ].filter((line, index, array) => array.findIndex((item) => item.toLowerCase() === line.toLowerCase()) === index);
+    ].map(cleanRuleIntentLine).filter(Boolean).filter((line, index, array) => array.findIndex((item) => item.toLowerCase() === line.toLowerCase()) === index);
     const nextText = combined.join("\n");
     setOnboardingForm((curr) => ({ ...curr, rule_onboarding_plain_language: nextText }));
     setNewRulePipelineForm((curr) => ({ ...curr, requirements_text: nextText }));
@@ -4917,8 +6198,11 @@ export default function App() {
     setOnboardingDocApprovalState({ loading: false, error: "", success: "", approved: false });
     setOnboardingReviewAck({ rules: false, docs: false, metadata: false });
     try {
-      const selectedMonitoringTool = String(onboardingForm.monitoring_tool || "prometheus").trim().toLowerCase();
-      const monitoringUrl = simplifyMonitoringUrl(onboardingForm.monitoring_url);
+      const onboardingPath = String(onboardingForm.onboarding_path || "setup_monitoring").trim().toLowerCase();
+      const selectedMonitoringTool = onboardingPath === "setup_monitoring"
+        ? "prometheus"
+        : String(onboardingForm.monitoring_tool || "prometheus").trim().toLowerCase();
+      const monitoringUrl = simplifyMonitoringUrl(onboardingForm.monitoring_url || (onboardingPath === "setup_monitoring" ? "http://prometheus:9090" : ""));
       const username = String(onboardingForm.assignment_username || "").trim();
       const assignmentProject = String(onboardingForm.name || "").trim();
       const userAssignments = username && assignmentProject ? { [username]: [assignmentProject] } : {};
@@ -4947,14 +6231,13 @@ export default function App() {
         active_provider: selectedMonitoringTool,
       };
 
-      const onboardingPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim().toLowerCase();
       const plainLanguageRequirements = [
         ...String(onboardingForm.rule_onboarding_plain_language || "")
           .split(/\r?\n/)
-          .map((line) => line.trim())
+          .map(cleanRuleIntentLine)
           .filter(Boolean),
         ...onboardingDerivedRequirements,
-      ].filter((line, index, array) => array.findIndex((item) => item.toLowerCase() === line.toLowerCase()) === index);
+      ].map(cleanRuleIntentLine).filter(Boolean).filter((line, index, array) => array.findIndex((item) => item.toLowerCase() === line.toLowerCase()) === index);
       const shouldStartRuleOnboarding = plainLanguageRequirements.length > 0;
 
       const response = await fetchJson("/api-gateway/onboarding/complete", authenticatedOptions({
@@ -5454,7 +6737,7 @@ export default function App() {
     const queries = toPlanLines(draft.remediation_queries_text ?? draft.queries);
     const executionPlan = String(draft.execution_plan || "").trim() || [
       commands.length ? `Commands:\n${commands.map((item) => `- ${item}`).join("\n")}` : "",
-      scripts.length ? `Scripts:\n${scripts.map((item) => `- ${item}`).join("\n")}` : "",
+      scripts.length ? `Remediation Script:\n${scripts.map((item) => `- ${item}`).join("\n")}` : "",
       queries.length ? `Queries:\n${queries.map((item) => `- ${item}`).join("\n")}` : "",
     ].filter(Boolean).join("\n\n");
 
@@ -5739,7 +7022,7 @@ export default function App() {
           prompt: [
             `Generate a meaningful ${normalizedKind} document draft for SRE operations from user input.`,
             "Return ONLY valid JSON with keys: title, summary, content, commands, scripts, queries, metadata.",
-            "Use commands/scripts/queries only when relevant and keep content actionable.",
+            "For remediation, prefer one guarded script with connection details over scattered command/query fragments.",
           ].join(" "),
           payload: {
             kind: normalizedKind,
@@ -5775,10 +7058,29 @@ export default function App() {
     const mergedCommands = mergeUnique(aiCommands, commandMatches);
     const mergedScripts = mergeUnique(aiScripts, scriptMatches);
     const mergedQueries = mergeUnique(aiQueries, queryMatches);
+    const serviceForScript = String(alertOnboarding.services || alertOnboarding.alert_type || applicationToMonitor || "kaiops-service")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean)[0] || "kaiops-service";
+    const environmentForScript = String(alertOnboarding.environment || onboardingForm.environment || "prod").trim() || "prod";
+    const generatedScript = buildKaiOpsRemediationScript({
+      service: serviceForScript,
+      environment: environmentForScript,
+      apiGatewayUrl: "http://api-gateway:8000",
+      prometheusUrl: onboardingForm.prometheus_url || onboardingForm.monitoring_url || "http://prometheus:9090",
+      mysqlHost: "mysql",
+      mysqlDatabase: "kaiops",
+      mysqlUser: "kaiops",
+    });
+    const finalCommands = normalizedKind === "remediation" ? [] : mergedCommands;
+    const finalQueries = normalizedKind === "remediation" ? [] : mergedQueries;
+    const finalScripts = normalizedKind === "remediation"
+      ? [generatedScript]
+      : mergedScripts;
     const mergedExecutionPlan = [
-      mergedCommands.length ? `Commands:\n${mergedCommands.map((item) => `- ${item}`).join("\n")}` : "",
-      mergedScripts.length ? `Scripts:\n${mergedScripts.map((item) => `- ${item}`).join("\n")}` : "",
-      mergedQueries.length ? `Queries:\n${mergedQueries.map((item) => `- ${item}`).join("\n")}` : "",
+      finalCommands.length ? `Commands:\n${finalCommands.map((item) => `- ${item}`).join("\n")}` : "",
+      finalScripts.length ? `Remediation Script:\n${finalScripts.map((item) => `- ${item}`).join("\n")}` : "",
+      finalQueries.length ? `Queries:\n${finalQueries.map((item) => `- ${item}`).join("\n")}` : "",
     ].filter(Boolean).join("\n\n");
 
     setAlertOnboarding((curr) => ({
@@ -5787,9 +7089,9 @@ export default function App() {
       summary: String(aiDraft?.summary || summary).trim(),
       content: String(aiDraft?.content || contentBody || prompt).trim(),
       execution_plan: normalizedKind === "remediation" ? mergedExecutionPlan : curr.execution_plan,
-      remediation_commands_text: normalizedKind === "remediation" ? mergedCommands.join("\n") : curr.remediation_commands_text,
-      remediation_scripts_text: normalizedKind === "remediation" ? mergedScripts.join("\n") : curr.remediation_scripts_text,
-      remediation_queries_text: normalizedKind === "remediation" ? mergedQueries.join("\n") : curr.remediation_queries_text,
+      remediation_commands_text: normalizedKind === "remediation" ? finalCommands.join("\n") : curr.remediation_commands_text,
+      remediation_scripts_text: normalizedKind === "remediation" ? finalScripts.join("\n") : curr.remediation_scripts_text,
+      remediation_queries_text: normalizedKind === "remediation" ? finalQueries.join("\n") : curr.remediation_queries_text,
     }));
 
     setAlertOnboardingState({
@@ -6104,6 +7406,7 @@ export default function App() {
       loadMonitorApplications(),
       loadGatewaySummary(),
       loadGatewayRecent(),
+      loadModelProviderStatus(),
       loadLandingPadRecent(),
       loadIncidentMetadata(),
       loadClosedIncidents(),
@@ -6236,6 +7539,25 @@ export default function App() {
   }, [alertsLimit]);
 
   useEffect(() => {
+    if (activeTab !== "home") {
+      return undefined;
+    }
+    const refreshAlertStream = async () => {
+      if (alertStreamRefreshInFlight.current) {
+        return;
+      }
+      alertStreamRefreshInFlight.current = true;
+      try {
+        await Promise.allSettled([loadRecentAlerts(), loadClosedIncidents()]);
+      } finally {
+        alertStreamRefreshInFlight.current = false;
+      }
+    };
+    const timer = window.setInterval(refreshAlertStream, 10000);
+    return () => window.clearInterval(timer);
+  }, [activeTab, alertsLimit, applicationToMonitor]);
+
+  useEffect(() => {
     if (activeTab !== "summary") {
       return;
     }
@@ -6310,12 +7632,16 @@ export default function App() {
     return filterAlertsForMonitor(alerts.rows, applicationToMonitor);
   }, [alerts.rows, applicationToMonitor]);
 
+  const monitorScopedRecentClosedAlerts = useMemo(() => {
+    return filterRowsForMonitor(closedIncidents.rows, applicationToMonitor);
+  }, [closedIncidents.rows, applicationToMonitor]);
+
   const visibleAlerts = useMemo(() => {
-    return monitorScopedAlerts;
-  }, [monitorScopedAlerts]);
+    return mergeAlertStreamRows(monitorScopedAlerts, monitorScopedRecentClosedAlerts);
+  }, [monitorScopedAlerts, monitorScopedRecentClosedAlerts]);
 
   const dashboardAlertSummary = useMemo(() => {
-    const summary = { total: visibleAlerts.length, ops: 0, test: 0, critical: 0, high: 0, awaiting: 0, active: 0 };
+    const summary = { total: visibleAlerts.length, ops: 0, test: 0, critical: 0, high: 0, awaiting: 0, active: 0, closed: 0 };
     visibleAlerts.forEach((row) => {
       const severity = String(row?.severity || "").toLowerCase();
       const status = String(row?.status || row?.state || "open").toLowerCase();
@@ -6335,6 +7661,9 @@ export default function App() {
       }
       if (status === "open" || status === "pending" || status === "investigating") {
         summary.active += 1;
+      }
+      if (isApprovalResolvedStatus(status) || row?._closed_incident) {
+        summary.closed += 1;
       }
     });
     return summary;
@@ -6362,6 +7691,9 @@ export default function App() {
         return false;
       }
       if (dashboardAlertFocus === "active" && !["open", "pending", "investigating"].includes(status)) {
+        return false;
+      }
+      if (dashboardAlertFocus === "closed" && !(isApprovalResolvedStatus(status) || row?._closed_incident)) {
         return false;
       }
       if (!query) {
@@ -6618,7 +7950,7 @@ export default function App() {
       appendErrorUsage(payload?.finops?.errors);
     });
 
-    return rows.filter((row) => isMeaningfulUsageRow(row));
+    return dedupeUsageRows(rows.filter((row) => isMeaningfulUsageRow(row)));
   }, [selectedAlertWorkflow, selectedAlertEventTrace]);
 
   const selectedFinopsDiagnostics = useMemo(() => {
@@ -6642,6 +7974,7 @@ export default function App() {
 
     return {
       usageRows: selectedAlertUsage.length,
+      fallbackRows: selectedAlertUsage.filter((row) => row.fallback).length,
       workflowCalls,
       workflowErrors,
       recommendationUsage,
@@ -6649,6 +7982,21 @@ export default function App() {
       traceErrors,
     };
   }, [selectedAlertWorkflow, selectedAlertEventTrace, selectedAlertUsage]);
+
+  const selectedModelProviderRows = useMemo(() => {
+    const providers = modelProviderStatus?.data?.providers && typeof modelProviderStatus.data.providers === "object"
+      ? modelProviderStatus.data.providers
+      : {};
+    return Object.entries(providers).map(([name, value]) => ({
+      name,
+      configured: Boolean(value?.configured),
+      healthy: Boolean(value?.healthy),
+      model: String(value?.model || name),
+      circuitOpen: Boolean(value?.circuit_open),
+      failures: Number(value?.failure_count || 0),
+      reason: String(value?.reason || ""),
+    }));
+  }, [modelProviderStatus]);
 
   const selectedAlertRouting = useMemo(() => extractObservedRoutingMetrics(selectedAlertWorkflow), [selectedAlertWorkflow]);
 
@@ -6694,7 +8042,23 @@ export default function App() {
     return incidentMetadata.rows.find((row) => String(row?.incident_id || "").trim() === selectedIncidentId) || null;
   }, [selectedIncidentId, monitorScopedIncidentMetadata, incidentMetadata.rows]);
 
+  const selectedAlertRecommendationId = useMemo(() => {
+    if (!selectedIncidentId) {
+      return "";
+    }
+    return (
+      approvalRecommendationId(selectedIncidentMetadataRow)
+      || approvalRecommendationFromPayload(selectedAlertWorkflow)
+      || approvalRecommendationFromPayload(selectedAlertData?.payload)
+      || ""
+    );
+  }, [selectedIncidentId, selectedIncidentMetadataRow, selectedAlertWorkflow, selectedAlertData?.payload]);
+
   const selectedExecutionPlan = useMemo(() => {
+    const projectionPayload =
+      selectedIncidentMetadataRow?.projection_payload && typeof selectedIncidentMetadataRow.projection_payload === "object"
+        ? selectedIncidentMetadataRow.projection_payload
+        : {};
     const recommendation =
       typeof selectedAlertWorkflow?.recommendation === "object" && selectedAlertWorkflow.recommendation
         ? selectedAlertWorkflow.recommendation
@@ -6711,8 +8075,22 @@ export default function App() {
     const remediationAction =
       typeof selectedAlertWorkflow?.remediation_action === "object" && selectedAlertWorkflow.remediation_action
         ? selectedAlertWorkflow.remediation_action
+        : typeof projectionPayload?.remediation_action === "object" && projectionPayload.remediation_action
+          ? projectionPayload.remediation_action
+          : {};
+    const approval =
+      typeof selectedAlertWorkflow?.approval === "object" && selectedAlertWorkflow.approval
+        ? selectedAlertWorkflow.approval
+        : typeof projectionPayload?.approval === "object" && projectionPayload.approval
+          ? projectionPayload.approval
         : {};
-    const commands = deriveExecutionCommands(selectedAlertWorkflow, selectedAlertEventTrace);
+    const workflowForExecution = {
+      ...(projectionPayload && typeof projectionPayload === "object" ? projectionPayload : {}),
+      ...(selectedAlertWorkflow && typeof selectedAlertWorkflow === "object" ? selectedAlertWorkflow : {}),
+      remediation_action: remediationAction,
+      approval,
+    };
+    const commands = deriveExecutionCommands(workflowForExecution, selectedAlertEventTrace);
 
     return {
       action:
@@ -6737,8 +8115,9 @@ export default function App() {
       riskTier: selectedAlertRouting?.risk_tier || decision?.risk_tier || "-",
       provider: selectedAlertRouting?.message_bus_provider || decision?.message_bus_provider || "-",
       incidentStatus: selectedAlertWorkflow?.incident?.status || selectedIncidentMetadataRow?.status || "-",
-      approvalStatus: selectedAlertWorkflow?.approval?.status || "pending",
+      approvalStatus: approval?.status || projectionPayload?.approval_status || "pending",
       commands,
+      remediationAction,
     };
   }, [selectedAlertWorkflow, selectedAlertRouting, selectedAlertEventTrace, selectedIncidentMetadataRow]);
   const selectedExecutionBreakdown = useMemo(() => {
@@ -6774,6 +8153,14 @@ export default function App() {
       approvalStatus: normalizeApprovalStatus(selectedExecutionPlan.approvalStatus || "pending"),
     };
   }, [selectedExecutionPlan]);
+  const selectedRemediationOutcome = useMemo(() => {
+    const latestResponse = unwrap(remediationExecutionState.result);
+    const responseOutcome = remediationOutcomeFromAction(latestResponse);
+    if (responseOutcome) {
+      return responseOutcome;
+    }
+    return remediationOutcomeFromAction(selectedExecutionPlan.remediationAction);
+  }, [remediationExecutionState.result, selectedExecutionPlan.remediationAction]);
 
   const selectedApplicationConnection = useMemo(() => {
     const workflowContext = typeof selectedAlertWorkflow?.context === "object" && selectedAlertWorkflow.context
@@ -6846,10 +8233,25 @@ export default function App() {
   ]);
 
   useEffect(() => {
+    const suggestedScript = selectedExecutionBreakdown.scripts.length
+      ? selectedExecutionBreakdown.scripts.join("\n")
+      : selectedExecutionBreakdown.hasPlan
+        ? buildKaiOpsRemediationScript({
+            service: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : selectedApplicationConnection.application,
+            environment: selectedApplicationConnection.environment,
+            apiGatewayUrl: "http://api-gateway:8000",
+            prometheusUrl: selectedApplicationConnection.endpoint !== "Not configured"
+              ? selectedApplicationConnection.endpoint
+              : onboardingForm.prometheus_url || onboardingForm.monitoring_url || "http://prometheus:9090",
+            mysqlHost: "mysql",
+            mysqlDatabase: "kaiops",
+            mysqlUser: "kaiops",
+          })
+        : "";
     setRemediationPlanEditor({
-      commands: selectedExecutionBreakdown.commands.join("\n"),
-      scripts: selectedExecutionBreakdown.scripts.join("\n"),
-      queries: selectedExecutionBreakdown.queries.join("\n"),
+      commands: suggestedScript ? "" : selectedExecutionBreakdown.commands.join("\n"),
+      scripts: suggestedScript,
+      queries: suggestedScript ? "" : selectedExecutionBreakdown.queries.join("\n"),
       connection_url: selectedApplicationConnection.endpoint === "Not configured" ? "" : selectedApplicationConnection.endpoint,
       connection_type: selectedApplicationConnection.connection_type || "application",
       namespace: selectedApplicationConnection.namespace || "",
@@ -6864,6 +8266,11 @@ export default function App() {
     selectedApplicationConnection.endpoint,
     selectedApplicationConnection.connection_type,
     selectedApplicationConnection.namespace,
+    selectedApplicationConnection.service,
+    selectedApplicationConnection.application,
+    selectedApplicationConnection.environment,
+    onboardingForm.prometheus_url,
+    onboardingForm.monitoring_url,
   ]);
 
   const selectedAlertTimelineRows = useMemo(() => {
@@ -7149,6 +8556,12 @@ export default function App() {
 
     return merged.filter((row) => isMeaningfulUsageRow(row));
   }, [panelWorkflowUsage, selectedAlertUsage, latestWorkflow, monitorScopedIncidentMetadata, gatewayRecent.rows]);
+
+  useEffect(() => {
+    if (diagnosticsDetailTab === "application" || diagnosticsDetailTab === "topics") {
+      setDiagnosticsDetailTab("processing");
+    }
+  }, [diagnosticsDetailTab]);
 
   useEffect(() => {
     if (activeTab !== "home" || homeDetailTab !== "diagnostics" || diagnosticsDetailTab !== "api") {
@@ -7721,6 +9134,9 @@ export default function App() {
   }, [selectedApprovalIncidentId, selectedApprovalRecommendationId]);
 
   useEffect(() => {
+    if (activeTab === "home" && homeDetailTab === "approval" && selectedIncidentId) {
+      return;
+    }
     if (!filteredPendingApprovals.length) {
       if (selectedApprovalIncidentId) {
         setSelectedApprovalIncidentId("");
@@ -7732,7 +9148,7 @@ export default function App() {
       return;
     }
     setSelectedApprovalIncidentId(approvalIncidentId(filteredPendingApprovals[0]));
-  }, [filteredPendingApprovals, selectedApprovalIncidentId]);
+  }, [activeTab, filteredPendingApprovals, homeDetailTab, selectedApprovalIncidentId, selectedIncidentId]);
 
   useEffect(() => {
     if (!selectedApprovalIncidentId) {
@@ -7740,6 +9156,25 @@ export default function App() {
     }
     loadApprovalIncidentContext(selectedApprovalIncidentId);
   }, [selectedApprovalIncidentId]);
+
+  useEffect(() => {
+    if (activeTab !== "home" || homeDetailTab !== "approval" || !selectedIncidentId) {
+      return;
+    }
+    setSelectedApprovalIncidentId((current) => current === selectedIncidentId ? current : selectedIncidentId);
+    setApprovalForm((current) => {
+      const nextRecommendationId = selectedAlertRecommendationId || current.recommendation_id;
+      if (current.incident_id === selectedIncidentId && current.recommendation_id === nextRecommendationId) {
+        return current;
+      }
+      return {
+        ...current,
+        incident_id: selectedIncidentId,
+        recommendation_id: nextRecommendationId,
+      };
+    });
+    loadApprovalIncidentContext(selectedIncidentId);
+  }, [activeTab, homeDetailTab, selectedIncidentId, selectedAlertRecommendationId]);
 
   function selectApprovalIncident(row) {
     const incidentId = approvalIncidentId(row);
@@ -7803,7 +9238,7 @@ export default function App() {
     }
 
     const patchIncidentRow = (row) => {
-      const rowIncidentId = String(row?.incident_id || row?.id || "").trim();
+      const rowIncidentId = String(row?.incident_id || row?.id || row?.alert_id || "").trim();
       if (rowIncidentId !== normalizedIncidentId) {
         return row;
       }
@@ -7825,7 +9260,7 @@ export default function App() {
       ...prev,
       rows: Array.isArray(prev.rows)
         ? prev.rows.map((row) => {
-            const rowIncidentId = String(row?.incident_id || "").trim();
+            const rowIncidentId = String(row?.incident_id || row?.id || row?.alert_id || "").trim();
             if (rowIncidentId !== normalizedIncidentId) {
               return row;
             }
@@ -7845,7 +9280,13 @@ export default function App() {
         return prev;
       }
       const workflow = payloadRoot?.workflow || payloadRoot;
-      const workflowIncidentId = String(workflow?.incident?.id || workflow?.incident_id || "").trim();
+      const workflowIncidentId = String(
+        workflow?.incident?.id
+        || workflow?.incident_id
+        || payloadRoot?.incident?.id
+        || payloadRoot?.incident_id
+        || ""
+      ).trim();
       if (workflowIncidentId !== normalizedIncidentId) {
         return prev;
       }
@@ -7908,7 +9349,8 @@ export default function App() {
   }
 
   const approvalReady = useMemo(() => {
-    const hasBase = String(approvalForm.incident_id || selectedApprovalIncidentId || "").trim() && String(approvalForm.approver || "").trim();
+    const cockpitIncidentId = activeTab === "home" && homeDetailTab === "approval" ? selectedIncidentId : "";
+    const hasBase = String(cockpitIncidentId || approvalForm.incident_id || selectedApprovalIncidentId || "").trim() && String(approvalForm.approver || "").trim();
     if (!hasBase) {
       return false;
     }
@@ -7916,7 +9358,7 @@ export default function App() {
       return true;
     }
     return String(approvalForm.modified_action || "").trim().length > 0;
-  }, [approvalForm]);
+  }, [activeTab, approvalForm, homeDetailTab, selectedApprovalIncidentId, selectedIncidentId]);
 
   async function executeApprovalAction({
     incidentId,
@@ -7986,10 +9428,82 @@ export default function App() {
     return "";
   }
 
+  function buildEditedRemediationPlan() {
+    return {
+      commands: toPlanLines(remediationPlanEditor.commands),
+      scripts: toPlanLines(remediationPlanEditor.scripts),
+      queries: toPlanLines(remediationPlanEditor.queries),
+    };
+  }
+
+  function buildRemediationExecutionPayload({ incidentId, recommendationId, approver, action, comment, editedPlan }) {
+    const decision = action === "modify" ? "modified" : "approved";
+    const planText = [
+      editedPlan.commands.length ? `Commands:\n${editedPlan.commands.map((item) => `- ${item}`).join("\n")}` : "",
+      editedPlan.scripts.length ? `Scripts:\n${editedPlan.scripts.map((item) => `- ${item}`).join("\n")}` : "",
+      editedPlan.queries.length ? `Queries:\n${editedPlan.queries.map((item) => `- ${item}`).join("\n")}` : "",
+    ].filter(Boolean).join("\n\n");
+
+    return {
+      incident_id: incidentId,
+      recommendation_id: recommendationId,
+      decision,
+      approver,
+      channel: approvalForm.channel || "web",
+      comment: String(comment || remediationPlanEditor.notes || "approved remediation execution").trim(),
+      modified_action: planText,
+      metadata: {
+        recommended_action: selectedExecutionPlan.action,
+        recommended_commands: [
+          ...editedPlan.commands,
+          ...editedPlan.scripts.map((item) => `script: ${item}`),
+          ...editedPlan.queries.map((item) => `query: ${item}`),
+        ],
+        execution_plan: editedPlan,
+        service: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : undefined,
+        environment: selectedApplicationConnection.environment,
+        remediation_target: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : selectedApplicationConnection.application,
+        connection_profile: {
+          application: selectedApplicationConnection.application,
+          service: selectedApplicationConnection.service,
+          environment: selectedApplicationConnection.environment,
+          namespace: String(remediationPlanEditor.namespace || selectedApplicationConnection.namespace || "").trim(),
+          endpoint_url: String(remediationPlanEditor.connection_url || "").trim(),
+          connection_type: String(remediationPlanEditor.connection_type || selectedApplicationConnection.connection_type || "").trim(),
+          source: selectedApplicationConnection.source,
+        },
+        ui_edited: true,
+      },
+    };
+  }
+
+  async function postRemediationExecution(payload, incidentId, comment) {
+    const response = await fetchJson("/api-gateway/remediation/execute", authenticatedOptions({
+      method: "POST",
+      body: JSON.stringify(payload),
+    }));
+    const action = unwrap(response);
+    setRemediationExecutionState({ loading: false, result: response, error: "" });
+    const status = String(action?.status || "").toLowerCase();
+    applyApprovalResolutionToUi(
+      incidentId,
+      status === "succeeded" ? "validating" : status === "failed" || status === "skipped" ? "failed" : "remediating",
+      comment
+    );
+    await refreshApprovalDrivenViews(incidentId);
+    return response;
+  }
+
   async function approveIncidentRow(row) {
     const incidentId = approvalIncidentId(row);
     const rowRecommendationId = approvalRecommendationId(row);
     setSelectedApprovalIncidentId(incidentId);
+    setApprovalForm((current) => ({
+      ...current,
+      action: "approve",
+      incident_id: incidentId || current.incident_id,
+      recommendation_id: rowRecommendationId || current.recommendation_id,
+    }));
     setApprovalState({ loading: true, result: null, error: "" });
 
     try {
@@ -8002,14 +9516,21 @@ export default function App() {
         channel: approvalForm.channel,
         comment: approvalForm.comment,
       });
+      setRemediationExecutionState({ loading: true, result: null, error: "" });
+      const remediationResponse = await postRemediationExecution(unwrap(response), incidentId, approvalForm.comment);
+      const remediationStatus = String(unwrap(remediationResponse)?.status || "").toLowerCase();
       setApprovalForm((current) => ({
         ...current,
         action: "approve",
         incident_id: incidentId || current.incident_id,
         recommendation_id: recommendationId || current.recommendation_id,
       }));
-      applyApprovalResolutionToUi(incidentId, "remediating", approvalForm.comment);
-      setApprovalState({ loading: false, result: response, error: "" });
+      applyApprovalResolutionToUi(
+        incidentId,
+        remediationStatus === "succeeded" ? "validating" : remediationStatus === "failed" || remediationStatus === "skipped" ? "failed" : "remediating",
+        approvalForm.comment
+      );
+      setApprovalState({ loading: false, result: { approval: response, remediation: remediationResponse }, error: "" });
       loadApprovalIncidentContext(incidentId, { force: true });
       await refreshApprovalDrivenViews(incidentId);
     } catch (error) {
@@ -8018,6 +9539,7 @@ export default function App() {
         ? "Inline approve could not submit because this incident has no linked remediation recommendation yet. Re-run the incident workflow to generate a recommendation."
         : raw;
       setApprovalState({ loading: false, result: null, error: concise });
+      setRemediationExecutionState((current) => current.loading ? { loading: false, result: null, error: concise } : current);
     }
   }
 
@@ -8025,6 +9547,12 @@ export default function App() {
     const incidentId = approvalIncidentId(row);
     const rowRecommendationId = approvalRecommendationId(row);
     setSelectedApprovalIncidentId(incidentId);
+    setApprovalForm((current) => ({
+      ...current,
+      action: "reject",
+      incident_id: incidentId || current.incident_id,
+      recommendation_id: rowRecommendationId || current.recommendation_id,
+    }));
     setApprovalState({ loading: true, result: null, error: "" });
 
     try {
@@ -8062,7 +9590,8 @@ export default function App() {
     event.preventDefault();
     setApprovalState({ loading: true, result: null, error: "" });
     try {
-      const incidentId = String(approvalForm.incident_id || selectedApprovalIncidentId || "").trim();
+      const cockpitIncidentId = activeTab === "home" && homeDetailTab === "approval" ? selectedIncidentId : "";
+      const incidentId = String(cockpitIncidentId || approvalForm.incident_id || selectedApprovalIncidentId || "").trim();
       const approver = String(approvalForm.approver || adminSession?.user?.username || "admin").trim();
       if (!looksLikeUuid(incidentId)) {
         throw new Error("Select a valid incident first from the approval queue.");
@@ -8071,7 +9600,8 @@ export default function App() {
         throw new Error("Approver is required.");
       }
       const recommendationIdCandidate = String(
-        approvalForm.recommendation_id
+        (cockpitIncidentId ? selectedAlertRecommendationId : "")
+        || approvalForm.recommendation_id
         || selectedApprovalRecommendationId
         || approvalRecommendationFromPayload(approvalIncidentContext.payload)
         || ""
@@ -8086,9 +9616,38 @@ export default function App() {
         comment: approvalForm.comment,
         modifiedAction: approvalForm.modified_action,
       });
-      const actionStatus = approvalForm.action === "reject" ? "failed" : "remediating";
+      let remediationResponse = null;
+      let actionStatus = approvalForm.action === "reject" ? "failed" : "remediating";
+      if (approvalForm.action === "approve" || approvalForm.action === "modify") {
+        const editedPlan = buildEditedRemediationPlan();
+        const hasPlan = editedPlan.commands.length || editedPlan.scripts.length || editedPlan.queries.length;
+        if (hasPlan) {
+          setRemediationExecutionState({ loading: true, result: null, error: "" });
+          const executionPayload = buildRemediationExecutionPayload({
+            incidentId,
+            recommendationId,
+            approver,
+            action: approvalForm.action,
+            comment: approvalForm.comment,
+            editedPlan,
+          });
+          remediationResponse = await postRemediationExecution(executionPayload, incidentId, approvalForm.comment);
+          const remediationStatus = String(unwrap(remediationResponse)?.status || "").toLowerCase();
+          actionStatus = remediationStatus === "succeeded"
+            ? "validating"
+            : remediationStatus === "failed" || remediationStatus === "skipped"
+              ? "failed"
+              : "remediating";
+        } else {
+          setRemediationExecutionState({
+            loading: false,
+            result: null,
+            error: "Approval was recorded, but no remediation commands, script, or validation query were available to execute.",
+          });
+        }
+      }
       applyApprovalResolutionToUi(incidentId, actionStatus, approvalForm.comment);
-      setApprovalState({ loading: false, result: response, error: "" });
+      setApprovalState({ loading: false, result: remediationResponse ? { approval: response, remediation: remediationResponse } : response, error: "" });
       loadApprovalIncidentContext(incidentId, { force: true });
       await refreshApprovalDrivenViews(incidentId);
     } catch (error) {
@@ -8097,6 +9656,7 @@ export default function App() {
         ? "Approval was rejected because this incident has no linked remediation recommendation yet. Re-run the incident workflow to generate one."
         : raw;
       setApprovalState({ loading: false, result: null, error: concise });
+      setRemediationExecutionState((current) => current.loading ? { loading: false, result: null, error: concise } : current);
     }
   }
 
@@ -8111,11 +9671,7 @@ export default function App() {
     ).trim();
     const approver = String(approvalForm.approver || adminSession?.user?.username || "admin").trim();
     const approvalStatus = normalizeApprovalStatus(selectedExecutionPlan.approvalStatus || approvalForm.action);
-    const editedPlan = {
-      commands: toPlanLines(remediationPlanEditor.commands),
-      scripts: toPlanLines(remediationPlanEditor.scripts),
-      queries: toPlanLines(remediationPlanEditor.queries),
-    };
+    const editedPlan = buildEditedRemediationPlan();
     const hasPlan = editedPlan.commands.length || editedPlan.scripts.length || editedPlan.queries.length;
 
     setRemediationExecutionState({ loading: true, result: null, error: "" });
@@ -8134,49 +9690,28 @@ export default function App() {
         throw new Error("Approve or modify the remediation first, then execute the approved plan.");
       }
 
-      const planText = [
-        editedPlan.commands.length ? `Commands:\n${editedPlan.commands.map((item) => `- ${item}`).join("\n")}` : "",
-        editedPlan.scripts.length ? `Scripts:\n${editedPlan.scripts.map((item) => `- ${item}`).join("\n")}` : "",
-        editedPlan.queries.length ? `Queries:\n${editedPlan.queries.map((item) => `- ${item}`).join("\n")}` : "",
-      ].filter(Boolean).join("\n\n");
-      const payload = {
-        incident_id: incidentId,
-        recommendation_id: recommendationId,
-        decision: approvalForm.action === "modify" ? "modified" : "approved",
+      if (!["approved", "modified"].includes(approvalStatus) && (approvalForm.action === "approve" || approvalForm.action === "modify")) {
+        const approvalResponse = await executeApprovalAction({
+          incidentId,
+          recommendationId,
+          action: approvalForm.action,
+          approver,
+          channel: approvalForm.channel,
+          comment: approvalForm.comment,
+          modifiedAction: approvalForm.modified_action,
+        });
+        setApprovalState({ loading: false, result: approvalResponse, error: "" });
+      }
+
+      const payload = buildRemediationExecutionPayload({
+        incidentId,
+        recommendationId,
+        action: approvalForm.action,
         approver,
-        channel: approvalForm.channel || "web",
         comment: String(approvalForm.comment || remediationPlanEditor.notes || "approved remediation execution").trim(),
-        modified_action: planText,
-        metadata: {
-          recommended_action: selectedExecutionPlan.action,
-          recommended_commands: [
-            ...editedPlan.commands,
-            ...editedPlan.scripts.map((item) => `script: ${item}`),
-            ...editedPlan.queries.map((item) => `query: ${item}`),
-          ],
-          execution_plan: editedPlan,
-          service: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : undefined,
-          environment: selectedApplicationConnection.environment,
-          remediation_target: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : selectedApplicationConnection.application,
-          connection_profile: {
-            application: selectedApplicationConnection.application,
-            service: selectedApplicationConnection.service,
-            environment: selectedApplicationConnection.environment,
-            namespace: String(remediationPlanEditor.namespace || selectedApplicationConnection.namespace || "").trim(),
-            endpoint_url: String(remediationPlanEditor.connection_url || "").trim(),
-            connection_type: String(remediationPlanEditor.connection_type || selectedApplicationConnection.connection_type || "").trim(),
-            source: selectedApplicationConnection.source,
-          },
-          ui_edited: true,
-        },
-      };
-      const response = await fetchJson("/api-gateway/remediation/execute", authenticatedOptions({
-        method: "POST",
-        body: JSON.stringify(payload),
-      }));
-      setRemediationExecutionState({ loading: false, result: response, error: "" });
-      applyApprovalResolutionToUi(incidentId, "remediating", approvalForm.comment);
-      await refreshApprovalDrivenViews(incidentId);
+        editedPlan,
+      });
+      await postRemediationExecution(payload, incidentId, approvalForm.comment);
     } catch (error) {
       setRemediationExecutionState({ loading: false, result: null, error: String(error?.message || error) });
     }
@@ -8331,7 +9866,7 @@ export default function App() {
         errors.push("Azure Service Bus Subscription is required for Azure Cloud deployment.");
       }
     }
-    const isSetupMonitoringPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim() === "setup_monitoring";
+    const isSetupMonitoringPath = String(onboardingForm.onboarding_path || "setup_monitoring").trim() === "setup_monitoring";
     const derivedRequirementCount = (Array.isArray(onboardingSourceDocs.rows) ? onboardingSourceDocs.rows : []).reduce(
       (count, row) => count + (Array.isArray(row?.derived_requirements) ? row.derived_requirements.length : 0),
       0,
@@ -8359,7 +9894,7 @@ export default function App() {
     onboardingSourceDocCount,
   ]);
   const onboardingAdvisory = useMemo(() => {
-    const onboardingPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim();
+    const onboardingPath = String(onboardingForm.onboarding_path || "setup_monitoring").trim();
     if (onboardingPath === "existing_monitoring") {
       return "Existing monitoring path: upload one Service Knowledge file, save project, then send alerts to /alerts/alertmanager to trigger workflow.";
     }
@@ -8378,7 +9913,7 @@ export default function App() {
     const configuredEndpoint = String(summary?.configured_monitoring_endpoint || onboardingForm.monitoring_url || "").trim();
     const projectName = String(summary?.project_name || onboardingForm.name || "").trim() || "<project-name>";
     const browserOrigin = typeof window !== "undefined" && window?.location?.origin ? window.location.origin : "http://localhost:8501";
-    const onboardingPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim().toLowerCase();
+    const onboardingPath = String(onboardingForm.onboarding_path || "setup_monitoring").trim().toLowerCase();
     const routeMessage = String(summary?.message || "").trim() || "Send alerts from your monitoring platform to this landing pad endpoint to trigger workflow execution.";
 
     const samplePayload = {
@@ -8471,10 +10006,21 @@ export default function App() {
   const onboardingRulePromptLines = useMemo(
     () => String(onboardingForm.rule_onboarding_plain_language || "")
       .split(/\r?\n/)
-      .map((line) => line.trim())
+      .map(cleanRuleIntentLine)
       .filter(Boolean),
     [onboardingForm.rule_onboarding_plain_language],
   );
+  const onboardingPrometheusRulePreview = useMemo(() => buildPrometheusRulePreview({
+    projectName: onboardingForm.name || selectedOnboardingProject,
+    serviceName: onboardingForm.name || selectedOnboardingProject || "kaiops-service",
+    environment: onboardingForm.environment || "prod",
+    requirements: onboardingRulePromptLines,
+  }), [
+    onboardingForm.name,
+    selectedOnboardingProject,
+    onboardingForm.environment,
+    onboardingRulePromptLines,
+  ]);
   const onboardingRulePromptVisible = onboardingSourceDocCount > 0 || onboardingRulePromptLines.length > 0 || onboardingGeneratedRuleRows.length > 0;
   const onboardingMetadataRows = useMemo(() => {
     const currentProject = String(selectedOnboardingProject || onboardingForm.name || "").trim();
@@ -8514,7 +10060,7 @@ export default function App() {
     onboardingReviewAck.metadata,
   ]);
   const onboardingNextAction = useMemo(() => {
-    const onboardingPath = String(onboardingForm.onboarding_path || "existing_monitoring").trim();
+    const onboardingPath = String(onboardingForm.onboarding_path || "setup_monitoring").trim();
     if (onboardingState.loading) {
       return "Saving setup and generating onboarding artifacts...";
     }
@@ -8584,8 +10130,8 @@ export default function App() {
       },
       {
         id: "setup",
-        title: "2. Setup",
-        hint: "Unified monitoring + landing pad",
+        title: "2. Guided Setup",
+        hint: "Prompt, auto-complete, score, validate",
         status: onboardingHasPendingDocumentApproval
           ? "Setup saved. Review generated documents to finalize."
           : onboardingDocumentSummary.approved
@@ -8599,7 +10145,7 @@ export default function App() {
           ? "Review generated artifacts"
           : setupComplete
             ? "Open workflow status"
-            : "Continue setup",
+            : "Continue guided setup",
       },
       {
         id: "knowledge",
@@ -8632,8 +10178,8 @@ export default function App() {
       && Boolean(String(onboardingForm.region || "").trim());
     const docsRulesDone = Boolean(onboardingSourceDocCount > 0 || onboardingRulePromptLines.length > 0 || onboardingGeneratedDocs.length > 0 || setupSaved);
     return [
-      { id: "setup", label: "1. Setup Monitoring", hint: "Project, tool, endpoint, landing pad", complete: monitoringDone },
-      { id: "docs_rules", label: "2. Documents & Rules", hint: "Service Knowledge, confidence, rule prompt", complete: docsRulesDone },
+      { id: "docs_rules", label: "1. Guided Setup", hint: "Describe, auto-complete, score, approve", complete: docsRulesDone },
+      { id: "setup", label: "2. Connection Setup", hint: "Monitoring tool, endpoint, landing pad", complete: monitoringDone },
     ];
   }, [
     onboardingForm.name,
@@ -8673,7 +10219,7 @@ export default function App() {
         setProjectSetupStep("status");
         return;
       }
-      setProjectSetupStep("setup");
+      setProjectSetupStep("docs_rules");
       return;
     }
     navigateAdminJourney(stepId);
@@ -8683,7 +10229,7 @@ export default function App() {
     if (adminWorkspace !== "project" || projectSetupShowAll) {
       return;
     }
-    if (projectSetupStep !== "setup") {
+    if (projectSetupStep !== "docs_rules") {
       return;
     }
     if (onboardingState.loading || onboardingState.error) {
@@ -8701,7 +10247,7 @@ export default function App() {
       return;
     }
     if (onboardingSourceDocCount === 0) {
-      setProjectSetupStep("setup");
+      setProjectSetupStep("docs_rules");
       setAlertKnowledgeView("onboarding");
       alertKnowledgeRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
       return;
@@ -9466,6 +11012,7 @@ export default function App() {
                     <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "high" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("high")}>High {dashboardAlertSummary.high}</button>
                     <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "awaiting" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("awaiting")}>Awaiting {dashboardAlertSummary.awaiting}</button>
                     <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "active" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("active")}>Active {dashboardAlertSummary.active}</button>
+                    <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "closed" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("closed")}>Closed {dashboardAlertSummary.closed}</button>
                     <button type="button" className={`dashboard-focus-chip ${dashboardAlertFocus === "test" ? "active" : ""}`} onClick={() => setDashboardAlertFocus("test")}>Test {dashboardAlertSummary.test}</button>
                   </div>
                   <div className="dashboard-alert-search">
@@ -9482,6 +11029,7 @@ export default function App() {
                 <p className="subtitle">
                   Showing {dashboardVisibleAlerts.length} of {visibleAlerts.length} alerts for {applicationToMonitor}.
                   {dashboardAlertFocus === "ops" && dashboardAlertSummary.test > 0 ? ` ${dashboardAlertSummary.test} smoke/stress alerts are hidden in Ops view.` : ""}
+                  {monitorScopedRecentClosedAlerts.length > 0 ? ` Includes ${monitorScopedRecentClosedAlerts.length} recent closed incident(s).` : ""}
                 </p>
                 {canManageSeverityOverride ? (
                   <p className="subtitle">L2/L3/Admin can set future severity overrides by alert name + service + environment.</p>
@@ -9534,7 +11082,7 @@ export default function App() {
                             aria-label={`Open alert ${rowId}`}
                           >
                             <td title={fullAlertId}>{compactAlertId}</td>
-                            <td>{formatUtcTimestamp(row.created_at || row.starts_at)}</td>
+                            <td>{formatUtcTimestamp(row.created_at || row.starts_at || row.closed_at)}</td>
                             <td className="alert-name-col">{row.name || row.alert_name || "-"}</td>
                             <td title={String(row.expression || row.expr || row.query || row.description || row.annotations?.description || "").trim()}>{alertRuleName}</td>
                             <td>{application}</td>
@@ -9769,9 +11317,9 @@ export default function App() {
                         </div>
                         <label>Execution Plan<textarea rows={4} value={alertOnboarding.execution_plan} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, execution_plan: e.target.value }))} /></label>
                         <div className="filter-grid">
-                          <label>Remediation Commands (one per line)<textarea rows={5} value={alertOnboarding.remediation_commands_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_commands_text: e.target.value }))} /></label>
-                          <label>Remediation Scripts (one per line)<textarea rows={5} value={alertOnboarding.remediation_scripts_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_scripts_text: e.target.value }))} /></label>
-                          <label>Validation Queries (one per line)<textarea rows={5} value={alertOnboarding.remediation_queries_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_queries_text: e.target.value }))} /></label>
+                          <label>Additional Commands<textarea rows={5} value={alertOnboarding.remediation_commands_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_commands_text: e.target.value }))} /></label>
+                          <label>Single Remediation Script<textarea rows={5} value={alertOnboarding.remediation_scripts_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_scripts_text: e.target.value }))} /></label>
+                          <label>Additional Validation Queries<textarea rows={5} value={alertOnboarding.remediation_queries_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_queries_text: e.target.value }))} /></label>
                         </div>
                       </>
                     ) : null}
@@ -9825,7 +11373,7 @@ export default function App() {
                   </div>
 
                   {(() => {
-                    const matchedApproval = resolvePendingApprovalFromAlertRow(selectedAlertRow);
+                    const matchedApproval = resolvePendingApprovalFromAlertRow(selectedAlertRow) || selectedIncidentMetadataRow;
                     const incidentId = approvalIncidentId(matchedApproval);
                     const status = normalizeApprovalStatus(
                       matchedApproval?.status
@@ -9842,7 +11390,10 @@ export default function App() {
                       || selectedAlertWorkflow?.decision?.requires_approval
                       || isApprovalPendingStatus(status)
                     );
-                    const hasActionableApproval = Boolean(matchedApproval && !isResolved);
+                    const hasActionableApproval = Boolean(
+                      resolvePendingApprovalFromAlertRow(selectedAlertRow)
+                      && !isResolved
+                    );
 
                     if (!requiresApproval) {
                       return null;
@@ -9928,14 +11479,14 @@ export default function App() {
 
                   {homeDetailTab === "diagnostics" ? (
                     <div className="detail-tabs" style={{ marginTop: 8 }}>
-                      {["application", "timeline", "context", "events", "finops", "api", "topics", "raw"].map((tab) => (
+                      {["processing", "timeline", "context", "events", "finops", "api", "raw"].map((tab) => (
                         <button
                           key={`diag-${tab}`}
                           type="button"
                           className={`detail-tab ${diagnosticsDetailTab === tab ? "active" : ""}`}
                           onClick={() => setDiagnosticsDetailTab(tab)}
                         >
-                          {tab === "application" ? "Application Flow" : tab === "timeline" ? "Flow Timeline" : tab === "context" ? "Context Flow" : tab === "events" ? "Agent Events" : tab === "finops" ? "FinOps" : tab === "api" ? "API Gateway" : tab === "topics" ? "Message Bus" : "Raw Payload"}
+                          {tab === "processing" ? "Processing Flow" : tab === "timeline" ? "Flow Timeline" : tab === "context" ? "Context Flow" : tab === "events" ? "Agent Events" : tab === "finops" ? "FinOps" : tab === "api" ? "API Gateway" : "Raw Payload"}
                         </button>
                       ))}
                     </div>
@@ -10265,12 +11816,11 @@ export default function App() {
                     </article>
                   ) : null}
 
-                  {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "application" ? (
-                    <ApplicationSankeyFlow
+                  {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "processing" ? (
+                    <ProcessingFlowMap
                       workflow={selectedAlertWorkflow}
                       timelineRows={selectedAlertTimelineRows}
                       routing={selectedAlertRouting}
-                      alertRows={alerts.rows}
                       selectedAlert={selectedAlertRow}
                       selectedAlertId={selectedAlertId}
                       onDrillTimeline={() => setDiagnosticsDetailTab("timeline")}
@@ -10298,6 +11848,47 @@ export default function App() {
 
                   {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "finops" ? (
                     <>
+                      <div className="metric-grid">
+                        <div className="metric-card">
+                          <span>Selected Router</span>
+                          <strong>{modelProviderStatus?.data?.selected?.default || "-"}</strong>
+                          <small>Default provider for new calls</small>
+                        </div>
+                        <div className="metric-card">
+                          <span>Critical Provider</span>
+                          <strong>{modelProviderStatus?.data?.selected?.critical || "-"}</strong>
+                          <small>Used for critical incidents</small>
+                        </div>
+                        <div className="metric-card">
+                          <span>Provider Health</span>
+                          <strong>
+                            {selectedModelProviderRows.filter((row) => row.configured && row.healthy && !row.circuitOpen).length}
+                            /
+                            {selectedModelProviderRows.filter((row) => row.configured).length}
+                          </strong>
+                          <small>{modelProviderStatus.error || "configured providers available"}</small>
+                        </div>
+                        <div className="metric-card">
+                          <span>Fallback Rows</span>
+                          <strong>{selectedFinopsDiagnostics.fallbackRows}</strong>
+                          <small>Historical or deterministic fallback calls</small>
+                        </div>
+                      </div>
+                      <div className="chip-row" style={{ margin: "10px 0 12px" }}>
+                        {selectedModelProviderRows.map((row) => {
+                          const ok = row.configured && row.healthy && !row.circuitOpen;
+                          const label = ok ? "ready" : row.configured ? "degraded" : "not configured";
+                          return (
+                            <span
+                              className={`workflow-pill ${ok ? "workflow-pill-active" : "workflow-pill-idle"}`}
+                              key={`provider-${row.name}`}
+                              title={row.reason || `${row.model}; failures=${row.failures}`}
+                            >
+                              {row.name}: {label}
+                            </span>
+                          );
+                        })}
+                      </div>
                       <div className="table-wrap table-wrap-scroll-x">
                         <table>
                           <thead>
@@ -10305,6 +11896,7 @@ export default function App() {
                               <th>Task</th>
                               <th>Provider</th>
                               <th>Model</th>
+                              <th>Status</th>
                               <th>Input</th>
                               <th>Output</th>
                               <th>Cost USD</th>
@@ -10317,6 +11909,11 @@ export default function App() {
                                 <td>{row.task || "-"}</td>
                                 <td>{row.provider || "-"}</td>
                                 <td>{row.model || "-"}</td>
+                                <td>
+                                  <span className={`pill ${row.fallback ? "status-failed" : "status-approved"}`}>
+                                    {row.fallback ? "fallback" : row.estimated ? "estimated" : "live"}
+                                  </span>
+                                </td>
                                 <td>{row.input_tokens || "-"}</td>
                                 <td>{row.output_tokens || "-"}</td>
                                 <td>{row.total_cost_usd || "-"}</td>
@@ -10325,14 +11922,14 @@ export default function App() {
                             ))}
                             {!selectedAlertUsage.length ? (
                               <tr>
-                                <td colSpan={7}>No FinOps usage rows rendered for selected alert.</td>
+                                <td colSpan={8}>No FinOps usage rows rendered for selected alert.</td>
                               </tr>
                             ) : null}
                           </tbody>
                         </table>
                       </div>
                       <p className="subtitle">
-                        FinOps diagnostics: rendered={selectedFinopsDiagnostics.usageRows}, workflow_calls={selectedFinopsDiagnostics.workflowCalls}, workflow_errors={selectedFinopsDiagnostics.workflowErrors}, recommendation_usage={selectedFinopsDiagnostics.recommendationUsage}, trace_calls={selectedFinopsDiagnostics.traceCalls}, trace_errors={selectedFinopsDiagnostics.traceErrors}
+                        FinOps diagnostics: rendered={selectedFinopsDiagnostics.usageRows}, fallback_rows={selectedFinopsDiagnostics.fallbackRows}, workflow_calls={selectedFinopsDiagnostics.workflowCalls}, workflow_errors={selectedFinopsDiagnostics.workflowErrors}, recommendation_usage={selectedFinopsDiagnostics.recommendationUsage}, trace_calls={selectedFinopsDiagnostics.traceCalls}, trace_errors={selectedFinopsDiagnostics.traceErrors}
                       </p>
                       {!selectedAlertUsage.length ? (
                         <p className="subtitle">No usage rows means upstream services did not persist model usage/cost entries for this alert payload.</p>
@@ -10370,10 +11967,6 @@ export default function App() {
                         </tbody>
                       </table>
                     </div>
-                  ) : null}
-
-                  {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "topics" ? (
-                    <TopicFlowGraph routing={selectedAlertRouting} timelineRows={selectedAlertTimelineRows} />
                   ) : null}
 
                   {homeDetailTab === "remediation" ? (
@@ -10449,6 +12042,20 @@ export default function App() {
                             ? "Plan is ready. Modify commands, scripts, or validation queries before executing the approved run path."
                             : "No remediation plan is available yet. Ensure recommendation and workflow events have been generated."}
                         </p>
+                        {selectedRemediationOutcome ? (
+                          <div className={`remediation-outcome remediation-outcome-${selectedRemediationOutcome.status}`}>
+                            <div>
+                              <strong>{selectedRemediationOutcome.title}</strong>
+                              <p>{selectedRemediationOutcome.detail}</p>
+                            </div>
+                            <dl>
+                              <dt>Action</dt>
+                              <dd>{selectedRemediationOutcome.actionType}</dd>
+                              <dt>Target</dt>
+                              <dd>{selectedRemediationOutcome.target}</dd>
+                            </dl>
+                          </div>
+                        ) : null}
                         <article className="panel remediation-connection-panel">
                           <div className="panel-head">
                             <h3>Application Connection Details</h3>
@@ -10466,13 +12073,13 @@ export default function App() {
                         </article>
                         <article className="panel remediation-editor-panel">
                           <div className="panel-head">
-                            <h3>Editable Remediation Command Plan</h3>
-                            <p>One item per line. The approved edited plan is submitted to the remediation engine.</p>
+                            <h3>Editable Remediation Script</h3>
+                            <p>Review one guarded script with connection details. The approved edited script is submitted to the remediation engine.</p>
                           </div>
                           <div className="remediation-editor-grid">
-                            <label>Commands<textarea rows={6} value={remediationPlanEditor.commands} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, commands: e.target.value }))} /></label>
-                            <label>Scripts<textarea rows={6} value={remediationPlanEditor.scripts} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, scripts: e.target.value }))} /></label>
-                            <label>Validation Queries<textarea rows={6} value={remediationPlanEditor.queries} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, queries: e.target.value }))} /></label>
+                            <label>Single Remediation Script<textarea rows={8} value={remediationPlanEditor.scripts} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, scripts: e.target.value }))} /></label>
+                            <label>Additional Commands<textarea rows={8} value={remediationPlanEditor.commands} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, commands: e.target.value }))} /></label>
+                            <label>Additional Validation Queries<textarea rows={8} value={remediationPlanEditor.queries} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, queries: e.target.value }))} /></label>
                           </div>
                           <label>Execution Notes<textarea rows={2} value={remediationPlanEditor.notes} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, notes: e.target.value }))} /></label>
                           <div className="remediation-execute-row">
@@ -10490,9 +12097,21 @@ export default function App() {
                               className="button-secondary"
                               onClick={() => setRemediationPlanEditor((curr) => ({
                                 ...curr,
-                                commands: selectedExecutionBreakdown.commands.join("\n"),
-                                scripts: selectedExecutionBreakdown.scripts.join("\n"),
-                                queries: selectedExecutionBreakdown.queries.join("\n"),
+                                commands: "",
+                                scripts: selectedExecutionBreakdown.scripts.length
+                                  ? selectedExecutionBreakdown.scripts.join("\n")
+                                  : buildKaiOpsRemediationScript({
+                                      service: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : selectedApplicationConnection.application,
+                                      environment: selectedApplicationConnection.environment,
+                                      apiGatewayUrl: "http://api-gateway:8000",
+                                      prometheusUrl: selectedApplicationConnection.endpoint !== "Not configured"
+                                        ? selectedApplicationConnection.endpoint
+                                        : onboardingForm.prometheus_url || onboardingForm.monitoring_url || "http://prometheus:9090",
+                                      mysqlHost: "mysql",
+                                      mysqlDatabase: "kaiops",
+                                      mysqlUser: "kaiops",
+                                    }),
+                                queries: "",
                               }))}
                               disabled={remediationExecutionState.loading}
                             >
@@ -11033,7 +12652,7 @@ export default function App() {
                       <div className="panel-head">
                         <div>
                           <h3>Setup Wizard</h3>
-                          <p>Use two main steps: set up monitoring first, then add documents and rules.</p>
+                          <p>Start with one plain-English setup prompt. KaiOps auto-completes details, scores the document, asks for missing values, then validates and updates knowledge/rules.</p>
                         </div>
                         <button
                           type="button"
@@ -11273,6 +12892,49 @@ export default function App() {
                                 compact
                               />
                             </details>
+                            <details className="setup-bus-details">
+                              <summary>Scale And VM Config</summary>
+                              <div className="scale-current-config">
+                                <strong>Current Compose Default</strong>
+                                <span>1 orchestrator/master container with <code>MESSAGE_BUS_WORKER_COUNT=1</code> per service. The scale overlay raises service worker counts without changing onboarding flow.</span>
+                              </div>
+                              <div className="scale-guide-grid">
+                                {SCALE_CAPACITY_GUIDE.map((row) => (
+                                  <div className="scale-guide-card" key={row.rate}>
+                                    <div className="scale-guide-rate">
+                                      <strong>{row.rate}</strong>
+                                      <span>{row.perSecond}</span>
+                                    </div>
+                                    <dl>
+                                      <div>
+                                        <dt>Masters</dt>
+                                        <dd>{row.masters}</dd>
+                                      </div>
+                                      <div>
+                                        <dt>Workers</dt>
+                                        <dd>{row.workers}</dd>
+                                      </div>
+                                      <div>
+                                        <dt>VM Config</dt>
+                                        <dd>{row.vm}</dd>
+                                      </div>
+                                      <div>
+                                        <dt>Runtime Config</dt>
+                                        <dd><code>{row.config}</code></dd>
+                                      </div>
+                                      <div>
+                                        <dt>State Services</dt>
+                                        <dd>{row.state}</dd>
+                                      </div>
+                                    </dl>
+                                  </div>
+                                ))}
+                              </div>
+                              <div className="scale-guide-command">
+                                <strong>Compose overlay</strong>
+                                <code>docker compose --env-file .env -f docker-compose.yml -f docker-compose.external-state.yml -f docker-compose.scale.yml up -d --build</code>
+                              </div>
+                            </details>
                           </div>
                         </details>
                         <details className="setup-form-section">
@@ -11395,10 +13057,10 @@ export default function App() {
                     <article className="panel">
                       <div className="panel-head">
                         <div>
-                          <h3>Documents & Rules</h3>
-                          <p>Add Service Knowledge, improve confidence, then generate reviewable documents and rules.</p>
+                          <h3>Guided Setup</h3>
+                          <p>Enter the service details once. KaiOps extracts project, monitoring, alert, remediation, rollback, and validation facts.</p>
                         </div>
-                        <button type="button" className="button-secondary" onClick={() => setProjectSetupStep("setup")}>Back To Monitoring</button>
+                        <button type="button" className="button-secondary" onClick={() => setProjectSetupStep("setup")}>Connection Setup</button>
                       </div>
                       <form className="form" onSubmit={saveOnboardingConnectivity}>
                         {onboardingValidationErrors.length ? (
@@ -11409,15 +13071,145 @@ export default function App() {
                         {onboardingHasPendingDocumentApproval ? (
                           <p className="error">Approve pending generated documents before submitting another update.</p>
                         ) : null}
+                        <section className="panel guided-setup-project-panel">
+                          <div className="panel-head">
+                            <div>
+                              <h3>Project & Connection</h3>
+                              <p>Select an existing project or create a new one. Prometheus is used when KaiOps creates monitoring rules.</p>
+                            </div>
+                            <span className={`workflow-pill ${onboardingProjectMode === "new" ? "workflow-pill-active" : "workflow-pill-idle"}`}>
+                              {onboardingProjectMode === "new" ? "new project" : "existing project"}
+                            </span>
+                          </div>
+                          <div className="filter-grid">
+                            <label>
+                              Project Mode
+                              <select
+                                value={onboardingProjectMode}
+                                onChange={(e) => {
+                                  const nextMode = e.target.value;
+                                  setOnboardingProjectMode(nextMode);
+                                  if (nextMode === "new") {
+                                    resetNewProjectOnboardingDraft();
+                                  }
+                                }}
+                              >
+                                <option value="existing">Update Existing Project</option>
+                                <option value="new">Create New Project</option>
+                              </select>
+                            </label>
+                            {onboardingProjectMode === "existing" ? (
+                              <label>
+                                Select Project
+                                <select
+                                  value={selectedOnboardingProject}
+                                  onChange={(e) => {
+                                    const nextProjectName = e.target.value;
+                                    setSelectedOnboardingProject(nextProjectName);
+                                    const row = (onboardingState.rows || []).find((item) => extractOnboardingProjectName(item) === nextProjectName);
+                                    if (row) {
+                                      applyProjectOnboardingRow(row);
+                                      return;
+                                    }
+                                    setOnboardingForm((curr) => ({
+                                      ...curr,
+                                      name: nextProjectName,
+                                      assignment_project: nextProjectName,
+                                    }));
+                                  }}
+                                >
+                                  <option value="">Select project</option>
+                                  {onboardingProjectOptions.map((name, index) => (
+                                    <option key={`guided-project-select-${name}-${index}`} value={name}>{name}</option>
+                                  ))}
+                                </select>
+                              </label>
+                            ) : null}
+                            <label>Project Name *<input placeholder="mysql-exporter" value={onboardingForm.name} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, name: e.target.value, assignment_project: e.target.value }))} /></label>
+                            <label>Owner Team *<input placeholder="data-platform" value={onboardingForm.owner_team} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, owner_team: e.target.value }))} /></label>
+                            <label>Environment<select value={onboardingForm.environment} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, environment: e.target.value }))}><option value="dev">dev</option><option value="staging">staging</option><option value="prod">prod</option></select></label>
+                            <label>Region *<input placeholder="ap-south-1" value={onboardingForm.region} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, region: e.target.value }))} /></label>
+                            <label>
+                              Setup Path
+                              <select
+                                value={onboardingForm.onboarding_path}
+                                onChange={(e) => {
+                                  const nextPath = e.target.value;
+                                  const defaultUrl = nextPath === "setup_monitoring" ? "http://prometheus:9090" : onboardingForm.monitoring_url;
+                                  setOnboardingForm((curr) => ({
+                                    ...curr,
+                                    onboarding_path: nextPath,
+                                    start_rule_onboarding: nextPath === "setup_monitoring",
+                                    monitoring_tool: nextPath === "setup_monitoring" ? "prometheus" : curr.monitoring_tool,
+                                    monitoring_url: simplifyMonitoringUrl(defaultUrl || curr.monitoring_url),
+                                    prometheus_url: nextPath === "setup_monitoring" ? simplifyMonitoringUrl(defaultUrl || curr.monitoring_url) : curr.prometheus_url,
+                                  }));
+                                  if (nextPath === "setup_monitoring") {
+                                    setNewRulePipelineForm((curr) => ({ ...curr, selected_tool: "prometheus" }));
+                                    setExistingRulePipelineForm((curr) => ({ ...curr, platform: "prometheus", connection_url: simplifyMonitoringUrl(defaultUrl || "") }));
+                                  }
+                                }}
+                              >
+                                <option value="setup_monitoring">Create Prometheus Rules</option>
+                                <option value="existing_monitoring">Use Existing Monitoring Webhook</option>
+                              </select>
+                            </label>
+                            {onboardingForm.onboarding_path === "existing_monitoring" ? (
+                              <label>
+                                Monitoring Tool
+                                <select
+                                  value={onboardingForm.monitoring_tool}
+                                  onChange={(e) => {
+                                    const nextTool = e.target.value;
+                                    setOnboardingForm((curr) => ({
+                                      ...curr,
+                                      monitoring_tool: nextTool,
+                                      prometheus_url: nextTool === "prometheus" ? curr.monitoring_url : "",
+                                      new_relic_url: nextTool === "new_relic" ? curr.monitoring_url : "",
+                                      datadog_url: nextTool === "datadog" ? curr.monitoring_url : "",
+                                    }));
+                                    setNewRulePipelineForm((curr) => ({ ...curr, selected_tool: nextTool }));
+                                    setExistingRulePipelineForm((curr) => ({ ...curr, platform: nextTool }));
+                                  }}
+                                >
+                                  <option value="prometheus">Prometheus</option>
+                                  <option value="new_relic">New Relic</option>
+                                  <option value="datadog">Datadog</option>
+                                </select>
+                              </label>
+                            ) : (
+                              <label>Monitoring Tool<input value="Prometheus" readOnly /></label>
+                            )}
+                            <label>
+                              Prometheus / Tool URL
+                              <input
+                                value={onboardingForm.monitoring_url}
+                                placeholder="http://prometheus:9090"
+                                onBlur={(e) => {
+                                  const normalized = simplifyMonitoringUrl(e.target.value || (onboardingForm.onboarding_path === "setup_monitoring" ? "http://prometheus:9090" : ""));
+                                  setOnboardingForm((curr) => ({
+                                    ...curr,
+                                    monitoring_url: normalized,
+                                    prometheus_url: curr.monitoring_tool === "prometheus" ? normalized : "",
+                                    new_relic_url: curr.monitoring_tool === "new_relic" ? normalized : "",
+                                    datadog_url: curr.monitoring_tool === "datadog" ? normalized : "",
+                                  }));
+                                  setExistingRulePipelineForm((curr) => ({ ...curr, connection_url: normalized }));
+                                }}
+                                onChange={(e) => setOnboardingForm((curr) => ({ ...curr, monitoring_url: e.target.value }))}
+                              />
+                            </label>
+                          </div>
+                        </section>
                         <details className="setup-form-section setup-source-doc-panel knowledge-guided-panel" open>
                           <summary>
-                            <span>Alert Knowledge</span>
-                            <small>Prompt, review, fill gaps, validate</small>
+                            <span>Setup Prompt</span>
+                            <small>Describe, auto-complete, score, validate</small>
                           </summary>
                           <div className="panel-head">
                             <div>
-                              <h3>Tell KaiOps What To Onboard</h3>
-                              <p>Describe the service once. KaiOps extracts the facts, then asks only for missing or low-confidence details.</p>
+                              <h3>Tell KaiOps What To Set Up</h3>
+                              <p>Paste a short description or runbook notes. KaiOps will complete the setup form and ask only for missing or low-confidence fields.</p>
                             </div>
                             <button
                               type="button"
@@ -11434,24 +13226,24 @@ export default function App() {
                               <span>{onboardingSourceDocCount > 0 ? "Input captured" : "Prompt or file"}</span>
                             </div>
                             <div className={`setup-flow-node ${onboardingKnowledgePack ? "complete" : ""}`}>
-                              <strong>Review</strong>
-                              <span>{onboardingKnowledgePack ? `${Math.round(Number(correctedKnowledgeConfidence || 0) * 100)}% confidence` : "Waiting"}</span>
+                              <strong>Score</strong>
+                              <span>{onboardingKnowledgePack ? `${Math.round(Number(correctedKnowledgeConfidence || 0) * 100)}% document score` : "Waiting"}</span>
                             </div>
                             <div className={`setup-flow-node ${knowledgePackState.approved ? "complete" : ""}`}>
-                              <strong>Validate</strong>
-                              <span>{knowledgePackState.approved ? "Saved to knowledge" : knowledgeReviewReady ? "Ready" : "Needs details"}</span>
+                              <strong>Update</strong>
+                              <span>{knowledgePackState.approved ? "Knowledge updated" : knowledgeReviewReady ? "Ready to validate" : "Needs placeholders"}</span>
                             </div>
                           </div>
                           <div className="knowledge-guided-prompt">
                             <label>
-                              Service Knowledge Prompt
+                              Setup Details
                               <textarea
                                 rows={7}
-                                placeholder="Example: Onboard mysql exporter alerts for prod. Service mysql-exporter is owned by data-platform. Alert when exporter is down for 5 minutes or table rows grow unexpectedly. Dependencies are MySQL, Prometheus, Grafana. Validate exporter /metrics, Prometheus target up, DB connectivity, and row-count query. Safe commands include docker logs mysql-exporter and mysqladmin ping. Rollback by restoring previous exporter config and restarting exporter."
+                                placeholder="Example: Set up monitoring for mysql-exporter in prod. Owner is data-platform. Prometheus URL is http://prometheus:9090. Alert when exporter is down for 5 minutes or table rows grow unexpectedly. Dependencies are MySQL, Prometheus, and Grafana. Validate /metrics, Prometheus target up, DB connectivity, and row-count query. Rollback by restoring previous exporter config and restarting exporter."
                                 value={onboardingForm.service_knowledge_prompt}
                                 onChange={(event) => setOnboardingForm((curr) => ({ ...curr, service_knowledge_prompt: event.target.value }))}
                               />
-                              <span className="field-hint">Use plain English. Paste ticket notes, RCA text, monitoring requirements, or runbook snippets here.</span>
+                              <span className="field-hint">Use plain English. KaiOps extracts setup fields, creates placeholders for missing values, and prepares rules from this prompt.</span>
                             </label>
                             <button
                               type="button"
@@ -11459,10 +13251,29 @@ export default function App() {
                               onClick={draftKnowledgePackFromPrompt}
                               disabled={knowledgePackState.loading || !String(onboardingForm.service_knowledge_prompt || "").trim()}
                             >
-                              {knowledgePackState.loading ? "Extracting..." : "Extract & Review"}
+                              {knowledgePackState.loading ? "Extracting..." : "Auto-Complete Setup"}
                             </button>
                           </div>
                           <p className="knowledge-review-status">{knowledgeReviewSummary}</p>
+                          {onboardingKnowledgePack ? (
+                            <div className="alert-rule-summary-grid">
+                              <article className="alert-rule-summary-card">
+                                <span>Document Score</span>
+                                <strong>{Math.round(Number(correctedKnowledgeConfidence || 0) * 100)}%</strong>
+                                <small>{knowledgeReviewReady ? "ready to validate" : `${knowledgeReviewFields.length} placeholder(s) need input`}</small>
+                              </article>
+                              <article className="alert-rule-summary-card">
+                                <span>Setup Identity</span>
+                                <strong>{onboardingForm.name || "-"}</strong>
+                                <small>{onboardingForm.owner_team || "-"} | {onboardingForm.environment || "-"}</small>
+                              </article>
+                              <article className="alert-rule-summary-card">
+                                <span>Rules Draft</span>
+                                <strong>{onboardingRulePromptLines.length}</strong>
+                                <small>plain-English rule intent(s)</small>
+                              </article>
+                            </div>
+                          ) : null}
                           <details className="admin-collapsible knowledge-supporting-docs">
                             <summary>Optional supporting file</summary>
                             <div className="knowledge-pack-panel">
@@ -11501,7 +13312,7 @@ export default function App() {
                               <div className="panel-head">
                                 <div>
                                   <h3>Review Extracted Details</h3>
-                                  <p>Confirm or fill missing details before KaiOps stores this as trusted Alert Knowledge.</p>
+                                  <p>Fill placeholders or correct extracted details. Validation updates trusted Alert Knowledge and unlocks document/rule generation.</p>
                                 </div>
                                 <button
                                   type="button"
@@ -11510,14 +13321,14 @@ export default function App() {
                                   disabled={knowledgePackState.loading || !onboardingSourceDocCount || !knowledgeReviewReady}
                                   title={!knowledgeReviewReady ? "Fill the requested missing details before approving." : ""}
                                 >
-                                  Validate & Save Knowledge
+                                  Validate & Update Knowledge
                                 </button>
                               </div>
                               {knowledgeReviewFields.length ? (
                                 <div className="knowledge-pack-fix-panel">
                                   <div>
                                     <strong>Questions To Complete Validation</strong>
-                                    <span>Answer these fields, or correct the extracted value, before saving this as trusted Alert Knowledge.</span>
+                                    <span>Complete these placeholders so the saved document has enough evidence and operator-safe remediation context.</span>
                                   </div>
                                   <div className="knowledge-pack-fix-grid">
                                     {knowledgeReviewFields.map(([key, fact]) => (
@@ -11526,11 +13337,8 @@ export default function App() {
                                         <textarea
                                           rows={KNOWLEDGE_LIST_FACTS.has(key) ? 3 : 2}
                                           placeholder={KNOWLEDGE_FACT_HINTS[key] || "Provide the correct value"}
-                                          value={knowledgePackCorrections[key] || ""}
-                                          onChange={(event) => setKnowledgePackCorrections((current) => ({
-                                            ...current,
-                                            [key]: event.target.value,
-                                          }))}
+                                          value={knowledgeFactEditValue(key, fact)}
+                                          onChange={(event) => updateKnowledgeFactCorrection(key, event.target.value)}
                                         />
                                         <small>Extracted: {knowledgeFactDisplayValue(fact)} | confidence {Math.round(Number(fact?.confidence || 0) * 100)}%</small>
                                       </label>
@@ -11543,13 +13351,21 @@ export default function App() {
                               <div className="table-wrap">
                                 <table>
                                   <thead>
-                                    <tr><th>Detail</th><th>Value</th><th>Confidence</th><th>Status</th></tr>
+                                    <tr><th>Detail</th><th>Editable Value</th><th>Confidence</th><th>Status</th></tr>
                                   </thead>
                                   <tbody>
                                     {Object.entries(correctedKnowledgeFacts).map(([key, fact]) => (
                                       <tr key={`docs-rules-fact-${key}`}>
                                         <td>{key.replaceAll("_", " ")}</td>
-                                        <td>{knowledgeFactDisplayValue(fact)}</td>
+                                        <td>
+                                          <textarea
+                                            className="inline-table-editor"
+                                            rows={KNOWLEDGE_LIST_FACTS.has(key) ? 3 : 1}
+                                            placeholder={KNOWLEDGE_FACT_HINTS[key] || "Provide the correct value"}
+                                            value={knowledgeFactEditValue(key, fact)}
+                                            onChange={(event) => updateKnowledgeFactCorrection(key, event.target.value)}
+                                          />
+                                        </td>
                                         <td>{Math.round(Number(fact?.confidence || 0) * 100)}%</td>
                                         <td>{String(fact?.status || "needs_review").replaceAll("_", " ")}</td>
                                       </tr>
@@ -11568,7 +13384,7 @@ export default function App() {
                           <div className="panel-head">
                             <div>
                               <h3>Rule Intent</h3>
-                              <p>Use extracted hints or type plain-English rules. Setup Monitoring path will generate Prometheus rules.</p>
+                              <p>Use extracted hints or type plain-English rules. KaiOps previews the Prometheus format before generation.</p>
                             </div>
                             <span className={`workflow-pill ${onboardingRulePromptVisible ? "workflow-pill-active" : "workflow-pill-idle"}`}>
                               {onboardingRulePromptVisible ? "ready" : "optional"}
@@ -11594,6 +13410,18 @@ export default function App() {
                               }}
                             />
                           </label>
+                          {onboardingForm.onboarding_path === "setup_monitoring" ? (
+                            <div className="knowledge-pack-review">
+                              <div className="panel-head">
+                                <div>
+                                  <h3>Prometheus Rule Preview</h3>
+                                  <p>Final rules are validated by the backend and written to the Prometheus rules workspace.</p>
+                                </div>
+                                <span className="workflow-pill workflow-pill-active">yaml</span>
+                              </div>
+                              <pre className="result">{onboardingPrometheusRulePreview}</pre>
+                            </div>
+                          ) : null}
                         </details>
                         <button
                           className="button-primary"
@@ -11822,7 +13650,7 @@ export default function App() {
                           </thead>
                           <tbody>
                             {(() => {
-                              const isSetupMonitoring = String(onboardingForm.onboarding_path || "existing_monitoring").trim() === "setup_monitoring";
+                              const isSetupMonitoring = String(onboardingForm.onboarding_path || "setup_monitoring").trim() === "setup_monitoring";
                               const rows = onboardingWorkflowSteps.length ? onboardingWorkflowSteps : (
                                 isSetupMonitoring
                                   ? [
@@ -12338,9 +14166,9 @@ export default function App() {
                             </div>
                             <label>Execution Plan<textarea rows={4} value={alertOnboarding.execution_plan} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, execution_plan: e.target.value }))} /></label>
                             <div className="filter-grid">
-                              <label>Remediation Commands (one per line)<textarea rows={5} value={alertOnboarding.remediation_commands_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_commands_text: e.target.value }))} /></label>
-                              <label>Remediation Scripts (one per line)<textarea rows={5} value={alertOnboarding.remediation_scripts_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_scripts_text: e.target.value }))} /></label>
-                              <label>Validation Queries (one per line)<textarea rows={5} value={alertOnboarding.remediation_queries_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_queries_text: e.target.value }))} /></label>
+                              <label>Additional Commands<textarea rows={5} value={alertOnboarding.remediation_commands_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_commands_text: e.target.value }))} /></label>
+                              <label>Single Remediation Script<textarea rows={5} value={alertOnboarding.remediation_scripts_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_scripts_text: e.target.value }))} /></label>
+                              <label>Additional Validation Queries<textarea rows={5} value={alertOnboarding.remediation_queries_text} onChange={(e) => setAlertOnboarding((curr) => ({ ...curr, remediation_queries_text: e.target.value }))} /></label>
                             </div>
                           </>
                         ) : null}
