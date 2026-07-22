@@ -701,6 +701,31 @@ class IncidentRepository:
             "agent_handoffs": len(events),
         }
 
+        observed_transport_provider = next(
+            (
+                str(item.get("transport_provider") or "").strip()
+                for item in reversed(event_trace)
+                if str(item.get("transport_provider") or "").strip().lower() not in {"", "unknown"}
+            ),
+            "",
+        )
+        observed_workflow = next(
+            (
+                str(item.get("payload", {}).get("decision", {}).get("workflow") or "").strip()
+                for item in reversed(event_trace)
+                if isinstance(item.get("payload"), dict)
+                and isinstance(item.get("payload", {}).get("decision"), dict)
+                and str(item.get("payload", {}).get("decision", {}).get("workflow") or "").strip()
+            ),
+            "",
+        )
+        decision_workflow = str(orchestration_decision.get("workflow") or observed_workflow or "guided-remediation")
+        decision_message_bus_provider = str(
+            orchestration_decision.get("message_bus_provider")
+            or observed_transport_provider
+            or "rabbitmq"
+        )
+
         scenario = {
             "id": "db-processed",
             "title": str(incident_payload.get("title") or alert_payload.get("name") or "Incident"),
@@ -713,13 +738,13 @@ class IncidentRepository:
             "alert": alert_payload,
             "incident": incident_payload,
             "decision": {
-                "workflow": str(orchestration_decision.get("workflow") or "db-processed"),
+                "workflow": decision_workflow,
                 "requires_approval": bool(orchestration_decision.get("requires_approval", False)),
                 "risk_tier": str(orchestration_decision.get("risk_tier") or "unknown"),
                 "execution_mode": str(orchestration_decision.get("execution_mode") or "unknown"),
                 "policy_version": str(orchestration_decision.get("policy_version") or "policy-v1"),
                 "policy_reason": str(orchestration_decision.get("policy_reason") or ""),
-                "message_bus_provider": str(orchestration_decision.get("message_bus_provider") or "unknown"),
+                "message_bus_provider": decision_message_bus_provider,
                 "stream_count": int(orchestration_decision.get("stream_count", 0) or 0),
                 "stream_threshold": int(orchestration_decision.get("stream_threshold", 0) or 0),
                 "planner_used": False,
@@ -871,7 +896,7 @@ class IncidentRepository:
             elif row["stage"] == "remediation_executed" and not persisted:
                 persisted = len(action_rows) > 0 or "remediating" in event_statuses
             elif row["stage"] == "closure_completed" and not persisted:
-                persisted = len(report_rows) > 0 or incident_status in {"closed", "resolved"}
+                persisted = incident_status in {"closed", "resolved", "failed"}
 
             stages.append(
                 {
@@ -2252,11 +2277,55 @@ class IncidentRepository:
             pending_rows = pending_result.scalars().all()
             pending_by_incident = {pending.incident_id: pending for pending in pending_rows}
 
+        action_by_incident: dict[UUID, ActionRecord] = {}
+        incident_ids = [row.incident_id for row in rows]
+        if incident_ids:
+            action_result = await self.session.execute(
+                select(ActionRecord)
+                .where(ActionRecord.incident_id.in_(incident_ids))
+                .order_by(ActionRecord.updated_at.desc(), ActionRecord.created_at.desc())
+            )
+            for action in action_result.scalars().all():
+                action_by_incident.setdefault(action.incident_id, action)
+
+        evaluation_by_incident: dict[UUID, EvaluationRecord] = {}
+        if incident_ids:
+            evaluation_result = await self.session.execute(
+                select(EvaluationRecord)
+                .where(EvaluationRecord.incident_id.in_(incident_ids))
+                .order_by(EvaluationRecord.created_at.desc())
+            )
+            for evaluation in evaluation_result.scalars().all():
+                evaluation_by_incident.setdefault(evaluation.incident_id, evaluation)
+
         response_rows: list[dict[str, Any]] = []
         for row in rows:
             pending = pending_by_incident.get(row.incident_id)
             merged_recommendation_id = row.recommendation_id or (pending.recommendation_id if pending is not None else None)
             merged_flow_id = row.flow_id or (pending.flow_id if pending is not None else None)
+            projection_payload = dict(row.projection_payload or {})
+            evaluation = evaluation_by_incident.get(row.incident_id)
+            if evaluation is not None:
+                evaluation_payload = dict(evaluation.report_payload or {})
+                projection_payload.setdefault("evaluation", evaluation_payload)
+                projection_payload.setdefault(
+                    "quality",
+                    {
+                        "overall_score": evaluation.overall_score,
+                        "quality_label": evaluation.quality_label,
+                        "requires_review": evaluation.requires_review,
+                    },
+                )
+            action = action_by_incident.get(row.incident_id)
+            projected_status = row.status
+            if action is not None:
+                action_status = str(action.status or "").lower()
+                if str(row.status or "").lower() == "remediating" and action_status in {"skipped", "failed", "rejected"}:
+                    projected_status = "failed"
+                elif str(row.status or "").lower() == "remediating" and action_status == "succeeded":
+                    projected_status = "validating"
+                projection_payload["remediation_action"] = action.payload or {}
+                projection_payload["remediation_status"] = action_status
 
             response_rows.append(
                 {
@@ -2269,7 +2338,7 @@ class IncidentRepository:
                     "service": row.service,
                     "environment": row.environment,
                     "severity": row.severity,
-                    "status": row.status,
+                    "status": projected_status,
                     "owner": row.owner,
                     "risk_tier": row.risk_tier,
                     "execution_mode": row.execution_mode,
@@ -2281,7 +2350,7 @@ class IncidentRepository:
                     "latest_event_type": row.latest_event_type,
                     "latest_event_at": row.latest_event_at,
                     "updated_at": row.updated_at,
-                    "projection_payload": row.projection_payload,
+                    "projection_payload": projection_payload,
                 }
             )
         return response_rows

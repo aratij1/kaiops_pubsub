@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="920" viewBox="0 0 1600 920">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#334155"/>
+    </marker>
+    <style>
+      .bg{fill:#fff}
+      .lane{fill:#f8fafc;stroke:#64748b;stroke-width:1.4;rx:18}
+      .edge{fill:#eff6ff;stroke:#2563eb;stroke-width:1.4;rx:18}
+      .app{fill:#f5faff;stroke:#2563eb;stroke-width:1.4;rx:18}
+      .ai{fill:#fbf7ff;stroke:#7c3aed;stroke-width:1.4;rx:18}
+      .data{fill:#f0fdf4;stroke:#059669;stroke-width:1.4;rx:18}
+      .ops{fill:#fff7ed;stroke:#ea580c;stroke-width:1.4;rx:18}
+      .gov{fill:#fff1f2;stroke:#e11d48;stroke-width:1.4;rx:18}
+      .box{fill:#fff;stroke:#475569;stroke-width:1.15;rx:8}
+      .blue{fill:#eff6ff;stroke:#2563eb}
+      .purple{fill:#f5f3ff;stroke:#7c3aed}
+      .green{fill:#ecfdf5;stroke:#059669}
+      .orange{fill:#fff7ed;stroke:#ea580c}
+      .red{fill:#fff1f2;stroke:#e11d48}
+      .bus{fill:#eef2ff;stroke:#4338ca;stroke-width:1.5;rx:12}
+      .title{font:700 24px Arial;fill:#111827}
+      .subtitle{font:12px Arial;fill:#475569}
+      .h{font:700 15px Arial;fill:#111827}
+      .t{font:13px Arial;fill:#111827}
+      .s{font:11px Arial;fill:#475569}
+      .tiny{font:10px Arial;fill:#64748b}
+      .a{stroke:#334155;stroke-width:1.7;fill:none;marker-end:url(#arrow)}
+      .soft{stroke:#64748b;stroke-width:1.25;stroke-dasharray:5 4;fill:none;marker-end:url(#arrow)}
+    </style>
+  </defs>
+
+  <rect class="bg" width="1600" height="920"/>
+  <text class="title" x="34" y="42">KaiOps Azure Production Scalable Architecture</text>
+  <text class="subtitle" x="34" y="64">Separated application and AI layers, managed Azure services, autoscaling workers, private networking, governed remediation</text>
+
+  <rect class="lane" x="30" y="105" width="180" height="575"/>
+  <text class="h" x="58" y="135">Alert Sources</text>
+  <rect class="box" x="55" y="165" width="130" height="38"/><text class="t" x="81" y="189">Prometheus</text>
+  <rect class="box" x="55" y="218" width="130" height="38"/><text class="t" x="77" y="242">Azure Monitor</text>
+  <rect class="box" x="55" y="271" width="130" height="38"/><text class="t" x="82" y="295">Grafana</text>
+  <rect class="box" x="55" y="324" width="130" height="38"/><text class="t" x="83" y="348">Data Factory</text>
+  <rect class="box" x="55" y="377" width="130" height="38"/><text class="t" x="79" y="401">VM / AKS Logs</text>
+  <rect class="box" x="55" y="430" width="130" height="38"/><text class="t" x="86" y="454">ITSM / Teams</text>
+  <rect class="box" x="55" y="483" width="130" height="38"/><text class="t" x="83" y="507">File Watcher</text>
+  <rect class="box" x="55" y="536" width="130" height="38"/><text class="t" x="87" y="560">Webhooks</text>
+
+  <rect class="edge" x="245" y="105" width="220" height="575"/>
+  <text class="h" x="282" y="135">Azure Edge</text>
+  <rect class="blue box" x="278" y="160" width="154" height="55"/><text class="t" x="303" y="185">Front Door</text><text class="s" x="305" y="203">global entry</text>
+  <rect class="blue box" x="278" y="245" width="154" height="55"/><text class="t" x="315" y="270">WAF</text><text class="s" x="302" y="288">threat filtering</text>
+  <rect class="blue box" x="278" y="330" width="154" height="55"/><text class="t" x="294" y="355">App Gateway</text><text class="s" x="306" y="373">private ingress</text>
+  <rect class="green box" x="278" y="415" width="154" height="55"/><text class="t" x="304" y="440">API Mgmt</text><text class="s" x="301" y="458">quotas/versioning</text>
+  <rect class="orange box" x="278" y="500" width="154" height="55"/><text class="t" x="298" y="525">Load Balancer</text><text class="s" x="305" y="543">multi-zone</text>
+
+  <rect class="app" x="510" y="105" width="360" height="575"/>
+  <text class="h" x="540" y="135">Application Layer - AKS / Container Apps</text>
+  <rect class="blue box" x="535" y="160" width="140" height="55"/><text class="t" x="570" y="185">UI</text><text class="s" x="560" y="203">Static Web Apps/CDN</text>
+  <rect class="blue box" x="705" y="160" width="140" height="55"/><text class="t" x="739" y="185">API Gateway</text><text class="s" x="744" y="203">N replicas</text>
+  <rect class="green box" x="535" y="245" width="140" height="55"/><text class="t" x="550" y="270">Landing Pad</text><text class="s" x="560" y="288">validate/dedupe</text>
+  <rect class="green box" x="705" y="245" width="140" height="55"/><text class="t" x="716" y="270">Monitoring Adapter</text><text class="s" x="736" y="288">webhooks</text>
+  <rect class="orange box" x="535" y="330" width="140" height="55"/><text class="t" x="563" y="355">Orchestrator</text><text class="s" x="558" y="373">workflow select</text>
+  <rect class="red box" x="705" y="330" width="140" height="55"/><text class="t" x="724" y="355">Approval</text><text class="s" x="725" y="373">human gates</text>
+  <rect class="red box" x="535" y="415" width="140" height="55"/><text class="t" x="550" y="440">Remediation</text><text class="s" x="556" y="458">policy plugins</text>
+  <rect class="box" x="705" y="415" width="140" height="55"/><text class="t" x="722" y="440">Onboarding</text><text class="s" x="724" y="458">apps/rules/docs</text>
+  <rect class="orange box" x="535" y="505" width="310" height="72"/><text class="t" x="604" y="532">KEDA / HPA Worker Pools</text><text class="s" x="566" y="554">scale by Service Bus queue length, CPU, p95 latency, active incident count</text>
+
+  <rect class="bus" x="510" y="720" width="715" height="86"/>
+  <text class="h" x="540" y="750">Azure Service Bus Premium / Event Hubs</text>
+  <text class="s" x="540" y="775">raw-alerts | enriched-alerts | orchestration-events | context-events | resolution-events | approval-events | remediation-events | notifications | dead-letter</text>
+
+  <rect class="ai" x="920" y="105" width="305" height="575"/>
+  <text class="h" x="950" y="135">AI Layer - Scalable Isolated Endpoint</text>
+  <rect class="purple box" x="950" y="158" width="115" height="48"/><text class="t" x="974" y="181">AI API</text><text class="s" x="969" y="198">private endpoint</text>
+  <rect class="purple box" x="1080" y="158" width="115" height="48"/><text class="t" x="1098" y="181">Model Router</text><text class="s" x="1106" y="198">fallbacks</text>
+  <rect class="purple box" x="950" y="228" width="115" height="48"/><text class="t" x="966" y="251">Context Agent</text><text class="s" x="973" y="268">N replicas</text>
+  <rect class="purple box" x="1080" y="228" width="115" height="48"/><text class="t" x="1095" y="251">Resolution</text><text class="s" x="1104" y="268">N replicas</text>
+  <rect class="purple box" x="950" y="298" width="115" height="48"/><text class="t" x="965" y="321">Knowledge</text><text class="s" x="977" y="338">RAG router</text>
+  <rect class="purple box" x="1080" y="298" width="115" height="48"/><text class="t" x="1101" y="321">Evaluation</text><text class="s" x="1096" y="338">quality scores</text>
+  <rect class="purple box" x="950" y="368" width="115" height="48"/><text class="t" x="966" y="391">Embedding</text><text class="s" x="970" y="408">batch workers</text>
+  <rect class="purple box" x="1080" y="368" width="115" height="48"/><text class="t" x="1101" y="391">Reranker</text><text class="s" x="1092" y="408">optional GPU</text>
+  <rect class="orange box" x="950" y="438" width="245" height="58"/><text class="t" x="1004" y="463">AI KEDA / HPA Autoscaler</text><text class="s" x="970" y="482">scale by context queue, resolution queue, token backlog, p95 latency</text>
+  <rect class="red box" x="950" y="518" width="115" height="58"/><text class="t" x="967" y="543">Rate Limits</text><text class="s" x="965" y="562">quota shaping</text>
+  <rect class="red box" x="1080" y="518" width="115" height="58"/><text class="t" x="1097" y="543">Circuit Breaker</text><text class="s" x="1100" y="562">fallback gate</text>
+  <rect class="purple box" x="950" y="598" width="245" height="50"/><text class="t" x="1005" y="621">Azure OpenAI / Gemini / OpenAI</text><text class="s" x="986" y="638">regional deployments, TPM/RPM pools, fallback chains</text>
+
+  <rect class="data" x="1270" y="105" width="285" height="575"/>
+  <text class="h" x="1300" y="135">Data / Knowledge Layer</text>
+  <rect class="green box" x="1300" y="160" width="225" height="55"/><text class="t" x="1354" y="185">Azure Database for MySQL</text><text class="s" x="1360" y="203">incidents, approvals, audit</text>
+  <rect class="green box" x="1300" y="245" width="225" height="55"/><text class="t" x="1356" y="270">Qdrant / AI Search</text><text class="s" x="1364" y="288">vector index</text>
+  <rect class="green box" x="1300" y="330" width="225" height="55"/><text class="t" x="1353" y="355">Azure Blob Storage</text><text class="s" x="1360" y="373">raw docs, archives</text>
+  <rect class="green box" x="1300" y="415" width="225" height="55"/><text class="t" x="1356" y="440">Azure Cache for Redis</text><text class="s" x="1357" y="458">sessions, locks, cache</text>
+  <rect class="green box" x="1300" y="500" width="225" height="55"/><text class="t" x="1357" y="525">Key Vault</text><text class="s" x="1355" y="543">secrets and certificates</text>
+  <rect class="green box" x="1300" y="585" width="225" height="55"/><text class="t" x="1352" y="610">Azure Files / GitOps</text><text class="s" x="1362" y="628">prometheus rules</text>
+
+  <rect class="ops" x="30" y="720" width="420" height="120"/>
+  <text class="h" x="58" y="750">Observability And Operations</text>
+  <rect class="orange box" x="60" y="775" width="115" height="42"/><text class="t" x="80" y="801">App Insights</text>
+  <rect class="orange box" x="195" y="775" width="115" height="42"/><text class="t" x="215" y="801">Log Analytics</text>
+  <rect class="orange box" x="330" y="775" width="90" height="42"/><text class="t" x="351" y="801">Grafana</text>
+
+  <rect class="gov" x="1270" y="720" width="285" height="120"/>
+  <text class="h" x="1300" y="750">Governance</text>
+  <rect class="red box" x="1300" y="775" width="100" height="42"/><text class="t" x="1328" y="801">RBAC</text>
+  <rect class="red box" x="1418" y="775" width="105" height="42"/><text class="t" x="1438" y="801">Policy</text>
+
+  <path class="a" d="M185 350 C220 350 235 355 278 355"/>
+  <path class="a" d="M432 528 C470 528 492 520 535 520"/>
+  <path class="a" d="M845 358 C880 358 902 252 950 252"/>
+  <path class="a" d="M1065 392 C1120 392 1210 272 1300 272"/>
+  <path class="a" d="M1195 442 C1240 442 1260 442 1300 442"/>
+  <path class="a" d="M690 577 C690 650 690 690 690 720"/>
+  <path class="a" d="M1072 648 C1072 680 1072 700 1072 720"/>
+  <path class="soft" d="M1225 763 C1245 763 1255 763 1270 763"/>
+  <path class="soft" d="M450 780 C475 780 490 780 510 780"/>
+
+  <text class="tiny" x="536" y="850">Scale policy: app workers scale by alert queues, CPU, active incidents; AI workers scale by context/resolution queues, token backlog, embedding batch depth, vector latency, model p95, and provider throttling.</text>
+  <text class="tiny" x="536" y="870">Cloud migration: replace Azure service bindings with equivalent managed services through config: EVENT_BUS_PROVIDER, DB_PROVIDER, VECTOR_STORE_PROVIDER, OBJECT_STORE_PROVIDER, LLM_PROVIDER.</text>
+</svg>

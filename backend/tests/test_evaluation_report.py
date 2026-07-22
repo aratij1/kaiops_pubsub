@@ -153,6 +153,33 @@ def test_requires_review_false_for_strong_grounded_response() -> None:
     assert evaluation["requires_review"] is False
 
 
+def test_requires_review_true_for_weak_rag_match_even_with_high_confidence() -> None:
+    evaluation = build_quality_evaluation(
+        prediction="Archive old MySQL alert rows and validate table growth",
+        context="mysql runbook: archive old MySQL alert rows and validate table growth",
+        confidence=0.99,
+        citations=["runbook://mysql", "incident://1", "action://archive"],
+        rag_matches=[{"kind": "runbook", "similarity": 0.27}],
+        runbook_found=True,
+    )
+    assert evaluation["requires_review"] is True
+    assert evaluation["quality_label"] != "high"
+
+
+def test_requires_review_true_for_fallback_even_with_text_output() -> None:
+    evaluation = build_quality_evaluation(
+        prediction="Investigate service health and collect Prometheus evidence",
+        context="service health evidence",
+        confidence=0.8,
+        citations=["incident://1"],
+        rag_matches=[],
+        runbook_found=False,
+        fallback_used=True,
+    )
+    assert evaluation["requires_review"] is True
+    assert evaluation["quality_label"] == "low"
+
+
 def test_external_judge_as_dict_blends_into_overall_score() -> None:
     baseline = build_quality_evaluation(prediction="x", context="y", confidence=0.5)
     with_external = build_quality_evaluation(

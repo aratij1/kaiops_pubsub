@@ -276,6 +276,57 @@ class RagDocumentUpdateRequest(RagDocumentRequest):
     path: str = Field(min_length=3)
 
 
+def _metadata_value(metadata: dict[str, str], *keys: str, default: str = "") -> str:
+    for key in keys:
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value
+    return default
+
+
+def _single_remediation_script(request: RagDocumentRequest) -> str:
+    service = (request.services[0] if request.services else request.alert_type or "kaiops-service").strip()
+    environment = _metadata_value(request.metadata, "environment", default="prod")
+    api_gateway_url = _metadata_value(
+        request.metadata,
+        "api_gateway_url",
+        "apiGatewayUrl",
+        "gateway_url",
+        default="http://api-gateway:8000",
+    )
+    prometheus_url = _metadata_value(
+        request.metadata,
+        "prometheus_url",
+        "monitoring_url",
+        "metrics_endpoint",
+        default="http://prometheus:9090",
+    )
+    mysql_host = _metadata_value(request.metadata, "mysql_host", "database_host", default="mysql")
+    mysql_database = _metadata_value(request.metadata, "mysql_database", "database_name", default="kaiops")
+    mysql_user = _metadata_value(request.metadata, "mysql_user", "database_user", default="kaiops")
+    return (
+        "bash scripts/remediation/kaiops_alert_health_triage.sh "
+        f"--service {service or 'kaiops-service'} "
+        f"--environment {environment or 'prod'} "
+        f"--api-gateway-url {api_gateway_url} "
+        f"--prometheus-url {prometheus_url} "
+        f"--mysql-host {mysql_host} "
+        f"--mysql-database {mysql_database} "
+        f"--mysql-user {mysql_user} "
+        "--dry-run true"
+    )
+
+
+def _execution_script_lines(request: RagDocumentRequest) -> list[str]:
+    scripts = [str(item).strip() for item in request.scripts if str(item).strip()]
+    has_fragments = any(str(item).strip() for item in [*request.commands, *request.queries])
+    if scripts:
+        return scripts
+    if has_fragments:
+        return [_single_remediation_script(request)]
+    return []
+
+
 class KnowledgePackSourceDocument(BaseModel):
     name: str = Field(default="uploaded-document", max_length=240)
     category: str | None = Field(default=None, max_length=80)
@@ -556,12 +607,13 @@ def render_document(request: RagDocumentRequest) -> str:
         body_lines.extend(["", "## Impact", request.impact.strip()])
     if request.execution_plan:
         body_lines.extend(["", "## Execution Plan", request.execution_plan.strip()])
-    if request.commands:
+    script_lines = _execution_script_lines(request)
+    if script_lines:
+        body_lines.extend(["", "## Remediation Script"])
+        for item in script_lines:
+            body_lines.extend(["```bash", item, "```"])
+    elif request.commands:
         body_lines.extend(["", "## Commands", *[f"- {item}" for item in request.commands if str(item).strip()]])
-    if request.scripts:
-        body_lines.extend(["", "## Scripts", *[f"- {item}" for item in request.scripts if str(item).strip()]])
-    if request.queries:
-        body_lines.extend(["", "## Queries", *[f"- {item}" for item in request.queries if str(item).strip()]])
     return f"{header}\n\n" + "\n".join(body_lines).rstrip() + "\n"
 
 

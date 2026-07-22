@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="560" viewBox="0 0 1180 560">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#334155"/></marker>
+    <style>
+      .bg{fill:#fff}.lane{fill:#f8fafc;stroke:#64748b;stroke-width:1.4;rx:18}.box{fill:#fff;stroke:#475569;stroke-width:1.2;rx:8}.green{fill:#ecfdf5;stroke:#059669}.blue{fill:#eff6ff;stroke:#2563eb}.orange{fill:#fff7ed;stroke:#ea580c}.title{font:700 24px Arial;fill:#111827}.h{font:700 15px Arial;fill:#111827}.t{font:13px Arial;fill:#111827}.s{font:11px Arial;fill:#475569}.a{stroke:#334155;stroke-width:1.7;fill:none;marker-end:url(#arrow)}.soft{stroke:#64748b;stroke-width:1.3;stroke-dasharray:5 4;fill:none;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect class="bg" width="1180" height="560"/>
+  <text class="title" x="34" y="42">Layer 01 - Monitoring And Alert Intake</text>
+  <text class="s" x="34" y="64">How monitoring sources create alerts and land them into KaiOps.</text>
+
+  <rect class="lane" x="30" y="95" width="210" height="370"/><text class="h" x="58" y="125">Monitoring Sources</text>
+  <rect class="box" x="60" y="152" width="150" height="42"/><text class="t" x="94" y="178">Prometheus</text>
+  <rect class="box" x="60" y="212" width="150" height="42"/><text class="t" x="86" y="238">Alertmanager</text>
+  <rect class="box" x="60" y="272" width="150" height="42"/><text class="t" x="89" y="298">Cloud Monitor</text>
+  <rect class="box" x="60" y="332" width="150" height="42"/><text class="t" x="92" y="358">File Watcher</text>
+  <rect class="box" x="60" y="392" width="150" height="42"/><text class="t" x="90" y="418">Manual/API</text>
+
+  <rect class="green box" x="310" y="170" width="175" height="118"/><text class="h" x="346" y="202">Landing Pad</text><text class="s" x="334" y="226">receive alert payload</text><text class="s" x="334" y="246">validate schema</text><text class="s" x="334" y="266">write raw file/event</text>
+  <rect class="blue box" x="560" y="150" width="180" height="90"/><text class="h" x="596" y="182">Normalize</text><text class="s" x="588" y="206">canonical alert id</text><text class="s" x="588" y="224">service/env/severity</text>
+  <rect class="blue box" x="560" y="285" width="180" height="90"/><text class="h" x="604" y="317">Dedupe</text><text class="s" x="586" y="341">fingerprint</text><text class="s" x="586" y="359">correlation id</text>
+  <rect class="orange box" x="815" y="170" width="195" height="118"/><text class="h" x="858" y="202">Persist Intake</text><text class="s" x="850" y="226">alerts table</text><text class="s" x="850" y="246">incident projection</text><text class="s" x="850" y="266">audit timeline</text>
+  <rect class="orange box" x="815" y="330" width="195" height="90"/><text class="h" x="860" y="362">Publish Event</text><text class="s" x="850" y="386">raw-alerts</text><text class="s" x="850" y="404">enriched-alerts</text>
+
+  <path class="a" d="M240 277L310 230"/><path class="a" d="M485 228L560 195"/><path class="a" d="M485 248L560 330"/><path class="a" d="M740 195L815 225"/><path class="a" d="M740 330L815 375"/><path class="soft" d="M912 420C930 486 725 505 392 448"/>
+  <text class="s" x="370" y="472">feedback: duplicate status, rejected payloads, ingest health</text>
+</svg>
