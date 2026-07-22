@@ -25,6 +25,8 @@ node_modules/
 backend/ingested_alerts/input/*.json
 backend/ingested_alerts/processed/*.json
 backend/ingested_alerts/failed/*.json
+backend/ingested_alerts/input_failed/*.json
+backend/ingested_alerts/input_replayed/*.json
 
 # Generated onboarding outputs
 backend/rag/changes/**
