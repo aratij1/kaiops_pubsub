@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import shlex
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from ai_workbench_common.agentic import AgentContext, BaseAgent
@@ -95,6 +98,88 @@ class ApiExecutionPlugin(BasePlugin):
         return await self._not_configured(action, "api")
 
 
+class LocalScriptExecutionPlugin(BasePlugin):
+    def __init__(self) -> None:
+        super().__init__("script_execution")
+
+    @staticmethod
+    def _repo_root() -> Path:
+        current = Path(__file__).resolve()
+        for parent in current.parents:
+            if (parent / "scripts" / "remediation").is_dir():
+                return parent
+        return Path("/app")
+
+    def _resolve_script_command(self, action: RemediationAction) -> list[str]:
+        execution_plan = action.parameters.get("execution_plan") if isinstance(action.parameters.get("execution_plan"), dict) else {}
+        scripts = execution_plan.get("scripts") if isinstance(execution_plan.get("scripts"), list) else []
+        commands = action.parameters.get("commands") if isinstance(action.parameters.get("commands"), list) else []
+        raw = next(
+            (
+                str(item).replace("script:", "", 1).strip()
+                for item in [*scripts, *commands]
+                if "kaiops_alert_health_triage.sh" in str(item)
+            ),
+            "",
+        )
+        if not raw:
+            raise ValueError("script_execution requires kaiops_alert_health_triage.sh in execution_plan.scripts")
+
+        parts = shlex.split(raw)
+        script_index = next((index for index, part in enumerate(parts) if part.endswith("kaiops_alert_health_triage.sh")), -1)
+        if script_index < 0:
+            raise ValueError("approved script path was not found")
+
+        script_token = parts[script_index]
+        relative_script = Path(script_token)
+        script_path = relative_script if relative_script.is_absolute() else self._repo_root() / relative_script
+        allowed_dir = (self._repo_root() / "scripts" / "remediation").resolve()
+        resolved_script = script_path.resolve()
+        if allowed_dir not in resolved_script.parents:
+            raise PermissionError(f"script path {resolved_script} is outside approved remediation directory")
+        if not resolved_script.exists():
+            raise FileNotFoundError(f"approved remediation script not found: {resolved_script}")
+
+        return ["sh", str(resolved_script), *parts[script_index + 1:]]
+
+    async def execute(self, action: RemediationAction) -> RemediationAction:
+        command = self._resolve_script_command(action)
+        env = os.environ.copy()
+        env.setdefault("MYSQL_PASSWORD", env.get("DB_PASSWORD", ""))
+        timeout_seconds = float(action.parameters.get("timeout_seconds") or 45)
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            cwd=str(self._repo_root()),
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            action.status = RemediationStatus.FAILED
+            action.error = f"script timed out after {timeout_seconds:g}s"
+            action.output = ""
+            return action
+
+        output = stdout.decode("utf-8", errors="replace").strip()
+        error = stderr.decode("utf-8", errors="replace").strip()
+        action.output = output
+        action.error = error if process.returncode else ""
+        action.status = RemediationStatus.SUCCEEDED if process.returncode == 0 else RemediationStatus.FAILED
+        action.parameters["execution_result"] = {
+            "executed": process.returncode == 0,
+            "executor": "local-script",
+            "command": command,
+            "returncode": process.returncode,
+            "stdout": output,
+            "stderr": error,
+        }
+        return action
+
+
 @dataclass
 class RemediationEngine(BaseAgent):
     plugins: dict[str, RemediationPlugin] = field(
@@ -106,6 +191,7 @@ class RemediationEngine(BaseAgent):
             "clear_cache": ApiExecutionPlugin(),
             "failover_database": ApiExecutionPlugin(),
             "api_execution": ApiExecutionPlugin(),
+            "script_execution": LocalScriptExecutionPlugin(),
             "terraform_rollback": TerraformRollbackPlugin(),
         }
     )
@@ -202,6 +288,8 @@ class RemediationEngine(BaseAgent):
         command_blob = " | ".join(self._normalize_text(item) for item in commands)
         haystack = f"{text} | {command_blob}"
 
+        if "kaiops_alert_health_triage.sh" in haystack:
+            return "script_execution"
         if any(keyword in haystack for keyword in ["restart pod", "rollout restart", "crashloop", "oom"]):
             return "restart_pod"
         if any(keyword in haystack for keyword in ["scale", "replicas", "hpa"]):
@@ -224,6 +312,7 @@ class RemediationEngine(BaseAgent):
         plan_commands = approved_execution_plan.get("commands") if isinstance(approved_execution_plan.get("commands"), list) else []
         plan_scripts = approved_execution_plan.get("scripts") if isinstance(approved_execution_plan.get("scripts"), list) else []
         plan_queries = approved_execution_plan.get("queries") if isinstance(approved_execution_plan.get("queries"), list) else []
+        has_approved_execution_plan = isinstance(approval.metadata.get("execution_plan"), dict)
         command_list = self._sanitize_recommended_commands([
             *[str(item) for item in recommended_commands],
             *[str(item) for item in plan_commands],
@@ -260,9 +349,21 @@ class RemediationEngine(BaseAgent):
             recommended_commands=command_list,
         )
         execution_plan = {
-            "commands": [str(item).strip() for item in (plan_commands or generated_execution_plan.get("commands", [])) if str(item).strip()],
-            "scripts": [str(item).strip() for item in (plan_scripts or generated_execution_plan.get("scripts", [])) if str(item).strip()],
-            "queries": [str(item).strip() for item in (plan_queries or generated_execution_plan.get("queries", [])) if str(item).strip()],
+            "commands": [
+                str(item).strip()
+                for item in (plan_commands if has_approved_execution_plan else generated_execution_plan.get("commands", []))
+                if str(item).strip()
+            ],
+            "scripts": [
+                str(item).strip()
+                for item in (plan_scripts if has_approved_execution_plan else generated_execution_plan.get("scripts", []))
+                if str(item).strip()
+            ],
+            "queries": [
+                str(item).strip()
+                for item in (plan_queries if has_approved_execution_plan else generated_execution_plan.get("queries", []))
+                if str(item).strip()
+            ],
         }
         connection_profile = approval.metadata.get("connection_profile") if isinstance(approval.metadata.get("connection_profile"), dict) else {}
 
@@ -386,6 +487,12 @@ class RemediationEngine(BaseAgent):
                 seen.add(key)
                 deduped.append(str(item).strip())
             commands = deduped
+            if any("kaiops_alert_health_triage.sh" in str(item) for item in recommended_commands):
+                scripts = [
+                    str(item).replace("script:", "", 1).strip()
+                    for item in recommended_commands
+                    if "kaiops_alert_health_triage.sh" in str(item)
+                ] or scripts
 
         return {
             "commands": commands,

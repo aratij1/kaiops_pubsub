@@ -152,6 +152,9 @@ def build_evaluation_report(
         external_metric = str(external.get("metric") or "")
         external_explanation = str(external.get("explanation") or "")
 
+    weak_rag_match = bool(match_rows) and rag_match_score < 0.45
+    missing_rag_evidence = not match_rows and not runbook_found
+
     hallucination_risk = _clamp_score(
         1.0
         - (0.42 * grounding_score)
@@ -159,6 +162,8 @@ def build_evaluation_report(
         - (0.18 * evidence_coverage)
         - (0.18 * confidence_score)
         + (0.12 if fallback_used else 0.0)
+        + (0.1 if weak_rag_match else 0.0)
+        + (0.08 if missing_rag_evidence else 0.0)
     )
     hallucination_score = _clamp_score(1.0 - hallucination_risk)
     overall_score = _clamp_score(
@@ -172,6 +177,16 @@ def build_evaluation_report(
         overall_score = _clamp_score((0.7 * overall_score) + (0.3 * external_score))
 
     label = "high" if overall_score >= 0.82 and hallucination_risk <= 0.25 else "medium" if overall_score >= 0.62 else "low"
+    if fallback_used or weak_rag_match:
+        label = "low" if overall_score < 0.62 or fallback_used else "medium"
+    requires_review = bool(
+        hallucination_risk >= 0.45
+        or grounding_score < 0.55
+        or confidence_score < 0.65
+        or fallback_used
+        or weak_rag_match
+        or missing_rag_evidence
+    )
     return EvaluationReport(
         confidence_score=round(confidence_score, 4),
         grounding_score=round(grounding_score, 4),
@@ -182,7 +197,7 @@ def build_evaluation_report(
         rag_match_score=round(rag_match_score, 4),
         overall_score=round(overall_score, 4),
         quality_label=label,
-        requires_review=bool(hallucination_risk >= 0.45 or grounding_score < 0.55 or confidence_score < 0.65),
+        requires_review=requires_review,
         external_judge=ExternalJudgeResult(
             metric=external_metric,
             score=round(external_score, 4) if external_score is not None else None,

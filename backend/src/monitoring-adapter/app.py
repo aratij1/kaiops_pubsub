@@ -110,6 +110,12 @@ LANDING_PAD_PROCESSED_DIR = LANDING_PAD_INPUT_DIR.parent / "processed"
 LANDING_PAD_FAILED_DIR = LANDING_PAD_INPUT_DIR.parent / "failed"
 LANDING_PAD_INPUT_REPLAYED_DIR = LANDING_PAD_INPUT_DIR.parent / "input_replayed"
 LANDING_PAD_INPUT_FAILED_DIR = LANDING_PAD_INPUT_DIR.parent / "input_failed"
+_DEFAULT_LANDING_PAD_REPLAY_DIR = LANDING_PAD_INPUT_DIR.parent / "Alerts"
+LANDING_PAD_ADDITIONAL_INPUT_DIRS = [
+    Path(item.strip())
+    for item in os.getenv("LANDING_PAD_ADDITIONAL_INPUT_DIRS", str(_DEFAULT_LANDING_PAD_REPLAY_DIR)).split(os.pathsep)
+    if item.strip()
+]
 LANDING_PAD_FILE_WATCHER_ENABLED = str(os.getenv("LANDING_PAD_FILE_WATCHER_ENABLED", "true")).strip().lower() in {
     "1",
     "true",
@@ -117,8 +123,8 @@ LANDING_PAD_FILE_WATCHER_ENABLED = str(os.getenv("LANDING_PAD_FILE_WATCHER_ENABL
     "on",
 }
 LANDING_PAD_FILE_WATCHER_INTERVAL_SECONDS = max(
-    5.0,
-    float(os.getenv("LANDING_PAD_FILE_WATCHER_INTERVAL_SECONDS", "15") or 15),
+    2.0,
+    float(os.getenv("LANDING_PAD_FILE_WATCHER_INTERVAL_SECONDS", "5") or 5),
 )
 LANDING_PAD_FILE_WATCHER_BATCH_SIZE = max(
     1,
@@ -212,8 +218,11 @@ def _landing_pad_file_rows(source_dir: Path, limit: int) -> list[dict[str, Any]]
 
 def _landing_pad_input_files(limit: int) -> list[Path]:
     LANDING_PAD_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    for directory in LANDING_PAD_ADDITIONAL_INPUT_DIRS:
+        directory.mkdir(parents=True, exist_ok=True)
+    candidate_dirs = [LANDING_PAD_INPUT_DIR, *LANDING_PAD_ADDITIONAL_INPUT_DIRS]
     return sorted(
-        [path for path in LANDING_PAD_INPUT_DIR.glob("*.json") if path.is_file()],
+        [path for directory in candidate_dirs for path in directory.glob("*.json") if path.is_file()],
         key=lambda path: path.stat().st_mtime,
     )[:limit]
 
@@ -288,6 +297,8 @@ def _archive_landing_pad_input_file(path: Path, target_dir: Path) -> str:
 
 def _landing_pad_input_is_stale(path: Path) -> bool:
     if LANDING_PAD_FILE_WATCHER_STALE_HOURS <= 0:
+        return False
+    if path.parent.resolve() != LANDING_PAD_INPUT_DIR.resolve():
         return False
     modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
     age_seconds = (datetime.now(timezone.utc) - modified_at).total_seconds()
@@ -3890,11 +3901,20 @@ async def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
 async def get_landing_pad_input(limit: int = 50) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 200))
     pending_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_DIR, safe_limit)
+    additional_pending: list[dict[str, Any]] = []
+    for directory in LANDING_PAD_ADDITIONAL_INPUT_DIRS:
+        additional_pending.extend(_landing_pad_file_rows(directory, safe_limit))
+    additional_pending = sorted(
+        additional_pending,
+        key=lambda row: str(row.get("modified_at") or ""),
+        reverse=True,
+    )[:safe_limit]
     replayed_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_REPLAYED_DIR, safe_limit)
     failed_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_FAILED_DIR, safe_limit)
-    pending_count = len([path for path in LANDING_PAD_INPUT_DIR.glob("*.json") if path.is_file()])
+    pending_count = len(_landing_pad_input_files(10_000))
     return {
         "input_dir": str(LANDING_PAD_INPUT_DIR),
+        "additional_input_dirs": [str(path) for path in LANDING_PAD_ADDITIONAL_INPUT_DIRS],
         "replayed_dir": str(LANDING_PAD_INPUT_REPLAYED_DIR),
         "failed_dir": str(LANDING_PAD_INPUT_FAILED_DIR),
         "watcher_enabled": LANDING_PAD_FILE_WATCHER_ENABLED,
@@ -3903,6 +3923,7 @@ async def get_landing_pad_input(limit: int = 50) -> dict[str, Any]:
         "watcher_stale_hours": LANDING_PAD_FILE_WATCHER_STALE_HOURS,
         "pending_count": pending_count,
         "pending_rows": pending_rows,
+        "additional_pending_rows": additional_pending,
         "replayed_rows": replayed_rows,
         "failed_rows": failed_rows,
     }
@@ -3919,7 +3940,7 @@ async def process_landing_pad_input(payload: dict[str, Any] = Body(default={})) 
         "requested": safe_limit,
         "processed": processed,
         "failed": failed,
-        "remaining": len([path for path in LANDING_PAD_INPUT_DIR.glob("*.json") if path.is_file()]),
+        "remaining": len(_landing_pad_input_files(10_000)),
         "rows": results,
     }
 

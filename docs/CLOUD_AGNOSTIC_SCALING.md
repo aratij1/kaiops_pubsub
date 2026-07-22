@@ -125,6 +125,67 @@ Scale out when any condition holds for 10 minutes:
 
 Scale in only after 30 minutes of stable low usage. Never scale in below 2 replicas for production control-plane services.
 
+## Capacity And VM Sizing
+
+Use this as the first sizing baseline. Final numbers should be tuned with live queue depth, p95 latency, model-provider throttling, and remediation execution duration.
+
+| Alerts/hour | Alerts/sec | Master/orchestrator setup | Worker setup | VM or node sizing | Required config |
+| --- | --- | --- | --- | --- | --- |
+| 100/hr | 0.03/sec | 1 master/orchestrator | Current local setup is fine: 1 worker per service | 1 VM, 2 vCPU, 8 GB RAM | `MESSAGE_BUS_WORKER_COUNT=1`; local Compose state is acceptable for dev/smoke |
+| 500/hr | 0.14/sec | 1 master/orchestrator | 1 alert-intelligence, 2 context, 2 resolution, 1 remediation | 1 VM, 4 vCPU, 16 GB RAM | Use `docker-compose.scale.yml`; set `CONTEXT_AGENT_WORKERS=2`, `RESOLUTION_AGENT_WORKERS=2` |
+| 1,000/hr | 0.28/sec | 2 orchestrators | 2 alert-intelligence, 3 context, 3 resolution, 2 closure, 1-2 remediation | 2 VMs with 4 vCPU and 16 GB each, or 1 VM with 8 vCPU and 32 GB | Enable RabbitMQ/Kafka durable bus; use shared DB/cache/vector store |
+| 10,000/hr | 2.78/sec | 3+ orchestrators | 4+ alert-intelligence, 6-10 context, 6-10 resolution, 3+ remediation | 3-6 VMs with 8 vCPU and 32 GB each, or AKS/VMSS node pool | Externalize MySQL/Redis/bus/vector/object storage; tune embedding batch size and provider limits |
+
+Current Compose default: 1 orchestrator/master container, 1 container for each worker-like service, and `MESSAGE_BUS_WORKER_COUNT=1` inside each service. The scale overlay changes worker counts through environment variables and Docker Compose `--scale` can add more service replicas where host ports do not collide.
+
+Recommended environment settings for a 1,000/hr VM scale-out profile:
+
+```env
+EVENT_BUS_PROVIDER=rabbitmq
+MESSAGE_BUS_DEFAULT_PROVIDER=rabbitmq
+MONITORING_ADAPTER_WORKERS=2
+ALERT_INTELLIGENCE_WORKERS=2
+ORCHESTRATOR_WORKERS=2
+CONTEXT_AGENT_WORKERS=3
+RESOLUTION_AGENT_WORKERS=3
+REMEDIATION_ENGINE_WORKERS=1
+APPROVAL_SERVICE_WORKERS=1
+CLOSURE_SERVICE_WORKERS=2
+RAG_EMBEDDING_BATCH_SIZE=32
+RAG_EMBEDDING_MAX_RETRIES=3
+```
+
+Recommended environment settings for a 10,000/hr production profile:
+
+```env
+CLOUD_PROVIDER=cloud-neutral
+DEPLOYMENT_PROFILE=production
+EVENT_BUS_PROVIDER=kafka
+MESSAGE_BUS_DEFAULT_PROVIDER=kafka
+VECTOR_STORE_PROVIDER=qdrant
+EMBEDDING_PROVIDER=azure-openai
+MONITORING_ADAPTER_WORKERS=4
+ALERT_INTELLIGENCE_WORKERS=4
+ORCHESTRATOR_WORKERS=3
+CONTEXT_AGENT_WORKERS=8
+RESOLUTION_AGENT_WORKERS=8
+REMEDIATION_ENGINE_WORKERS=3
+APPROVAL_SERVICE_WORKERS=2
+CLOSURE_SERVICE_WORKERS=4
+RAG_EMBEDDING_BATCH_SIZE=64
+RAG_EMBEDDING_MAX_RETRIES=5
+```
+
+For production, keep stateful services outside the application VMs:
+
+| State component | Small setup | Enterprise setup |
+| --- | --- | --- |
+| SQL | Dedicated MySQL VM or managed MySQL | Managed HA MySQL/PostgreSQL with backups and read replica |
+| Cache | Dedicated Redis VM | Managed Redis with persistence and zone redundancy |
+| Message bus | RabbitMQ durable queues | Kafka/Event Hubs/MSK with partitioned topics and lag monitoring |
+| Vector store | Qdrant/pgvector single node | Qdrant cluster, Azure AI Search, or managed vector index |
+| Object documents | Mounted volume | Blob/S3/GCS object storage with lifecycle and versioning |
+
 ## Cloud Migration
 
 Migration should be a configuration and data movement exercise, not a code fork.

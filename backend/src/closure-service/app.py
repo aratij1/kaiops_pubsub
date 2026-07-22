@@ -80,6 +80,40 @@ def _resolve_closure_service_name(action: RemediationAction, incident_payload: d
     return str(action.target or "unknown").strip() or "unknown"
 
 
+def _build_final_incident_payload(
+    *,
+    action: RemediationAction,
+    report: ResolutionReport,
+    incident_payload: dict[str, Any] | None,
+    recommendation: dict[str, Any] | None,
+    source_contract: dict[str, Any] | None,
+) -> dict[str, Any]:
+    incident_payload_map = incident_payload if isinstance(incident_payload, dict) else {}
+    recommendation_map = recommendation if isinstance(recommendation, dict) else {}
+    source_contract_map = source_contract if isinstance(source_contract, dict) else {}
+    service_name = _resolve_closure_service_name(action, incident_payload_map)
+    final_payload = {
+        "id": str(action.incident_id),
+        "service": service_name,
+        "environment": str(incident_payload_map.get("environment") or action.parameters.get("environment") or "prod"),
+        "severity": str(incident_payload_map.get("severity") or recommendation_map.get("severity") or "warning").lower(),
+        "status": IncidentStatus.CLOSED.value if report.health_restored else IncidentStatus.FAILED.value,
+        "title": str(incident_payload_map.get("title") or f"Incident {action.incident_id}"),
+        "summary": str(incident_payload_map.get("summary") or ""),
+        "owner_team": incident_payload_map.get("owner_team"),
+        "ticket_id": incident_payload_map.get("ticket_id"),
+        "closed_at": datetime.now(timezone.utc).isoformat() if report.health_restored else incident_payload_map.get("closed_at"),
+        "trace_id": str(
+            incident_payload_map.get("trace_id")
+            or source_contract_map.get("trace_id")
+            or recommendation_map.get("trace_id")
+            or ""
+        ) or None,
+    }
+    final_payload["alert_ids"] = incident_payload_map.get("alert_ids") if isinstance(incident_payload_map.get("alert_ids"), list) else []
+    return final_payload
+
+
 async def _persist_closure_event(
     *,
     app: FastAPI,
@@ -97,18 +131,14 @@ async def _persist_closure_event(
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
         incident_payload = await repo.get_incident(str(action.incident_id)) or {}
-        service_name = _resolve_closure_service_name(action, incident_payload)
-        final_incident_payload = {
-            **(incident_payload if isinstance(incident_payload, dict) else {}),
-            "id": str(action.incident_id),
-            "service": service_name,
-            "title": str((incident_payload or {}).get("title") or f"Incident {action.incident_id}"),
-            "environment": str((incident_payload or {}).get("environment") or "prod"),
-            "severity": str((incident_payload or {}).get("severity") or recommendation.get("severity") or "warning").lower(),
-            "status": IncidentStatus.CLOSED.value if report.health_restored else IncidentStatus.FAILED.value,
-            "closed_at": datetime.now(timezone.utc).isoformat() if report.health_restored else (incident_payload or {}).get("closed_at"),
-            "trace_id": str((incident_payload or {}).get("trace_id") or source_contract.get("trace_id") or recommendation.get("trace_id") or "") or None,
-        }
+        final_incident_payload = _build_final_incident_payload(
+            action=action,
+            report=report,
+            incident_payload=incident_payload,
+            recommendation=recommendation,
+            source_contract=source_contract,
+        )
+        service_name = str(final_incident_payload.get("service") or "unknown")
         await repo.save_incident(Incident.model_validate(final_incident_payload))
         await repo.save_incident_event(
             build_event_envelope(
@@ -175,7 +205,7 @@ async def startup(app: FastAPI) -> None:
 
     async def handle(payload: dict) -> None:
         action = RemediationAction.model_validate(_extract_remediation_action_payload(payload))
-        report = await validate(action)
+        report = await _validate_and_store(action)
         await _persist_closure_event(app=app, action=action, report=report, source_payload=payload)
         payload_out = _build_closure_event_payload(action=action, report=report, source_payload=payload)
         await app.state.producer.publish(CLOSURE_EVENTS, payload_out, key=str(action.incident_id))
@@ -194,8 +224,7 @@ async def shutdown(_: FastAPI) -> None:
 app = create_app(title="KaiMS Closure Service", settings=settings, startup=startup, shutdown=shutdown)
 
 
-@app.post("/validate", response_model=ResolutionReport)
-async def validate(action: RemediationAction) -> ResolutionReport:
+async def _validate_and_store(action: RemediationAction) -> ResolutionReport:
     report = await agent.validate(action)
     if settings.database_enabled:
         async with app.state.session_factory() as session:
@@ -203,4 +232,11 @@ async def validate(action: RemediationAction) -> ResolutionReport:
             await repo.save_report(report)
             await repo.save_knowledge_base(report)
             await session.commit()
+    return report
+
+
+@app.post("/validate", response_model=ResolutionReport)
+async def validate(action: RemediationAction) -> ResolutionReport:
+    report = await _validate_and_store(action)
+    await _persist_closure_event(app=app, action=action, report=report, source_payload={})
     return report

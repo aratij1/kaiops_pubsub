@@ -92,6 +92,22 @@ class ResolutionIntelligenceAgent(BaseAgent):
         if not str(runbook or "").strip():
             return []
         commands: list[str] = []
+        seen: set[str] = set()
+        preferred_section = re.search(
+            r"##\s*Remediation Script\s*```(?:bash|sh|shell)?\s*([\s\S]*?)```",
+            str(runbook),
+            flags=re.IGNORECASE,
+        )
+        if preferred_section:
+            script = " ".join(
+                line.strip()
+                for line in preferred_section.group(1).splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ).strip()
+            if script:
+                commands.append(script)
+                seen.add(script.lower())
+                return commands[:max_items]
         for line in str(runbook).splitlines():
             token = line.strip().lstrip("- ").strip().strip("`")
             if not token:
@@ -101,13 +117,17 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 continue
             # Capture command-like steps while avoiding prose-heavy runbook lines.
             if (
-                token.startswith(("kubectl ", "helm ", "terraform ", "ansible-playbook ", "redis-cli ", "mysql "))
+                token.startswith(("bash ", "sh ", "pwsh ", "powershell ", "python ", "curl "))
+                or token.startswith(("kubectl ", "helm ", "terraform ", "ansible-playbook ", "redis-cli ", "mysql "))
                 or token.startswith("scripts/")
                 or token.startswith("./")
                 or token.startswith("Invoke-")
                 or token.startswith("Get-")
             ):
+                if token.lower() in seen:
+                    continue
                 commands.append(token)
+                seen.add(token.lower())
             if len(commands) >= max_items:
                 break
         return commands
@@ -154,6 +174,13 @@ class ResolutionIntelligenceAgent(BaseAgent):
         root = self._norm(root_cause)
         runbook = str(context.runbook or "")
         runbook_commands = self._sanitize_commands(self._extract_runbook_commands(runbook), max_items=4)
+        if runbook_commands:
+            target = str(context.alert.service or "service").strip()
+            return (
+                "Execute approved runbook remediation script and validation checks",
+                runbook_commands,
+                target,
+            )
 
         if any(keyword in root for keyword in ["deploy", "release", "rollout", "version"]):
             target = str(context.kubernetes.get("deployment") or context.alert.service or "service").strip()
