@@ -219,13 +219,15 @@ async def consume_forever(
                     success = False
                     dlq_published = False
 
+                    last_error = ""
                     while attempts <= max_retries:
                         try:
                             await handler(payload)
                             success = True
                             processed_cache.mark(identity)
                             break
-                        except Exception:
+                        except Exception as exc:
+                            last_error = str(exc) or exc.__class__.__name__
                             attempts += 1
                             if attempts > max_retries:
                                 break
@@ -237,14 +239,20 @@ async def consume_forever(
 
                     logger.error(
                         "failed to process rabbitmq message",
-                        extra={"topic": consumer._topic, "attempts": attempts, "max_retries": max_retries},
+                        extra={
+                            "topic": consumer._topic,
+                            "attempts": attempts,
+                            "max_retries": max_retries,
+                            "error": last_error,
+                            "message_identity": identity,
+                        },
                     )
                     if consumer._exchange is not None and consumer._dlq_routing_key:
                         try:
                             envelope = {
                                 "failed_topic": consumer._topic,
                                 "payload": payload,
-                                "error": "handler_failed",
+                                "error": last_error or "handler_failed",
                                 "attempts": attempts,
                                 "failed_at": datetime.now(timezone.utc).isoformat(),
                             }

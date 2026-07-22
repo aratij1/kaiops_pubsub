@@ -294,6 +294,50 @@ def test_closure_service_name_prefers_incident_service_over_action_target() -> N
     assert closure_service_app._resolve_closure_service_name(action, {}) == str(action.target)
 
 
+def test_closure_final_incident_payload_ignores_ui_approval_fields() -> None:
+    action = RemediationAction(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        action_type="script_execution",
+        target="mysql",
+        status="succeeded",
+        output="health restored",
+        parameters={"environment": "prod"},
+    )
+    report = ResolutionReport(
+        incident_id=action.incident_id,
+        remediation_action_id=action.id,
+        root_cause="Alert table growth",
+        impact="DB pressure",
+        action_taken="script_execution",
+        health_restored=True,
+        alerts_cleared=True,
+        knowledge_base_entry="resolved",
+    )
+    payload = closure_service_app._build_final_incident_payload(
+        action=action,
+        report=report,
+        incident_payload={
+            "service": "mysql",
+            "environment": "prod",
+            "severity": "high",
+            "title": "mysql: row count high",
+            "state": "remediating",
+            "approval_status": "remediating",
+            "approval": {"decision": "approved"},
+        },
+        recommendation={"trace_id": "trace-closure"},
+        source_contract={},
+    )
+
+    assert payload["status"] == "closed"
+    assert payload["service"] == "mysql"
+    assert payload["trace_id"] == "trace-closure"
+    assert "state" not in payload
+    assert "approval" not in payload
+    assert "approval_status" not in payload
+    Incident.model_validate(payload)
+
+
 def test_monitoring_raw_alert_payload_includes_event_contract() -> None:
     alert = Alert(
         source="prometheus",

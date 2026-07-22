@@ -198,7 +198,11 @@ class AzureAISearchVectorStore:
             if not isinstance(row, dict):
                 continue
             doc = dict(row)
-            doc["_similarity"] = float(doc.pop("@search.score", 0.0) or 0.0)
+            score = float(doc.pop("@search.score", 0.0) or 0.0)
+            doc["_similarity"] = score
+            doc["_semantic_score"] = score
+            doc["_metadata_match_score"] = 0.0
+            doc["match_confidence"] = score
             doc["_vector_store"] = "azure-ai-search"
             services = doc.get("services", [])
             if isinstance(services, str):
@@ -276,7 +280,15 @@ class VectorDBConnector(BaseConnector):
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
-        query = f"{alert.service} {alert.name} {alert.description}"
+        query = " ".join(
+            [
+                str(alert.service or ""),
+                str(alert.name or ""),
+                str(alert.description or ""),
+                " ".join(f"{key}={value}" for key, value in alert.labels.items()),
+                " ".join(f"{key}={value}" for key, value in alert.annotations.items()),
+            ]
+        )
         ranked = self.search(
             query,
             limit=8,
@@ -415,12 +427,14 @@ class VectorDBConnector(BaseConnector):
                 "service_scoped_retrieval": True,
                 "metadata_prefilter": True,
                 "full_document_rerank": True,
+                "metadata_confidence_scoring": True,
             },
             "index_strategy": {
                 "chunking": "chunk-level-for-remote-document-level-for-local",
                 "metadata_shortlist": True,
                 "full_document_rerank": True,
                 "service_filter": True,
+                "score_components": ["semantic_score", "metadata_match_score", "match_confidence"],
                 "preferred_kinds": ["runbook", "incident", "deployment", "dependency", "change"],
             },
         }
@@ -450,6 +464,7 @@ class VectorDBConnector(BaseConnector):
         if remote_matches:
             return remote_matches
         return self._rank_documents(
+            query=query,
             query_vector=query_vector,
             limit=limit,
             preferred_kinds=kind_filter,
@@ -667,16 +682,103 @@ class VectorDBConnector(BaseConnector):
         )
         return best_score >= min_similarity
 
-    def _metadata_rank_score(self, query_vector: list[float], doc: dict[str, Any]) -> float:
+    @staticmethod
+    def _tokenize(text: Any) -> set[str]:
+        return {
+            token
+            for token in re.findall(r"[a-z0-9][a-z0-9_.:-]{2,}", str(text or "").lower())
+            if token not in {"the", "and", "for", "with", "from", "this", "that", "alert", "service"}
+        }
+
+    def _doc_match_text(self, doc: dict[str, Any]) -> str:
+        services = doc.get("services", [])
+        dependencies = doc.get("dependencies", [])
+        if isinstance(services, list):
+            services = " ".join(str(item) for item in services)
+        if isinstance(dependencies, list):
+            dependencies = " ".join(str(item) for item in dependencies)
+        return " ".join(
+            [
+                str(doc.get("kind", "")),
+                str(doc.get("title", "")),
+                str(doc.get("alert_type", "")),
+                str(doc.get("alert_id", "")),
+                str(doc.get("incident_id", "")),
+                str(doc.get("source_ref", "")),
+                str(doc.get("source_system", "")),
+                str(services),
+                str(dependencies),
+                str(doc.get("deployment", "")),
+                str(doc.get("content", "")),
+            ]
+        ).lower()
+
+    def _metadata_exact_score(
+        self,
+        *,
+        query: str,
+        doc: dict[str, Any],
+        service: str | None,
+        preferred_kinds: set[str] | None,
+    ) -> float:
+        query_text = str(query or "").lower()
+        doc_text = self._doc_match_text(doc)
+        query_tokens = self._tokenize(query_text)
+        doc_tokens = self._tokenize(doc_text)
+
+        score = 0.0
+        service_token = str(service or "").strip().lower()
+        if service_token and service_token in doc_tokens:
+            score += 0.22
+
+        doc_kind = str(doc.get("kind") or "").strip().lower()
+        if preferred_kinds and doc_kind in preferred_kinds:
+            score += 0.08
+
+        alert_tokens = {token for token in query_tokens if "alert" in token or token.endswith("high") or token.endswith("down")}
+        if alert_tokens and any(token in doc_text for token in alert_tokens):
+            score += 0.18
+
+        metric_tokens = {token for token in query_tokens if "_" in token or token.startswith(("mysql", "kaiops", "http", "queue"))}
+        if metric_tokens:
+            matched = len([token for token in metric_tokens if token in doc_text])
+            score += min(0.18, 0.06 * matched)
+
+        connector_tokens = {"database", "table", "environment", "project", "fingerprint", "source_ref"}
+        keyed_tokens = {
+            piece.split("=", 1)[1].strip().lower()
+            for piece in query_text.split()
+            if "=" in piece and piece.split("=", 1)[0].strip().lower() in connector_tokens
+        }
+        if keyed_tokens:
+            matched = len([token for token in keyed_tokens if token and token in doc_text])
+            score += min(0.16, 0.05 * matched)
+
+        if "kaiops_alert_health_triage.sh" in query_text and "kaiops_alert_health_triage.sh" in doc_text:
+            score += 0.08
+
+        overlap = len(query_tokens & doc_tokens) / max(1, len(query_tokens))
+        score += min(0.10, overlap)
+        return min(score, 1.0)
+
+    def _metadata_rank_score(self, *, query: str, query_vector: list[float], doc: dict[str, Any], service: str | None, preferred_kinds: set[str] | None) -> float:
         embedding = doc.get("_metadata_embedding")
         if not isinstance(embedding, list):
             embedding = self.embedding_model.embed(self._metadata_text(doc))
             doc["_metadata_embedding"] = embedding
-        return cosine_similarity(query_vector, embedding)
+        semantic_score = cosine_similarity(query_vector, embedding)
+        exact_score = self._metadata_exact_score(
+            query=query,
+            doc=doc,
+            service=service,
+            preferred_kinds=preferred_kinds,
+        )
+        return (0.55 * semantic_score) + (0.45 * exact_score)
 
     def _rank_documents(
         self,
         *,
+        query: str,
         query_vector: list[float],
         limit: int,
         preferred_kinds: set[str] | None = None,
@@ -697,18 +799,37 @@ class VectorDBConnector(BaseConnector):
         shortlisted = heapq.nlargest(
             shortlist_size,
             candidates,
-            key=lambda doc: self._metadata_rank_score(query_vector, doc),
+            key=lambda doc: self._metadata_rank_score(
+                query=query,
+                query_vector=query_vector,
+                doc=doc,
+                service=service,
+                preferred_kinds=preferred_kinds,
+            ),
         )
         hydrated = [dict(doc) if doc.get("_synthetic") else self._load_full_document(str(doc.get("path", ""))) for doc in shortlisted]
-        scored = [
-            (cosine_similarity(query_vector, doc.get("_embedding") or self.embedding_model.embed(self._document_text(doc))), doc)
-            for doc in hydrated
-        ]
+        scored = []
+        for doc in hydrated:
+            semantic_score = cosine_similarity(
+                query_vector,
+                doc.get("_embedding") or self.embedding_model.embed(self._document_text(doc)),
+            )
+            metadata_score = self._metadata_exact_score(
+                query=query,
+                doc=doc,
+                service=service,
+                preferred_kinds=preferred_kinds,
+            )
+            match_confidence = max(semantic_score, (0.65 * metadata_score) + (0.35 * max(semantic_score, 0.0)))
+            scored.append((match_confidence, semantic_score, metadata_score, doc))
         top = heapq.nlargest(limit, scored, key=lambda item: item[0])
         results = []
-        for score, doc in top:
+        for score, semantic_score, metadata_score, doc in top:
             doc = dict(doc)
             doc["_similarity"] = score
+            doc["_semantic_score"] = semantic_score
+            doc["_metadata_match_score"] = metadata_score
+            doc["match_confidence"] = score
             results.append(doc)
         return results
 
@@ -862,10 +983,16 @@ class ContextIntelligenceAgent(BaseAgent):
                         "title": doc.get("title"),
                         "path": doc.get("path"),
                         "similarity": float(doc.get("_similarity", 0.0) or 0.0),
+                        "semantic_score": float(doc.get("_semantic_score", doc.get("_similarity", 0.0)) or 0.0),
+                        "metadata_match_score": float(doc.get("_metadata_match_score", 0.0) or 0.0),
+                        "match_confidence": float(doc.get("match_confidence", doc.get("_similarity", 0.0)) or 0.0),
                     }
                     for doc in vector_matches
                 ],
                 "rag_top_similarity": max((doc.get("_similarity", 0.0) for doc in vector_matches), default=0.0),
+                "rag_top_semantic_score": max((doc.get("_semantic_score", 0.0) for doc in vector_matches), default=0.0),
+                "rag_top_metadata_match_score": max((doc.get("_metadata_match_score", 0.0) for doc in vector_matches), default=0.0),
+                "rag_top_match_confidence": max((doc.get("match_confidence", doc.get("_similarity", 0.0)) for doc in vector_matches), default=0.0),
                 "rag_service_tagged_match": service_tagged_match,
                 "rag_index": vector_connector.index_info() if vector_connector else {},
                 "context_graph": {

@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1540" height="860" viewBox="0 0 1540 860">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#334155"/>
+    </marker>
+    <style>
+      .bg{fill:#fff}
+      .lane{fill:#f8fafc;stroke:#64748b;stroke-width:1.4;rx:18}
+      .app{fill:#f5faff;stroke:#2563eb;stroke-width:1.4;rx:18}
+      .ai{fill:#fbf7ff;stroke:#7c3aed;stroke-width:1.4;rx:18}
+      .data{fill:#f0fdf4;stroke:#059669;stroke-width:1.4;rx:18}
+      .ops{fill:#fff7ed;stroke:#ea580c;stroke-width:1.4;rx:18}
+      .box{fill:#fff;stroke:#475569;stroke-width:1.15;rx:8}
+      .blue{fill:#eff6ff;stroke:#2563eb}
+      .purple{fill:#f5f3ff;stroke:#7c3aed}
+      .green{fill:#ecfdf5;stroke:#059669}
+      .orange{fill:#fff7ed;stroke:#ea580c}
+      .red{fill:#fff1f2;stroke:#e11d48}
+      .bus{fill:#eef2ff;stroke:#4338ca;stroke-width:1.5;rx:12}
+      .title{font:700 24px Arial;fill:#111827}
+      .subtitle{font:12px Arial;fill:#475569}
+      .h{font:700 15px Arial;fill:#111827}
+      .t{font:13px Arial;fill:#111827}
+      .s{font:11px Arial;fill:#475569}
+      .tiny{font:10px Arial;fill:#64748b}
+      .a{stroke:#334155;stroke-width:1.7;fill:none;marker-end:url(#arrow)}
+      .soft{stroke:#64748b;stroke-width:1.25;stroke-dasharray:5 4;fill:none;marker-end:url(#arrow)}
+    </style>
+  </defs>
+
+  <rect class="bg" width="1540" height="860"/>
+  <text class="title" x="34" y="42">KaiOps Proposed Scalable Enterprise Architecture</text>
+  <text class="subtitle" x="34" y="64">Cloud-agnostic, horizontally scalable, governed AIOps platform with separated application and AI layers</text>
+
+  <!-- Edge and sources -->
+  <rect class="lane" x="30" y="105" width="185" height="580"/>
+  <text class="h" x="58" y="135">Enterprise Sources</text>
+  <rect class="box" x="55" y="165" width="135" height="38"/><text class="t" x="82" y="189">Prometheus</text>
+  <rect class="box" x="55" y="218" width="135" height="38"/><text class="t" x="80" y="242">Cloud Monitor</text>
+  <rect class="box" x="55" y="271" width="135" height="38"/><text class="t" x="82" y="295">Log Systems</text>
+  <rect class="box" x="55" y="324" width="135" height="38"/><text class="t" x="84" y="348">ETL / Batch</text>
+  <rect class="box" x="55" y="377" width="135" height="38"/><text class="t" x="89" y="401">APM Tools</text>
+  <rect class="box" x="55" y="430" width="135" height="38"/><text class="t" x="84" y="454">ITSM Events</text>
+  <rect class="box" x="55" y="483" width="135" height="38"/><text class="t" x="84" y="507">File Watcher</text>
+  <rect class="box" x="55" y="536" width="135" height="38"/><text class="t" x="85" y="560">Webhooks</text>
+  <rect class="box" x="55" y="589" width="135" height="38"/><text class="t" x="87" y="613">Manual Test</text>
+
+  <rect class="ops" x="255" y="105" width="205" height="580"/>
+  <text class="h" x="292" y="135">Edge / Ingress</text>
+  <rect class="blue box" x="285" y="170" width="145" height="62"/><text class="t" x="314" y="197">WAF / TLS</text><text class="s" x="307" y="217">zero trust edge</text>
+  <rect class="blue box" x="285" y="260" width="145" height="62"/><text class="t" x="306" y="287">Load Balancer</text><text class="s" x="307" y="307">active-active</text>
+  <rect class="green box" x="285" y="350" width="145" height="62"/><text class="t" x="314" y="377">Landing Pad</text><text class="s" x="307" y="397">validate/dedupe</text>
+  <rect class="orange box" x="285" y="440" width="145" height="62"/><text class="t" x="310" y="467">Rate Limiter</text><text class="s" x="307" y="487">backpressure</text>
+  <rect class="red box" x="285" y="530" width="145" height="62"/><text class="t" x="312" y="557">Dead Letter</text><text class="s" x="307" y="577">replay queue</text>
+
+  <!-- App layer -->
+  <rect class="app" x="505" y="105" width="390" height="580"/>
+  <text class="h" x="535" y="135">Application Layer - Stateless Services</text>
+  <rect class="blue box" x="535" y="165" width="145" height="58"/><text class="t" x="572" y="190">API Gateway</text><text class="tiny" x="562" y="208">N replicas</text>
+  <rect class="blue box" x="720" y="165" width="145" height="58"/><text class="t" x="746" y="190">Cockpit UI</text><text class="tiny" x="754" y="208">CDN/cache</text>
+  <rect class="green box" x="535" y="255" width="145" height="58"/><text class="t" x="552" y="280">Monitoring Adapter</text><text class="tiny" x="560" y="298">N workers</text>
+  <rect class="orange box" x="720" y="255" width="145" height="58"/><text class="t" x="735" y="280">Orchestrator</text><text class="tiny" x="746" y="298">state machine</text>
+  <rect class="red box" x="535" y="345" width="145" height="58"/><text class="t" x="559" y="370">Approval Service</text><text class="tiny" x="562" y="388">policy gate</text>
+  <rect class="red box" x="720" y="345" width="145" height="58"/><text class="t" x="738" y="370">Remediation</text><text class="tiny" x="746" y="388">connector-gated</text>
+  <rect class="box" x="535" y="435" width="145" height="58"/><text class="t" x="563" y="460">Onboarding</text><text class="tiny" x="554" y="478">docs/rules/apps</text>
+  <rect class="box" x="720" y="435" width="145" height="58"/><text class="t" x="754" y="460">Reports</text><text class="tiny" x="746" y="478">SLA/MTTR</text>
+  <rect class="orange box" x="535" y="525" width="330" height="72"/><text class="t" x="594" y="552">Worker Pool / Autoscaling</text><text class="s" x="584" y="574">scale by queue depth, CPU, latency, active incidents, LLM backlog</text>
+
+  <!-- Event backbone -->
+  <rect class="bus" x="505" y="720" width="760" height="85"/>
+  <text class="h" x="535" y="750">Event Backbone - Managed Kafka / RabbitMQ / Service Bus / Pub/Sub</text>
+  <text class="s" x="535" y="775">raw-alerts | enriched-alerts | orchestration-events | context-events | resolution-events | approval-events | remediation-events | notifications | dead-letter</text>
+
+  <!-- AI layer -->
+  <rect class="ai" x="940" y="105" width="325" height="580"/>
+  <text class="h" x="970" y="135">AI Intelligence Layer</text>
+  <rect class="purple box" x="970" y="165" width="120" height="58"/><text class="t" x="989" y="190">AI Gateway</text><text class="tiny" x="993" y="208">endpoint only</text>
+  <rect class="purple box" x="1115" y="165" width="120" height="58"/><text class="t" x="1134" y="190">Model Router</text><text class="tiny" x="1138" y="208">fallbacks</text>
+  <rect class="purple box" x="970" y="255" width="120" height="58"/><text class="t" x="987" y="280">Context Agent</text><text class="tiny" x="993" y="298">N workers</text>
+  <rect class="purple box" x="1115" y="255" width="120" height="58"/><text class="t" x="1128" y="280">Resolution</text><text class="tiny" x="1138" y="298">RCA/fix</text>
+  <rect class="green box" x="970" y="345" width="120" height="58"/><text class="t" x="991" y="370">Knowledge</text><text class="tiny" x="994" y="388">router</text>
+  <rect class="green box" x="1115" y="345" width="120" height="58"/><text class="t" x="1136" y="370">Embeddings</text><text class="tiny" x="1134" y="388">batch/cache</text>
+  <rect class="orange box" x="970" y="435" width="265" height="58"/><text class="t" x="1015" y="460">Evaluation / Guardrails</text><text class="tiny" x="1012" y="478">confidence, grounding, hallucination, cost</text>
+  <rect class="red box" x="970" y="525" width="265" height="72"/><text class="t" x="1020" y="552">AI Runtime Controls</text><text class="s" x="1012" y="574">rate limits, model fallback, prompt versions, response validation</text>
+
+  <!-- Data layer -->
+  <rect class="data" x="1310" y="105" width="200" height="580"/>
+  <text class="h" x="1342" y="135">Data Platform</text>
+  <rect class="green box" x="1335" y="165" width="150" height="58"/><text class="t" x="1362" y="190">Managed SQL</text><text class="tiny" x="1358" y="208">HA + replicas</text>
+  <rect class="green box" x="1335" y="255" width="150" height="58"/><text class="t" x="1360" y="280">Object Store</text><text class="tiny" x="1358" y="298">docs/files</text>
+  <rect class="purple box" x="1335" y="345" width="150" height="58"/><text class="t" x="1360" y="370">Vector Search</text><text class="tiny" x="1350" y="388">Azure AI Search</text>
+  <rect class="blue box" x="1335" y="435" width="150" height="58"/><text class="t" x="1368" y="460">Cache</text><text class="tiny" x="1358" y="478">Redis cluster</text>
+  <rect class="orange box" x="1335" y="525" width="150" height="58"/><text class="t" x="1368" y="550">Archive</text><text class="tiny" x="1354" y="568">cold history</text>
+  <rect class="red box" x="1335" y="615" width="150" height="44"/><text class="t" x="1364" y="642">Backups</text>
+
+  <!-- Governance / Ops bottom -->
+  <rect class="ops" x="30" y="720" width="430" height="85"/>
+  <text class="h" x="60" y="750">Enterprise Governance</text>
+  <text class="s" x="60" y="775">Auth/RBAC | tenant/environment policy | secrets manager | audit | trace IDs | private networking | IaC | CI/CD gates</text>
+
+  <!-- Arrows -->
+  <path class="a" d="M215 390L285 381"/>
+  <path class="a" d="M430 291L535 194"/>
+  <path class="a" d="M430 381L535 284"/>
+  <path class="a" d="M680 284L720 284"/>
+  <path class="a" d="M865 284L970 284"/>
+  <path class="a" d="M1090 284L1115 284"/>
+  <path class="a" d="M1235 284L1335 374"/>
+  <path class="a" d="M1235 374L1335 374"/>
+  <path class="a" d="M865 374L970 464"/>
+  <path class="a" d="M865 374L535 374"/>
+  <path class="a" d="M680 374L720 374"/>
+  <path class="a" d="M865 464L1335 194"/>
+  <path class="soft" d="M700 597C720 660 770 720 820 720"/>
+  <path class="soft" d="M1102 597C1105 660 1060 720 1015 720"/>
+  <path class="soft" d="M1410 583C1390 705 1270 760 1265 760"/>
+  <path class="soft" d="M255 720C310 660 330 610 358 592"/>
+
+  <!-- Outputs -->
+  <rect class="lane" x="1310" y="720" width="200" height="85"/>
+  <text class="h" x="1340" y="750">Enterprise Outputs</text>
+  <text class="s" x="1340" y="775">Teams | Email | Slack | ITSM | Webhooks | Runbook docs | Remediation connectors</text>
+</svg>

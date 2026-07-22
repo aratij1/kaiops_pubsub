@@ -1,34 +1,267 @@
 {
-  "version": "connectors-v1",
-  "default_connector": "generic-api",
+  "version": "connectors-v2",
+  "last_reviewed": "2026-07-22",
+  "default_connector": "kaiops-api",
+  "connection_policy": {
+    "live_execution_requires_secret_ref": true,
+    "dry_run_default": true,
+    "timeout_seconds_default": 15,
+    "retry": {
+      "max_attempts": 2,
+      "backoff_seconds": 3
+    }
+  },
   "connectors": {
-    "orders-db": {
-      "connector_id": "orders-db-api",
-      "system": "orders-db",
+    "kaiops-api": {
+      "connector_id": "kaiops-api",
+      "system": "kaiops-platform",
       "type": "api",
-      "endpoint": "https://orders-db.internal/api",
+      "endpoint": "http://api-gateway:8000",
       "auth_method": "service-account-token",
-      "secret_ref": "vault://kaiops/prod/orders-db-token",
-      "allowed_operations": ["read_status", "failover_database", "verify_replication_health"]
+      "secret_ref": "vault://kaiops/prod/api-gateway-token",
+      "timeout_seconds": 15,
+      "allowed_operations": [
+        "read_status",
+        "read_metrics",
+        "api_execution",
+        "script_execution",
+        "verify_slo",
+        "verify_service_health",
+        "verify_onboarding_flow",
+        "verify_workflow_health",
+        "retry_workflow"
+      ],
+      "health_check": {
+        "method": "GET",
+        "path": "/healthz"
+      }
     },
-    "payments": {
-      "connector_id": "payments-k8s",
-      "system": "payments-api",
-      "type": "kubernetes",
-      "cluster": "prod-us-east-1",
-      "namespace": "payments",
-      "auth_method": "kubeconfig-service-account",
-      "secret_ref": "vault://kaiops/prod/payments-kubeconfig",
-      "allowed_operations": ["read_status", "rollback_deployment", "restart_pod", "verify_slo"]
+    "api-gateway": {
+      "connector_id": "api-gateway-runtime",
+      "system": "api-gateway",
+      "type": "api",
+      "endpoint": "http://api-gateway:8000",
+      "auth_method": "service-account-token",
+      "secret_ref": "vault://kaiops/prod/api-gateway-token",
+      "timeout_seconds": 15,
+      "allowed_operations": [
+        "read_status",
+        "read_metrics",
+        "api_execution",
+        "script_execution",
+        "restart_service",
+        "scale_service",
+        "rollback_deployment",
+        "verify_slo",
+        "verify_service_health",
+        "verify_onboarding_flow"
+      ],
+      "health_check": {
+        "method": "GET",
+        "path": "/healthz"
+      }
+    },
+    "kaiops-core": {
+      "connector_id": "kaiops-core-runtime",
+      "system": "kaiops-core",
+      "type": "api",
+      "endpoint": "http://kaiops-core:8000",
+      "auth_method": "service-account-token",
+      "secret_ref": "vault://kaiops/prod/kaiops-core-token",
+      "timeout_seconds": 15,
+      "allowed_operations": [
+        "read_status",
+        "read_metrics",
+        "api_execution",
+        "script_execution",
+        "restart_service",
+        "scale_service",
+        "rollback_deployment",
+        "verify_slo",
+        "verify_service_health",
+        "verify_onboarding_flow"
+      ],
+      "health_check": {
+        "method": "GET",
+        "path": "/healthz"
+      }
+    },
+    "kaiops-core1": {
+      "connector_id": "kaiops-core1-runtime",
+      "system": "kaiops-core1",
+      "type": "api",
+      "endpoint": "http://kaiops-core1:8000",
+      "auth_method": "service-account-token",
+      "secret_ref": "vault://kaiops/prod/kaiops-core1-token",
+      "timeout_seconds": 15,
+      "allowed_operations": [
+        "read_status",
+        "read_metrics",
+        "api_execution",
+        "script_execution",
+        "restart_service",
+        "scale_service",
+        "rollback_deployment",
+        "verify_slo",
+        "verify_service_health",
+        "verify_onboarding_flow"
+      ],
+      "health_check": {
+        "method": "GET",
+        "path": "/healthz"
+      }
+    },
+    "kaiops-platform": {
+      "connector_id": "kaiops-platform-runtime",
+      "system": "kaiops-platform",
+      "type": "api",
+      "endpoint": "http://api-gateway:8000",
+      "auth_method": "service-account-token",
+      "secret_ref": "vault://kaiops/prod/platform-token",
+      "timeout_seconds": 15,
+      "allowed_operations": [
+        "read_status",
+        "read_metrics",
+        "api_execution",
+        "script_execution",
+        "read_database",
+        "replay_etl_batch",
+        "verify_data_quality",
+        "restart_service",
+        "scale_service",
+        "rollback_deployment",
+        "verify_service_health",
+        "verify_onboarding_flow",
+        "verify_workflow_health",
+        "retry_workflow",
+        "verify_slo"
+      ],
+      "health_check": {
+        "method": "GET",
+        "path": "/healthz"
+      }
+    },
+    "mysql": {
+      "connector_id": "kaiops-mysql",
+      "system": "mysql",
+      "type": "mysql",
+      "host": "mysql",
+      "port": 3306,
+      "database": "kaiops",
+      "auth_method": "database-user",
+      "secret_ref": "vault://kaiops/prod/mysql-password",
+      "timeout_seconds": 15,
+      "allowed_operations": [
+        "read_status",
+        "read_metrics",
+        "read_database",
+        "archive_database_rows",
+        "verify_database_health",
+        "api_execution",
+        "script_execution",
+        "verify_onboarding_flow"
+      ],
+      "health_check": {
+        "command": "SELECT 1"
+      }
+    },
+    "etl-orders": {
+      "connector_id": "etl-orders-runtime",
+      "system": "etl-orders",
+      "type": "api",
+      "endpoint": "http://api-gateway:8000",
+      "auth_method": "service-account-token",
+      "secret_ref": "vault://kaiops/prod/etl-orders-token",
+      "timeout_seconds": 20,
+      "allowed_operations": [
+        "read_status",
+        "read_database",
+        "replay_etl_batch",
+        "verify_data_quality",
+        "api_execution",
+        "script_execution"
+      ],
+      "health_check": {
+        "method": "GET",
+        "path": "/healthz"
+      }
+    },
+    "policy-engine": {
+      "connector_id": "policy-engine-runtime",
+      "system": "policy-engine",
+      "type": "api",
+      "endpoint": "http://policy-engine:8000",
+      "auth_method": "service-account-token",
+      "secret_ref": "vault://kaiops/prod/policy-engine-token",
+      "timeout_seconds": 15,
+      "allowed_operations": [
+        "read_status",
+        "restart_service",
+        "verify_service_health",
+        "api_execution",
+        "script_execution"
+      ],
+      "health_check": {
+        "method": "GET",
+        "path": "/healthz"
+      }
+    },
+    "prometheus": {
+      "connector_id": "prometheus-http",
+      "system": "prometheus",
+      "type": "http",
+      "endpoint": "http://prometheus:9090",
+      "auth_method": "none",
+      "secret_ref": "",
+      "timeout_seconds": 10,
+      "allowed_operations": [
+        "read_status",
+        "read_metrics",
+        "verify_slo",
+        "verify_onboarding_flow"
+      ],
+      "health_check": {
+        "method": "GET",
+        "path": "/-/healthy"
+      }
+    },
+    "rabbitmq": {
+      "connector_id": "rabbitmq-management",
+      "system": "rabbitmq",
+      "type": "api",
+      "endpoint": "http://rabbitmq:15672",
+      "auth_method": "basic",
+      "secret_ref": "vault://kaiops/prod/rabbitmq-management",
+      "timeout_seconds": 10,
+      "allowed_operations": [
+        "read_status",
+        "read_metrics",
+        "verify_service_health"
+      ],
+      "health_check": {
+        "method": "GET",
+        "path": "/api/health/checks/alarms"
+      }
     },
     "generic-api": {
       "connector_id": "generic-api",
       "system": "generic",
       "type": "api",
-      "endpoint": "https://api.internal",
+      "endpoint": "http://api-gateway:8000",
       "auth_method": "service-account-token",
       "secret_ref": "vault://kaiops/prod/default-token",
-      "allowed_operations": ["read_status"]
+      "timeout_seconds": 10,
+      "allowed_operations": [
+        "read_status",
+        "read_metrics",
+        "api_execution",
+        "script_execution",
+        "verify_service_health"
+      ],
+      "health_check": {
+        "method": "GET",
+        "path": "/healthz"
+      }
     }
   }
 }
