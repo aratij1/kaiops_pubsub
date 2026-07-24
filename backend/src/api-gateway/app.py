@@ -217,6 +217,10 @@ def _query_alerts_table_row_count() -> float:
 
 
 async def startup(app: FastAPI) -> None:
+    app.state.proxy_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(settings.gateway_request_timeout_seconds, connect=5.0, pool=5.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=30.0),
+    )
     if settings.database_enabled:
         app.state.user_service = UserService(settings=settings, session_factory=app.state.session_factory)
         await app.state.user_service.bootstrap_defaults()
@@ -226,7 +230,13 @@ async def startup(app: FastAPI) -> None:
     ALERTS_TABLE_ROWS.labels(settings.db_database, "alerts").set_function(_query_alerts_table_row_count)
 
 
-app = create_app(title="KaiMS API Gateway", settings=settings, startup=startup)
+async def shutdown(app: FastAPI) -> None:
+    client = getattr(app.state, "proxy_client", None)
+    if client is not None:
+        await client.aclose()
+
+
+app = create_app(title="KaiMS API Gateway", settings=settings, startup=startup, shutdown=shutdown)
 app.include_router(user_management_router)
 
 
@@ -524,23 +534,47 @@ async def proxy(
 ) -> tuple[int, dict[str, Any]]:
     target_url = f"{target_base.rstrip('/')}/{path.lstrip('/')}"
     headers = {"x-trace-id": trace_id}
-    last_error: Exception | None = None
-    timeout = httpx.Timeout(settings.gateway_request_timeout_seconds, connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        for attempt in range(1, 6):
-            try:
-                response = await client.request(method, target_url, json=payload or None, headers=headers, params=params)
-                response.raise_for_status()
-                return response.status_code, response.json()
-            except httpx.HTTPStatusError:
+    client = getattr(app.state, "proxy_client", None)
+    if client is None:
+        raise httpx.ConnectError("API gateway proxy client is not initialized")
+
+    normalized_method = method.upper()
+    is_fast_read = normalized_method == "GET" and path.split("?", 1)[0] in {
+        "/alerts/all",
+        "/alerts/applications",
+        "/alerts/severity-overrides",
+        "/incidents/closed",
+        "/landing-pad/recent",
+        "/onboarding/state",
+    }
+    request_timeout = 12.0 if is_fast_read else settings.gateway_request_timeout_seconds
+    timeout = httpx.Timeout(request_timeout, connect=5.0, pool=5.0)
+    max_attempts = 2 if normalized_method in {"GET", "HEAD", "OPTIONS"} else 1
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = await client.request(
+                method,
+                target_url,
+                json=payload or None,
+                headers=headers,
+                params=params,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            return response.status_code, response.json()
+        except httpx.HTTPStatusError:
+            raise
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            if attempt >= max_attempts:
                 raise
-            except httpx.HTTPError as exc:
-                last_error = exc
-                if attempt == 5:
-                    break
-                await asyncio.sleep(0.5 * attempt)
-    assert last_error is not None
-    raise last_error
+            await asyncio.sleep(0.2 * attempt)
+        except httpx.HTTPError:
+            # A read/pool timeout means the downstream is saturated. Retrying
+            # immediately multiplies that load and prolongs the outage.
+            raise
+
+    raise httpx.ConnectError(f"Unable to connect to downstream service: {target_url}")
 
 
 async def guarded_proxy(
@@ -846,6 +880,23 @@ async def get_all_alerts(
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
     path = f"/alerts/all?{urlencode({'limit': str(limit)})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/alerts/applications")
+async def get_alert_applications(
+    request: Request,
+    limit: int = 5000,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/alerts/applications?{urlencode({'limit': str(limit)})}"
     return await guarded_proxy(
         request=request,
         method="GET",

@@ -1,0 +1,36 @@
+{
+  "projects": {
+    "telemetry": {
+      "application_id": "8a7f3e31-60e8-4f54-96c5-bd2a8a15c701",
+      "name": "telemetry",
+      "display_name": "OpenTelemetry Astronomy Shop",
+      "environment": "test",
+      "aliases": ["astronomy-shop", "astronomy shop", "opentelemetry-demo", "otel-demo"],
+      "code_roots": ["/workspace/external/telemetry/opentelemetry-demo"],
+      "service_catalog_root": "/workspace/external/telemetry/opentelemetry-demo/src",
+      "telemetry": {
+        "prometheus_url": "http://host.docker.internal:19090",
+        "jaeger_url": "http://host.docker.internal:16686",
+        "opensearch_url": "http://host.docker.internal:9200",
+        "opensearch_index": "otel-*"
+      },
+      "ticket_sources": {
+        "zammad_url": "http://host.docker.internal:8081",
+        "landing_pad": "/data/landing/documents"
+      },
+      "email_sources": {
+        "mailpit_url": "http://host.docker.internal:8025",
+        "landing_pad": "/data/landing/documents"
+      },
+      "correlation_keys": [
+        "service.name",
+        "trace_id",
+        "span_id",
+        "deployment.environment",
+        "exception.type",
+        "http.response.status_code",
+        "scenario_id"
+      ]
+    }
+  }
+}

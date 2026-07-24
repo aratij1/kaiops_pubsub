@@ -1,7 +1,9 @@
 # Optional scaling overlay for VM-based deployments.
 # Usage:
 #   docker compose --env-file .env.cloud -f docker-compose.yml -f docker-compose.scale.yml up -d --build
-#   docker compose --env-file .env.cloud -f docker-compose.yml -f docker-compose.scale.yml up -d --scale context-agent=3 --scale resolution-agent=3
+#   docker compose --env-file .env.cloud -f docker-compose.yml -f docker-compose.scale.yml up -d \
+#     --scale alert-intelligence=2 --scale orchestrator=2 --scale context-agent=2 \
+#     --scale resolution-agent=2 --scale remediation-engine=2 --scale closure-service=2
 #
 # Notes:
 # - UI/API ports cannot be scaled multiple times on one VM because host ports collide.
@@ -58,17 +60,17 @@ services:
 
   context-agent:
     environment:
-      MESSAGE_BUS_WORKER_COUNT: ${CONTEXT_AGENT_WORKERS:-2}
+      MESSAGE_BUS_WORKER_COUNT: ${CONTEXT_AGENT_WORKERS:-3}
     deploy: *small-worker-resources
 
   resolution-agent:
     environment:
-      MESSAGE_BUS_WORKER_COUNT: ${RESOLUTION_AGENT_WORKERS:-2}
+      MESSAGE_BUS_WORKER_COUNT: ${RESOLUTION_AGENT_WORKERS:-3}
     deploy: *small-worker-resources
 
   remediation-engine:
     environment:
-      MESSAGE_BUS_WORKER_COUNT: ${REMEDIATION_ENGINE_WORKERS:-1}
+      MESSAGE_BUS_WORKER_COUNT: ${REMEDIATION_ENGINE_WORKERS:-2}
     deploy: *small-worker-resources
 
   approval-service:

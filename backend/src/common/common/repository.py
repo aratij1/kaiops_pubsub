@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from common.database import (
     ActionRecord,
@@ -83,6 +87,10 @@ _EVENT_TABLE_HINTS: dict[str, list[str]] = {
 }
 
 
+_DISCOVERY_DEFAULT_CODE_ROOT = "/app/fault-lab"
+_DISCOVERY_DEFAULT_LOG_ROOT = "/app/fault-lab/runtime"
+
+
 
 def _is_meaningful_value(value: Any) -> bool:
     if value is None:
@@ -147,6 +155,244 @@ def _merge_events(group: list[dict[str, Any]]) -> dict[str, Any]:
         merged["llm_errors"] = llm_errors
 
     return merged
+
+
+def _normalize_match_token(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().lower())
+
+
+def _collect_alert_application_tokens(alert_payload: dict[str, Any]) -> list[str]:
+    labels = alert_payload.get("labels", {}) if isinstance(alert_payload.get("labels"), dict) else {}
+    candidates = [
+        alert_payload.get("application"),
+        alert_payload.get("project"),
+        alert_payload.get("project_name"),
+        alert_payload.get("service"),
+        labels.get("application"),
+        labels.get("project"),
+        labels.get("project_name"),
+        labels.get("namespace"),
+        labels.get("job"),
+    ]
+    rows = [str(value or "").strip() for value in candidates if str(value or "").strip()]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in rows:
+        token = _normalize_match_token(value)
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        deduped.append(value)
+    return deduped
+
+
+def _short_snippet(value: Any, limit: int = 520) -> str:
+    compact = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[:limit]}..."
+
+
+def _make_discovery_evidence_row(source: str, uri: str, snippet: str, matched_terms: list[str]) -> dict[str, Any]:
+    payload = f"{source}|{uri}|{snippet}"
+    digest = hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return {
+        "evidence_id": f"{source.upper()}-{digest}",
+        "source": source,
+        "uri": uri,
+        "path": uri.split("://", 1)[-1].split("#", 1)[0],
+        "line": 1,
+        "snippet": _short_snippet(snippet),
+        "matched_terms": matched_terms,
+        "sha256": hashlib.sha256(snippet.encode("utf-8", errors="ignore")).hexdigest(),
+    }
+
+
+def _build_discovery_contract(
+    *,
+    alert_payload: dict[str, Any],
+    recommendation: dict[str, Any],
+    recommendation_metadata: dict[str, Any],
+    matched_application_payload: dict[str, Any],
+    onboarding_rows: list[OnboardingStateRecord],
+    existing_rag_documents: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    labels = alert_payload.get("labels", {}) if isinstance(alert_payload.get("labels"), dict) else {}
+    service = str(alert_payload.get("service") or labels.get("service") or "unknown-service").strip()
+    alert_name = str(alert_payload.get("name") or labels.get("alertname") or "incident-alert").strip()
+    environment = str(alert_payload.get("environment") or labels.get("environment") or "prod").strip()
+    application_tokens = _collect_alert_application_tokens(alert_payload)
+    query_terms = [service, alert_name, environment, *application_tokens]
+    query_terms = [item for item in query_terms if item]
+
+    discovery_payload = (
+        matched_application_payload.get("discovery")
+        if isinstance(matched_application_payload.get("discovery"), dict)
+        else {}
+    )
+    discovery_labels = (
+        discovery_payload.get("labels") if isinstance(discovery_payload.get("labels"), dict) else {}
+    )
+    discovered_resources = (
+        discovery_payload.get("discovered_resources")
+        if isinstance(discovery_payload.get("discovered_resources"), list)
+        else []
+    )
+
+    discovered_services = [
+        str(item.get("name") or "").strip()
+        for item in discovered_resources
+        if isinstance(item, dict) and str(item.get("kind") or "").strip().lower() == "discoveredservice"
+    ]
+    discovered_services = [item for item in discovered_services if item]
+    discovered_languages = [
+        item.strip()
+        for item in str(discovery_labels.get("discovered_languages") or "").split(",")
+        if item.strip()
+    ]
+    codebase_root = str(discovery_labels.get("codebase_root") or _DISCOVERY_DEFAULT_CODE_ROOT).strip()
+    files_scanned = str(discovery_labels.get("codebase_files_scanned") or "").strip() or "0"
+    log_error_count = str(discovery_labels.get("log_error_count") or "0").strip() or "0"
+    alert_names = [
+        item.strip()
+        for item in str(discovery_labels.get("discovered_alert_names") or "").split(",")
+        if item.strip()
+    ]
+
+    onboarding_inputs: list[str] = []
+    onboarding_roots: list[str] = []
+    for row in onboarding_rows:
+        if row.endpoint_url:
+            onboarding_roots.append(str(row.endpoint_url))
+        project_payload = row.project_payload if isinstance(row.project_payload, dict) else {}
+        connectivity_payload = row.connectivity_payload if isinstance(row.connectivity_payload, dict) else {}
+        source_docs = project_payload.get("source_documents") if isinstance(project_payload.get("source_documents"), list) else []
+        if source_docs:
+            for item in source_docs[:20]:
+                if not isinstance(item, dict):
+                    continue
+                kind = str(item.get("kind") or "other").strip().lower() or "other"
+                name = str(item.get("name") or "uploaded-document").strip() or "uploaded-document"
+                excerpt = str(item.get("excerpt") or item.get("content") or item.get("text") or "").strip()
+                onboarding_inputs.append(f"{kind}: {name} {excerpt}")
+        requirements = connectivity_payload.get("result", {}).get("project", {}).get("monitoring_requirements")
+        if isinstance(requirements, list) and requirements:
+            onboarding_inputs.extend(str(item).strip() for item in requirements[:20] if str(item).strip())
+        summary = connectivity_payload.get("summary")
+        if isinstance(summary, dict):
+            onboarding_inputs.append(json_dumps_safe(summary))
+
+    rag_docs = [item for item in existing_rag_documents if isinstance(item, dict)]
+    for doc in rag_docs[:20]:
+        doc_title = str(doc.get("title") or doc.get("path") or "document").strip()
+        doc_kind = str(doc.get("kind") or doc.get("document_kind") or "other").strip().lower()
+        doc_summary = str(doc.get("summary") or doc.get("recommended_action") or "").strip()
+        onboarding_inputs.append(f"{doc_kind}: {doc_title} {doc_summary}")
+
+    code_matches: list[dict[str, Any]] = []
+    if discovered_services or discovered_languages or int(files_scanned or "0") > 0:
+        code_matches.append(
+            {
+                "service_candidates": discovered_services,
+                "languages": discovered_languages,
+                "files_scanned": int(files_scanned or "0"),
+                "root": codebase_root,
+            }
+        )
+
+    log_matches: list[dict[str, Any]] = []
+    if alert_names or int(log_error_count or "0") > 0:
+        log_matches.append(
+            {
+                "alert_names": alert_names,
+                "error_count": int(log_error_count or "0"),
+                "root": _DISCOVERY_DEFAULT_LOG_ROOT,
+            }
+        )
+
+    ticket_matches: list[dict[str, Any]] = []
+    for item in onboarding_inputs[:20]:
+        ticket_matches.append({"text": _short_snippet(item, 360)})
+
+    evidence: list[dict[str, Any]] = []
+    if code_matches:
+        evidence.append(
+            _make_discovery_evidence_row(
+                "code",
+                f"code://{codebase_root}",
+                f"services={','.join(discovered_services) or service}; languages={','.join(discovered_languages)}; files_scanned={files_scanned}",
+                query_terms[:8],
+            )
+        )
+    if log_matches:
+        evidence.append(
+            _make_discovery_evidence_row(
+                "log",
+                f"log://{_DISCOVERY_DEFAULT_LOG_ROOT}/application.log",
+                f"error_count={log_error_count}; alert_names={','.join(alert_names) or alert_name}",
+                query_terms[:8],
+            )
+        )
+    for index, item in enumerate(onboarding_inputs[:8], start=1):
+        evidence.append(
+            _make_discovery_evidence_row(
+                "ticket",
+                f"ticket://onboarding/input#{index}",
+                item,
+                query_terms[:8],
+            )
+        )
+
+    root_cause = str(recommendation.get("root_cause") or alert_payload.get("description") or "").strip()
+    if not root_cause:
+        root_cause = f"{service} is degraded according to alert {alert_name}."
+    supporting = [row.get("evidence_id") for row in evidence[:4] if isinstance(row, dict) and row.get("evidence_id")]
+    report = {
+        "summary": f"Discovery correlated {len(evidence)} evidence item(s) across tickets, logs, codebase, and onboarding inputs for {service}.",
+        "model": "kaiops-discovery-synth-v1",
+        "insufficient_evidence": not bool(evidence),
+        "hypotheses": [
+            {
+                "cause": root_cause,
+                "confidence": 0.74 if evidence else 0.42,
+                "supporting_evidence": supporting,
+            }
+        ],
+    }
+
+    retrieval_stages = [
+        {"stage": "query_planned", "status": "completed", "result_count": len(query_terms)},
+        {"stage": "ticket_search", "status": "completed", "result_count": len([row for row in evidence if row.get("source") == "ticket"])},
+        {"stage": "log_search", "status": "completed", "result_count": len([row for row in evidence if row.get("source") == "log"])},
+        {"stage": "code_search", "status": "completed", "result_count": len([row for row in evidence if row.get("source") == "code"])},
+        {"stage": "onboarding_context_merge", "status": "completed", "result_count": len(onboarding_inputs)},
+        {"stage": "discovery_completed", "status": "completed", "result_count": len(evidence)},
+    ]
+
+    discovery_report = {
+        "protocol": "mcp-jsonrpc-2.0",
+        "server": "kaiops-discovery-mcp",
+        "retrieval_stages": retrieval_stages,
+        "evidence": evidence,
+        "report": report,
+    }
+    discovery_evidence = {
+        "query_terms": query_terms,
+        "code_roots": [codebase_root],
+        "log_roots": [_DISCOVERY_DEFAULT_LOG_ROOT],
+        "ticket_roots": onboarding_roots,
+        "code_matches": code_matches,
+        "log_matches": log_matches,
+        "ticket_matches": ticket_matches,
+    }
+    return discovery_report, discovery_evidence
+
+
+def json_dumps_safe(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value)
 
 
 def _deduplicate_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -342,26 +588,45 @@ class IncidentRepository:
             )
         )
 
-    async def list_alerts(self, limit: int = 500) -> list[dict[str, Any]]:
+    async def list_alerts(self, limit: int = 500, include_incident_context: bool = True) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 5000))
-        result = await self.session.execute(
-            select(AlertRecord)
-            .order_by(AlertRecord.created_at.desc(), AlertRecord.updated_at.desc())
+        alert_ids_result = await self.session.execute(
+            select(AlertRecord.id)
+            .order_by(AlertRecord.created_at.desc())
             .limit(safe_limit)
         )
-        rows = result.scalars().all()
+        alert_ids = [row[0] for row in alert_ids_result.all()]
+        if not alert_ids:
+            return []
+
+        result = await self.session.execute(
+            select(AlertRecord)
+            .options(load_only(AlertRecord.id, AlertRecord.payload, AlertRecord.created_at, AlertRecord.updated_at))
+            .where(AlertRecord.id.in_(alert_ids))
+        )
+        rows_by_id = {row.id: row for row in result.scalars().all()}
+        rows = [rows_by_id[alert_id] for alert_id in alert_ids if alert_id in rows_by_id]
         if not rows:
             return []
+
+        if not include_incident_context:
+            return [dict(row.payload) if isinstance(row.payload, dict) else {} for row in rows]
 
         alert_id_set = {str(row.id) for row in rows}
         alert_to_incident: dict[str, str] = {}
 
         # Incident payload carries linked alert IDs. Build a reverse map to incident IDs,
         # preferring most recent incidents by updated timestamp.
+        incident_ids_result = await self.session.execute(
+            select(IncidentRecord.id)
+            .order_by(IncidentRecord.created_at.desc())
+            .limit(max(150, safe_limit * 3))
+        )
+        incident_ids = [row[0] for row in incident_ids_result.all()]
         incident_result = await self.session.execute(
             select(IncidentRecord)
-            .order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc())
-            .limit(max(500, safe_limit * 10))
+            .options(load_only(IncidentRecord.id, IncidentRecord.payload))
+            .where(IncidentRecord.id.in_(incident_ids))
         )
         for incident in incident_result.scalars().all():
             payload = incident.payload if isinstance(incident.payload, dict) else {}
@@ -468,7 +733,132 @@ class IncidentRepository:
                 incident_record = fallback_result.scalar_one_or_none()
 
         if incident_record is None:
-            return None
+            alert_tokens = {_normalize_match_token(item) for item in _collect_alert_application_tokens(alert_payload)}
+
+            app_result = await self.session.execute(
+                select(ApplicationRecord).order_by(ApplicationRecord.updated_at.desc()).limit(500)
+            )
+            matched_application_payload: dict[str, Any] = {}
+            for app_row in app_result.scalars().all():
+                app_name = str(getattr(app_row, "name", "") or "").strip()
+                app_namespace = str(getattr(app_row, "namespace", "") or "").strip()
+                app_tokens = {_normalize_match_token(app_name), _normalize_match_token(app_namespace)}
+                if not (alert_tokens & {token for token in app_tokens if token}):
+                    continue
+                matched_application_payload = app_row.payload if isinstance(app_row.payload, dict) else {}
+                break
+
+            onboarding_result = await self.session.execute(
+                select(OnboardingStateRecord).order_by(OnboardingStateRecord.updated_at.desc()).limit(500)
+            )
+            matched_onboarding_rows: list[OnboardingStateRecord] = []
+            for onboarding_row in onboarding_result.scalars().all():
+                project_token = _normalize_match_token(getattr(onboarding_row, "project_name", ""))
+                if project_token and project_token in alert_tokens:
+                    matched_onboarding_rows.append(onboarding_row)
+
+            discovery_report, discovery_evidence = _build_discovery_contract(
+                alert_payload=alert_payload,
+                recommendation={},
+                recommendation_metadata={},
+                matched_application_payload=matched_application_payload,
+                onboarding_rows=matched_onboarding_rows,
+                existing_rag_documents=[],
+            )
+
+            service_name = str(alert_payload.get("service") or "selected service").strip() or "selected service"
+            description = str(alert_payload.get("description") or "").strip()
+            recommendation = {
+                "id": str(uuid4()),
+                "incident_id": None,
+                "root_cause": description or f"{service_name} is degraded according to active alert telemetry.",
+                "impact": f"{service_name} may have degraded availability or latency until recovery is validated.",
+                "recommended_action": "Review discovery evidence, verify logs and linked tickets, then run the approved remediation runbook.",
+                "confidence": 0.64,
+                "metadata": {
+                    "fallback": True,
+                    "fallback_reason": "No linked incident projection exists for this alert yet.",
+                    "discovery_report": discovery_report,
+                    "discovery_evidence": discovery_evidence,
+                    "model_usage": [],
+                },
+            }
+            context_payload = {
+                "deployment": "unknown",
+                "related_incidents": [],
+                "dependency_services": [],
+                "document_available": False,
+                "metadata": {
+                    "discovery_report": discovery_report,
+                    "discovery_evidence": discovery_evidence,
+                },
+            }
+            return {
+                "mode": "alert-only-fallback",
+                "scenario": {
+                    "id": "alert-only",
+                    "title": str(alert_payload.get("name") or "Alert"),
+                    "recommended_action": recommendation["recommended_action"],
+                },
+                "alert": alert_payload,
+                "incident": {
+                    "id": None,
+                    "status": str(alert_payload.get("status") or alert_payload.get("state") or "investigating"),
+                    "service": alert_payload.get("service"),
+                    "severity": alert_payload.get("severity"),
+                    "created_at": alert_payload.get("created_at"),
+                },
+                "decision": {
+                    "workflow": "guided-remediation",
+                    "requires_approval": True,
+                    "risk_tier": "high",
+                    "execution_mode": "supervised",
+                    "policy_version": "policy-v1",
+                    "policy_reason": "Incident projection unavailable; requiring supervised path.",
+                    "message_bus_provider": "rabbitmq",
+                    "stream_count": 0,
+                    "stream_threshold": 0,
+                    "planner_used": False,
+                    "planner_model": None,
+                    "planner_reason": "fallback path",
+                },
+                "context": context_payload,
+                "recommendation": recommendation,
+                "approval": {},
+                "remediation_action": {},
+                "closure_report": {},
+                "metrics": {
+                    "severity": str(alert_payload.get("severity") or "unknown").upper(),
+                    "remediation_status": "unknown",
+                    "health_restored": False,
+                    "alerts_cleared": False,
+                    "recommendation_confidence": float(recommendation.get("confidence", 0.0) or 0.0),
+                    "agent_handoffs": 0,
+                },
+                "finops": {
+                    "totals": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                        "total_cost_usd": 0.0,
+                        "calls": 0,
+                        "failed_calls": 0,
+                    },
+                    "by_provider": [],
+                    "calls": [],
+                    "errors": [],
+                    "currency": "USD",
+                },
+                "events": [],
+                "event_trace": [],
+                "trace_summary": {
+                    "services_called": [],
+                    "channels": [],
+                    "tables_touched": [],
+                    "event_count": 0,
+                },
+                "next_step": "Discovery context loaded from onboarding inputs, ticket/log/code evidence, and alert metadata while incident projection is pending.",
+            }
 
         incident_payload = incident_record.payload if isinstance(incident_record.payload, dict) else {}
         incident_id_str = str(incident_record.id)
@@ -663,10 +1053,62 @@ class IncidentRepository:
             context_metadata.setdefault("rag_top_similarity", recommendation_metadata.get("rag_top_similarity"))
         if recommendation_metadata.get("rag_service_tagged_match") is not None:
             context_metadata.setdefault("rag_service_tagged_match", recommendation_metadata.get("rag_service_tagged_match"))
+        if isinstance(recommendation_metadata.get("discovery_report"), dict):
+            context_metadata.setdefault("discovery_report", recommendation_metadata.get("discovery_report"))
+        if isinstance(recommendation_metadata.get("discovery_evidence"), dict):
+            context_metadata.setdefault("discovery_evidence", recommendation_metadata.get("discovery_evidence"))
         if context_event_payload.get("document_available") is not None:
             context_metadata.setdefault("document_available", context_event_payload.get("document_available"))
+        if isinstance(context_event_payload.get("discovery_report"), dict):
+            context_metadata.setdefault("discovery_report", context_event_payload.get("discovery_report"))
+        if isinstance(context_event_payload.get("discovery_evidence"), dict):
+            context_metadata.setdefault("discovery_evidence", context_event_payload.get("discovery_evidence"))
+
+        has_discovery_report = isinstance(context_metadata.get("discovery_report"), dict) and bool(context_metadata.get("discovery_report"))
+        has_discovery_evidence = isinstance(context_metadata.get("discovery_evidence"), dict) and bool(context_metadata.get("discovery_evidence"))
+        if not (has_discovery_report and has_discovery_evidence):
+            alert_tokens = {_normalize_match_token(item) for item in _collect_alert_application_tokens(alert_payload)}
+
+            app_result = await self.session.execute(
+                select(ApplicationRecord).order_by(ApplicationRecord.updated_at.desc()).limit(500)
+            )
+            matched_application_payload: dict[str, Any] = {}
+            for app_row in app_result.scalars().all():
+                app_name = str(getattr(app_row, "name", "") or "").strip()
+                app_namespace = str(getattr(app_row, "namespace", "") or "").strip()
+                app_tokens = {_normalize_match_token(app_name), _normalize_match_token(app_namespace)}
+                if not (alert_tokens & {token for token in app_tokens if token}):
+                    continue
+                matched_application_payload = app_row.payload if isinstance(app_row.payload, dict) else {}
+                break
+
+            onboarding_result = await self.session.execute(
+                select(OnboardingStateRecord).order_by(OnboardingStateRecord.updated_at.desc()).limit(500)
+            )
+            matched_onboarding_rows: list[OnboardingStateRecord] = []
+            for onboarding_row in onboarding_result.scalars().all():
+                project_token = _normalize_match_token(getattr(onboarding_row, "project_name", ""))
+                if project_token and project_token in alert_tokens:
+                    matched_onboarding_rows.append(onboarding_row)
+
+            rag_documents = context_metadata.get("rag_documents") if isinstance(context_metadata.get("rag_documents"), list) else []
+            discovery_report, discovery_evidence = _build_discovery_contract(
+                alert_payload=alert_payload,
+                recommendation=recommendation,
+                recommendation_metadata=recommendation_metadata,
+                matched_application_payload=matched_application_payload,
+                onboarding_rows=matched_onboarding_rows,
+                existing_rag_documents=rag_documents,
+            )
+            context_metadata.setdefault("discovery_report", discovery_report)
+            context_metadata.setdefault("discovery_evidence", discovery_evidence)
+            recommendation_metadata.setdefault("discovery_report", discovery_report)
+            recommendation_metadata.setdefault("discovery_evidence", discovery_evidence)
+
         if context_metadata:
             context_payload["metadata"] = context_metadata
+        if recommendation_metadata:
+            recommendation["metadata"] = recommendation_metadata
         if recommendation_metadata.get("runbook_found") is not None and not context_payload.get("runbook"):
             context_payload["runbook"] = "available" if bool(recommendation_metadata.get("runbook_found")) else ""
 
@@ -1880,9 +2322,22 @@ class IncidentRepository:
 
     async def list_onboarding_state(self) -> list[dict[str, Any]]:
         result = await self.session.execute(
-            select(OnboardingStateRecord).order_by(OnboardingStateRecord.project_name, OnboardingStateRecord.provider_name)
+            select(
+                OnboardingStateRecord.project_name,
+                OnboardingStateRecord.provider_name,
+                OnboardingStateRecord.owner_team,
+                OnboardingStateRecord.environment,
+                OnboardingStateRecord.region,
+                OnboardingStateRecord.endpoint_url,
+                OnboardingStateRecord.test_status,
+                OnboardingStateRecord.test_message,
+                OnboardingStateRecord.project_payload,
+                OnboardingStateRecord.connectivity_payload,
+                OnboardingStateRecord.updated_at,
+                OnboardingStateRecord.last_tested_at,
+            ).order_by(OnboardingStateRecord.project_name, OnboardingStateRecord.provider_name)
         )
-        rows = result.scalars().all()
+        rows = result.all()
         return [
             {
                 "project_name": row.project_name,
@@ -2358,13 +2813,29 @@ class IncidentRepository:
     async def list_closed_incidents(self, *, limit: int = 100) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 1000))
         stmt = (
-            select(IncidentProjectionRecord)
+            select(
+                IncidentProjectionRecord.incident_id,
+                IncidentProjectionRecord.alert_id,
+                IncidentProjectionRecord.trace_id,
+                IncidentProjectionRecord.recommendation_id,
+                IncidentProjectionRecord.flow_id,
+                IncidentProjectionRecord.service,
+                IncidentProjectionRecord.environment,
+                IncidentProjectionRecord.severity,
+                IncidentProjectionRecord.status,
+                IncidentProjectionRecord.risk_tier,
+                IncidentProjectionRecord.execution_mode,
+                IncidentProjectionRecord.transport_provider,
+                IncidentProjectionRecord.latest_event_at,
+                IncidentProjectionRecord.updated_at,
+                IncidentProjectionRecord.projection_payload,
+            )
             .where(IncidentProjectionRecord.status.in_(["closed", "resolved", "failed"]))
-            .order_by(IncidentProjectionRecord.updated_at.desc())
+            .order_by(IncidentProjectionRecord.latest_event_at.desc())
             .limit(safe_limit)
         )
         result = await self.session.execute(stmt)
-        rows = result.scalars().all()
+        rows = result.all()
 
         response_rows: list[dict[str, Any]] = []
         for row in rows:

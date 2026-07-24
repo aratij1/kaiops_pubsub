@@ -426,6 +426,20 @@
     "source": "rag-incident"
   },
   {
+    "id": "new-kaiops-rule-onboarding",
+    "alert_id": "new_kaiops-rule-onboarding",
+    "alert_name": "new_kaiops Monitoring Rule Onboarding",
+    "alert_type": "monitoring-rule-onboarding",
+    "title": "new_kaiops Monitoring Rule Onboarding",
+    "service": "new_kaiops",
+    "severity": "HIGH",
+    "summary": "Plain-language monitoring requirements were converted to prometheus rules.",
+    "recommended_action": "Review generated rules and approve production deployment.",
+    "description": "Plain-language monitoring requirements were converted to prometheus rules.",
+    "deployment": "prod",
+    "source": "rag-incident"
+  },
+  {
     "id": "orders-replica-lag",
     "alert_id": "ORDERS-REPLICA-LAG",
     "alert_name": "Orders database replica lag",

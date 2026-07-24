@@ -58,8 +58,72 @@ def _rule_kind(rule_name: str, slug: str) -> str:
     return suffix
 
 
-def _build_runbook_document_payload(application: ApplicationRegistration, result: RulesGeneratedResult) -> dict[str, Any]:
+async def _discover_similar_ticket_context(
+    application: ApplicationRegistration,
+    result: RulesGeneratedResult,
+) -> list[dict[str, Any]]:
+    """Retrieve incident/ticket evidence without using existing runbooks as source context."""
+    rule_terms = " ".join(
+        str((rule.annotations or {}).get("summary") or rule.name)
+        for rule in result.alert_rules[:8]
+    )
+    query = " ".join(
+        part
+        for part in (
+            application.name,
+            application.environment,
+            application.technology,
+            application.namespace,
+            rule_terms,
+        )
+        if str(part or "").strip()
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            search_response = await client.get(
+                f"{settings.context_agent_url}/rag/search",
+                params={"query": query, "kind": "incident", "limit": 5},
+            )
+            search_response.raise_for_status()
+            matches = search_response.json().get("matches", [])
+            tickets: list[dict[str, Any]] = []
+            for match in matches[:3]:
+                if str(match.get("kind") or "").strip().lower() != "incident":
+                    continue
+                path = str(match.get("path") or "").strip()
+                if not path:
+                    continue
+                detail_response = await client.get(
+                    f"{settings.context_agent_url}/rag/documents/content",
+                    params={"path": path},
+                )
+                detail_response.raise_for_status()
+                detail = detail_response.json()
+                tickets.append(
+                    {
+                        "title": str(detail.get("title") or match.get("title") or "Historical incident"),
+                        "summary": str(detail.get("summary") or "").strip(),
+                        "content": str(detail.get("content") or "").strip(),
+                        "path": path,
+                        "score": float(match.get("score") or 0.0),
+                    }
+                )
+            return tickets
+    except Exception as exc:
+        logger.warning(
+            "similar ticket discovery failed; using baseline rule guidance",
+            extra={"application": application.name, "error": str(exc)},
+        )
+        return []
+
+
+def _build_runbook_document_payload(
+    application: ApplicationRegistration,
+    result: RulesGeneratedResult,
+    similar_tickets: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     slug = str(application.name or "").strip().lower().replace(" ", "-") or "application"
+    similar_tickets = similar_tickets or []
     highest_severity = "info"
     sections: list[str] = [
         f"Auto-generated monitoring runbook for **{application.name}**.",
@@ -69,8 +133,28 @@ def _build_runbook_document_payload(application: ApplicationRegistration, result
         f"- Namespace: {application.namespace}",
         f"- Owner team: {application.owner_team}",
         "",
-        "## Alert Rules",
+        "## Historical Ticket Context",
     ]
+    if similar_tickets:
+        sections.append(
+            "The following similar resolved incidents were discovered before this runbook was generated:"
+        )
+        for ticket in similar_tickets:
+            evidence = str(ticket.get("summary") or ticket.get("content") or "").strip()
+            evidence = " ".join(evidence.split())[:700]
+            sections.append(f"### {ticket.get('title') or 'Historical incident'}")
+            sections.append(f"- Similarity: {float(ticket.get('score') or 0.0):.3f}")
+            sections.append(f"- Evidence: {evidence or 'Historical incident metadata matched this service and alert pattern.'}")
+            sections.append(f"- Source ticket: `{ticket.get('path') or 'unknown'}`")
+            sections.append("")
+    else:
+        sections.append(
+            "No sufficiently similar historical ticket was found. Baseline troubleshooting guidance is used and must be reviewed after the first resolved incident."
+        )
+        sections.append("")
+    sections.extend([
+        "## Alert Rules",
+    ])
     for rule in result.alert_rules:
         severity = str(rule.severity or "warning").strip().lower()
         if _SEVERITY_RANK.get(severity, 0) > _SEVERITY_RANK.get(highest_severity, 0):
@@ -103,6 +187,9 @@ def _build_runbook_document_payload(application: ApplicationRegistration, result
             "namespace": str(application.namespace or ""),
             "source": "rule-generation-agent",
             "application_id": str(application.id),
+            "context_strategy": "similar-historical-tickets-first",
+            "historical_ticket_count": len(similar_tickets),
+            "historical_ticket_paths": [str(ticket.get("path") or "") for ticket in similar_tickets],
         },
     }
 
@@ -114,7 +201,8 @@ async def _publish_runbook_document(application: ApplicationRegistration, result
     must not break rule generation, which is this service's primary job."""
     if not result.alert_rules:
         return
-    payload = _build_runbook_document_payload(application, result)
+    similar_tickets = await _discover_similar_ticket_context(application, result)
+    payload = _build_runbook_document_payload(application, result, similar_tickets)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(f"{settings.context_agent_url}/rag/documents", json=payload)

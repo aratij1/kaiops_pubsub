@@ -23,6 +23,13 @@ scrape_configs:
     static_configs:
       - targets: ["monitoring-adapter:8000"]
 
+  # Fault Lab produces the bounded application symptoms and breached metrics for
+  # the 50 KaiOps incident scenarios. kaiops_fault_ratio > 1 marks a live breach.
+  - job_name: kaiops-fault-lab
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["fault-lab:8080"]
+
   - job_name: kaiops-alert-intelligence
     metrics_path: /metrics
     static_configs:

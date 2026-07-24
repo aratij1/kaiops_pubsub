@@ -1,12 +1,12 @@
 {
   "project": {
-    "name": "kaiops-core1",
-    "owner_team": "kaiops-platform",
+    "name": "new_kaiops",
+    "owner_team": "data",
     "environment": "prod",
     "region": "ap-south-1"
   },
   "deployment_mode": "on_prem",
-  "prometheus_url": "http://pr",
+  "prometheus_url": "http://prometheus:9090",
   "new_relic_url": "",
   "datadog_url": "",
   "azure_subscription_id": "",

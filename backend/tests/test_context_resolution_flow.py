@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from ai_workbench_common.memory_store import InMemoryStore
 from common.models import Alert, AlertSeverity, Incident
@@ -23,6 +25,33 @@ class StaticProvider(ModelProvider):
                 output_cost_per_million=2.0,
             ),
         )
+
+
+class FallbackGateway:
+    async def generate(self, request) -> dict:
+        content = {
+            "title": "Identify the most likely root cause using only",
+            "summary": "Generic fallback RCA draft",
+            "content": "Generic fallback content that should not be used as trusted RCA.",
+            "commands": [],
+            "scripts": [],
+            "queries": [],
+            "metadata": {
+                "fallback": True,
+                "fallback_reason": "gemini unavailable; gpt-4o unavailable; gpt-5 unavailable",
+            },
+        }
+        return {
+            "model": "heuristic-fallback",
+            "content": json.dumps(content),
+            "usage": {
+                "provider": "heuristic-fallback",
+                "model": "heuristic-fallback",
+                "task": request.task,
+                "estimated": True,
+                "fallback": True,
+            },
+        }
 
 
 def static_router() -> ModelRouter:
@@ -70,7 +99,7 @@ async def test_context_agent_returns_requested_shape() -> None:
     assert context.metadata["context_graph"] == {
         "enabled": True,
         "stages": ["validate_event", "collect_connector_evidence", "assemble_context"],
-        "connector_count": 7,
+        "connector_count": 8,
     }
 
 
@@ -93,6 +122,27 @@ async def test_resolution_agent_generates_recommendation() -> None:
     assert recommendation.confidence >= 0.9
     assert recommendation.impact == "Payments latency"
     assert recommendation.recommended_action == "Rollback deployment"
+
+
+@pytest.mark.asyncio
+async def test_resolution_agent_clamps_all_model_fallback_confidence() -> None:
+    alert = Alert(
+        source="prometheus",
+        name="KaiOpsServiceDown",
+        service="kaiops-platform",
+        severity=AlertSeverity.CRITICAL,
+        description="KaiOps platform service is not reachable by Prometheus for more than 1 minute.",
+    )
+    incident = Incident(service="kaiops-platform", severity=AlertSeverity.CRITICAL, title="kaiops service down")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+
+    recommendation = await ResolutionIntelligenceAgent(model_gateway=FallbackGateway()).resolve(context)
+
+    assert recommendation.confidence <= 0.49
+    assert not recommendation.root_cause.startswith("{")
+    assert recommendation.metadata["fallback_used"] is True
+    assert recommendation.metadata["quality_gate"]["requires_human_review"] is True
+    assert recommendation.metadata["quality_gate"]["trusted_for_auto_execution"] is False
 
 
 @pytest.mark.asyncio
