@@ -30,26 +30,35 @@ class RabbitMQProducer:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._connection: RobustConnection | None = None
-        self._channel: RobustChannel | None = None
-        self._exchange: RobustExchange | None = None
+        self._channels: list[RobustChannel] = []
+        self._exchanges: list[RobustExchange] = []
+        self._next_exchange_index = 0
 
     async def start(self) -> None:
         if self._connection is not None:
             return
         attempts = max(1, int(self._settings.rabbitmq_startup_attempts or 1))
         retry_seconds = max(0.1, float(self._settings.rabbitmq_startup_retry_seconds or 0.1))
+        pool_size = max(1, int(self._settings.rabbitmq_publisher_channel_pool_size or 1))
         for attempt in range(1, attempts + 1):
             try:
                 self._connection = await aio_pika.connect_robust(self._settings.rabbitmq_url)
-                self._channel = await self._connection.channel()
-                self._exchange = await self._channel.declare_exchange(
-                    self._settings.rabbitmq_exchange,
-                    ExchangeType.TOPIC,
-                    durable=True,
-                )
+                for _ in range(pool_size):
+                    channel = await self._connection.channel()
+                    exchange = await channel.declare_exchange(
+                        self._settings.rabbitmq_exchange,
+                        ExchangeType.TOPIC,
+                        durable=True,
+                    )
+                    self._channels.append(channel)
+                    self._exchanges.append(exchange)
                 logger.info(
                     "connected rabbitmq producer",
-                    extra={"url": self._settings.rabbitmq_url, "exchange": self._settings.rabbitmq_exchange},
+                    extra={
+                        "url": self._settings.rabbitmq_url,
+                        "exchange": self._settings.rabbitmq_exchange,
+                        "channel_pool_size": pool_size,
+                    },
                 )
                 return
             except Exception:
@@ -71,11 +80,19 @@ class RabbitMQProducer:
         if self._connection is not None:
             await self._connection.close()
         self._connection = None
-        self._channel = None
-        self._exchange = None
+        self._channels = []
+        self._exchanges = []
+        self._next_exchange_index = 0
+
+    def _next_exchange(self) -> RobustExchange:
+        # Plain round-robin: a single int increment between awaits is not
+        # preemptible in one asyncio event loop, so no lock is needed here.
+        exchange = self._exchanges[self._next_exchange_index % len(self._exchanges)]
+        self._next_exchange_index += 1
+        return exchange
 
     async def publish(self, topic: str, event: dict[str, Any] | Any, key: str | None = None) -> None:
-        if self._exchange is None:
+        if not self._exchanges:
             logger.info("rabbitmq producer unavailable; event logged", extra={"topic": topic, "payload": normalize_payload(event)})
             return
         payload = normalize_payload(event)
@@ -86,7 +103,7 @@ class RabbitMQProducer:
         }
         body = json.dumps(envelope, default=str).encode("utf-8")
         routing_key = topic
-        await self._exchange.publish(
+        await self._next_exchange().publish(
             Message(
                 body,
                 content_type="application/json",
@@ -117,6 +134,13 @@ class RabbitMQConsumer:
             try:
                 self._connection = await aio_pika.connect_robust(self._settings.rabbitmq_url)
                 self._channel = await self._connection.channel()
+                # Bound how many unacked messages the broker will push to this
+                # consumer at once. Without this, a channel drop mid-backlog can
+                # leave thousands of delivered-but-unacked messages that all fail
+                # to nack together (a single ExceptionGroup with one sub-exception
+                # per message), and total in-flight work per consumer is otherwise
+                # unbounded.
+                await self._channel.set_qos(prefetch_count=self._settings.rabbitmq_consumer_prefetch_count)
                 self._exchange = await self._channel.declare_exchange(
                     self._settings.rabbitmq_exchange,
                     ExchangeType.TOPIC,
@@ -222,11 +246,17 @@ async def consume_forever(
                     last_error = ""
                     while attempts <= max_retries:
                         try:
-                            await handler(payload)
+                            await asyncio.wait_for(
+                                handler(payload),
+                                timeout=consumer._settings.rabbitmq_handler_timeout_seconds,
+                            )
                             success = True
                             processed_cache.mark(identity)
                             break
                         except Exception as exc:
+                            # Includes asyncio.TimeoutError: without a bound here a
+                            # single hung downstream call could block this consumer
+                            # (and its whole prefetch batch) indefinitely.
                             last_error = str(exc) or exc.__class__.__name__
                             attempts += 1
                             if attempts > max_retries:

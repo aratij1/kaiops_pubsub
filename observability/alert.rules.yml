@@ -356,3 +356,28 @@ groups:
         annotations:
           summary: "Incident processing queue high"
           description: "Raw alerts are being processed but no closure events are observed."
+
+  - name: kaiops-fault-lab
+    rules:
+      # Fires whenever a fault-lab scenario's normalized signal exceeds its
+      # threshold. Labels (severity, alert_name, service, scenario_id,
+      # ticket_example) flow through alertmanager into the landing pad.
+      - alert: KaiOpsApplicationFaultDetected
+        expr: kaiops_fault_ratio > 1
+        for: 15s
+        labels:
+          source: kaiops-fault-lab
+          severity: "{{ $labels.severity }}"
+        annotations:
+          summary: "{{ $labels.alert_name }} on {{ $labels.service }}"
+          description: "Scenario {{ $labels.scenario_id }} breached its threshold. Example context ticket: {{ $labels.ticket_example }}."
+
+      - alert: KaiOpsFaultLabUnavailable
+        expr: up{job="kaiops-fault-lab"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          source: kaiops-fault-lab
+        annotations:
+          summary: "KaiOps Fault Lab is unavailable"
+          description: "Prometheus cannot scrape the fault-lab /metrics endpoint."

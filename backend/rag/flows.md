@@ -283,6 +283,15 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Summary:** create rule for checking the alerts are getting ingested  every 10 mins
 - **Recommended Action:** Investigate issue
 
+## new_kaiops Monitoring Rule Onboarding
+- **Service:** new_kaiops
+- **Severity:** HIGH
+- **Alert Type:** monitoring-rule-onboarding
+- **Alert ID:** new_kaiops-rule-onboarding
+- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
+- **Recommended Action:** Review generated rules and approve production deployment.
+- **Deployment:** prod
+
 ## Orders database replica lag
 - **Service:** orders-db
 - **Severity:** CRITICAL

@@ -1,0 +1,20 @@
+groups:
+  - name: kaiops-fault-lab
+    rules:
+      - alert: KaiOpsApplicationFaultDetected
+        expr: kaiops_fault_ratio > 1
+        for: 15s
+        labels:
+          source: kaiops-fault-lab
+          severity: "{{ $labels.severity }}"
+        annotations:
+          summary: "{{ $labels.alert_name }} on {{ $labels.service }}"
+          description: "Scenario {{ $labels.scenario_id }} breached its threshold. Example context ticket: {{ $labels.ticket_example }}."
+
+      - alert: KaiOpsFaultLabUnavailable
+        expr: up{job="kaiops-fault-lab"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "KaiOps Fault Lab is unavailable"

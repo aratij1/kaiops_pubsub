@@ -218,9 +218,33 @@ def remove_alert_severity_override(*, name: str, service: str = "", environment:
 
 
 def severity_from_string(value: str | None) -> str:
+    # Must always return a valid AlertSeverity value (lowercase); the default is
+    # consumed directly by AlertSeverity(...). Covers monitoring vocabularies
+    # (Prometheus warning/critical) and ticket/priority vocabularies (Jira
+    # blocker/highest/major/medium/minor) plus the fault-lab Critical/High/Medium.
     normalized = (value or "HIGH").strip().upper()
-    mapping = {"CRITICAL": "critical", "HIGH": "high", "WARNING": "warning", "INFO": "info"}
-    return mapping.get(normalized, "HIGH")
+    mapping = {
+        "BLOCKER": "critical",
+        "HIGHEST": "critical",
+        "CRITICAL": "critical",
+        "P1": "critical",
+        "SEV1": "critical",
+        "HIGH": "high",
+        "MAJOR": "high",
+        "ERROR": "high",
+        "P2": "high",
+        "SEV2": "high",
+        "MEDIUM": "warning",
+        "MODERATE": "warning",
+        "WARNING": "warning",
+        "P3": "warning",
+        "SEV3": "warning",
+        "LOW": "info",
+        "MINOR": "info",
+        "INFO": "info",
+        "INFORMATIONAL": "info",
+    }
+    return mapping.get(normalized, "high")
 
 
 def default_flow_catalog_entries() -> list[dict[str, str]]:

@@ -32,9 +32,12 @@ class Settings(BaseSettings):
     rabbitmq_exchange: str = Field(default="kaiops.events", alias="RABBITMQ_EXCHANGE")
     rabbitmq_queue_prefix: str = Field(default="kaiops", alias="RABBITMQ_QUEUE_PREFIX")
     rabbitmq_consumer_max_retries: int = Field(default=3, alias="RABBITMQ_CONSUMER_MAX_RETRIES")
+    rabbitmq_consumer_prefetch_count: int = Field(default=10, alias="RABBITMQ_CONSUMER_PREFETCH_COUNT")
+    rabbitmq_handler_timeout_seconds: float = Field(default=120.0, alias="RABBITMQ_HANDLER_TIMEOUT_SECONDS")
     rabbitmq_dlq_suffix: str = Field(default=".dlq", alias="RABBITMQ_DLQ_SUFFIX")
     rabbitmq_startup_attempts: int = Field(default=30, alias="RABBITMQ_STARTUP_ATTEMPTS")
     rabbitmq_startup_retry_seconds: float = Field(default=2.0, alias="RABBITMQ_STARTUP_RETRY_SECONDS")
+    rabbitmq_publisher_channel_pool_size: int = Field(default=4, alias="RABBITMQ_PUBLISHER_CHANNEL_POOL_SIZE")
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     database_url: str = Field(
         default=_LOCAL_MYSQL_DEFAULT_URL,
@@ -46,6 +49,10 @@ class Settings(BaseSettings):
     db_user: str = Field(default="kaiops", alias="DB_USER")
     db_password: str = Field(default="kaiops", alias="DB_PASSWORD")
     db_database: str = Field(default="kaiops", alias="DB_DATABASE")
+    db_pool_size: int = Field(default=10, alias="DB_POOL_SIZE")
+    db_max_overflow: int = Field(default=20, alias="DB_MAX_OVERFLOW")
+    db_pool_timeout_seconds: float = Field(default=30.0, alias="DB_POOL_TIMEOUT_SECONDS")
+    db_pool_recycle_seconds: int = Field(default=1800, alias="DB_POOL_RECYCLE_SECONDS")
     otlp_endpoint: str | None = Field(default=None, alias="OTEL_EXPORTER_OTLP_ENDPOINT")
     model_router_url: str = Field(default="http://model-router:8000", alias="MODEL_ROUTER_URL")
     context_agent_url: str = Field(default="http://context-agent:8000", alias="CONTEXT_AGENT_URL")

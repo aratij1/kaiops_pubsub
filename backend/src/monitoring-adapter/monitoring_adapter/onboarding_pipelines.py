@@ -452,7 +452,7 @@ def build_prometheus_rules_yaml(
     project_name: str,
     rules: list[dict[str, Any]],
     *,
-    include_smoke_test_alert: bool = True,
+    include_smoke_test_alert: bool = False,
 ) -> str:
     normalized_project = slugify(project_name)
     prometheus_rules = [
