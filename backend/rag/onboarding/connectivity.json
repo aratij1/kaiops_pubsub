@@ -1,7 +1,7 @@
 {
   "project": {
-    "name": "etl-orders-dq-20260722141810",
-    "owner_team": "data-platform",
+    "name": "new_kaiops",
+    "owner_team": "data",
     "environment": "prod",
     "region": "us-east-1"
   },

@@ -1,12 +1,14 @@
 from __future__ import annotations
 import asyncio
 from collections import deque
+import hashlib
+import heapq
 import json
 import os
 import re
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
@@ -95,6 +97,8 @@ from monitoring_adapter.existing_monitoring import (
     normalize_provider_name,
     verify_hmac_signature,
 )
+from monitoring_adapter.landing_pad_normalizer import normalize_landing_pad_alert
+from monitoring_adapter.landing_pad_sources import SUPPORTED_SUFFIXES, load_landing_pad_file
 from monitoring_adapter.email_ingestion import ImapConfig, email_to_alert_payload, fetch_unseen_emails
 
 ALERT_BODY = Body(...)
@@ -138,6 +142,30 @@ LANDING_PAD_ADDITIONAL_INPUT_DIRS = [
     for item in os.getenv("LANDING_PAD_ADDITIONAL_INPUT_DIRS", str(_DEFAULT_LANDING_PAD_REPLAY_DIR)).split(os.pathsep)
     if item.strip()
 ]
+# Archive folders (processed/failed/input_replayed/input_failed) are partitioned
+# by UTC date (YYYY/MM/DD) so no single directory accumulates an unbounded
+# number of entries as tickets, emails and fault-lab alerts stream in. The
+# live `input/` inbox stays flat since the watcher/Alertmanager need a cheap,
+# non-recursive scan of it and files are archived out of it quickly.
+LANDING_PAD_LISTING_LOOKBACK_DAYS = max(1, int(os.getenv("LANDING_PAD_LISTING_LOOKBACK_DAYS", "14") or 14))
+LANDING_PAD_DEDUP_LOOKBACK_DAYS = max(1, int(os.getenv("LANDING_PAD_DEDUP_LOOKBACK_DAYS", "30") or 30))
+
+# Bounds for burst ingestion (a 10,000-alert burst across CSV/email/webhook
+# sources): how many publish+persist operations may run concurrently
+# process-wide, and how long a claimed-but-never-finished input file waits
+# before being recovered for retry.
+LANDING_PAD_INGEST_CONCURRENCY = max(1, int(os.getenv("LANDING_PAD_INGEST_CONCURRENCY", "8") or 8))
+LANDING_PAD_CLAIM_STALE_MINUTES = max(1.0, float(os.getenv("LANDING_PAD_CLAIM_STALE_MINUTES", "15") or 15))
+ALERTMANAGER_DEDUP_TTL_SECONDS = max(
+    30.0,
+    float(os.getenv("ALERTMANAGER_DEDUP_TTL_SECONDS", "900") or 900),
+)
+ALERTMANAGER_DEDUP_MAX_ENTRIES = max(
+    100,
+    int(os.getenv("ALERTMANAGER_DEDUP_MAX_ENTRIES", "10000") or 10000),
+)
+_ALERTMANAGER_RECENT_DELIVERIES: dict[str, float] = {}
+
 LANDING_PAD_FILE_WATCHER_ENABLED = str(os.getenv("LANDING_PAD_FILE_WATCHER_ENABLED", "true")).strip().lower() in {
     "1",
     "true",
@@ -148,6 +176,83 @@ LANDING_PAD_FILE_WATCHER_INTERVAL_SECONDS = max(
     2.0,
     float(os.getenv("LANDING_PAD_FILE_WATCHER_INTERVAL_SECONDS", "5") or 5),
 )
+
+_PROMPT_FRAGMENT_PATTERNS = (
+    "identify the most likely root cause using only",
+    "assess customer, service, dependency, and business impact",
+    "generate an operator-safe remediation",
+)
+
+
+def _is_prompt_fragment(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    return any(fragment in text for fragment in _PROMPT_FRAGMENT_PATTERNS)
+
+
+def _clean_recommendation_text(value: Any, *, keys: tuple[str, ...], fallback: str) -> str:
+    """Return operator-readable recommendation text from model/scenario payloads."""
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    if not text:
+        return fallback
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return fallback if _is_prompt_fragment(text) else text
+        if isinstance(payload, dict):
+            for key in keys:
+                candidate = payload.get(key)
+                if isinstance(candidate, (str, int, float)):
+                    candidate_text = str(candidate).strip()
+                    if candidate_text and not _is_prompt_fragment(candidate_text):
+                        return candidate_text
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            if metadata.get("fallback"):
+                return fallback
+            for key in ("summary", "content", "title"):
+                candidate = payload.get(key)
+                if isinstance(candidate, (str, int, float)):
+                    candidate_text = str(candidate).strip()
+                    if candidate_text and not _is_prompt_fragment(candidate_text):
+                        return candidate_text
+        return fallback
+    return fallback if _is_prompt_fragment(text) else text
+
+
+def _clean_resolution_fields(scenario: dict[str, Any], service: str, description: str) -> dict[str, str]:
+    service_name = str(service or scenario.get("service") or "the affected service").strip()
+    description_text = str(description or scenario.get("description") or "").strip()
+    root_fallback = (
+        f"{service_name} is unhealthy or unreachable according to the selected alert signal."
+    )
+    if description_text:
+        root_fallback = f"{description_text}"
+    impact_fallback = (
+        f"{service_name} may have degraded availability, latency, or dependent workflow impact until recovery is validated."
+    )
+    action_fallback = "Execute the approved runbook remediation script and validation checks."
+    root_cause = _clean_recommendation_text(
+        scenario.get("root_cause"),
+        keys=("root_cause", "cause", "summary", "content", "title"),
+        fallback=root_fallback,
+    )
+    impact = _clean_recommendation_text(
+        scenario.get("impact"),
+        keys=("impact", "customer_impact", "dependency_impact", "summary", "content", "title"),
+        fallback=impact_fallback,
+    )
+    recommended_action = _clean_recommendation_text(
+        scenario.get("recommended_action"),
+        keys=("recommended_action", "action", "summary", "content", "title"),
+        fallback=action_fallback,
+    )
+    return {
+        "root_cause": root_cause,
+        "impact": impact,
+        "recommended_action": recommended_action,
+    }
 LANDING_PAD_FILE_WATCHER_BATCH_SIZE = max(
     1,
     min(int(os.getenv("LANDING_PAD_FILE_WATCHER_BATCH_SIZE", "25") or 25), 200),
@@ -155,6 +260,14 @@ LANDING_PAD_FILE_WATCHER_BATCH_SIZE = max(
 LANDING_PAD_FILE_WATCHER_STALE_HOURS = max(
     0.0,
     float(os.getenv("LANDING_PAD_FILE_WATCHER_STALE_HOURS", "24") or 24),
+)
+LANDING_PAD_SCAN_MAX_FILES = max(
+    100,
+    int(os.getenv("LANDING_PAD_SCAN_MAX_FILES", "4000") or 4000),
+)
+LANDING_PAD_SCAN_MAX_PARSE_BYTES = max(
+    16_384,
+    int(os.getenv("LANDING_PAD_SCAN_MAX_PARSE_BYTES", "1048576") or 1_048_576),
 )
 # Jira ticket ingestion — shared-secret webhook auth (checked via
 # ?token=... query param or X-Webhook-Token header). Empty secret means the
@@ -194,6 +307,49 @@ _ALLOWED_DEPLOYMENT_MODES = {"on_prem", "azure_cloud"}
 ONBOARDING_RULE_EVENTS = "onboarding-rule-events"
 
 
+def _date_partition_dir(base: Path, moment: datetime) -> Path:
+    """Return the YYYY/MM/DD partition of `base` for the given UTC moment."""
+    return base / f"{moment:%Y}" / f"{moment:%m}" / f"{moment:%d}"
+
+
+def _recent_date_partition_dirs(base: Path, *, days: int) -> list[Path]:
+    """Existing date partitions under `base` for the last `days` days, newest first.
+
+    Bounds directory scans (dedup checks, recent-file listings) to a fixed
+    number of small partitions instead of walking a growing multi-year archive.
+    """
+    now = datetime.now(timezone.utc)
+    directories: list[Path] = []
+    seen: set[Path] = set()
+    for offset in range(days):
+        candidate = _date_partition_dir(base, now - timedelta(days=offset))
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_dir():
+            directories.append(candidate)
+    return directories
+
+
+def _collect_partitioned_json_files(base: Path, *, lookback_days: int, max_files: int | None = None) -> list[Path]:
+    files: list[Path] = []
+    for directory in _recent_date_partition_dirs(base, days=lookback_days):
+        candidates = (path for path in directory.glob("*.json"))
+        if max_files is None:
+            ordered = sorted(candidates, key=lambda item: item.name, reverse=True)
+        else:
+            # Archive filenames start with a fixed-width UTC timestamp. Select
+            # by name without stat()ing every historical file, then perform
+            # metadata reads only for the small bounded result set.
+            ordered = heapq.nlargest(max_files, candidates, key=lambda item: item.name)
+        files.extend(ordered)
+        if max_files is not None and len(files) >= max_files:
+            return heapq.nlargest(max_files, files, key=lambda item: item.name)
+    if max_files is not None:
+        return heapq.nlargest(max_files, files, key=lambda item: item.name)
+    return files
+
+
 def _persist_alert_to_landing_pad(
     mapped_payload: dict[str, Any],
     raw_alert: dict[str, Any],
@@ -204,6 +360,8 @@ def _persist_alert_to_landing_pad(
     try:
         base_dir = LANDING_PAD_PROCESSED_DIR if status == "processed" else LANDING_PAD_FAILED_DIR
         now = datetime.now(timezone.utc)
+        target_dir = _date_partition_dir(base_dir, now)
+        target_dir.mkdir(parents=True, exist_ok=True)
         source_slug = slugify(str(mapped_payload.get("source") or "unknown-source")) or "unknown-source"
         date_segment = now.strftime("%Y-%m-%d")
         target_dir = base_dir / source_slug / date_segment
@@ -229,16 +387,43 @@ def _persist_alert_to_landing_pad(
         return None
 
 
-def _landing_pad_file_rows(source_dir: Path, limit: int) -> list[dict[str, Any]]:
+def _write_alert_to_landing_pad_input(mapped_payload: dict[str, Any], raw_alert: dict[str, Any]) -> Path:
+    LANDING_PAD_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))
+    labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
+    fingerprint = str(labels.get("alert_fingerprint") or uuid.uuid4().hex).strip() or uuid.uuid4().hex
+    safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:24]
+    file_name = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}_{alert_name}_{safe_fingerprint}_{uuid.uuid4().hex[:8]}.json"
+    out_path = LANDING_PAD_INPUT_DIR / file_name
+    tmp_path = out_path.with_suffix(".tmp")
+    payload = {
+        "received_at": now.isoformat(),
+        "source": "prometheus-alertmanager",
+        "status": "received",
+        "alert": mapped_payload,
+        "raw": raw_alert,
+    }
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(out_path)
+    return out_path
+
+
+def _landing_pad_file_rows(source_dir: Path, limit: int, *, partitioned: bool = False) -> list[dict[str, Any]]:
     source_dir.mkdir(parents=True, exist_ok=True)
     # rglob (not glob) so this still finds files once processed/failed are
     # nested into <source>/<date>/ subfolders; harmless no-op for the flat
     # input/replayed/failed-input dirs this is also used for.
-    files = sorted(
-        [path for path in source_dir.rglob("*.json") if path.is_file()],
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )[:limit]
+    if partitioned:
+        candidates = _collect_partitioned_json_files(source_dir, lookback_days=LANDING_PAD_LISTING_LOOKBACK_DAYS)
+    else:
+        # Keep inbox scans cheap even when legacy folders contain very deep trees.
+        candidates = [
+            path
+            for path in source_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+        ]
+    files = heapq.nlargest(limit, candidates, key=lambda path: path.stat().st_mtime)
     rows: list[dict[str, Any]] = []
     for path in files:
         entry: dict[str, Any] = {
@@ -248,8 +433,19 @@ def _landing_pad_file_rows(source_dir: Path, limit: int) -> list[dict[str, Any]]
             "size_bytes": int(path.stat().st_size),
         }
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            alert = payload.get("alert") if isinstance(payload, dict) and isinstance(payload.get("alert"), dict) else payload
+            if path.suffix.lower() == ".json" and path.stat().st_size <= LANDING_PAD_SCAN_MAX_PARSE_BYTES:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                alert = payload.get("alert") if isinstance(payload, dict) and isinstance(payload.get("alert"), dict) else payload
+            elif path.suffix.lower() == ".json":
+                payload = {"source": "json", "received_at": entry["modified_at"]}
+                alert = {}
+                entry["parse_error"] = (
+                    f"skipped parse for file larger than LANDING_PAD_SCAN_MAX_PARSE_BYTES={LANDING_PAD_SCAN_MAX_PARSE_BYTES}"
+                )
+            else:
+                loaded = load_landing_pad_file(path)
+                alert = loaded[0][0] if loaded else {}
+                payload = {"source": alert.get("source"), "received_at": entry["modified_at"]}
             labels = alert.get("labels", {}) if isinstance(alert, dict) and isinstance(alert.get("labels"), dict) else {}
             annotations = alert.get("annotations", {}) if isinstance(alert, dict) and isinstance(alert.get("annotations"), dict) else {}
             entry.update(
@@ -275,20 +471,28 @@ def _landing_pad_input_files(limit: int) -> list[Path]:
     for directory in LANDING_PAD_ADDITIONAL_INPUT_DIRS:
         directory.mkdir(parents=True, exist_ok=True)
     candidate_dirs = [LANDING_PAD_INPUT_DIR, *LANDING_PAD_ADDITIONAL_INPUT_DIRS]
-    return sorted(
-        [path for directory in candidate_dirs for path in directory.glob("*.json") if path.is_file()],
-        key=lambda path: path.stat().st_mtime,
-    )[:limit]
+    candidates: list[Path] = []
+    scanned = 0
+    for directory in candidate_dirs:
+        for path in directory.glob("*"):
+            if scanned >= LANDING_PAD_SCAN_MAX_FILES:
+                break
+            scanned += 1
+            if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES:
+                candidates.append(path)
+        if scanned >= LANDING_PAD_SCAN_MAX_FILES:
+            break
+    return heapq.nsmallest(limit, candidates, key=lambda path: path.stat().st_mtime)
 
 
 def _mapped_alerts_from_landing_pad_payload(payload: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     if isinstance(payload.get("alert"), dict):
         raw_alert = payload.get("raw") if isinstance(payload.get("raw"), dict) else payload["alert"]
-        return [(payload["alert"], raw_alert)]
+        return [(normalize_landing_pad_alert(payload["alert"], raw_alert), raw_alert)]
 
     alerts_payload = payload.get("alerts") if isinstance(payload.get("alerts"), list) else None
     if alerts_payload is None:
-        return [(payload, payload)]
+        return [(normalize_landing_pad_alert(payload, payload), payload)]
 
     common_labels = payload.get("commonLabels", {}) if isinstance(payload.get("commonLabels"), dict) else {}
     common_annotations = payload.get("commonAnnotations", {}) if isinstance(payload.get("commonAnnotations"), dict) else {}
@@ -303,56 +507,61 @@ def _mapped_alerts_from_landing_pad_payload(payload: dict[str, Any]) -> list[tup
         annotations = item.get("annotations", {}) if isinstance(item.get("annotations"), dict) else {}
         merged_labels = {**common_labels, **labels}
         merged_annotations = {**common_annotations, **annotations}
-        mapped.append(
-            (
-                {
-                    "source": "prometheus-alertmanager",
-                    "name": str(merged_labels.get("alertname") or "prometheus-alert"),
-                    "service": str(
-                        merged_labels.get("service")
-                        or merged_labels.get("job")
-                        or merged_labels.get("instance")
-                        or "kaiops-platform"
-                    ),
-                    "environment": str(merged_labels.get("environment") or merged_labels.get("env") or "prod"),
-                    "severity": str(merged_labels.get("severity") or "warning").lower(),
-                    "description": str(
-                        merged_annotations.get("description")
-                        or merged_annotations.get("summary")
-                        or merged_labels.get("alertname")
-                        or "Prometheus alert"
-                    ),
-                    "labels": {
-                        **merged_labels,
-                        "alert_status": status,
-                        "alert_fingerprint": str(item.get("fingerprint") or ""),
-                    },
-                    "annotations": {
-                        **merged_annotations,
-                        "startsAt": str(item.get("startsAt") or ""),
-                        "endsAt": str(item.get("endsAt") or ""),
-                        "generatorURL": str(item.get("generatorURL") or ""),
-                    },
-                },
-                item,
-            )
-        )
+        mapped_payload = {
+            "source": "prometheus-alertmanager",
+            "name": str(merged_labels.get("alertname") or "prometheus-alert"),
+            "service": str(
+                merged_labels.get("service")
+                or merged_labels.get("job")
+                or merged_labels.get("instance")
+                or "kaiops-platform"
+            ),
+            "environment": str(merged_labels.get("environment") or merged_labels.get("env") or "prod"),
+            "severity": str(merged_labels.get("severity") or "warning").lower(),
+            "description": str(
+                merged_annotations.get("description")
+                or merged_annotations.get("summary")
+                or merged_labels.get("alertname")
+                or "Prometheus alert"
+            ),
+            "labels": {
+                **merged_labels,
+                "alert_status": status,
+                "alert_fingerprint": str(item.get("fingerprint") or ""),
+            },
+            "annotations": {
+                **merged_annotations,
+                "startsAt": str(item.get("startsAt") or ""),
+                "endsAt": str(item.get("endsAt") or ""),
+                "generatorURL": str(item.get("generatorURL") or ""),
+            },
+        }
+        mapped.append((normalize_landing_pad_alert(mapped_payload, item), item))
     return mapped
 
 
 def _archive_landing_pad_input_file(path: Path, target_dir: Path) -> str:
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_path = target_dir / path.name
+    partition_dir = _date_partition_dir(target_dir, datetime.now(timezone.utc))
+    partition_dir.mkdir(parents=True, exist_ok=True)
+    original_name = path.name.split("_", 1)[1] if path.parent.name == ".claiming" and "_" in path.name else path.name
+    target_path = partition_dir / original_name
     if target_path.exists():
-        target_path = target_dir / f"{path.stem}_{uuid.uuid4().hex[:8]}{path.suffix}"
-    path.replace(target_path)
+        original_path = Path(original_name)
+        target_path = partition_dir / f"{original_path.stem}_{uuid.uuid4().hex[:8]}{original_path.suffix}"
+    try:
+        path.replace(target_path)
+    except FileNotFoundError:
+        # Another worker may have already claimed or archived the file.
+        # Treat that as an idempotent archive outcome so the replay path
+        # can complete without surfacing a hard failure to the gateway.
+        return str(target_path)
     return str(target_path)
 
 
-def _landing_pad_input_is_stale(path: Path) -> bool:
+def _landing_pad_input_is_stale(path: Path, *, original_parent: Path) -> bool:
     if LANDING_PAD_FILE_WATCHER_STALE_HOURS <= 0:
         return False
-    if path.parent.resolve() != LANDING_PAD_INPUT_DIR.resolve():
+    if original_parent.resolve() != LANDING_PAD_INPUT_DIR.resolve():
         return False
     modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
     age_seconds = (datetime.now(timezone.utc) - modified_at).total_seconds()
@@ -365,12 +574,119 @@ def _processed_landing_pad_match_exists(mapped_payload: dict[str, Any]) -> bool:
     fingerprint = str(labels.get("alert_fingerprint") or "no-fingerprint").strip() or "no-fingerprint"
     safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:24]
     pattern = f"*_{alert_name}_{safe_fingerprint}.json"
-    return any(path.is_file() for path in LANDING_PAD_PROCESSED_DIR.rglob(pattern))
+    # Dedup only needs to look back a bounded window of date partitions rather
+    # than the entire historical archive, which otherwise grows without limit.
+    return any(
+        path.is_file()
+        for directory in _recent_date_partition_dirs(LANDING_PAD_PROCESSED_DIR, days=LANDING_PAD_DEDUP_LOOKBACK_DAYS)
+        for path in directory.glob(pattern)
+    )
 
 
-async def _process_landing_pad_input_file(path: Path) -> dict[str, Any]:
+async def _claim_landing_pad_input_file(path: Path) -> tuple[Path, Path] | None:
+    """Atomically move `path` into a sibling `.claiming/` dir so different
+    files never contend and the same file is never processed twice.
+
+    `Path.rename` is atomic at the syscall level for the source path on both
+    POSIX and Windows NTFS: once one caller's rename succeeds, a concurrent
+    renamer of the same source path fails immediately with FileNotFoundError.
+    This fully replaces the need for a global lock across files. Claiming
+    happens in a directory sibling to the file's own parent (not one shared
+    global dir) since LANDING_PAD_ADDITIONAL_INPUT_DIRS may live on a
+    different volume, and rename requires same-volume source/destination.
+    """
+    original_parent = path.parent
+    claim_dir = original_parent / ".claiming"
+    claim_dir.mkdir(parents=True, exist_ok=True)
+    claimed_path = claim_dir / f"{uuid.uuid4().hex[:8]}_{path.name}"
+    for attempt in range(3):
+        try:
+            path.rename(claimed_path)
+            return claimed_path, original_parent
+        except FileNotFoundError:
+            return None
+        except PermissionError:
+            # Transient on Windows (Defender/indexer briefly holding a lock on
+            # a just-written file); essentially never happens in Linux
+            # containers. Give it a couple of short retries, then defer to
+            # the next watcher tick rather than blocking this one.
+            if attempt >= 2:
+                return None
+            await asyncio.sleep(0.05)
+        except OSError:
+            return None
+    return None
+
+
+def _recover_stale_claims() -> int:
+    """Move `.claiming/` entries older than LANDING_PAD_CLAIM_STALE_MINUTES
+    back into their parent input dir for retry.
+
+    If a worker crashes after claiming a file but before archiving it, the
+    claimed file is invisible to the watcher forever (it only lists the
+    parent dir, never `.claiming/`). This sweep recovers those orphans.
+    """
+    recovered = 0
+    now = datetime.now(timezone.utc)
+    for directory in [LANDING_PAD_INPUT_DIR, *LANDING_PAD_ADDITIONAL_INPUT_DIRS]:
+        claim_dir = directory / ".claiming"
+        if not claim_dir.is_dir():
+            continue
+        for claimed_path in claim_dir.iterdir():
+            if not claimed_path.is_file():
+                continue
+            try:
+                modified_at = datetime.fromtimestamp(claimed_path.stat().st_mtime, tz=timezone.utc)
+                age_seconds = (now - modified_at).total_seconds()
+                if age_seconds <= LANDING_PAD_CLAIM_STALE_MINUTES * 60:
+                    continue
+                original_name = claimed_path.name.split("_", 1)[1] if "_" in claimed_path.name else claimed_path.name
+                target_path = directory / original_name
+                if target_path.exists():
+                    target_path = directory / f"{uuid.uuid4().hex[:8]}_{original_name}"
+                claimed_path.replace(target_path)
+                recovered += 1
+            except Exception:
+                logger.exception("failed to recover stale landing-pad claim %s", claimed_path)
+    return recovered
+
+
+# Shared across every publish+persist operation (CSV/webhook rows, individual
+# files, whole watcher-tick batches) so total in-flight ingestion work stays
+# globally bounded regardless of how many files or rows are involved at once.
+_LANDING_PAD_INGEST_SEMAPHORE = asyncio.Semaphore(LANDING_PAD_INGEST_CONCURRENCY)
+
+
+async def _ingest_one_landing_pad_row(mapped_payload: dict[str, Any], raw_alert: dict[str, Any]) -> dict[str, Any]:
+    """Publish+persist a single alert row, bounded by the shared ingest
+    semaphore. Raises on failure after recording a `failed` audit entry for
+    this row; callers gather with return_exceptions=True so one bad row never
+    blocks its siblings."""
+    async with _LANDING_PAD_INGEST_SEMAPHORE:
+        try:
+            alert = _build_alert_from_payload(mapped_payload)
+            await _publish_ingested_alert(alert)
+            landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, raw_alert, status="processed")
+            return {
+                "alert_id": str(alert.id),
+                "name": alert.name,
+                "service": alert.service,
+                "severity": alert.severity.value,
+                "landing_pad_file": landing_pad_file,
+            }
+        except Exception as exc:
+            _persist_alert_to_landing_pad(mapped_payload, raw_alert, status="failed", error=str(exc))
+            raise
+
+
+async def _process_landing_pad_input_file_unlocked(
+    path: Path,
+    *,
+    original_parent: Path,
+    skip_existing_processed: bool = True,
+) -> dict[str, Any]:
     try:
-        if _landing_pad_input_is_stale(path):
+        if _landing_pad_input_is_stale(path, original_parent=original_parent):
             archived_path = _archive_landing_pad_input_file(path, LANDING_PAD_INPUT_REPLAYED_DIR)
             return {
                 "file": path.name,
@@ -379,16 +695,22 @@ async def _process_landing_pad_input_file(path: Path) -> dict[str, Any]:
                 "reason": f"input file older than {LANDING_PAD_FILE_WATCHER_STALE_HOURS:g} hours",
             }
 
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("landing pad input must be a JSON object")
-
-        ingested_rows: list[dict[str, Any]] = []
-        mapped_alerts = _mapped_alerts_from_landing_pad_payload(payload)
+        if path.suffix.lower() == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("landing pad input must be a JSON object")
+            source_rows = load_landing_pad_file(path)
+            mapped_alerts = (
+                source_rows
+                if source_rows and source_rows[0][0].get("source") == "email"
+                else _mapped_alerts_from_landing_pad_payload(payload)
+            )
+        else:
+            mapped_alerts = load_landing_pad_file(path)
         if not mapped_alerts:
             raise ValueError("landing pad input did not contain a firing alert")
 
-        if all(_processed_landing_pad_match_exists(mapped_payload) for mapped_payload, _ in mapped_alerts):
+        if skip_existing_processed and all(_processed_landing_pad_match_exists(mapped_payload) for mapped_payload, _ in mapped_alerts):
             archived_path = _archive_landing_pad_input_file(path, LANDING_PAD_INPUT_REPLAYED_DIR)
             return {
                 "file": path.name,
@@ -397,27 +719,34 @@ async def _process_landing_pad_input_file(path: Path) -> dict[str, Any]:
                 "reason": "matching processed landing-pad audit already exists",
             }
 
-        for mapped_payload, raw_alert in mapped_alerts:
-            alert = _build_alert_from_payload(mapped_payload)
-            await _publish_ingested_alert(alert)
-            # _build_alert_from_payload derives extra labels (e.g. support_tier)
-            # onto its own internal copy of the labels dict, not the caller's
-            # mapped_payload — sync back so the audit record matches what was
-            # actually published, not the pre-enrichment input.
-            mapped_payload["labels"] = dict(alert.labels)
-            landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, raw_alert, status="processed")
-            ingested_rows.append(
-                {
-                    "alert_id": str(alert.id),
-                    "name": alert.name,
-                    "service": alert.service,
-                    "severity": alert.severity.value,
-                    "landing_pad_file": landing_pad_file,
-                }
-            )
+        results = await asyncio.gather(
+            *(_ingest_one_landing_pad_row(mapped_payload, raw_alert) for mapped_payload, raw_alert in mapped_alerts),
+            return_exceptions=True,
+        )
+        ingested_rows = [row for row in results if not isinstance(row, Exception)]
+        row_failures = [
+            {"index": index, "error": str(row)} for index, row in enumerate(results) if isinstance(row, Exception)
+        ]
 
-        archived_path = _archive_landing_pad_input_file(path, LANDING_PAD_INPUT_REPLAYED_DIR)
-        return {"file": path.name, "status": "processed", "archived_path": archived_path, "alerts": ingested_rows}
+        if not row_failures:
+            status = "processed"
+            archive_dir = LANDING_PAD_INPUT_REPLAYED_DIR
+        elif ingested_rows:
+            status = "processed_partial"
+            archive_dir = LANDING_PAD_INPUT_REPLAYED_DIR
+        else:
+            status = "failed_all_rows"
+            archive_dir = LANDING_PAD_INPUT_FAILED_DIR
+
+        archived_path = _archive_landing_pad_input_file(path, archive_dir)
+        return {
+            "file": path.name,
+            "status": status,
+            "archived_path": archived_path,
+            "alerts": ingested_rows,
+            "row_count": len(mapped_alerts),
+            "row_failures": row_failures,
+        }
     except Exception as exc:
         logger.exception("failed to replay landing pad input file %s", path)
         try:
@@ -425,6 +754,32 @@ async def _process_landing_pad_input_file(path: Path) -> dict[str, Any]:
         except Exception:
             archived_path = str(path)
         return {"file": path.name, "status": "failed", "error": str(exc), "archived_path": archived_path}
+
+
+async def _process_landing_pad_input_file(
+    path: Path,
+    *,
+    skip_existing_processed: bool = True,
+) -> dict[str, Any]:
+    # Alertmanager requests can process a newly written file directly while
+    # the optional watcher independently scans the same directory. Claiming
+    # the file (an atomic rename into a sibling .claiming/ dir) before doing
+    # any work means the two can never race on the same file, and different
+    # files are never serialized against each other.
+    claimed = await _claim_landing_pad_input_file(path)
+    if claimed is None:
+        return {
+            "file": path.name,
+            "status": "already_processed",
+            "archived_path": str(path),
+            "reason": "landing-pad input was claimed by another processor",
+        }
+    claimed_path, original_parent = claimed
+    return await _process_landing_pad_input_file_unlocked(
+        claimed_path,
+        original_parent=original_parent,
+        skip_existing_processed=skip_existing_processed,
+    )
 
 
 class OnboardingProviderStatus(BaseModel):
@@ -611,7 +966,7 @@ class OnboardingCompletePayload(BaseModel):
     source_documents: list[dict[str, Any]] = Field(default_factory=list)
     selected_monitoring_tool: str | None = None
     generate_documents: bool = True
-    include_smoke_test_alert: bool = True
+    include_smoke_test_alert: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -637,7 +992,7 @@ class OnboardingCompletePayload(BaseModel):
         onboarding_path = str(normalized.get("onboarding_path") or "existing_monitoring").strip().lower()
         normalized["onboarding_path"] = onboarding_path or "existing_monitoring"
         normalized["generate_documents"] = bool(normalized.get("generate_documents", True))
-        normalized["include_smoke_test_alert"] = bool(normalized.get("include_smoke_test_alert", True))
+        normalized["include_smoke_test_alert"] = bool(normalized.get("include_smoke_test_alert", False))
         return normalized
 
     @model_validator(mode="after")
@@ -797,34 +1152,42 @@ INCIDENT_PROJECTION_WORKER_ENABLED = str(
     os.getenv("INCIDENT_PROJECTION_WORKER_ENABLED", "true")
 ).strip().lower() in {"1", "true", "yes", "on"}
 INCIDENT_PROJECTION_INTERVAL_SECONDS = max(
-    5.0,
-    float(os.getenv("INCIDENT_PROJECTION_INTERVAL_SECONDS", "15") or 15),
+    15.0,
+    float(os.getenv("INCIDENT_PROJECTION_INTERVAL_SECONDS", "60") or 60),
+)
+INCIDENT_PROJECTION_BATCH_SIZE = max(
+    10,
+    min(int(os.getenv("INCIDENT_PROJECTION_BATCH_SIZE", "100") or 100), 500),
 )
 async def _incident_projection_worker() -> None:
     stop_event = app.state.monitoring_adapter_stop_event
     while not stop_event.is_set():
+        # This is a reconciliation/repair loop, not the primary event path.
+        # Delay it so startup and interactive reads receive capacity first.
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=float(INCIDENT_PROJECTION_INTERVAL_SECONDS))
+            continue
+        except asyncio.TimeoutError:
+            pass
+
         try:
             if settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
                 async with app.state.session_factory() as session:
                     repo = IncidentRepository(session)
-                    await repo.project_recent_incident_events(limit=800)
+                    await repo.project_recent_incident_events(limit=INCIDENT_PROJECTION_BATCH_SIZE)
                     await session.commit()
             _record_worker_success("incident_projection_worker")
         except Exception as exc:
             _record_worker_failure("incident_projection_worker", exc)
-
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=float(INCIDENT_PROJECTION_INTERVAL_SECONDS))
-        except asyncio.TimeoutError:
-            continue
 
 
 async def _landing_pad_file_watcher() -> None:
     stop_event = app.state.monitoring_adapter_stop_event
     while not stop_event.is_set():
         try:
-            for path in _landing_pad_input_files(LANDING_PAD_FILE_WATCHER_BATCH_SIZE):
-                await _process_landing_pad_input_file(path)
+            _recover_stale_claims()
+            paths = _landing_pad_input_files(LANDING_PAD_FILE_WATCHER_BATCH_SIZE)
+            await asyncio.gather(*(_process_landing_pad_input_file(path) for path in paths), return_exceptions=True)
             _record_worker_success("landing_pad_file_watcher")
         except Exception as exc:
             _record_worker_failure("landing_pad_file_watcher", exc)
@@ -1932,15 +2295,20 @@ async def run_local_payment_workflow(
         )
     )
     model_errors: list[dict[str, str]] = []
+    cleaned_resolution = _clean_resolution_fields(
+        scenario,
+        service=enriched_alert.service,
+        description=enriched_alert.description,
+    )
     try:
         recommendation = await ai_client.resolve(context=context)
     except Exception as exc:
         recommendation = Recommendation(
             incident_id=incident.id,
-            root_cause=scenario["root_cause"],
+            root_cause=cleaned_resolution["root_cause"],
             confidence=0.72,
-            impact=scenario["impact"],
-            recommended_action=scenario["recommended_action"],
+            impact=cleaned_resolution["impact"],
+            recommended_action=cleaned_resolution["recommended_action"],
             severity=enriched_alert.severity,
             rationale=(
                 "RCA model route failed; recommendation is based on retrieved RAG context "
@@ -1958,14 +2326,27 @@ async def run_local_payment_workflow(
                 "error": str(exc),
             }
         )
-    recommendation.root_cause = scenario["root_cause"]
-    recommendation.impact = scenario["impact"]
-    recommendation.recommended_action = scenario["recommended_action"]
+    recommendation.root_cause = _clean_recommendation_text(
+        getattr(recommendation, "root_cause", None),
+        keys=("root_cause", "cause", "summary", "content", "title"),
+        fallback=cleaned_resolution["root_cause"],
+    )
+    recommendation.impact = _clean_recommendation_text(
+        getattr(recommendation, "impact", None),
+        keys=("impact", "customer_impact", "dependency_impact", "summary", "content", "title"),
+        fallback=cleaned_resolution["impact"],
+    )
+    recommendation.recommended_action = _clean_recommendation_text(
+        getattr(recommendation, "recommended_action", None),
+        keys=("recommended_action", "action", "summary", "content", "title"),
+        fallback=cleaned_resolution["recommended_action"],
+    )
     recommendation.rationale = (
-        f"Scenario evidence links {scenario['root_cause']} to {scenario['impact']}; "
-        f"recommended action is {scenario['recommended_action']}."
+        f"Evidence links {recommendation.root_cause} to {recommendation.impact}; "
+        f"recommended action is {recommendation.recommended_action}."
     )
     recommendation.trace_id = trace_id
+    recommendation.metadata["display_fields_sanitized"] = True
     recommendation.metadata["rag_documents"] = context.metadata.get("rag_documents", 0)
     recommendation.metadata["rag_matches"] = context.metadata.get("rag_matches", [])
     recommendation.metadata["rag_top_similarity"] = context.metadata.get("rag_top_similarity", 0.0)
@@ -2012,8 +2393,8 @@ async def run_local_payment_workflow(
         comparison_payload = {
             "service": enriched_alert.service,
             "incident": incident.title,
-            "root_cause": scenario["root_cause"],
-            "recommended_action": scenario["recommended_action"],
+            "root_cause": recommendation.root_cause,
+            "recommended_action": recommendation.recommended_action,
         }
         comparison_prompt = PROMPT_SUMMARIZE_RCA
         try:
@@ -2206,7 +2587,7 @@ async def run_local_payment_workflow(
             "scenario": {
                 "id": flow_id,
                 "title": scenario["title"],
-                "recommended_action": scenario["recommended_action"],
+                "recommended_action": recommendation.recommended_action,
             },
             "alert": enriched_alert.model_dump(mode="json"),
             "incident": incident.model_dump(mode="json"),
@@ -2244,7 +2625,7 @@ async def run_local_payment_workflow(
             "scenario": {
                 "id": flow_id,
                 "title": scenario["title"],
-                "recommended_action": scenario["recommended_action"],
+                "recommended_action": recommendation.recommended_action,
             },
             "alert": enriched_alert.model_dump(mode="json"),
             "incident": incident.model_dump(mode="json"),
@@ -2431,7 +2812,7 @@ async def run_local_payment_workflow(
         "scenario": {
             "id": flow_id,
             "title": scenario["title"],
-            "recommended_action": scenario["recommended_action"],
+            "recommended_action": recommendation.recommended_action,
         },
         "alert": enriched_alert.model_dump(mode="json"),
         "incident": incident.model_dump(mode="json"),
@@ -2975,6 +3356,7 @@ def _build_alert_from_payload(payload: dict[str, Any], trace_id: str | None = No
         description=payload.get("description", annotations.get("summary", "")),
         labels=labels,
         annotations=annotations,
+        correlation_id=str(payload.get("correlation_id") or labels.get("incident_correlation_id") or "") or None,
         trace_id=trace_id,
     )
 
@@ -3772,6 +4154,96 @@ async def ingest_alert(payload: dict = ALERT_BODY, x_trace_id: str | None = Head
     return alert
 
 
+async def _ingest_one_alertmanager_alert(mapped_payload: dict[str, Any], item: dict[str, Any], status: str) -> dict[str, Any]:
+    """Write+process one Alertmanager alert. Concurrency is bounded inside
+    _process_landing_pad_input_file's per-row worker (the shared ingest
+    semaphore), so this function needs no bound of its own."""
+    labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
+    alertname = str(labels.get("alertname") or "unknown-alert")
+    service = str(mapped_payload.get("service") or "unknown")
+    try:
+        landing_pad_input_file = _write_alert_to_landing_pad_input(mapped_payload, item)
+        process_result = await _process_landing_pad_input_file(
+            landing_pad_input_file,
+            skip_existing_processed=False,
+        )
+    except Exception as exc:
+        logger.exception("failed to land alertmanager alert")
+        _persist_alert_to_landing_pad(mapped_payload, item, status="failed", error=str(exc))
+        return {
+            "kind": "skipped",
+            "status": status,
+            "alertname": alertname,
+            "service": service,
+            "reason": f"landing pad ingestion failed: {exc}",
+        }
+
+    processed_alerts = process_result.get("alerts") if isinstance(process_result.get("alerts"), list) else []
+    if processed_alerts:
+        return {
+            "kind": "ingested",
+            "rows": [
+                {
+                    **alert_row,
+                    "status": status,
+                    "landing_pad_input_file": str(landing_pad_input_file),
+                    "landing_pad_archived_path": process_result.get("archived_path"),
+                }
+                for alert_row in processed_alerts
+            ],
+        }
+
+    return {
+        "kind": "skipped",
+        "status": status,
+        "alertname": alertname,
+        "service": service,
+        "reason": str(process_result.get("reason") or process_result.get("error") or process_result.get("status")),
+        "landing_pad_input_file": str(landing_pad_input_file),
+        "landing_pad_archived_path": process_result.get("archived_path"),
+    }
+
+
+def _alertmanager_delivery_key(item: dict[str, Any], labels: dict[str, Any], status: str) -> str:
+    fingerprint = str(item.get("fingerprint") or "").strip()
+    if fingerprint:
+        return f"{status}:{fingerprint}"
+    stable_payload = json.dumps(
+        {
+            "status": status,
+            "labels": labels,
+            "startsAt": item.get("startsAt"),
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(stable_payload.encode("utf-8")).hexdigest()
+
+
+def _claim_alertmanager_delivery(delivery_key: str) -> bool:
+    """Return False for repeated Alertmanager notifications within the TTL.
+
+    Alertmanager intentionally repeats unresolved alerts. Without this guard,
+    every repeat creates another landing-pad file and can form a monitoring
+    feedback loop when the alert itself concerns KaiOps latency.
+    """
+    now = perf_counter()
+    cutoff = now - ALERTMANAGER_DEDUP_TTL_SECONDS
+    if len(_ALERTMANAGER_RECENT_DELIVERIES) >= ALERTMANAGER_DEDUP_MAX_ENTRIES:
+        expired = [key for key, seen_at in _ALERTMANAGER_RECENT_DELIVERIES.items() if seen_at < cutoff]
+        for key in expired:
+            _ALERTMANAGER_RECENT_DELIVERIES.pop(key, None)
+        if len(_ALERTMANAGER_RECENT_DELIVERIES) >= ALERTMANAGER_DEDUP_MAX_ENTRIES:
+            oldest = min(_ALERTMANAGER_RECENT_DELIVERIES, key=_ALERTMANAGER_RECENT_DELIVERIES.get)
+            _ALERTMANAGER_RECENT_DELIVERIES.pop(oldest, None)
+
+    last_seen = _ALERTMANAGER_RECENT_DELIVERIES.get(delivery_key)
+    if last_seen is not None and last_seen >= cutoff:
+        return False
+    _ALERTMANAGER_RECENT_DELIVERIES[delivery_key] = now
+    return True
+
+
 @app.post("/alerts/alertmanager")
 async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
     alerts_payload = payload.get("alerts", []) if isinstance(payload, dict) else []
@@ -3782,7 +4254,7 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
     common_annotations = payload.get("commonAnnotations", {}) if isinstance(payload.get("commonAnnotations"), dict) else {}
 
     received = len(alerts_payload)
-    ingested_rows: list[dict[str, Any]] = []
+    queued_rows: list[dict[str, Any]] = []
     skipped_rows: list[dict[str, Any]] = []
 
     for item in alerts_payload:
@@ -3795,6 +4267,13 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
         annotations = item.get("annotations", {}) if isinstance(item.get("annotations"), dict) else {}
         merged_labels = {**common_labels, **labels}
         merged_annotations = {**common_annotations, **annotations}
+        origin_system = str(
+            merged_labels.get("source_system")
+            or merged_labels.get("origin_system")
+            or merged_labels.get("source")
+            or "prometheus"
+        ).strip().lower() or "prometheus"
+        delivery_key = _alertmanager_delivery_key(item, merged_labels, status)
 
         if status != "firing":
             skipped_rows.append(
@@ -3806,9 +4285,19 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 }
             )
             continue
+        if not _claim_alertmanager_delivery(delivery_key):
+            skipped_rows.append(
+                {
+                    "status": status,
+                    "alertname": str(merged_labels.get("alertname") or "unknown-alert"),
+                    "service": str(merged_labels.get("service") or merged_labels.get("job") or "unknown"),
+                    "reason": "Duplicate Alertmanager delivery suppressed within deduplication window",
+                }
+            )
+            continue
 
         mapped_payload = {
-            "source": "prometheus-alertmanager",
+            "source": origin_system,
             "name": str(merged_labels.get("alertname") or "prometheus-alert"),
             "service": str(merged_labels.get("service") or merged_labels.get("job") or merged_labels.get("instance") or "kaiops-platform"),
             "environment": str(merged_labels.get("environment") or merged_labels.get("env") or "prod"),
@@ -3816,6 +4305,9 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
             "description": str(merged_annotations.get("description") or merged_annotations.get("summary") or merged_labels.get("alertname") or "Prometheus alert"),
             "labels": {
                 **merged_labels,
+                "origin_system": origin_system,
+                "ingestion_channel": "monitoring",
+                "transport": "alertmanager",
                 "alert_status": status,
                 "alert_fingerprint": str(item.get("fingerprint") or ""),
             },
@@ -3826,41 +4318,34 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 "generatorURL": str(item.get("generatorURL") or ""),
             },
         }
-
         try:
-            alert = _build_alert_from_payload(mapped_payload, trace_id=x_trace_id)
-            await _publish_ingested_alert(alert)
+            landing_pad_input_file = _write_alert_to_landing_pad_input(mapped_payload, item)
+            queued_rows.append(
+                {
+                    "status": status,
+                    "alertname": mapped_payload["name"],
+                    "service": mapped_payload["service"],
+                    "landing_pad_input_file": str(landing_pad_input_file),
+                }
+            )
         except Exception as exc:
-            logger.exception("failed to ingest alertmanager alert")
+            _ALERTMANAGER_RECENT_DELIVERIES.pop(delivery_key, None)
+            logger.exception("failed to enqueue alertmanager alert")
             _persist_alert_to_landing_pad(mapped_payload, item, status="failed", error=str(exc))
             skipped_rows.append(
                 {
                     "status": status,
-                    "alertname": str(merged_labels.get("alertname") or "unknown-alert"),
-                    "service": str(merged_labels.get("service") or merged_labels.get("job") or "unknown"),
-                    "reason": f"ingestion failed: {exc}",
+                    "alertname": mapped_payload["name"],
+                    "service": mapped_payload["service"],
+                    "reason": f"landing pad enqueue failed: {exc}",
                 }
             )
-            continue
-
-        mapped_payload["labels"] = dict(alert.labels)
-        landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item, status="processed")
-        ingested_rows.append(
-            {
-                "alert_id": str(alert.id),
-                "name": alert.name,
-                "service": alert.service,
-                "severity": alert.severity.value,
-                "status": status,
-                "landing_pad_file": landing_pad_file,
-            }
-        )
 
     return {
         "received": received,
-        "ingested": len(ingested_rows),
+        "queued": len(queued_rows),
         "skipped": len(skipped_rows),
-        "alerts": ingested_rows,
+        "rows": queued_rows,
         "skipped_rows": skipped_rows,
     }
 
@@ -4032,7 +4517,7 @@ async def get_recent_alerts(limit: int = 50) -> dict[str, Any]:
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
-            rows = await repo.list_alerts(limit=safe_limit)
+            rows = await repo.list_alerts(limit=safe_limit, include_incident_context=False)
         return {"rows": rows, "count": len(rows)}
 
     rows = list(RECENT_ALERTS)[:safe_limit]
@@ -4046,11 +4531,76 @@ async def get_all_alerts(limit: int = 500) -> dict[str, Any]:
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
-            rows = await repo.list_alerts(limit=safe_limit)
+            rows = await repo.list_alerts(limit=safe_limit, include_incident_context=False)
         return {"rows": rows, "count": len(rows)}
 
     rows = list(RECENT_ALERTS)[:safe_limit]
     return {"rows": rows, "count": len(rows)}
+
+
+def _alert_application_candidates(row: dict[str, Any]) -> list[str]:
+    labels = row.get("labels", {}) if isinstance(row.get("labels"), dict) else {}
+    candidates = [
+        row.get("application"),
+        row.get("project"),
+        row.get("project_name"),
+        row.get("service"),
+        labels.get("application"),
+        labels.get("project"),
+        labels.get("project_name"),
+        labels.get("deployment"),
+        labels.get("namespace"),
+        labels.get("job"),
+    ]
+    return [str(value or "").strip() for value in candidates if str(value or "").strip()]
+
+
+def _is_displayable_alert_application(value: str) -> bool:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return False
+    if "/" in normalized or ":" in normalized:
+        return False
+    if re.match(r"^(unknown|default|prod|dev|staging|warning|critical|high|info)$", normalized, re.IGNORECASE):
+        return False
+    if re.match(
+        r"^(prometheus|alertmanager|blackbox|node-exporter|mysql|redis|rabbitmq|kafka|zookeeper)$",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return False
+    return True
+
+
+@app.get("/alerts/applications")
+async def get_alert_applications(limit: int = 5000) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit), 10000))
+    session_factory = getattr(app.state, "session_factory", None)
+    if settings.database_enabled and session_factory is not None:
+        async with session_factory() as session:
+            repo = IncidentRepository(session)
+            rows = await repo.list_alerts(limit=safe_limit)
+    else:
+        rows = list(RECENT_ALERTS)[:safe_limit]
+
+    seen: set[str] = set()
+    applications: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for candidate in _alert_application_candidates(row):
+            if not _is_displayable_alert_application(candidate):
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            applications.append(candidate)
+
+    return {
+        "rows": [{"name": name} for name in applications],
+        "count": len(applications),
+        "scanned_alerts": len(rows),
+    }
 
 
 @app.get("/alerts/{alert_id}/processed-result")
@@ -4145,17 +4695,33 @@ async def delete_onboarding_state(project_name: str, provider_name: str | None =
 
 
 @app.get("/landing-pad/recent")
-async def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
+def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
+    """Read landing-pad audit files on FastAPI's bounded worker threadpool.
+
+    The archive can contain thousands of files during an alert burst. Keeping
+    this handler synchronous is intentional: Starlette executes it outside the
+    asyncio event loop, so filesystem metadata and JSON parsing cannot freeze
+    unrelated health, alert, and rule API requests.
+    """
     safe_limit = max(1, min(int(limit), 200))
     LANDING_PAD_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     LANDING_PAD_FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
+    recent_lookback_days = min(LANDING_PAD_LISTING_LOOKBACK_DAYS, 3)
+    scan_cap = max(safe_limit * 3, 80)
+
     files = sorted(
         [
-            path
-            for source_dir in (LANDING_PAD_PROCESSED_DIR, LANDING_PAD_FAILED_DIR)
-            for path in source_dir.rglob("*.json")  # nested under <source>/<date>/
-            if path.is_file()
+            *_collect_partitioned_json_files(
+                LANDING_PAD_PROCESSED_DIR,
+                lookback_days=recent_lookback_days,
+                max_files=scan_cap,
+            ),
+            *_collect_partitioned_json_files(
+                LANDING_PAD_FAILED_DIR,
+                lookback_days=recent_lookback_days,
+                max_files=scan_cap,
+            ),
         ],
         key=lambda path: path.stat().st_mtime,
         reverse=True,
@@ -4179,9 +4745,27 @@ async def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
                     "received_at": payload.get("received_at") if isinstance(payload, dict) else None,
                     "status": payload.get("status") if isinstance(payload, dict) else None,
                     "error": payload.get("error") if isinstance(payload, dict) else None,
+                    "source": (
+                        alert.get("source") or payload.get("source")
+                        if isinstance(alert, dict)
+                        else payload.get("source")
+                    ),
                     "name": alert.get("name") if isinstance(alert, dict) else None,
                     "service": alert.get("service") if isinstance(alert, dict) else None,
+                    "environment": alert.get("environment") if isinstance(alert, dict) else None,
                     "severity": alert.get("severity") if isinstance(alert, dict) else None,
+                    "description": alert.get("description") if isinstance(alert, dict) else None,
+                    "application": alert.get("application") or labels.get("application"),
+                    "project": alert.get("project") or labels.get("project"),
+                    "project_name": alert.get("project_name") or labels.get("project_name"),
+                    "labels": labels,
+                    "annotations": annotations,
+                    "origin_system": (
+                        alert.get("origin_system")
+                        or labels.get("origin_system")
+                        or labels.get("source_system")
+                    ),
+                    "ingestion_channel": alert.get("ingestion_channel") or labels.get("ingestion_channel"),
                     "alert_status": labels.get("alert_status") if isinstance(labels, dict) else None,
                     "alertname": labels.get("alertname") if isinstance(labels, dict) else None,
                     "summary": annotations.get("summary") if isinstance(annotations, dict) else None,
@@ -4194,6 +4778,8 @@ async def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
     return {
         "processed_dir": str(LANDING_PAD_PROCESSED_DIR),
         "failed_dir": str(LANDING_PAD_FAILED_DIR),
+        "partition_scheme": "YYYY/MM/DD",
+        "listing_lookback_days": recent_lookback_days,
         "rows": rows,
         "count": len(rows),
     }
@@ -4211,14 +4797,16 @@ async def get_landing_pad_input(limit: int = 50) -> dict[str, Any]:
         key=lambda row: str(row.get("modified_at") or ""),
         reverse=True,
     )[:safe_limit]
-    replayed_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_REPLAYED_DIR, safe_limit)
-    failed_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_FAILED_DIR, safe_limit)
+    replayed_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_REPLAYED_DIR, safe_limit, partitioned=True)
+    failed_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_FAILED_DIR, safe_limit, partitioned=True)
     pending_count = len(_landing_pad_input_files(10_000))
     return {
         "input_dir": str(LANDING_PAD_INPUT_DIR),
         "additional_input_dirs": [str(path) for path in LANDING_PAD_ADDITIONAL_INPUT_DIRS],
         "replayed_dir": str(LANDING_PAD_INPUT_REPLAYED_DIR),
         "failed_dir": str(LANDING_PAD_INPUT_FAILED_DIR),
+        "partition_scheme": "YYYY/MM/DD",
+        "listing_lookback_days": LANDING_PAD_LISTING_LOOKBACK_DAYS,
         "watcher_enabled": LANDING_PAD_FILE_WATCHER_ENABLED,
         "watcher_interval_seconds": LANDING_PAD_FILE_WATCHER_INTERVAL_SECONDS,
         "watcher_batch_size": LANDING_PAD_FILE_WATCHER_BATCH_SIZE,
@@ -4235,9 +4823,16 @@ async def get_landing_pad_input(limit: int = 50) -> dict[str, Any]:
 async def process_landing_pad_input(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
     requested_limit = payload.get("limit", LANDING_PAD_FILE_WATCHER_BATCH_SIZE) if isinstance(payload, dict) else LANDING_PAD_FILE_WATCHER_BATCH_SIZE
     safe_limit = max(1, min(int(requested_limit or LANDING_PAD_FILE_WATCHER_BATCH_SIZE), 200))
-    results = [await _process_landing_pad_input_file(path) for path in _landing_pad_input_files(safe_limit)]
-    processed = len([row for row in results if row.get("status") == "processed"])
-    failed = len([row for row in results if row.get("status") == "failed"])
+    gathered = await asyncio.gather(
+        *(_process_landing_pad_input_file(path) for path in _landing_pad_input_files(safe_limit)),
+        return_exceptions=True,
+    )
+    results = [
+        row if isinstance(row, dict) else {"status": "failed", "error": str(row)}
+        for row in gathered
+    ]
+    processed = len([row for row in results if row.get("status") in {"processed", "processed_partial"}])
+    failed = len([row for row in results if row.get("status") in {"failed", "failed_all_rows"}])
     return {
         "requested": safe_limit,
         "processed": processed,

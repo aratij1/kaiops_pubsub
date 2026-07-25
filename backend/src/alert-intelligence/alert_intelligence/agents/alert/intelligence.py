@@ -11,6 +11,31 @@ from ai_workbench_common.embeddings import HashingEmbeddingModel, cosine_similar
 from common.models import Alert, AlertSeverity, Incident, IncidentStatus, utc_now
 from common.repository_interfaces import AlertHistoryRepository, InMemoryAlertHistoryRepository
 
+_CORRELATION_WEIGHTS = {
+    "text_similarity": 0.30,
+    "service": 0.15,
+    "environment": 0.08,
+    "topology": 0.15,
+    "deployment_change": 0.12,
+    "metric_signal": 0.10,
+    "temporal": 0.07,
+    "alert_family": 0.03,
+}
+
+_DEPENDENCY_KEYS = (
+    "dependency",
+    "dependencies",
+    "upstream",
+    "downstream",
+    "database",
+    "db",
+    "queue",
+    "topic",
+)
+_TOPOLOGY_KEYS = ("cluster", "namespace", "node", "host", "pod", "app", "application", "job", "instance")
+_DEPLOYMENT_KEYS = ("deployment", "release", "revision", "version", "change_id", "change", "build")
+_METRIC_KEYS = ("metric", "metric_name", "__name__", "prometheus_rule", "rule", "alertname")
+
 
 @dataclass
 class AlertIntelligenceAgent(BaseAgent):
@@ -41,20 +66,30 @@ class AlertIntelligenceAgent(BaseAgent):
         return alert
 
     async def correlate_alerts(self, alert: Alert) -> Alert:
-        text = self._correlation_text(alert)
-        vector = self._embed(text)
         best_match: Alert | None = None
         best_score = 0.0
+        best_evidence: dict[str, Any] = {}
         for candidate in await self.alert_history_repository.list_recent_alerts():
-            candidate_score = cosine_similarity(vector, self._embed(self._correlation_text(candidate)))
+            candidate_score, evidence = self._correlation_score(alert, candidate)
             if candidate_score > best_score:
                 best_match = candidate
                 best_score = candidate_score
+                best_evidence = evidence
 
         if best_match and best_score >= float(self.correlation_threshold or 0.72):
             alert.correlation_id = best_match.correlation_id or str(best_match.id)
         else:
             alert.correlation_id = str(alert.id)
+        alert.metadata["correlation"] = {
+            "algorithm": "weighted-enterprise-correlation-v1",
+            "score": round(best_score, 4),
+            "threshold": float(self.correlation_threshold or 0.72),
+            "matched": bool(best_match and best_score >= float(self.correlation_threshold or 0.72)),
+            "matched_alert_id": str(best_match.id) if best_match else None,
+            "matched_correlation_id": str(best_match.correlation_id or best_match.id) if best_match else None,
+            "evidence": best_evidence,
+            "weights": dict(_CORRELATION_WEIGHTS),
+        }
         return alert
 
     def classify_severity(self, alert: Alert) -> Alert:
@@ -127,6 +162,139 @@ class AlertIntelligenceAgent(BaseAgent):
     def _correlation_text(self, alert: Alert) -> str:
         labels = " ".join(f"{key}:{value}" for key, value in sorted(alert.labels.items()))
         return f"{alert.service} {alert.environment} {alert.name} {alert.description} {labels}"
+
+    def _correlation_score(self, alert: Alert, candidate: Alert) -> tuple[float, dict[str, Any]]:
+        text_score = cosine_similarity(
+            self._embed(self._correlation_text(alert)),
+            self._embed(self._correlation_text(candidate)),
+        )
+        service_score = self._service_score(alert, candidate)
+        environment_score = 1.0 if self._norm(alert.environment) == self._norm(candidate.environment) else 0.0
+        topology_score, topology_evidence = self._token_overlap_score(alert, candidate, _TOPOLOGY_KEYS + _DEPENDENCY_KEYS)
+        deployment_score, deployment_evidence = self._token_overlap_score(alert, candidate, _DEPLOYMENT_KEYS)
+        metric_score, metric_evidence = self._token_overlap_score(alert, candidate, _METRIC_KEYS)
+        temporal_score = self._temporal_score(alert, candidate)
+        alert_family_score = 1.0 if self._alert_family(alert.name) == self._alert_family(candidate.name) else 0.0
+
+        score = (
+            _CORRELATION_WEIGHTS["text_similarity"] * text_score
+            + _CORRELATION_WEIGHTS["service"] * service_score
+            + _CORRELATION_WEIGHTS["environment"] * environment_score
+            + _CORRELATION_WEIGHTS["topology"] * topology_score
+            + _CORRELATION_WEIGHTS["deployment_change"] * deployment_score
+            + _CORRELATION_WEIGHTS["metric_signal"] * metric_score
+            + _CORRELATION_WEIGHTS["temporal"] * temporal_score
+            + _CORRELATION_WEIGHTS["alert_family"] * alert_family_score
+        )
+        corroboration_bonus = self._corroboration_bonus(
+            service_score=service_score,
+            topology_score=topology_score,
+            deployment_score=deployment_score,
+            metric_score=metric_score,
+            temporal_score=temporal_score,
+        )
+        score += corroboration_bonus
+        evidence = {
+            "text_similarity": round(text_score, 4),
+            "service": round(service_score, 4),
+            "environment": round(environment_score, 4),
+            "topology": round(topology_score, 4),
+            "topology_overlap": topology_evidence,
+            "deployment_change": round(deployment_score, 4),
+            "deployment_change_overlap": deployment_evidence,
+            "metric_signal": round(metric_score, 4),
+            "metric_signal_overlap": metric_evidence,
+            "temporal": round(temporal_score, 4),
+            "alert_family": round(alert_family_score, 4),
+            "corroboration_bonus": round(corroboration_bonus, 4),
+        }
+        return min(1.0, max(0.0, score)), evidence
+
+    def _service_score(self, alert: Alert, candidate: Alert) -> float:
+        alert_service = self._norm(alert.service)
+        candidate_service = self._norm(candidate.service)
+        if alert_service and alert_service == candidate_service:
+            return 1.0
+        left = self._tokens_for(alert, ("service", "app", "application") + _DEPENDENCY_KEYS)
+        right = self._tokens_for(candidate, ("service", "app", "application") + _DEPENDENCY_KEYS)
+        if alert_service and alert_service in right:
+            return 0.85
+        if candidate_service and candidate_service in left:
+            return 0.85
+        return self._jaccard(left, right)
+
+    def _token_overlap_score(
+        self,
+        alert: Alert,
+        candidate: Alert,
+        keys: tuple[str, ...],
+    ) -> tuple[float, list[str]]:
+        left = self._tokens_for(alert, keys)
+        right = self._tokens_for(candidate, keys)
+        overlap = sorted(left.intersection(right))
+        return self._jaccard(left, right), overlap[:12]
+
+    def _tokens_for(self, alert: Alert, keys: tuple[str, ...]) -> set[str]:
+        values: list[str] = [alert.service, alert.environment]
+        for source in (alert.labels, alert.annotations, alert.metadata):
+            for key, value in source.items():
+                key_norm = self._norm(key)
+                if key_norm in keys or key_norm.replace("-", "_") in keys:
+                    values.append(str(value))
+        return {
+            token
+            for value in values
+            for token in self._split_tokens(value)
+            if token and token not in {"prod", "production", "default", "unknown", "none", "na"}
+        }
+
+    def _temporal_score(self, alert: Alert, candidate: Alert) -> float:
+        seconds = abs((alert.starts_at - candidate.starts_at).total_seconds())
+        window = max(60.0, float(self.retention_minutes or 30) * 60.0)
+        return max(0.0, 1.0 - min(seconds, window) / window)
+
+    def _jaccard(self, left: set[str], right: set[str]) -> float:
+        if not left or not right:
+            return 0.0
+        return len(left.intersection(right)) / len(left.union(right))
+
+    def _corroboration_bonus(
+        self,
+        *,
+        service_score: float,
+        topology_score: float,
+        deployment_score: float,
+        metric_score: float,
+        temporal_score: float,
+    ) -> float:
+        independent_hits = sum(
+            [
+                service_score >= 0.5,
+                topology_score >= 0.5,
+                deployment_score >= 0.5,
+                metric_score >= 0.5,
+                temporal_score >= 0.7,
+            ]
+        )
+        if independent_hits >= 4 and topology_score >= 0.5:
+            return 0.05
+        if independent_hits >= 3 and topology_score >= 0.75 and deployment_score >= 0.5:
+            return 0.03
+        return 0.0
+
+    def _split_tokens(self, value: Any) -> list[str]:
+        raw = str(value or "").strip().lower().replace("/", " ").replace(",", " ").replace("|", " ")
+        return [token for token in raw.replace("_", "-").split() for token in token.split("-") if len(token) >= 2]
+
+    def _alert_family(self, value: str) -> str:
+        text = self._norm(value)
+        for token in ("latency", "timeout", "unavailable", "down", "error", "saturation", "lag", "throughput", "quality"):
+            if token in text:
+                return token
+        return text
+
+    def _norm(self, value: Any) -> str:
+        return str(value or "").strip().lower().replace("_", "-")
 
     def _embed(self, text: str) -> list[float]:
         cached = self._embedding_cache.get(text)

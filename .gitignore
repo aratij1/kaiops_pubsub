@@ -23,10 +23,18 @@ node_modules/
 # Generated UI and runtime artifacts
 .tmp-ui-bundle.js
 backend/ingested_alerts/input/*.json
-backend/ingested_alerts/processed/*.json
-backend/ingested_alerts/failed/*.json
-backend/ingested_alerts/input_failed/*.json
-backend/ingested_alerts/input_replayed/*.json
+backend/ingested_alerts/input/*.csv
+backend/ingested_alerts/input/*.eml
+# processed/ and failed/ are date-partitioned (YYYY/MM/DD); tracked *.txt
+# sample fixtures stay tracked, only generated *.json audit records are ignored.
+backend/ingested_alerts/processed/**/*.json
+backend/ingested_alerts/failed/**/*.json
+# input_replayed/ and input_failed/ hold nothing but generated archive copies.
+backend/ingested_alerts/input_replayed/**
+backend/ingested_alerts/input_failed/**
+
+# Fault-lab generated runtime logs
+fault-lab/runtime/*.log
 
 # Generated onboarding outputs
 backend/rag/changes/**

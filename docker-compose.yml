@@ -26,6 +26,11 @@ x-service-env: &service-env
   LANDING_PAD_FILE_WATCHER_INTERVAL_SECONDS: ${LANDING_PAD_FILE_WATCHER_INTERVAL_SECONDS:-15}
   LANDING_PAD_FILE_WATCHER_BATCH_SIZE: ${LANDING_PAD_FILE_WATCHER_BATCH_SIZE:-25}
   LANDING_PAD_FILE_WATCHER_STALE_HOURS: ${LANDING_PAD_FILE_WATCHER_STALE_HOURS:-24}
+  # Landing-pad archives (processed/failed/input_replayed/input_failed) are
+  # partitioned by UTC date (YYYY/MM/DD). These bound how many date partitions
+  # the "recent" listing and duplicate-alert checks scan.
+  LANDING_PAD_LISTING_LOOKBACK_DAYS: ${LANDING_PAD_LISTING_LOOKBACK_DAYS:-14}
+  LANDING_PAD_DEDUP_LOOKBACK_DAYS: ${LANDING_PAD_DEDUP_LOOKBACK_DAYS:-30}
   LANDING_PAD_ARCHIVE_ENABLED: ${LANDING_PAD_ARCHIVE_ENABLED:-false}
   LANDING_PAD_ARCHIVE_AFTER_DAYS: ${LANDING_PAD_ARCHIVE_AFTER_DAYS:-30}
   LANDING_PAD_ARCHIVE_INTERVAL_SECONDS: ${LANDING_PAD_ARCHIVE_INTERVAL_SECONDS:-3600}
@@ -63,6 +68,11 @@ x-service-env: &service-env
   MODEL_ROUTER_RCA_PROVIDER: ${MODEL_ROUTER_RCA_PROVIDER:-gpt-4o}
   MODEL_ROUTER_DEFAULT_PROVIDER: ${MODEL_ROUTER_DEFAULT_PROVIDER:-gpt-4o}
   GATEWAY_REQUEST_TIMEOUT_SECONDS: ${GATEWAY_REQUEST_TIMEOUT_SECONDS:-180}
+  LANDING_PAD_INGEST_CONCURRENCY: ${LANDING_PAD_INGEST_CONCURRENCY:-8}
+  ALERTMANAGER_DEDUP_TTL_SECONDS: ${ALERTMANAGER_DEDUP_TTL_SECONDS:-900}
+  ALERTMANAGER_DEDUP_MAX_ENTRIES: ${ALERTMANAGER_DEDUP_MAX_ENTRIES:-10000}
+  INCIDENT_PROJECTION_INTERVAL_SECONDS: ${INCIDENT_PROJECTION_INTERVAL_SECONDS:-60}
+  INCIDENT_PROJECTION_BATCH_SIZE: ${INCIDENT_PROJECTION_BATCH_SIZE:-100}
   KAFKA_ENABLED: ${KAFKA_ENABLED:-true}
   EVENT_BUS_PROVIDER: ${EVENT_BUS_PROVIDER:-rabbitmq}
   MESSAGE_BUS_DYNAMIC_ROUTING: "true"
@@ -121,6 +131,11 @@ services:
   mysql:
     image: mysql:8.4
     restart: unless-stopped
+    # Raised from the image default so per-service DB_POOL_SIZE/DB_MAX_OVERFLOW
+    # increases (needed for a 10k-alert burst) don't exhaust connections across
+    # the ~24 services sharing this one instance. Verify the effective value
+    # for your environment (SHOW VARIABLES LIKE 'max_connections') and adjust.
+    command: ["--max-connections=${MYSQL_MAX_CONNECTIONS:-400}"]
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-kaiops}
@@ -248,6 +263,16 @@ services:
     depends_on:
       monitoring-adapter: { condition: service_started }
 
+  fault-lab:
+    build: ./fault-lab
+    restart: unless-stopped
+    # Produces the bounded application symptoms (HTTP errors, JSON logs, breached
+    # Prometheus metrics) for the 50 KaiOps incident scenarios. Prometheus scrapes
+    # /metrics; the discovery-service reads the shared runtime log for context.
+    ports: ["8080:8080"]
+    volumes:
+      - ./fault-lab/runtime:/app/runtime
+
   prometheus:
     image: prom/prometheus:v2.54.1
     restart: unless-stopped
@@ -270,14 +295,47 @@ services:
       blackbox-exporter: { condition: service_started }
       kafka-exporter: { condition: service_started }
       alertmanager: { condition: service_started }
+      fault-lab: { condition: service_started }
 
   monitoring-adapter:
+    image: ${MONITORING_ADAPTER_IMAGE:-kaiops_pubsub-monitoring-adapter:latest}
     build: *service-build
     restart: unless-stopped
-    environment: { <<: *service-env, SERVICE_NAME: monitoring-adapter }
+    environment:
+      <<: *service-env
+      SERVICE_NAME: monitoring-adapter
+      # Keep maintenance and bulk ingestion out of the API-serving event loop.
+      LANDING_PAD_FILE_WATCHER_ENABLED: "false"
+      INCIDENT_PROJECTION_WORKER_ENABLED: "false"
+      # This service is on the ingestion hot path for a 10k-alert burst; give
+      # it a larger DB pool than the shared default (paired with mysql's
+      # raised max-connections above).
+      DB_POOL_SIZE: ${MONITORING_ADAPTER_DB_POOL_SIZE:-20}
+      DB_MAX_OVERFLOW: ${MONITORING_ADAPTER_DB_MAX_OVERFLOW:-30}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/monitoring-adapter
     ports: ["8001:8000"]
+    volumes:
+      - ./backend/rag:/app/rag
+      - ${INGESTED_ALERTS_HOST_PATH:-./backend/ingested_alerts}:/app/ingested_alerts
+    depends_on:
+      kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  monitoring-ingestion-worker:
+    image: ${MONITORING_ADAPTER_IMAGE:-kaiops_pubsub-monitoring-adapter:latest}
+    restart: unless-stopped
+    environment:
+      <<: *service-env
+      SERVICE_NAME: monitoring-ingestion-worker
+      LANDING_PAD_FILE_WATCHER_ENABLED: "true"
+      INCIDENT_PROJECTION_WORKER_ENABLED: "true"
+      DB_POOL_SIZE: ${MONITORING_WORKER_DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${MONITORING_WORKER_DB_MAX_OVERFLOW:-10}
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/monitoring-adapter
     volumes:
       - ./backend/rag:/app/rag
       - ${INGESTED_ALERTS_HOST_PATH:-./backend/ingested_alerts}:/app/ingested_alerts
@@ -301,10 +359,19 @@ services:
   discovery-service:
     build: *service-build
     restart: unless-stopped
-    environment: { <<: *service-env, SERVICE_NAME: discovery-service }
+    environment:
+      <<: *service-env
+      SERVICE_NAME: discovery-service
+      # Discovery inspects the monitored app's source tree and runtime log to
+      # build real context (services, technology, metrics endpoint, active
+      # scenarios). The fault-lab is mounted read-only and shares its runtime log.
+      DISCOVERY_CODEBASE_ROOT: /app/fault-lab
+      DISCOVERY_LOG_PATH: /app/fault-lab/runtime/application.log
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/discovery-service
     ports: ["8012:8000"]
+    volumes:
+      - ./fault-lab:/app/fault-lab:ro
     depends_on:
       application-onboarding: { condition: service_started }
       rabbitmq: { condition: service_healthy }
@@ -411,7 +478,21 @@ services:
   alert-intelligence:
     build: *service-build
     restart: unless-stopped
-    environment: { <<: *service-env, SERVICE_NAME: alert-intelligence }
+    environment:
+      <<: *service-env
+      SERVICE_NAME: alert-intelligence
+      # This service is on the ingestion hot path for a 10k-alert burst; give
+      # it a larger DB pool than the shared default (paired with mysql's
+      # raised max-connections above).
+      DB_POOL_SIZE: ${ALERT_INTELLIGENCE_DB_POOL_SIZE:-20}
+      DB_MAX_OVERFLOW: ${ALERT_INTELLIGENCE_DB_MAX_OVERFLOW:-30}
+      # MESSAGE_BUS_WORKER_COUNT (shared default above) spins up N competing
+      # consumer tasks in this one process/event loop - raising it adds I/O
+      # concurrency (more DB round-trips/publishes in flight) but NOT CPU
+      # parallelism, since alert correlation scoring is synchronous with no
+      # await inside its scoring loop. For a real 10k burst, prefer running
+      # multiple alert-intelligence replicas (RabbitMQ/Kafka competing
+      # consumers already support this safely) over just raising this value.
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/alert-intelligence
     ports: ["8002:8000"]
@@ -436,16 +517,55 @@ services:
   context-agent:
     build: *service-build
     restart: unless-stopped
-    environment: { <<: *service-env, SERVICE_NAME: context-agent }
+    environment:
+      <<: *service-env
+      SERVICE_NAME: context-agent
+      DISCOVERY_MCP_URL: http://discovery-mcp:8000/mcp
+      DISCOVERY_MCP_TIMEOUT_SECONDS: "45"
+      DISCOVERY_MCP_MAX_EVIDENCE: "24"
+      CODE_DISCOVERY_ROOTS: /app/backend/src,/app/ai-workbench/src,/app/scripts,/app/config,/app/observability,/app/backend/rag,/app/fault-lab
+      LOG_DISCOVERY_ROOTS: /data/fault-lab/runtime,/data/landing,/app/observability,/app/backend/runtime,/app/backend/ingested_alerts
+      DISCOVERY_MAX_FILES: "180"
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/ai-workbench/src/context-agent
     ports: ["8004:8000"]
     volumes:
       - ./backend/rag:/app/rag
+      - ./fault-lab:/data/fault-lab:ro
+      - ./backend/ingested_alerts:/data/landing:ro
+      - ./observability:/app/observability:ro
+      - ./backend/runtime:/app/backend/runtime:ro
+      - ./backend/ingested_alerts:/app/backend/ingested_alerts:ro
     depends_on:
+      discovery-mcp: { condition: service_started }
       kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
+
+  discovery-mcp:
+    build: *service-build
+    restart: unless-stopped
+    environment:
+      <<: *service-env
+      SERVICE_NAME: discovery-mcp
+      DISCOVERY_MCP_CODE_ROOTS: /workspace/backend/src,/workspace/ai-workbench/src,/workspace/frontend/react/src,/workspace/scripts,/workspace/config,/workspace/observability,/workspace/fault-lab,/workspace/docs
+      DISCOVERY_MCP_LOG_ROOTS: /data/fault-lab/runtime,/data/landing,/workspace/fault-lab/runtime,/workspace/backend/ingested_alerts,/workspace/observability,/workspace/backend/runtime
+      DISCOVERY_MCP_TICKET_ROOTS: /workspace/backend/rag,/data/tickets,/data/landing/documents
+      DISCOVERY_MCP_MYSQL_TABLES: alerts,incident_projections,incidents,closed_incidents,onboarding_state
+      DISCOVERY_MCP_MAX_FILES: "60"
+      DISCOVERY_MCP_MAX_TICKET_FILES: "80"
+      DISCOVERY_MCP_MYSQL_MAX_ROWS: "140"
+      DISCOVERY_MCP_PROJECTS_FILE: /workspace/backend/config/discovery-projects.json
+      DISCOVERY_MCP_TELEMETRY_TIMEOUT_SECONDS: "6"
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/discovery-mcp
+    ports: ["8021:8000"]
+    volumes:
+      - ./:/workspace:ro
+      - ./fault-lab:/data/fault-lab:ro
+      - ./backend/ingested_alerts:/data/landing:ro
+      - ./backend/ingested_alerts:/data/landing:ro
+      - ${KAI_OPS_TICKET_SAMPLE_PATH:-./backend/ingested_alerts}:/data/tickets:ro
 
   model-router:
     build: *service-build

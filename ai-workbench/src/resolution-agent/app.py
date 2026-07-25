@@ -167,6 +167,8 @@ async def startup(app: FastAPI) -> None:
         recommendation.metadata["rag_matches"] = context.metadata.get("rag_matches", [])
         recommendation.metadata["rag_top_similarity"] = context.metadata.get("rag_top_similarity", 0.0)
         recommendation.metadata["rag_service_tagged_match"] = context.metadata.get("rag_service_tagged_match", False)
+        recommendation.metadata["discovery_report"] = context.metadata.get("discovery_report", {})
+        recommendation.metadata["discovery_evidence"] = context.metadata.get("discovery_evidence", {})
         recommendation.metadata["runbook_found"] = bool(context.runbook)
         policy_version = str(decision_payload.get("policy_version") or "").strip()
         policy_reason = str(decision_payload.get("policy_reason") or "").strip()
@@ -224,6 +226,8 @@ async def resolve(context: Context) -> Recommendation:
     recommendation.metadata["rag_matches"] = context.metadata.get("rag_matches", [])
     recommendation.metadata["rag_top_similarity"] = context.metadata.get("rag_top_similarity", 0.0)
     recommendation.metadata["rag_service_tagged_match"] = context.metadata.get("rag_service_tagged_match", False)
+    recommendation.metadata["discovery_report"] = context.metadata.get("discovery_report", {})
+    recommendation.metadata["discovery_evidence"] = context.metadata.get("discovery_evidence", {})
     recommendation.metadata["runbook_found"] = bool(context.runbook)
     synthetic_incident = Incident(
         id=context.incident_id,

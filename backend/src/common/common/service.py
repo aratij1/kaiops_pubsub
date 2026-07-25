@@ -19,6 +19,11 @@ from common.telemetry import metrics_response, setup_tracing
 
 _MAX_HTTP_BODY_LOG_BYTES = 4096
 _SKIP_HTTP_LOG_PATHS = {"/healthz", "/readyz", "/metrics"}
+_OMIT_HTTP_REQUEST_BODY_PATHS = {
+    "/alerts/alertmanager",
+    "/api/v1/alerts/generic",
+    "/api/v1/alerts/prometheus",
+}
 _MASKED_VALUE = "***"
 _SENSITIVE_KEYS = {
     "password",
@@ -117,7 +122,11 @@ def create_app(
 
         started = perf_counter()
         request_body = await request.body()
-        request_payload = _sanitize_http_payload(request_body, request.headers.get("content-type"))
+        request_payload = (
+            "<omitted: high-volume ingestion payload>"
+            if path in _OMIT_HTTP_REQUEST_BODY_PATHS
+            else _sanitize_http_payload(request_body, request.headers.get("content-type"))
+        )
 
         async def receive() -> dict[str, Any]:
             return {"type": "http.request", "body": request_body, "more_body": False}

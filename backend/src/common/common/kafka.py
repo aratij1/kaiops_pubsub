@@ -94,7 +94,13 @@ class KafkaConsumer:
             consumer = AIOKafkaConsumer(
                 self._topic,
                 bootstrap_servers=self._settings.kafka_bootstrap_servers,
-                group_id=self._settings.kafka_group_id,
+                # Isolate each service+topic into its own consumer group, mirroring
+                # RabbitMQ's `{prefix}.{service_name}.{topic}` queue naming
+                # (common/rabbitmq.py). Without this, every service shared the
+                # literal group id "kaiops" and any one member joining/leaving
+                # triggered a group-wide rebalance for everyone, regardless of
+                # which topic they actually cared about.
+                group_id=f"{self._settings.kafka_group_id}.{self._settings.service_name}.{self._topic}",
                 value_deserializer=lambda value: json.loads(value.decode("utf-8")),
                 enable_auto_commit=False,
             )

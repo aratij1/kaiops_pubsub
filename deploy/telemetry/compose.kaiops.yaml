@@ -1,0 +1,82 @@
+# KaiOps-compatible host ports and container names.
+# Apply after the demo's compose.yaml and compose.observability.yaml.
+services:
+  ad:
+    container_name: telemetry-ad
+  cart:
+    container_name: telemetry-cart
+  checkout:
+    container_name: telemetry-checkout
+  currency:
+    container_name: telemetry-currency
+  email:
+    container_name: telemetry-email
+  flagd:
+    container_name: telemetry-flagd
+  flagd-ui:
+    container_name: telemetry-flagd-ui
+  frontend:
+    container_name: telemetry-frontend
+  frontend-proxy:
+    container_name: telemetry-frontend-proxy
+    ports: !override
+      - "18080:8080"
+      - "18081:10000"
+  image-provider:
+    container_name: telemetry-image-provider
+  load-generator:
+    container_name: telemetry-load-generator
+  payment:
+    container_name: telemetry-payment
+    healthcheck:
+      test:
+        - "CMD"
+        - "/nodejs/bin/node"
+        - "-e"
+        - "const net=require('net');const c=new net.Socket();c.setTimeout(2000);c.connect(50051,'127.0.0.1',()=>{c.destroy();process.exit(0)});c.on('error',()=>process.exit(1));c.on('timeout',()=>process.exit(1));"
+      start_period: 30s
+      interval: 15s
+      timeout: 60s
+      retries: 10
+  product-catalog:
+    container_name: telemetry-product-catalog
+    healthcheck:
+      start_period: 30s
+      interval: 15s
+      timeout: 60s
+      retries: 10
+  quote:
+    container_name: telemetry-quote
+  recommendation:
+    container_name: telemetry-recommendation
+  shipping:
+    container_name: telemetry-shipping
+  telemetry-docs:
+    container_name: telemetry-docs
+  astronomy-db:
+    container_name: telemetry-astronomy-db
+  valkey-cart:
+    container_name: telemetry-valkey-cart
+  otel-collector:
+    container_name: telemetry-otel-collector
+  opamp-server:
+    container_name: telemetry-opamp-server
+  prometheus:
+    container_name: telemetry-prometheus
+    ports: !override
+      - "19090:9090"
+    volumes: !override
+      - ../../../deploy/telemetry/prometheus-kaiops.yaml:/etc/prometheus/prometheus-config.yaml:ro
+      - ../../../deploy/telemetry/telemetry-alerts.yml:/etc/prometheus/telemetry-alerts.yml:ro
+  jaeger:
+    container_name: telemetry-jaeger
+    ports: !override
+      - "16686:16686"
+  opensearch:
+    container_name: telemetry-opensearch
+    ports: !override
+      - "9200:9200"
+  grafana:
+    container_name: telemetry-grafana
+    ports: !override
+      - "13000:3000"
