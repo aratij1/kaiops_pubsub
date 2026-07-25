@@ -561,8 +561,17 @@ function alertTimeMs(row) {
   );
 }
 
-function alertIdentityKey(row) {
+function alertIdentityKeys(row) {
+  // Different sources populate different identity fields for the *same* real-world alert:
+  // a landing-pad file listing carries no fingerprint/incident_id at all (see
+  // _landing_pad_file_rows on the backend, which never surfaces labels), while the
+  // primary /alerts/all API row for that same alert does. Returning every candidate key
+  // (instead of picking just the single highest-priority one) lets the caller union two
+  // rows together if ANY key overlaps, rather than requiring both sides to agree on which
+  // identity field happened to be available.
   const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
+  const keys = [];
+
   const fingerprint = String(
     row?.fingerprint
     || row?.alert_fingerprint
@@ -571,25 +580,38 @@ function alertIdentityKey(row) {
     || ""
   ).trim();
   if (fingerprint) {
-    return `fingerprint:${fingerprint.toLowerCase()}`;
+    keys.push(`fingerprint:${fingerprint.toLowerCase()}`);
   }
 
   const incidentId = String(row?.incident_id || "").trim();
   if (incidentId) {
-    return `incident:${incidentId.toLowerCase()}`;
+    keys.push(`incident:${incidentId.toLowerCase()}`);
   }
 
   const correlation = String(row?.correlation_id || row?.trace_id || "").trim();
   if (correlation) {
-    return `correlation:${correlation.toLowerCase()}`;
+    keys.push(`correlation:${correlation.toLowerCase()}`);
   }
 
   const name = String(row?.name || row?.alert_name || labels?.alertname || "").trim().toLowerCase();
   const service = String(row?.service || labels?.service || labels?.job || "").trim().toLowerCase();
-  const severity = String(row?.severity || labels?.severity || "").trim().toLowerCase();
-  const timestampMs = alertTimeMs(row);
-  const bucket = timestampMs > 0 ? Math.floor(timestampMs / (5 * 60 * 1000)) : 0;
-  return `composite:${name}|${service}|${severity}|${bucket}`;
+  if (name && service) {
+    const severity = String(row?.severity || labels?.severity || "").trim().toLowerCase();
+    const timestampMs = alertTimeMs(row);
+    const bucket = timestampMs > 0 ? Math.floor(timestampMs / (5 * 60 * 1000)) : 0;
+    keys.push(`composite:${name}|${service}|${severity}|${bucket}`);
+  }
+
+  return keys;
+}
+
+function alertApplicationCandidate(row) {
+  const application = String(row?.application || "").trim();
+  const service = String(row?.service || "").trim();
+  // An application value that's just a copy of the service name is almost always a bad
+  // fallback (some mappers default "application" to "service" when the real project/app
+  // name is unknown), not a genuine project label -- don't let it win over a real one.
+  return application && application.toLowerCase() !== service.toLowerCase() ? application : "";
 }
 
 function alertRowScore(row) {
@@ -600,13 +622,48 @@ function alertRowScore(row) {
   return openScore + dataScore;
 }
 
+function resolveCanonicalAlertRow(row, candidates) {
+  if (!row || typeof row !== "object") {
+    return row;
+  }
+  const rowKeys = new Set(alertIdentityKeys(row));
+  if (!rowKeys.size) {
+    return row;
+  }
+  const matches = (Array.isArray(candidates) ? candidates : []).filter((candidate) => {
+    if (!candidate || typeof candidate !== "object") {
+      return false;
+    }
+    return alertIdentityKeys(candidate).some((key) => rowKeys.has(key));
+  });
+  if (!matches.length) {
+    return row;
+  }
+  return matches
+    .slice()
+    .sort((left, right) => {
+      const leftCanonical = ALERT_UUID_PATTERN.test(String(left?.alert_id || left?.id || "")) ? 1 : 0;
+      const rightCanonical = ALERT_UUID_PATTERN.test(String(right?.alert_id || right?.id || "")) ? 1 : 0;
+      if (leftCanonical !== rightCanonical) {
+        return rightCanonical - leftCanonical;
+      }
+      const leftLanding = left?._stream_kind === "landing_pad" ? 1 : 0;
+      const rightLanding = right?._stream_kind === "landing_pad" ? 1 : 0;
+      if (leftLanding !== rightLanding) {
+        return leftLanding - rightLanding;
+      }
+      return alertRowScore(right) - alertRowScore(left);
+    })[0];
+}
+
 function dedupeAndConsolidateAlertRows(rows, options = {}) {
   const allowedChannels = new Set(
     Array.isArray(options.channels)
       ? options.channels
       : ["prometheus", "telemetry", "email", "ticket", "log"]
   );
-  const grouped = new Map();
+  const keyToGroup = new Map();
+  const groups = [];
 
   (Array.isArray(rows) ? rows : []).forEach((row) => {
     if (!row || typeof row !== "object") {
@@ -616,34 +673,54 @@ function dedupeAndConsolidateAlertRows(rows, options = {}) {
     if (!allowedChannels.has(channel)) {
       return;
     }
-    const key = alertIdentityKey(row);
-    const existing = grouped.get(key);
-    if (!existing) {
-      grouped.set(key, {
-        row: { ...row, source_channel: channel, source_channels: [channel] },
-        channels: new Set([channel]),
-      });
-      return;
+
+    const candidateKeys = alertIdentityKeys(row);
+    // A row with zero candidate keys (no name/service and no id at all) can't be matched
+    // to anything -- give it a unique key so it still shows up as its own row instead of
+    // silently colliding with every other keyless row under a single shared bucket.
+    const lookupKeys = candidateKeys.length ? candidateKeys : [`row:${groups.length}:${Math.random()}`];
+    let group = null;
+    for (const key of lookupKeys) {
+      if (keyToGroup.has(key)) {
+        group = keyToGroup.get(key);
+        break;
+      }
     }
 
-    existing.channels.add(channel);
-    const incomingScore = alertRowScore(row);
-    const existingScore = alertRowScore(existing.row);
-    const incomingTime = alertTimeMs(row);
-    const existingTime = alertTimeMs(existing.row);
-    const incomingIsLandingPad = row?._stream_kind === "landing_pad";
-    const existingIsLandingPad = existing.row?._stream_kind === "landing_pad";
-    const shouldReplace = existingIsLandingPad && !incomingIsLandingPad
-      ? true
-      : !existingIsLandingPad && incomingIsLandingPad
-        ? false
-        : incomingScore > existingScore || (incomingScore === existingScore && incomingTime > existingTime);
-    if (shouldReplace) {
-      existing.row = { ...row, source_channel: channel };
+    if (!group) {
+      group = { row: { ...row, source_channel: channel, source_channels: [channel] }, channels: new Set([channel]) };
+      groups.push(group);
+    } else {
+      group.channels.add(channel);
+      const incomingScore = alertRowScore(row);
+      const existingScore = alertRowScore(group.row);
+      const incomingTime = alertTimeMs(row);
+      const existingTime = alertTimeMs(group.row);
+      const incomingIsLandingPad = row?._stream_kind === "landing_pad";
+      const existingIsLandingPad = group.row?._stream_kind === "landing_pad";
+      const shouldReplace = existingIsLandingPad && !incomingIsLandingPad
+        ? true
+        : !existingIsLandingPad && incomingIsLandingPad
+          ? false
+          : incomingScore > existingScore || (incomingScore === existingScore && incomingTime > existingTime);
+      const priorApplication = alertApplicationCandidate(group.row);
+      const incomingApplication = alertApplicationCandidate(row);
+      if (shouldReplace) {
+        group.row = { ...row, source_channel: channel };
+        if (!alertApplicationCandidate(group.row) && priorApplication) {
+          group.row.application = priorApplication;
+        }
+      } else if (!priorApplication && incomingApplication) {
+        group.row.application = incomingApplication;
+      }
     }
+
+    // Register every candidate key from this row against the resolved group so a later
+    // row matching via a *different* one of these keys still merges into the same group.
+    lookupKeys.forEach((key) => keyToGroup.set(key, group));
   });
 
-  return Array.from(grouped.values())
+  return groups
     .map((entry) => ({
       ...entry.row,
       source_channels: Array.from(entry.channels).sort(),
@@ -6819,15 +6896,16 @@ export default function App() {
   }
 
   function openAlertDetails(row) {
-    const alertId = row?.alert_id || row?.id || row?.incident_id;
+    const canonicalRow = resolveCanonicalAlertRow(row, alerts.rows);
+    const alertId = canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id;
     if (!alertId) {
       return;
     }
     setSelectedAlertId(String(alertId));
     setActiveTab("home");
     setHomeDetailTab("timeline");
-    loadAlertDetails(alertId, row);
-    loadSelectedAlertDocumentLinks(alertId, row);
+    loadAlertDetails(alertId, canonicalRow);
+    loadSelectedAlertDocumentLinks(alertId, canonicalRow);
   }
 
   function openAlertDetailsFromIncident(row) {

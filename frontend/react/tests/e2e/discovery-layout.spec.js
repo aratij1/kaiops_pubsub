@@ -123,6 +123,8 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await expect(firstAlert).toBeVisible({ timeout: 30_000 });
   await firstAlert.locator("button").first().click();
 
+  await expect(page.locator(".alert-details-cockpit .detail-context")).toContainText("11111111-1111-4111-8111-111111111111");
+  await expect(page.locator(".alert-details-cockpit .detail-context")).not.toContainText("email-pod-crash-duplicate.eml");
   await expect(page.getByRole("button", { name: "Incident Workspace", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Evidence", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Actions", exact: true })).toHaveCount(0);
