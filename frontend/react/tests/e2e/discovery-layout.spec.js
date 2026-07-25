@@ -136,12 +136,15 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await expect(discoveryTab).toBeVisible();
   await discoveryTab.click();
   await expect(page.getByRole("heading", { name: "Discovery + Context", exact: true })).toBeVisible();
-  await expect(page.locator(".analysis-journey")).toContainText("Connect context");
-  await expect(page.locator(".analysis-journey")).toContainText("Evidence-backed response");
+  await expect(page.locator(".investigation-story")).toContainText("Alert becomes a search plan");
+  await expect(page.locator(".investigation-story")).toContainText("Tools return source facts");
+  await expect(page.locator(".investigation-story")).toContainText("Facts are connected to operations");
+  await expect(page.locator(".investigation-story")).toContainText("RCA and impact are derived");
+  await expect(page.locator(".investigation-story")).toContainText("Evidence becomes an action");
   await expect(page.getByText("Memory pressure in user-profile", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Evidence used", { exact: true }).first()).toBeVisible();
   await expect(page.getByText(/```json/)).toHaveCount(0);
-  await page.getByText("Technical deep dive", { exact: true }).click();
+  await page.getByText("Open technical retrieval trace", { exact: true }).click();
   await expect(page.locator(".combined-analysis-grid")).toBeVisible();
 
   const desktopOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1);
