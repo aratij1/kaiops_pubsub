@@ -123,6 +123,8 @@ async def _persist_context_event(
                     "related_incidents": len(context.related_incidents),
                     "dependency_services": len(context.dependency_services),
                     "document_available": bool(context.metadata.get("rag_service_tagged_match", False)),
+                    "discovery_report": context.metadata.get("discovery_report", {}),
+                    "discovery_evidence": context.metadata.get("discovery_evidence", {}),
                 },
             )
         )
@@ -139,6 +141,21 @@ def _build_context_event_payload(
 ) -> dict[str, Any]:
     decision_payload = decision if isinstance(decision, dict) else {}
     flow_id = str(decision_payload.get("flow_id") or incident.id)
+    discovery = context.metadata.get("discovery_report", {})
+    if not isinstance(discovery, dict):
+        discovery = {}
+    report = discovery.get("report") if isinstance(discovery.get("report"), dict) else {}
+    evidence = discovery.get("evidence") if isinstance(discovery.get("evidence"), list) else []
+    evidence_ids = [
+        str(row.get("evidence_id"))
+        for row in evidence
+        if isinstance(row, dict) and str(row.get("evidence_id") or "").strip()
+    ]
+    citations = [
+        str(row.get("uri"))
+        for row in evidence
+        if isinstance(row, dict) and str(row.get("uri") or "").strip()
+    ]
     event_contract = build_agent_event_contract(
         flow_id=flow_id,
         incident_id=str(incident.id),
@@ -150,6 +167,16 @@ def _build_context_event_payload(
             "transport_provider": provider_used,
             "topic": CONTEXT_EVENTS,
             "rag_document_count": context.metadata.get("rag_documents", 0),
+            "discovery": {
+                "protocol": discovery.get("protocol"),
+                "summary": report.get("summary"),
+                "hypotheses": report.get("hypotheses", []),
+                "retrieval_stages": discovery.get("retrieval_stages", []),
+                "evidence": evidence,
+                "model_usage": discovery.get("model_usage", {}),
+                "model_interaction": discovery.get("model_interaction", {}),
+                "insufficient_evidence": report.get("insufficient_evidence", False),
+            },
         },
         metadata={
             "workflow": decision_payload.get("workflow"),
@@ -157,9 +184,9 @@ def _build_context_event_payload(
             "message_bus_provider": decision_payload.get("message_bus_provider"),
         },
         confidence=0.8,
-        reasoning="connector fusion across observability, cmdb, and rag context",
-        citations=[f"rag://{alert.service}", "cmdb://dependencies"],
-        evidence_ids=[f"alert:{alert.id}", f"incident:{incident.id}"],
+        reasoning=str(report.get("summary") or "connector fusion across observability, tickets, code, logs, cmdb, and rag context"),
+        citations=citations or [f"rag://{alert.service}", "cmdb://dependencies"],
+        evidence_ids=evidence_ids or [f"alert:{alert.id}", f"incident:{incident.id}"],
     )
     return {
         "context": context,

@@ -1,0 +1,191 @@
+# New Relic text alerts for ingestion worker
+# Supported format: key:value pairs, one alert block separated by blank lines
+
+source: newrelic
+incident_title: Payments API Error Rate Spike
+condition_name: Payments5xxRate
+service: payments-api
+priority: high
+environment: prod
+workflow_id: payment-latency
+description: Error rate exceeded 5% in the last 10 minutes
+
+source: newrelic
+incident_title: Orders DB Connections Saturated
+condition_name: OrdersDbConnectionSaturation
+service: orders-db
+priority: critical
+env: prod
+scenario_id: orders-replica-lag
+description: Open connections above 90% for 15 minutes
+
+source: newrelic
+incident_title: Checkout Transaction Duration Spike
+condition_name: CheckoutTxnDuration
+service: checkout
+priority: high
+environment: prod
+workflow_id: payment-latency
+description: Transaction duration p95 crossed 1200ms
+
+source: newrelic
+incident_title: Checkout Apdex Degradation
+condition_name: CheckoutApdexLow
+service: checkout
+priority: warning
+environment: prod
+workflow_id: payment-latency
+description: Apdex dropped below 0.82 for 10 minutes
+
+source: newrelic
+incident_title: Orders Replica Lag Alert
+condition_name: OrdersReplicaLag
+service: orders-db
+priority: critical
+environment: prod
+scenario_id: orders-replica-lag
+description: Replica lag reached 420 seconds
+
+source: newrelic
+incident_title: Inventory API Error Burst
+condition_name: InventoryApiErrorRate
+service: inventory
+priority: high
+environment: prod
+workflow_id: payment-latency
+description: Error rate exceeded 3 percent on inventory endpoints
+
+source: newrelic
+incident_title: Catalog API Throughput Drop
+condition_name: CatalogThroughputDrop
+service: catalog-api
+priority: warning
+environment: prod
+workflow_id: payment-latency
+description: Throughput dropped 35 percent compared to baseline
+
+source: newrelic
+incident_title: Cart Service External Call Failures
+condition_name: CartExternalDependencyFailures
+service: cart-service
+priority: high
+environment: prod
+workflow_id: payment-latency
+description: Upstream dependency failures detected above threshold
+
+source: newrelic
+incident_title: Auth Service Login Error Spike
+condition_name: AuthLoginErrors
+service: auth-service
+priority: high
+environment: prod
+workflow_id: payment-latency
+description: Login API errors exceeded 2.5 percent
+
+source: newrelic
+incident_title: Fraud Engine Queue Delay
+condition_name: FraudQueueDelay
+service: fraud-engine
+priority: warning
+environment: prod
+workflow_id: payment-latency
+description: Queue delay increased beyond 90 seconds
+
+source: newrelic
+incident_title: Shipping API SLA Breach
+condition_name: ShippingApiSlaBreach
+service: shipping-api
+priority: critical
+environment: prod
+workflow_id: payment-latency
+description: SLA breach persisted for 12 minutes
+
+source: newrelic
+incident_title: Notification Worker Retry Storm
+condition_name: NotificationRetryStorm
+service: notification-worker
+priority: warning
+environment: prod
+workflow_id: payment-latency
+description: Retry attempts exceeded configured policy limits
+
+source: newrelic
+incident_title: Billing Processor Failure Ratio
+condition_name: BillingFailureRatio
+service: billing-processor
+priority: high
+environment: prod
+workflow_id: payment-latency
+description: Failure ratio crossed 4 percent in billing jobs
+
+source: newrelic
+incident_title: Search API Latency Regression
+condition_name: SearchLatencyRegression
+service: search-api
+priority: warning
+environment: prod
+workflow_id: payment-latency
+description: Median search latency regressed by 40 percent
+
+source: newrelic
+incident_title: Customer Profile DB Wait Spike
+condition_name: CustomerDbWaitSpike
+service: customer-profile
+priority: high
+environment: prod
+workflow_id: payment-latency
+description: DB wait time increased significantly on hot queries
+
+source: newrelic
+incident_title: Reconciliation Pipeline Job Failure
+condition_name: ReconciliationJobFailed
+service: reconciliation
+priority: critical
+environment: prod
+workflow_id: payment-latency
+description: Scheduled reconciliation pipeline failed execution
+
+source: newrelic
+incident_title: Reporting Service CPU Saturation
+condition_name: ReportingCpuSaturation
+service: reporting
+priority: warning
+environment: prod
+workflow_id: payment-latency
+description: CPU saturation exceeded 85 percent across instances
+
+source: newrelic
+incident_title: Warehouse Sync Delay Breach
+condition_name: WarehouseSyncDelay
+service: warehouse-sync
+priority: high
+environment: prod
+workflow_id: payment-latency
+description: Warehouse sync delay crossed 25 minutes
+
+source: newrelic
+incident_title: Event Consumer Backlog Growth
+condition_name: EventConsumerBacklog
+service: event-consumer
+priority: warning
+environment: prod
+workflow_id: payment-latency
+description: Event backlog grew above 30000 pending messages
+
+source: newrelic
+incident_title: Orders DB Read Replica Unhealthy
+condition_name: OrdersReplicaHealth
+service: orders-db
+priority: high
+environment: prod
+scenario_id: orders-replica-lag
+description: Replica heartbeat checks are intermittently failing
+
+source: newrelic
+incident_title: Payments API Latency Critical
+condition_name: PaymentsApiLatencyCritical
+service: payments-api
+priority: critical
+environment: prod
+workflow_id: payment-latency
+description: API latency crossed critical threshold for 7 minutes

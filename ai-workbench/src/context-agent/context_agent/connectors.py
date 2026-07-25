@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import heapq
+import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,6 +80,297 @@ class CMDBConnector(BaseConnector):
             "owner_team": alert.metadata.get("owner_team", "platform-ops"),
             "tier": "tier-1" if alert.service in {"payments", "checkout"} else "tier-2",
             "dependencies": ["checkout", "ledger", "fraud"] if alert.service == "payments" else [],
+        }
+
+
+class LocalEvidenceConnector(BaseConnector):
+    """Find bounded, service-related evidence in mounted source code and logs."""
+
+    name = "local-evidence"
+    _code_suffixes = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".yml", ".yaml", ".json", ".md"}
+    _log_suffixes = {".log", ".out", ".txt", ".json", ".jsonl"}
+
+    def __init__(self) -> None:
+        self.code_roots = self._roots(
+            "CODE_DISCOVERY_ROOTS",
+            "/app/backend/src,/app/ai-workbench/src,/app/scripts,/app/config,/app/observability,/app/backend/rag,/app/fault-lab",
+        )
+        self.log_roots = self._roots("LOG_DISCOVERY_ROOTS", "/data/fault-lab/runtime,/data/landing,/app/fault-lab/runtime")
+        self.max_files = max(10, min(int(os.getenv("DISCOVERY_MAX_FILES", "180")), 1000))
+        self.max_matches = max(1, min(int(os.getenv("DISCOVERY_MAX_MATCHES", "12")), 50))
+
+    @staticmethod
+    def _evidence_id(kind: str, path: str, line_number: int, snippet: str) -> str:
+        digest = hashlib.sha256(f"{kind}|{path}|{line_number}|{snippet}".encode()).hexdigest()[:16]
+        return f"{kind.upper()}-{digest}"
+
+    @staticmethod
+    def _roots(name: str, default: str) -> list[Path]:
+        return [Path(value.strip()) for value in os.getenv(name, default).split(",") if value.strip()]
+
+    @staticmethod
+    def _terms(alert: Alert) -> list[str]:
+        values = [
+            alert.service,
+            alert.name,
+            alert.labels.get("scenario_id", ""),
+            alert.labels.get("ticket_id", ""),
+            alert.labels.get("component", ""),
+        ]
+        terms: list[str] = []
+        for value in values:
+            terms.extend(token.lower() for token in re.findall(r"[a-zA-Z0-9_.-]{3,}", str(value)))
+        return list(dict.fromkeys(terms))[:20]
+
+    def _search(self, roots: list[Path], suffixes: set[str], terms: list[str], kind: str) -> list[dict[str, Any]]:
+        matches: list[tuple[int, dict[str, Any]]] = []
+        scanned = 0
+        excluded_dirs = {".git", ".claiming", "node_modules", "dist", "build", "__pycache__", ".venv", "kaiops.egg-info"}
+        for root in roots:
+            if not root.exists() or not root.is_dir():
+                continue
+            for path in root.rglob("*"):
+                if scanned >= self.max_files:
+                    break
+                if any(part in excluded_dirs for part in path.parts):
+                    continue
+                if not path.is_file() or path.suffix.lower() not in suffixes:
+                    continue
+                scanned += 1
+                try:
+                    if path.stat().st_size > 2_000_000:
+                        continue
+                    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                except OSError:
+                    continue
+                for line_number, line in enumerate(lines, 1):
+                    lowered = line.lower()
+                    score = sum(1 for term in terms if term in lowered)
+                    if score:
+                        snippet = line.strip()[:500]
+                        path_str = str(path)
+                        matches.append(
+                            (
+                                score,
+                                {
+                                    "kind": kind,
+                                    "source": kind,
+                                    "path": path_str,
+                                    "line": line_number,
+                                    "uri": f"{kind}://{path.as_posix()}#L{line_number}",
+                                    "snippet": snippet,
+                                    "matched_terms": [term for term in terms if term in lowered],
+                                    "evidence_id": self._evidence_id(kind, path_str, line_number, snippet),
+                                },
+                            )
+                        )
+        return [item for _, item in heapq.nlargest(self.max_matches, matches, key=lambda row: row[0])]
+
+    async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
+        await asyncio.sleep(0)
+        terms = self._terms(alert)
+        return {
+            "query_terms": terms,
+            "code_matches": self._search(self.code_roots, self._code_suffixes, terms, "code"),
+            "log_matches": self._search(self.log_roots, self._log_suffixes, terms, "log"),
+            "code_roots": [str(root) for root in self.code_roots],
+            "log_roots": [str(root) for root in self.log_roots],
+        }
+
+
+class DiscoveryMCPConnector(BaseConnector):
+    """Evidence-grounded discovery over a read-only MCP JSON-RPC server."""
+
+    name = "discovery-mcp"
+
+    def __init__(self) -> None:
+        self.mcp_url = os.getenv("DISCOVERY_MCP_URL", "http://discovery-mcp:8000/mcp")
+        self.model_router_url = os.getenv("MODEL_ROUTER_URL", "http://model-router:8000").rstrip("/")
+        self.timeout = max(2.0, min(float(os.getenv("DISCOVERY_MCP_TIMEOUT_SECONDS", "15")), 60.0))
+        self.max_evidence = max(3, min(int(os.getenv("DISCOVERY_MCP_MAX_EVIDENCE", "18")), 40))
+
+    @staticmethod
+    def _query_terms(alert: Alert, incident: Incident) -> list[str]:
+        values = [
+            alert.service,
+            alert.name,
+            alert.environment,
+            alert.correlation_id,
+            alert.trace_id,
+            incident.ticket_id,
+            alert.labels.get("scenario_id"),
+            alert.labels.get("component"),
+            alert.labels.get("ticket_id"),
+            alert.labels.get("application"),
+            alert.labels.get("project"),
+        ]
+        terms: list[str] = []
+        for value in values:
+            terms.extend(re.findall(r"[a-zA-Z0-9_.-]{3,}", str(value or "").lower()))
+        return list(dict.fromkeys(terms))[:24]
+
+    async def _call_mcp(
+        self,
+        client: httpx.AsyncClient,
+        tool: str,
+        terms: list[str],
+        alert: Alert,
+    ) -> dict[str, Any]:
+        arguments = {
+            "terms": terms,
+            "limit": 8,
+            "service": alert.service,
+            "trace_id": str(alert.trace_id or ""),
+            "application": str(alert.labels.get("application") or ""),
+            "project": str(alert.labels.get("project") or ""),
+            "environment": alert.environment,
+        }
+        response = await client.post(
+            self.mcp_url,
+            json={
+                "jsonrpc": "2.0",
+                "id": tool,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload.get("error"), dict):
+            raise RuntimeError(str(payload["error"].get("message") or "MCP tool failed"))
+        return payload.get("result") if isinstance(payload.get("result"), dict) else {}
+
+    @staticmethod
+    def _fallback_report(evidence: list[dict[str, Any]], stages: list[dict[str, Any]]) -> dict[str, Any]:
+        citations = [str(row.get("evidence_id")) for row in evidence[:6] if row.get("evidence_id")]
+        return {
+            "summary": "Evidence was retrieved; model synthesis was unavailable.",
+            "hypotheses": [],
+            "affected_components": [],
+            "recommended_next_checks": ["Review the cited evidence and collect additional targeted signals."],
+            "insufficient_evidence": not bool(evidence),
+            "citations": citations,
+            "retrieval_stages": stages,
+        }
+
+    async def _analyze(
+        self, client: httpx.AsyncClient, alert: Alert, evidence: list[dict[str, Any]], stages: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        compact = [
+            {
+                "evidence_id": row.get("evidence_id"),
+                "source": row.get("source"),
+                "uri": row.get("uri"),
+                "snippet": row.get("snippet"),
+            }
+            for row in evidence[: self.max_evidence]
+        ]
+        prompt = (
+            "Analyze only the supplied evidence. Return strict JSON with summary, hypotheses "
+            "(cause, confidence 0..1, supporting_evidence, contradicting_evidence), "
+            "affected_components, recommended_next_checks, insufficient_evidence, and citations. "
+            "Every factual conclusion must cite evidence_id. Never invent a root cause."
+        )
+        request_payload = {
+            "alert": {
+                "name": alert.name,
+                "service": alert.service,
+                "environment": alert.environment,
+            },
+            "evidence": compact,
+        }
+        response = await client.post(
+            f"{self.model_router_url}/route",
+            json={
+                "severity": str(getattr(alert.severity, "value", alert.severity)),
+                "task": "rca",
+                "prompt": prompt,
+                "payload": request_payload,
+            },
+        )
+        response.raise_for_status()
+        routed = response.json()
+        content = routed.get("content")
+        try:
+            report = json.loads(content) if isinstance(content, str) else content
+        except json.JSONDecodeError:
+            report = None
+        if (
+            str(routed.get("model") or "").lower() == "heuristic-fallback"
+            or not isinstance(report, dict)
+            or "hypotheses" not in report
+            or not isinstance(report.get("hypotheses"), list)
+            or "insufficient_evidence" not in report
+        ):
+            report = self._fallback_report(evidence, stages)
+        report["retrieval_stages"] = stages
+        report["evidence_count"] = len(evidence)
+        report["model"] = routed.get("model", "unknown")
+        usage = routed.get("usage") if isinstance(routed.get("usage"), dict) else {}
+        interaction = {
+            "task": "rca",
+            "endpoint": f"{self.model_router_url}/route",
+            "prompt": prompt,
+            "request_payload": request_payload,
+            "response_received": content,
+            "parsed_response": report,
+            "model": routed.get("model", "unknown"),
+            "provider": routed.get("provider", "unknown"),
+            "usage": usage,
+        }
+        return report, usage, interaction
+
+    async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
+        terms = self._query_terms(alert, incident)
+        stages: list[dict[str, Any]] = [{"stage": "query_planned", "status": "completed", "terms": terms}]
+        evidence: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            results = await asyncio.gather(
+                *(
+                    self._call_mcp(client, tool, terms, alert)
+                    for tool in ("logs.search", "tickets.search", "code.search", "mysql.search", "telemetry.search")
+                ),
+                return_exceptions=True,
+            )
+            for tool, result in zip(
+                ("logs.search", "tickets.search", "code.search", "mysql.search", "telemetry.search"),
+                results,
+                strict=True,
+            ):
+                if isinstance(result, Exception):
+                    stages.append({"stage": tool.replace(".", "_"), "status": "failed", "error": str(result)[:240]})
+                    continue
+                rows = result.get("evidence", []) if isinstance(result.get("evidence"), list) else []
+                evidence.extend(row for row in rows if isinstance(row, dict))
+                stages.append({"stage": tool.replace(".", "_"), "status": "completed", "result_count": len(rows)})
+            deduped = list({str(row.get("evidence_id")): row for row in evidence}.values())[: self.max_evidence]
+            stages.append({"stage": "evidence_correlated", "status": "completed", "result_count": len(deduped)})
+            try:
+                report, usage, model_interaction = await self._analyze(client, alert, deduped, stages)
+                stages.append({"stage": "llm_analysis", "status": "completed", "model": report.get("model")})
+            except Exception as exc:
+                report = self._fallback_report(deduped, stages)
+                usage = {}
+                model_interaction = {
+                    "task": "rca",
+                    "status": "failed",
+                    "error": str(exc)[:500],
+                    "prompt": "Evidence-grounded RCA analysis",
+                    "request_payload": {"evidence_count": len(deduped)},
+                    "response_received": None,
+                }
+                stages.append({"stage": "llm_analysis", "status": "failed", "error": str(exc)[:240]})
+        stages.append({"stage": "discovery_completed", "status": "completed"})
+        report["retrieval_stages"] = stages
+        return {
+            "protocol": "mcp-jsonrpc-2.0",
+            "server": self.mcp_url,
+            "query_terms": terms,
+            "evidence": deduped,
+            "report": report,
+            "retrieval_stages": stages,
+            "model_usage": usage,
+            "model_interaction": model_interaction,
         }
 
 
@@ -852,6 +1146,8 @@ class ContextIntelligenceAgent(BaseAgent):
             JenkinsConnector(),
             GitHubConnector(),
             CMDBConnector(),
+            DiscoveryMCPConnector(),
+            LocalEvidenceConnector(),
             VectorDBConnector(),
         ]
     )
@@ -878,7 +1174,7 @@ class ContextIntelligenceAgent(BaseAgent):
                     ToolSpec(
                         name=tool_name,
                         handler=_handler,
-                        timeout_seconds=10.0,
+                        timeout_seconds=45.0 if connector.name == "discovery-mcp" else 10.0,
                         permissions={"context-agent"},
                     )
                 )
@@ -964,6 +1260,9 @@ class ContextIntelligenceAgent(BaseAgent):
                 for doc in change_docs
             ]
         )
+        local_evidence = by_name.get("local-evidence", {}) if isinstance(by_name.get("local-evidence"), dict) else {}
+        discovery_report = by_name.get("discovery-mcp", {}) if isinstance(by_name.get("discovery-mcp"), dict) else {}
+        discovery_report = self._merge_discovery_results(alert, discovery_report, local_evidence)
         context = Context(
             incident_id=incident.id,
             alert=alert,
@@ -995,6 +1294,8 @@ class ContextIntelligenceAgent(BaseAgent):
                 "rag_top_match_confidence": max((doc.get("match_confidence", doc.get("_similarity", 0.0)) for doc in vector_matches), default=0.0),
                 "rag_service_tagged_match": service_tagged_match,
                 "rag_index": vector_connector.index_info() if vector_connector else {},
+                "discovery_evidence": local_evidence,
+                "discovery_report": discovery_report,
                 "context_graph": {
                     "enabled": True,
                     "stages": [*state.get("graph_stages", []), "assemble_context"],
@@ -1012,6 +1313,56 @@ class ContextIntelligenceAgent(BaseAgent):
         if not isinstance(context, Context):
             raise ContextFailure("context graph produced non-context output")
         return context
+
+    def _merge_discovery_results(
+        self,
+        alert: Alert,
+        mcp_result: dict[str, Any],
+        local_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        report_payload = dict(mcp_result) if isinstance(mcp_result, dict) else {}
+        existing_evidence = report_payload.get("evidence") if isinstance(report_payload.get("evidence"), list) else []
+        retrieval_stages = report_payload.get("retrieval_stages") if isinstance(report_payload.get("retrieval_stages"), list) else []
+        code_matches = local_result.get("code_matches") if isinstance(local_result.get("code_matches"), list) else []
+        log_matches = local_result.get("log_matches") if isinstance(local_result.get("log_matches"), list) else []
+        local_evidence = [row for row in [*code_matches, *log_matches] if isinstance(row, dict)]
+
+        merged_by_id: dict[str, dict[str, Any]] = {}
+        for row in [*existing_evidence, *local_evidence]:
+            evidence_id = str(row.get("evidence_id") or "").strip()
+            if evidence_id:
+                merged_by_id[evidence_id] = row
+
+        if code_matches:
+            retrieval_stages.append({"stage": "local_code_search", "status": "completed", "result_count": len(code_matches)})
+        if log_matches:
+            retrieval_stages.append({"stage": "local_log_search", "status": "completed", "result_count": len(log_matches)})
+
+        report = report_payload.get("report") if isinstance(report_payload.get("report"), dict) else {}
+        if not report:
+            report = {}
+        if local_evidence and not str(report.get("summary") or "").strip():
+            report["summary"] = (
+                f"Local discovery matched {len(code_matches)} code snippets and {len(log_matches)} log snippets "
+                f"for alert {alert.name} on service {alert.service}."
+            )
+        report.setdefault("hypotheses", [])
+        report.setdefault("affected_components", sorted({str(alert.service or "").strip() or "unknown"}))
+        report.setdefault(
+            "recommended_next_checks",
+            [
+                "Inspect the cited code and log evidence for the matched service before executing remediation.",
+                "Correlate the matched code paths with the latest deployment and incident timeline.",
+            ],
+        )
+        report["insufficient_evidence"] = bool(report.get("insufficient_evidence", False)) and not bool(local_evidence)
+        report_payload["protocol"] = str(report_payload.get("protocol") or ("local-evidence" if local_evidence else "mcp-jsonrpc-2.0"))
+        report_payload["query_terms"] = report_payload.get("query_terms") or local_result.get("query_terms") or []
+        report_payload["report"] = report
+        report_payload["evidence"] = list(merged_by_id.values())
+        report_payload["retrieval_stages"] = retrieval_stages
+        report_payload["model_usage"] = report_payload.get("model_usage") if isinstance(report_payload.get("model_usage"), dict) else {}
+        return report_payload
 
     async def execute(self, context: AgentContext) -> Context:
         if context.alert is None or context.incident is None:
