@@ -6028,16 +6028,30 @@ export default function App() {
     recentAlertsRequestRef.current = { inFlight: true, requestId, startedAt: Date.now() };
     setAlerts((prev) => ({ ...prev, loading: !background, error: "" }));
     try {
-      const payload = await fetchJson(`/api-gateway/alerts/all?limit=${alertsLimit}`, {
-        timeoutMs: background ? 6000 : 7000,
-        maxAttempts: 1,
-      });
+      const [payload, landingPayload] = await Promise.all([
+        fetchJson(`/api-gateway/alerts/all?limit=${alertsLimit}`, {
+          timeoutMs: background ? 6000 : 7000,
+          maxAttempts: 1,
+        }),
+        fetchJson(`/api-gateway/landing-pad/recent?limit=${Math.min(Math.max(alertsLimit, 50), 200)}`, {
+          timeoutMs: background ? 6000 : 7000,
+          maxAttempts: 1,
+        }).catch(() => null),
+      ]);
       const data = unwrap(payload);
       const rows = data?.rows || [];
+      const landingRowsRaw = unwrap(landingPayload)?.rows;
+      const landingRows = (Array.isArray(landingRowsRaw) ? landingRowsRaw : [])
+        .filter((row) => String(row?.status || "").trim().toLowerCase() !== "failed")
+        .map((row, index) => mapLandingPadRowToAlertStreamRow(row, index));
+      const mergedRows = dedupeAndConsolidateAlertRows([
+        ...(Array.isArray(rows) ? rows : []),
+        ...landingRows,
+      ]);
       if (recentAlertsRequestRef.current.requestId !== requestId) {
         return;
       }
-      setAlerts({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
+      setAlerts({ loading: false, rows: mergedRows, error: "" });
     } catch (error) {
       if (background) {
         if (recentAlertsRequestRef.current.requestId !== requestId) {

@@ -1,6 +1,8 @@
 import { expect, test } from "@playwright/test";
 
 test("discovery is a first-class responsive alert view", async ({ page }) => {
+  test.setTimeout(45_000);
+
   await page.route("**/api-gateway/**", async (route) => {
     const path = new URL(route.request().url()).pathname.replace(/^\/api-gateway/, "");
     const body = path === "/auth/login"
@@ -17,6 +19,21 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
                 { id: "project-kaiops", name: "KaiOps", namespace: "kaiops", status: "dashboard_created", metrics_endpoint: "http://api-gateway:8000/metrics" },
                 { id: "project-telemetry", name: "Telemetry", namespace: "telemetry", status: "dashboard_created", metrics_endpoint: "http://host.docker.internal:19090/metrics" },
               ] } }
+            : path.startsWith("/landing-pad/recent")
+              ? { data: { rows: [
+                  {
+                    file: "checkout-log-alert.json",
+                    received_at: "2026-07-25T12:00:00Z",
+                    status: "processed",
+                    source: "opensearch-log-alert",
+                    name: "Checkout log error burst",
+                    service: "checkout-api",
+                    application: "KaiOps",
+                    project_name: "KaiOps",
+                    severity: "high",
+                    labels: { project_name: "KaiOps", origin_system: "opensearch", ingestion_channel: "log" },
+                  },
+                ] } }
             : { data: [], rows: [], summary: {}, items: [] };
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
   });
@@ -60,6 +77,10 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await page.getByRole("button", { name: "Sign In" }).click();
 
   await expect(page.getByRole("heading", { name: "KaiOps + Telemetry" })).toBeVisible();
+  await expect(page.getByText("Pod crash loop", { exact: true }).first()).toBeVisible();
+  await expect(page.locator(".source-email").filter({ hasText: "Email" }).first()).toBeVisible();
+  await expect(page.getByText("Checkout log error burst", { exact: true }).first()).toBeVisible();
+  await expect(page.locator(".source-log").filter({ hasText: "Logs / OpenSearch" }).first()).toBeVisible();
   const telemetryProject = page.getByRole("button", { name: /Telemetry telemetry namespace/ });
   await expect(telemetryProject).toBeVisible();
   await expect(page.getByText("Telemetry signals missing", { exact: true })).toHaveCount(0);
