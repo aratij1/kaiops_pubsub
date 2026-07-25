@@ -4083,6 +4083,12 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
         annotations = item.get("annotations", {}) if isinstance(item.get("annotations"), dict) else {}
         merged_labels = {**common_labels, **labels}
         merged_annotations = {**common_annotations, **annotations}
+        origin_system = str(
+            merged_labels.get("source_system")
+            or merged_labels.get("origin_system")
+            or merged_labels.get("source")
+            or "prometheus"
+        ).strip().lower() or "prometheus"
         delivery_key = _alertmanager_delivery_key(item, merged_labels, status)
 
         if status != "firing":
@@ -4107,7 +4113,7 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
             continue
 
         mapped_payload = {
-            "source": "prometheus-alertmanager",
+            "source": origin_system,
             "name": str(merged_labels.get("alertname") or "prometheus-alert"),
             "service": str(merged_labels.get("service") or merged_labels.get("job") or merged_labels.get("instance") or "kaiops-platform"),
             "environment": str(merged_labels.get("environment") or merged_labels.get("env") or "prod"),
@@ -4115,6 +4121,9 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
             "description": str(merged_annotations.get("description") or merged_annotations.get("summary") or merged_labels.get("alertname") or "Prometheus alert"),
             "labels": {
                 **merged_labels,
+                "origin_system": origin_system,
+                "ingestion_channel": "monitoring",
+                "transport": "alertmanager",
                 "alert_status": status,
                 "alert_fingerprint": str(item.get("fingerprint") or ""),
             },
