@@ -1,12 +1,12 @@
 {
   "project": {
-    "name": "kaiops-core1",
-    "owner_team": "kaiops-platform",
+    "name": "etl-orders-dq-20260722141810",
+    "owner_team": "data-platform",
     "environment": "prod",
-    "region": "ap-south-1"
+    "region": "us-east-1"
   },
   "deployment_mode": "on_prem",
-  "prometheus_url": "http://pr",
+  "prometheus_url": "http://prometheus:9090",
   "new_relic_url": "",
   "datadog_url": "",
   "azure_subscription_id": "",

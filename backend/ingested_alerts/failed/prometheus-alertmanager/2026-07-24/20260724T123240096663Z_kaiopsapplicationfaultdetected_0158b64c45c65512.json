@@ -1,0 +1,58 @@
+{
+  "received_at": "2026-07-24T12:32:40.096663+00:00",
+  "source": "prometheus-alertmanager",
+  "status": "failed",
+  "error": "'HIGH' is not a valid AlertSeverity",
+  "alert": {
+    "source": "prometheus-alertmanager",
+    "name": "KaiOpsApplicationFaultDetected",
+    "service": "order-service",
+    "environment": "prod",
+    "severity": "medium",
+    "description": "Scenario kaiops-scenario-03 breached its threshold. Example context ticket: KAI-0041.",
+    "labels": {
+      "alert_name": "Thread pool exhaustion",
+      "alertname": "KaiOpsApplicationFaultDetected",
+      "component": "Application",
+      "instance": "fault-lab:8080",
+      "job": "kaiops-fault-lab",
+      "scenario_id": "kaiops-scenario-03",
+      "service": "order-service",
+      "severity": "Medium",
+      "source": "kaiops-fault-lab",
+      "ticket_example": "KAI-0041",
+      "alert_status": "firing",
+      "alert_fingerprint": "0158b64c45c65512"
+    },
+    "annotations": {
+      "description": "Scenario kaiops-scenario-03 breached its threshold. Example context ticket: KAI-0041.",
+      "summary": "Thread pool exhaustion on order-service",
+      "startsAt": "2026-07-24T12:32:30.625Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://f8df959ff1ac:9090/graph?g0.expr=kaiops_fault_ratio+%3E+1&g0.tab=1"
+    }
+  },
+  "raw": {
+    "status": "firing",
+    "labels": {
+      "alert_name": "Thread pool exhaustion",
+      "alertname": "KaiOpsApplicationFaultDetected",
+      "component": "Application",
+      "instance": "fault-lab:8080",
+      "job": "kaiops-fault-lab",
+      "scenario_id": "kaiops-scenario-03",
+      "service": "order-service",
+      "severity": "Medium",
+      "source": "kaiops-fault-lab",
+      "ticket_example": "KAI-0041"
+    },
+    "annotations": {
+      "description": "Scenario kaiops-scenario-03 breached its threshold. Example context ticket: KAI-0041.",
+      "summary": "Thread pool exhaustion on order-service"
+    },
+    "startsAt": "2026-07-24T12:32:30.625Z",
+    "endsAt": "0001-01-01T00:00:00Z",
+    "generatorURL": "http://f8df959ff1ac:9090/graph?g0.expr=kaiops_fault_ratio+%3E+1&g0.tab=1",
+    "fingerprint": "0158b64c45c65512"
+  }
+}

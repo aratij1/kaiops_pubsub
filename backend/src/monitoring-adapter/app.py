@@ -47,7 +47,7 @@ from common.topics import (
 )
 from ai_workbench_common.prompts import PROMPT_SUMMARIZE_RCA
 import httpx
-from fastapi import Body, Header, HTTPException, Query
+from fastapi import BackgroundTasks, Body, Header, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
 from monitoring_adapter.state import (
     ALERT_SEVERITY_OVERRIDES_FILE,
@@ -95,6 +95,7 @@ from monitoring_adapter.existing_monitoring import (
     normalize_provider_name,
     verify_hmac_signature,
 )
+from monitoring_adapter.email_ingestion import ImapConfig, email_to_alert_payload, fetch_unseen_emails
 
 ALERT_BODY = Body(...)
 
@@ -108,8 +109,29 @@ CLOSED_INCIDENTS: deque[dict[str, Any]] = deque(maxlen=500)
 LANDING_PAD_INPUT_DIR = Path(os.getenv("LANDING_PAD_INPUT_DIR", "/app/ingested_alerts/input"))
 LANDING_PAD_PROCESSED_DIR = LANDING_PAD_INPUT_DIR.parent / "processed"
 LANDING_PAD_FAILED_DIR = LANDING_PAD_INPUT_DIR.parent / "failed"
+LANDING_PAD_ARCHIVE_DIR = LANDING_PAD_INPUT_DIR.parent / "archive"
 LANDING_PAD_INPUT_REPLAYED_DIR = LANDING_PAD_INPUT_DIR.parent / "input_replayed"
 LANDING_PAD_INPUT_FAILED_DIR = LANDING_PAD_INPUT_DIR.parent / "input_failed"
+
+# Archival strategy for processed/failed landing-pad records — opt-in, since
+# most deployments are fine keeping everything in processed/failed. When
+# enabled, a background sweep moves files older than the configured age out
+# of processed/<source>/<date>/ and failed/<source>/<date>/ into the mirrored
+# path under archive/, preserving the source/date layout.
+LANDING_PAD_ARCHIVE_ENABLED = str(os.getenv("LANDING_PAD_ARCHIVE_ENABLED", "false")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+LANDING_PAD_ARCHIVE_AFTER_DAYS = max(
+    1.0,
+    float(os.getenv("LANDING_PAD_ARCHIVE_AFTER_DAYS", "30") or 30),
+)
+LANDING_PAD_ARCHIVE_INTERVAL_SECONDS = max(
+    60.0,
+    float(os.getenv("LANDING_PAD_ARCHIVE_INTERVAL_SECONDS", "3600") or 3600),
+)
 _DEFAULT_LANDING_PAD_REPLAY_DIR = LANDING_PAD_INPUT_DIR.parent / "Alerts"
 LANDING_PAD_ADDITIONAL_INPUT_DIRS = [
     Path(item.strip())
@@ -134,9 +156,35 @@ LANDING_PAD_FILE_WATCHER_STALE_HOURS = max(
     0.0,
     float(os.getenv("LANDING_PAD_FILE_WATCHER_STALE_HOURS", "24") or 24),
 )
+# Jira ticket ingestion — shared-secret webhook auth (checked via
+# ?token=... query param or X-Webhook-Token header). Empty secret means the
+# endpoint is disabled (fails closed, unlike the HMAC webhook verifier
+# elsewhere in this file which fails open when unconfigured).
+JIRA_WEBHOOK_SECRET = str(os.getenv("JIRA_WEBHOOK_SECRET", "") or "").strip()
+
+# Email ingestion via IMAP polling — disabled unless explicitly enabled and
+# fully configured, since it requires real mailbox credentials.
+EMAIL_INGESTION_ENABLED = str(os.getenv("EMAIL_INGESTION_ENABLED", "false")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+EMAIL_IMAP_HOST = str(os.getenv("EMAIL_IMAP_HOST", "") or "").strip()
+EMAIL_IMAP_PORT = int(os.getenv("EMAIL_IMAP_PORT", "993") or 993)
+EMAIL_IMAP_USER = str(os.getenv("EMAIL_IMAP_USER", "") or "").strip()
+EMAIL_IMAP_PASSWORD = str(os.getenv("EMAIL_IMAP_PASSWORD", "") or "").strip()
+EMAIL_IMAP_MAILBOX = str(os.getenv("EMAIL_IMAP_MAILBOX", "INBOX") or "INBOX").strip()
+EMAIL_IMAP_USE_SSL = str(os.getenv("EMAIL_IMAP_USE_SSL", "true")).strip().lower() in {"1", "true", "yes", "on"}
+EMAIL_POLL_INTERVAL_SECONDS = max(15.0, float(os.getenv("EMAIL_POLL_INTERVAL_SECONDS", "60") or 60))
+EMAIL_POLL_BATCH_SIZE = max(1, min(int(os.getenv("EMAIL_POLL_BATCH_SIZE", "25") or 25), 100))
+EMAIL_DEFAULT_SERVICE = str(os.getenv("EMAIL_DEFAULT_SERVICE", "email-inbox") or "email-inbox").strip()
+
 WORKER_FAILURE_COUNTS: dict[str, int] = {
     "incident_projection_worker": 0,
     "landing_pad_file_watcher": 0,
+    "email_poll_worker": 0,
+    "landing_pad_archive_worker": 0,
 }
 WORKER_FAILURE_THRESHOLD = max(1, int(os.getenv("WORKER_FAILURE_THRESHOLD", "5") or 5))
 _ALLOWED_PROJECT_ENVIRONMENTS = {"dev", "staging", "prod"}
@@ -154,9 +202,12 @@ def _persist_alert_to_landing_pad(
     error: str | None = None,
 ) -> str | None:
     try:
-        target_dir = LANDING_PAD_PROCESSED_DIR if status == "processed" else LANDING_PAD_FAILED_DIR
-        target_dir.mkdir(parents=True, exist_ok=True)
+        base_dir = LANDING_PAD_PROCESSED_DIR if status == "processed" else LANDING_PAD_FAILED_DIR
         now = datetime.now(timezone.utc)
+        source_slug = slugify(str(mapped_payload.get("source") or "unknown-source")) or "unknown-source"
+        date_segment = now.strftime("%Y-%m-%d")
+        target_dir = base_dir / source_slug / date_segment
+        target_dir.mkdir(parents=True, exist_ok=True)
         alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))
         labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
         fingerprint = str(labels.get("alert_fingerprint") or "no-fingerprint").strip() or "no-fingerprint"
@@ -165,7 +216,7 @@ def _persist_alert_to_landing_pad(
         out_path = target_dir / file_name
         payload = {
             "received_at": now.isoformat(),
-            "source": "prometheus-alertmanager",
+            "source": str(mapped_payload.get("source") or "prometheus-alertmanager"),
             "status": status,
             "error": error,
             "alert": mapped_payload,
@@ -180,8 +231,11 @@ def _persist_alert_to_landing_pad(
 
 def _landing_pad_file_rows(source_dir: Path, limit: int) -> list[dict[str, Any]]:
     source_dir.mkdir(parents=True, exist_ok=True)
+    # rglob (not glob) so this still finds files once processed/failed are
+    # nested into <source>/<date>/ subfolders; harmless no-op for the flat
+    # input/replayed/failed-input dirs this is also used for.
     files = sorted(
-        [path for path in source_dir.glob("*.json") if path.is_file()],
+        [path for path in source_dir.rglob("*.json") if path.is_file()],
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )[:limit]
@@ -311,7 +365,7 @@ def _processed_landing_pad_match_exists(mapped_payload: dict[str, Any]) -> bool:
     fingerprint = str(labels.get("alert_fingerprint") or "no-fingerprint").strip() or "no-fingerprint"
     safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:24]
     pattern = f"*_{alert_name}_{safe_fingerprint}.json"
-    return any(path.is_file() for path in LANDING_PAD_PROCESSED_DIR.glob(pattern))
+    return any(path.is_file() for path in LANDING_PAD_PROCESSED_DIR.rglob(pattern))
 
 
 async def _process_landing_pad_input_file(path: Path) -> dict[str, Any]:
@@ -346,6 +400,11 @@ async def _process_landing_pad_input_file(path: Path) -> dict[str, Any]:
         for mapped_payload, raw_alert in mapped_alerts:
             alert = _build_alert_from_payload(mapped_payload)
             await _publish_ingested_alert(alert)
+            # _build_alert_from_payload derives extra labels (e.g. support_tier)
+            # onto its own internal copy of the labels dict, not the caller's
+            # mapped_payload — sync back so the audit record matches what was
+            # actually published, not the pre-enrichment input.
+            mapped_payload["labels"] = dict(alert.labels)
             landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, raw_alert, status="processed")
             ingested_rows.append(
                 {
@@ -776,12 +835,110 @@ async def _landing_pad_file_watcher() -> None:
             continue
 
 
+def _sweep_landing_pad_archive_once() -> dict[str, int]:
+    """Move processed/failed landing-pad files older than
+    LANDING_PAD_ARCHIVE_AFTER_DAYS into the mirrored path under
+    archive/<source>/<date>/, preserving the source/date layout. Returns a
+    counter dict so callers (worker loop or the manual trigger endpoint) can
+    report how much was moved.
+    """
+    cutoff = datetime.now(timezone.utc).timestamp() - (LANDING_PAD_ARCHIVE_AFTER_DAYS * 86400)
+    moved = 0
+    errors = 0
+    for base_dir in (LANDING_PAD_PROCESSED_DIR, LANDING_PAD_FAILED_DIR):
+        if not base_dir.exists():
+            continue
+        for path in base_dir.rglob("*.json"):
+            if not path.is_file():
+                continue
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+                relative = path.relative_to(base_dir)
+                target_path = LANDING_PAD_ARCHIVE_DIR / base_dir.name / relative
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                if target_path.exists():
+                    target_path = target_path.with_name(f"{target_path.stem}_{uuid.uuid4().hex[:8]}{target_path.suffix}")
+                path.replace(target_path)
+                moved += 1
+            except Exception:
+                logger.exception("failed to archive landing pad file %s", path)
+                errors += 1
+    return {"moved": moved, "errors": errors}
+
+
+async def _landing_pad_archive_worker() -> None:
+    stop_event = app.state.monitoring_adapter_stop_event
+    while not stop_event.is_set():
+        try:
+            result = _sweep_landing_pad_archive_once()
+            if result["moved"]:
+                logger.info("landing pad archive sweep moved %s file(s)", result["moved"])
+            _record_worker_success("landing_pad_archive_worker")
+        except Exception as exc:
+            _record_worker_failure("landing_pad_archive_worker", exc)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=float(LANDING_PAD_ARCHIVE_INTERVAL_SECONDS))
+        except asyncio.TimeoutError:
+            continue
+
+
+async def _process_polled_email(message: dict[str, Any]) -> None:
+    mapped_payload = email_to_alert_payload(message, default_service=EMAIL_DEFAULT_SERVICE)
+    try:
+        alert = _build_alert_from_payload(mapped_payload)
+        await _publish_ingested_alert(alert)
+    except Exception as exc:
+        logger.exception("failed to ingest polled email %s", message.get("message_id"))
+        _persist_alert_to_landing_pad(mapped_payload, message, status="failed", error=str(exc))
+        return
+    mapped_payload["labels"] = dict(alert.labels)
+    _persist_alert_to_landing_pad(mapped_payload, message, status="processed")
+
+
+async def _email_poll_worker() -> None:
+    stop_event = app.state.monitoring_adapter_stop_event
+    imap_config = ImapConfig(
+        host=EMAIL_IMAP_HOST,
+        port=EMAIL_IMAP_PORT,
+        username=EMAIL_IMAP_USER,
+        password=EMAIL_IMAP_PASSWORD,
+        mailbox=EMAIL_IMAP_MAILBOX,
+        use_ssl=EMAIL_IMAP_USE_SSL,
+    )
+    while not stop_event.is_set():
+        try:
+            # imaplib is blocking/sync — run it off the event loop thread.
+            messages = await asyncio.to_thread(fetch_unseen_emails, imap_config, limit=EMAIL_POLL_BATCH_SIZE)
+            for message in messages:
+                await _process_polled_email(message)
+            _record_worker_success("email_poll_worker")
+        except Exception as exc:
+            _record_worker_failure("email_poll_worker", exc)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=float(EMAIL_POLL_INTERVAL_SECONDS))
+        except asyncio.TimeoutError:
+            continue
+
+
 async def _on_startup(_: Any) -> None:
     app.state.monitoring_adapter_stop_event = asyncio.Event()
     if INCIDENT_PROJECTION_WORKER_ENABLED:
         app.state.incident_projection_task = asyncio.create_task(_incident_projection_worker())
     if LANDING_PAD_FILE_WATCHER_ENABLED:
         app.state.landing_pad_file_watcher_task = asyncio.create_task(_landing_pad_file_watcher())
+    if LANDING_PAD_ARCHIVE_ENABLED:
+        app.state.landing_pad_archive_task = asyncio.create_task(_landing_pad_archive_worker())
+    if EMAIL_INGESTION_ENABLED:
+        if EMAIL_IMAP_HOST and EMAIL_IMAP_USER and EMAIL_IMAP_PASSWORD:
+            app.state.email_poll_task = asyncio.create_task(_email_poll_worker())
+        else:
+            logger.warning(
+                "EMAIL_INGESTION_ENABLED is true but EMAIL_IMAP_HOST/EMAIL_IMAP_USER/EMAIL_IMAP_PASSWORD "
+                "are not fully configured — email polling will not start."
+            )
 
 
 async def _on_shutdown(_: Any) -> None:
@@ -800,6 +957,20 @@ async def _on_shutdown(_: Any) -> None:
         watcher_task.cancel()
         try:
             await watcher_task
+        except asyncio.CancelledError:
+            pass
+    archive_task = getattr(app.state, "landing_pad_archive_task", None)
+    if archive_task is not None:
+        archive_task.cancel()
+        try:
+            await archive_task
+        except asyncio.CancelledError:
+            pass
+    email_task = getattr(app.state, "email_poll_task", None)
+    if email_task is not None:
+        email_task.cancel()
+        try:
+            await email_task
         except asyncio.CancelledError:
             pass
 
@@ -2754,9 +2925,24 @@ def _record_closed_incident(
     )
 
 
+def _severity_to_support_tier(severity: str) -> str:
+    """Maps severity to a first-line (L1) vs specialist-escalation (L2/L3)
+    support tier, for display/filtering only — no notification or assignment
+    routing yet. "L1" corresponds to the existing SystemRole.L1_OPERATOR
+    role; "L2/L3" corresponds to L2_ENGINEER + L3_ENGINEER combined (this
+    project doesn't currently split severity between L2 and L3 individually).
+    Critical/high alerts skip straight to L2/L3 since they need a specialist
+    right away; warning/info are routine enough for L1 to triage first.
+    """
+    normalized = str(severity or "").strip().lower()
+    if normalized in {"critical", "high"}:
+        return "L2/L3"
+    return "L1"
+
+
 def _build_alert_from_payload(payload: dict[str, Any], trace_id: str | None = None) -> Alert:
     trace_id = trace_id or uuid.uuid4().hex
-    labels = payload.get("labels", {}) if isinstance(payload.get("labels"), dict) else {}
+    labels = dict(payload.get("labels", {}) if isinstance(payload.get("labels"), dict) else {})
     annotations = payload.get("annotations", {}) if isinstance(payload.get("annotations"), dict) else {}
     severity_value = severity_from_string(str(payload.get("severity", labels.get("severity", "warning"))))
 
@@ -2777,6 +2963,8 @@ def _build_alert_from_payload(payload: dict[str, Any], trace_id: str | None = No
             continue
         severity_value = severity_from_string(str(rule.get("severity") or severity_value))
         break
+
+    labels.setdefault("support_tier", _severity_to_support_tier(severity_value))
 
     return Alert(
         source=payload.get("source", payload.get("generatorURL", "unknown")),
@@ -3243,7 +3431,7 @@ async def discover_monitoring_objects(integration_id: str, payload: dict[str, An
 
 
 @app.post("/monitoring/integrations/{integration_id}/register-webhook")
-async def register_monitoring_webhook(integration_id: str, payload: dict[str, Any] = ALERT_BODY) -> dict[str, Any]:
+async def register_monitoring_webhook(integration_id: str, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     session_factory = _db_required()
     default_gateway_base = str(getattr(settings, "gateway_public_base_url", "") or "http://localhost:8080")
     public_base_url = str(payload.get("public_base_url") or default_gateway_base).rstrip("/")
@@ -3655,6 +3843,7 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
             )
             continue
 
+        mapped_payload["labels"] = dict(alert.labels)
         landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item, status="processed")
         ingested_rows.append(
             {
@@ -3674,6 +3863,119 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
         "alerts": ingested_rows,
         "skipped_rows": skipped_rows,
     }
+
+
+def _jira_priority_to_severity(priority_name: str) -> str:
+    normalized = str(priority_name or "").strip().lower()
+    if normalized in {"highest", "blocker", "critical"}:
+        return "critical"
+    if normalized in {"high"}:
+        return "high"
+    if normalized in {"low", "lowest", "trivial"}:
+        return "info"
+    return "warning"
+
+
+def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
+    if not isinstance(issue, dict):
+        raise ValueError("jira webhook payload must contain an issue object")
+    fields = issue.get("fields", {}) if isinstance(issue.get("fields"), dict) else {}
+    issue_key = str(issue.get("key") or "unknown-issue")
+    issue_id = str(issue.get("id") or "")
+    summary = str(fields.get("summary") or issue_key)
+    priority = fields.get("priority", {}) if isinstance(fields.get("priority"), dict) else {}
+    status_field = fields.get("status", {}) if isinstance(fields.get("status"), dict) else {}
+    project = fields.get("project", {}) if isinstance(fields.get("project"), dict) else {}
+    reporter = fields.get("reporter", {}) if isinstance(fields.get("reporter"), dict) else {}
+    assignee = fields.get("assignee", {}) if isinstance(fields.get("assignee"), dict) else {}
+    webhook_event = str(payload.get("webhookEvent") or "").strip()
+
+    mapped_payload = {
+        "source": "jira",
+        "name": summary,
+        "service": str(project.get("key") or "jira-tickets"),
+        "environment": "prod",
+        "severity": _jira_priority_to_severity(str(priority.get("name") or "")),
+        "description": str(fields.get("description") or summary),
+        "labels": {
+            "alert_status": "firing",
+            "ticket_id": issue_key,
+            "jira_issue_id": issue_id,
+            "jira_status": str(status_field.get("name") or ""),
+            "jira_priority": str(priority.get("name") or ""),
+            "jira_reporter": str(reporter.get("displayName") or ""),
+            "jira_assignee": str(assignee.get("displayName") or ""),
+            "jira_webhook_event": webhook_event,
+        },
+        "annotations": {
+            "summary": summary,
+            "description": str(fields.get("description") or ""),
+        },
+    }
+    return mapped_payload, issue_key
+
+
+async def _process_jira_webhook(payload: dict[str, Any], trace_id: str | None) -> None:
+    """Runs after the HTTP response has already been sent (via BackgroundTasks)
+    so the webhook receiver can ack Jira with 200 immediately instead of
+    making Jira wait on alert-build + publish + landing-pad persistence.
+    """
+    try:
+        mapped_payload, issue_key = _jira_payload_to_alert_payload(payload)
+    except ValueError:
+        logger.exception("received malformed jira webhook payload")
+        return
+    try:
+        alert = _build_alert_from_payload(mapped_payload, trace_id=trace_id)
+        await _publish_ingested_alert(alert)
+    except Exception as exc:
+        logger.exception("failed to ingest jira webhook for issue %s", issue_key)
+        _persist_alert_to_landing_pad(mapped_payload, payload, status="failed", error=str(exc))
+        return
+    mapped_payload["labels"] = dict(alert.labels)
+    _persist_alert_to_landing_pad(mapped_payload, payload, status="processed")
+
+
+@app.post("/api/v1/tickets/jira")
+@app.post("/api/v1/alerts/jira")
+async def ingest_jira_webhook(
+    payload: dict = ALERT_BODY,
+    background_tasks: BackgroundTasks = None,
+    token: str | None = None,
+    x_webhook_token: str | None = Header(default=None),
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Ingest a Jira issue-created/updated webhook into the same landing pad
+    pipeline Prometheus alerts use. Auth is a shared secret, checked via
+    either ?token=... or the X-Webhook-Token header — configured via
+    JIRA_WEBHOOK_SECRET. Fails closed: if the secret isn't configured, this
+    endpoint refuses all requests rather than accepting unverified webhooks.
+
+    Registered under both /api/v1/tickets/jira (original path) and
+    /api/v1/alerts/jira (the provider-webhook convention build_webhook_path()
+    uses for every other monitoring provider), so register-webhook's
+    auto-generated URL for the "jira" provider resolves to a real receiver.
+
+    Responds 200 immediately after basic validation; the actual alert build +
+    publish + landing-pad persistence happens in a background task so slow
+    downstream steps can't cause Jira to time out and retry the webhook.
+    """
+    if not JIRA_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="Jira ingestion is not configured (JIRA_WEBHOOK_SECRET unset)")
+    provided_token = str(token or x_webhook_token or "").strip()
+    if not provided_token or provided_token != JIRA_WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="invalid or missing Jira webhook token")
+
+    issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
+    if not isinstance(issue, dict):
+        raise HTTPException(status_code=400, detail="jira webhook payload must contain an issue object")
+    issue_key = str(issue.get("key") or "unknown-issue")
+    webhook_event = str(payload.get("webhookEvent") or "").strip()
+
+    background_tasks.add_task(_process_jira_webhook, payload, x_trace_id)
+    logger.info("received jira webhook event=%s issue=%s", webhook_event, issue_key)
+    return {"received": True, "webhookEvent": webhook_event, "ticket_id": issue_key}
 
 
 @app.get("/alerts")
@@ -3852,7 +4154,7 @@ async def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
         [
             path
             for source_dir in (LANDING_PAD_PROCESSED_DIR, LANDING_PAD_FAILED_DIR)
-            for path in source_dir.glob("*.json")
+            for path in source_dir.rglob("*.json")  # nested under <source>/<date>/
             if path.is_file()
         ],
         key=lambda path: path.stat().st_mtime,
@@ -3942,6 +4244,33 @@ async def process_landing_pad_input(payload: dict[str, Any] = Body(default={})) 
         "failed": failed,
         "remaining": len(_landing_pad_input_files(10_000)),
         "rows": results,
+    }
+
+
+@app.get("/landing-pad/archive")
+async def get_landing_pad_archive(limit: int = 50) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit), 200))
+    rows = _landing_pad_file_rows(LANDING_PAD_ARCHIVE_DIR, safe_limit)
+    return {
+        "archive_dir": str(LANDING_PAD_ARCHIVE_DIR),
+        "archive_enabled": LANDING_PAD_ARCHIVE_ENABLED,
+        "archive_after_days": LANDING_PAD_ARCHIVE_AFTER_DAYS,
+        "archive_interval_seconds": LANDING_PAD_ARCHIVE_INTERVAL_SECONDS,
+        "rows": rows,
+        "count": len(rows),
+    }
+
+
+@app.post("/landing-pad/archive/run")
+async def run_landing_pad_archive() -> dict[str, Any]:
+    """Manually trigger one archive sweep immediately, independent of the
+    background worker's interval — useful for testing and for on-demand
+    cleanup without waiting for LANDING_PAD_ARCHIVE_INTERVAL_SECONDS.
+    """
+    result = _sweep_landing_pad_archive_once()
+    return {
+        "archive_after_days": LANDING_PAD_ARCHIVE_AFTER_DAYS,
+        **result,
     }
 
 

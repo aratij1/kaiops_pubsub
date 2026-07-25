@@ -19,6 +19,7 @@ SUPPORTED_MONITORING_PROVIDERS = [
     "nagios",
     "zabbix",
     "elastic",
+    "jira",
 ]
 
 
@@ -250,6 +251,7 @@ def provider_registry() -> dict[str, IMonitoringProvider]:
         "nagios": BaseMonitoringProvider("nagios"),
         "zabbix": BaseMonitoringProvider("zabbix"),
         "elastic": BaseMonitoringProvider("elastic"),
+        "jira": BaseMonitoringProvider("jira"),
     }
     return {
         "prometheus": PrometheusProvider(),

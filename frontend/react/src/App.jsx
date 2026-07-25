@@ -11173,6 +11173,7 @@ export default function App() {
                         <th>Application</th>
                         <th>Service</th>
                         <th>Severity</th>
+                        <th>Tier</th>
                         <th>Status</th>
                         <th>Action</th>
                       </tr>
@@ -11183,6 +11184,7 @@ export default function App() {
                         const fullAlertId = String(row.alert_id || row.id || row.incident_id || "-");
                         const compactAlertId = fullAlertId.length > 16 ? `${fullAlertId.slice(0, 8)}...${fullAlertId.slice(-6)}` : fullAlertId;
                         const severity = String(row.severity || "-").toUpperCase();
+                        const supportTier = String(row.labels?.support_tier || "-");
                         const status = String(row.status || row.state || "open");
                         const application = row.application || row.project_name || row.project || row.service || "-";
                         const alertRuleName = String(
@@ -11216,6 +11218,7 @@ export default function App() {
                             <td>{application}</td>
                             <td>{row.service || "-"}</td>
                             <td><span className={`pill severity-${severity.toLowerCase()}`}>{severity}</span></td>
+                            <td><span className={`pill tier-${supportTier.toLowerCase().replace("/", "-")}`}>{supportTier}</span></td>
                             <td><span className={`pill status-${status.toLowerCase()}`}>{status}</span></td>
                             <td>
                               <button

@@ -1,0 +1,215 @@
+{
+  "received_at": "2026-07-24T09:38:18.080713+00:00",
+  "source": "jira",
+  "status": "processed",
+  "error": null,
+  "alert": {
+    "source": "jira",
+    "name": "[Critical] LLM provider error rate high on kaiops-model-router - occurrence 06 test",
+    "service": "KAN",
+    "environment": "prod",
+    "severity": "critical",
+    "description": "KaiOps historical monitoring incident for contextual RCA retrieval.\n\nALERT DETAILS\n- Alert: LLM provider error rate high\n- Service: kaiops-model-router\n- Source: KaiOps Synthetic Monitor\n- Environment: Pre-Production\n- Evidence: Model calls returned 429/5xx above 8%; occurrence 6/20. KaiOps correlation found 3 related signals across 2 monitored resources.\n- Correlation ID: INC-2025-10986\n\nROOT CAUSE\nPrimary provider quota was exhausted by an unbounded summarization workflow.\n\nBUSINESS IMPACT\nkaiops-model-router experienced major production degradation; approximately 4898 transactions or operational events were delayed or failed. Incident response and business operations were at risk of SLA breach.\n\nRESOLUTION STEPS\n1. Route to approved fallback model.\n2. enforce token and concurrency budgets.\n3. repair summarization batching.\n\nVALIDATION\nModel error rate below 1%, queue age normal, and cost guardrails show no breach.\n\nPREVENTION\nAdd regression coverage for llm provider error rate high; retain the alert with early-warning threshold; track recurrence using scenario label kaiops-scenario-50; review capacity/configuration during the next problem-management cycle.",
+    "labels": {
+      "alert_status": "firing",
+      "ticket_id": "KAN-995",
+      "jira_issue_id": "11100",
+      "jira_status": "Done",
+      "jira_priority": "Highest",
+      "jira_reporter": "Arati",
+      "jira_assignee": "",
+      "jira_webhook_event": "jira:issue_updated",
+      "support_tier": "L2/L3"
+    },
+    "annotations": {
+      "summary": "[Critical] LLM provider error rate high on kaiops-model-router - occurrence 06 test",
+      "description": "KaiOps historical monitoring incident for contextual RCA retrieval.\n\nALERT DETAILS\n- Alert: LLM provider error rate high\n- Service: kaiops-model-router\n- Source: KaiOps Synthetic Monitor\n- Environment: Pre-Production\n- Evidence: Model calls returned 429/5xx above 8%; occurrence 6/20. KaiOps correlation found 3 related signals across 2 monitored resources.\n- Correlation ID: INC-2025-10986\n\nROOT CAUSE\nPrimary provider quota was exhausted by an unbounded summarization workflow.\n\nBUSINESS IMPACT\nkaiops-model-router experienced major production degradation; approximately 4898 transactions or operational events were delayed or failed. Incident response and business operations were at risk of SLA breach.\n\nRESOLUTION STEPS\n1. Route to approved fallback model.\n2. enforce token and concurrency budgets.\n3. repair summarization batching.\n\nVALIDATION\nModel error rate below 1%, queue age normal, and cost guardrails show no breach.\n\nPREVENTION\nAdd regression coverage for llm provider error rate high; retain the alert with early-warning threshold; track recurrence using scenario label kaiops-scenario-50; review capacity/configuration during the next problem-management cycle."
+    }
+  },
+  "raw": {
+    "timestamp": 1784885709292,
+    "webhookEvent": "jira:issue_updated",
+    "issue_event_type_name": "issue_updated",
+    "user": {
+      "self": "https://kaiops-test.atlassian.net/rest/api/2/user?accountId=712020%3Adf3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+      "accountId": "712020:df3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+      "avatarUrls": {
+        "48x48": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+        "24x24": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+        "16x16": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+        "32x32": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png"
+      },
+      "displayName": "Arati",
+      "active": true,
+      "timeZone": "Asia/Calcutta",
+      "accountType": "atlassian"
+    },
+    "issue": {
+      "id": "11100",
+      "self": "https://kaiops-test.atlassian.net/rest/api/2/issue/11100",
+      "key": "KAN-995",
+      "fields": {
+        "statuscategorychangedate": null,
+        "issuetype": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/issuetype/10008",
+          "id": "10008",
+          "description": "Tasks track small, distinct pieces of work.",
+          "iconUrl": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/issuetype/avatar/10318?size=medium",
+          "name": "Task",
+          "subtask": false,
+          "avatarId": 10318,
+          "entityId": "8963f416-c42c-4ae6-a254-4ea0ab794a4e",
+          "hierarchyLevel": 0
+        },
+        "components": [],
+        "timespent": 0,
+        "timeoriginalestimate": 0,
+        "description": "KaiOps historical monitoring incident for contextual RCA retrieval.\n\nALERT DETAILS\n- Alert: LLM provider error rate high\n- Service: kaiops-model-router\n- Source: KaiOps Synthetic Monitor\n- Environment: Pre-Production\n- Evidence: Model calls returned 429/5xx above 8%; occurrence 6/20. KaiOps correlation found 3 related signals across 2 monitored resources.\n- Correlation ID: INC-2025-10986\n\nROOT CAUSE\nPrimary provider quota was exhausted by an unbounded summarization workflow.\n\nBUSINESS IMPACT\nkaiops-model-router experienced major production degradation; approximately 4898 transactions or operational events were delayed or failed. Incident response and business operations were at risk of SLA breach.\n\nRESOLUTION STEPS\n1. Route to approved fallback model.\n2. enforce token and concurrency budgets.\n3. repair summarization batching.\n\nVALIDATION\nModel error rate below 1%, queue age normal, and cost guardrails show no breach.\n\nPREVENTION\nAdd regression coverage for llm provider error rate high; retain the alert with early-warning threshold; track recurrence using scenario label kaiops-scenario-50; review capacity/configuration during the next problem-management cycle.",
+        "project": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/project/10001",
+          "id": "10001",
+          "key": "KAN",
+          "name": "kaiops-test",
+          "projectTypeKey": "software",
+          "simplified": true,
+          "avatarUrls": {
+            "48x48": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415",
+            "24x24": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415?size=small",
+            "16x16": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415?size=xsmall",
+            "32x32": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415?size=medium"
+          }
+        },
+        "fixVersions": [],
+        "statusCategory": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/statuscategory/3",
+          "id": 3,
+          "key": "done",
+          "colorName": "green",
+          "name": "Complete"
+        },
+        "aggregatetimespent": 0,
+        "resolution": null,
+        "timetracking": {
+          "originalEstimate": "0m",
+          "remainingEstimate": "0m",
+          "timeSpent": "0m",
+          "originalEstimateSeconds": 0,
+          "remainingEstimateSeconds": 0,
+          "timeSpentSeconds": 0
+        },
+        "customfield_10015": null,
+        "security": null,
+        "attachment": [],
+        "aggregatetimeestimate": 0,
+        "resolutiondate": null,
+        "workratio": -1,
+        "summary": "[Critical] LLM provider error rate high on kaiops-model-router - occurrence 06 test",
+        "issuerestriction": {
+          "issuerestrictions": {},
+          "shouldDisplay": true
+        },
+        "watches": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/issue/KAN-995/watchers",
+          "watchCount": 0,
+          "isWatching": false
+        },
+        "lastViewed": "2026-07-24T15:03:15.864+0530",
+        "creator": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/user?accountId=712020%3Adf3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "accountId": "712020:df3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "avatarUrls": {
+            "48x48": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "24x24": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "16x16": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "32x32": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png"
+          },
+          "displayName": "Arati",
+          "active": true,
+          "timeZone": "Asia/Calcutta",
+          "accountType": "atlassian"
+        },
+        "subtasks": [],
+        "created": "2026-07-24T14:51:51.194+0530",
+        "reporter": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/user?accountId=712020%3Adf3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "accountId": "712020:df3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "avatarUrls": {
+            "48x48": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "24x24": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "16x16": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "32x32": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png"
+          },
+          "displayName": "Arati",
+          "active": true,
+          "timeZone": "Asia/Calcutta",
+          "accountType": "atlassian"
+        },
+        "customfield_10021": null,
+        "aggregateprogress": {
+          "progress": 0,
+          "total": 0
+        },
+        "priority": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/priority/1",
+          "iconUrl": "https://kaiops-test.atlassian.net/images/icons/priorities/highest_new.svg",
+          "name": "Highest",
+          "id": "1"
+        },
+        "customfield_10001": null,
+        "labels": [
+          "ai-platform",
+          "historical-context",
+          "kaiops",
+          "kaiops-scenario-50",
+          "monitoring"
+        ],
+        "environment": "Pre-Production",
+        "customfield_10019": null,
+        "timeestimate": 0,
+        "aggregatetimeoriginalestimate": 0,
+        "versions": [],
+        "duedate": null,
+        "progress": {
+          "progress": 0,
+          "total": 0
+        },
+        "issuelinks": [],
+        "votes": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/issue/KAN-995/votes",
+          "votes": 0,
+          "hasVoted": false
+        },
+        "assignee": null,
+        "updated": "2026-07-24T15:05:09.292+0530",
+        "status": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/status/10007",
+          "description": "",
+          "iconUrl": "https://kaiops-test.atlassian.net/images/icons/statuses/generic.png",
+          "name": "Done",
+          "id": "10007",
+          "statusCategory": {
+            "self": "https://kaiops-test.atlassian.net/rest/api/2/statuscategory/3",
+            "id": 3,
+            "key": "done",
+            "colorName": "green",
+            "name": "Complete"
+          }
+        }
+      }
+    },
+    "changelog": {
+      "id": "11137",
+      "items": [
+        {
+          "field": "summary",
+          "fieldtype": "jira",
+          "fieldId": "summary",
+          "from": null,
+          "fromString": "[Critical] LLM provider error rate high on kaiops-model-router - occurrence 06",
+          "to": null,
+          "toString": "[Critical] LLM provider error rate high on kaiops-model-router - occurrence 06 test"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,215 @@
+{
+  "received_at": "2026-07-24T09:39:10.749925+00:00",
+  "source": "jira",
+  "status": "processed",
+  "error": null,
+  "alert": {
+    "source": "jira",
+    "name": "[Critical] High error rate on checkout-api - occurrence 13 - test",
+    "service": "KAN",
+    "environment": "prod",
+    "severity": "critical",
+    "description": "KaiOps historical monitoring incident for contextual RCA retrieval.\n\nALERT DETAILS\n- Alert: High error rate\n- Service: checkout-api\n- Source: CloudWatch\n- Environment: Production\n- Evidence: 5xx rate exceeded 8% for 10 minutes; occurrence 13/20. KaiOps correlation found 2 related signals across 1 monitored resources.\n- Correlation ID: INC-2025-10013\n\nROOT CAUSE\nA faulty release introduced an unhandled null response from the pricing client.\n\nBUSINESS IMPACT\ncheckout-api experienced major production degradation; approximately 1069 transactions or operational events were delayed or failed. Incident response and business operations were at risk of SLA breach.\n\nRESOLUTION STEPS\n1. Rollback checkout-api to the last stable image.\n2. clear affected pods.\n3. verify pricing-client contract.\n4. run checkout smoke tests.\n\nVALIDATION\n5xx rate below 1% for 15 minutes and checkout success rate above 99%.\n\nPREVENTION\nAdd regression coverage for high error rate; retain the alert with early-warning threshold; track recurrence using scenario label kaiops-scenario-01; review capacity/configuration during the next problem-management cycle.",
+    "labels": {
+      "alert_status": "firing",
+      "ticket_id": "KAN-22",
+      "jira_issue_id": "10128",
+      "jira_status": "Done",
+      "jira_priority": "Highest",
+      "jira_reporter": "Arati",
+      "jira_assignee": "",
+      "jira_webhook_event": "jira:issue_updated",
+      "support_tier": "L2/L3"
+    },
+    "annotations": {
+      "summary": "[Critical] High error rate on checkout-api - occurrence 13 - test",
+      "description": "KaiOps historical monitoring incident for contextual RCA retrieval.\n\nALERT DETAILS\n- Alert: High error rate\n- Service: checkout-api\n- Source: CloudWatch\n- Environment: Production\n- Evidence: 5xx rate exceeded 8% for 10 minutes; occurrence 13/20. KaiOps correlation found 2 related signals across 1 monitored resources.\n- Correlation ID: INC-2025-10013\n\nROOT CAUSE\nA faulty release introduced an unhandled null response from the pricing client.\n\nBUSINESS IMPACT\ncheckout-api experienced major production degradation; approximately 1069 transactions or operational events were delayed or failed. Incident response and business operations were at risk of SLA breach.\n\nRESOLUTION STEPS\n1. Rollback checkout-api to the last stable image.\n2. clear affected pods.\n3. verify pricing-client contract.\n4. run checkout smoke tests.\n\nVALIDATION\n5xx rate below 1% for 15 minutes and checkout success rate above 99%.\n\nPREVENTION\nAdd regression coverage for high error rate; retain the alert with early-warning threshold; track recurrence using scenario label kaiops-scenario-01; review capacity/configuration during the next problem-management cycle."
+    }
+  },
+  "raw": {
+    "timestamp": 1784885760574,
+    "webhookEvent": "jira:issue_updated",
+    "issue_event_type_name": "issue_updated",
+    "user": {
+      "self": "https://kaiops-test.atlassian.net/rest/api/2/user?accountId=712020%3Adf3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+      "accountId": "712020:df3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+      "avatarUrls": {
+        "48x48": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+        "24x24": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+        "16x16": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+        "32x32": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png"
+      },
+      "displayName": "Arati",
+      "active": true,
+      "timeZone": "Asia/Calcutta",
+      "accountType": "atlassian"
+    },
+    "issue": {
+      "id": "10128",
+      "self": "https://kaiops-test.atlassian.net/rest/api/2/issue/10128",
+      "key": "KAN-22",
+      "fields": {
+        "statuscategorychangedate": null,
+        "issuetype": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/issuetype/10008",
+          "id": "10008",
+          "description": "Tasks track small, distinct pieces of work.",
+          "iconUrl": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/issuetype/avatar/10318?size=medium",
+          "name": "Task",
+          "subtask": false,
+          "avatarId": 10318,
+          "entityId": "8963f416-c42c-4ae6-a254-4ea0ab794a4e",
+          "hierarchyLevel": 0
+        },
+        "components": [],
+        "timespent": 0,
+        "timeoriginalestimate": 0,
+        "description": "KaiOps historical monitoring incident for contextual RCA retrieval.\n\nALERT DETAILS\n- Alert: High error rate\n- Service: checkout-api\n- Source: CloudWatch\n- Environment: Production\n- Evidence: 5xx rate exceeded 8% for 10 minutes; occurrence 13/20. KaiOps correlation found 2 related signals across 1 monitored resources.\n- Correlation ID: INC-2025-10013\n\nROOT CAUSE\nA faulty release introduced an unhandled null response from the pricing client.\n\nBUSINESS IMPACT\ncheckout-api experienced major production degradation; approximately 1069 transactions or operational events were delayed or failed. Incident response and business operations were at risk of SLA breach.\n\nRESOLUTION STEPS\n1. Rollback checkout-api to the last stable image.\n2. clear affected pods.\n3. verify pricing-client contract.\n4. run checkout smoke tests.\n\nVALIDATION\n5xx rate below 1% for 15 minutes and checkout success rate above 99%.\n\nPREVENTION\nAdd regression coverage for high error rate; retain the alert with early-warning threshold; track recurrence using scenario label kaiops-scenario-01; review capacity/configuration during the next problem-management cycle.",
+        "project": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/project/10001",
+          "id": "10001",
+          "key": "KAN",
+          "name": "kaiops-test",
+          "projectTypeKey": "software",
+          "simplified": true,
+          "avatarUrls": {
+            "48x48": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415",
+            "24x24": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415?size=small",
+            "16x16": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415?size=xsmall",
+            "32x32": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415?size=medium"
+          }
+        },
+        "fixVersions": [],
+        "statusCategory": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/statuscategory/3",
+          "id": 3,
+          "key": "done",
+          "colorName": "green",
+          "name": "Complete"
+        },
+        "aggregatetimespent": 0,
+        "resolution": null,
+        "timetracking": {
+          "originalEstimate": "0m",
+          "remainingEstimate": "0m",
+          "timeSpent": "0m",
+          "originalEstimateSeconds": 0,
+          "remainingEstimateSeconds": 0,
+          "timeSpentSeconds": 0
+        },
+        "customfield_10015": null,
+        "security": null,
+        "attachment": [],
+        "aggregatetimeestimate": 0,
+        "resolutiondate": null,
+        "workratio": -1,
+        "summary": "[Critical] High error rate on checkout-api - occurrence 13 - test",
+        "watches": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/issue/KAN-22/watchers",
+          "watchCount": 0,
+          "isWatching": false
+        },
+        "issuerestriction": {
+          "issuerestrictions": {},
+          "shouldDisplay": true
+        },
+        "lastViewed": "2026-07-24T15:05:50.431+0530",
+        "creator": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/user?accountId=712020%3Adf3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "accountId": "712020:df3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "avatarUrls": {
+            "48x48": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "24x24": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "16x16": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "32x32": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png"
+          },
+          "displayName": "Arati",
+          "active": true,
+          "timeZone": "Asia/Calcutta",
+          "accountType": "atlassian"
+        },
+        "subtasks": [],
+        "created": "2026-07-24T14:51:51.157+0530",
+        "reporter": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/user?accountId=712020%3Adf3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "accountId": "712020:df3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "avatarUrls": {
+            "48x48": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "24x24": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "16x16": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "32x32": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png"
+          },
+          "displayName": "Arati",
+          "active": true,
+          "timeZone": "Asia/Calcutta",
+          "accountType": "atlassian"
+        },
+        "customfield_10021": null,
+        "aggregateprogress": {
+          "progress": 0,
+          "total": 0
+        },
+        "priority": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/priority/1",
+          "iconUrl": "https://kaiops-test.atlassian.net/images/icons/priorities/highest_new.svg",
+          "name": "Highest",
+          "id": "1"
+        },
+        "customfield_10001": null,
+        "labels": [
+          "application",
+          "historical-context",
+          "kaiops",
+          "kaiops-scenario-01",
+          "monitoring"
+        ],
+        "environment": "Production",
+        "customfield_10019": "0|i00073:",
+        "timeestimate": 0,
+        "aggregatetimeoriginalestimate": 0,
+        "versions": [],
+        "duedate": null,
+        "progress": {
+          "progress": 0,
+          "total": 0
+        },
+        "votes": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/issue/KAN-22/votes",
+          "votes": 0,
+          "hasVoted": false
+        },
+        "issuelinks": [],
+        "assignee": null,
+        "updated": "2026-07-24T15:06:00.574+0530",
+        "status": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/status/10007",
+          "description": "",
+          "iconUrl": "https://kaiops-test.atlassian.net/images/icons/statuses/generic.png",
+          "name": "Done",
+          "id": "10007",
+          "statusCategory": {
+            "self": "https://kaiops-test.atlassian.net/rest/api/2/statuscategory/3",
+            "id": 3,
+            "key": "done",
+            "colorName": "green",
+            "name": "Complete"
+          }
+        }
+      }
+    },
+    "changelog": {
+      "id": "11139",
+      "items": [
+        {
+          "field": "summary",
+          "fieldtype": "jira",
+          "fieldId": "summary",
+          "from": null,
+          "fromString": "[Critical] High error rate on checkout-api - occurrence 13",
+          "to": null,
+          "toString": "[Critical] High error rate on checkout-api - occurrence 13 - test"
+        }
+      ]
+    }
+  }
+}
