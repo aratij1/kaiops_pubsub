@@ -4448,9 +4448,27 @@ def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
                     "received_at": payload.get("received_at") if isinstance(payload, dict) else None,
                     "status": payload.get("status") if isinstance(payload, dict) else None,
                     "error": payload.get("error") if isinstance(payload, dict) else None,
+                    "source": (
+                        alert.get("source") or payload.get("source")
+                        if isinstance(alert, dict)
+                        else payload.get("source")
+                    ),
                     "name": alert.get("name") if isinstance(alert, dict) else None,
                     "service": alert.get("service") if isinstance(alert, dict) else None,
+                    "environment": alert.get("environment") if isinstance(alert, dict) else None,
                     "severity": alert.get("severity") if isinstance(alert, dict) else None,
+                    "description": alert.get("description") if isinstance(alert, dict) else None,
+                    "application": alert.get("application") or labels.get("application"),
+                    "project": alert.get("project") or labels.get("project"),
+                    "project_name": alert.get("project_name") or labels.get("project_name"),
+                    "labels": labels,
+                    "annotations": annotations,
+                    "origin_system": (
+                        alert.get("origin_system")
+                        or labels.get("origin_system")
+                        or labels.get("source_system")
+                    ),
+                    "ingestion_channel": alert.get("ingestion_channel") or labels.get("ingestion_channel"),
                     "alert_status": labels.get("alert_status") if isinstance(labels, dict) else None,
                     "alertname": labels.get("alertname") if isinstance(labels, dict) else None,
                     "summary": annotations.get("summary") if isinstance(annotations, dict) else None,
