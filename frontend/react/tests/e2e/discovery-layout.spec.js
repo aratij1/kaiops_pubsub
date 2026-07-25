@@ -113,6 +113,10 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await expect(firstAlert).toBeVisible({ timeout: 30_000 });
   await firstAlert.locator("button").first().click();
 
+  await expect(page.getByRole("button", { name: "Incident Workspace", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Evidence", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Actions", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Incident Workspace", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Signal to Recovery", exact: true })).toBeVisible();
   await expect(page.locator(".unified-incident-timeline")).toBeVisible();
   await expect(page.locator(".timeline-phase-card")).toHaveCount(6);
@@ -132,6 +136,8 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await expect(discoveryTab).toBeVisible();
   await discoveryTab.click();
   await expect(page.getByRole("heading", { name: "Discovery + Context", exact: true })).toBeVisible();
+  await expect(page.locator(".analysis-journey")).toContainText("Connect context");
+  await expect(page.locator(".analysis-journey")).toContainText("Evidence-backed response");
   await expect(page.getByText("Memory pressure in user-profile", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Evidence used", { exact: true }).first()).toBeVisible();
   await expect(page.getByText(/```json/)).toHaveCount(0);

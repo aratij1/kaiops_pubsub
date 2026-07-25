@@ -11230,7 +11230,7 @@ export default function App() {
   }, [selectedApprovalIncidentId, selectedApprovalRecommendationId]);
 
   useEffect(() => {
-    if (activeTab === "home" && homeDetailTab === "actions" && selectedIncidentId) {
+    if (activeTab === "home" && homeDetailTab === "timeline" && selectedIncidentId) {
       return;
     }
     if (!filteredPendingApprovals.length) {
@@ -11445,7 +11445,7 @@ export default function App() {
   }
 
   const approvalReady = useMemo(() => {
-    const cockpitIncidentId = activeTab === "home" && homeDetailTab === "actions" ? selectedIncidentId : "";
+    const cockpitIncidentId = activeTab === "home" && homeDetailTab === "timeline" ? selectedIncidentId : "";
     const hasBase = String(cockpitIncidentId || approvalForm.incident_id || selectedApprovalIncidentId || "").trim() && String(approvalForm.approver || "").trim();
     if (!hasBase) {
       return false;
@@ -11686,7 +11686,7 @@ export default function App() {
     event.preventDefault();
     setApprovalState({ loading: true, result: null, error: "" });
     try {
-      const cockpitIncidentId = activeTab === "home" && homeDetailTab === "actions" ? selectedIncidentId : "";
+      const cockpitIncidentId = activeTab === "home" && homeDetailTab === "timeline" ? selectedIncidentId : "";
       const incidentId = String(cockpitIncidentId || approvalForm.incident_id || selectedApprovalIncidentId || "").trim();
       const approver = String(approvalForm.approver || adminSession?.user?.username || "admin").trim();
       if (!looksLikeUuid(incidentId)) {
@@ -13635,7 +13635,7 @@ export default function App() {
                           <button
                             type="button"
                             className="button-primary"
-                            onClick={() => setHomeDetailTab("actions")}
+                            onClick={() => setHomeDetailTab("timeline")}
                           >
                             Review Decision
                           </button>
@@ -13656,14 +13656,14 @@ export default function App() {
                   })()}
 
                   <div className="detail-tabs">
-                    {["timeline", "discovery", "evidence", "actions", "raw"].map((tab) => (
+                    {["timeline", "discovery", "raw"].map((tab) => (
                       <button
                         key={`detail-${tab}`}
                         type="button"
                         className={`detail-tab ${homeDetailTab === tab ? "active" : ""}`}
                         onClick={() => setHomeDetailTab(tab)}
                       >
-                        {tab === "timeline" ? "Incident Timeline" : tab === "discovery" ? "Discovery + Context" : tab === "evidence" ? "Evidence" : tab === "actions" ? "Actions" : "Raw Data"}
+                        {tab === "timeline" ? "Incident Workspace" : tab === "discovery" ? "Discovery + Context" : "Raw Data"}
                       </button>
                     ))}
                   </div>
@@ -13722,6 +13722,22 @@ export default function App() {
                         <span className="source-badge source-ticket">Jira / tickets</span>
                         <span className="source-badge">Source code</span>
                       </div>
+                      <div className="analysis-journey" aria-label="Connected investigation journey">
+                        {[
+                          ["01", "Discover", "Signals and source facts"],
+                          ["02", "Connect context", "Documents, changes, and dependencies"],
+                          ["03", "Explain", "Grounded RCA and impact"],
+                          ["04", "Act", "Evidence-backed response"],
+                        ].map(([number, label, detail], index) => (
+                          <div className="analysis-journey-segment" key={label}>
+                            <article>
+                              <span>{number}</span>
+                              <div><strong>{label}</strong><small>{detail}</small></div>
+                            </article>
+                            {index < 3 ? <i aria-hidden="true">→</i> : null}
+                          </div>
+                        ))}
+                      </div>
                       <IntelligenceConnectionView
                         workflow={selectedAlertWorkflow}
                         documents={selectedAlertRagDocuments}
@@ -13763,6 +13779,19 @@ export default function App() {
 
                   {homeDetailTab === "timeline" ? (
                     <>
+                      <header className="incident-workspace-hero">
+                        <div>
+                          <span className="discovery-eyebrow">Unified response cockpit</span>
+                          <h3>Incident Workspace</h3>
+                          <p>Follow the incident, verify the evidence, make the decision, and execute recovery without switching tabs.</p>
+                        </div>
+                        <div className="incident-workspace-kpis">
+                          <span><strong>{selectedCanonicalIncidentStatus}</strong> lifecycle</span>
+                          <span><strong>{selectedAlertTimelineRows.length}</strong> events</span>
+                          <span><strong>{selectedAlertRagDocuments.length}</strong> documents</span>
+                          <span><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong> grounded</span>
+                        </div>
+                      </header>
                       <UnifiedIncidentTimeline
                         workflow={selectedAlertWorkflow}
                         rows={selectedAlertTimelineRows}
@@ -13904,11 +13933,14 @@ export default function App() {
                     </>
                   ) : null}
 
-                  {homeDetailTab === "evidence" ? (
-                    <article className="panel">
+                  {homeDetailTab === "timeline" ? (
+                    <article className="panel incident-workspace-section evidence-workspace">
                       <div className="panel-head">
-                        <h3>Evidence Workspace</h3>
-                        <p>Canonical alert identity, trace context, and document-link evidence.</p>
+                        <div>
+                          <span className="workspace-section-number">02</span>
+                          <h3>Evidence & Trust</h3>
+                          <p>Canonical identity, traceability, linked knowledge, and evaluation quality.</p>
+                        </div>
                       </div>
                       <div className="table-wrap table-wrap-scroll-x">
                         <table>
@@ -13935,11 +13967,14 @@ export default function App() {
                     </article>
                   ) : null}
 
-                  {homeDetailTab === "actions" ? (
-                    <article className="panel">
+                  {homeDetailTab === "timeline" ? (
+                    <article className="panel incident-workspace-section approval-workspace">
                       <div className="panel-head">
-                        <h3>Approval Workspace</h3>
-                        <p>Directly approve/reject/modify for this alert incident.</p>
+                        <div>
+                          <span className="workspace-section-number">03</span>
+                          <h3>Decision & Approval</h3>
+                          <p>Review evidence quality and approve, reject, or modify the proposed response.</p>
+                        </div>
                       </div>
                       <div className="table-wrap">
                         <table>
@@ -13987,8 +14022,8 @@ export default function App() {
                     </article>
                   ) : null}
 
-                  {homeDetailTab === "actions" ? (
-                    <article className="panel alert-documents-panel">
+                  {homeDetailTab === "timeline" ? (
+                    <article className="panel alert-documents-panel incident-workspace-section">
                       <div className="panel-head">
                         <h3>Alert Documents</h3>
                         <p>Download backend-linked documents for the selected alert.</p>
@@ -14074,7 +14109,7 @@ export default function App() {
                                 Provide Documents
                               </button>
                             ) : (
-                              <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("actions")}>
+                              <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("timeline")}>
                                 Escalate To L2/L3
                               </button>
                             )}
@@ -14256,12 +14291,15 @@ export default function App() {
                     </div>
                   ) : null}
 
-                  {homeDetailTab === "actions" ? (
+                  {homeDetailTab === "timeline" ? (
                     <>
-                      <article className="panel remediation-workspace">
+                      <article className="panel remediation-workspace incident-workspace-section">
                         <div className="panel-head">
-                          <h3>Resolution & Remediation Workspace</h3>
-                          <p>Step 1: confirm incident + approval status. Step 2: execute approved remediation steps.</p>
+                          <div>
+                            <span className="workspace-section-number">04</span>
+                            <h3>Resolution & Remediation</h3>
+                            <p>Confirm the decision, review the guarded plan, execute, and validate recovery.</p>
+                          </div>
                         </div>
                         <div className="workflow-guide-grid remediation-flow-grid">
                           {selectedWorkflowFlowStages.map((stage) => (
