@@ -3723,11 +3723,41 @@ th {
   font-weight: 700;
 }
 
+.context-doc-highlight {
+  border: 1px solid #f3d27a;
+  border-left: 3px solid #d9a422;
+  border-radius: 8px;
+  background: #fff8e1;
+  padding: 6px 8px;
+  display: grid;
+  gap: 2px;
+  margin-top: 2px;
+}
+
+.context-doc-highlight strong {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: #8a6100;
+}
+
+.context-doc-highlight p {
+  margin: 0;
+  font-size: 12px;
+  color: #4a3b00;
+  overflow-wrap: anywhere;
+}
+
 .context-doc-actions {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
   margin-top: 4px;
+}
+
+.context-doc-actions .button-secondary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .context-doc-preview {
