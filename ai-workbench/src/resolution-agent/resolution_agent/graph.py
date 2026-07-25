@@ -171,20 +171,38 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
 
     @staticmethod
-    def _extract_model_text(content: Any, *, fallback_text: str) -> str:
+    def _extract_model_object(content: Any) -> dict[str, Any] | None:
+        text = str(content or "").strip()
+        if not text:
+            return None
+        fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+        candidates = [fenced.group(1).strip()] if fenced else []
+        candidates.append(text)
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
+        if first_brace >= 0 and last_brace > first_brace:
+            candidates.append(text[first_brace:last_brace + 1])
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    @staticmethod
+    def _extract_model_text(content: Any, *, keys: tuple[str, ...], fallback_text: str) -> str:
         text = str(content or "").strip()
         if not text:
             return fallback_text
-        try:
-            parsed = json.loads(text)
-        except (TypeError, ValueError):
-            return text
-        if not isinstance(parsed, dict):
+        parsed = ResolutionIntelligenceAgent._extract_model_object(text)
+        if parsed is None:
             return text
         metadata = parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {}
         if metadata.get("fallback"):
             return fallback_text
-        for key in ("root_cause", "summary", "recommended_action", "content", "title"):
+        for key in keys:
             value = parsed.get(key)
             if str(value or "").strip():
                 return str(value).strip()
@@ -393,8 +411,51 @@ class ResolutionIntelligenceAgent(BaseAgent):
             }
             for item in context.recent_changes[:5]
         ]
+        discovery_report = (
+            context.metadata.get("discovery_report")
+            if isinstance(context.metadata.get("discovery_report"), dict)
+            else {}
+        )
+        raw_evidence = discovery_report.get("evidence") if isinstance(discovery_report.get("evidence"), list) else []
+        service_terms = {
+            token
+            for value in (context.alert.service, context.alert.name, *context.alert.labels.values())
+            for token in re.split(r"[^a-z0-9]+", self._norm(value))
+            if len(token) >= 3
+        }
+        relevant_evidence: list[dict[str, Any]] = []
+        for item in raw_evidence:
+            if not isinstance(item, dict):
+                continue
+            evidence_text = self._norm(
+                " ".join(
+                    str(item.get(key) or "")
+                    for key in ("evidence_id", "source", "uri", "path", "snippet", "service")
+                )
+            )
+            if service_terms and not any(term in evidence_text for term in service_terms):
+                continue
+            relevant_evidence.append(
+                {
+                    "evidence_id": item.get("evidence_id"),
+                    "source": item.get("source"),
+                    "uri": item.get("uri") or item.get("path"),
+                    "snippet": str(item.get("snippet") or "")[:500],
+                }
+            )
+            if len(relevant_evidence) >= 12:
+                break
 
         state["gathered_context"] = {
+            "alert": {
+                "name": context.alert.name,
+                "service": context.alert.service,
+                "severity": context.alert.severity.value,
+                "description": context.alert.description,
+                "labels": context.alert.labels,
+            },
+            "observability": context.observability,
+            "discovery_evidence": relevant_evidence,
             "deployment": context.deployment,
             "related_incidents": related_incident_preview,
             "runbook": runbook_preview,
@@ -414,7 +475,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
             payload=payload,
             fallback_content=f"Likely service degradation in {context.alert.service}",
         )
-        content = self._extract_model_text(response["content"], fallback_text=f"Likely service degradation in {context.alert.service}")
+        content = self._extract_model_text(
+            response["content"],
+            keys=("root_cause", "cause", "summary"),
+            fallback_text=f"Evidence is insufficient to determine the root cause of {context.alert.service} degradation.",
+        )
         state["root_cause"] = self._infer_root_cause(context, content)
         state["rationale"] = f"Model {response['model']} linked symptoms to {state['root_cause']}"
         state.setdefault("model_usage", []).append(response["usage"])
@@ -441,7 +506,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
     async def impact_analysis(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
         prompt = PROMPT_ASSESS_IMPACT
-        payload = {"service": context.alert.service, "metrics": context.observability}
+        payload = {
+            "alert": state["gathered_context"].get("alert", {}),
+            "metrics": context.observability,
+            "dependencies": context.dependency_services[:8],
+            "discovery_evidence": state["gathered_context"].get("discovery_evidence", []),
+        }
         response = await self._generate_with_fallback(
             context=context,
             task=ModelTask.IMPACT,
@@ -454,6 +524,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         else:
             state["impact"] = self._extract_model_text(
                 response["content"],
+                keys=("impact_summary", "customer_impact", "service_impact", "severity_rationale", "summary"),
                 fallback_text=f"{context.alert.service.title()} service impact requires immediate triage",
             )
         state.setdefault("model_usage", []).append(response["usage"])
@@ -490,6 +561,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
         model_action = self._extract_model_text(
             response["content"],
+            keys=("recommended_action", "action", "summary"),
             fallback_text=f"Investigate {context.alert.service} health and apply documented runbook remediation",
         )
         action, commands, remediation_target = self._infer_action_and_commands(

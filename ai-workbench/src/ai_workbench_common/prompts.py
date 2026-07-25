@@ -29,18 +29,23 @@ PROMPT_IDENTIFY_ROOT_CAUSE = _env_prompt(
     "KAIOPS_PROMPT_IDENTIFY_ROOT_CAUSE",
     (
         "Identify the most likely root cause using only supplied incident, alert, metric, log, topology, "
-        "deployment, and RAG/runbook evidence. Return a compact JSON-compatible answer with keys: "
+        "deployment, and RAG/runbook evidence. Prioritize evidence that explicitly matches the alert service, "
+        "alert name, labels, or dependency path; do not use unrelated historical incidents as causal evidence. "
+        "Return only one JSON object, with no markdown fence or introductory prose, using keys: "
         "root_cause, evidence_used, missing_evidence, alternative_causes, confidence_score, grounding_notes. "
-        "If evidence is insufficient, say so and recommend the next diagnostic step. Do not fabricate facts."
+        "Keep root_cause to one operational sentence. If evidence is insufficient, say so and identify the next "
+        "diagnostic step. Do not fabricate facts."
     ),
 )
 PROMPT_ASSESS_IMPACT = _env_prompt(
     "KAIOPS_PROMPT_ASSESS_IMPACT",
     (
         "Assess customer, service, dependency, and business impact using only the supplied context. "
-        "Return a compact JSON-compatible answer with keys: impacted_services, customer_impact, "
+        "Distinguish observed impact from risk; do not translate a metric into customer impact without evidence. "
+        "Return only one JSON object, with no markdown fence or introductory prose, using keys: impacted_services, customer_impact, "
         "dependency_impact, severity_rationale, blast_radius, assumptions, evidence_used, confidence_score. "
-        "Keep unsupported impact claims out of the answer and list them as assumptions or missing evidence."
+        "missing_evidence, assumptions, evidence_used, confidence_score. Keep unsupported impact claims out of "
+        "the answer and list them as assumptions or missing evidence."
     ),
 )
 PROMPT_RECOMMEND_REMEDIATION = _env_prompt(

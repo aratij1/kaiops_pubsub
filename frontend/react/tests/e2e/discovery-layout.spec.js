@@ -49,21 +49,6 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
             : { data: [], rows: [], summary: {}, items: [] };
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
   });
-  await page.route("**/monitoring-adapter/alerts/*/processed-result", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        data: {
-          alert: { id: "11111111-1111-4111-8111-111111111111", name: "Pod crash loop", service: "user-profile" },
-          incident: { id: "incident-pod-crash-1", status: "investigating" },
-          context: { metadata: { rag_documents: 1 } },
-          recommendation: { root_cause: "Memory pressure", metadata: {} },
-          events: [],
-        },
-      }),
-    });
-  });
   await page.route("**/monitoring-adapter/**", async (route) => {
     const workflow = {
       alert: { id: "alert-discovery-1", name: "Pod crash loop", service: "user-profile", severity: "critical" },
@@ -94,6 +79,12 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
             },
           },
         },
+      },
+      recommendation: {
+        root_cause: "Given the evidence:\\n```json\\n{\"root_cause\":\"Memory pressure in user-profile\",\"evidence_used\":[\"Container memory limit reached\"],\"missing_evidence\":[\"Heap profile\"],\"confidence_score\":0.72}\\n```",
+        impact: "```json\\n{\"impacted_services\":[\"user-profile\"],\"customer_impact\":\"Intermittent profile failures\",\"blast_radius\":\"Single service\",\"confidence_score\":0.64}\\n```",
+        recommended_action: "Restart the affected pod after approval and validate memory.",
+        metadata: {},
       },
     };
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { workflow } }) });
@@ -131,6 +122,9 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await discoveryTab.click();
   await expect(page.getByRole("heading", { name: "Discovery + Context Intelligence", exact: true })).toBeVisible();
   await expect(page.locator(".combined-analysis-page")).toBeVisible();
+  await expect(page.getByText("Memory pressure in user-profile", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Evidence used", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText(/```json/)).toHaveCount(0);
 
   const desktopOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1);
   expect(desktopOverflow).toBeFalsy();
