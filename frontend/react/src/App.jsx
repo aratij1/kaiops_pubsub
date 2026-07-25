@@ -6054,6 +6054,8 @@ export default function App() {
   const [gatewayRecent, setGatewayRecent] = useState({ loading: false, rows: [], error: "" });
   const [modelProviderStatus, setModelProviderStatus] = useState({ loading: false, data: null, error: "" });
   const [landingPadRecent, setLandingPadRecent] = useState({ loading: false, rows: [], error: "" });
+  const [ingestionStreamChannel, setIngestionStreamChannel] = useState("all");
+  const [ingestionStreamQuery, setIngestionStreamQuery] = useState("");
   const [ragDocs, setRagDocs] = useState({ loading: false, rows: [], error: "" });
   const [guidanceQuery, setGuidanceQuery] = useState("");
   const [guidanceState, setGuidanceState] = useState({ loading: false, rows: [], error: "" });
@@ -6943,7 +6945,7 @@ export default function App() {
   async function loadLandingPadRecent() {
     setLandingPadRecent((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/landing-pad/recent?limit=50");
+      const payload = await fetchJson("/api-gateway/landing-pad/recent?limit=200");
       const data = unwrap(payload);
       const rows = data?.rows || [];
       setLandingPadRecent({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
@@ -9670,6 +9672,20 @@ export default function App() {
     loadMonitorApplications();
   }, [adminSession.accessToken]);
 
+  useEffect(() => {
+    if (
+      activeTab !== "stream"
+      || !Boolean(String(adminSession.accessToken || "").trim())
+    ) {
+      return undefined;
+    }
+    loadLandingPadRecent();
+    const timer = window.setInterval(() => {
+      loadLandingPadRecent();
+    }, 10_000);
+    return () => window.clearInterval(timer);
+  }, [activeTab, adminSession.accessToken]);
+
   const latestWorkflow = useMemo(() => {
     return workflowState?.result?.data || {};
   }, [workflowState]);
@@ -11928,6 +11944,7 @@ export default function App() {
 
   const tabs = [
     { id: "home", label: "Dashboard" },
+    { id: "stream", label: "Alert Ingestion Stream" },
     { id: "copilot", label: "Copilot Studio" },
     { id: "executive", label: "Executive Dashboard" },
     { id: "admin", label: "Admin Center" },
@@ -11941,6 +11958,7 @@ export default function App() {
 
   const sidebarSections = [
     { id: "home", icon: "DB", shortLabel: "Dashboard", label: "Dashboard", tone: "ops" },
+    { id: "stream", icon: "LS", shortLabel: "Live Stream", label: "Alert Ingestion Stream", tone: "meta" },
     { id: "approval", icon: "AL", shortLabel: "Approval", label: "Human Approval", tone: "risk" },
     { id: "executive", icon: "EX", shortLabel: "Executive", label: "Executive Dashboard", tone: "meta" },
     { id: "admin", icon: "AD", shortLabel: "Admin", label: "Admin Center", tone: "bus" },
@@ -11997,6 +12015,57 @@ export default function App() {
     }),
     [sidebarSections, allowedTabs, currentRole],
   );
+  const ingestionStreamRows = useMemo(
+    () => (Array.isArray(landingPadRecent.rows) ? landingPadRecent.rows : [])
+      .map((row, index) => {
+        const mapped = mapLandingPadRowToAlertStreamRow(row, index);
+        return {
+          ...mapped,
+          file: row?.file || "-",
+          path: row?.path || "",
+          error: row?.error || "",
+          source_channel: normalizeAlertChannel(mapped),
+        };
+      })
+      .sort((left, right) => alertTimeMs(right) - alertTimeMs(left)),
+    [landingPadRecent.rows],
+  );
+  const ingestionStreamCounts = useMemo(() => {
+    const counts = { all: ingestionStreamRows.length, email: 0, log: 0, prometheus: 0, telemetry: 0, ticket: 0, failed: 0 };
+    ingestionStreamRows.forEach((row) => {
+      const channel = String(row?.source_channel || "prometheus");
+      counts[channel] = Number(counts[channel] || 0) + 1;
+      if (String(row?.status || "").toLowerCase() === "failed" || row?.error) {
+        counts.failed += 1;
+      }
+    });
+    return counts;
+  }, [ingestionStreamRows]);
+  const visibleIngestionStreamRows = useMemo(() => {
+    const query = String(ingestionStreamQuery || "").trim().toLowerCase();
+    return ingestionStreamRows.filter((row) => {
+      const failed = String(row?.status || "").toLowerCase() === "failed" || Boolean(row?.error);
+      if (ingestionStreamChannel === "failed" && !failed) {
+        return false;
+      }
+      if (!["all", "failed"].includes(ingestionStreamChannel) && row.source_channel !== ingestionStreamChannel) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      return [
+        row.name,
+        row.service,
+        row.application,
+        row.project_name,
+        row.source,
+        row.file,
+        row.status,
+        row.error,
+      ].map((value) => String(value || "").toLowerCase()).join(" ").includes(query);
+    });
+  }, [ingestionStreamRows, ingestionStreamChannel, ingestionStreamQuery]);
   const isAuthenticated = Boolean(String(adminSession.accessToken || "").trim());
   const isAdministrator = currentRole === "administrator";
   const canUseApprovalActions = allowedTabs.includes("approval");
@@ -13182,6 +13251,113 @@ export default function App() {
               </div>
             ) : null}
           </section>
+
+          {activeTab === "stream" ? (
+            <section className="grid single-col ingestion-stream-page">
+              <article className="ingestion-stream-hero">
+                <div>
+                  <span className="discovery-eyebrow">Live multi-source intake</span>
+                  <h2>Alert Ingestion Stream</h2>
+                  <p>Email, logs, Prometheus, Telemetry, and ticketing events as they land in KaiOps.</p>
+                </div>
+                <div className="ingestion-live-state">
+                  <span className={`ingestion-live-dot ${landingPadRecent.loading ? "is-loading" : ""}`} aria-hidden="true" />
+                  <div>
+                    <strong>{landingPadRecent.loading ? "Syncing now" : "Live · 10s refresh"}</strong>
+                    <small>{visibleIngestionStreamRows.length} of {ingestionStreamRows.length} arrivals shown</small>
+                  </div>
+                  <button type="button" className="button-secondary" onClick={loadLandingPadRecent} disabled={landingPadRecent.loading}>
+                    {landingPadRecent.loading ? "Refreshing..." : "Refresh now"}
+                  </button>
+                </div>
+              </article>
+
+              <div className="ingestion-channel-grid" aria-label="Alert source counts">
+                {[
+                  ["all", "ALL", "All arrivals", ingestionStreamCounts.all],
+                  ["prometheus", "PR", "Prometheus", ingestionStreamCounts.prometheus],
+                  ["telemetry", "OT", "Telemetry", ingestionStreamCounts.telemetry],
+                  ["email", "EM", "Email", ingestionStreamCounts.email],
+                  ["log", "LG", "Logs / OpenSearch", ingestionStreamCounts.log],
+                  ["ticket", "TK", "Tickets / Jira", ingestionStreamCounts.ticket],
+                  ["failed", "!", "Failed intake", ingestionStreamCounts.failed],
+                ].map(([channel, icon, label, count]) => (
+                  <button
+                    type="button"
+                    key={`stream-channel-${channel}`}
+                    className={`ingestion-channel-card channel-${channel} ${ingestionStreamChannel === channel ? "is-active" : ""}`}
+                    onClick={() => setIngestionStreamChannel(channel)}
+                    aria-pressed={ingestionStreamChannel === channel}
+                  >
+                    <span>{icon}</span>
+                    <div><strong>{count}</strong><small>{label}</small></div>
+                  </button>
+                ))}
+              </div>
+
+              <article className="panel ingestion-stream-panel">
+                <div className="ingestion-stream-toolbar">
+                  <div>
+                    <span className="discovery-eyebrow">Landing-pad events</span>
+                    <h3>
+                      {ingestionStreamChannel === "all"
+                        ? "All source activity"
+                        : ingestionStreamChannel === "failed"
+                          ? "Failed ingestion activity"
+                          : `${sourceChannelLabel(ingestionStreamChannel)} activity`}
+                    </h3>
+                  </div>
+                  <label>
+                    <span>Search stream</span>
+                    <input
+                      value={ingestionStreamQuery}
+                      onChange={(event) => setIngestionStreamQuery(event.target.value)}
+                      placeholder="Alert, service, project, source, file"
+                    />
+                  </label>
+                </div>
+                {landingPadRecent.error ? <p className="error">{landingPadRecent.error}</p> : null}
+                <div className="ingestion-stream-list">
+                  {visibleIngestionStreamRows.map((row, index) => {
+                    const channel = row.source_channel || "prometheus";
+                    const failed = String(row.status || "").toLowerCase() === "failed" || Boolean(row.error);
+                    return (
+                      <article className={`ingestion-event channel-${channel} ${failed ? "is-failed" : ""}`} key={`${row.file || row.id || "arrival"}-${index}`}>
+                        <div className="ingestion-event-marker">
+                          <span>{channel === "email" ? "EM" : channel === "log" ? "LG" : channel === "ticket" ? "TK" : channel === "telemetry" ? "OT" : "PR"}</span>
+                          <i aria-hidden="true" />
+                        </div>
+                        <div className="ingestion-event-main">
+                          <header>
+                            <div>
+                              <strong>{row.name || row.alert_name || "Unnamed alert"}</strong>
+                              <span className={`source-badge source-${channel}`}>{sourceChannelLabel(channel)}</span>
+                              <span className={`pill ${failed ? "status-failed" : statusPillClass(row.status || "processed")}`}>{row.status || "processed"}</span>
+                            </div>
+                            <time>{formatIstTimestamp(row.received_at || row.created_at || row.modified_at)}</time>
+                          </header>
+                          <p>{row.description || row.annotations?.description || row.error || "Alert received and normalized by the landing pad."}</p>
+                          <footer>
+                            <span><b>Service</b>{row.service || "-"}</span>
+                            <span><b>Project</b>{row.application || row.project_name || row.project || "-"}</span>
+                            <span><b>Severity</b>{String(row.severity || "-").toUpperCase()}</span>
+                            <span title={row.file}><b>File</b>{compactText(row.file, 44)}</span>
+                          </footer>
+                          {row.error ? <small className="ingestion-event-error">{row.error}</small> : null}
+                        </div>
+                      </article>
+                    );
+                  })}
+                  {!visibleIngestionStreamRows.length && !landingPadRecent.loading ? (
+                    <div className="ingestion-stream-empty">
+                      <strong>No arrivals match this view.</strong>
+                      <p>Choose another source, clear the search, or verify that its connector is delivering files or webhooks to the landing pad.</p>
+                    </div>
+                  ) : null}
+                </div>
+              </article>
+            </section>
+          ) : null}
 
           {activeTab === "home" ? (
             <section className="grid single-col">
