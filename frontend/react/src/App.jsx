@@ -3087,9 +3087,22 @@ function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
     { id: "validate", icon: "◎", label: "Validate", hint: "Recovery confirmed", match: ["validat", "closure", "closed", "health restored"] },
   ];
   const assigned = new Set();
+  // Lane text is built from curated, human-readable fields only -- NOT the raw
+  // inputValueText/outputValueText JSON blobs, which almost always carry a trace_id
+  // (matches "discover"'s "trace" token) or similar incidental substrings and would
+  // otherwise pull unrelated events (e.g. ingestion/topic-handoff rows) into the wrong lane.
+  const laneText = (row) => [row?.status, row?.stage, row?.detail, row?.agent, row?.service, row?.consumes, row?.publishes]
+    .map((item) => String(item || "").toLowerCase())
+    .join(" ");
   const laneRows = lanes.map((lane) => {
+    // A row is claimed by at most one lane: the first (in detect -> validate order) whose
+    // keywords match. Previously every lane re-tested every row independently, so a single
+    // event could match more than one lane's keywords and appear duplicated across phases.
     const matched = safeRows.filter((row, index) => {
-      const text = timelineRowText(row).toLowerCase();
+      if (assigned.has(index)) {
+        return false;
+      }
+      const text = laneText(row);
       const hit = lane.match.some((token) => text.includes(token));
       if (hit) assigned.add(index);
       return hit;
@@ -3159,11 +3172,18 @@ function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
                 <strong>{lane.rows.length}</strong>
                 <span>{lane.rows.length === 1 ? "event" : "events"}</span>
               </div>
-              <small className="timeline-phase-latest">
-                {lane.rows.length
-                  ? compactText(latest.stage || latest.agent || latest.service || latest.detail, 54)
-                  : "Not reached yet"}
-              </small>
+              {lane.rows.length ? (
+                <div className="timeline-phase-latest">
+                  <strong>{compactText(latest.stage || latest.agent || latest.service || `${lane.label} event`, 60)}</strong>
+                  <p>{compactText(latest.detail || latest.outputValueText || latest.inputValueText, 140) || "No additional detail was recorded for this event."}</p>
+                  <small>
+                    {latest.agent || latest.service || "KaiOps"} · {formatIstTimestamp(latest.timestamp || latest.created_at)}
+                    {latest.status || timelineRowStatus(latest) ? ` · ${latest.status || timelineRowStatus(latest)}` : ""}
+                  </small>
+                </div>
+              ) : (
+                <small className="timeline-phase-latest timeline-phase-latest-empty">Not reached yet</small>
+              )}
               {lane.rows.length ? (
                 <button
                   type="button"
@@ -3577,6 +3597,25 @@ function groundedIntelligenceDisplay(label, value) {
   return { headline, details };
 }
 
+function downloadInvestigationArtifact(filename, payload) {
+  const safeName = String(filename || "kaiops-investigation.json")
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/-+/g, "-")
+    .toLowerCase();
+  const content = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+  const blob = new Blob([content], {
+    type: typeof payload === "string" ? "text/plain;charset=utf-8" : "application/json;charset=utf-8",
+  });
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = safeName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
 function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocument }) {
   const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
   const context = safeWorkflow.context && typeof safeWorkflow.context === "object" ? safeWorkflow.context : {};
@@ -3698,6 +3737,33 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
       value: recommendation.recommended_action || (Array.isArray(report.recommended_next_checks) ? report.recommended_next_checks.join(" ") : "No action was produced."),
     },
   ].map((item) => ({ ...item, display: groundedIntelligenceDisplay(item.label, item.value) }));
+  const investigationPackage = {
+    generated_at: new Date().toISOString(),
+    alert: safeWorkflow.alert || {},
+    incident: safeWorkflow.incident || {},
+    query_plan: { query_terms: queryTerms, retrieval_stages: discovery.retrieval_stages || [] },
+    discovery_evidence: evidence,
+    assembled_context: context,
+    ranked_documents: ragMatches,
+    linked_documents: documents,
+    hypotheses,
+    citations: supportingIds,
+    recommendation,
+  };
+  const stageArtifact = (stageId) => {
+    if (stageId === "signal") return investigationPackage.query_plan;
+    if (stageId === "discover") return { source_counts: sourceCounts, evidence };
+    if (stageId === "context") return { context, ranked_documents: ragMatches, linked_documents: documents };
+    if (stageId === "reason") {
+      return { report, hypotheses, citations: supportingIds, root_cause: recommendation.root_cause, impact: recommendation.impact };
+    }
+    return {
+      recommended_action: recommendation.recommended_action,
+      preventive_action: recommendation.preventive_action,
+      validation: recommendation.validation || report.recommended_next_checks || [],
+      approval: safeWorkflow.approval || {},
+    };
+  };
 
   return (
     <section className="intelligence-connection">
@@ -3707,9 +3773,14 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
           <h3>Discovery Evidence → Context Assembly → RCA & Impact</h3>
           <p>This is the handoff between the two agents. Only retrieved evidence and assembled context should support downstream conclusions.</p>
         </div>
-        <span className={`workflow-pill ${evidence.length || contextItems.length ? "workflow-pill-active" : "workflow-pill-idle"}`}>
-          {evidence.length || contextItems.length ? "connected" : "no context"}
-        </span>
+        <div className="intelligence-header-actions">
+          <span className={`workflow-pill ${evidence.length || contextItems.length ? "workflow-pill-active" : "workflow-pill-idle"}`}>
+            {evidence.length || contextItems.length ? "connected" : "no context"}
+          </span>
+          <button type="button" className="button-primary" onClick={() => downloadInvestigationArtifact("kaiops-complete-investigation.json", investigationPackage)}>
+            Download complete investigation
+          </button>
+        </div>
       </header>
       <div className="investigation-story">
         <div className="investigation-story-intro">
@@ -3737,6 +3808,13 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
                     ? stage.tags.map((tag) => <span key={`${stage.id}-${tag}`}>{compactText(tag, 30)}</span>)
                     : <span>Awaiting persisted data</span>}
                 </div>
+                <button
+                  type="button"
+                  className="investigation-download-button"
+                  onClick={() => downloadInvestigationArtifact(`kaiops-${stage.number}-${stage.id}.json`, stageArtifact(stage.id))}
+                >
+                  Download {stage.id === "discover" ? "evidence & logs" : stage.id === "context" ? "context & documents" : stage.id === "reason" ? "RCA & impact" : stage.id === "act" ? "action plan" : "search plan"}
+                </button>
               </article>
               {index < storyStages.length - 1 ? (
                 <div className="investigation-story-handoff" aria-hidden="true">
@@ -3768,6 +3846,13 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
             <div className="intelligence-fact" key={`lineage-evidence-${item.evidence_id || index}`}>
               <strong>{item.evidence_id || `FACT-${index + 1}`}</strong>
               <span>{item.source || "source"} · {compactText(item.snippet, 150)}</span>
+              <button
+                type="button"
+                className="intelligence-inline-download"
+                onClick={() => downloadInvestigationArtifact(`kaiops-${item.source || "evidence"}-${item.evidence_id || index + 1}.json`, item)}
+              >
+                Download {String(item.source || "evidence").toLowerCase()}
+              </button>
             </div>
           ))}
         </article>
@@ -3804,6 +3889,18 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
                   ))}
                 </dl>
               ) : null}
+              <button
+                type="button"
+                className="intelligence-inline-download"
+                onClick={() => downloadInvestigationArtifact(`kaiops-${item.label}.json`, {
+                  type: item.label,
+                  value: item.value,
+                  display: item.display,
+                  citations: supportingIds,
+                })}
+              >
+                Download {item.label}
+              </button>
             </div>
           ))}
           <div className="intelligence-citations">
@@ -3812,6 +3909,19 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
           </div>
           <div className="intelligence-document-downloads">
             <strong>{documents.length} linked document(s)</strong>
+            {documents.length ? (
+              <button
+                type="button"
+                className="button-primary"
+                onClick={() => downloadInvestigationArtifact("kaiops-linked-document-package.json", {
+                  documents,
+                  ranked_matches: ragMatches,
+                  assembled_context: context,
+                })}
+              >
+                Download all documents + context
+              </button>
+            ) : null}
             {documents.slice(0, 6).map((doc, index) => (
               <button
                 type="button"
@@ -11441,6 +11551,19 @@ export default function App() {
     return pendingApprovals.find((row) => String(row?.service || "").trim().toLowerCase() === service) || null;
   }
 
+  // Single source of truth for "what is the approval status of the selected alert" so the
+  // Decision Gate, Decision & Approval section, and any other view agree instead of each
+  // computing their own answer from a different subset of fields.
+  const selectedMatchedApproval = useMemo(
+    () => resolvePendingApprovalFromAlertRow(selectedAlertRow),
+    [selectedAlertRow, pendingApprovals, pendingApprovalByIncidentId],
+  );
+
+  const selectedApprovalStatus = useMemo(
+    () => normalizeApprovalStatus(selectedMatchedApproval?.status || selectedAlertWorkflow?.approval?.status),
+    [selectedMatchedApproval, selectedAlertWorkflow?.approval?.status],
+  );
+
   function selectApprovalFromAlertRow(alertRow) {
     const matchedRow = resolvePendingApprovalFromAlertRow(alertRow);
     if (!matchedRow) {
@@ -13848,15 +13971,12 @@ export default function App() {
                   </div>
 
                   {(() => {
-                    const matchedApproval = resolvePendingApprovalFromAlertRow(selectedAlertRow);
+                    const matchedApproval = selectedMatchedApproval;
                     const incidentId = approvalIncidentId(matchedApproval)
                       || selectedAlertWorkflow?.incident?.id
                       || selectedAlertWorkflow?.incident_id
                       || "";
-                    const approvalStatus = normalizeApprovalStatus(
-                      matchedApproval?.status
-                      || selectedAlertWorkflow?.approval?.status
-                    );
+                    const approvalStatus = selectedApprovalStatus;
                     const isResolved = isApprovalResolvedStatus(approvalStatus);
                     const requiresApproval = Boolean(
                       matchedApproval
@@ -13866,10 +13986,7 @@ export default function App() {
                       || selectedAlertWorkflow?.decision?.requires_approval
                       || isApprovalPendingStatus(approvalStatus)
                     );
-                    const hasActionableApproval = Boolean(
-                      resolvePendingApprovalFromAlertRow(selectedAlertRow)
-                      && !isResolved
-                    );
+                    const hasActionableApproval = Boolean(matchedApproval && !isResolved);
 
                     if (!requiresApproval) {
                       return null;
@@ -14236,7 +14353,7 @@ export default function App() {
                             <tr><th>Trace ID</th><td>{selectedAlertDocumentContract?.observability?.trace_id || selectedAlertRow?.trace_id || "-"}</td></tr>
                             <tr><th>Correlation ID</th><td>{selectedAlertDocumentContract?.canonical_alert?.correlation_id || selectedAlertRow?.correlation_id || "-"}</td></tr>
                             <tr><th>Document Link Contract</th><td>{selectedAlertDocumentContract?.document_link_summary?.contract_version || "-"}</td></tr>
-                            <tr><th>Linked Document Count</th><td>{selectedAlertDocumentContract?.document_link_summary?.count ?? selectedAlertRagDocuments.length}</td></tr>
+                            <tr><th>Linked Document Count</th><td>{selectedAlertRagDocuments.length}</td></tr>
                             <tr><th>Evaluation Contract</th><td>{selectedAlertEvaluation.contractVersion}</td></tr>
                             <tr><th>Overall Evaluation</th><td>{formatQualityPercent(selectedAlertEvaluation.overallScore)} ({selectedAlertEvaluation.qualityLabel})</td></tr>
                             <tr><th>Confidence Score</th><td>{formatQualityPercent(selectedAlertEvaluation.confidenceScore)}</td></tr>
@@ -14266,7 +14383,7 @@ export default function App() {
                           <tbody>
                             <tr><th>Incident</th><td>{approvalForm.incident_id || selectedAlertWorkflow?.incident?.id || "-"}</td></tr>
                             <tr><th>Recommendation</th><td>{approvalForm.recommendation_id || "-"}</td></tr>
-                            <tr><th>Current Approval Status</th><td>{selectedAlertWorkflow?.approval?.status || "pending"}</td></tr>
+                            <tr><th>Current Approval Status</th><td>{selectedApprovalStatus || (selectedMatchedApproval ? "pending" : "not active")}</td></tr>
                             <tr><th>Role Eligible</th><td>{canUseApprovalActions ? "yes" : "no"}</td></tr>
                             <tr><th>Evaluation Quality</th><td>{formatQualityPercent(selectedAlertEvaluation.overallScore)} ({selectedAlertEvaluation.qualityLabel})</td></tr>
                             <tr><th>Grounding / Hallucination Risk</th><td>{formatQualityPercent(selectedAlertEvaluation.groundingScore)} / {formatQualityPercent(selectedAlertEvaluation.hallucinationRisk)}</td></tr>
@@ -14324,7 +14441,7 @@ export default function App() {
                       {selectedAlertDocumentContract?.document_link_summary ? (
                         <p className="subtitle">
                           Source: {selectedAlertDocumentContract.document_link_summary.source}
-                          {" | "}Matches: {selectedAlertDocumentContract.document_link_summary.count}
+                          {" | "}Matches: {selectedAlertRagDocuments.length}
                           {" | "}Reasons: {(selectedAlertDocumentContract.document_link_summary.match_reasons || []).join(", ") || "-"}
                         </p>
                       ) : null}

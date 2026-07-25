@@ -5458,7 +5458,7 @@ th {
   --story-tone: #2f78a6;
   position: relative;
   display: grid;
-  grid-template-rows: auto auto auto 1fr;
+  grid-template-rows: auto auto auto 1fr auto;
   gap: 10px;
   min-width: 0;
   padding: 14px;
@@ -5467,6 +5467,41 @@ th {
   border-radius: 14px;
   background: color-mix(in srgb, var(--panel) 94%, var(--story-tone) 6%);
   box-shadow: 0 9px 22px color-mix(in srgb, var(--story-tone) 10%, transparent);
+}
+
+.intelligence-header-actions {
+  display: grid;
+  gap: 8px;
+  justify-items: end;
+}
+
+.investigation-download-button,
+.intelligence-inline-download {
+  justify-self: start;
+  padding: 6px 9px;
+  color: var(--story-tone, var(--accent));
+  font-size: .6rem;
+  font-weight: 850;
+  border: 1px solid color-mix(in srgb, var(--story-tone, var(--accent)) 32%, var(--line) 68%);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 92%, var(--story-tone, var(--accent)) 8%);
+  cursor: pointer;
+}
+
+.investigation-download-button {
+  width: 100%;
+  margin-top: 2px;
+}
+
+.investigation-download-button:hover,
+.intelligence-inline-download:hover {
+  color: #fff;
+  background: var(--story-tone, var(--accent));
+}
+
+.intelligence-inline-download {
+  margin-top: 5px;
+  color: var(--accent);
 }
 
 .investigation-story-card::before {
@@ -5624,6 +5659,10 @@ th {
 
   .investigation-story-intro strong {
     text-align: left;
+  }
+
+  .intelligence-header-actions {
+    justify-items: start;
   }
 
   .investigation-story-track {
@@ -6749,8 +6788,7 @@ th {
   line-height: 1;
 }
 
-.timeline-phase-summary span,
-.timeline-phase-latest {
+.timeline-phase-summary span {
   color: var(--muted);
   font-size: .68rem;
 }
@@ -6759,6 +6797,36 @@ th {
   display: block;
   min-height: 32px;
   margin-top: 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 92%, var(--accent) 8%);
+}
+
+.timeline-phase-latest strong {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--ink);
+  font-size: .72rem;
+}
+
+.timeline-phase-latest p {
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: .68rem;
+  line-height: 1.35;
+}
+
+.timeline-phase-latest small {
+  color: var(--muted);
+  font-size: .6rem;
+}
+
+.timeline-phase-latest-empty {
+  color: var(--muted);
+  font-size: .68rem;
+  font-style: italic;
+  text-align: center;
 }
 
 .timeline-phase-details {
