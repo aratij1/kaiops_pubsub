@@ -1086,6 +1086,20 @@ function normalizeApprovalStatus(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function canonicalIncidentStatus(...values) {
+  const statuses = values
+    .flat()
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean);
+  if (!statuses.length) {
+    return "unknown";
+  }
+
+  const terminalPriority = ["closed", "resolved", "failed", "cancelled", "canceled"];
+  const terminal = terminalPriority.find((candidate) => statuses.includes(candidate));
+  return terminal || statuses[0];
+}
+
 function isApprovalResolvedStatus(value) {
   const token = normalizeApprovalStatus(value);
   if (!token) {
@@ -9993,6 +10007,23 @@ export default function App() {
     return incidentMetadata.rows.find((row) => String(row?.incident_id || "").trim() === selectedIncidentId) || null;
   }, [selectedIncidentId, monitorScopedIncidentMetadata, incidentMetadata.rows]);
 
+  const selectedCanonicalIncidentStatus = useMemo(
+    () => canonicalIncidentStatus(
+      selectedStageCompleteness.data?.status,
+      selectedIncidentMetadataRow?.status,
+      selectedAlertWorkflow?.incident?.status,
+      selectedAlertRow?.status,
+      selectedAlertRow?.state,
+    ),
+    [
+      selectedStageCompleteness.data?.status,
+      selectedIncidentMetadataRow?.status,
+      selectedAlertWorkflow?.incident?.status,
+      selectedAlertRow?.status,
+      selectedAlertRow?.state,
+    ],
+  );
+
   const selectedAlertRecommendationId = useMemo(() => {
     if (!selectedIncidentId) {
       return "";
@@ -10065,12 +10096,12 @@ export default function App() {
       executionMode: selectedAlertRouting?.execution_mode || decision?.execution_mode || "-",
       riskTier: selectedAlertRouting?.risk_tier || decision?.risk_tier || "-",
       provider: selectedAlertRouting?.message_bus_provider || decision?.message_bus_provider || "-",
-      incidentStatus: selectedAlertWorkflow?.incident?.status || selectedIncidentMetadataRow?.status || "-",
+      incidentStatus: selectedCanonicalIncidentStatus,
       approvalStatus: approval?.status || projectionPayload?.approval_status || "pending",
       commands,
       remediationAction,
     };
-  }, [selectedAlertWorkflow, selectedAlertRouting, selectedAlertEventTrace, selectedIncidentMetadataRow]);
+  }, [selectedAlertWorkflow, selectedAlertRouting, selectedAlertEventTrace, selectedIncidentMetadataRow, selectedCanonicalIncidentStatus]);
   const selectedExecutionBreakdown = useMemo(() => {
     const grouped = { commands: [], scripts: [], queries: [] };
     (Array.isArray(selectedExecutionPlan.commands) ? selectedExecutionPlan.commands : []).forEach((item) => {
@@ -11881,7 +11912,7 @@ export default function App() {
     if (!selectedAlertRow) {
       return null;
     }
-    const status = String(selectedAlertRow?.status || selectedAlertRow?.state || "open");
+    const status = selectedCanonicalIncidentStatus;
     const alertName = String(selectedAlertRow?.name || selectedAlertRow?.alert_name || "").trim();
     const service = String(selectedAlertRow?.service || "").trim();
     const environment = String(selectedAlertRow?.environment || "").trim();
@@ -11901,7 +11932,7 @@ export default function App() {
       ).toLowerCase(),
       overrideSaving: alertSeverityOverrides.savingKey === overrideKey,
     };
-  }, [selectedAlertRow, severityOverrideByKey, alertSeverityDrafts, alertSeverityOverrides.savingKey]);
+  }, [selectedAlertRow, selectedCanonicalIncidentStatus, severityOverrideByKey, alertSeverityDrafts, alertSeverityOverrides.savingKey]);
   const selectedAlertRuleSummary = useMemo(
     () => summarizeAlertRuleContext(selectedAlertRow, selectedAlertWorkflow),
     [selectedAlertRow, selectedAlertWorkflow],
@@ -13265,7 +13296,7 @@ export default function App() {
                       <input value={String(selectedAlertRow?.service || "-")} readOnly />
                     </label>
                     <label>Status
-                      <input value={String(selectedAlertRow?.status || selectedAlertRow?.state || "open")} readOnly />
+                      <input value={selectedCanonicalIncidentStatus} readOnly />
                     </label>
                     <label>Current Severity
                       <input value={String(selectedAlertRow?.severity || "-").toUpperCase()} readOnly />
@@ -13519,26 +13550,32 @@ export default function App() {
                     <span><strong>ID:</strong> {selectedAlertId}</span>
                     <span><strong>Service:</strong> {selectedAlertRow?.service || "-"}</span>
                     <span><strong>Severity:</strong> {String(selectedAlertRow?.severity || "-").toUpperCase()}</span>
+                    <span>
+                      <strong>Status:</strong>{" "}
+                      <span className={`pill ${statusPillClass(selectedCanonicalIncidentStatus)}`}>
+                        {selectedCanonicalIncidentStatus}
+                      </span>
+                    </span>
                   </div>
 
                   {(() => {
-                    const matchedApproval = resolvePendingApprovalFromAlertRow(selectedAlertRow) || selectedIncidentMetadataRow;
+                    const matchedApproval = resolvePendingApprovalFromAlertRow(selectedAlertRow);
                     const incidentId = approvalIncidentId(matchedApproval)
                       || selectedAlertWorkflow?.incident?.id
                       || selectedAlertWorkflow?.incident_id
                       || "";
-                    const status = normalizeApprovalStatus(
+                    const approvalStatus = normalizeApprovalStatus(
                       matchedApproval?.status
                       || selectedAlertWorkflow?.approval?.status
                     );
-                    const isResolved = isApprovalResolvedStatus(status);
+                    const isResolved = isApprovalResolvedStatus(approvalStatus);
                     const requiresApproval = Boolean(
                       matchedApproval
                       || selectedExecutionPlan?.requiresApproval
                       || selectedAlertRouting?.requires_approval
                       || selectedAlertWorkflow?.approval?.required
                       || selectedAlertWorkflow?.decision?.requires_approval
-                      || isApprovalPendingStatus(status)
+                      || isApprovalPendingStatus(approvalStatus)
                     );
                     const hasActionableApproval = Boolean(
                       resolvePendingApprovalFromAlertRow(selectedAlertRow)
@@ -13563,16 +13600,20 @@ export default function App() {
                         </div>
                         <p className="subtitle">
                           {hasActionableApproval
-                            ? `Matched incident ${incidentId || "-"} with status ${status || "pending"}.`
+                            ? `Matched incident ${incidentId || "-"} with approval status ${approvalStatus || "pending"}.`
                             : matchedApproval
-                              ? `Approval is already ${status || "resolved"} for this incident.`
-                              : "This workflow indicates approval may be required, but no active pending approval row is linked yet."}
+                              ? `Approval is already ${approvalStatus || "resolved"} for this incident.`
+                              : `Incident is ${selectedCanonicalIncidentStatus}; no active pending approval is linked.`}
                         </p>
                         <div className="table-wrap">
                           <table>
                             <tbody>
                               <tr><th>Incident</th><td>{incidentId || "-"}</td></tr>
-                              <tr><th>Status</th><td>{status || (hasActionableApproval ? "pending" : "not active")}</td></tr>
+                              <tr>
+                                <th>Incident Status</th>
+                                <td><span className={`pill ${statusPillClass(selectedCanonicalIncidentStatus)}`}>{selectedCanonicalIncidentStatus}</span></td>
+                              </tr>
+                              <tr><th>Approval Status</th><td>{approvalStatus || (hasActionableApproval ? "pending" : "not active")}</td></tr>
                               <tr><th>Role Eligible</th><td>{canUseApprovalActions ? "yes" : "no"}</td></tr>
                             </tbody>
                           </table>
@@ -13736,8 +13777,8 @@ export default function App() {
                             <tr>
                               <th>Persisted Incident Status</th>
                               <td>
-                                <span className={`pill ${statusPillClass(selectedStageCompleteness.data?.status || selectedAlertWorkflow?.incident?.status)}`}>
-                                  {selectedStageCompleteness.data?.status || selectedAlertWorkflow?.incident?.status || "-"}
+                                <span className={`pill ${statusPillClass(selectedCanonicalIncidentStatus)}`}>
+                                  {selectedCanonicalIncidentStatus}
                                 </span>
                               </td>
                             </tr>
