@@ -3431,6 +3431,49 @@ th {
   line-height: 1.45;
 }
 
+.intelligence-output-details {
+  display: grid;
+  gap: 5px;
+  margin: 5px 0 0;
+}
+
+.intelligence-output-details div {
+  display: grid;
+  gap: 2px;
+  padding-top: 5px;
+  border-top: 1px solid #e5edf5;
+}
+
+.intelligence-output-details dt {
+  color: #526b7d;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+}
+
+.intelligence-output-details dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.intelligence-document-downloads {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding-top: 4px;
+}
+
+.intelligence-document-downloads > strong {
+  width: 100%;
+  color: #234b69;
+  font-size: 11px;
+}
+
 .intelligence-context-item small {
   color: #28745f;
 }

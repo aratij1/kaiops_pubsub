@@ -276,34 +276,31 @@ function cleanRecommendationText(value, fallback = "-") {
   if (!text) {
     return fallback;
   }
-  if (text.startsWith("{") && text.endsWith("}")) {
-    try {
-      const payload = JSON.parse(text);
-      if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-        const keys = [
-          "root_cause",
-          "cause",
-          "impact",
-          "customer_impact",
-          "dependency_impact",
-          "recommended_action",
-          "action",
-          "summary",
-          "content",
-          "title",
-        ];
-        for (const key of keys) {
-          const candidate = String(payload[key] || "").trim();
-          if (candidate && !isPromptFragment(candidate)) {
-            return candidate;
-          }
-        }
-        if (payload.metadata?.fallback) {
-          return fallback;
-        }
+  const payload = parseStructuredIntelligence(text);
+  if (payload) {
+    const keys = [
+      "root_cause",
+      "cause",
+      "impact_summary",
+      "service_impact",
+      "impact",
+      "customer_impact",
+      "dependency_impact",
+      "severity_rationale",
+      "recommended_action",
+      "action",
+      "summary",
+      "content",
+      "title",
+    ];
+    for (const key of keys) {
+      const candidate = String(payload[key] || "").trim();
+      if (candidate && !isPromptFragment(candidate)) {
+        return candidate;
       }
-    } catch {
-      return isPromptFragment(text) ? fallback : text;
+    }
+    if (payload.metadata?.fallback) {
+      return fallback;
     }
     return fallback;
   }
@@ -3438,7 +3435,102 @@ function DiscoveryFlowView({ workflow, timelineRows = [], selectedAlert = null, 
   );
 }
 
-function IntelligenceConnectionView({ workflow, documents = [] }) {
+function parseStructuredIntelligence(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value;
+  }
+  const text = String(value || "").trim();
+  if (!text) {
+    return null;
+  }
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidates = [fenced?.[1], text];
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(text.slice(firstBrace, lastBrace + 1));
+  }
+  for (const candidate of candidates.filter(Boolean)) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch (_error) {
+      // Continue through compatible legacy model-response shapes.
+    }
+  }
+  return null;
+}
+
+function intelligenceListText(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (item && typeof item === "object") {
+          return item.snippet || item.summary || item.evidence_id || item.id || Object.values(item).filter(Boolean).join(": ");
+        }
+        return String(item || "").trim();
+      })
+      .filter(Boolean)
+      .join("; ");
+  }
+  if (value && typeof value === "object") {
+    return Object.entries(value)
+      .map(([key, item]) => `${key.replaceAll("_", " ")}: ${intelligenceListText(item)}`)
+      .join("; ");
+  }
+  return String(value || "").trim();
+}
+
+function groundedIntelligenceDisplay(label, value) {
+  const parsed = parseStructuredIntelligence(value);
+  if (!parsed) {
+    return { headline: cleanRecommendationText(value, `No ${label.toLowerCase()} was produced.`), details: [] };
+  }
+  const isRca = label === "RCA";
+  const isImpact = label === "Impact";
+  const headline = String(
+    isRca
+      ? parsed.root_cause || parsed.cause || parsed.summary
+      : isImpact
+        ? parsed.impact_summary || parsed.service_impact || parsed.customer_impact || parsed.severity_rationale || parsed.summary
+        : parsed.recommended_action || parsed.action || parsed.summary
+  ).trim() || `No ${label.toLowerCase()} was produced.`;
+  const detailCandidates = isRca
+    ? [
+        ["Evidence used", parsed.evidence_used],
+        ["Alternative causes", parsed.alternative_causes],
+        ["Missing evidence", parsed.missing_evidence],
+        ["Grounding notes", parsed.grounding_notes],
+      ]
+    : isImpact
+      ? [
+          ["Impacted services", parsed.impacted_services],
+          ["Customer impact", parsed.customer_impact],
+          ["Dependency impact", parsed.dependency_impact],
+          ["Blast radius", parsed.blast_radius],
+          ["Evidence used", parsed.evidence_used],
+          ["Missing evidence", parsed.missing_evidence],
+          ["Assumptions", parsed.assumptions],
+        ]
+      : [
+          ["Why", parsed.why_this_action],
+          ["Validation", parsed.validation_queries],
+          ["Rollback", parsed.rollback_plan],
+          ["Missing evidence", parsed.missing_evidence],
+        ];
+  const details = detailCandidates
+    .map(([detailLabel, detailValue]) => ({ label: detailLabel, value: intelligenceListText(detailValue) }))
+    .filter((item) => item.value);
+  const confidence = Number(parsed.confidence_score);
+  if (Number.isFinite(confidence) && confidence >= 0) {
+    details.push({ label: "Confidence", value: `${Math.round(confidence * 100)}%` });
+  }
+  return { headline, details };
+}
+
+function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocument }) {
   const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
   const context = safeWorkflow.context && typeof safeWorkflow.context === "object" ? safeWorkflow.context : {};
   const metadata = context.metadata && typeof context.metadata === "object" ? context.metadata : {};
@@ -3487,7 +3579,7 @@ function IntelligenceConnectionView({ workflow, documents = [] }) {
       label: "Recommended action",
       value: recommendation.recommended_action || (Array.isArray(report.recommended_next_checks) ? report.recommended_next_checks.join(" ") : "No action was produced."),
     },
-  ];
+  ].map((item) => ({ ...item, display: groundedIntelligenceDisplay(item.label, item.value) }));
 
   return (
     <section className="intelligence-connection">
@@ -3541,14 +3633,38 @@ function IntelligenceConnectionView({ workflow, documents = [] }) {
           {outputs.map((item) => (
             <div className="intelligence-output-item" key={`output-${item.label}`}>
               <strong>{item.label}</strong>
-              <span>{item.value}</span>
+              <span>{item.display.headline}</span>
+              {item.display.details.length ? (
+                <dl className="intelligence-output-details">
+                  {item.display.details.map((detail) => (
+                    <div key={`${item.label}-${detail.label}`}>
+                      <dt>{detail.label}</dt>
+                      <dd>{detail.value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              ) : null}
             </div>
           ))}
           <div className="intelligence-citations">
             <strong>Supporting evidence IDs</strong>
             <span>{supportingIds.join(", ") || "No explicit citations returned"}</span>
           </div>
-          <small>{documents.length} linked document(s) available for operator review.</small>
+          <div className="intelligence-document-downloads">
+            <strong>{documents.length} linked document(s)</strong>
+            {documents.slice(0, 6).map((doc, index) => (
+              <button
+                type="button"
+                className="button-secondary"
+                key={`intelligence-download-${doc?.path || doc?.document_id || doc?.title || index}`}
+                disabled={!doc?.path && !doc?.content && !doc?.summary && !doc?.recommended_action}
+                onClick={() => onDownloadDocument && onDownloadDocument(doc)}
+              >
+                Download {compactText(doc?.title || doc?.path || `Document ${index + 1}`, 34)}
+              </button>
+            ))}
+            {!documents.length ? <small>No alert-linked document is available yet.</small> : null}
+          </div>
         </article>
       </div>
     </section>
@@ -13537,6 +13653,7 @@ export default function App() {
                       <IntelligenceConnectionView
                         workflow={selectedAlertWorkflow}
                         documents={selectedAlertRagDocuments}
+                        onDownloadDocument={downloadRagDocument}
                       />
                       <div className="combined-analysis-grid">
                         <article className="combined-analysis-card combined-analysis-discovery">

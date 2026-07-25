@@ -65,6 +65,21 @@ def static_router() -> ModelRouter:
     )
 
 
+def test_resolution_agent_extracts_values_from_fenced_json_with_introductory_text() -> None:
+    content = """Given the evidence, here is the result:
+```json
+{"root_cause":"Collector endpoint is unreachable","confidence_score":0.72}
+```"""
+
+    parsed = ResolutionIntelligenceAgent._extract_model_text(
+        content,
+        keys=("root_cause", "summary"),
+        fallback_text="fallback",
+    )
+
+    assert parsed == "Collector endpoint is unreachable"
+
+
 def test_vector_db_connector_loads_rag_documents() -> None:
     connector = VectorDBConnector()
 
