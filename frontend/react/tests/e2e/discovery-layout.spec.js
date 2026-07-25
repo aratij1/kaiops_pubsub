@@ -11,7 +11,7 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
         ? { status: "ok", service: "api-gateway" }
         : path.startsWith("/alerts/all")
           ? { data: { rows: [
-              { alert_id: "alert-discovery-1", id: "alert-discovery-1", name: "Pod crash loop", service: "user-profile", application: "kaiops-core1", labels: { project_name: "KaiOps" }, severity: "critical", status: "active", source: "email" },
+              { alert_id: "11111111-1111-4111-8111-111111111111", id: "11111111-1111-4111-8111-111111111111", name: "Pod crash loop", service: "user-profile", application: "kaiops-core1", labels: { project_name: "KaiOps", alert_fingerprint: "email-pod-crash-1" }, severity: "critical", status: "active", source: "email" },
               { alert_id: "alert-telemetry-1", id: "alert-telemetry-1", name: "Telemetry signals missing", service: "astronomy-shop", application: "Telemetry", labels: { project_name: "Telemetry", origin_system: "telemetry", ingestion_channel: "monitoring" }, severity: "warning", status: "active", source: "telemetry" },
             ] } }
           : path === "/applications"
@@ -33,9 +33,36 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
                     severity: "high",
                     labels: { project_name: "KaiOps", origin_system: "opensearch", ingestion_channel: "log" },
                   },
+                  {
+                    file: "email-pod-crash-duplicate.eml",
+                    received_at: "2026-07-25T12:01:00Z",
+                    status: "processed",
+                    source: "email",
+                    name: "Pod crash loop",
+                    service: "user-profile",
+                    application: "KaiOps",
+                    project_name: "KaiOps",
+                    severity: "critical",
+                    labels: { project_name: "KaiOps", origin_system: "email", ingestion_channel: "email", alert_fingerprint: "email-pod-crash-1" },
+                  },
                 ] } }
             : { data: [], rows: [], summary: {}, items: [] };
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  });
+  await page.route("**/monitoring-adapter/alerts/*/processed-result", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          alert: { id: "11111111-1111-4111-8111-111111111111", name: "Pod crash loop", service: "user-profile" },
+          incident: { id: "incident-pod-crash-1", status: "investigating" },
+          context: { metadata: { rag_documents: 1 } },
+          recommendation: { root_cause: "Memory pressure", metadata: {} },
+          events: [],
+        },
+      }),
+    });
   });
   await page.route("**/monitoring-adapter/**", async (route) => {
     const workflow = {
@@ -78,6 +105,8 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
 
   await expect(page.getByRole("heading", { name: "KaiOps + Telemetry" })).toBeVisible();
   await expect(page.getByText("Pod crash loop", { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole("button", { name: "Open alert 11111111-1111-4111-8111-111111111111" })).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Open alert email-pod-crash-duplicate.eml" })).toHaveCount(0);
   await expect(page.locator(".source-email").filter({ hasText: "Email" }).first()).toBeVisible();
   await expect(page.getByText("Checkout log error burst", { exact: true }).first()).toBeVisible();
   await expect(page.locator(".source-log").filter({ hasText: "Logs / OpenSearch" }).first()).toBeVisible();

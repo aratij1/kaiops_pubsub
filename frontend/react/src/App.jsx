@@ -634,7 +634,13 @@ function dedupeAndConsolidateAlertRows(rows, options = {}) {
     const existingScore = alertRowScore(existing.row);
     const incomingTime = alertTimeMs(row);
     const existingTime = alertTimeMs(existing.row);
-    const shouldReplace = incomingScore > existingScore || (incomingScore === existingScore && incomingTime > existingTime);
+    const incomingIsLandingPad = row?._stream_kind === "landing_pad";
+    const existingIsLandingPad = existing.row?._stream_kind === "landing_pad";
+    const shouldReplace = existingIsLandingPad && !incomingIsLandingPad
+      ? true
+      : !existingIsLandingPad && incomingIsLandingPad
+        ? false
+        : incomingScore > existingScore || (incomingScore === existingScore && incomingTime > existingTime);
     if (shouldReplace) {
       existing.row = { ...row, source_channel: channel };
     }
@@ -703,6 +709,8 @@ function projectHintFromAlertRow(row) {
     .filter(Boolean);
   return candidates[0] || "";
 }
+
+const ALERT_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function mapLandingPadRowToAlertStreamRow(row, index = 0) {
   const payload = row && typeof row === "object" ? row : {};
@@ -3547,7 +3555,7 @@ function IntelligenceConnectionView({ workflow, documents = [] }) {
   );
 }
 
-function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, documentContract, onLoadDocumentContent, compact = false }) {
+function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, documentContract, onLoadDocumentContent, onDownloadDocument, compact = false }) {
   const [documentPreviewState, setDocumentPreviewState] = useState({ key: "", loading: false, content: null, error: "" });
   const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
   const safeTimelineRows = Array.isArray(timelineRows) ? timelineRows : [];
@@ -3719,6 +3727,17 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
     metadata_match_score: doc?.metadata_match_score ?? doc?._metadata_match_score ?? "-",
     source_ref: doc?.source_ref || "-",
   });
+  const documentContextExcerpt = (doc) => compactText(
+    doc?.context_excerpt
+    || doc?.matched_text
+    || doc?.snippet
+    || doc?.match_reason
+    || doc?.summary
+    || doc?.recommended_action
+    || doc?.content
+    || doc?.path,
+    320
+  ) || "No context excerpt was reported for this document.";
   const viewDocument = async (doc, index) => {
     const key = documentKey(doc, index);
     if (!key) {
@@ -3902,7 +3921,10 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
                   <strong>{doc.title || doc.path || `Document ${index + 1}`}</strong>
                   <span>{doc.kind || doc.document_kind || "document"} | confidence {Math.round(Number(doc.match_confidence || doc._similarity || doc.score || 0) * 100) || "-"}%</span>
                   <small>semantic {Math.round(Number(doc.semantic_score || doc._semantic_score || 0) * 100) || "-"}% | metadata {Math.round(Number(doc.metadata_match_score || doc._metadata_match_score || 0) * 100) || "-"}%</small>
-                  <small>{compactText(doc.match_reason || doc.summary || doc.path, 160) || "-"}</small>
+                  <div className="context-doc-highlight">
+                    <strong>Context collected from this document</strong>
+                    <p>{documentContextExcerpt(doc)}</p>
+                  </div>
                   <details>
                     <summary>Metadata</summary>
                     <pre className="result">{JSON.stringify(documentMetadata(doc), null, 2)}</pre>
@@ -3910,6 +3932,15 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
                   <div className="context-doc-actions">
                     <button type="button" className="button-secondary" onClick={() => viewDocument(doc, index)}>
                       {documentPreviewState.key === documentKey(doc, index) ? "Hide" : "View"} Document
+                    </button>
+                    <button
+                      type="button"
+                      className="button-secondary"
+                      disabled={!doc.path && !doc.content && !doc.summary && !doc.recommended_action}
+                      title="Download this document and its collected context"
+                      onClick={() => onDownloadDocument && onDownloadDocument(doc)}
+                    >
+                      Download
                     </button>
                   </div>
                   {renderDocumentPreview(doc, index)}
@@ -6252,9 +6283,33 @@ export default function App() {
     }
   }
 
-  async function loadAlertDetails(alertId) {
+  async function loadAlertDetails(alertId, fallbackRow = null) {
     const normalized = String(alertId || "").trim();
     if (!normalized) {
+      return;
+    }
+    if (!ALERT_UUID_PATTERN.test(normalized)) {
+      const landingAlert = fallbackRow && typeof fallbackRow === "object" ? fallbackRow : {};
+      setSelectedAlertData({
+        loading: false,
+        payload: {
+          data: {
+            alert: landingAlert,
+            incident: null,
+            context: {
+              metadata: {
+                source: landingAlert.source || "landing-pad",
+                origin_system: landingAlert.origin_system || landingAlert.labels?.origin_system || "",
+                ingestion_channel: landingAlert.ingestion_channel || landingAlert.labels?.ingestion_channel || "",
+                processing_state: "landing_pad_only",
+              },
+            },
+            timeline: [],
+          },
+        },
+        error: "",
+        alertId: normalized,
+      });
       return;
     }
     setSelectedAlertData((prev) => ({
@@ -6286,10 +6341,27 @@ export default function App() {
     }
   }
 
-  async function loadSelectedAlertDocumentLinks(alertId) {
+  async function loadSelectedAlertDocumentLinks(alertId, fallbackRow = null) {
     const normalized = String(alertId || "").trim();
     if (!normalized) {
       setSelectedAlertDocumentLinks({ loading: false, alertId: "", rows: [], canonicalAlert: null, contract: null, error: "" });
+      return;
+    }
+    if (!ALERT_UUID_PATTERN.test(normalized)) {
+      setSelectedAlertDocumentLinks({
+        loading: false,
+        alertId: normalized,
+        rows: [],
+        canonicalAlert: fallbackRow && typeof fallbackRow === "object" ? fallbackRow : null,
+        contract: {
+          document_link_summary: {
+            count: 0,
+            source: "landing-pad-local-fallback",
+            processing_state: "landing_pad_only",
+          },
+        },
+        error: "",
+      });
       return;
     }
     setSelectedAlertDocumentLinks((current) => ({
@@ -6366,8 +6438,8 @@ export default function App() {
     setSelectedAlertId(String(alertId));
     setActiveTab("home");
     setHomeDetailTab("timeline");
-    loadAlertDetails(alertId);
-    loadSelectedAlertDocumentLinks(alertId);
+    loadAlertDetails(alertId, row);
+    loadSelectedAlertDocumentLinks(alertId, row);
   }
 
   function openAlertDetailsFromIncident(row) {
@@ -8223,20 +8295,21 @@ export default function App() {
 
   async function downloadRagDocument(doc) {
     const path = String(doc?.path || "").trim();
-    if (!path) {
-      return;
-    }
     try {
-      const full = unwrap(await fetchJson(`/api-gateway/rag/documents/content?path=${encodeURIComponent(path)}`, authenticatedOptions()));
-      const title = String(full?.title || doc?.title || path.split(/[\\/]/).pop() || "alert-document").trim();
+      const full = path
+        ? unwrap(await fetchJson(`/api-gateway/rag/documents/content?path=${encodeURIComponent(path)}`, authenticatedOptions()))
+        : doc;
+      const title = String(full?.title || doc?.title || (path ? path.split(/[\\/]/).pop() : "") || "alert-document").trim();
       const content = [
         `# ${title}`,
         "",
         full?.summary ? `Summary: ${String(full.summary).trim()}` : "",
         full?.kind || doc?.kind ? `Kind: ${String(full?.kind || doc?.kind).trim()}` : "",
         full?.alert_id || doc?.alert_id ? `Alert ID: ${String(full?.alert_id || doc?.alert_id).trim()}` : "",
+        doc?.match_reason ? `Context match: ${String(doc.match_reason).trim()}` : "",
+        doc?.match_confidence ? `Match confidence: ${Math.round(Number(doc.match_confidence) * 100)}%` : "",
         "",
-        String(full?.content || doc?.content || "").trim(),
+        String(full?.content || doc?.content || doc?.recommended_action || doc?.summary || "").trim(),
       ].filter((line) => line !== "").join("\n");
       const safeName = `${title || "alert-document"}`.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "alert-document";
       const blob = new Blob([content || JSON.stringify(full || doc, null, 2)], { type: "text/markdown;charset=utf-8" });
@@ -13301,12 +13374,13 @@ export default function App() {
 
                   {(() => {
                     const matchedApproval = resolvePendingApprovalFromAlertRow(selectedAlertRow) || selectedIncidentMetadataRow;
-                    const incidentId = approvalIncidentId(matchedApproval);
+                    const incidentId = approvalIncidentId(matchedApproval)
+                      || selectedAlertWorkflow?.incident?.id
+                      || selectedAlertWorkflow?.incident_id
+                      || "";
                     const status = normalizeApprovalStatus(
                       matchedApproval?.status
-                      || selectedAlertRow?.status
-                      || selectedAlertRow?.state
-                      || selectedAlertWorkflow?.incident?.status
+                      || selectedAlertWorkflow?.approval?.status
                     );
                     const isResolved = isApprovalResolvedStatus(status);
                     const requiresApproval = Boolean(
@@ -13480,6 +13554,7 @@ export default function App() {
                             evaluation={selectedAlertEvaluation}
                             documentContract={selectedAlertDocumentContract}
                             onLoadDocumentContent={loadRagDocumentContent}
+                            onDownloadDocument={downloadRagDocument}
                           />
                         </article>
                       </div>
@@ -13850,6 +13925,7 @@ export default function App() {
                       evaluation={selectedAlertEvaluation}
                       documentContract={selectedAlertDocumentContract}
                       onLoadDocumentContent={loadRagDocumentContent}
+                      onDownloadDocument={downloadRagDocument}
                     />
                   ) : null}
 
