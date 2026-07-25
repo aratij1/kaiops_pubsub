@@ -1,0 +1,215 @@
+{
+  "received_at": "2026-07-24T09:50:43.805415+00:00",
+  "source": "jira",
+  "status": "processed",
+  "error": null,
+  "alert": {
+    "source": "jira",
+    "name": "[High] Memory leak on catalog-api - occurrence 14 -test",
+    "service": "KAN",
+    "environment": "prod",
+    "severity": "high",
+    "description": "KaiOps historical monitoring incident for contextual RCA retrieval.\n\nALERT DETAILS\n- Alert: Memory leak\n- Service: catalog-api\n- Source: Datadog\n- Environment: Production\n- Evidence: Container memory grew continuously above 90% across three hours; occurrence 14/20. KaiOps correlation found 3 related signals across 1 monitored resources.\n- Correlation ID: INC-2025-10074\n\nROOT CAUSE\nAn unbounded in-memory product cache retained expired catalogue objects.\n\nBUSINESS IMPACT\ncatalog-api performance or availability was degraded; approximately 722 transactions or events were affected, with partial SLA impact and increased support workload.\n\nRESOLUTION STEPS\n1. Disable the local cache feature flag.\n2. restart pods with rolling strategy.\n3. deploy bounded cache and eviction fix.\n\nVALIDATION\nMemory remains below 70% for two hours with stable object count and no OOM kills.\n\nPREVENTION\nAdd regression coverage for memory leak; retain the alert with early-warning threshold; track recurrence using scenario label kaiops-scenario-04; review capacity/configuration during the next problem-management cycle.",
+    "labels": {
+      "alert_status": "firing",
+      "ticket_id": "KAN-83",
+      "jira_issue_id": "10143",
+      "jira_status": "Done",
+      "jira_priority": "High",
+      "jira_reporter": "Arati",
+      "jira_assignee": "",
+      "jira_webhook_event": "jira:issue_updated",
+      "support_tier": "L2/L3"
+    },
+    "annotations": {
+      "summary": "[High] Memory leak on catalog-api - occurrence 14 -test",
+      "description": "KaiOps historical monitoring incident for contextual RCA retrieval.\n\nALERT DETAILS\n- Alert: Memory leak\n- Service: catalog-api\n- Source: Datadog\n- Environment: Production\n- Evidence: Container memory grew continuously above 90% across three hours; occurrence 14/20. KaiOps correlation found 3 related signals across 1 monitored resources.\n- Correlation ID: INC-2025-10074\n\nROOT CAUSE\nAn unbounded in-memory product cache retained expired catalogue objects.\n\nBUSINESS IMPACT\ncatalog-api performance or availability was degraded; approximately 722 transactions or events were affected, with partial SLA impact and increased support workload.\n\nRESOLUTION STEPS\n1. Disable the local cache feature flag.\n2. restart pods with rolling strategy.\n3. deploy bounded cache and eviction fix.\n\nVALIDATION\nMemory remains below 70% for two hours with stable object count and no OOM kills.\n\nPREVENTION\nAdd regression coverage for memory leak; retain the alert with early-warning threshold; track recurrence using scenario label kaiops-scenario-04; review capacity/configuration during the next problem-management cycle."
+    }
+  },
+  "raw": {
+    "timestamp": 1784886455367,
+    "webhookEvent": "jira:issue_updated",
+    "issue_event_type_name": "issue_updated",
+    "user": {
+      "self": "https://kaiops-test.atlassian.net/rest/api/2/user?accountId=712020%3Adf3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+      "accountId": "712020:df3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+      "avatarUrls": {
+        "48x48": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+        "24x24": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+        "16x16": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+        "32x32": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png"
+      },
+      "displayName": "Arati",
+      "active": true,
+      "timeZone": "Asia/Calcutta",
+      "accountType": "atlassian"
+    },
+    "issue": {
+      "id": "10143",
+      "self": "https://kaiops-test.atlassian.net/rest/api/2/issue/10143",
+      "key": "KAN-83",
+      "fields": {
+        "statuscategorychangedate": null,
+        "issuetype": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/issuetype/10008",
+          "id": "10008",
+          "description": "Tasks track small, distinct pieces of work.",
+          "iconUrl": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/issuetype/avatar/10318?size=medium",
+          "name": "Task",
+          "subtask": false,
+          "avatarId": 10318,
+          "entityId": "8963f416-c42c-4ae6-a254-4ea0ab794a4e",
+          "hierarchyLevel": 0
+        },
+        "components": [],
+        "timespent": 0,
+        "timeoriginalestimate": 0,
+        "description": "KaiOps historical monitoring incident for contextual RCA retrieval.\n\nALERT DETAILS\n- Alert: Memory leak\n- Service: catalog-api\n- Source: Datadog\n- Environment: Production\n- Evidence: Container memory grew continuously above 90% across three hours; occurrence 14/20. KaiOps correlation found 3 related signals across 1 monitored resources.\n- Correlation ID: INC-2025-10074\n\nROOT CAUSE\nAn unbounded in-memory product cache retained expired catalogue objects.\n\nBUSINESS IMPACT\ncatalog-api performance or availability was degraded; approximately 722 transactions or events were affected, with partial SLA impact and increased support workload.\n\nRESOLUTION STEPS\n1. Disable the local cache feature flag.\n2. restart pods with rolling strategy.\n3. deploy bounded cache and eviction fix.\n\nVALIDATION\nMemory remains below 70% for two hours with stable object count and no OOM kills.\n\nPREVENTION\nAdd regression coverage for memory leak; retain the alert with early-warning threshold; track recurrence using scenario label kaiops-scenario-04; review capacity/configuration during the next problem-management cycle.",
+        "project": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/project/10001",
+          "id": "10001",
+          "key": "KAN",
+          "name": "kaiops-test",
+          "projectTypeKey": "software",
+          "simplified": true,
+          "avatarUrls": {
+            "48x48": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415",
+            "24x24": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415?size=small",
+            "16x16": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415?size=xsmall",
+            "32x32": "https://kaiops-test.atlassian.net/rest/api/2/universal_avatar/view/type/project/avatar/10415?size=medium"
+          }
+        },
+        "fixVersions": [],
+        "statusCategory": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/statuscategory/3",
+          "id": 3,
+          "key": "done",
+          "colorName": "green",
+          "name": "Complete"
+        },
+        "aggregatetimespent": 0,
+        "resolution": null,
+        "timetracking": {
+          "originalEstimate": "0m",
+          "remainingEstimate": "0m",
+          "timeSpent": "0m",
+          "originalEstimateSeconds": 0,
+          "remainingEstimateSeconds": 0,
+          "timeSpentSeconds": 0
+        },
+        "customfield_10015": null,
+        "security": null,
+        "attachment": [],
+        "aggregatetimeestimate": 0,
+        "resolutiondate": null,
+        "workratio": -1,
+        "summary": "[High] Memory leak on catalog-api - occurrence 14 -test",
+        "watches": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/issue/KAN-83/watchers",
+          "watchCount": 0,
+          "isWatching": false
+        },
+        "issuerestriction": {
+          "issuerestrictions": {},
+          "shouldDisplay": true
+        },
+        "lastViewed": "2026-07-24T15:17:02.441+0530",
+        "creator": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/user?accountId=712020%3Adf3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "accountId": "712020:df3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "avatarUrls": {
+            "48x48": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "24x24": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "16x16": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "32x32": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png"
+          },
+          "displayName": "Arati",
+          "active": true,
+          "timeZone": "Asia/Calcutta",
+          "accountType": "atlassian"
+        },
+        "subtasks": [],
+        "created": "2026-07-24T14:51:51.159+0530",
+        "reporter": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/user?accountId=712020%3Adf3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "accountId": "712020:df3b29b4-6c2d-46f9-9b7f-4a3f2ba557c8",
+          "avatarUrls": {
+            "48x48": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "24x24": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "16x16": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png",
+            "32x32": "https://secure.gravatar.com/avatar/4c3dfb86d185a75deefded88063ffdd3?d=https%3A%2F%2Favatar-management--avatars.us-west-2.prod.public.atl-paas.net%2Finitials%2FA-1.png"
+          },
+          "displayName": "Arati",
+          "active": true,
+          "timeZone": "Asia/Calcutta",
+          "accountType": "atlassian"
+        },
+        "customfield_10021": null,
+        "aggregateprogress": {
+          "progress": 0,
+          "total": 0
+        },
+        "priority": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/priority/2",
+          "iconUrl": "https://kaiops-test.atlassian.net/images/icons/priorities/high_new.svg",
+          "name": "High",
+          "id": "2"
+        },
+        "customfield_10001": null,
+        "labels": [
+          "application",
+          "historical-context",
+          "kaiops",
+          "kaiops-scenario-04",
+          "monitoring"
+        ],
+        "environment": "Production",
+        "customfield_10019": "0|i000af:",
+        "timeestimate": 0,
+        "aggregatetimeoriginalestimate": 0,
+        "versions": [],
+        "duedate": null,
+        "progress": {
+          "progress": 0,
+          "total": 0
+        },
+        "votes": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/issue/KAN-83/votes",
+          "votes": 0,
+          "hasVoted": false
+        },
+        "issuelinks": [],
+        "assignee": null,
+        "updated": "2026-07-24T15:17:35.367+0530",
+        "status": {
+          "self": "https://kaiops-test.atlassian.net/rest/api/2/status/10007",
+          "description": "",
+          "iconUrl": "https://kaiops-test.atlassian.net/images/icons/statuses/generic.png",
+          "name": "Done",
+          "id": "10007",
+          "statusCategory": {
+            "self": "https://kaiops-test.atlassian.net/rest/api/2/statuscategory/3",
+            "id": 3,
+            "key": "done",
+            "colorName": "green",
+            "name": "Complete"
+          }
+        }
+      }
+    },
+    "changelog": {
+      "id": "11141",
+      "items": [
+        {
+          "field": "summary",
+          "fieldtype": "jira",
+          "fieldId": "summary",
+          "from": null,
+          "fromString": "[High] Memory leak on catalog-api - occurrence 14",
+          "to": null,
+          "toString": "[High] Memory leak on catalog-api - occurrence 14 -test"
+        }
+      ]
+    }
+  }
+}

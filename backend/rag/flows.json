@@ -1,19 +1,5 @@
 [
   {
-    "id": "admin-ui-doc-flow-20260719221735-rule-onboarding",
-    "alert_id": "admin-ui-doc-flow-20260719221735-rule-onboarding",
-    "alert_name": "admin-ui-doc-flow-20260719221735 Monitoring Rule Onboarding",
-    "alert_type": "monitoring-rule-onboarding",
-    "title": "admin-ui-doc-flow-20260719221735 Monitoring Rule Onboarding",
-    "service": "admin-ui-doc-flow-20260719221735",
-    "severity": "HIGH",
-    "summary": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "recommended_action": "Review generated rules and approve production deployment.",
-    "description": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "deployment": "prod",
-    "source": "rag-incident"
-  },
-  {
     "id": "dw-1014",
     "alert_id": "DW-1014",
     "alert_name": "Airflow Scheduler Down",
@@ -26,6 +12,19 @@
     "description": "Service: airflow",
     "execution_plan": "systemctl restart airflow-scheduler",
     "deployment": "Not explicitly documented.",
+    "source": "rag-incident"
+  },
+  {
+    "id": "alert-when-checkout-latency-exceeds-2-seconds",
+    "alert_id": "ALERT-WHEN-CHECKOUT-LATENCY-EXCEEDS-2-SECONDS",
+    "alert_name": "Alert when checkout latency exceeds 2 seconds",
+    "alert_type": "availability",
+    "title": "Alert when checkout latency exceeds 2 seconds",
+    "service": "payments",
+    "severity": "HIGH",
+    "summary": "Alert when checkout latency exceeds 2 seconds",
+    "recommended_action": "Investigate issue",
+    "description": "Alert when checkout latency exceeds 2 seconds",
     "source": "rag-incident"
   },
   {
@@ -166,54 +165,12 @@
     "source": "rag-incident"
   },
   {
-    "id": "etl-orders-dq-20260721130504-rule-onboarding",
-    "alert_id": "etl-orders-dq-20260721130504-rule-onboarding",
-    "alert_name": "etl-orders-dq-20260721130504 Monitoring Rule Onboarding",
+    "id": "etl-orders-dq-20260722141810-rule-onboarding",
+    "alert_id": "etl-orders-dq-20260722141810-rule-onboarding",
+    "alert_name": "etl-orders-dq-20260722141810 Monitoring Rule Onboarding",
     "alert_type": "monitoring-rule-onboarding",
-    "title": "etl-orders-dq-20260721130504 Monitoring Rule Onboarding",
-    "service": "etl-orders-dq-20260721130504",
-    "severity": "HIGH",
-    "summary": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "recommended_action": "Review generated rules and approve production deployment.",
-    "description": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "deployment": "prod",
-    "source": "rag-incident"
-  },
-  {
-    "id": "etl-orders-dq-20260721131241-rule-onboarding",
-    "alert_id": "etl-orders-dq-20260721131241-rule-onboarding",
-    "alert_name": "etl-orders-dq-20260721131241 Monitoring Rule Onboarding",
-    "alert_type": "monitoring-rule-onboarding",
-    "title": "etl-orders-dq-20260721131241 Monitoring Rule Onboarding",
-    "service": "etl-orders-dq-20260721131241",
-    "severity": "HIGH",
-    "summary": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "recommended_action": "Review generated rules and approve production deployment.",
-    "description": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "deployment": "prod",
-    "source": "rag-incident"
-  },
-  {
-    "id": "etl-orders-dq-20260721131727-rule-onboarding",
-    "alert_id": "etl-orders-dq-20260721131727-rule-onboarding",
-    "alert_name": "etl-orders-dq-20260721131727 Monitoring Rule Onboarding",
-    "alert_type": "monitoring-rule-onboarding",
-    "title": "etl-orders-dq-20260721131727 Monitoring Rule Onboarding",
-    "service": "etl-orders-dq-20260721131727",
-    "severity": "HIGH",
-    "summary": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "recommended_action": "Review generated rules and approve production deployment.",
-    "description": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "deployment": "prod",
-    "source": "rag-incident"
-  },
-  {
-    "id": "etl-orders-dq-20260721131834-rule-onboarding",
-    "alert_id": "etl-orders-dq-20260721131834-rule-onboarding",
-    "alert_name": "etl-orders-dq-20260721131834 Monitoring Rule Onboarding",
-    "alert_type": "monitoring-rule-onboarding",
-    "title": "etl-orders-dq-20260721131834 Monitoring Rule Onboarding",
-    "service": "etl-orders-dq-20260721131834",
+    "title": "etl-orders-dq-20260722141810 Monitoring Rule Onboarding",
+    "service": "etl-orders-dq-20260722141810",
     "severity": "HIGH",
     "summary": "Plain-language monitoring requirements were converted to prometheus rules.",
     "recommended_action": "Review generated rules and approve production deployment.",
@@ -543,20 +500,6 @@
     "source": "rag-incident"
   },
   {
-    "id": "setup-doc-e2e-20260719163442-rule-onboarding",
-    "alert_id": "setup-doc-e2e-20260719163442-rule-onboarding",
-    "alert_name": "setup-doc-e2e-20260719163442 Monitoring Rule Onboarding",
-    "alert_type": "monitoring-rule-onboarding",
-    "title": "setup-doc-e2e-20260719163442 Monitoring Rule Onboarding",
-    "service": "setup-doc-e2e-20260719163442",
-    "severity": "HIGH",
-    "summary": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "recommended_action": "Review generated rules and approve production deployment.",
-    "description": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "deployment": "prod",
-    "source": "rag-incident"
-  },
-  {
     "id": "dw-1003",
     "alert_id": "DW-1003",
     "alert_name": "Source System Unavailable",
@@ -584,20 +527,6 @@
     "description": "Service: spark-cluster",
     "execution_plan": "Increase executor memory",
     "deployment": "Not explicitly documented.",
-    "source": "rag-incident"
-  },
-  {
-    "id": "test-rule-onboarding",
-    "alert_id": "test-rule-onboarding",
-    "alert_name": "test Monitoring Rule Onboarding",
-    "alert_type": "monitoring-rule-onboarding",
-    "title": "test Monitoring Rule Onboarding",
-    "service": "test",
-    "severity": "HIGH",
-    "summary": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "recommended_action": "Review generated rules and approve production deployment.",
-    "description": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "deployment": "prod",
     "source": "rag-incident"
   },
   {

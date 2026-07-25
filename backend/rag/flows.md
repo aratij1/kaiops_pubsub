@@ -2,15 +2,6 @@
 
 _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit the source incident docs and resubmit them — this file is overwritten on every rebuild and excluded from RAG document matching._
 
-## admin-ui-doc-flow-20260719221735 Monitoring Rule Onboarding
-- **Service:** admin-ui-doc-flow-20260719221735
-- **Severity:** HIGH
-- **Alert Type:** monitoring-rule-onboarding
-- **Alert ID:** admin-ui-doc-flow-20260719221735-rule-onboarding
-- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
-- **Recommended Action:** Review generated rules and approve production deployment.
-- **Deployment:** prod
-
 ## Airflow Scheduler Down
 - **Service:** airflow
 - **Severity:** CRITICAL
@@ -20,6 +11,14 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Recommended Action:** Investigate issue
 - **Deployment:** Not explicitly documented.
 - **Execution Plan:** systemctl restart airflow-scheduler
+
+## Alert when checkout latency exceeds 2 seconds
+- **Service:** payments
+- **Severity:** HIGH
+- **Alert Type:** availability
+- **Alert ID:** ALERT-WHEN-CHECKOUT-LATENCY-EXCEEDS-2-SECONDS
+- **Summary:** Alert when checkout latency exceeds 2 seconds
+- **Recommended Action:** Investigate issue
 
 ## Auth session store hotspot
 - **Service:** auth-session
@@ -113,38 +112,11 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Deployment:** ETL workflow / DAG changes for sales_etl
 - **Execution Plan:** airflow dags trigger sales_etl; validate DAG logs; re-run workflow if safe
 
-## etl-orders-dq-20260721130504 Monitoring Rule Onboarding
-- **Service:** etl-orders-dq-20260721130504
+## etl-orders-dq-20260722141810 Monitoring Rule Onboarding
+- **Service:** etl-orders-dq-20260722141810
 - **Severity:** HIGH
 - **Alert Type:** monitoring-rule-onboarding
-- **Alert ID:** etl-orders-dq-20260721130504-rule-onboarding
-- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
-- **Recommended Action:** Review generated rules and approve production deployment.
-- **Deployment:** prod
-
-## etl-orders-dq-20260721131241 Monitoring Rule Onboarding
-- **Service:** etl-orders-dq-20260721131241
-- **Severity:** HIGH
-- **Alert Type:** monitoring-rule-onboarding
-- **Alert ID:** etl-orders-dq-20260721131241-rule-onboarding
-- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
-- **Recommended Action:** Review generated rules and approve production deployment.
-- **Deployment:** prod
-
-## etl-orders-dq-20260721131727 Monitoring Rule Onboarding
-- **Service:** etl-orders-dq-20260721131727
-- **Severity:** HIGH
-- **Alert Type:** monitoring-rule-onboarding
-- **Alert ID:** etl-orders-dq-20260721131727-rule-onboarding
-- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
-- **Recommended Action:** Review generated rules and approve production deployment.
-- **Deployment:** prod
-
-## etl-orders-dq-20260721131834 Monitoring Rule Onboarding
-- **Service:** etl-orders-dq-20260721131834
-- **Severity:** HIGH
-- **Alert Type:** monitoring-rule-onboarding
-- **Alert ID:** etl-orders-dq-20260721131834-rule-onboarding
+- **Alert ID:** etl-orders-dq-20260722141810-rule-onboarding
 - **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
 - **Recommended Action:** Review generated rules and approve production deployment.
 - **Deployment:** prod
@@ -360,15 +332,6 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Root Cause:** Deployment 2.5
 - **Impact:** Kaiops-Resolution-Agent service impact requires immediate triage
 
-## setup-doc-e2e-20260719163442 Monitoring Rule Onboarding
-- **Service:** setup-doc-e2e-20260719163442
-- **Severity:** HIGH
-- **Alert Type:** monitoring-rule-onboarding
-- **Alert ID:** setup-doc-e2e-20260719163442-rule-onboarding
-- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
-- **Recommended Action:** Review generated rules and approve production deployment.
-- **Deployment:** prod
-
 ## Source System Unavailable
 - **Service:** oracle-source
 - **Severity:** CRITICAL
@@ -388,15 +351,6 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Recommended Action:** Investigate issue
 - **Deployment:** Not explicitly documented.
 - **Execution Plan:** Increase executor memory
-
-## test Monitoring Rule Onboarding
-- **Service:** test
-- **Severity:** HIGH
-- **Alert Type:** monitoring-rule-onboarding
-- **Alert ID:** test-rule-onboarding
-- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
-- **Recommended Action:** Review generated rules and approve production deployment.
-- **Deployment:** prod
 
 ## trace-id-fallback-verify Incident Summary
 - **Service:** payments

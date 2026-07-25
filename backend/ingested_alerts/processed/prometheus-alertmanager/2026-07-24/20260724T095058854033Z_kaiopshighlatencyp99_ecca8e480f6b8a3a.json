@@ -1,0 +1,51 @@
+{
+  "received_at": "2026-07-24T09:50:58.854033+00:00",
+  "source": "prometheus-alertmanager",
+  "status": "processed",
+  "error": null,
+  "alert": {
+    "source": "prometheus-alertmanager",
+    "name": "KaiOpsHighLatencyP99",
+    "service": "api-gateway",
+    "environment": "prod",
+    "severity": "critical",
+    "description": "Service api-gateway operation /onboarding/state p99 latency is above 3s.",
+    "labels": {
+      "alertname": "KaiOpsHighLatencyP99",
+      "category": "latency",
+      "landing_pad": "realtime",
+      "operation": "/onboarding/state",
+      "service": "api-gateway",
+      "severity": "critical",
+      "alert_status": "firing",
+      "alert_fingerprint": "ecca8e480f6b8a3a",
+      "support_tier": "L2/L3"
+    },
+    "annotations": {
+      "description": "Service api-gateway operation /onboarding/state p99 latency is above 3s.",
+      "summary": "Critical p99 latency in KaiOps service",
+      "startsAt": "2026-07-24T09:50:44.854Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://c0b43bee68be:9090/graph?g0.expr=histogram_quantile%280.99%2C+sum+by+%28le%2C+service%2C+operation%29+%28rate%28kaiops_request_latency_seconds_bucket%5B5m%5D%29%29%29+%3E+3&g0.tab=1"
+    }
+  },
+  "raw": {
+    "status": "firing",
+    "labels": {
+      "alertname": "KaiOpsHighLatencyP99",
+      "category": "latency",
+      "landing_pad": "realtime",
+      "operation": "/onboarding/state",
+      "service": "api-gateway",
+      "severity": "critical"
+    },
+    "annotations": {
+      "description": "Service api-gateway operation /onboarding/state p99 latency is above 3s.",
+      "summary": "Critical p99 latency in KaiOps service"
+    },
+    "startsAt": "2026-07-24T09:50:44.854Z",
+    "endsAt": "0001-01-01T00:00:00Z",
+    "generatorURL": "http://c0b43bee68be:9090/graph?g0.expr=histogram_quantile%280.99%2C+sum+by+%28le%2C+service%2C+operation%29+%28rate%28kaiops_request_latency_seconds_bucket%5B5m%5D%29%29%29+%3E+3&g0.tab=1",
+    "fingerprint": "ecca8e480f6b8a3a"
+  }
+}

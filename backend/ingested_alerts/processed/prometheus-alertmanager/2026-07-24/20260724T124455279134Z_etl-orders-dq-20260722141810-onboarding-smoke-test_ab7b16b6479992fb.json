@@ -1,0 +1,49 @@
+{
+  "received_at": "2026-07-24T12:44:55.279134+00:00",
+  "source": "prometheus-alertmanager",
+  "status": "processed",
+  "error": null,
+  "alert": {
+    "source": "prometheus-alertmanager",
+    "name": "etl-orders-dq-20260722141810-onboarding-smoke-test",
+    "service": "kaiops-platform",
+    "environment": "prod",
+    "severity": "info",
+    "description": "Auto-generated alert used to verify Prometheus rule loading and alert flow.",
+    "labels": {
+      "alertname": "etl-orders-dq-20260722141810-onboarding-smoke-test",
+      "environment": "prod",
+      "onboarding_test": "true",
+      "project": "etl-orders-dq-20260722141810",
+      "severity": "info",
+      "alert_status": "firing",
+      "alert_fingerprint": "ab7b16b6479992fb",
+      "support_tier": "L1"
+    },
+    "annotations": {
+      "description": "Auto-generated alert used to verify Prometheus rule loading and alert flow.",
+      "summary": "etl-orders-dq-20260722141810 onboarding smoke test",
+      "startsAt": "2026-07-24T07:01:52.213Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://c0b43bee68be:9090/graph?g0.expr=vector%281%29&g0.tab=1"
+    }
+  },
+  "raw": {
+    "status": "firing",
+    "labels": {
+      "alertname": "etl-orders-dq-20260722141810-onboarding-smoke-test",
+      "environment": "prod",
+      "onboarding_test": "true",
+      "project": "etl-orders-dq-20260722141810",
+      "severity": "info"
+    },
+    "annotations": {
+      "description": "Auto-generated alert used to verify Prometheus rule loading and alert flow.",
+      "summary": "etl-orders-dq-20260722141810 onboarding smoke test"
+    },
+    "startsAt": "2026-07-24T07:01:52.213Z",
+    "endsAt": "0001-01-01T00:00:00Z",
+    "generatorURL": "http://c0b43bee68be:9090/graph?g0.expr=vector%281%29&g0.tab=1",
+    "fingerprint": "ab7b16b6479992fb"
+  }
+}

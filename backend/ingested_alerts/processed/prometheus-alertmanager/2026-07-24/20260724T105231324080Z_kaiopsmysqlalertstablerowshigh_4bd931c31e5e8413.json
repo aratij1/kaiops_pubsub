@@ -1,0 +1,67 @@
+{
+  "received_at": "2026-07-24T10:52:31.324080+00:00",
+  "source": "prometheus-alertmanager",
+  "status": "processed",
+  "error": null,
+  "alert": {
+    "source": "prometheus-alertmanager",
+    "name": "KaiOpsMySQLAlertsTableRowsHigh",
+    "service": "mysql",
+    "environment": "prod",
+    "severity": "warning",
+    "description": "alerts table has 1538 rows, above threshold 20 for kaiops-core.",
+    "labels": {
+      "alertname": "KaiOpsMySQLAlertsTableRowsHigh",
+      "category": "database",
+      "database": "kaiops",
+      "instance": "api-gateway:8000",
+      "project": "kaiops-core",
+      "service": "mysql",
+      "severity": "warning",
+      "table": "alerts",
+      "application": "kaiops-test-verify-2",
+      "environment": "prod",
+      "job": "kaiops-test-verify-2",
+      "kaiops_generated_target": "/etc/prometheus/generated-targets/kaiops-test-verify-2.json",
+      "namespace": "kaiops",
+      "tenant": "default",
+      "alert_status": "firing",
+      "alert_fingerprint": "4bd931c31e5e8413",
+      "support_tier": "L2/L3"
+    },
+    "annotations": {
+      "description": "alerts table has 1538 rows, above threshold 20 for kaiops-core.",
+      "summary": "KaiOps alerts table row count is high",
+      "startsAt": "2026-07-24T07:14:32.581Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://c0b43bee68be:9090/graph?g0.expr=kaiops_mysql_alerts_table_rows%7Bdatabase%3D%22kaiops%22%2Ctable%3D%22alerts%22%7D+%3E+300&g0.tab=1"
+    }
+  },
+  "raw": {
+    "status": "firing",
+    "labels": {
+      "alertname": "KaiOpsMySQLAlertsTableRowsHigh",
+      "application": "kaiops-test-verify-2",
+      "category": "database",
+      "database": "kaiops",
+      "environment": "prod",
+      "instance": "api-gateway:8000",
+      "job": "kaiops-test-verify-2",
+      "kaiops_generated_target": "/etc/prometheus/generated-targets/kaiops-test-verify-2.json",
+      "namespace": "kaiops",
+      "project": "kaiops-core",
+      "service": "mysql",
+      "severity": "warning",
+      "table": "alerts",
+      "tenant": "default"
+    },
+    "annotations": {
+      "description": "alerts table has 1538 rows, above threshold 20 for kaiops-core.",
+      "summary": "KaiOps alerts table row count is high"
+    },
+    "startsAt": "2026-07-24T07:14:32.581Z",
+    "endsAt": "0001-01-01T00:00:00Z",
+    "generatorURL": "http://c0b43bee68be:9090/graph?g0.expr=kaiops_mysql_alerts_table_rows%7Bdatabase%3D%22kaiops%22%2Ctable%3D%22alerts%22%7D+%3E+300&g0.tab=1",
+    "fingerprint": "4bd931c31e5e8413"
+  }
+}
