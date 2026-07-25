@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
@@ -95,7 +94,10 @@ def _build_fallback_content(request: RouteRequest, error_message: str) -> str:
             "fallback_reason": error_message[:400],
         },
     }
-    return json.dumps(doc)
+    # Return plain, human-readable text (not the raw JSON blob) so that any caller that
+    # forwards this content verbatim -- e.g. an approval-requested email -- shows a clean
+    # message instead of a dumped dict.
+    return doc["content"]
 
 
 @app.post("/route")
