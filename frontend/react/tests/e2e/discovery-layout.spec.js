@@ -151,6 +151,16 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await expect(page.locator(".investigation-story")).toContainText("Facts are connected to operations");
   await expect(page.locator(".investigation-story")).toContainText("RCA and impact are derived");
   await expect(page.locator(".investigation-story")).toContainText("Evidence becomes an action");
+  const [completeDownload] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("button", { name: "Download complete investigation" }).click(),
+  ]);
+  expect(completeDownload.suggestedFilename()).toBe("kaiops-complete-investigation.json");
+  const [evidenceDownload] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("button", { name: "Download evidence & logs" }).click(),
+  ]);
+  expect(evidenceDownload.suggestedFilename()).toBe("kaiops-02-discover.json");
   await expect(page.getByText("Memory pressure in user-profile", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Evidence used", { exact: true }).first()).toBeVisible();
   await expect(page.getByText(/```json/)).toHaveCount(0);
