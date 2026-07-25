@@ -1,0 +1,27 @@
+{
+  "source": "opensearch-log-alert",
+  "origin_system": "opensearch",
+  "ingestion_channel": "log",
+  "name": "CheckoutLogErrorBurst",
+  "service": "checkout-api",
+  "environment": "prod",
+  "severity": "high",
+  "description": "OpenSearch log monitor detected repeated checkout failures in the last five minutes.",
+  "labels": {
+    "alertname": "CheckoutLogErrorBurst",
+    "project": "kaiops",
+    "project_name": "KaiOps",
+    "application": "KaiOps",
+    "service": "checkout-api",
+    "environment": "prod",
+    "origin_system": "opensearch",
+    "ingestion_channel": "log",
+    "log_index": "telemetry-logs-*",
+    "query_id": "checkout-error-burst"
+  },
+  "annotations": {
+    "summary": "Checkout error log burst",
+    "description": "More than 20 ERROR entries matched service.name=checkout-api in five minutes.",
+    "evidence_uri": "opensearch://telemetry-logs-*/_search?query_id=checkout-error-burst"
+  }
+}
