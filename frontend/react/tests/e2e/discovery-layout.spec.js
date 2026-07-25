@@ -115,16 +115,18 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
 
   await expect(page.getByRole("heading", { name: "Signal to Recovery", exact: true })).toBeVisible();
   await expect(page.locator(".unified-incident-timeline")).toBeVisible();
-  await expect(page.getByText("Context retrieved from", { exact: true })).toBeVisible();
+  await expect(page.locator(".timeline-phase-card")).toHaveCount(6);
+  await expect(page.getByText("Evidence", { exact: true }).first()).toBeVisible();
 
   const discoveryTab = page.getByRole("button", { name: "Discovery + Context", exact: true });
   await expect(discoveryTab).toBeVisible();
   await discoveryTab.click();
-  await expect(page.getByRole("heading", { name: "Discovery + Context Intelligence", exact: true })).toBeVisible();
-  await expect(page.locator(".combined-analysis-page")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Discovery + Context", exact: true })).toBeVisible();
   await expect(page.getByText("Memory pressure in user-profile", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Evidence used", { exact: true }).first()).toBeVisible();
   await expect(page.getByText(/```json/)).toHaveCount(0);
+  await page.getByText("Technical deep dive", { exact: true }).click();
+  await expect(page.locator(".combined-analysis-grid")).toBeVisible();
 
   const desktopOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1);
   expect(desktopOverflow).toBeFalsy();

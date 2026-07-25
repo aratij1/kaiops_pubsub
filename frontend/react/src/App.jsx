@@ -3064,12 +3064,12 @@ function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
   const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
   const safeRows = Array.isArray(rows) ? rows : [];
   const lanes = [
-    { id: "detect", label: "Detect", hint: "Alert received and normalized", match: ["landing", "ingest", "alert", "monitor"] },
-    { id: "discover", label: "Discover", hint: "Tickets, logs, traces, and code searched", match: ["discover", "ticket", "log", "trace", "code", "context"] },
-    { id: "diagnose", label: "Diagnose", hint: "RCA and impact grounded in evidence", match: ["resolution", "root cause", "rca", "impact", "model"] },
-    { id: "decide", label: "Decide", hint: "Policy and human decision gate", match: ["approval", "decision", "policy", "risk"] },
-    { id: "act", label: "Act", hint: "Remediation planned or executed", match: ["remedi", "execute", "command", "action"] },
-    { id: "validate", label: "Validate", hint: "Recovery checked and incident closed", match: ["validat", "closure", "closed", "health restored"] },
+    { id: "detect", icon: "↗", label: "Detect", hint: "Signal received", match: ["landing", "ingest", "alert", "monitor"] },
+    { id: "discover", icon: "⌕", label: "Discover", hint: "Evidence collected", match: ["discover", "ticket", "log", "trace", "code", "context"] },
+    { id: "diagnose", icon: "◇", label: "Diagnose", hint: "Cause assessed", match: ["resolution", "root cause", "rca", "impact", "model"] },
+    { id: "decide", icon: "✓", label: "Decide", hint: "Risk reviewed", match: ["approval", "decision", "policy", "risk"] },
+    { id: "act", icon: "⚡", label: "Act", hint: "Fix executed", match: ["remedi", "execute", "command", "action"] },
+    { id: "validate", icon: "◎", label: "Validate", hint: "Recovery confirmed", match: ["validat", "closure", "closed", "health restored"] },
   ];
   const assigned = new Set();
   const laneRows = lanes.map((lane) => {
@@ -3119,47 +3119,51 @@ function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
         </div>
       </header>
       <div className="unified-source-strip">
-        <strong>Context retrieved from</strong>
+        <strong>Evidence</strong>
         {retrievedSources.length
           ? retrievedSources.map((source) => <span key={source}>{compactText(source, 42)}</span>)
-          : <span>No source evidence returned yet</span>}
+          : <span>Waiting for source evidence</span>}
       </div>
-      <div className="unified-timeline-lanes">
+      <div className="timeline-phase-map">
         {laneRows.map((lane, laneIndex) => {
           const failed = lane.rows.some((row) => timelineRowHasError(row));
           const fallback = lane.rows.some((row) => timelineRowStatus(row) === "fallback");
           const status = failed ? "failed" : fallback ? "fallback" : lane.rows.length ? "complete" : "waiting";
+          const latest = lane.rows[lane.rows.length - 1] || {};
           return (
-            <article className={`unified-timeline-lane is-${status}`} key={lane.id}>
-              <div className="unified-lane-rail">
-                <span>{laneIndex + 1}</span>
-                {laneIndex < laneRows.length - 1 ? <i /> : null}
+            <article className={`timeline-phase-card is-${status}`} key={lane.id}>
+              <div className="timeline-phase-top">
+                <span className="timeline-phase-icon" aria-hidden="true">{lane.icon}</span>
+                <span className="timeline-phase-number">{String(laneIndex + 1).padStart(2, "0")}</span>
+                <i className="timeline-phase-status">{status}</i>
               </div>
-              <div className="unified-lane-body">
-                <div className="unified-lane-title">
-                  <div><h4>{lane.label}</h4><p>{lane.hint}</p></div>
-                  <b>{status}</b>
-                </div>
-                {lane.rows.length ? (
-                  <div className="unified-lane-events">
-                    {lane.rows.slice(0, 6).map((row, rowIndex) => (
-                      <details key={`${lane.id}-${rowIndex}`} open={rowIndex === 0}>
-                        <summary>
-                          <span>{row.stage || row.agent || row.service || `Event ${rowIndex + 1}`}</span>
-                          <small>{row.status || timelineRowStatus(row)}</small>
-                        </summary>
-                        <p>{row.detail || row.outputValueText || row.inputValueText || "Stage completed without a detailed payload."}</p>
-                        <div className="unified-event-meta">
-                          <span>agent: {row.agent || row.service || "-"}</span>
-                          <span>time: {formatIstTimestamp(row.timestamp || row.created_at)}</span>
-                          <span>duration: {row.executionTimeMs || row.execution_time_ms || "-"} ms</span>
+              <h4>{lane.label}</h4>
+              <p>{lane.hint}</p>
+              <div className="timeline-phase-summary">
+                <strong>{lane.rows.length}</strong>
+                <span>{lane.rows.length === 1 ? "event" : "events"}</span>
+              </div>
+              <small className="timeline-phase-latest">
+                {lane.rows.length
+                  ? compactText(latest.stage || latest.agent || latest.service || latest.detail, 54)
+                  : "Not reached yet"}
+              </small>
+              {lane.rows.length ? (
+                <details className="timeline-phase-details">
+                  <summary>View events</summary>
+                  <div className="timeline-phase-event-list">
+                    {lane.rows.slice(0, 8).map((row, rowIndex) => (
+                      <article key={`${lane.id}-${rowIndex}`}>
+                        <div>
+                          <strong>{row.stage || row.agent || row.service || `Event ${rowIndex + 1}`}</strong>
+                          <span>{formatIstTimestamp(row.timestamp || row.created_at)}</span>
                         </div>
-                      </details>
+                        <p>{compactText(row.detail || row.outputValueText || row.inputValueText, 240) || "Stage completed."}</p>
+                      </article>
                     ))}
-                    {lane.rows.length > 6 ? <small>+ {lane.rows.length - 6} additional events</small> : null}
                   </div>
-                ) : <p className="unified-lane-empty">Waiting for this phase to emit an event.</p>}
-              </div>
+                </details>
+              ) : null}
             </article>
           );
         })}
@@ -13628,9 +13632,9 @@ export default function App() {
                     <section className="combined-analysis-page">
                       <header className="combined-analysis-hero">
                         <div>
-                          <span className="discovery-eyebrow">Unified investigation flow</span>
-                          <h3>Discovery + Context Intelligence</h3>
-                          <p>Single-page, source-aware triage for Prometheus, email, and ticket alerts with grounded RCA and impact reasoning.</p>
+                          <span className="discovery-eyebrow">Investigation overview</span>
+                          <h3>Discovery + Context</h3>
+                          <p>See what KaiOps found, what it means, and what to do next.</p>
                         </div>
                         <div className="combined-analysis-kpis">
                           <span><strong>{selectedAlertTimelineRows.length}</strong> timeline stages</span>
@@ -13640,41 +13644,50 @@ export default function App() {
                         </div>
                       </header>
                       <div className="combined-analysis-source-rail">
-                        <strong>Sources searched</strong>
+                        <strong>Connected evidence</strong>
                         <span className="source-badge source-prometheus">Prometheus</span>
                         <span className="source-badge">Jaeger traces</span>
                         <span className="source-badge">OpenSearch logs</span>
-                        <span className="source-badge">Application logs</span>
                         <span className="source-badge source-email">Email</span>
                         <span className="source-badge source-ticket">Jira / tickets</span>
                         <span className="source-badge">Source code</span>
-                        <span className="source-badge">KaiOps records</span>
                       </div>
                       <IntelligenceConnectionView
                         workflow={selectedAlertWorkflow}
                         documents={selectedAlertRagDocuments}
                         onDownloadDocument={downloadRagDocument}
                       />
-                      <div className="combined-analysis-grid">
-                        <article className="combined-analysis-card combined-analysis-discovery">
-                          <DiscoveryFlowView
-                            workflow={selectedAlertWorkflow}
-                            timelineRows={selectedAlertTimelineRows}
-                            selectedAlert={selectedAlertRow}
-                          />
-                        </article>
-                        <article className="combined-analysis-card combined-analysis-context">
-                          <ContextRetrievalGraph
-                            workflow={selectedAlertWorkflow}
-                            timelineRows={selectedAlertTimelineRows}
-                            documents={selectedAlertRagDocuments}
-                            evaluation={selectedAlertEvaluation}
-                            documentContract={selectedAlertDocumentContract}
-                            onLoadDocumentContent={loadRagDocumentContent}
-                            onDownloadDocument={downloadRagDocument}
-                          />
-                        </article>
-                      </div>
+                      <details className="investigation-deep-dive">
+                        <summary>
+                          <span>
+                            <strong>Technical deep dive</strong>
+                            <small>Agent trace, retrieval pipeline, source metadata, and raw evidence</small>
+                          </span>
+                          <b>Expand</b>
+                        </summary>
+                        <div className="combined-analysis-grid">
+                          <article className="combined-analysis-card combined-analysis-discovery">
+                            <DiscoveryFlowView
+                              workflow={selectedAlertWorkflow}
+                              timelineRows={selectedAlertTimelineRows}
+                              selectedAlert={selectedAlertRow}
+                              compact
+                            />
+                          </article>
+                          <article className="combined-analysis-card combined-analysis-context">
+                            <ContextRetrievalGraph
+                              workflow={selectedAlertWorkflow}
+                              timelineRows={selectedAlertTimelineRows}
+                              documents={selectedAlertRagDocuments}
+                              evaluation={selectedAlertEvaluation}
+                              documentContract={selectedAlertDocumentContract}
+                              onLoadDocumentContent={loadRagDocumentContent}
+                              onDownloadDocument={downloadRagDocument}
+                              compact
+                            />
+                          </article>
+                        </div>
+                      </details>
                     </section>
                   ) : null}
 
