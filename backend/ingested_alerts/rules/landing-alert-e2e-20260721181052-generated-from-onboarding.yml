@@ -1,0 +1,47 @@
+groups:
+- name: landing-alert-e2e-20260721181052-generated-rules
+  rules:
+  - alert: landing-alert-e2e-20260721181052-request-latency-ms-p95-warning-prometheus
+    expr: quantile_over_time(0.95, request_latency_ms_p95[5m]) > 500.0
+    for: 5m
+    labels:
+      severity: warning
+      project: landing-alert-e2e-20260721181052
+      environment: prod
+    annotations:
+      summary: Create warning Prometheus p95 latency alert when latency is above 500
+        for 5 minutes for api-gateway route traffic.
+      description: Generated from plain-language onboarding for project landing-alert-e2e-20260721181052.
+  - alert: landing-alert-e2e-20260721181052-error-rate-percent-critical-prometheus
+    expr: avg_over_time(error_rate_percent[5m]) > 5.0
+    for: 5m
+    labels:
+      severity: critical
+      project: landing-alert-e2e-20260721181052
+      environment: prod
+    annotations:
+      summary: Create critical Prometheus error rate alert when error rate is above
+        5 for 5 minutes for kaiops-core1 availability incidents.
+      description: Generated from plain-language onboarding for project landing-alert-e2e-20260721181052.
+  - alert: landing-alert-e2e-20260721181052-etl-rejected-rows-warning-prometheus
+    expr: sum_over_time(etl_rejected_rows[5m]) > 1.0
+    for: 5m
+    labels:
+      severity: warning
+      project: landing-alert-e2e-20260721181052
+      environment: prod
+    annotations:
+      summary: Create warning Prometheus data quality alert when data quality rejected
+        rows are above 1 for 5 minutes for ETL order loads.
+      description: Generated from plain-language onboarding for project landing-alert-e2e-20260721181052.
+  - alert: landing-alert-e2e-20260721181052-etl-rejected-rows-warning-prometheus
+    expr: sum_over_time(etl_rejected_rows[5m]) > 1.0
+    for: 5m
+    labels:
+      severity: warning
+      project: landing-alert-e2e-20260721181052
+      environment: prod
+    annotations:
+      summary: Create warning Prometheus MySQL alert when rejected rows are above
+        1 for 5 minutes for alerts table growth.
+      description: Generated from plain-language onboarding for project landing-alert-e2e-20260721181052.

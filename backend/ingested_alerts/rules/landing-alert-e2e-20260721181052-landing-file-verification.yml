@@ -1,0 +1,55 @@
+﻿groups:
+- name: landing-alert-e2e-20260721181052-landing-file-verification
+  rules:
+  - alert: HighRequestLatency
+    expr: vector(1)
+    for: 0m
+    labels:
+      severity: warning
+      service: api-gateway
+      environment: prod
+      project: landing-alert-e2e-20260721181052
+      e2e_run: "landing-alert-e2e-20260721181052"
+      source_file: "20260721T085449461405Z_highrequestlatency_cfa156f60c81a9ed.json"
+    annotations:
+      summary: "HighRequestLatency verification alert from landing file"
+      description: "P95 latency is above 500ms for api-gateway /route."
+  - alert: KaiOpsHighLatencyP95
+    expr: vector(1)
+    for: 0m
+    labels:
+      severity: warning
+      service: api-gateway
+      environment: prod
+      project: landing-alert-e2e-20260721181052
+      e2e_run: "landing-alert-e2e-20260721181052"
+      source_file: "20260721T085448985645Z_kaiopshighlatencyp95_217f818bfd942ddf.json"
+    annotations:
+      summary: "KaiOpsHighLatencyP95 verification alert from landing file"
+      description: "Service api-gateway operation /route p95 latency is above 2s."
+  - alert: ServiceDown
+    expr: vector(1)
+    for: 0m
+    labels:
+      severity: critical
+      service: kaiops-core1
+      environment: prod
+      project: landing-alert-e2e-20260721181052
+      e2e_run: "landing-alert-e2e-20260721181052"
+      source_file: "20260721T085339746876Z_servicedown_e9789b8fc444fa39.json"
+    annotations:
+      summary: "ServiceDown verification alert from landing file"
+      description: "Endpoint kaiops-core1 is unreachable."
+  - alert: KaiOpsMySQLAlertsTableRowsHigh
+    expr: vector(1)
+    for: 0m
+    labels:
+      severity: warning
+      service: mysql
+      environment: prod
+      project: landing-alert-e2e-20260721181052
+      e2e_run: "landing-alert-e2e-20260721181052"
+      source_file: "20260721T081108745158Z_kaiopsmysqlalertstablerowshigh_46e408884901f001.json"
+    annotations:
+      summary: "KaiOpsMySQLAlertsTableRowsHigh verification alert from landing file"
+      description: "alerts table has 2836 rows, above threshold 20 for kaiops-core."

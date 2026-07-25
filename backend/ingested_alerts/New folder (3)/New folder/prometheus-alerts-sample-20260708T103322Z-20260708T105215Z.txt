@@ -1,0 +1,171 @@
+# Prometheus text alerts for ingestion worker
+# Supported format: key=value pairs, one alert block separated by blank lines
+
+source=prometheus
+alertname=OrdersReplicaLagPrimary
+action=Page
+service=orders-db
+severity=critical
+environment=prod
+flow_id=orders-replica-lag
+description=Primary replica lag above threshold for 10 minutes
+
+source=prometheus
+alertname=CheckoutLatencyP95High
+service=checkout
+severity=high
+environment=prod
+flow_id=payment-latency
+description=P95 latency crossed 900ms for 5m
+
+source=prometheus
+alertname=CheckoutLatencyP99Critical
+service=checkout
+severity=critical
+environment=prod
+flow_id=payment-latency
+description=P99 latency crossed 1400ms for 5m
+
+source=prometheus
+alertname=PaymentsApi5xxBurst
+service=payments-api
+severity=high
+environment=prod
+flow_id=payment-latency
+description=5xx error ratio exceeded 4 percent in 10m window
+
+source=prometheus
+alertname=OrdersDbConnectionSaturation
+service=orders-db
+severity=critical
+environment=prod
+flow_id=orders-replica-lag
+description=Database open connections above 92 percent
+
+source=prometheus
+alertname=OrdersDbCpuHot
+service=orders-db
+severity=high
+environment=prod
+flow_id=orders-replica-lag
+description=Database CPU above 90 percent for 15 minutes
+
+source=prometheus
+alertname=InventoryServiceMemoryPressure
+service=inventory
+severity=warning
+environment=prod
+flow_id=payment-latency
+description=Container memory usage crossed 80 percent
+
+source=prometheus
+alertname=CatalogApiTimeoutRate
+service=catalog-api
+severity=high
+environment=prod
+flow_id=payment-latency
+description=Timeout ratio exceeded 3 percent on API gateway route
+
+source=prometheus
+alertname=CartRedisEvictionsHigh
+service=cart-cache
+severity=warning
+environment=prod
+flow_id=payment-latency
+description=Redis evictions sustained above 200 per minute
+
+source=prometheus
+alertname=MessageQueueConsumerLag
+service=event-consumer
+severity=high
+environment=prod
+flow_id=payment-latency
+description=Consumer lag exceeded 25000 messages
+
+source=prometheus
+alertname=KafkaBrokerDiskUsageHigh
+service=message-bus
+severity=warning
+environment=prod
+flow_id=payment-latency
+description=Broker disk usage above 85 percent
+
+source=prometheus
+alertname=AuthServiceTokenValidationErrors
+service=auth-service
+severity=high
+environment=prod
+flow_id=payment-latency
+description=JWT validation errors increased sharply
+
+source=prometheus
+alertname=ShippingApiDependencyFailure
+service=shipping-api
+severity=critical
+environment=prod
+flow_id=payment-latency
+description=Downstream carrier dependency failing health checks
+
+source=prometheus
+alertname=NotificationWorkerRetriesHigh
+service=notification-worker
+severity=warning
+environment=prod
+flow_id=payment-latency
+description=Retry count crossed threshold for email queue
+
+source=prometheus
+alertname=WarehouseSyncJobDelay
+service=warehouse-sync
+severity=high
+environment=prod
+flow_id=payment-latency
+description=Sync lag exceeded 20 minutes against source system
+
+source=prometheus
+alertname=ReportingQueryDurationHigh
+service=reporting
+severity=warning
+environment=prod
+flow_id=payment-latency
+description=95th percentile query duration crossed 4 seconds
+
+source=prometheus
+alertname=CustomerProfileApiErrors
+service=customer-profile
+severity=high
+environment=prod
+flow_id=payment-latency
+description=Error ratio above 2 percent for profile endpoints
+
+source=prometheus
+alertname=ReconciliationBatchFailure
+service=reconciliation
+severity=critical
+environment=prod
+flow_id=payment-latency
+description=Nightly reconciliation batch failed twice consecutively
+
+source=prometheus
+alertname=SearchIndexerBacklog
+service=search-indexer
+severity=warning
+environment=prod
+flow_id=payment-latency
+description=Index backlog above 50000 documents
+
+source=prometheus
+alertname=FraudEngineLatencyHigh
+service=fraud-engine
+severity=high
+environment=prod
+flow_id=payment-latency
+description=Model inference latency exceeded 700ms p95
+
+source=prometheus
+alertname=OrdersReplicaLagSecondary
+service=orders-db
+severity=high
+environment=prod
+flow_id=orders-replica-lag
+description=Secondary replica lag exceeded 5 minutes
