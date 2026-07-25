@@ -3613,6 +3613,77 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
     ...(Array.isArray(report.citations) ? report.citations : []),
     ...hypotheses.flatMap((item) => Array.isArray(item?.supporting_evidence) ? item.supporting_evidence : []),
   ].filter(Boolean)));
+  const queryTerms = Array.isArray(discovery.query_terms)
+    ? discovery.query_terms
+    : Array.isArray(metadata.query_terms)
+      ? metadata.query_terms
+      : [];
+  const recentChanges = Array.isArray(context.recent_changes) ? context.recent_changes : [];
+  const dependencies = Array.isArray(context.dependency_services) ? context.dependency_services : [];
+  const relatedIncidents = Array.isArray(context.related_incidents) ? context.related_incidents : [];
+  const reasoningConfidence = Number(recommendation.confidence ?? report.confidence_score ?? 0);
+  const storyStages = [
+    {
+      id: "signal",
+      number: "01",
+      eyebrow: "Question formed",
+      title: "Alert becomes a search plan",
+      summary: "Service, alert name, environment, symptoms, and scenario are converted into focused retrieval terms.",
+      metric: queryTerms.length || "Auto",
+      metricLabel: queryTerms.length === 1 ? "query term" : "query terms",
+      tags: queryTerms.slice(0, 5),
+      tone: "blue",
+    },
+    {
+      id: "discover",
+      number: "02",
+      eyebrow: "Read-only discovery",
+      title: "Tools return source facts",
+      summary: "Logs, tickets, traces, metrics, and code are searched. Every useful fact keeps its source and immutable evidence ID.",
+      metric: evidence.length,
+      metricLabel: evidence.length === 1 ? "grounded fact" : "grounded facts",
+      tags: Object.entries(sourceCounts).map(([source, count]) => `${source} ${count}`).slice(0, 5),
+      tone: "violet",
+    },
+    {
+      id: "context",
+      number: "03",
+      eyebrow: "Context retrieval",
+      title: "Facts are connected to operations",
+      summary: "Semantic and metadata search rank documents, then merge dependencies, recent changes, related incidents, and runbook guidance.",
+      metric: ragMatches.length || documents.length,
+      metricLabel: "ranked documents",
+      tags: [
+        dependencies.length ? `${dependencies.length} dependencies` : "",
+        recentChanges.length ? `${recentChanges.length} changes` : "",
+        relatedIncidents.length ? `${relatedIncidents.length} incidents` : "",
+        context.runbook ? "runbook found" : "",
+      ].filter(Boolean),
+      tone: "green",
+    },
+    {
+      id: "reason",
+      number: "04",
+      eyebrow: "Grounded reasoning",
+      title: "RCA and impact are derived",
+      summary: "The reasoning agent compares hypotheses against collected context, retains alternatives and missing evidence, and cites supporting facts.",
+      metric: Number.isFinite(reasoningConfidence) && reasoningConfidence > 0 ? `${Math.round(reasoningConfidence * 100)}%` : supportingIds.length,
+      metricLabel: Number.isFinite(reasoningConfidence) && reasoningConfidence > 0 ? "confidence" : "citations",
+      tags: supportingIds.slice(0, 4),
+      tone: "orange",
+    },
+    {
+      id: "act",
+      number: "05",
+      eyebrow: "Decision ready",
+      title: "Evidence becomes an action",
+      summary: "RCA, impact, and safety constraints produce an operator-readable recommendation for approval, execution, and validation.",
+      metric: recommendation.recommended_action ? "Ready" : "Pending",
+      metricLabel: "recommended action",
+      tags: ["approval gate", "guarded execution", "recovery validation"],
+      tone: "red",
+    },
+  ];
   const outputs = [
     {
       label: "RCA",
@@ -3640,6 +3711,48 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
           {evidence.length || contextItems.length ? "connected" : "no context"}
         </span>
       </header>
+      <div className="investigation-story">
+        <div className="investigation-story-intro">
+          <span>How KaiOps reached this conclusion</span>
+          <strong>Every conclusion moves through an observable, evidence-backed handoff.</strong>
+        </div>
+        <div className="investigation-story-track">
+          {storyStages.map((stage, index) => (
+            <div className="investigation-story-segment" key={stage.id}>
+              <article className={`investigation-story-card tone-${stage.tone}`}>
+                <header>
+                  <span className="investigation-story-number">{stage.number}</span>
+                  <div>
+                    <small>{stage.eyebrow}</small>
+                    <h4>{stage.title}</h4>
+                  </div>
+                </header>
+                <p>{stage.summary}</p>
+                <div className="investigation-story-metric">
+                  <strong>{stage.metric}</strong>
+                  <span>{stage.metricLabel}</span>
+                </div>
+                <div className="investigation-story-tags">
+                  {stage.tags.length
+                    ? stage.tags.map((tag) => <span key={`${stage.id}-${tag}`}>{compactText(tag, 30)}</span>)
+                    : <span>Awaiting persisted data</span>}
+                </div>
+              </article>
+              {index < storyStages.length - 1 ? (
+                <div className="investigation-story-handoff" aria-hidden="true">
+                  <i>→</i>
+                  <small>{index === 0 ? "query" : index === 1 ? "evidence" : index === 2 ? "context" : "decision"}</small>
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="intelligence-lineage-heading">
+        <span className="discovery-eyebrow">Live lineage from this alert</span>
+        <h4>Inspect exactly what entered each stage</h4>
+        <p>Source facts are shown on the left, assembled operational context in the middle, and the derived conclusions on the right.</p>
+      </div>
       <div className="intelligence-connection-flow">
         <article className="intelligence-column intelligence-discovery-column">
           <span className="intelligence-column-step">1</span>
@@ -13722,22 +13835,6 @@ export default function App() {
                         <span className="source-badge source-ticket">Jira / tickets</span>
                         <span className="source-badge">Source code</span>
                       </div>
-                      <div className="analysis-journey" aria-label="Connected investigation journey">
-                        {[
-                          ["01", "Discover", "Signals and source facts"],
-                          ["02", "Connect context", "Documents, changes, and dependencies"],
-                          ["03", "Explain", "Grounded RCA and impact"],
-                          ["04", "Act", "Evidence-backed response"],
-                        ].map(([number, label, detail], index) => (
-                          <div className="analysis-journey-segment" key={label}>
-                            <article>
-                              <span>{number}</span>
-                              <div><strong>{label}</strong><small>{detail}</small></div>
-                            </article>
-                            {index < 3 ? <i aria-hidden="true">→</i> : null}
-                          </div>
-                        ))}
-                      </div>
                       <IntelligenceConnectionView
                         workflow={selectedAlertWorkflow}
                         documents={selectedAlertRagDocuments}
@@ -13746,8 +13843,8 @@ export default function App() {
                       <details className="investigation-deep-dive">
                         <summary>
                           <span>
-                            <strong>Technical deep dive</strong>
-                            <small>Agent trace, retrieval pipeline, source metadata, and raw evidence</small>
+                            <strong>Open technical retrieval trace</strong>
+                            <small>Inspect every discovery query, context lookup, document score, agent handoff, and raw evidence record</small>
                           </span>
                           <b>Expand</b>
                         </summary>
@@ -13797,6 +13894,15 @@ export default function App() {
                         rows={selectedAlertTimelineRows}
                         documents={selectedAlertRagDocuments}
                       />
+                      <details className="panel incident-workspace-section workspace-collapsible" open>
+                      <summary className="panel-head">
+                        <div>
+                          <span className="workspace-section-number">01</span>
+                          <h3>Incident Overview</h3>
+                          <p>Alert identity, status, root cause, quality metrics, and stage completeness.</p>
+                        </div>
+                        <span className="section-toggle-indicator" />
+                      </summary>
                       <div className="table-wrap table-wrap-scroll-x incident-overview-table">
                         <table>
                           <tbody>
@@ -13930,18 +14036,20 @@ export default function App() {
                           {" "}({selectedStageCompleteness.data?.stage_completion?.percentage ?? 0}%)
                         </p>
                       ) : null}
+                      </details>
                     </>
                   ) : null}
 
                   {homeDetailTab === "timeline" ? (
-                    <article className="panel incident-workspace-section evidence-workspace">
-                      <div className="panel-head">
+                    <details className="panel incident-workspace-section workspace-collapsible evidence-workspace">
+                      <summary className="panel-head">
                         <div>
                           <span className="workspace-section-number">02</span>
                           <h3>Evidence & Trust</h3>
                           <p>Canonical identity, traceability, linked knowledge, and evaluation quality.</p>
                         </div>
-                      </div>
+                        <span className="section-toggle-indicator" />
+                      </summary>
                       <div className="table-wrap table-wrap-scroll-x">
                         <table>
                           <tbody>
@@ -13964,18 +14072,19 @@ export default function App() {
                           </tbody>
                         </table>
                       </div>
-                    </article>
+                    </details>
                   ) : null}
 
                   {homeDetailTab === "timeline" ? (
-                    <article className="panel incident-workspace-section approval-workspace">
-                      <div className="panel-head">
+                    <details className="panel incident-workspace-section workspace-collapsible approval-workspace" open>
+                      <summary className="panel-head">
                         <div>
                           <span className="workspace-section-number">03</span>
                           <h3>Decision & Approval</h3>
                           <p>Review evidence quality and approve, reject, or modify the proposed response.</p>
                         </div>
-                      </div>
+                        <span className="section-toggle-indicator" />
+                      </summary>
                       <div className="table-wrap">
                         <table>
                           <tbody>
@@ -14019,15 +14128,18 @@ export default function App() {
                       ) : (
                         <p className="subtitle">Login with an approval-eligible role to submit actions. You can still view full approval context here.</p>
                       )}
-                    </article>
+                    </details>
                   ) : null}
 
                   {homeDetailTab === "timeline" ? (
-                    <article className="panel alert-documents-panel incident-workspace-section">
-                      <div className="panel-head">
-                        <h3>Alert Documents</h3>
-                        <p>Download backend-linked documents for the selected alert.</p>
-                      </div>
+                    <details className="panel alert-documents-panel incident-workspace-section workspace-collapsible">
+                      <summary className="panel-head">
+                        <div>
+                          <h3>Alert Documents</h3>
+                          <p>Download backend-linked documents for the selected alert.</p>
+                        </div>
+                        <span className="section-toggle-indicator" />
+                      </summary>
                       {ragDocs.error ? <p className="error">{ragDocs.error}</p> : null}
                       {selectedAlertDocumentLinks.error ? (
                         <p className="subtitle">Backend document-link contract unavailable; using local fallback matcher. {selectedAlertDocumentLinks.error}</p>
@@ -14122,7 +14234,7 @@ export default function App() {
                           ) : null}
                         </div>
                       )}
-                    </article>
+                    </details>
                   ) : null}
 
                   {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "pipeline" ? (
@@ -14293,14 +14405,15 @@ export default function App() {
 
                   {homeDetailTab === "timeline" ? (
                     <>
-                      <article className="panel remediation-workspace incident-workspace-section">
-                        <div className="panel-head">
+                      <details className="panel remediation-workspace incident-workspace-section workspace-collapsible" open>
+                        <summary className="panel-head">
                           <div>
                             <span className="workspace-section-number">04</span>
                             <h3>Resolution & Remediation</h3>
                             <p>Confirm the decision, review the guarded plan, execute, and validate recovery.</p>
                           </div>
-                        </div>
+                          <span className="section-toggle-indicator" />
+                        </summary>
                         <div className="workflow-guide-grid remediation-flow-grid">
                           {selectedWorkflowFlowStages.map((stage) => (
                             <div className="workflow-guide-card remediation-flow-card" key={stage.id}>
@@ -14479,7 +14592,7 @@ export default function App() {
                             </tbody>
                           </table>
                         </div>
-                      </article>
+                      </details>
                       <ExecutionPlanGraph plan={selectedExecutionPlan} />
                     </>
                   ) : null}
