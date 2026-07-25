@@ -95,6 +95,16 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await page.getByRole("button", { name: "Sign In" }).click();
 
   await expect(page.getByRole("heading", { name: "KaiOps + Telemetry" })).toBeVisible();
+  await page.getByTitle("Alert Ingestion Stream").click();
+  await expect(page.getByRole("heading", { name: "Alert Ingestion Stream", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Email/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Logs \/ OpenSearch/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Prometheus/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Tickets \/ Jira/ })).toBeVisible();
+  await expect(page.locator(".ingestion-event.channel-email").filter({ hasText: "Pod crash loop" })).toBeVisible();
+  await expect(page.getByText("Checkout log error burst", { exact: true })).toBeVisible();
+  await page.getByTitle("Dashboard", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "KaiOps + Telemetry" })).toBeVisible();
   await expect(page.getByText("Pod crash loop", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("button", { name: "Open alert 11111111-1111-4111-8111-111111111111" })).toHaveCount(1);
   await expect(page.getByRole("button", { name: "Open alert email-pod-crash-duplicate.eml" })).toHaveCount(0);
