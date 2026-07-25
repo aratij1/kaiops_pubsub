@@ -8,9 +8,15 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
       : path === "/healthz"
         ? { status: "ok", service: "api-gateway" }
         : path.startsWith("/alerts/all")
-          ? { data: { rows: [{ alert_id: "alert-discovery-1", id: "alert-discovery-1", name: "Pod crash loop", service: "user-profile", application: "kaiops-core1", severity: "critical", status: "active" }] } }
-          : path === "/applications/monitoring"
-            ? { data: [{ id: "kaiops-core1", name: "kaiops-core1" }] }
+          ? { data: { rows: [
+              { alert_id: "alert-discovery-1", id: "alert-discovery-1", name: "Pod crash loop", service: "user-profile", application: "kaiops-core1", labels: { project_name: "KaiOps" }, severity: "critical", status: "active", source: "email" },
+              { alert_id: "alert-telemetry-1", id: "alert-telemetry-1", name: "Telemetry signals missing", service: "astronomy-shop", application: "Telemetry", labels: { project_name: "Telemetry", origin_system: "telemetry", ingestion_channel: "monitoring" }, severity: "warning", status: "active", source: "telemetry" },
+            ] } }
+          : path === "/applications"
+            ? { data: { rows: [
+                { id: "project-kaiops", name: "KaiOps", namespace: "kaiops", status: "dashboard_created", metrics_endpoint: "http://api-gateway:8000/metrics" },
+                { id: "project-telemetry", name: "Telemetry", namespace: "telemetry", status: "dashboard_created", metrics_endpoint: "http://host.docker.internal:19090/metrics" },
+              ] } }
             : { data: [], rows: [], summary: {}, items: [] };
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
   });
@@ -53,21 +59,34 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await page.getByLabel("Password").fill(process.env.KAIOPS_E2E_PASSWORD || "Admin@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
 
+  await expect(page.getByRole("heading", { name: "KaiOps + Telemetry" })).toBeVisible();
+  const telemetryProject = page.getByRole("button", { name: /Telemetry telemetry namespace/ });
+  await expect(telemetryProject).toBeVisible();
+  await expect(page.getByText("Telemetry signals missing", { exact: true })).toHaveCount(0);
+  await telemetryProject.click();
+  await expect(page.getByText("Telemetry signals missing", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Pod crash loop", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: /KaiOps kaiops namespace/ }).click();
+
   const firstAlert = page.locator("table tbody tr").filter({ hasText: "Pod crash loop" }).first();
   await expect(firstAlert).toBeVisible({ timeout: 30_000 });
   await firstAlert.locator("button").first().click();
 
-  const discoveryTab = page.getByRole("button", { name: "Discovery Agent", exact: true });
+  await expect(page.getByRole("heading", { name: "Signal to Recovery", exact: true })).toBeVisible();
+  await expect(page.locator(".unified-incident-timeline")).toBeVisible();
+  await expect(page.getByText("Context retrieved from", { exact: true })).toBeVisible();
+
+  const discoveryTab = page.getByRole("button", { name: "Discovery + Context", exact: true });
   await expect(discoveryTab).toBeVisible();
   await discoveryTab.click();
-  await expect(page.getByRole("heading", { name: "Discovery Agent", exact: true })).toBeVisible();
-  await expect(page.locator(".discovery-workspace")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Discovery + Context Intelligence", exact: true })).toBeVisible();
+  await expect(page.locator(".combined-analysis-page")).toBeVisible();
 
   const desktopOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1);
   expect(desktopOverflow).toBeFalsy();
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(page.locator(".discovery-workspace")).toBeVisible();
+  await expect(page.locator(".combined-analysis-page")).toBeVisible();
   const mobileOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1);
   expect(mobileOverflow).toBeFalsy();
 });

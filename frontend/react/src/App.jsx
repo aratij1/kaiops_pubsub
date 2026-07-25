@@ -32,7 +32,8 @@ const DEFAULT_ALERT = {
 
 const REAL_USE_CASE_SCOPE = "real-usecases";
 const TEST_USE_CASE_SCOPE = "test-usecases";
-const FIXED_MONITOR_SCOPES = [REAL_USE_CASE_SCOPE, TEST_USE_CASE_SCOPE];
+const CORE_MONITOR_PROJECTS = ["KaiOps", "Telemetry"];
+const FIXED_MONITOR_SCOPES = [...CORE_MONITOR_PROJECTS, REAL_USE_CASE_SCOPE, TEST_USE_CASE_SCOPE];
 
 const SERVICE_TOPIC_FLOW = [
   { service: "monitoring-adapter", consumes: "-", publishes: "raw-alerts", agent: "alert" },
@@ -241,6 +242,9 @@ function isKaiopsCoreAlert(row) {
     .trim()
     .toLowerCase();
 
+  if (project.includes("telemetry") || project.includes("astronomy")) {
+    return false;
+  }
   if (KAIOPS_CORE_SERVICE_SET.has(service)) {
     return true;
   }
@@ -319,10 +323,25 @@ function filterAlertsForMonitor(rows, applicationToMonitor) {
     return alertRows.filter((row) => isGeneratedOrTestAlert(row));
   }
   return alertRows.filter((row) => {
+    const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
+    const explicitProject = String(
+      row?.project_name
+      || labels?.project_name
+      || row?.project
+      || labels?.project
+      || row?.application
+      || labels?.application
+      || ""
+    ).trim().toLowerCase();
+    if (target === "telemetry") {
+      return explicitProject === "telemetry" || explicitProject === "astronomy-shop";
+    }
+    if (isKaiopsCoreSelection(target) && (explicitProject === "telemetry" || explicitProject === "astronomy-shop")) {
+      return false;
+    }
     if (isKaiopsCoreSelection(target)) {
       return isKaiopsCoreAlert(row);
     }
-    const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
     const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
     const candidates = [
       row?.application,
@@ -433,6 +452,24 @@ function isEphemeralProjectName(value) {
 function normalizeAlertChannel(row) {
   const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
   const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
+  const explicitOrigin = String(
+    labels?.origin_system
+    || labels?.source_system
+    || metadata?.origin_system
+    || row?.origin_system
+    || ""
+  ).trim().toLowerCase();
+  const explicitChannel = String(
+    labels?.ingestion_channel
+    || labels?.source_channel
+    || metadata?.ingestion_channel
+    || row?.ingestion_channel
+    || ""
+  ).trim().toLowerCase();
+  if (explicitOrigin.includes("telemetry") || explicitOrigin.includes("opentelemetry")) return "telemetry";
+  if (explicitOrigin.includes("email") || explicitChannel.includes("email")) return "email";
+  if (explicitOrigin.includes("jira") || explicitOrigin.includes("ticket") || explicitChannel.includes("ticket")) return "ticket";
+  if (explicitOrigin.includes("log") || explicitOrigin.includes("opensearch") || explicitChannel.includes("log")) return "log";
   const source = [
     row?.source,
     row?.provider,
@@ -455,6 +492,13 @@ function normalizeAlertChannel(row) {
     .filter(Boolean)
     .join(" ");
   if (
+    source.includes("telemetry")
+    || source.includes("opentelemetry")
+    || source.includes("astronomy")
+  ) {
+    return "telemetry";
+  }
+  if (
     source.includes("prometheus")
     || source.includes("alertmanager")
     || source.includes("monitoring-adapter")
@@ -463,6 +507,13 @@ function normalizeAlertChannel(row) {
   }
   if (source.includes("email") || source.includes("smtp") || source.includes("mail") || source.includes("outlook")) {
     return "email";
+  }
+  if (
+    source.includes("opensearch")
+    || source.includes("log-alert")
+    || source.includes("log monitoring")
+  ) {
+    return "log";
   }
   if (
     source.includes("jira")
@@ -489,6 +540,8 @@ function sourceChannelLabel(value) {
   if (key === "prometheus") return "Prometheus";
   if (key === "email") return "Email";
   if (key === "ticket") return "Ticket";
+  if (key === "telemetry") return "Telemetry / Prometheus";
+  if (key === "log") return "Logs / OpenSearch";
   if (key === "other") return "Other";
   return key || "Unknown";
 }
@@ -551,7 +604,11 @@ function alertRowScore(row) {
 }
 
 function dedupeAndConsolidateAlertRows(rows, options = {}) {
-  const allowedChannels = new Set(Array.isArray(options.channels) ? options.channels : ["prometheus", "email", "ticket"]);
+  const allowedChannels = new Set(
+    Array.isArray(options.channels)
+      ? options.channels
+      : ["prometheus", "telemetry", "email", "ticket", "log"]
+  );
   const grouped = new Map();
 
   (Array.isArray(rows) ? rows : []).forEach((row) => {
@@ -691,7 +748,10 @@ function mergeAlertStreamRows(openRows, recentClosedRows) {
   };
   (Array.isArray(openRows) ? openRows : []).forEach(add);
   (Array.isArray(recentClosedRows) ? recentClosedRows : []).map(mapClosedIncidentToAlertStreamRow).forEach(add);
-  return dedupeAndConsolidateAlertRows(merged, { channels: ["prometheus", "email", "ticket"] });
+  return dedupeAndConsolidateAlertRows(
+    merged,
+    { channels: ["prometheus", "telemetry", "email", "ticket", "log"] }
+  );
 }
 
 function onboardingSourceDocCategoryLabel(category) {
@@ -2992,6 +3052,114 @@ function FlowTimelineGraph({ rows }) {
         </div>
       </article>
     </div>
+  );
+}
+
+function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
+  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const lanes = [
+    { id: "detect", label: "Detect", hint: "Alert received and normalized", match: ["landing", "ingest", "alert", "monitor"] },
+    { id: "discover", label: "Discover", hint: "Tickets, logs, traces, and code searched", match: ["discover", "ticket", "log", "trace", "code", "context"] },
+    { id: "diagnose", label: "Diagnose", hint: "RCA and impact grounded in evidence", match: ["resolution", "root cause", "rca", "impact", "model"] },
+    { id: "decide", label: "Decide", hint: "Policy and human decision gate", match: ["approval", "decision", "policy", "risk"] },
+    { id: "act", label: "Act", hint: "Remediation planned or executed", match: ["remedi", "execute", "command", "action"] },
+    { id: "validate", label: "Validate", hint: "Recovery checked and incident closed", match: ["validat", "closure", "closed", "health restored"] },
+  ];
+  const assigned = new Set();
+  const laneRows = lanes.map((lane) => {
+    const matched = safeRows.filter((row, index) => {
+      const text = timelineRowText(row).toLowerCase();
+      const hit = lane.match.some((token) => text.includes(token));
+      if (hit) assigned.add(index);
+      return hit;
+    });
+    return { ...lane, rows: matched };
+  });
+  safeRows.forEach((row, index) => {
+    if (!assigned.has(index)) {
+      const target = laneRows[Math.min(laneRows.length - 1, Math.floor((index / Math.max(1, safeRows.length)) * laneRows.length))];
+      target.rows.push(row);
+    }
+  });
+  const recommendation = safeWorkflow?.recommendation || {};
+  const contextMetadata = recommendation?.metadata || safeWorkflow?.context?.metadata || {};
+  const retrievedSources = Array.from(new Set([
+    ...(Array.isArray(contextMetadata?.sources) ? contextMetadata.sources : []),
+    ...(Array.isArray(documents) ? documents.map((doc) => doc?.source || doc?.kind || doc?.path) : []),
+    ...safeRows.flatMap((row) => {
+      const text = timelineRowText(row).toLowerCase();
+      return [
+        text.includes("ticket") || text.includes("jira") ? "Jira / tickets" : "",
+        text.includes("log") || text.includes("opensearch") ? "Logs" : "",
+        text.includes("trace") || text.includes("jaeger") ? "Traces" : "",
+        text.includes("code") || text.includes("repository") ? "Source code" : "",
+        text.includes("prometheus") || text.includes("metric") ? "Metrics" : "",
+      ].filter(Boolean);
+    }),
+  ].map((value) => String(value || "").trim()).filter(Boolean)));
+
+  return (
+    <section className="unified-incident-timeline" aria-label="Unified incident timeline">
+      <header className="unified-timeline-header">
+        <div>
+          <span className="discovery-eyebrow">Live incident journey</span>
+          <h3>Signal to Recovery</h3>
+          <p>One ordered view joining ingestion, discovery, context retrieval, reasoning, approval, remediation, and validation.</p>
+        </div>
+        <div className="unified-timeline-stats">
+          <span><strong>{safeRows.length}</strong> events</span>
+          <span><strong>{retrievedSources.length}</strong> sources</span>
+          <span><strong>{laneRows.filter((lane) => lane.rows.length).length}</strong>/6 phases observed</span>
+        </div>
+      </header>
+      <div className="unified-source-strip">
+        <strong>Context retrieved from</strong>
+        {retrievedSources.length
+          ? retrievedSources.map((source) => <span key={source}>{compactText(source, 42)}</span>)
+          : <span>No source evidence returned yet</span>}
+      </div>
+      <div className="unified-timeline-lanes">
+        {laneRows.map((lane, laneIndex) => {
+          const failed = lane.rows.some((row) => timelineRowHasError(row));
+          const fallback = lane.rows.some((row) => timelineRowStatus(row) === "fallback");
+          const status = failed ? "failed" : fallback ? "fallback" : lane.rows.length ? "complete" : "waiting";
+          return (
+            <article className={`unified-timeline-lane is-${status}`} key={lane.id}>
+              <div className="unified-lane-rail">
+                <span>{laneIndex + 1}</span>
+                {laneIndex < laneRows.length - 1 ? <i /> : null}
+              </div>
+              <div className="unified-lane-body">
+                <div className="unified-lane-title">
+                  <div><h4>{lane.label}</h4><p>{lane.hint}</p></div>
+                  <b>{status}</b>
+                </div>
+                {lane.rows.length ? (
+                  <div className="unified-lane-events">
+                    {lane.rows.slice(0, 6).map((row, rowIndex) => (
+                      <details key={`${lane.id}-${rowIndex}`} open={rowIndex === 0}>
+                        <summary>
+                          <span>{row.stage || row.agent || row.service || `Event ${rowIndex + 1}`}</span>
+                          <small>{row.status || timelineRowStatus(row)}</small>
+                        </summary>
+                        <p>{row.detail || row.outputValueText || row.inputValueText || "Stage completed without a detailed payload."}</p>
+                        <div className="unified-event-meta">
+                          <span>agent: {row.agent || row.service || "-"}</span>
+                          <span>time: {formatIstTimestamp(row.timestamp || row.created_at)}</span>
+                          <span>duration: {row.executionTimeMs || row.execution_time_ms || "-"} ms</span>
+                        </div>
+                      </details>
+                    ))}
+                    {lane.rows.length > 6 ? <small>+ {lane.rows.length - 6} additional events</small> : null}
+                  </div>
+                ) : <p className="unified-lane-empty">Waiting for this phase to emit an event.</p>}
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -5557,7 +5725,7 @@ function buildWorkflowFlowStages(workflow, timelineRows = []) {
 
 export default function App() {
   const defaultMonitorApplications = FIXED_MONITOR_SCOPES;
-  const [applicationToMonitor, setApplicationToMonitor] = useState(REAL_USE_CASE_SCOPE);
+  const [applicationToMonitor, setApplicationToMonitor] = useState("KaiOps");
   const [monitorApplications, setMonitorApplications] = useState(defaultMonitorApplications);
   const [activeTab, setActiveTab] = useState("home");
   const [uiDensity, setUiDensity] = useState("comfortable");
@@ -5609,7 +5777,7 @@ export default function App() {
     error: "",
     incidentId: "",
   });
-  const [homeDetailTab, setHomeDetailTab] = useState("overview");
+  const [homeDetailTab, setHomeDetailTab] = useState("timeline");
   const [diagnosticsDetailTab, setDiagnosticsDetailTab] = useState("pipeline");
   const [approvalForm, setApprovalForm] = useState({
     action: "approve",
@@ -6176,7 +6344,7 @@ export default function App() {
     }
     setSelectedAlertId(String(alertId));
     setActiveTab("home");
-    setHomeDetailTab("overview");
+    setHomeDetailTab("timeline");
     loadAlertDetails(alertId);
     loadSelectedAlertDocumentLinks(alertId);
   }
@@ -6427,8 +6595,33 @@ export default function App() {
   }
 
   async function loadMonitorApplications() {
-    setMonitorApplications(defaultMonitorApplications);
-    setApplicationToMonitor((current) => (defaultMonitorApplications.includes(current) ? current : REAL_USE_CASE_SCOPE));
+    try {
+      const payload = await fetchJson("/api-gateway/applications", authenticatedOptions());
+      const data = unwrap(payload);
+      const applicationRows = Array.isArray(data?.rows) ? data.rows : [];
+      setMonitoringApps({ loading: false, rows: applicationRows, error: "" });
+      const registered = applicationRows
+        .map((row) => String(row?.name || "").trim())
+        .filter(Boolean);
+      const ordered = Array.from(new Set([
+        ...CORE_MONITOR_PROJECTS.filter((name) => registered.some((item) => item.toLowerCase() === name.toLowerCase())),
+        ...registered,
+        REAL_USE_CASE_SCOPE,
+        TEST_USE_CASE_SCOPE,
+      ]));
+      const options = ordered.length ? ordered : defaultMonitorApplications;
+      setMonitorApplications(options);
+      setApplicationToMonitor((current) => (
+        options.some((item) => item.toLowerCase() === String(current || "").toLowerCase())
+          ? current
+          : options[0] || "KaiOps"
+      ));
+    } catch (_error) {
+      setMonitorApplications(defaultMonitorApplications);
+      setApplicationToMonitor((current) => (
+        defaultMonitorApplications.includes(current) ? current : "KaiOps"
+      ));
+    }
   }
 
   async function searchGuidanceDocs() {
@@ -9106,7 +9299,7 @@ export default function App() {
   );
 
   const visibleAlertSourceSummary = useMemo(() => {
-    const summary = { prometheus: 0, email: 0, ticket: 0 };
+    const summary = { prometheus: 0, telemetry: 0, email: 0, ticket: 0, log: 0 };
     visibleAlerts.forEach((row) => {
       const channels = Array.isArray(row?.source_channels) && row.source_channels.length
         ? row.source_channels
@@ -10652,7 +10845,7 @@ export default function App() {
   }, [selectedApprovalIncidentId, selectedApprovalRecommendationId]);
 
   useEffect(() => {
-    if (activeTab === "home" && homeDetailTab === "approval" && selectedIncidentId) {
+    if (activeTab === "home" && homeDetailTab === "actions" && selectedIncidentId) {
       return;
     }
     if (!filteredPendingApprovals.length) {
@@ -10676,7 +10869,7 @@ export default function App() {
   }, [selectedApprovalIncidentId]);
 
   useEffect(() => {
-    if (activeTab !== "home" || homeDetailTab !== "approval" || !selectedIncidentId) {
+    if (activeTab !== "home" || homeDetailTab !== "actions" || !selectedIncidentId) {
       return;
     }
     setSelectedApprovalIncidentId((current) => current === selectedIncidentId ? current : selectedIncidentId);
@@ -10867,7 +11060,7 @@ export default function App() {
   }
 
   const approvalReady = useMemo(() => {
-    const cockpitIncidentId = activeTab === "home" && homeDetailTab === "approval" ? selectedIncidentId : "";
+    const cockpitIncidentId = activeTab === "home" && homeDetailTab === "actions" ? selectedIncidentId : "";
     const hasBase = String(cockpitIncidentId || approvalForm.incident_id || selectedApprovalIncidentId || "").trim() && String(approvalForm.approver || "").trim();
     if (!hasBase) {
       return false;
@@ -11108,7 +11301,7 @@ export default function App() {
     event.preventDefault();
     setApprovalState({ loading: true, result: null, error: "" });
     try {
-      const cockpitIncidentId = activeTab === "home" && homeDetailTab === "approval" ? selectedIncidentId : "";
+      const cockpitIncidentId = activeTab === "home" && homeDetailTab === "actions" ? selectedIncidentId : "";
       const incidentId = String(cockpitIncidentId || approvalForm.incident_id || selectedApprovalIncidentId || "").trim();
       const approver = String(approvalForm.approver || adminSession?.user?.username || "admin").trim();
       if (!looksLikeUuid(incidentId)) {
@@ -12494,6 +12687,42 @@ export default function App() {
 
           {activeTab === "home" ? (
             <section className="grid single-col">
+              <article className="panel monitoring-projects-panel">
+                <div className="panel-head">
+                  <div>
+                    <span className="discovery-eyebrow">Monitoring projects</span>
+                    <h2>KaiOps + Telemetry</h2>
+                    <p>Select a project to scope alerts, incidents, discovery evidence, and timeline events.</p>
+                  </div>
+                  <button type="button" className="button-secondary" onClick={loadMonitorApplications}>Refresh Projects</button>
+                </div>
+                <div className="monitoring-project-grid">
+                  {CORE_MONITOR_PROJECTS.map((projectName) => {
+                    const project = (monitoringApps.rows || []).find(
+                      (row) => String(row?.name || "").trim().toLowerCase() === projectName.toLowerCase()
+                    );
+                    const selected = String(applicationToMonitor || "").toLowerCase() === projectName.toLowerCase();
+                    return (
+                      <button
+                        type="button"
+                        className={`monitoring-project-card ${selected ? "is-selected" : ""}`}
+                        key={projectName}
+                        onClick={() => setApplicationToMonitor(projectName)}
+                      >
+                        <span className="monitoring-project-icon">{projectName === "Telemetry" ? "OT" : "KO"}</span>
+                        <span className="monitoring-project-copy">
+                          <strong>{projectName}</strong>
+                          <small>{project?.namespace || (projectName === "Telemetry" ? "telemetry" : "kaiops")} namespace</small>
+                          <code>{project?.metrics_endpoint || (projectName === "Telemetry" ? "Prometheus :19090" : "API Gateway metrics")}</code>
+                        </span>
+                        <span className={`pill ${String(project?.status || "").includes("failed") ? "status-failed" : "status-closed"}`}>
+                          {project?.status || "registered"}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </article>
               <article className="panel workflow-guide-panel">
                 <div className="panel-head">
                   <h2>Workflow Health & Next Action</h2>
@@ -12564,8 +12793,10 @@ export default function App() {
                 </p>
                 <div className="alert-source-breakdown" aria-label="Alert source visibility">
                   <span className="source-badge source-prometheus">Prometheus {visibleAlertSourceSummary.prometheus}</span>
+                  <span className="source-badge source-telemetry">Telemetry {visibleAlertSourceSummary.telemetry}</span>
                   <span className="source-badge source-email">Email {visibleAlertSourceSummary.email}</span>
                   <span className="source-badge source-ticket">Ticket {visibleAlertSourceSummary.ticket}</span>
+                  <span className="source-badge source-log">Logs {visibleAlertSourceSummary.log}</span>
                 </div>
                 {canManageSeverityOverride ? (
                   <p className="subtitle">L2/L3/Admin can set future severity overrides by alert name + service + environment.</p>
@@ -12999,7 +13230,7 @@ export default function App() {
                             onClick={() => {
                               const matched = selectApprovalFromAlertRow(selectedAlertRow);
                               if (matched) {
-                                setActiveTab("approval");
+                              setActiveTab("approval");
                               }
                             }}
                           >
@@ -13008,7 +13239,7 @@ export default function App() {
                           <button
                             type="button"
                             className="button-primary"
-                            onClick={() => setHomeDetailTab("approval")}
+                            onClick={() => setHomeDetailTab("actions")}
                           >
                             Review Decision
                           </button>
@@ -13029,19 +13260,19 @@ export default function App() {
                   })()}
 
                   <div className="detail-tabs">
-                    {["overview", "discovery", "evidence", "documents", "approval", "remediation", "diagnostics"].map((tab) => (
+                    {["timeline", "discovery", "evidence", "actions", "raw"].map((tab) => (
                       <button
                         key={`detail-${tab}`}
                         type="button"
                         className={`detail-tab ${homeDetailTab === tab ? "active" : ""}`}
                         onClick={() => setHomeDetailTab(tab)}
                       >
-                        {tab === "overview" ? "Overview" : tab === "discovery" ? "Discovery Agent" : tab === "evidence" ? "Evidence" : tab === "documents" ? "Documents" : tab === "approval" ? "Approval" : tab === "remediation" ? "Remediation" : "Timeline"}
+                        {tab === "timeline" ? "Incident Timeline" : tab === "discovery" ? "Discovery + Context" : tab === "evidence" ? "Evidence" : tab === "actions" ? "Actions" : "Raw Data"}
                       </button>
                     ))}
                   </div>
 
-                  {homeDetailTab === "diagnostics" ? (
+                  {false && homeDetailTab === "diagnostics" ? (
                     <div className="detail-tabs" style={{ marginTop: 8 }}>
                       {["processing", "timeline", "context", "events", "finops", "api", "raw", "pipeline"].map((tab) => (
                         <button
@@ -13123,8 +13354,13 @@ export default function App() {
                     </section>
                   ) : null}
 
-                  {homeDetailTab === "overview" ? (
+                  {homeDetailTab === "timeline" ? (
                     <>
+                      <UnifiedIncidentTimeline
+                        workflow={selectedAlertWorkflow}
+                        rows={selectedAlertTimelineRows}
+                        documents={selectedAlertRagDocuments}
+                      />
                       <div className="table-wrap table-wrap-scroll-x">
                         <table>
                           <tbody>
@@ -13292,7 +13528,7 @@ export default function App() {
                     </article>
                   ) : null}
 
-                  {homeDetailTab === "approval" ? (
+                  {homeDetailTab === "actions" ? (
                     <article className="panel">
                       <div className="panel-head">
                         <h3>Approval Workspace</h3>
@@ -13344,7 +13580,7 @@ export default function App() {
                     </article>
                   ) : null}
 
-                  {homeDetailTab === "documents" ? (
+                  {homeDetailTab === "actions" ? (
                     <article className="panel alert-documents-panel">
                       <div className="panel-head">
                         <h3>Alert Documents</h3>
@@ -13431,7 +13667,7 @@ export default function App() {
                                 Provide Documents
                               </button>
                             ) : (
-                              <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("approval")}>
+                              <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("actions")}>
                                 Escalate To L2/L3
                               </button>
                             )}
@@ -13612,7 +13848,7 @@ export default function App() {
                     </div>
                   ) : null}
 
-                  {homeDetailTab === "remediation" ? (
+                  {homeDetailTab === "actions" ? (
                     <>
                       <article className="panel remediation-workspace">
                         <div className="panel-head">
@@ -13802,7 +14038,7 @@ export default function App() {
                     </>
                   ) : null}
 
-                  {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "raw" ? (
+                  {homeDetailTab === "raw" ? (
                     <pre className="result">{JSON.stringify(selectedAlertData.payload || {}, null, 2)}</pre>
                   ) : null}
                 </article>

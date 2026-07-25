@@ -121,6 +121,7 @@ def email_to_alert(
     )
     status = _text(structured.get("status") or header_values.get("x-kaiops-alert-status"), "firing").lower()
     alert_name = _text(structured.get("alert_name"))
+    application_id = _text(structured.get("application_id") or header_values.get("x-kaiops-application-id"))
     if not alert_name:
         match = re.search(r"(?:^|\n)Alert\s*:\s*([^\r\n]+)", body, re.IGNORECASE)
         alert_name = _text(match.group(1) if match else subject, "Email incident")
@@ -141,7 +142,10 @@ def email_to_alert(
                 "in_reply_to": header_values.get("in-reply-to"),
                 "incident_correlation_id": correlation_id,
                 "scenario_id": structured.get("scenario_id") or header_values.get("x-kaiops-scenario-id"),
-                "application_id": structured.get("application_id") or header_values.get("x-kaiops-application-id"),
+                "application_id": application_id,
+                "project_name": structured.get("project_name") or header_values.get("x-kaiops-project") or application_id,
+                "origin_system": "email",
+                "ingestion_channel": "email",
                 "component": structured.get("component"),
                 "ticket_id": structured.get("ticket_example"),
                 "runbook_id": structured.get("runbook_id"),

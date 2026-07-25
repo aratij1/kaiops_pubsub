@@ -34,8 +34,17 @@ services:
         - "/nodejs/bin/node"
         - "-e"
         - "const net=require('net');const c=new net.Socket();c.setTimeout(2000);c.connect(50051,'127.0.0.1',()=>{c.destroy();process.exit(0)});c.on('error',()=>process.exit(1));c.on('timeout',()=>process.exit(1));"
+      start_period: 30s
+      interval: 15s
+      timeout: 60s
+      retries: 10
   product-catalog:
     container_name: telemetry-product-catalog
+    healthcheck:
+      start_period: 30s
+      interval: 15s
+      timeout: 60s
+      retries: 10
   quote:
     container_name: telemetry-quote
   recommendation:
@@ -56,6 +65,9 @@ services:
     container_name: telemetry-prometheus
     ports: !override
       - "19090:9090"
+    volumes: !override
+      - ../../../deploy/telemetry/prometheus-kaiops.yaml:/etc/prometheus/prometheus-config.yaml:ro
+      - ../../../deploy/telemetry/telemetry-alerts.yml:/etc/prometheus/telemetry-alerts.yml:ro
   jaeger:
     container_name: telemetry-jaeger
     ports: !override
