@@ -6136,3 +6136,210 @@ th {
     max-height: 70vh;
   }
 }
+
+/* Timeline interaction fix: one controlled event panel, never overlapping content */
+.unified-incident-timeline {
+  overflow: hidden;
+}
+
+.timeline-phase-map::before {
+  display: none;
+}
+
+.timeline-phase-card {
+  overflow: hidden;
+}
+
+.timeline-phase-card:hover {
+  z-index: 1;
+}
+
+.timeline-phase-top {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  grid-template-areas:
+    "icon number"
+    "icon status";
+  column-gap: 9px;
+  row-gap: 1px;
+}
+
+.timeline-phase-icon {
+  grid-area: icon;
+}
+
+.timeline-phase-number {
+  grid-area: number;
+  font-size: .62rem;
+  letter-spacing: .08em;
+}
+
+.timeline-phase-status {
+  grid-area: status;
+  margin: 0;
+  font-size: .58rem;
+}
+
+.timeline-phase-toggle {
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  font-size: .7rem;
+  font-weight: 800;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.timeline-phase-toggle::after {
+  margin-left: 5px;
+  content: "→";
+}
+
+.timeline-phase-toggle.is-active::after {
+  content: "↑";
+}
+
+.timeline-event-panel {
+  margin: 0 26px 26px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--panel) 96%, var(--accent) 4%);
+  border: 1px solid color-mix(in srgb, var(--line) 66%, var(--accent) 34%);
+  border-radius: 16px;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 65%, transparent);
+}
+
+.timeline-event-panel > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--panel) 86%, var(--accent) 14%);
+  border-bottom: 1px solid var(--line);
+}
+
+.timeline-event-panel > header > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.timeline-event-panel > header .timeline-phase-icon {
+  width: 32px;
+  height: 32px;
+}
+
+.timeline-event-panel > header > div > div {
+  display: grid;
+  gap: 2px;
+}
+
+.timeline-event-panel > header small {
+  color: var(--muted);
+}
+
+.timeline-event-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  max-height: 430px;
+  overflow: auto;
+  background: var(--line);
+}
+
+.timeline-event-list > article {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+  padding: 13px;
+  background: var(--panel);
+}
+
+.timeline-event-index {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  color: var(--accent);
+  font-size: .64rem;
+  font-weight: 900;
+  background: color-mix(in srgb, var(--panel) 72%, var(--accent) 28%);
+  border-radius: 9px;
+}
+
+.timeline-event-list article > div {
+  min-width: 0;
+}
+
+.timeline-event-list article header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.timeline-event-list article header strong {
+  font-size: .75rem;
+}
+
+.timeline-event-list article header span {
+  color: var(--muted);
+  font-size: .62rem;
+  text-transform: uppercase;
+}
+
+.timeline-event-list article p {
+  margin: 5px 0;
+  color: var(--muted);
+  font-size: .7rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.timeline-event-list article small {
+  color: var(--muted);
+  font-size: .62rem;
+}
+
+.alert-details-cockpit {
+  overflow: clip;
+}
+
+.incident-overview-table {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+.incident-overview-table table {
+  table-layout: fixed;
+}
+
+.incident-overview-table th {
+  width: 190px;
+  color: var(--muted);
+  font-size: .68rem;
+  letter-spacing: .025em;
+  text-transform: uppercase;
+  background: color-mix(in srgb, var(--panel) 88%, var(--accent) 12%);
+}
+
+.incident-overview-table td {
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 850px) {
+  .timeline-event-panel {
+    margin: 0 18px 18px;
+  }
+
+  .timeline-event-list {
+    grid-template-columns: 1fr;
+  }
+
+  .incident-overview-table th {
+    width: 125px;
+  }
+}

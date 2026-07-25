@@ -117,6 +117,16 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await expect(page.locator(".unified-incident-timeline")).toBeVisible();
   await expect(page.locator(".timeline-phase-card")).toHaveCount(6);
   await expect(page.getByText("Evidence", { exact: true }).first()).toBeVisible();
+  const detectPhase = page.locator(".timeline-phase-card").filter({ hasText: "Detect" });
+  const discoverPhase = page.locator(".timeline-phase-card").filter({ hasText: "Discover" });
+  await detectPhase.getByRole("button", { name: "View events" }).click();
+  await expect(page.locator(".timeline-event-panel")).toHaveCount(1);
+  await expect(page.getByText("Detect events", { exact: true })).toBeVisible();
+  await discoverPhase.getByRole("button", { name: "View events" }).click();
+  await expect(page.locator(".timeline-event-panel")).toHaveCount(1);
+  await expect(page.getByText("Discover events", { exact: true })).toBeVisible();
+  await page.locator(".timeline-event-panel").getByRole("button", { name: "Close" }).click();
+  await expect(page.locator(".timeline-event-panel")).toHaveCount(0);
 
   const discoveryTab = page.getByRole("button", { name: "Discovery + Context", exact: true });
   await expect(discoveryTab).toBeVisible();

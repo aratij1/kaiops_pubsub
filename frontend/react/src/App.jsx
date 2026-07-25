@@ -3061,6 +3061,7 @@ function FlowTimelineGraph({ rows }) {
 }
 
 function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
+  const [expandedPhaseId, setExpandedPhaseId] = useState("");
   const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
   const safeRows = Array.isArray(rows) ? rows : [];
   const lanes = [
@@ -3103,6 +3104,7 @@ function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
       ].filter(Boolean);
     }),
   ].map((value) => String(value || "").trim()).filter(Boolean)));
+  const expandedLane = laneRows.find((lane) => lane.id === expandedPhaseId && lane.rows.length) || null;
 
   return (
     <section className="unified-incident-timeline" aria-label="Unified incident timeline">
@@ -3149,25 +3151,52 @@ function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
                   : "Not reached yet"}
               </small>
               {lane.rows.length ? (
-                <details className="timeline-phase-details">
-                  <summary>View events</summary>
-                  <div className="timeline-phase-event-list">
-                    {lane.rows.slice(0, 8).map((row, rowIndex) => (
-                      <article key={`${lane.id}-${rowIndex}`}>
-                        <div>
-                          <strong>{row.stage || row.agent || row.service || `Event ${rowIndex + 1}`}</strong>
-                          <span>{formatIstTimestamp(row.timestamp || row.created_at)}</span>
-                        </div>
-                        <p>{compactText(row.detail || row.outputValueText || row.inputValueText, 240) || "Stage completed."}</p>
-                      </article>
-                    ))}
-                  </div>
-                </details>
+                <button
+                  type="button"
+                  className={`timeline-phase-toggle ${expandedPhaseId === lane.id ? "is-active" : ""}`}
+                  aria-expanded={expandedPhaseId === lane.id}
+                  aria-controls="timeline-event-panel"
+                  onClick={() => setExpandedPhaseId((current) => current === lane.id ? "" : lane.id)}
+                >
+                  {expandedPhaseId === lane.id ? "Hide events" : "View events"}
+                </button>
               ) : null}
             </article>
           );
         })}
       </div>
+      {expandedLane ? (
+        <section className="timeline-event-panel" id="timeline-event-panel" aria-live="polite">
+          <header>
+            <div>
+              <span className="timeline-phase-icon" aria-hidden="true">{expandedLane.icon}</span>
+              <div>
+                <strong>{expandedLane.label} events</strong>
+                <small>{expandedLane.rows.length} recorded workflow event(s)</small>
+              </div>
+            </div>
+            <button type="button" className="button-secondary" onClick={() => setExpandedPhaseId("")}>Close</button>
+          </header>
+          <div className="timeline-event-list">
+            {expandedLane.rows.slice(0, 20).map((row, rowIndex) => (
+              <article key={`${expandedLane.id}-expanded-${rowIndex}`}>
+                <span className="timeline-event-index">{String(rowIndex + 1).padStart(2, "0")}</span>
+                <div>
+                  <header>
+                    <strong>{row.stage || row.agent || row.service || `Event ${rowIndex + 1}`}</strong>
+                    <span>{row.status || timelineRowStatus(row)}</span>
+                  </header>
+                  <p>{compactText(row.detail || row.outputValueText || row.inputValueText, 360) || "Stage completed."}</p>
+                  <small>
+                    {row.agent || row.service || "KaiOps"} · {formatIstTimestamp(row.timestamp || row.created_at)}
+                    {row.executionTimeMs || row.execution_time_ms ? ` · ${row.executionTimeMs || row.execution_time_ms} ms` : ""}
+                  </small>
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
     </section>
   );
 }
@@ -13479,7 +13508,7 @@ export default function App() {
               ) : null}
 
               {selectedAlertRow ? (
-                <article className="panel" ref={alertDetailsRef}>
+                <article className="panel alert-details-cockpit" ref={alertDetailsRef}>
                   <div className="panel-head">
                     <div>
                       <h2>Alert Details Cockpit</h2>
@@ -13698,7 +13727,7 @@ export default function App() {
                         rows={selectedAlertTimelineRows}
                         documents={selectedAlertRagDocuments}
                       />
-                      <div className="table-wrap table-wrap-scroll-x">
+                      <div className="table-wrap table-wrap-scroll-x incident-overview-table">
                         <table>
                           <tbody>
                             <tr><th>Alert</th><td>{selectedAlertRow?.name || selectedAlertWorkflow?.alert?.name || "-"}</td></tr>
