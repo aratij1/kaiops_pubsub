@@ -4841,14 +4841,17 @@ function ProcessingFlowMap({ workflow, timelineRows, routing, selectedAlert, sel
   const failedCount = safeRows.filter(rowHasFailure).length;
 
   const nodeStatus = (row, order, fallbackHint = "") => {
-    const statusText = [
-      row?.status,
-      row?.detail,
-      row?.errorValueText,
-      row?.inputValueText,
-      row?.outputValueText,
-      fallbackHint,
-    ].map((item) => String(item || "").toLowerCase()).join(" ");
+    // Only trust the dedicated error/fallback signal for this stage, not the
+    // stringified input/output JSON blobs — those often contain unrelated
+    // fields (e.g. the incident's overall lifecycle status) whose text can
+    // coincidentally include words like "failed", which previously caused
+    // unrelated stages to be mislabeled as failed.
+    const errorText = String(row?.errorValueText || "").toLowerCase();
+    const hintText = String(fallbackHint || "").toLowerCase();
+    const statusText = `${errorText} ${hintText}`;
+    if (statusText.includes("error") || statusText.includes("failed") || statusText.includes("exception")) {
+      return "failed";
+    }
     if (
       statusText.includes("fallback")
       || statusText.includes("skipped")
@@ -5901,6 +5904,10 @@ export default function App() {
     approved: false,
   });
   const [knowledgePackCorrections, setKnowledgePackCorrections] = useState({});
+  // Backend re-validation results for manually corrected fields, keyed by fact key.
+  // Populated by revalidateKnowledgeCorrections(); until a field has been re-validated
+  // here, its correction is treated as unverified rather than auto-"accepted".
+  const [knowledgePackRevalidation, setKnowledgePackRevalidation] = useState({ loading: false, error: "", facts: {}, validatedCorrections: {} });
   const [onboardingReviewAck, setOnboardingReviewAck] = useState({ rules: false, docs: false, metadata: false });
   const [onboardingDocApprovalState, setOnboardingDocApprovalState] = useState({
     loading: false,
@@ -7153,18 +7160,45 @@ export default function App() {
       const correctionEmpty = Array.isArray(normalizedCorrection)
         ? normalizedCorrection.length === 0
         : !String(normalizedCorrection || "").trim();
-      next[key] = hasCorrection
-        ? {
+      if (!hasCorrection) {
+        next[key] = fact;
+        return;
+      }
+      if (correctionEmpty) {
+        next[key] = {
           ...(fact || {}),
           value: normalizedCorrection,
-          confidence: correctionEmpty ? 0 : 0.95,
-          status: correctionEmpty ? "needs_review" : "accepted",
-          sources: [...(Array.isArray(fact?.sources) ? fact.sources : []), "user-confirmed"],
+          confidence: 0,
+          status: "needs_review",
+          sources: Array.isArray(fact?.sources) ? fact.sources : [],
+        };
+        return;
+      }
+      // Only trust a backend-verified confidence/status if it was computed from
+      // the exact text currently in the box. If the user has typed something
+      // new since the last revalidation call, treat it as unverified again
+      // rather than keep showing a stale "accepted" badge.
+      const validatedSnapshot = knowledgePackRevalidation.validatedCorrections?.[key];
+      const backendFact = validatedSnapshot === correction ? knowledgePackRevalidation.facts?.[key] : null;
+      next[key] = backendFact
+        ? {
+          // Keep backendFact.value as-is (what the backend actually detected —
+          // may legitimately be empty if the correction didn't match anything).
+          // The edit textarea itself reads straight from knowledgePackCorrections,
+          // so it still shows exactly what the user typed regardless of this.
+          ...backendFact,
+          sources: [...(Array.isArray(backendFact.sources) ? backendFact.sources : []), "user-confirmed"],
         }
-        : fact;
+        : {
+          ...(fact || {}),
+          value: normalizedCorrection,
+          confidence: 0,
+          status: "pending_validation",
+          sources: [...(Array.isArray(fact?.sources) ? fact.sources : []), "user-confirmed"],
+        };
     });
     return next;
-  }, [knowledgePackCorrections, onboardingKnowledgeFacts]);
+  }, [knowledgePackCorrections, onboardingKnowledgeFacts, knowledgePackRevalidation]);
   const knowledgeReviewFields = useMemo(
     () => Object.entries(correctedKnowledgeFacts).filter(([, fact]) => {
       const value = fact?.value;
@@ -7271,14 +7305,18 @@ export default function App() {
     setOnboardingSourceDocs({ loading: false, rows: nextRows, error: "" });
     await draftKnowledgePack(nextRows);
     if (promptRow.derived_requirements.length) {
-      const manual = String(onboardingForm.rule_onboarding_plain_language || "")
-        .split(/\r?\n/)
+      // Replace (not merge) with the current prompt's derived requirements.
+      // The previous version folded in whatever was already sitting in
+      // rule_onboarding_plain_language — which, after a prior Auto-Complete
+      // run, was itself already the merged result of an even earlier run.
+      // That let stale requirement lines from long-past prompts accumulate
+      // indefinitely across re-runs in the same session, silently bleeding
+      // into unrelated projects' generated rule summaries.
+      const nextText = promptRow.derived_requirements
         .map(cleanRuleIntentLine)
-        .filter(Boolean);
-      const combined = [...manual, ...promptRow.derived_requirements].map(cleanRuleIntentLine).filter(Boolean).filter(
-        (line, index, array) => array.findIndex((item) => item.toLowerCase() === line.toLowerCase()) === index,
-      );
-      const nextText = combined.join("\n");
+        .filter(Boolean)
+        .filter((line, index, array) => array.findIndex((item) => item.toLowerCase() === line.toLowerCase()) === index)
+        .join("\n");
       setOnboardingForm((curr) => ({ ...curr, rule_onboarding_plain_language: nextText }));
       setNewRulePipelineForm((curr) => ({ ...curr, requirements_text: nextText }));
     }
@@ -7298,10 +7336,90 @@ export default function App() {
         body: JSON.stringify(payload),
       })));
       setKnowledgePackCorrections({});
+      setKnowledgePackRevalidation({ loading: false, error: "", facts: {}, validatedCorrections: {} });
       setKnowledgePackState({ loading: false, draft: response?.knowledge_pack ? response : { knowledge_pack: response }, error: "", success: "", approved: false });
       return response;
     } catch (error) {
       setKnowledgePackState((current) => ({ ...current, loading: false, error: error.message, success: "", approved: false }));
+      return null;
+    }
+  }
+
+  // Formats manual corrections into a synthetic document using the same
+  // keyword vocabulary the backend's extractor looks for (service:, owner:,
+  // dependency:, alert:, rollback:, validate:), so re-running extraction with
+  // this text folded in can actually detect the corrected values.
+  function knowledgePackCorrectionDocumentText() {
+    const lines = [];
+    const prefixByKey = {
+      service: "service",
+      environment: "environment",
+      owner_team: "owner",
+      dependencies: "dependency",
+      alert_patterns: "alert",
+      rollback_plan: "rollback",
+      validation_checks: "validate",
+    };
+    Object.entries(knowledgePackCorrections).forEach(([key, rawValue]) => {
+      const normalized = normalizeKnowledgeCorrectionValue(key, rawValue);
+      const items = (Array.isArray(normalized) ? normalized : [normalized]).filter((item) => String(item || "").trim());
+      items.forEach((item) => {
+        // "commands" must be left as-is: the backend only recognizes lines that
+        // already start with a real tool name (kubectl, helm, mysql, etc.).
+        lines.push(key === "commands" ? item : `${prefixByKey[key] || key}: ${item}`);
+      });
+    });
+    return lines.join("\n");
+  }
+
+  async function revalidateKnowledgeCorrections() {
+    const correctionText = knowledgePackCorrectionDocumentText();
+    if (!correctionText.trim()) {
+      setKnowledgePackRevalidation((current) => ({ ...current, loading: false, error: "No manual edits to validate yet." }));
+      return null;
+    }
+    const basePayload = buildKnowledgePackPayload(onboardingSourceDocs.rows);
+    // service/environment/owner_team are matched by the backend from these
+    // top-level request fields FIRST, before it ever looks at document text —
+    // so a correction to one of these three has to override the field here,
+    // not just get folded into the corrections document (which would be
+    // silently ignored otherwise).
+    const topLevelOverrides = {};
+    ["service", "environment", "owner_team"].forEach((key) => {
+      if (!Object.prototype.hasOwnProperty.call(knowledgePackCorrections, key)) {
+        return;
+      }
+      const normalized = normalizeKnowledgeCorrectionValue(key, knowledgePackCorrections[key]);
+      const text = String(normalized || "").trim();
+      if (text) {
+        topLevelOverrides[key] = text;
+      }
+    });
+    const payload = {
+      ...basePayload,
+      ...topLevelOverrides,
+      documents: [
+        ...basePayload.documents,
+        {
+          name: "user-corrections.md",
+          category: "knowledge_pack",
+          text: correctionText,
+          excerpt: correctionText.slice(0, 220),
+        },
+      ],
+    };
+    const validatedSnapshot = { ...knowledgePackCorrections };
+    setKnowledgePackRevalidation((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const response = unwrap(await fetchJson("/api-gateway/knowledge-pack/validate", authenticatedOptions({
+        method: "POST",
+        body: JSON.stringify(payload),
+      })));
+      const facts = response?.knowledge_pack?.facts || response?.facts || {};
+      setKnowledgePackRevalidation({ loading: false, error: "", facts, validatedCorrections: validatedSnapshot });
+      return facts;
+    } catch (error) {
+      setKnowledgePackRevalidation((current) => ({ ...current, loading: false, error: error.message }));
       return null;
     }
   }
@@ -14552,7 +14670,7 @@ export default function App() {
                         </div>
                         <div>
                           <span>Service Knowledge</span>
-                          <strong>{onboardingSourceDocCount > 0 ? "added" : "missing"}</strong>
+                          <strong>{knowledgePackState.approved ? "approved" : onboardingKnowledgePack?.status || (onboardingSourceDocCount > 0 ? "added" : "missing")}</strong>
                         </div>
                         <div>
                           <span>Generated Rules</span>
@@ -15195,14 +15313,26 @@ export default function App() {
                                 </div>
                                 <button
                                   type="button"
+                                  className="button-secondary"
+                                  onClick={revalidateKnowledgeCorrections}
+                                  disabled={knowledgePackRevalidation.loading || !Object.keys(knowledgePackCorrections).length}
+                                  title="Re-check your manual edits against the uploaded documents before approving."
+                                >
+                                  {knowledgePackRevalidation.loading ? "Checking against document..." : "Check Edits Against Document"}
+                                </button>
+                                <button
+                                  type="button"
                                   className="button-primary"
                                   onClick={approveKnowledgePack}
                                   disabled={knowledgePackState.loading || !onboardingSourceDocCount || !knowledgeReviewReady}
-                                  title={!knowledgeReviewReady ? "Fill the requested missing details before approving." : ""}
+                                  title={!knowledgeReviewReady ? "Fill the requested missing details, then Check Edits Against Document before approving." : ""}
                                 >
                                   Validate & Update Knowledge
                                 </button>
                               </div>
+                              {knowledgePackRevalidation.error ? (
+                                <p className="error">{knowledgePackRevalidation.error}</p>
+                              ) : null}
                               {knowledgeReviewFields.length ? (
                                 <div className="knowledge-pack-fix-panel">
                                   <div>
@@ -15312,6 +15442,9 @@ export default function App() {
                         </button>
                         {knowledgeHasUnvalidatedInput ? (
                           <p className="subtitle onboarding-review-warning">Validation required: answer the questions above and click Validate & Save Knowledge before generating artifacts.</p>
+                        ) : null}
+                        {!knowledgeHasUnvalidatedInput && onboardingValidationErrors.length > 0 ? (
+                          <p className="subtitle onboarding-review-warning">{onboardingValidationErrors[0]}</p>
                         ) : null}
                       </form>
                       {onboardingState.error ? <p className="error">{onboardingState.error}</p> : null}

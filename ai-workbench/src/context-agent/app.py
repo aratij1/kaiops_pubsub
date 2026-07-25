@@ -429,6 +429,24 @@ def _fact(value: Any, confidence: float, sources: list[str], status: str | None 
     }
 
 
+def _compute_knowledge_pack_validation(facts: dict[str, Any]) -> dict[str, Any]:
+    required = ["service", "environment", "owner_team", "alert_patterns"]
+    recommended = ["dependencies", "commands", "rollback_plan", "validation_checks"]
+    missing_required = [key for key in required if not facts[key]["value"]]
+    missing_recommended = [key for key in recommended if not facts[key]["value"]]
+    low_confidence = [key for key, value in facts.items() if float(value.get("confidence") or 0.0) < 0.7]
+    overall_confidence = round(
+        sum(float(value.get("confidence") or 0.0) for value in facts.values()) / max(1, len(facts)),
+        3,
+    )
+    return {
+        "missing_required": missing_required,
+        "missing_recommended": missing_recommended,
+        "low_confidence": low_confidence,
+        "overall_confidence": overall_confidence,
+    }
+
+
 def _classify_pack_document(name: str, text: str, category: str | None = None) -> str:
     haystack = f"{category or ''} {name} {text}".lower()
     if re.search(r"\b(rca|postmortem|root cause)\b", haystack):
@@ -499,27 +517,17 @@ def build_knowledge_pack(request: KnowledgePackRequest) -> dict[str, Any]:
         "rollback_plan": _fact(rollback, 0.78 if rollback else 0.0, source_names),
         "validation_checks": _fact(validation_checks, 0.8 if validation_checks else 0.0, source_names),
     }
-    required = ["service", "environment", "owner_team", "alert_patterns"]
-    recommended = ["dependencies", "commands", "rollback_plan", "validation_checks"]
-    missing_required = [key for key in required if not facts[key]["value"]]
-    missing_recommended = [key for key in recommended if not facts[key]["value"]]
-    low_confidence = [key for key, value in facts.items() if float(value.get("confidence") or 0.0) < 0.7]
-    overall_confidence = round(
-        sum(float(value.get("confidence") or 0.0) for value in facts.values()) / max(1, len(facts)),
-        3,
-    )
+    validation = _compute_knowledge_pack_validation(facts)
+    missing_required = validation["missing_required"]
+    missing_recommended = validation["missing_recommended"]
+    low_confidence = validation["low_confidence"]
     return {
         "contract_version": "kaiops.knowledge-pack.v1",
         "status": "ready" if not missing_required and not low_confidence[:1] else "needs_review",
         "document_count": len(docs),
         "detected_documents": detected_docs,
         "facts": facts,
-        "validation": {
-            "missing_required": missing_required,
-            "missing_recommended": missing_recommended,
-            "low_confidence": low_confidence,
-            "overall_confidence": overall_confidence,
-        },
+        "validation": validation,
         "next_questions": [
             question
             for key, question in {
@@ -856,6 +864,11 @@ async def approve_knowledge_pack(request: KnowledgePackApproveRequest) -> dict[s
         sources = fact.get("sources") if isinstance(fact.get("sources"), list) else []
         fact["sources"] = _unique_tokens([*sources, "manual-review"], limit=8)
     pack["facts"] = facts
+    # accepted_facts overrides above change confidence/status per field, so
+    # validation stats (esp. overall_confidence) must be recomputed here —
+    # otherwise the persisted knowledge_pack_confidence reflects the stale
+    # pre-override extraction average instead of what was actually approved.
+    pack["validation"] = _compute_knowledge_pack_validation(facts)
     pack["status"] = "approved"
     rag_request = _knowledge_pack_to_rag_request(pack, request.approved_by)
     result = write_rag_document(rag_request)
