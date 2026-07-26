@@ -210,6 +210,66 @@ def _search_tickets(terms: list[str], limit: int) -> list[dict[str, Any]]:
     return [row[1] for row in ranked[:limit]]
 
 
+async def _search_jira_tickets(arguments: dict[str, Any], terms: list[str], limit: int) -> list[dict[str, Any]]:
+    _, project = _project_for(arguments)
+    ticket_sources = project.get("ticket_sources") if isinstance(project.get("ticket_sources"), dict) else {}
+    jira_url = str(os.getenv("JIRA_URL") or ticket_sources.get("jira_url") or "").strip().rstrip("/")
+    user_email = str(os.getenv("JIRA_USER_EMAIL") or "").strip()
+    api_token = str(os.getenv("JIRA_API_TOKEN") or "").strip()
+    project_key = str(os.getenv("JIRA_PROJECT_KEY") or ticket_sources.get("jira_project_key") or "").strip()
+    if not jira_url or not user_email or not api_token or not terms:
+        return []
+
+    search_text = " ".join(terms[:8]).replace('"', '\\"')
+    clauses = [f'text ~ "{search_text}"']
+    if project_key:
+        safe_project = re.sub(r"[^A-Za-z0-9_-]", "", project_key)
+        if safe_project:
+            clauses.insert(0, f'project = "{safe_project}"')
+    jql = " AND ".join(clauses) + " ORDER BY updated DESC"
+    timeout = httpx.Timeout(max(2.0, min(float(os.getenv("JIRA_TIMEOUT_SECONDS", "8")), 30.0)))
+    async with httpx.AsyncClient(timeout=timeout, auth=(user_email, api_token)) as client:
+        response = await client.get(
+            f"{jira_url}/rest/api/3/search",
+            params={
+                "jql": jql,
+                "maxResults": limit,
+                "fields": "summary,description,status,priority,issuetype,created,updated,labels,components",
+            },
+            headers={"Accept": "application/json"},
+        )
+        response.raise_for_status()
+        issues = response.json().get("issues", [])
+
+    evidence: list[dict[str, Any]] = []
+    for index, issue in enumerate(issues[:limit], 1):
+        if not isinstance(issue, dict):
+            continue
+        fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+        key = str(issue.get("key") or "").strip()
+        summary = str(fields.get("summary") or "").strip()
+        status = fields.get("status") if isinstance(fields.get("status"), dict) else {}
+        priority = fields.get("priority") if isinstance(fields.get("priority"), dict) else {}
+        snippet = (
+            f"{key} {summary}; status={status.get('name', 'unknown')}; "
+            f"priority={priority.get('name', 'unknown')}; updated={fields.get('updated', '')}"
+        )
+        matched = [term for term in terms if term in snippet.lower()] or terms[:1]
+        item = _evidence("ticket", Path(f"jira/{key or index}"), 1, snippet, matched)
+        item.update(
+            {
+                "uri": f"{jira_url}/browse/{key}" if key else jira_url,
+                "ticket_id": key,
+                "ticket_system": "jira",
+                "title": summary,
+                "status": status.get("name"),
+                "priority": priority.get("name"),
+            }
+        )
+        evidence.append(item)
+    return evidence
+
+
 def _mysql_connection_settings() -> dict[str, Any]:
     return {
         "host": os.getenv("DB_HOST", "mysql"),
@@ -480,6 +540,24 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     return {"tool": name, "query_terms": terms, "result_count": len(rows), "evidence": rows}
 
 
+async def _call_ticket_tool(arguments: dict[str, Any]) -> dict[str, Any]:
+    terms = _terms(arguments)
+    limit = max(1, min(int(arguments.get("limit", 8)), 20))
+    jira_rows = await _search_jira_tickets(arguments, terms, limit)
+    local_rows = _search_tickets(terms, limit)
+    rows = (jira_rows + local_rows)[:limit]
+    return {
+        "tool": "tickets.search",
+        "query_terms": terms,
+        "result_count": len(rows),
+        "evidence": rows,
+        "sources": {
+            "jira": len(jira_rows),
+            "local_history": len(local_rows),
+        },
+    }
+
+
 @app.post("/mcp")
 async def mcp(request: MCPRequest) -> dict[str, Any]:
     try:
@@ -499,6 +577,8 @@ async def mcp(request: MCPRequest) -> dict[str, Any]:
                 result = await _call_mysql_tool(safe_arguments)
             elif name == "telemetry.search":
                 result = await _search_telemetry(safe_arguments)
+            elif name == "tickets.search":
+                result = await _call_ticket_tool(safe_arguments)
             else:
                 result = _call_tool(name, safe_arguments)
         else:
