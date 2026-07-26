@@ -102,7 +102,12 @@ def build_incident_candidate(alert: Alert, incident: Incident, llm: dict[str, An
             summary=alert.description[:1000],
             observed_at=alert.starts_at,
             confidence=1.0,
-            attributes={"service": alert.service, "environment": alert.environment},
+            attributes={
+                "service": alert.service,
+                "environment": alert.environment,
+                "occurrence_count": str(alert.labels.get("occurrence_count") or "1"),
+                "log_level": str(alert.labels.get("log_level") or ""),
+            },
         )
     ]
     similar: list[dict[str, Any]] = []

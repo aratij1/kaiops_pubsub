@@ -97,7 +97,7 @@ class AzureOpenAIEmbeddingModel(Embeddings):
             cache=self._cache,
             batch_size=self._batch_size,
             remote_embed=lambda batch: self._embed_remote_batch(
-                [str(text or "")[: self._max_input_chars] for text in batch]
+                [(str(text or "").strip()[: self._max_input_chars] or "[empty document]") for text in batch]
             ),
             fallback_embed=self._fallback.embed_documents,
         )
@@ -187,7 +187,7 @@ class OpenAIEmbeddingModel(Embeddings):
             cache=self._cache,
             batch_size=self._batch_size,
             remote_embed=lambda batch: self._embed_remote_batch(
-                [str(text or "")[: self._max_input_chars] for text in batch]
+                [(str(text or "").strip()[: self._max_input_chars] or "[empty document]") for text in batch]
             ),
             fallback_embed=self._fallback.embed_documents,
         )

@@ -6,6 +6,7 @@ import heapq
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypedDict
@@ -713,13 +714,19 @@ class VectorDBConnector(BaseConnector):
     documents: list[dict[str, Any]] = field(default_factory=list)
     _document_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     _remote_store: AzureAISearchVectorStore | None = field(default=None, init=False)
+    _load_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if not self.documents:
-            self.documents = self.load_documents()
+        # Loading performs remote embedding calls. Keep construction/startup
+        # side-effect free so message-bus consumers become available first.
+        pass
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
+        if not self.documents:
+            with self._load_lock:
+                if not self.documents:
+                    self.documents = self.load_documents()
         query = " ".join(
             [
                 str(alert.service or ""),
@@ -1326,7 +1333,15 @@ class ContextIntelligenceAgent(BaseAgent):
                     ToolSpec(
                         name=tool_name,
                         handler=_handler,
-                        timeout_seconds=45.0 if connector.name == "discovery-mcp" else 10.0,
+                        timeout_seconds=(
+                            300.0
+                            if connector.name == "vector-db"
+                            else 45.0
+                            if connector.name == "discovery-mcp"
+                            else 30.0
+                            if connector.name == "local-evidence"
+                            else 10.0
+                        ),
                         permissions={"context-agent"},
                     )
                 )

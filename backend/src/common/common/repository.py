@@ -1128,10 +1128,17 @@ class IncidentRepository:
             context_metadata.setdefault("discovery_report", context_event_payload.get("discovery_report"))
         if isinstance(context_event_payload.get("discovery_evidence"), dict):
             context_metadata.setdefault("discovery_evidence", context_event_payload.get("discovery_evidence"))
+        if isinstance(context_event_payload.get("context_sources"), dict):
+            context_metadata.setdefault("context_sources", context_event_payload.get("context_sources"))
+        if isinstance(context_event_payload.get("context_evidence"), dict):
+            context_metadata.setdefault("context_evidence", context_event_payload.get("context_evidence"))
 
         has_discovery_report = isinstance(context_metadata.get("discovery_report"), dict) and bool(context_metadata.get("discovery_report"))
         has_discovery_evidence = isinstance(context_metadata.get("discovery_evidence"), dict) and bool(context_metadata.get("discovery_evidence"))
-        if not (has_discovery_report and has_discovery_evidence):
+        # Never manufacture completed Context/Discovery data from alert text. If
+        # Context did not emit a persisted event, return an empty stage so the UI
+        # accurately reports that downstream processing has not occurred.
+        if context_event_payload and not (has_discovery_report and has_discovery_evidence):
             alert_tokens = {_normalize_match_token(item) for item in _collect_alert_application_tokens(alert_payload)}
 
             app_result = await self.session.execute(
@@ -1462,6 +1469,29 @@ class IncidentRepository:
         result = await self.session.execute(select(IncidentRecord).where(IncidentRecord.id == incident_uuid))
         record = result.scalar_one_or_none()
         return record.payload if record else None
+
+    async def find_open_jira_by_correlation_key(self, correlation_key: str) -> str | None:
+        """Resolve a previously qualified Jira incident for a correlated signal."""
+        normalized = str(correlation_key or "").strip()
+        if not normalized:
+            return None
+        result = await self.session.execute(
+            select(IncidentRecord)
+            .where(IncidentRecord.ticket_id.is_not(None))
+            .order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc())
+            .limit(1000)
+        )
+        for record in result.scalars().all():
+            payload = record.payload if isinstance(record.payload, dict) else {}
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            candidate = (
+                metadata.get("incident_candidate")
+                if isinstance(metadata.get("incident_candidate"), dict)
+                else {}
+            )
+            if str(candidate.get("correlation_key") or "").strip() == normalized:
+                return str(record.ticket_id or candidate.get("jira_key") or "").strip() or None
+        return None
 
     async def get_latest_recommendation_for_incident(self, incident_id: Any) -> dict[str, Any] | None:
         incident_uuid = self._parse_uuid(incident_id)
