@@ -3685,6 +3685,59 @@ function groundedIntelligenceDisplay(label, value) {
   return { headline, details };
 }
 
+function canonicalIncidentAnalysis(workflow, alertRow = null) {
+  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
+  const recommendation = safeWorkflow.recommendation && typeof safeWorkflow.recommendation === "object"
+    ? safeWorkflow.recommendation
+    : {};
+  const metadata = recommendation.metadata && typeof recommendation.metadata === "object"
+    ? recommendation.metadata
+    : {};
+  const contextMetadata = safeWorkflow?.context?.metadata && typeof safeWorkflow.context.metadata === "object"
+    ? safeWorkflow.context.metadata
+    : {};
+  const discovery = contextMetadata.discovery_report && typeof contextMetadata.discovery_report === "object"
+    ? contextMetadata.discovery_report
+    : {};
+  const report = discovery.report && typeof discovery.report === "object" ? discovery.report : {};
+  const hypotheses = Array.isArray(report.hypotheses) ? report.hypotheses : [];
+  const rca = metadata.rca_analysis && typeof metadata.rca_analysis === "object" ? metadata.rca_analysis : {};
+  const impact = metadata.impact_analysis && typeof metadata.impact_analysis === "object" ? metadata.impact_analysis : {};
+  const remediation = metadata.remediation_analysis && typeof metadata.remediation_analysis === "object"
+    ? metadata.remediation_analysis
+    : {};
+  const confirmedRootCause = cleanRecommendationText(rca.root_cause || recommendation.root_cause, "");
+  const hypothesis = hypotheses.find((item) => item && item.cause);
+  const rootCause = confirmedRootCause
+    || (hypothesis ? `Hypothesis (not confirmed): ${cleanRecommendationText(hypothesis.cause, "")}` : "")
+    || "RCA pending: available evidence is insufficient for a grounded conclusion.";
+  const explicitImpact = cleanRecommendationText(
+    impact.impact_summary
+      || impact.customer_impact
+      || impact.service_impact
+      || recommendation.impact,
+    "",
+  );
+  const action = cleanRecommendationText(remediation.recommended_action || recommendation.recommended_action, "");
+  return {
+    rootCause,
+    impact: explicitImpact || "Impact not established from current evidence.",
+    action: action || "Recommended action pending grounded RCA.",
+    rca,
+    impactAnalysis: impact,
+    remediation,
+    status: confirmedRootCause ? "resolved-analysis" : hypothesis ? "hypothesis" : "insufficient-evidence",
+    confidence: Number(recommendation.confidence ?? rca.confidence_score ?? hypothesis?.confidence ?? 0),
+    externalKnowledgeUsed: Boolean(
+      rca.external_knowledge_used
+      || report.external_knowledge_used
+      || metadata.external_knowledge_used
+    ),
+    externalToolsUsed: Array.isArray(report.external_tools_used) ? report.external_tools_used : [],
+    service: alertRow?.service || safeWorkflow?.alert?.service || recommendation?.metadata?.service || "unknown",
+  };
+}
+
 function downloadInvestigationArtifact(filename, payload) {
   const safeName = String(filename || "kaiops-investigation.json")
     .replace(/[^a-z0-9._-]+/gi, "-")
@@ -3714,6 +3767,7 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
   const recommendation = safeWorkflow.recommendation && typeof safeWorkflow.recommendation === "object"
     ? safeWorkflow.recommendation
     : {};
+  const canonicalAnalysis = canonicalIncidentAnalysis(safeWorkflow);
   const ragMatches = Array.isArray(metadata.rag_matches) ? metadata.rag_matches : [];
   const sourceCounts = evidence.reduce((result, item) => {
     const source = String(item?.source || "other").toLowerCase();
@@ -3849,13 +3903,13 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
             alternative_causes: hypotheses.slice(1).map((item) => item.cause),
             confidence_score: hypotheses[0].confidence,
             grounding_notes: report.summary,
-          }) || report.summary || "No grounded root cause was produced.",
+          }) || canonicalAnalysis.rootCause,
     },
     {
       label: "Impact",
       value: Object.keys(impactAnalysis).length
         ? impactAnalysis
-        : recommendation.impact || report.impact || "No explicit impact assessment was produced.",
+        : recommendation.impact || report.impact || canonicalAnalysis.impact,
     },
     {
       label: "Recommended action",
@@ -3867,7 +3921,7 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
               validation_queries: report.recommended_next_checks.slice(1),
               missing_evidence: report.insufficient_evidence ? ["Resolution Agent output is not available yet."] : [],
             }
-          : "No action was produced."),
+          : canonicalAnalysis.action),
     },
   ].map((item) => ({ ...item, display: groundedIntelligenceDisplay(item.label, item.value) }));
   const investigationPackage = {
@@ -10274,7 +10328,7 @@ export default function App() {
       return "Loading processed result from monitoring adapter.";
     }
     if (selectedAlertData.payload) {
-      return "Processed workflow result from monitoring-adapter; no LLM call required for this view.";
+      return "Canonical processed workflow result; Discovery and Resolution LLM outputs are shown when available.";
     }
     if (selectedAlertData.error) {
       return "Processed workflow result unavailable; showing alert-stream fallback fields only.";
@@ -13270,18 +13324,18 @@ export default function App() {
       formatIstTimestamp(row.closed_at || row.updated_at),
     ]);
 
+    const selectedCanonicalAnalysis = canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow);
     const selectedSummaryRows = selectedAlertRow
       ? [
           ["Alert ID", selectedAlertId],
           ["Name", selectedAlertRow?.name || selectedAlertWorkflow?.alert?.name || "-"],
           ["Service", selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "-"],
           ["Incident", selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "-"],
-          ["Root Cause", cleanRecommendationText(selectedAlertWorkflow?.recommendation?.root_cause, selectedAlertWorkflow?.alert?.description || selectedAlertRow?.description || "-")],
-          ["Recommended Action", cleanRecommendationText(selectedAlertWorkflow?.recommendation?.recommended_action, "-")],
-          ["Impact", cleanRecommendationText(
-            selectedAlertWorkflow?.recommendation?.impact,
-            `${selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "Selected service"} may have degraded availability, latency, or dependent workflow impact until recovery is validated.`,
-          )],
+          ["Analysis Status", selectedCanonicalAnalysis.status],
+          ["Root Cause", selectedCanonicalAnalysis.rootCause],
+          ["Recommended Action", selectedCanonicalAnalysis.action],
+          ["Impact", selectedCanonicalAnalysis.impact],
+          ["External Knowledge Used", selectedCanonicalAnalysis.externalKnowledgeUsed ? "yes" : "no"],
         ]
       : [];
     const selectedEventsRows = selectedAlertEvents.slice(0, 250).map((event) => [
@@ -14382,12 +14436,11 @@ export default function App() {
                             </tr>
                             <tr><th>Closed At</th><td>{formatIstTimestamp(selectedAlertWorkflow?.incident?.closed_at)}</td></tr>
                             <tr><th>Service</th><td>{selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "-"}</td></tr>
-                            <tr><th>Root Cause</th><td>{cleanRecommendationText(selectedAlertWorkflow?.recommendation?.root_cause, selectedAlertWorkflow?.alert?.description || selectedAlertRow?.description || "-")}</td></tr>
-                            <tr><th>Recommended Action</th><td>{cleanRecommendationText(selectedAlertWorkflow?.recommendation?.recommended_action, "-")}</td></tr>
-                            <tr><th>Impact</th><td>{cleanRecommendationText(
-                              selectedAlertWorkflow?.recommendation?.impact,
-                              `${selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "Selected service"} may have degraded availability, latency, or dependent workflow impact until recovery is validated.`,
-                            )}</td></tr>
+                            <tr><th>Analysis Status</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).status}</td></tr>
+                            <tr><th>Root Cause</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).rootCause}</td></tr>
+                            <tr><th>Recommended Action</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).action}</td></tr>
+                            <tr><th>Impact</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).impact}</td></tr>
+                            <tr><th>External Knowledge Used</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).externalKnowledgeUsed ? "yes" : "no"}</td></tr>
                           </tbody>
                         </table>
                       </div>
