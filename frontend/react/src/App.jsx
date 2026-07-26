@@ -3739,6 +3739,15 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
   const recommendationMetadata = recommendation.metadata && typeof recommendation.metadata === "object"
     ? recommendation.metadata
     : {};
+  const rcaAnalysis = recommendationMetadata.rca_analysis && typeof recommendationMetadata.rca_analysis === "object"
+    ? recommendationMetadata.rca_analysis
+    : {};
+  const impactAnalysis = recommendationMetadata.impact_analysis && typeof recommendationMetadata.impact_analysis === "object"
+    ? recommendationMetadata.impact_analysis
+    : {};
+  const remediationAnalysis = recommendationMetadata.remediation_analysis && typeof recommendationMetadata.remediation_analysis === "object"
+    ? recommendationMetadata.remediation_analysis
+    : {};
   const detectedErrors = Array.isArray(report.detected_errors)
     ? report.detected_errors
     : Array.isArray(discovery.detected_errors)
@@ -3749,6 +3758,8 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
   const supportingIds = Array.from(new Set([
     ...(Array.isArray(report.citations) ? report.citations : []),
     ...hypotheses.flatMap((item) => Array.isArray(item?.supporting_evidence) ? item.supporting_evidence : []),
+    ...(Array.isArray(rcaAnalysis.evidence_used) ? rcaAnalysis.evidence_used : []),
+    ...(Array.isArray(impactAnalysis.evidence_used) ? impactAnalysis.evidence_used : []),
     ...detectedErrors.map((item) => item?.evidence_id),
   ].filter(Boolean)));
   const queryTerms = Array.isArray(discovery.query_terms)
@@ -3759,7 +3770,12 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
   const recentChanges = Array.isArray(context.recent_changes) ? context.recent_changes : [];
   const dependencies = Array.isArray(context.dependency_services) ? context.dependency_services : [];
   const relatedIncidents = Array.isArray(context.related_incidents) ? context.related_incidents : [];
-  const reasoningConfidence = Number(recommendation.confidence ?? report.confidence_score ?? 0);
+  const reasoningConfidence = Number(
+    recommendation.confidence
+    ?? rcaAnalysis.confidence_score
+    ?? report.confidence_score
+    ?? 0
+  );
   const storyStages = [
     {
       id: "signal",
@@ -3825,15 +3841,33 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
   const outputs = [
     {
       label: "RCA",
-      value: recommendation.root_cause || report.summary || "No grounded root cause was produced.",
+      value: Object.keys(rcaAnalysis).length
+        ? rcaAnalysis
+        : recommendation.root_cause || (hypotheses[0] && {
+            root_cause: hypotheses[0].cause,
+            evidence_used: hypotheses[0].supporting_evidence,
+            alternative_causes: hypotheses.slice(1).map((item) => item.cause),
+            confidence_score: hypotheses[0].confidence,
+            grounding_notes: report.summary,
+          }) || report.summary || "No grounded root cause was produced.",
     },
     {
       label: "Impact",
-      value: recommendation.impact || "No explicit impact assessment was produced.",
+      value: Object.keys(impactAnalysis).length
+        ? impactAnalysis
+        : recommendation.impact || report.impact || "No explicit impact assessment was produced.",
     },
     {
       label: "Recommended action",
-      value: recommendation.recommended_action || (Array.isArray(report.recommended_next_checks) ? report.recommended_next_checks.join(" ") : "No action was produced."),
+      value: Object.keys(remediationAnalysis).length
+        ? remediationAnalysis
+        : recommendation.recommended_action || (Array.isArray(report.recommended_next_checks)
+          ? {
+              recommended_action: report.recommended_next_checks[0],
+              validation_queries: report.recommended_next_checks.slice(1),
+              missing_evidence: report.insufficient_evidence ? ["Resolution Agent output is not available yet."] : [],
+            }
+          : "No action was produced."),
     },
   ].map((item) => ({ ...item, display: groundedIntelligenceDisplay(item.label, item.value) }));
   const investigationPackage = {
@@ -3855,10 +3889,19 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
     if (stageId === "discover") return { source_counts: sourceCounts, evidence };
     if (stageId === "context") return { context, ranked_documents: ragMatches, linked_documents: documents };
     if (stageId === "reason") {
-      return { report, hypotheses, citations: supportingIds, root_cause: recommendation.root_cause, impact: recommendation.impact };
+      return {
+        report,
+        hypotheses,
+        citations: supportingIds,
+        rca_analysis: rcaAnalysis,
+        impact_analysis: impactAnalysis,
+        root_cause: recommendation.root_cause,
+        impact: recommendation.impact,
+      };
     }
     return {
       recommended_action: recommendation.recommended_action,
+      remediation_analysis: remediationAnalysis,
       preventive_action: recommendation.preventive_action,
       validation: recommendation.validation || report.recommended_next_checks || [],
       approval: safeWorkflow.approval || {},
