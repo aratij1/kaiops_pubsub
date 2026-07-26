@@ -184,6 +184,10 @@ def _build_context_event_payload(
                 "model_usage": discovery.get("model_usage", {}),
                 "model_interaction": discovery.get("model_interaction", {}),
                 "insufficient_evidence": report.get("insufficient_evidence", False),
+                "external_knowledge_eligible": report.get("external_knowledge_eligible", False),
+                "external_knowledge_used": report.get("external_knowledge_used", False),
+                "external_tools_used": report.get("external_tools_used", []),
+                "external_knowledge_error": report.get("external_knowledge_error"),
             },
         },
         metadata={

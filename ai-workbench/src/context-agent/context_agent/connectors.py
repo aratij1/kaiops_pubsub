@@ -466,7 +466,15 @@ class DiscoveryMCPConnector(BaseConnector):
                     continue
                 rows = result.get("evidence", []) if isinstance(result.get("evidence"), list) else []
                 evidence_by_tool[tool] = [row for row in rows if isinstance(row, dict)]
-                stages.append({"stage": tool.replace(".", "_"), "status": "completed", "result_count": len(rows)})
+                provider_status = str(result.get("provider_status") or "completed")
+                stages.append(
+                    {
+                        "stage": tool.replace(".", "_"),
+                        "status": provider_status,
+                        "result_count": len(rows),
+                        "error": result.get("provider_error"),
+                    }
+                )
             deduped: list[dict[str, Any]] = []
             seen: set[str] = set()
             tool_order = tuple(discovery_tools)

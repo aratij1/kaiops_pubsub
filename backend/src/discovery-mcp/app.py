@@ -675,6 +675,14 @@ TOOLS = [
             }
         },
     },
+    {
+        "name": "external.search",
+        "description": "Read-only search through the explicitly configured external knowledge provider.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"terms": {"type": "array"}, "limit": {"type": "integer"}},
+        },
+    },
 ]
 
 
@@ -745,6 +753,79 @@ async def _call_logs_tool(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _call_external_search_tool(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Query an explicitly configured read-only external search provider.
+
+    The provider must accept ``{"query": str, "limit": int}`` and return either
+    ``{"results": [...]}`` or ``{"items": [...]}``. Keeping this behind a
+    configured endpoint avoids silently treating a second LLM call as external
+    evidence.
+    """
+    terms = _terms(arguments)
+    limit = max(1, min(int(arguments.get("limit", 8)), 10))
+    endpoint = str(os.getenv("EXTERNAL_KNOWLEDGE_SEARCH_URL", "")).strip()
+    if not endpoint:
+        return {
+            "tool": "external.search",
+            "query_terms": terms,
+            "result_count": 0,
+            "evidence": [],
+            "provider_status": "unavailable",
+            "provider_error": "EXTERNAL_KNOWLEDGE_SEARCH_URL is not configured",
+        }
+    headers = {"Accept": "application/json"}
+    token = str(os.getenv("EXTERNAL_KNOWLEDGE_SEARCH_TOKEN", "")).strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    timeout = max(2.0, min(float(os.getenv("EXTERNAL_KNOWLEDGE_SEARCH_TIMEOUT_SECONDS", "12")), 30.0))
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+            response = await client.post(endpoint, json={"query": " ".join(terms), "limit": limit})
+            response.raise_for_status()
+            payload = response.json()
+        rows = payload.get("results") if isinstance(payload, dict) else []
+        if not isinstance(rows, list) and isinstance(payload, dict):
+            rows = payload.get("items")
+        rows = rows if isinstance(rows, list) else []
+        evidence: list[dict[str, Any]] = []
+        for index, row in enumerate(rows[:limit], 1):
+            if not isinstance(row, dict):
+                continue
+            uri = str(row.get("url") or row.get("uri") or "").strip()
+            snippet = _redact(str(row.get("snippet") or row.get("description") or row.get("title") or ""))[:700]
+            if not uri or not snippet:
+                continue
+            digest = hashlib.sha256(f"{uri}|{snippet}".encode()).hexdigest()[:16]
+            evidence.append(
+                {
+                    "evidence_id": f"EXTERNAL-{digest}",
+                    "source": "external.search",
+                    "uri": uri,
+                    "title": str(row.get("title") or "")[:200],
+                    "snippet": snippet,
+                    "matched_terms": terms,
+                    "confidence": min(0.6, float(row.get("confidence") or 0.5)),
+                    "knowledge_only": True,
+                }
+            )
+        return {
+            "tool": "external.search",
+            "query_terms": terms,
+            "result_count": len(evidence),
+            "evidence": evidence,
+            "provider_status": "completed",
+        }
+    except Exception as exc:
+        return {
+            "tool": "external.search",
+            "query_terms": terms,
+            "result_count": 0,
+            "evidence": [],
+            "provider_status": "failed",
+            "provider_error": str(exc)[:240],
+        }
+
+
 @app.post("/mcp")
 async def mcp(request: MCPRequest) -> dict[str, Any]:
     try:
@@ -768,6 +849,8 @@ async def mcp(request: MCPRequest) -> dict[str, Any]:
                 result = await _call_ticket_tool(safe_arguments)
             elif name == "logs.search":
                 result = await _call_logs_tool(safe_arguments)
+            elif name == "external.search":
+                result = await _call_external_search_tool(safe_arguments)
             else:
                 result = await asyncio.to_thread(_call_tool, name, safe_arguments)
         else:

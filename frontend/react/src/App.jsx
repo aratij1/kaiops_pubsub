@@ -3719,6 +3719,19 @@ function canonicalIncidentAnalysis(workflow, alertRow = null) {
     "",
   );
   const action = cleanRecommendationText(remediation.recommended_action || recommendation.recommended_action, "");
+  const externalKnowledgeUsed = Boolean(
+    rca.external_knowledge_used
+      || report.external_knowledge_used
+      || metadata.external_knowledge_used
+  );
+  const externalKnowledgeEligible = Boolean(
+    report.external_knowledge_eligible
+      || metadata.external_knowledge_eligible
+  );
+  const externalKnowledgeError = cleanRecommendationText(
+    report.external_knowledge_error || metadata.external_knowledge_error,
+    "",
+  );
   return {
     rootCause,
     impact: explicitImpact || "Impact not established from current evidence.",
@@ -3728,12 +3741,21 @@ function canonicalIncidentAnalysis(workflow, alertRow = null) {
     remediation,
     status: confirmedRootCause ? "resolved-analysis" : hypothesis ? "hypothesis" : "insufficient-evidence",
     confidence: Number(recommendation.confidence ?? rca.confidence_score ?? hypothesis?.confidence ?? 0),
-    externalKnowledgeUsed: Boolean(
-      rca.external_knowledge_used
-      || report.external_knowledge_used
-      || metadata.external_knowledge_used
-    ),
-    externalToolsUsed: Array.isArray(report.external_tools_used) ? report.external_tools_used : [],
+    externalKnowledgeUsed,
+    externalKnowledgeEligible,
+    externalKnowledgeError,
+    externalKnowledgeStatus: externalKnowledgeUsed
+      ? "used"
+      : externalKnowledgeError
+        ? `failed: ${externalKnowledgeError}`
+        : externalKnowledgeEligible
+          ? "eligible; no configured external evidence returned"
+          : "not required",
+    externalToolsUsed: Array.isArray(metadata.external_tools_used)
+      ? metadata.external_tools_used
+      : Array.isArray(report.external_tools_used)
+        ? report.external_tools_used
+        : [],
     service: alertRow?.service || safeWorkflow?.alert?.service || recommendation?.metadata?.service || "unknown",
   };
 }
@@ -13335,7 +13357,7 @@ export default function App() {
           ["Root Cause", selectedCanonicalAnalysis.rootCause],
           ["Recommended Action", selectedCanonicalAnalysis.action],
           ["Impact", selectedCanonicalAnalysis.impact],
-          ["External Knowledge Used", selectedCanonicalAnalysis.externalKnowledgeUsed ? "yes" : "no"],
+          ["External Knowledge", selectedCanonicalAnalysis.externalKnowledgeStatus],
         ]
       : [];
     const selectedEventsRows = selectedAlertEvents.slice(0, 250).map((event) => [
@@ -14440,7 +14462,7 @@ export default function App() {
                             <tr><th>Root Cause</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).rootCause}</td></tr>
                             <tr><th>Recommended Action</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).action}</td></tr>
                             <tr><th>Impact</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).impact}</td></tr>
-                            <tr><th>External Knowledge Used</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).externalKnowledgeUsed ? "yes" : "no"}</td></tr>
+                            <tr><th>External Knowledge</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).externalKnowledgeStatus}</td></tr>
                           </tbody>
                         </table>
                       </div>
