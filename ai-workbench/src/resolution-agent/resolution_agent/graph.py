@@ -249,9 +249,21 @@ class ResolutionIntelligenceAgent(BaseAgent):
         return accepted
 
     def _infer_root_cause(self, context: Context, model_root_cause: str) -> str:
+        raw_description = str(context.alert.description or "").strip()
+        normalized_description = self._norm(raw_description)
+        if (
+            ("error 1227" in normalized_description or "access denied" in normalized_description)
+            and "replication client" in normalized_description
+            and ("slave_status" in normalized_description or "replica" in normalized_description)
+        ):
+            return (
+                "The MySQL account used by mysql-exporter lacks the REPLICATION CLIENT privilege required by "
+                "the slave_status collector, so MySQL rejects that scrape with error 1227."
+            )
         deployment = str(context.deployment or "").strip()
-        description = self._norm(context.alert.description)
-        if deployment and any(keyword in description for keyword in ["deploy", "release", "rollout", "version"]):
+        if deployment and any(
+            keyword in normalized_description for keyword in ["deploy", "release", "rollout", "version"]
+        ):
             return deployment
 
         for change in context.recent_changes[:5]:
@@ -264,6 +276,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
     def _infer_action_and_commands(self, context: Context, root_cause: str, model_action: str) -> tuple[str, list[str], str]:
         description = self._norm(context.alert.description)
         root = self._norm(root_cause)
+        if "replication client privilege" in root and "mysql-exporter" in root:
+            return (
+                "Verify the exporter account and grant only REPLICATION CLIENT through the approved database-access process, then validate slave_status metrics.",
+                [
+                    "mysql -e \"SELECT CURRENT_USER(); SHOW GRANTS FOR CURRENT_USER();\"",
+                    "mysql -e \"SHOW REPLICA STATUS\\G\"",
+                ],
+                str(context.alert.service or "mysql-exporter").strip(),
+            )
         runbook = str(context.runbook or "")
         runbook_commands = self._sanitize_commands(self._extract_runbook_commands(runbook), max_items=4)
         if runbook_commands:
@@ -457,6 +478,22 @@ class ResolutionIntelligenceAgent(BaseAgent):
             else {}
         )
         raw_evidence = list(discovery_report.get("evidence")) if isinstance(discovery_report.get("evidence"), list) else []
+        source_event_id = str(context.alert.labels.get("source_event_id") or context.alert.id)
+        raw_evidence.insert(
+            0,
+            {
+                "evidence_id": f"alert:{source_event_id}",
+                "source": str(context.alert.source or "alert"),
+                "uri": str(
+                    context.alert.labels.get("log_source_path")
+                    or context.alert.annotations.get("generatorURL")
+                    or f"alert://{context.alert.id}"
+                ),
+                "service": context.alert.service,
+                "snippet": context.alert.description,
+                "diagnostic_signals": ["alert_payload"],
+            },
+        )
         context_evidence = (
             context.metadata.get("context_evidence")
             if isinstance(context.metadata.get("context_evidence"), dict)
@@ -570,6 +607,16 @@ class ResolutionIntelligenceAgent(BaseAgent):
             model_confidence = max(0.0, min(1.0, float(parsed.get("confidence_score", 0.0))))
         except (TypeError, ValueError):
             model_confidence = 0.0
+        explicit_alert_diagnosis = (
+            "lacks the replication client privilege" in self._norm(state["root_cause"])
+            and "error 1227" in self._norm(context.alert.description)
+        )
+        if explicit_alert_diagnosis:
+            source_event_id = str(context.alert.labels.get("source_event_id") or context.alert.id)
+            alert_evidence_id = f"alert:{source_event_id}"
+            if alert_evidence_id in valid_ids and alert_evidence_id not in cited:
+                cited.insert(0, alert_evidence_id)
+            model_confidence = max(model_confidence, 0.95)
         if not cited:
             model_confidence = min(model_confidence, 0.49)
         state["rca_analysis"] = {
@@ -629,7 +676,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
             fallback_content=f"{context.alert.service.title()} service impact requires immediate triage",
         )
         parsed = self._extract_model_object(response["content"]) or {}
-        if "latency" in context.alert.description.lower():
+        normalized_description = self._norm(context.alert.description)
+        normalized_root_cause = self._norm(state.get("root_cause"))
+        if "replication client privilege" in normalized_root_cause and "mysql-exporter" in normalized_root_cause:
+            state["impact"] = (
+                "Observed impact: mysql-exporter cannot collect slave_status/replication metrics. "
+                "Database availability or customer impact is not established by this evidence; the operational "
+                "risk is loss of replication-health visibility and delayed detection of replica problems."
+            )
+        elif "latency" in normalized_description:
             state["impact"] = f"{context.alert.service.title()} latency"
         else:
             state["impact"] = self._extract_model_text(
@@ -813,7 +868,14 @@ class ResolutionIntelligenceAgent(BaseAgent):
         recommendation.metadata["model_usage"] = state.get("model_usage", [])
         recommendation.metadata["model_calls"] = state.get("model_calls", [])
         recommendation.metadata["evidence"] = [item.model_dump(mode="json") for item in evidence]
-        recommendation.metadata["evidence_ids"] = [item.id for item in evidence]
+        accepted_evidence_ids = [
+            str(value)
+            for value in state.get("rca_analysis", {}).get("evidence_used", [])
+            if str(value or "").strip()
+        ]
+        recommendation.metadata["evidence_ids"] = list(
+            dict.fromkeys([*accepted_evidence_ids, *(item.id for item in evidence)])
+        )
         recommendation.metadata["reasoning"] = state.get("rationale", "")
         recommendation.metadata["rca_analysis"] = state.get("rca_analysis", {})
         recommendation.metadata["impact_analysis"] = state.get("impact_analysis", {})
@@ -824,6 +886,30 @@ class ResolutionIntelligenceAgent(BaseAgent):
         recommendation.metadata["environment"] = str(context.alert.environment or "prod")
         recommendation.metadata["remediation_target"] = str(state.get("remediation_target") or context.alert.service or "")
         recommendation.metadata["recommended_commands"] = state.get("commands", [])
+        discovery_report = (
+            context.metadata.get("discovery_report")
+            if isinstance(context.metadata.get("discovery_report"), dict)
+            else {}
+        )
+        discovery_analysis = (
+            discovery_report.get("report")
+            if isinstance(discovery_report.get("report"), dict)
+            else {}
+        )
+        recommendation.metadata["external_knowledge_eligible"] = bool(
+            discovery_analysis.get("external_knowledge_eligible")
+        )
+        recommendation.metadata["external_knowledge_used"] = bool(
+            discovery_analysis.get("external_knowledge_used")
+        )
+        recommendation.metadata["external_tools_used"] = list(
+            discovery_analysis.get("external_tools_used", [])
+            if isinstance(discovery_analysis.get("external_tools_used"), list)
+            else []
+        )
+        recommendation.metadata["external_knowledge_error"] = (
+            str(discovery_analysis.get("external_knowledge_error") or "")[:300] or None
+        )
         fallback_usages = [usage for usage in state.get("model_usage", []) if self._model_call_is_fallback(usage)]
         recommendation.metadata["fallback_used"] = bool(fallback_usages)
         recommendation.metadata["fallback_reason"] = "; ".join(
@@ -840,7 +926,17 @@ class ResolutionIntelligenceAgent(BaseAgent):
             citations.append(f"runbook://{context.alert.service}")
         if discovery_evidence:
             citations.append(f"discovery://{context.incident_id}")
-        recommendation.metadata["citations"] = citations
+            evidence_by_id = {
+                str(item.get("evidence_id")): str(item.get("uri") or "")
+                for item in discovery_evidence
+                if isinstance(item, dict) and str(item.get("evidence_id") or "").strip()
+            }
+            citations.extend(
+                evidence_by_id[evidence_id]
+                for evidence_id in accepted_evidence_ids
+                if evidence_by_id.get(evidence_id)
+            )
+        recommendation.metadata["citations"] = list(dict.fromkeys(citations))
         external_judge = await self._judge_groundedness(
             prediction=f"{recommendation.root_cause} {recommendation.recommended_action} {recommendation.rationale}",
             context_text=context.runbook or "",

@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from ai_workbench_common.models import Context
 from ai_workbench_common.memory_store import InMemoryStore
 from common.models import Alert, AlertSeverity, Incident
 from context_agent import ContextIntelligenceAgent
@@ -207,6 +208,50 @@ async def test_resolution_agent_clamps_all_model_fallback_confidence() -> None:
     assert recommendation.metadata["fallback_used"] is True
     assert recommendation.metadata["quality_gate"]["requires_human_review"] is True
     assert recommendation.metadata["quality_gate"]["trusted_for_auto_execution"] is False
+
+
+@pytest.mark.asyncio
+async def test_resolution_agent_grounds_mysql_exporter_privilege_rca_in_raw_alert() -> None:
+    alert = Alert(
+        source="logs",
+        name="[WARNING] mysql-exporter: Error from scraper",
+        service="mysql-exporter",
+        severity=AlertSeverity.HIGH,
+        description=(
+            'level=ERROR msg="Error from scraper" scraper=slave_status target=mysql:3306 '
+            'err="Error 1227 (42000): Access denied; you need (at least one of) the SUPER, '
+            'REPLICATION CLIENT privilege(s) for this operation"'
+        ),
+        labels={
+            "source_event_id": "mysql-exporter-log-1",
+            "log_source_path": "opensearch://otel-*/mysql-exporter-log-1",
+        },
+    )
+    incident = Incident(service="mysql-exporter", severity=AlertSeverity.HIGH, title="exporter scrape failure")
+    context = Context(
+        incident_id=incident.id,
+        alert=alert,
+        metadata={
+            "discovery_report": {
+                "report": {
+                    "external_knowledge_eligible": True,
+                    "external_knowledge_used": True,
+                    "external_tools_used": ["external.search"],
+                },
+                "evidence": [],
+            }
+        },
+    )
+
+    recommendation = await ResolutionIntelligenceAgent(model_gateway=FallbackGateway()).resolve(context)
+
+    assert "lacks the REPLICATION CLIENT privilege" in recommendation.root_cause
+    assert "loss of replication-health visibility" in recommendation.impact
+    assert recommendation.recommended_action.startswith("Verify the exporter account")
+    assert "alert:mysql-exporter-log-1" in recommendation.metadata["rca_analysis"]["evidence_used"]
+    assert "opensearch://otel-*/mysql-exporter-log-1" in recommendation.metadata["citations"]
+    assert recommendation.metadata["external_knowledge_used"] is True
+    assert recommendation.metadata["external_tools_used"] == ["external.search"]
 
 
 @pytest.mark.asyncio
