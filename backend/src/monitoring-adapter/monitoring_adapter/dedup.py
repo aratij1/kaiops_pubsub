@@ -21,6 +21,12 @@ def compute_fingerprint(mapped_payload: dict[str, Any]) -> str:
     existing = str(labels.get("alert_fingerprint") or "").strip()
     if existing:
         return existing
+    error_signature = str(labels.get("error_signature") or "").strip()
+    if error_signature:
+        service = str(mapped_payload.get("service") or "").strip().lower()
+        environment = str(mapped_payload.get("environment") or "prod").strip().lower()
+        seed = f"{error_signature.lower()}|{service}|{environment}"
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
 
     name = str(mapped_payload.get("name") or "").strip().lower()
     service = str(mapped_payload.get("service") or "").strip().lower()
