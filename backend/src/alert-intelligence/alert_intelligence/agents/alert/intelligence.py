@@ -9,7 +9,9 @@ from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.config import get_settings
 from ai_workbench_common.embeddings import HashingEmbeddingModel, cosine_similarity
 from common.models import Alert, AlertSeverity, Incident, IncidentStatus, utc_now
+from common.incident_policy import IncidentSeverityPolicy
 from common.repository_interfaces import AlertHistoryRepository, InMemoryAlertHistoryRepository
+from alert_intelligence.discovery import build_incident_candidate
 
 _CORRELATION_WEIGHTS = {
     "text_similarity": 0.30,
@@ -134,11 +136,30 @@ class AlertIntelligenceAgent(BaseAgent):
         )
         return alert, incident
 
-    async def process(self, alert: Alert) -> tuple[Alert, Incident]:
+    async def process(self, alert: Alert, llm_discovery: dict[str, Any] | None = None) -> tuple[Alert, Incident]:
         alert = await self.deduplicate_alerts(alert)
         alert = await self.correlate_alerts(alert)
         alert = self.classify_severity(alert)
-        return await self.enrich_alert(alert)
+        alert, incident = await self.enrich_alert(alert)
+        candidate = build_incident_candidate(alert, incident, llm_discovery)
+        criticality = str(alert.labels.get("service_criticality") or alert.labels.get("criticality") or "medium")
+        policy = IncidentSeverityPolicy().evaluate(candidate, service_criticality=criticality)
+        candidate.final_severity = policy.final_severity
+        alert.severity = policy.final_severity
+        incident.severity = policy.final_severity
+        incident.title = candidate.title
+        incident.summary = candidate.description
+        incident.ticket_id = candidate.jira_key
+        incident.metadata.update(
+            {
+                "incident_candidate": candidate.model_dump(mode="json"),
+                "severity_policy": policy.model_dump(mode="json"),
+                "managed_by_kaiops": True,
+                "kaiops_incident_id": str(incident.id),
+                "event_origin": "kaiops",
+            }
+        )
+        return alert, incident
 
     async def can_execute(self, context: AgentContext) -> bool:
         return context.alert is not None

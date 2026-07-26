@@ -59,6 +59,16 @@ services:
     container_name: telemetry-valkey-cart
   otel-collector:
     container_name: telemetry-otel-collector
+    command: !override
+      - --config=/etc/otelcol-config.yml
+      - --config=/etc/otelcol-config-observability.yml
+      - --config=/etc/otelcol-config-extras.yml
+      - --config=/etc/otelcol-docker-logs.yml
+      - --feature-gates=service.profilesSupport
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ../../../deploy/telemetry/otelcol-docker-logs.yml:/etc/otelcol-docker-logs.yml:ro
+      - telemetry-otelcol-storage-v2:/var/lib/otelcol/storage
   opamp-server:
     container_name: telemetry-opamp-server
   prometheus:
@@ -80,3 +90,6 @@ services:
     container_name: telemetry-grafana
     ports: !override
       - "13000:3000"
+
+volumes:
+  telemetry-otelcol-storage-v2:

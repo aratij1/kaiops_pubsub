@@ -234,6 +234,113 @@ class Alert(BaseEvent):
         return value.strip().lower()
 
 
+class EvidenceReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str
+    source: str
+    uri: str
+    summary: str
+    observed_at: datetime | None = None
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class RawAlert(BaseEvent):
+    """Canonical, source-neutral alert accepted by Monitoring Adapters."""
+
+    event_id: str = Field(default_factory=lambda: str(uuid4()))
+    source_event_id: str
+    idempotency_key: str
+    source: str
+    source_type: str
+    application: str
+    service: str
+    environment: str = "prod"
+    observed_severity: AlertSeverity = AlertSeverity.WARNING
+    title: str
+    description: str
+    observed_at: datetime = Field(default_factory=utc_now)
+    raw_payload_ref: str
+    fingerprint: str
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+    evidence: list[EvidenceReference] = Field(default_factory=list)
+
+
+class IncidentCandidate(BaseEvent):
+    """Structured output of Discovery before deterministic policy/Jira."""
+
+    event_id: str = Field(default_factory=lambda: str(uuid4()))
+    incident_id: str
+    jira_key: str | None = None
+    source_event_ids: list[str] = Field(default_factory=list)
+    idempotency_key: str
+    correlation_key: str
+    application: str
+    service: str
+    environment: str = "prod"
+    category: str
+    title: str
+    description: str
+    initial_hypothesis: str
+    technical_impact: str
+    business_impact: str
+    affected_users: str = "unknown"
+    scope: str = "single-service"
+    urgency: str = "normal"
+    actionable: bool = True
+    actionability_reason: str = ""
+    recommended_severity: AlertSeverity
+    final_severity: AlertSeverity | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence: list[EvidenceReference] = Field(default_factory=list)
+    similar_incidents: list[dict[str, Any]] = Field(default_factory=list)
+    model_provider: str = "heuristic-fallback"
+    model_name: str = "deterministic-discovery-v1"
+    model_version: str = "v1"
+    reasoning: str = ""
+
+
+class SeverityPolicyDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    recommended_severity: AlertSeverity
+    final_severity: AlertSeverity
+    service_criticality: str
+    environment: str
+    impact: str
+    urgency: str
+    affected_users: str
+    scope: str
+    rules_fired: list[str] = Field(default_factory=list)
+    policy_version: str = "incident-severity-policy-v1"
+
+
+class JiraIncidentSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    incident_id: str
+    jira_key: str
+    status: str
+    owner: str | None = None
+    severity: AlertSeverity
+    priority: str
+    application: str
+    service: str
+    environment: str
+    correlated_source_event_ids: list[str] = Field(default_factory=list)
+    initial_hypothesis: str
+    business_impact: str
+    evidence: list[EvidenceReference] = Field(default_factory=list)
+    similar_incidents: list[dict[str, Any]] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0)
+    resolution_status: str = "unresolved"
+    managed_by_kaiops: bool = True
+    kaiops_incident_id: str
+    event_origin: str = "kaiops"
+
+
 class Incident(BaseEvent):
     alert_ids: list[UUID] = Field(default_factory=list)
     service: str

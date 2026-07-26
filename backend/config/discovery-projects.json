@@ -1,5 +1,27 @@
 {
   "projects": {
+    "kaiops": {
+      "name": "kaiops",
+      "display_name": "KaiOps Platform",
+      "environment": "prod",
+      "aliases": ["kaiops-platform", "kaiops core", "kaiops-core"],
+      "code_roots": [
+        "/workspace/backend/src",
+        "/workspace/ai-workbench/src",
+        "/workspace/frontend/react/src",
+        "/workspace/scripts",
+        "/workspace/observability"
+      ],
+      "service_catalog_root": "/workspace/backend/src",
+      "telemetry": {
+        "prometheus_url": "http://prometheus:9090"
+      },
+      "ticket_sources": {
+        "jira_url": "",
+        "landing_pad": "/data/landing/documents"
+      },
+      "correlation_keys": ["service", "trace_id", "incident_id", "alert_fingerprint", "environment"]
+    },
     "telemetry": {
       "application_id": "8a7f3e31-60e8-4f54-96c5-bd2a8a15c701",
       "name": "telemetry",

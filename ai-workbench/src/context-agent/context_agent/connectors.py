@@ -253,6 +253,48 @@ class DiscoveryMCPConnector(BaseConnector):
             "retrieval_stages": stages,
         }
 
+    @staticmethod
+    def _detected_errors(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        significant_signals = {
+            "connection_refused",
+            "timeout",
+            "authentication",
+            "resource_exhaustion",
+            "dependency_unavailable",
+            "exception",
+            "http_5xx",
+            "error",
+        }
+        for row in evidence:
+            if not isinstance(row, dict) or str(row.get("signal_type") or "") == "log_diagnosis":
+                continue
+            raw_signals = row.get("diagnostic_signals") if isinstance(row.get("diagnostic_signals"), list) else []
+            signals = [str(signal) for signal in raw_signals if str(signal) in significant_signals]
+            if not signals:
+                continue
+            snippet = str(row.get("snippet") or "").strip()
+            identity = (str(row.get("container") or row.get("service") or ""), snippet)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            timestamp_match = re.match(r"^(\d{4}-\d{2}-\d{2}T[^\s]+)", snippet)
+            findings.append(
+                {
+                    "evidence_id": row.get("evidence_id"),
+                    "service": row.get("service"),
+                    "container": row.get("container"),
+                    "timestamp": timestamp_match.group(1) if timestamp_match else None,
+                    "signals": signals,
+                    "message": snippet[:700],
+                    "source_uri": row.get("uri") or row.get("path"),
+                }
+            )
+            if len(findings) >= 12:
+                break
+        return findings
+
     async def _analyze(
         self, client: httpx.AsyncClient, alert: Alert, evidence: list[dict[str, Any]], stages: list[dict[str, Any]]
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -323,7 +365,7 @@ class DiscoveryMCPConnector(BaseConnector):
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         terms = self._query_terms(alert, incident)
         stages: list[dict[str, Any]] = [{"stage": "query_planned", "status": "completed", "terms": terms}]
-        evidence: list[dict[str, Any]] = []
+        evidence_by_tool: dict[str, list[dict[str, Any]]] = {}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             results = await asyncio.gather(
                 *(
@@ -341,9 +383,28 @@ class DiscoveryMCPConnector(BaseConnector):
                     stages.append({"stage": tool.replace(".", "_"), "status": "failed", "error": str(result)[:240]})
                     continue
                 rows = result.get("evidence", []) if isinstance(result.get("evidence"), list) else []
-                evidence.extend(row for row in rows if isinstance(row, dict))
+                evidence_by_tool[tool] = [row for row in rows if isinstance(row, dict)]
                 stages.append({"stage": tool.replace(".", "_"), "status": "completed", "result_count": len(rows)})
-            deduped = list({str(row.get("evidence_id")): row for row in evidence}.values())[: self.max_evidence]
+            deduped: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            tool_order = ("logs.search", "tickets.search", "code.search", "mysql.search", "telemetry.search")
+            max_rows = max((len(evidence_by_tool.get(tool, [])) for tool in tool_order), default=0)
+            for index in range(max_rows):
+                for tool in tool_order:
+                    rows = evidence_by_tool.get(tool, [])
+                    if index >= len(rows):
+                        continue
+                    row = rows[index]
+                    evidence_id = str(row.get("evidence_id") or "")
+                    if evidence_id and evidence_id in seen:
+                        continue
+                    if evidence_id:
+                        seen.add(evidence_id)
+                    deduped.append(row)
+                    if len(deduped) >= self.max_evidence:
+                        break
+                if len(deduped) >= self.max_evidence:
+                    break
             stages.append({"stage": "evidence_correlated", "status": "completed", "result_count": len(deduped)})
             try:
                 report, usage, model_interaction = await self._analyze(client, alert, deduped, stages)
@@ -360,6 +421,9 @@ class DiscoveryMCPConnector(BaseConnector):
                     "response_received": None,
                 }
                 stages.append({"stage": "llm_analysis", "status": "failed", "error": str(exc)[:240]})
+        detected_errors = self._detected_errors(deduped)
+        report["detected_errors"] = detected_errors
+        report["detected_error_count"] = len(detected_errors)
         stages.append({"stage": "discovery_completed", "status": "completed"})
         report["retrieval_stages"] = stages
         return {
@@ -368,6 +432,7 @@ class DiscoveryMCPConnector(BaseConnector):
             "query_terms": terms,
             "evidence": deduped,
             "report": report,
+            "detected_errors": detected_errors,
             "retrieval_stages": stages,
             "model_usage": usage,
             "model_interaction": model_interaction,
