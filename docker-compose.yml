@@ -35,6 +35,18 @@ x-service-env: &service-env
   LANDING_PAD_ARCHIVE_AFTER_DAYS: ${LANDING_PAD_ARCHIVE_AFTER_DAYS:-30}
   LANDING_PAD_ARCHIVE_INTERVAL_SECONDS: ${LANDING_PAD_ARCHIVE_INTERVAL_SECONDS:-3600}
   JIRA_WEBHOOK_SECRET: ${JIRA_WEBHOOK_SECRET:-}
+  # Outbound Jira API — distinct from JIRA_WEBHOOK_SECRET (inbound auth).
+  # Used by the centralized dedup step to create/update Jira tickets from
+  # Prometheus/log/email alerts, making Jira the single source of truth.
+  JIRA_API_BASE_URL: ${JIRA_API_BASE_URL:-}
+  JIRA_API_EMAIL: ${JIRA_API_EMAIL:-}
+  JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
+  JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:-}
+  CENTRALIZED_JIRA_ROUTING_ENABLED: ${CENTRALIZED_JIRA_ROUTING_ENABLED:-false}
+  LOG_INGESTION_ENABLED: ${LOG_INGESTION_ENABLED:-false}
+  LOG_WATCH_PATHS: ${LOG_WATCH_PATHS:-}
+  LOG_POLL_INTERVAL_SECONDS: ${LOG_POLL_INTERVAL_SECONDS:-30}
+  LOG_DEFAULT_SERVICE: ${LOG_DEFAULT_SERVICE:-log-ingestion}
   EMAIL_INGESTION_ENABLED: ${EMAIL_INGESTION_ENABLED:-false}
   EMAIL_IMAP_HOST: ${EMAIL_IMAP_HOST:-}
   EMAIL_IMAP_PORT: ${EMAIL_IMAP_PORT:-993}
@@ -307,6 +319,7 @@ services:
       # Keep maintenance and bulk ingestion out of the API-serving event loop.
       LANDING_PAD_FILE_WATCHER_ENABLED: "false"
       INCIDENT_PROJECTION_WORKER_ENABLED: "false"
+      LOG_INGESTION_ENABLED: "false"
       # This service is on the ingestion hot path for a 10k-alert burst; give
       # it a larger DB pool than the shared default (paired with mysql's
       # raised max-connections above).

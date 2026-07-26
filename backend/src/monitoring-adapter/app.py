@@ -100,6 +100,9 @@ from monitoring_adapter.existing_monitoring import (
 from monitoring_adapter.landing_pad_normalizer import normalize_landing_pad_alert
 from monitoring_adapter.landing_pad_sources import SUPPORTED_SUFFIXES, load_landing_pad_file
 from monitoring_adapter.email_ingestion import ImapConfig, email_to_alert_payload, fetch_unseen_emails
+from monitoring_adapter.dedup import compute_fingerprint
+from monitoring_adapter.jira_client import JiraClient, JiraClientError
+from monitoring_adapter.log_ingestion import LogWatchState, fetch_new_log_lines, log_line_to_alert_payload
 
 ALERT_BODY = Body(...)
 
@@ -275,6 +278,33 @@ LANDING_PAD_SCAN_MAX_PARSE_BYTES = max(
 # elsewhere in this file which fails open when unconfigured).
 JIRA_WEBHOOK_SECRET = str(os.getenv("JIRA_WEBHOOK_SECRET", "") or "").strip()
 
+# Outbound Jira API — distinct from JIRA_WEBHOOK_SECRET above (inbound
+# auth). When CENTRALIZED_JIRA_ROUTING_ENABLED is true, Prometheus/log/
+# email ingestion route through the centralized dedup step and create or
+# update Jira tickets instead of publishing straight to the landing pad —
+# Jira's own webhook (unchanged, JIRA_WEBHOOK_SECRET above) becomes the
+# only door back into the landing pad. Off by default so this can be
+# rolled out only once real Jira credentials are configured.
+JIRA_API_BASE_URL = str(os.getenv("JIRA_API_BASE_URL", "") or "").strip()
+JIRA_API_EMAIL = str(os.getenv("JIRA_API_EMAIL", "") or "").strip()
+JIRA_API_TOKEN = str(os.getenv("JIRA_API_TOKEN", "") or "").strip()
+JIRA_PROJECT_KEY = str(os.getenv("JIRA_PROJECT_KEY", "") or "").strip()
+CENTRALIZED_JIRA_ROUTING_ENABLED = str(os.getenv("CENTRALIZED_JIRA_ROUTING_ENABLED", "false")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+# Log ingestion — watches log files, extracts failure lines as alerts, and
+# routes them through the same centralized Jira dedup step as Prometheus
+# and email. Disabled unless explicit paths are configured.
+LOG_INGESTION_ENABLED = str(os.getenv("LOG_INGESTION_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "on"}
+LOG_WATCH_PATHS = [Path(item.strip()) for item in os.getenv("LOG_WATCH_PATHS", "").split(os.pathsep) if item.strip()]
+LOG_POLL_INTERVAL_SECONDS = max(5.0, float(os.getenv("LOG_POLL_INTERVAL_SECONDS", "30") or 30))
+LOG_DEFAULT_SERVICE = str(os.getenv("LOG_DEFAULT_SERVICE", "log-ingestion") or "log-ingestion").strip()
+LOG_INGESTION_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "log_ingestion_state.json"
+
 # Email ingestion via IMAP polling — disabled unless explicitly enabled and
 # fully configured, since it requires real mailbox credentials.
 EMAIL_INGESTION_ENABLED = str(os.getenv("EMAIL_INGESTION_ENABLED", "false")).strip().lower() in {
@@ -298,6 +328,7 @@ WORKER_FAILURE_COUNTS: dict[str, int] = {
     "landing_pad_file_watcher": 0,
     "email_poll_worker": 0,
     "landing_pad_archive_worker": 0,
+    "log_poll_worker": 0,
 }
 WORKER_FAILURE_THRESHOLD = max(1, int(os.getenv("WORKER_FAILURE_THRESHOLD", "5") or 5))
 _ALLOWED_PROJECT_ENVIRONMENTS = {"dev", "staging", "prod"}
@@ -360,11 +391,12 @@ def _persist_alert_to_landing_pad(
     try:
         base_dir = LANDING_PAD_PROCESSED_DIR if status == "processed" else LANDING_PAD_FAILED_DIR
         now = datetime.now(timezone.utc)
+        # Must match the YYYY/MM/DD scheme every reader scans
+        # (_collect_partitioned_json_files / _recent_date_partition_dirs /
+        # the dedup check / GET /landing-pad/recent) — a prior source-named
+        # subfolder scheme here silently orphaned every write from all of
+        # those readers.
         target_dir = _date_partition_dir(base_dir, now)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        source_slug = slugify(str(mapped_payload.get("source") or "unknown-source")) or "unknown-source"
-        date_segment = now.strftime("%Y-%m-%d")
-        target_dir = base_dir / source_slug / date_segment
         target_dir.mkdir(parents=True, exist_ok=True)
         alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))
         labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
@@ -1249,6 +1281,17 @@ async def _landing_pad_archive_worker() -> None:
 
 async def _process_polled_email(message: dict[str, Any]) -> None:
     mapped_payload = email_to_alert_payload(message, default_service=EMAIL_DEFAULT_SERVICE)
+
+    if CENTRALIZED_JIRA_ROUTING_ENABLED:
+        # Same reasoning as the Alertmanager path: email no longer
+        # shortcuts into the landing pad — routes through centralized
+        # dedup and Jira create-or-update instead.
+        try:
+            await _route_alert_through_jira(mapped_payload, message, source="email")
+        except Exception:
+            logger.exception("failed to route polled email %s through jira", message.get("message_id"))
+        return
+
     try:
         alert = _build_alert_from_payload(mapped_payload)
         await _publish_ingested_alert(alert)
@@ -1286,6 +1329,46 @@ async def _email_poll_worker() -> None:
             continue
 
 
+async def _process_log_line(record: dict[str, Any]) -> None:
+    mapped_payload = log_line_to_alert_payload(record, default_service=LOG_DEFAULT_SERVICE)
+    if mapped_payload is None:
+        return  # not a failure line — no alert, no Jira ticket
+    if CENTRALIZED_JIRA_ROUTING_ENABLED:
+        try:
+            await _route_alert_through_jira(mapped_payload, record, source="logs")
+        except Exception:
+            logger.exception("failed to route log alert through jira: %s", record.get("source_path"))
+        return
+    try:
+        alert = _build_alert_from_payload(mapped_payload)
+        await _publish_ingested_alert(alert)
+    except Exception as exc:
+        logger.exception("failed to ingest log alert from %s", record.get("source_path"))
+        _persist_alert_to_landing_pad(mapped_payload, record, status="failed", error=str(exc))
+        return
+    mapped_payload["labels"] = dict(alert.labels)
+    _persist_alert_to_landing_pad(mapped_payload, record, status="processed")
+
+
+async def _log_poll_worker() -> None:
+    stop_event = app.state.monitoring_adapter_stop_event
+    state = LogWatchState(LOG_INGESTION_STATE_FILE)
+    while not stop_event.is_set():
+        try:
+            # File I/O is blocking — run it off the event loop thread.
+            records = await asyncio.to_thread(fetch_new_log_lines, LOG_WATCH_PATHS, state)
+            for record in records:
+                await _process_log_line(record)
+            _record_worker_success("log_poll_worker")
+        except Exception as exc:
+            _record_worker_failure("log_poll_worker", exc)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=float(LOG_POLL_INTERVAL_SECONDS))
+        except asyncio.TimeoutError:
+            continue
+
+
 async def _on_startup(_: Any) -> None:
     app.state.monitoring_adapter_stop_event = asyncio.Event()
     if INCIDENT_PROJECTION_WORKER_ENABLED:
@@ -1302,6 +1385,11 @@ async def _on_startup(_: Any) -> None:
                 "EMAIL_INGESTION_ENABLED is true but EMAIL_IMAP_HOST/EMAIL_IMAP_USER/EMAIL_IMAP_PASSWORD "
                 "are not fully configured — email polling will not start."
             )
+    if LOG_INGESTION_ENABLED:
+        if LOG_WATCH_PATHS:
+            app.state.log_poll_task = asyncio.create_task(_log_poll_worker())
+        else:
+            logger.warning("LOG_INGESTION_ENABLED is true but LOG_WATCH_PATHS is empty — log polling will not start.")
 
 
 async def _on_shutdown(_: Any) -> None:
@@ -1334,6 +1422,13 @@ async def _on_shutdown(_: Any) -> None:
         email_task.cancel()
         try:
             await email_task
+        except asyncio.CancelledError:
+            pass
+    log_task = getattr(app.state, "log_poll_task", None)
+    if log_task is not None:
+        log_task.cancel()
+        try:
+            await log_task
         except asyncio.CancelledError:
             pass
 
@@ -4318,6 +4413,46 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 "generatorURL": str(item.get("generatorURL") or ""),
             },
         }
+        if CENTRALIZED_JIRA_ROUTING_ENABLED:
+            # Prometheus no longer shortcuts into the landing pad — it
+            # routes through centralized dedup and Jira create-or-update.
+            # Jira's own webhook (unchanged) is what eventually reaches the
+            # landing pad, once a human/Jira acts on the resulting ticket.
+            try:
+                result = await _route_alert_through_jira(mapped_payload, item, source="prometheus")
+                if result.get("routed"):
+                    queued_rows.append(
+                        {
+                            "status": status,
+                            "alertname": mapped_payload["name"],
+                            "service": mapped_payload["service"],
+                            "jira_issue_key": result.get("jira_issue_key"),
+                            "jira_action": result.get("action"),
+                        }
+                    )
+                else:
+                    _ALERTMANAGER_RECENT_DELIVERIES.pop(delivery_key, None)
+                    skipped_rows.append(
+                        {
+                            "status": status,
+                            "alertname": mapped_payload["name"],
+                            "service": mapped_payload["service"],
+                            "reason": str(result.get("reason") or "jira routing failed"),
+                        }
+                    )
+            except Exception as exc:
+                _ALERTMANAGER_RECENT_DELIVERIES.pop(delivery_key, None)
+                logger.exception("failed to route alertmanager alert through jira")
+                skipped_rows.append(
+                    {
+                        "status": status,
+                        "alertname": mapped_payload["name"],
+                        "service": mapped_payload["service"],
+                        "reason": f"jira routing failed: {exc}",
+                    }
+                )
+            continue
+
         try:
             landing_pad_input_file = _write_alert_to_landing_pad_input(mapped_payload, item)
             queued_rows.append(
@@ -4348,6 +4483,86 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
         "rows": queued_rows,
         "skipped_rows": skipped_rows,
     }
+
+
+def _jira_api_client() -> JiraClient | None:
+    if not (JIRA_API_BASE_URL and JIRA_API_EMAIL and JIRA_API_TOKEN and JIRA_PROJECT_KEY):
+        return None
+    return JiraClient(
+        base_url=JIRA_API_BASE_URL,
+        email=JIRA_API_EMAIL,
+        api_token=JIRA_API_TOKEN,
+        project_key=JIRA_PROJECT_KEY,
+    )
+
+
+async def _route_alert_through_jira(mapped_payload: dict[str, Any], raw_item: dict[str, Any], *, source: str) -> dict[str, Any]:
+    """The centralized dedup -> Jira decision point every ingestion path
+    (Prometheus, logs, email) routes through when
+    CENTRALIZED_JIRA_ROUTING_ENABLED is on, instead of publishing straight
+    to the landing pad. Looks up whether an open Jira ticket already exists
+    for this alert's fingerprint; creates a new issue if not, comments on
+    the existing one if so. Does NOT touch the landing pad, raw-alerts
+    queue, or _build_alert_from_payload — those only run later, when Jira's
+    own webhook (unchanged) calls back into /api/v1/alerts/jira.
+    """
+    client = _jira_api_client()
+    if client is None:
+        logger.warning("centralized jira routing enabled but JIRA_API_* is not fully configured; alert dropped")
+        return {"routed": False, "reason": "jira api not configured"}
+
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        logger.warning("centralized jira routing requires a database; alert dropped")
+        return {"routed": False, "reason": "database not available"}
+
+    normalized = normalize_landing_pad_alert(mapped_payload, raw_item)
+    fingerprint = compute_fingerprint(normalized)
+    summary = str(normalized.get("name") or "alert")
+    description = str(normalized.get("description") or summary)
+    severity = str(normalized.get("severity") or "warning")
+
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        existing = await repo.get_open_jira_ticket_link(fingerprint)
+        if existing is not None:
+            issue_key = str(existing["jira_issue_key"])
+            try:
+                # A ticket can be closed by a human directly in Jira between
+                # occurrences — check before commenting on a closed issue.
+                status_name = await client.get_issue_status(issue_key)
+                if status_name.strip().lower() in {"done", "closed", "resolved"}:
+                    await repo.close_jira_ticket_link(issue_key)
+                    existing = None
+            except JiraClientError:
+                logger.exception("failed to check jira issue status for %s", issue_key)
+
+        if existing is not None:
+            issue_key = str(existing["jira_issue_key"])
+            try:
+                await client.add_comment(
+                    issue_key,
+                    f"Recurring occurrence detected by KaiOps ({source}).\n\n{description}",
+                )
+                await repo.bump_jira_ticket_occurrence(fingerprint)
+                await session.commit()
+                return {"routed": True, "action": "commented", "jira_issue_key": issue_key, "fingerprint": fingerprint}
+            except JiraClientError:
+                logger.exception("failed to comment on jira issue %s", issue_key)
+                return {"routed": False, "reason": "jira comment failed", "jira_issue_key": issue_key}
+
+        try:
+            issue_key = await client.create_issue(
+                summary=summary,
+                description=description,
+                severity=severity,
+            )
+            await repo.save_jira_ticket_link(fingerprint=fingerprint, jira_issue_key=issue_key, source=source)
+            await session.commit()
+            return {"routed": True, "action": "created", "jira_issue_key": issue_key, "fingerprint": fingerprint}
+        except JiraClientError:
+            logger.exception("failed to create jira issue for fingerprint %s", fingerprint)
+            return {"routed": False, "reason": "jira create failed"}
 
 
 def _jira_priority_to_severity(priority_name: str) -> str:
