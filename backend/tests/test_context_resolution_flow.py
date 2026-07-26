@@ -119,6 +119,27 @@ async def test_context_agent_returns_requested_shape() -> None:
 
 
 @pytest.mark.asyncio
+async def test_context_agent_persists_multi_source_evidence_manifest() -> None:
+    alert = Alert(
+        source="prometheus",
+        name="TelemetryCollectorUnavailable",
+        service="otel-collector",
+        severity=AlertSeverity.CRITICAL,
+        description="Prometheus cannot scrape collector metrics endpoint",
+        labels={"project_name": "Telemetry", "application": "Telemetry"},
+    )
+    incident = Incident(service="otel-collector", severity=AlertSeverity.CRITICAL, title="collector unavailable")
+
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+
+    assert set(context.metadata["context_sources"]) >= {"logs", "tickets", "code", "rag"}
+    assert all(context.metadata["context_sources"][source]["attempted"] is True for source in ("logs", "tickets", "code", "rag"))
+    assert context.metadata["context_sources"]["rag"]["result_count"] == len(context.metadata["rag_matches"])
+    assert set(context.metadata["context_evidence"]) >= {"logs", "tickets", "code", "rag"}
+    assert context.metadata["context_evidence"]["rag"]
+
+
+@pytest.mark.asyncio
 async def test_resolution_agent_generates_recommendation() -> None:
     alert = Alert(
         source="prometheus",
