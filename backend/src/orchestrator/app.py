@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 from common.config import get_settings
 from common.event_publishers import RabbitMQPublisher, build_orchestration_envelope
@@ -21,6 +22,9 @@ settings.service_name = "orchestrator"
 agent = OrchestratorAgent()
 tasks: list[asyncio.Task] = []
 logger = get_logger(__name__)
+MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
+    os.getenv("MESSAGE_BUS_DUAL_CONSUME_ENABLED", "false")
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 async def _persist_orchestration_event(app: FastAPI, envelope: dict) -> None:
@@ -40,7 +44,7 @@ def _build_ingress_consumers() -> list[tuple[str, object, object]]:
     consumers: list[tuple[str, object, object]] = []
     for worker in range(workers):
         consumers.append((f"rabbitmq-w{worker + 1}", RabbitMQConsumer(settings, ENRICHED_ALERTS), consume_rabbitmq_forever))
-    if settings.kafka_enabled:
+    if settings.kafka_enabled and MESSAGE_BUS_DUAL_CONSUME_ENABLED:
         for worker in range(workers):
             consumers.insert(
                 worker,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -25,6 +26,9 @@ settings = get_settings()
 settings.service_name = "context-agent"
 agent = ContextIntelligenceAgent()
 tasks: list[asyncio.Task] = []
+MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
+    os.getenv("MESSAGE_BUS_DUAL_CONSUME_ENABLED", "false")
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _extract_message_bus_provider(payload: dict[str, Any]) -> str:
@@ -119,9 +123,10 @@ async def _persist_context_event(
                 },
                 payload={
                     "workflow": decision_payload.get("workflow"),
+                    "context": context.model_dump(mode="json"),
                     "deployment": context.deployment,
-                    "related_incidents": len(context.related_incidents),
-                    "dependency_services": len(context.dependency_services),
+                    "related_incidents": context.related_incidents,
+                    "dependency_services": context.dependency_services,
                     "document_available": bool(context.metadata.get("rag_service_tagged_match", False)),
                     "discovery_report": context.metadata.get("discovery_report", {}),
                     "discovery_evidence": context.metadata.get("discovery_evidence", {}),
@@ -207,7 +212,7 @@ def _build_ingress_consumers() -> list[tuple[str, object, object]]:
         consumers.append(
             (f"rabbitmq-w{worker + 1}", RabbitMQConsumer(settings, ORCHESTRATION_EVENTS), consume_rabbitmq_forever)
         )
-    if settings.kafka_enabled:
+    if settings.kafka_enabled and MESSAGE_BUS_DUAL_CONSUME_ENABLED:
         for worker in range(workers):
             consumers.insert(
                 worker,
@@ -217,8 +222,6 @@ def _build_ingress_consumers() -> list[tuple[str, object, object]]:
 
 
 async def startup(app: FastAPI) -> None:
-    vector_connector().reload()
-
     provider = str(getattr(settings, "event_bus_provider", "rabbitmq") or "rabbitmq").strip().lower()
     app.state.message_bus_publishers = {provider: app.state.producer, "rabbitmq": app.state.producer}
 
@@ -937,7 +940,7 @@ async def get_rag_document_content(path: str) -> dict[str, Any]:
 @app.post("/rag/reload")
 async def reload_rag() -> dict[str, Any]:
     connector = vector_connector()
-    count = connector.reload()
+    count = await asyncio.to_thread(connector.reload)
     rebuild_flow_catalog_from_rag(connector)
     return {"status": "reloaded", "document_count": count, "index": connector.index_info()}
 
