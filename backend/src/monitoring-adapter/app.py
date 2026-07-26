@@ -25,6 +25,8 @@ from ai_workbench_common.model_evaluation import build_quality_evaluation
 from common.models import (
     Alert,
     AlertSeverity,
+    EvidenceReference,
+    RawAlert,
     Incident,
     IncidentStatus,
     Approval,
@@ -44,6 +46,7 @@ from common.topics import (
     ALERT_RECEIVED,
     APPROVAL_REQUESTED,
     AUTOMATION_EXECUTED,
+    JIRA_INVESTIGATIONS,
     RAW_ALERTS,
     RESOLUTION_GENERATED,
 )
@@ -102,7 +105,14 @@ from monitoring_adapter.landing_pad_sources import SUPPORTED_SUFFIXES, load_land
 from monitoring_adapter.email_ingestion import ImapConfig, email_to_alert_payload, fetch_unseen_emails
 from monitoring_adapter.dedup import compute_fingerprint
 from monitoring_adapter.jira_client import JiraClient, JiraClientError
-from monitoring_adapter.log_ingestion import LogWatchState, fetch_new_log_lines, log_line_to_alert_payload
+from monitoring_adapter.jira_admission import JiraAdmissionState
+from monitoring_adapter.log_ingestion import (
+    LogWatchState,
+    OpenSearchLogState,
+    fetch_new_log_lines,
+    fetch_opensearch_error_logs,
+    log_line_to_alert_payload,
+)
 
 ALERT_BODY = Body(...)
 
@@ -110,6 +120,7 @@ settings = get_settings()
 settings.service_name = "monitoring-adapter"
 logger = get_logger(__name__)
 RECENT_ALERTS: deque[dict[str, Any]] = deque(maxlen=200)
+RECENT_INGESTION_EVENTS: deque[dict[str, Any]] = deque(maxlen=500)
 # Fallback only for deployments without database-backed workflow state.
 PENDING_WORKFLOWS: dict[str, dict[str, Any]] = {}
 CLOSED_INCIDENTS: deque[dict[str, Any]] = deque(maxlen=500)
@@ -304,6 +315,88 @@ LOG_WATCH_PATHS = [Path(item.strip()) for item in os.getenv("LOG_WATCH_PATHS", "
 LOG_POLL_INTERVAL_SECONDS = max(5.0, float(os.getenv("LOG_POLL_INTERVAL_SECONDS", "30") or 30))
 LOG_DEFAULT_SERVICE = str(os.getenv("LOG_DEFAULT_SERVICE", "log-ingestion") or "log-ingestion").strip()
 LOG_INGESTION_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "log_ingestion_state.json"
+OPENSEARCH_LOG_INGESTION_ENABLED = str(
+    os.getenv("OPENSEARCH_LOG_INGESTION_ENABLED", "false")
+).strip().lower() in {"1", "true", "yes", "on"}
+OPENSEARCH_LOG_URL = str(os.getenv("OPENSEARCH_LOG_URL", "http://host.docker.internal:9200") or "").strip()
+OPENSEARCH_LOG_INDEX = str(os.getenv("OPENSEARCH_LOG_INDEX", "otel-*") or "otel-*").strip()
+OPENSEARCH_LOG_DOCKER_API_URL = str(
+    os.getenv("OPENSEARCH_LOG_DOCKER_API_URL", "http://docker-socket-proxy:2375") or ""
+).strip()
+OPENSEARCH_LOG_POLL_INTERVAL_SECONDS = max(
+    10.0, float(os.getenv("OPENSEARCH_LOG_POLL_INTERVAL_SECONDS", "30") or 30)
+)
+OPENSEARCH_LOG_LOOKBACK_SECONDS = max(30, int(os.getenv("OPENSEARCH_LOG_LOOKBACK_SECONDS", "300") or 300))
+OPENSEARCH_LOG_BATCH_SIZE = max(1, min(int(os.getenv("OPENSEARCH_LOG_BATCH_SIZE", "100") or 100), 500))
+OPENSEARCH_LOG_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "opensearch_log_ingestion_state.json"
+OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING = str(
+    os.getenv("OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING", "true")
+).strip().lower() in {"1", "true", "yes", "on"}
+OPENSEARCH_LOG_JIRA_ROUTING_ENABLED = str(
+    os.getenv("OPENSEARCH_LOG_JIRA_ROUTING_ENABLED", "false")
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMETHEUS_JIRA_ROUTING_ENABLED = str(
+    os.getenv("PROMETHEUS_JIRA_ROUTING_ENABLED", "false")
+).strip().lower() in {"1", "true", "yes", "on"}
+EMAIL_JIRA_ROUTING_ENABLED = str(
+    os.getenv("EMAIL_JIRA_ROUTING_ENABLED", "false")
+).strip().lower() in {"1", "true", "yes", "on"}
+JIRA_TRIGGER_TROUBLESHOOTING = str(
+    os.getenv("JIRA_TRIGGER_TROUBLESHOOTING", "true")
+).strip().lower() in {"1", "true", "yes", "on"}
+JIRA_TRIGGER_ON_COMMENT = str(
+    os.getenv("JIRA_TRIGGER_ON_COMMENT", "false")
+).strip().lower() in {"1", "true", "yes", "on"}
+JIRA_ADMISSION_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "jira_admission_state.json"
+JIRA_RECURRENCE_WINDOW_SECONDS = max(
+    30, int(os.getenv("JIRA_RECURRENCE_WINDOW_SECONDS", "300") or 300)
+)
+JIRA_COMMENT_COOLDOWN_SECONDS = max(
+    0, int(os.getenv("JIRA_COMMENT_COOLDOWN_SECONDS", "900") or 900)
+)
+JIRA_MAX_NEW_ISSUES_PER_HOUR = max(
+    1, int(os.getenv("JIRA_MAX_NEW_ISSUES_PER_HOUR", "5") or 5)
+)
+JIRA_LOG_MIN_OCCURRENCES = max(1, int(os.getenv("JIRA_LOG_MIN_OCCURRENCES", "3") or 3))
+JIRA_PROMETHEUS_MIN_OCCURRENCES = max(
+    1, int(os.getenv("JIRA_PROMETHEUS_MIN_OCCURRENCES", "1") or 1)
+)
+JIRA_EMAIL_MIN_OCCURRENCES = max(1, int(os.getenv("JIRA_EMAIL_MIN_OCCURRENCES", "1") or 1))
+JIRA_ALLOWED_SEVERITIES = {
+    item.strip().lower()
+    for item in os.getenv("JIRA_ALLOWED_SEVERITIES", "warning,high,critical").split(",")
+    if item.strip()
+}
+NONACTIONABLE_ALERT_PUBLISH_ENABLED = str(
+    os.getenv("NONACTIONABLE_ALERT_PUBLISH_ENABLED", "false")
+).strip().lower() in {"1", "true", "yes", "on"}
+JIRA_ADMISSION = JiraAdmissionState(
+    JIRA_ADMISSION_STATE_FILE,
+    recurrence_window_seconds=JIRA_RECURRENCE_WINDOW_SECONDS,
+    comment_cooldown_seconds=JIRA_COMMENT_COOLDOWN_SECONDS,
+    max_new_issues_per_hour=JIRA_MAX_NEW_ISSUES_PER_HOUR,
+    min_occurrences={
+        "logs": JIRA_LOG_MIN_OCCURRENCES,
+        "prometheus": JIRA_PROMETHEUS_MIN_OCCURRENCES,
+        "email": JIRA_EMAIL_MIN_OCCURRENCES,
+    },
+)
+_PIPELINE_AUDIT_RECENT: dict[str, float] = {}
+
+
+def _should_audit_pipeline(fingerprint: str, outcome: str, *, ttl_seconds: float = 300.0) -> bool:
+    now = perf_counter()
+    key = f"{fingerprint}:{outcome}"
+    previous = _PIPELINE_AUDIT_RECENT.get(key)
+    if previous is not None and now - previous < ttl_seconds:
+        return False
+    _PIPELINE_AUDIT_RECENT[key] = now
+    if len(_PIPELINE_AUDIT_RECENT) > 10_000:
+        cutoff = now - ttl_seconds
+        for audit_key, seen_at in list(_PIPELINE_AUDIT_RECENT.items()):
+            if seen_at < cutoff:
+                _PIPELINE_AUDIT_RECENT.pop(audit_key, None)
+    return True
 
 # Email ingestion via IMAP polling — disabled unless explicitly enabled and
 # fully configured, since it requires real mailbox credentials.
@@ -322,6 +415,12 @@ EMAIL_IMAP_USE_SSL = str(os.getenv("EMAIL_IMAP_USE_SSL", "true")).strip().lower(
 EMAIL_POLL_INTERVAL_SECONDS = max(15.0, float(os.getenv("EMAIL_POLL_INTERVAL_SECONDS", "60") or 60))
 EMAIL_POLL_BATCH_SIZE = max(1, min(int(os.getenv("EMAIL_POLL_BATCH_SIZE", "25") or 25), 100))
 EMAIL_DEFAULT_SERVICE = str(os.getenv("EMAIL_DEFAULT_SERVICE", "email-inbox") or "email-inbox").strip()
+EMAIL_ALERT_SUBJECT_REGEX = str(
+    os.getenv(
+        "EMAIL_ALERT_SUBJECT_REGEX",
+        r"(?i)\b(alert|incident|critical|warning|error|failure|failed|down|sev[1-5]|p[1-5])\b",
+    )
+)
 
 WORKER_FAILURE_COUNTS: dict[str, int] = {
     "incident_projection_worker": 0,
@@ -329,6 +428,7 @@ WORKER_FAILURE_COUNTS: dict[str, int] = {
     "email_poll_worker": 0,
     "landing_pad_archive_worker": 0,
     "log_poll_worker": 0,
+    "opensearch_log_poll_worker": 0,
 }
 WORKER_FAILURE_THRESHOLD = max(1, int(os.getenv("WORKER_FAILURE_THRESHOLD", "5") or 5))
 _ALLOWED_PROJECT_ENVIRONMENTS = {"dev", "staging", "prod"}
@@ -413,6 +513,31 @@ def _persist_alert_to_landing_pad(
             "raw": raw_alert,
         }
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        RECENT_INGESTION_EVENTS.appendleft(
+            {
+                "file": file_name,
+                "path": str(out_path),
+                "modified_at": now.isoformat(),
+                "received_at": now.isoformat(),
+                "status": status,
+                "error": error,
+                "source": mapped_payload.get("source"),
+                "name": mapped_payload.get("name"),
+                "service": mapped_payload.get("service"),
+                "environment": mapped_payload.get("environment"),
+                "severity": mapped_payload.get("severity"),
+                "description": mapped_payload.get("description"),
+                "application": mapped_payload.get("application") or labels.get("application"),
+                "project": mapped_payload.get("project") or labels.get("project"),
+                "project_name": mapped_payload.get("project_name") or labels.get("project_name"),
+                "labels": labels,
+                "annotations": mapped_payload.get("annotations") or {},
+                "origin_system": mapped_payload.get("origin_system") or labels.get("origin_system"),
+                "ingestion_channel": mapped_payload.get("ingestion_channel") or labels.get("ingestion_channel"),
+                "alert_status": labels.get("alert_status"),
+                "alertname": labels.get("alertname"),
+            }
+        )
         return str(out_path)
     except Exception:
         logger.exception("failed to persist alert to landing pad %s", status)
@@ -1282,12 +1407,12 @@ async def _landing_pad_archive_worker() -> None:
 async def _process_polled_email(message: dict[str, Any]) -> None:
     mapped_payload = email_to_alert_payload(message, default_service=EMAIL_DEFAULT_SERVICE)
 
-    if CENTRALIZED_JIRA_ROUTING_ENABLED:
+    if CENTRALIZED_JIRA_ROUTING_ENABLED or EMAIL_JIRA_ROUTING_ENABLED:
         # Same reasoning as the Alertmanager path: email no longer
         # shortcuts into the landing pad — routes through centralized
         # dedup and Jira create-or-update instead.
         try:
-            await _route_alert_through_jira(mapped_payload, message, source="email")
+            await _route_and_trigger_investigation(mapped_payload, message, source="email")
         except Exception:
             logger.exception("failed to route polled email %s through jira", message.get("message_id"))
         return
@@ -1312,6 +1437,7 @@ async def _email_poll_worker() -> None:
         password=EMAIL_IMAP_PASSWORD,
         mailbox=EMAIL_IMAP_MAILBOX,
         use_ssl=EMAIL_IMAP_USE_SSL,
+        subject_pattern=EMAIL_ALERT_SUBJECT_REGEX,
     )
     while not stop_event.is_set():
         try:
@@ -1319,6 +1445,7 @@ async def _email_poll_worker() -> None:
             messages = await asyncio.to_thread(fetch_unseen_emails, imap_config, limit=EMAIL_POLL_BATCH_SIZE)
             for message in messages:
                 await _process_polled_email(message)
+            logger.info("email_poll_complete mailbox=%s fetched=%s", EMAIL_IMAP_MAILBOX, len(messages))
             _record_worker_success("email_poll_worker")
         except Exception as exc:
             _record_worker_failure("email_poll_worker", exc)
@@ -1333,11 +1460,26 @@ async def _process_log_line(record: dict[str, Any]) -> None:
     mapped_payload = log_line_to_alert_payload(record, default_service=LOG_DEFAULT_SERVICE)
     if mapped_payload is None:
         return  # not a failure line — no alert, no Jira ticket
-    if CENTRALIZED_JIRA_ROUTING_ENABLED:
+    jira_routing_enabled = CENTRALIZED_JIRA_ROUTING_ENABLED or (
+        OPENSEARCH_LOG_JIRA_ROUTING_ENABLED and str(record.get("source_path") or "").startswith("opensearch://")
+    )
+    if jira_routing_enabled:
         try:
-            await _route_alert_through_jira(mapped_payload, record, source="logs")
+            await _route_and_trigger_investigation(
+                mapped_payload,
+                record,
+                source="logs",
+                trigger_enabled=OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING,
+            )
         except Exception:
             logger.exception("failed to route log alert through jira: %s", record.get("source_path"))
+        return
+    if not NONACTIONABLE_ALERT_PUBLISH_ENABLED:
+        logger.info(
+            "jira_pipeline stage=classification outcome=live_stream_only source=logs log_source=%s "
+            "reason=jira routing disabled",
+            record.get("source_path"),
+        )
         return
     try:
         alert = _build_alert_from_payload(mapped_payload)
@@ -1369,6 +1511,31 @@ async def _log_poll_worker() -> None:
             continue
 
 
+async def _opensearch_log_poll_worker() -> None:
+    stop_event = app.state.monitoring_adapter_stop_event
+    state = OpenSearchLogState(OPENSEARCH_LOG_STATE_FILE)
+    while not stop_event.is_set():
+        try:
+            records = await fetch_opensearch_error_logs(
+                endpoint=OPENSEARCH_LOG_URL,
+                index_pattern=OPENSEARCH_LOG_INDEX,
+                state=state,
+                lookback_seconds=OPENSEARCH_LOG_LOOKBACK_SECONDS,
+                batch_size=OPENSEARCH_LOG_BATCH_SIZE,
+                docker_api_endpoint=OPENSEARCH_LOG_DOCKER_API_URL,
+            )
+            for record in records:
+                await _process_log_line(record)
+            _record_worker_success("opensearch_log_poll_worker")
+        except Exception as exc:
+            _record_worker_failure("opensearch_log_poll_worker", exc)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=float(OPENSEARCH_LOG_POLL_INTERVAL_SECONDS))
+        except asyncio.TimeoutError:
+            continue
+
+
 async def _on_startup(_: Any) -> None:
     app.state.monitoring_adapter_stop_event = asyncio.Event()
     if INCIDENT_PROJECTION_WORKER_ENABLED:
@@ -1390,6 +1557,13 @@ async def _on_startup(_: Any) -> None:
             app.state.log_poll_task = asyncio.create_task(_log_poll_worker())
         else:
             logger.warning("LOG_INGESTION_ENABLED is true but LOG_WATCH_PATHS is empty — log polling will not start.")
+    if OPENSEARCH_LOG_INGESTION_ENABLED:
+        if OPENSEARCH_LOG_URL:
+            app.state.opensearch_log_poll_task = asyncio.create_task(_opensearch_log_poll_worker())
+        else:
+            logger.warning(
+                "OPENSEARCH_LOG_INGESTION_ENABLED is true but OPENSEARCH_LOG_URL is empty; polling will not start."
+            )
 
 
 async def _on_shutdown(_: Any) -> None:
@@ -1429,6 +1603,13 @@ async def _on_shutdown(_: Any) -> None:
         log_task.cancel()
         try:
             await log_task
+        except asyncio.CancelledError:
+            pass
+    opensearch_log_task = getattr(app.state, "opensearch_log_poll_task", None)
+    if opensearch_log_task is not None:
+        opensearch_log_task.cancel()
+        try:
+            await opensearch_log_task
         except asyncio.CancelledError:
             pass
 
@@ -3456,14 +3637,14 @@ def _build_alert_from_payload(payload: dict[str, Any], trace_id: str | None = No
     )
 
 
-async def _publish_ingested_alert(alert: Alert) -> None:
+async def _publish_ingested_alert(alert: Alert, *, topic: str = RAW_ALERTS) -> None:
     payload = _build_raw_alert_event_payload(alert)
     started = perf_counter()
-    await app.state.producer.publish(RAW_ALERTS, payload, key=alert.service)
-    EVENT_PUBLISH_LATENCY.labels(settings.service_name, RAW_ALERTS, "monitoring-adapter").observe(
+    await app.state.producer.publish(topic, payload, key=alert.service)
+    EVENT_PUBLISH_LATENCY.labels(settings.service_name, topic, "monitoring-adapter").observe(
         max(0.0, perf_counter() - started)
     )
-    EVENT_CONTRACTS_EMITTED.labels(settings.service_name, RAW_ALERTS, "monitoring-adapter", "v1").inc()
+    EVENT_CONTRACTS_EMITTED.labels(settings.service_name, topic, "monitoring-adapter", "v1").inc()
     RECENT_ALERTS.appendleft(
         {
             "id": str(alert.id),
@@ -3483,6 +3664,61 @@ async def _publish_ingested_alert(alert: Alert) -> None:
 
 def _build_raw_alert_event_payload(alert: Alert) -> dict[str, Any]:
     incident_hint = str(alert.id)
+    source_event_id = str(
+        alert.labels.get("source_event_id")
+        or alert.labels.get("opensearch_document_id")
+        or alert.labels.get("email_message_id")
+        or alert.labels.get("jira_issue_id")
+        or alert.id
+    )
+    fingerprint = str(
+        alert.fingerprint
+        or compute_fingerprint(
+            {
+                "name": alert.name,
+                "service": alert.service,
+                "environment": alert.environment,
+                "labels": alert.labels,
+            }
+        )
+    )
+    raw_payload_ref = str(
+        alert.labels.get("landing_pad_ref")
+        or alert.labels.get("log_source_path")
+        or alert.annotations.get("generatorURL")
+        or f"landing-pad://{source_event_id}"
+    )
+    idempotency_key = hashlib.sha256(
+        f"raw-alert|{alert.source}|{source_event_id}|{fingerprint}".encode()
+    ).hexdigest()
+    raw_alert = RawAlert(
+        event_id=incident_hint,
+        source_event_id=source_event_id,
+        idempotency_key=idempotency_key,
+        source=alert.source,
+        source_type=str(alert.labels.get("source_type") or alert.source),
+        application=str(alert.labels.get("application") or alert.labels.get("project_name") or alert.service),
+        service=alert.service,
+        environment=alert.environment,
+        observed_severity=alert.severity,
+        title=alert.name,
+        description=alert.description,
+        observed_at=alert.starts_at,
+        raw_payload_ref=raw_payload_ref,
+        fingerprint=fingerprint,
+        labels={str(key): str(value) for key, value in alert.labels.items()},
+        annotations={str(key): str(value) for key, value in alert.annotations.items()},
+        evidence=[
+            EvidenceReference(
+                evidence_id=f"source:{source_event_id}",
+                source=alert.source,
+                uri=raw_payload_ref,
+                summary=alert.description[:1000],
+                observed_at=alert.starts_at,
+            )
+        ],
+        trace_id=alert.trace_id,
+    )
     event_contract = build_agent_event_contract(
         flow_id=incident_hint,
         incident_id=incident_hint,
@@ -3506,6 +3742,11 @@ def _build_raw_alert_event_payload(alert: Alert) -> dict[str, Any]:
     )
     return {
         "alert": alert,
+        "raw_alert": raw_alert,
+        "event_id": raw_alert.event_id,
+        "source_event_id": source_event_id,
+        "trace_id": alert.trace_id,
+        "idempotency_key": idempotency_key,
         "event_contract": event_contract,
     }
 
@@ -4413,13 +4654,13 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 "generatorURL": str(item.get("generatorURL") or ""),
             },
         }
-        if CENTRALIZED_JIRA_ROUTING_ENABLED:
+        if CENTRALIZED_JIRA_ROUTING_ENABLED or PROMETHEUS_JIRA_ROUTING_ENABLED:
             # Prometheus no longer shortcuts into the landing pad — it
             # routes through centralized dedup and Jira create-or-update.
             # Jira's own webhook (unchanged) is what eventually reaches the
             # landing pad, once a human/Jira acts on the resulting ticket.
             try:
-                result = await _route_alert_through_jira(mapped_payload, item, source="prometheus")
+                result = await _route_and_trigger_investigation(mapped_payload, item, source="prometheus")
                 if result.get("routed"):
                     queued_rows.append(
                         {
@@ -4496,6 +4737,156 @@ def _jira_api_client() -> JiraClient | None:
     )
 
 
+def _jira_issue_description(
+    normalized: dict[str, Any],
+    raw_item: dict[str, Any],
+    *,
+    source: str,
+    recurring: bool = False,
+) -> str:
+    labels = normalized.get("labels") if isinstance(normalized.get("labels"), dict) else {}
+    service = str(normalized.get("service") or labels.get("service") or "unknown-service")
+    severity = str(normalized.get("severity") or "warning").upper()
+    timestamp = str(raw_item.get("timestamp") or labels.get("startsAt") or "Not provided")
+    source_path = str(raw_item.get("source_path") or labels.get("log_source_path") or source)
+    trace_id = str(raw_item.get("trace_id") or labels.get("trace_id") or "").strip()
+    document_id = str(raw_item.get("document_id") or labels.get("opensearch_document_id") or "").strip()
+    error_signature = str(labels.get("error_signature") or "").strip()
+    details = str(normalized.get("description") or normalized.get("name") or "No error message provided").strip()
+
+    lines = [
+        "h2. Incident summary",
+        f"KaiOps {'detected another occurrence of' if recurring else 'detected'} an error affecting *{service}*.",
+        "",
+        "h2. Classification",
+        f"* Service: {service}",
+        f"* Severity: {severity}",
+        f"* Source: {source}",
+        f"* Detected at: {timestamp}",
+        f"* Environment: {normalized.get('environment') or 'unknown'}",
+        "",
+        "h2. Error details",
+        "{code}",
+        details[:5000],
+        "{code}",
+        "",
+        "h2. Evidence",
+        f"* Log source: {source_path}",
+    ]
+    if trace_id:
+        lines.append(f"* Trace ID: {trace_id}")
+    if document_id:
+        lines.append(f"* OpenSearch document ID: {document_id}")
+    if error_signature:
+        lines.append(f"* Deduplication signature: {error_signature}")
+    lines.extend(
+        [
+            "",
+            "h2. Automated troubleshooting",
+            "* Context collection requested",
+            "* Discovery checks requested",
+            "* Subsequent matching occurrences will be added as comments",
+        ]
+    )
+    return "\n".join(lines)
+
+
+async def _route_and_trigger_investigation(
+    mapped_payload: dict[str, Any],
+    raw_item: dict[str, Any],
+    *,
+    source: str,
+    trigger_enabled: bool = True,
+) -> dict[str, Any]:
+    """Persist raw evidence, apply a cheap recurrence gate, then run Discovery.
+
+    Jira is deliberately absent from this stage. Alert Intelligence owns the
+    post-Discovery actionability decision and Jira create-or-update operation.
+    """
+    normalized = normalize_landing_pad_alert(mapped_payload, raw_item)
+    fingerprint = compute_fingerprint(normalized)
+    severity = str(normalized.get("severity") or "warning").lower()
+    if severity not in JIRA_ALLOWED_SEVERITIES:
+        decision = None
+        result = {
+            "routed": False,
+            "action": "suppressed",
+            "reason": "severity not admitted for Discovery",
+            "fingerprint": fingerprint,
+            "occurrence_count": 1,
+        }
+    else:
+        decision = JIRA_ADMISSION.evaluate_for_discovery(
+            fingerprint=fingerprint,
+            source=source,
+            severity=severity,
+        )
+        result = {
+            "routed": decision.allowed,
+            "action": decision.action,
+            "reason": decision.reason,
+            "fingerprint": fingerprint,
+            "occurrence_count": decision.occurrence_count,
+        }
+    labels = dict(mapped_payload.get("labels") or {})
+    project_name = str(
+        labels.get("project_name")
+        or labels.get("application")
+        or mapped_payload.get("project_name")
+        or mapped_payload.get("application")
+        or ("KaiOps" if source in {"prometheus", "email"} else source)
+    )
+    labels.update(
+        {
+            "pipeline_outcome": str(result.get("action") or "failed"),
+            "pipeline_reason": str(result.get("reason") or ""),
+            "project_name": project_name,
+            "application": project_name,
+            "origin_system": source,
+            "source_event_id": str(
+                raw_item.get("document_id")
+                or raw_item.get("message_id")
+                or labels.get("alert_fingerprint")
+                or fingerprint
+            ),
+            "discovery_fingerprint": fingerprint,
+            "occurrence_count": str(result.get("occurrence_count") or 1),
+            "pipeline_stage": "pre_discovery_admission",
+        }
+    )
+    mapped_payload["labels"] = labels
+    _persist_alert_to_landing_pad(mapped_payload, raw_item, status="processed")
+    should_trigger = result.get("routed") and trigger_enabled and JIRA_TRIGGER_TROUBLESHOOTING
+    if not should_trigger:
+        logger.info(
+            "incident_pipeline stage=pre_discovery outcome=%s source=%s fingerprint=%s reason=%s",
+            result.get("action"),
+            source,
+            fingerprint,
+            result.get("reason") or "discovery disabled",
+        )
+        return result
+
+    labels.update(
+        {
+            "troubleshooting_requested": "true",
+            "pipeline_stage": "discovery_requested",
+        }
+    )
+    mapped_payload["labels"] = labels
+    alert = _build_alert_from_payload(mapped_payload)
+    await _publish_ingested_alert(alert, topic=RAW_ALERTS)
+    logger.info(
+        "incident_pipeline stage=discovery outcome=published source=%s fingerprint=%s alert_id=%s",
+        source,
+        fingerprint,
+        alert.id,
+    )
+    result["discovery_published"] = True
+    result["alert_id"] = str(alert.id)
+    return result
+
+
 async def _route_alert_through_jira(mapped_payload: dict[str, Any], raw_item: dict[str, Any], *, source: str) -> dict[str, Any]:
     """The centralized dedup -> Jira decision point every ingestion path
     (Prometheus, logs, email) routes through when
@@ -4519,12 +4910,41 @@ async def _route_alert_through_jira(mapped_payload: dict[str, Any], raw_item: di
     normalized = normalize_landing_pad_alert(mapped_payload, raw_item)
     fingerprint = compute_fingerprint(normalized)
     summary = str(normalized.get("name") or "alert")
-    description = str(normalized.get("description") or summary)
+    description = _jira_issue_description(normalized, raw_item, source=source)
     severity = str(normalized.get("severity") or "warning")
+    if severity.lower() not in JIRA_ALLOWED_SEVERITIES:
+        audited = _should_audit_pipeline(fingerprint, "severity_suppressed")
+        if audited:
+            logger.info(
+                "jira_pipeline stage=admission outcome=suppressed source=%s fingerprint=%s reason=severity severity=%s",
+                source,
+                fingerprint,
+                severity,
+            )
+        return {
+            "routed": False,
+            "action": "suppressed",
+            "reason": "severity not admitted",
+            "fingerprint": fingerprint,
+            "audited": audited,
+        }
 
     async with session_factory() as session:
         repo = IncidentRepository(session)
         existing = await repo.get_open_jira_ticket_link(fingerprint)
+        if existing is None:
+            try:
+                recovered_issue_key = await client.find_open_issue_by_label(f"kaiops-fingerprint-{fingerprint}")
+                if recovered_issue_key:
+                    await repo.save_jira_ticket_link(
+                        fingerprint=fingerprint,
+                        jira_issue_key=recovered_issue_key,
+                        source=source,
+                    )
+                    await session.commit()
+                    existing = await repo.get_open_jira_ticket_link(fingerprint)
+            except JiraClientError:
+                logger.exception("failed to search Jira for fingerprint %s", fingerprint)
         if existing is not None:
             issue_key = str(existing["jira_issue_key"])
             try:
@@ -4537,16 +4957,54 @@ async def _route_alert_through_jira(mapped_payload: dict[str, Any], raw_item: di
             except JiraClientError:
                 logger.exception("failed to check jira issue status for %s", issue_key)
 
+        decision = JIRA_ADMISSION.evaluate(
+            fingerprint=fingerprint,
+            source=source,
+            severity=severity,
+            has_open_ticket=existing is not None,
+        )
+        audited = decision.allowed or _should_audit_pipeline(fingerprint, decision.action)
+        if audited:
+            logger.info(
+                "jira_pipeline stage=admission outcome=%s source=%s fingerprint=%s occurrences=%s reason=%s",
+                decision.action,
+                source,
+                fingerprint,
+                decision.occurrence_count,
+                decision.reason,
+            )
+        if not decision.allowed:
+            return {
+                "routed": False,
+                "action": decision.action,
+                "reason": decision.reason,
+                "fingerprint": fingerprint,
+                "occurrence_count": decision.occurrence_count,
+                "audited": audited,
+            }
+
         if existing is not None:
             issue_key = str(existing["jira_issue_key"])
             try:
                 await client.add_comment(
                     issue_key,
-                    f"Recurring occurrence detected by KaiOps ({source}).\n\n{description}",
+                    _jira_issue_description(normalized, raw_item, source=source, recurring=True),
                 )
                 await repo.bump_jira_ticket_occurrence(fingerprint)
                 await session.commit()
-                return {"routed": True, "action": "commented", "jira_issue_key": issue_key, "fingerprint": fingerprint}
+                logger.info(
+                    "jira_pipeline stage=jira outcome=commented source=%s fingerprint=%s issue=%s",
+                    source,
+                    fingerprint,
+                    issue_key,
+                )
+                return {
+                    "routed": True,
+                    "action": "commented",
+                    "jira_issue_key": issue_key,
+                    "fingerprint": fingerprint,
+                    "audited": True,
+                }
             except JiraClientError:
                 logger.exception("failed to comment on jira issue %s", issue_key)
                 return {"routed": False, "reason": "jira comment failed", "jira_issue_key": issue_key}
@@ -4556,10 +5014,23 @@ async def _route_alert_through_jira(mapped_payload: dict[str, Any], raw_item: di
                 summary=summary,
                 description=description,
                 severity=severity,
+                labels={"fingerprint": fingerprint, "managed": "by-kaiops"},
             )
             await repo.save_jira_ticket_link(fingerprint=fingerprint, jira_issue_key=issue_key, source=source)
             await session.commit()
-            return {"routed": True, "action": "created", "jira_issue_key": issue_key, "fingerprint": fingerprint}
+            logger.info(
+                "jira_pipeline stage=jira outcome=created source=%s fingerprint=%s issue=%s",
+                source,
+                fingerprint,
+                issue_key,
+            )
+            return {
+                "routed": True,
+                "action": "created",
+                "jira_issue_key": issue_key,
+                "fingerprint": fingerprint,
+                "audited": True,
+            }
         except JiraClientError:
             logger.exception("failed to create jira issue for fingerprint %s", fingerprint)
             return {"routed": False, "reason": "jira create failed"}
@@ -4590,6 +5061,12 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
     reporter = fields.get("reporter", {}) if isinstance(fields.get("reporter"), dict) else {}
     assignee = fields.get("assignee", {}) if isinstance(fields.get("assignee"), dict) else {}
     webhook_event = str(payload.get("webhookEvent") or "").strip()
+    jira_labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
+    managed = "managed_by_kaiops" in jira_labels
+    kaiops_incident_label = next(
+        (str(label) for label in jira_labels if str(label).startswith("kaiops_incident_")),
+        "",
+    )
 
     mapped_payload = {
         "source": "jira",
@@ -4607,6 +5084,9 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
             "jira_reporter": str(reporter.get("displayName") or ""),
             "jira_assignee": str(assignee.get("displayName") or ""),
             "jira_webhook_event": webhook_event,
+            "managed_by_kaiops": str(managed).lower(),
+            "kaiops_incident_id": kaiops_incident_label.removeprefix("kaiops_incident_").replace("_", "-"),
+            "event_origin": "kaiops" if managed else "jira",
         },
         "annotations": {
             "summary": summary,
@@ -4616,11 +5096,27 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
     return mapped_payload, issue_key
 
 
+def _is_kaiops_managed_jira_update(payload: dict[str, Any]) -> bool:
+    issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
+    fields = issue.get("fields", {}) if isinstance(issue, dict) and isinstance(issue.get("fields"), dict) else {}
+    labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
+    comment = payload.get("comment", {}) if isinstance(payload.get("comment"), dict) else {}
+    comment_body = str(comment.get("body") or "")
+    return "managed_by_kaiops" in labels and (
+        "[kaiops-managed-update]" in comment_body
+        or str(payload.get("event_origin") or "").lower() == "kaiops"
+    )
+
+
 async def _process_jira_webhook(payload: dict[str, Any], trace_id: str | None) -> None:
     """Runs after the HTTP response has already been sent (via BackgroundTasks)
     so the webhook receiver can ack Jira with 200 immediately instead of
     making Jira wait on alert-build + publish + landing-pad persistence.
     """
+    if _is_kaiops_managed_jira_update(payload):
+        issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
+        logger.info("ignored KaiOps-originated Jira webhook issue=%s", issue.get("key"))
+        return
     try:
         mapped_payload, issue_key = _jira_payload_to_alert_payload(payload)
     except ValueError:
@@ -4910,7 +5406,7 @@ async def delete_onboarding_state(project_name: str, provider_name: str | None =
 
 
 @app.get("/landing-pad/recent")
-def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
+def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> dict[str, Any]:
     """Read landing-pad audit files on FastAPI's bounded worker threadpool.
 
     The archive can contain thousands of files during an alert burst. Keeping
@@ -4919,13 +5415,35 @@ def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
     unrelated health, alert, and rule API requests.
     """
     safe_limit = max(1, min(int(limit), 200))
+    live_rows = list(RECENT_INGESTION_EVENTS)[:safe_limit]
+    if live_rows:
+        return {
+            "processed_dir": str(LANDING_PAD_PROCESSED_DIR),
+            "failed_dir": str(LANDING_PAD_FAILED_DIR),
+            "partition_scheme": "YYYY/MM/DD",
+            "listing_lookback_days": 0,
+            "source": "live-memory-buffer",
+            "rows": live_rows,
+            "count": len(live_rows),
+        }
+    if not include_archive:
+        return {
+            "processed_dir": str(LANDING_PAD_PROCESSED_DIR),
+            "failed_dir": str(LANDING_PAD_FAILED_DIR),
+            "partition_scheme": "YYYY/MM/DD",
+            "listing_lookback_days": 0,
+            "source": "live-memory-buffer",
+            "rows": [],
+            "count": 0,
+        }
     LANDING_PAD_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     LANDING_PAD_FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
     recent_lookback_days = min(LANDING_PAD_LISTING_LOOKBACK_DAYS, 3)
     scan_cap = max(safe_limit * 3, 80)
 
-    files = sorted(
+    files = heapq.nlargest(
+        safe_limit,
         [
             *_collect_partitioned_json_files(
                 LANDING_PAD_PROCESSED_DIR,
@@ -4938,17 +5456,20 @@ def get_landing_pad_recent(limit: int = 20) -> dict[str, Any]:
                 max_files=scan_cap,
             ),
         ],
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )[:safe_limit]
+        key=lambda path: path.name,
+    )
 
     rows: list[dict[str, Any]] = []
     for path in files:
+        try:
+            filename_timestamp = datetime.strptime(path.name[:22], "%Y%m%dT%H%M%S%fZ").replace(tzinfo=timezone.utc)
+            modified_at = filename_timestamp.isoformat()
+        except ValueError:
+            modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
         entry: dict[str, Any] = {
             "file": path.name,
             "path": str(path),
-            "modified_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
-            "size_bytes": int(path.stat().st_size),
+            "modified_at": modified_at,
         }
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))

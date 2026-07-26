@@ -433,7 +433,22 @@ class ResolutionIntelligenceAgent(BaseAgent):
             if isinstance(context.metadata.get("discovery_report"), dict)
             else {}
         )
-        raw_evidence = discovery_report.get("evidence") if isinstance(discovery_report.get("evidence"), list) else []
+        raw_evidence = list(discovery_report.get("evidence")) if isinstance(discovery_report.get("evidence"), list) else []
+        context_evidence = (
+            context.metadata.get("context_evidence")
+            if isinstance(context.metadata.get("context_evidence"), dict)
+            else {}
+        )
+        for source_name in ("logs", "code", "tickets", "telemetry", "database", "rag"):
+            rows = context_evidence.get(source_name)
+            if isinstance(rows, list):
+                raw_evidence.extend(row for row in rows if isinstance(row, dict))
+        unique_evidence: dict[str, dict[str, Any]] = {}
+        for index, item in enumerate(raw_evidence):
+            if isinstance(item, dict):
+                key = str(item.get("evidence_id") or item.get("uri") or item.get("path") or index)
+                unique_evidence[key] = item
+        raw_evidence = list(unique_evidence.values())
         service_terms = {
             token
             for value in (context.alert.service, context.alert.name, *context.alert.labels.values())
@@ -458,10 +473,30 @@ class ResolutionIntelligenceAgent(BaseAgent):
                     "source": item.get("source"),
                     "uri": item.get("uri") or item.get("path"),
                     "snippet": str(item.get("snippet") or "")[:500],
+                    "diagnostic_signals": item.get("diagnostic_signals", []),
+                    "signal_counts": item.get("signal_counts", {}),
+                    "supporting_evidence": item.get("supporting_evidence", []),
                 }
             )
-            if len(relevant_evidence) >= 12:
+            if len(relevant_evidence) >= 24:
                 break
+
+        log_evidence = [
+            row for row in relevant_evidence if str(row.get("source") or "").lower() in {"log", "opensearch"}
+        ]
+        code_evidence = [row for row in relevant_evidence if str(row.get("source") or "").lower() == "code"]
+        discovery_analysis = (
+            discovery_report.get("report")
+            if isinstance(discovery_report.get("report"), dict)
+            else {}
+        )
+        detected_errors = (
+            discovery_analysis.get("detected_errors")
+            if isinstance(discovery_analysis.get("detected_errors"), list)
+            else discovery_report.get("detected_errors")
+            if isinstance(discovery_report.get("detected_errors"), list)
+            else []
+        )
 
         state["gathered_context"] = {
             "alert": {
@@ -473,6 +508,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
             },
             "observability": context.observability,
             "discovery_evidence": relevant_evidence,
+            "log_intelligence": log_evidence[:8],
+            "code_evidence": code_evidence[:8],
+            "detected_errors": detected_errors[:12],
             "deployment": context.deployment,
             "related_incidents": related_incident_preview,
             "runbook": runbook_preview,
@@ -528,6 +566,8 @@ class ResolutionIntelligenceAgent(BaseAgent):
             "metrics": context.observability,
             "dependencies": context.dependency_services[:8],
             "discovery_evidence": state["gathered_context"].get("discovery_evidence", []),
+            "log_intelligence": state["gathered_context"].get("log_intelligence", []),
+            "detected_errors": state["gathered_context"].get("detected_errors", []),
         }
         response = await self._generate_with_fallback(
             context=context,
@@ -693,6 +733,8 @@ class ResolutionIntelligenceAgent(BaseAgent):
         recommendation.metadata["evidence"] = [item.model_dump(mode="json") for item in evidence]
         recommendation.metadata["evidence_ids"] = [item.id for item in evidence]
         recommendation.metadata["reasoning"] = state.get("rationale", "")
+        recommendation.metadata["detected_errors"] = state.get("gathered_context", {}).get("detected_errors", [])
+        recommendation.metadata["detected_error_count"] = len(recommendation.metadata["detected_errors"])
         recommendation.metadata["service"] = str(context.alert.service or "")
         recommendation.metadata["environment"] = str(context.alert.environment or "prod")
         recommendation.metadata["remediation_target"] = str(state.get("remediation_target") or context.alert.service or "")

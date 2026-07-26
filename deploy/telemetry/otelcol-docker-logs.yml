@@ -1,0 +1,69 @@
+# Docker stdout/stderr collection for the local Telemetry environment.
+# This layer is loaded last, so pipeline arrays repeat the base processors and
+# observability exporters that the OpenTelemetry Collector merge semantics replace.
+receivers:
+  filelog/docker:
+    include:
+      - /var/lib/docker/containers/*/*.log
+    include_file_name: false
+    include_file_path: true
+    # Start new files at their live tail so an initial deployment does not bury
+    # current evidence beneath the host's entire Docker history. File-storage
+    # checkpoints retain offsets for known files, so normal collector restarts
+    # still replay records written while the collector was unavailable.
+    start_at: end
+    storage: file_storage
+    operators:
+      - type: json_parser
+        parse_from: body
+        timestamp:
+          parse_from: attributes.time
+          layout_type: gotime
+          layout: "2006-01-02T15:04:05.999999999Z07:00"
+      - type: move
+        from: attributes.log
+        to: body
+      - type: move
+        from: attributes.stream
+        to: attributes["log.iostream"]
+      - type: regex_parser
+        parse_from: attributes["log.file.path"]
+        regex: '^/var/lib/docker/containers/(?P<container_id>[^/]+)/.*\.log$'
+      - type: move
+        from: attributes.container_id
+        to: resource.attributes["container.id"]
+      - type: add
+        field: resource.attributes["project.name"]
+        value: telemetry
+      - type: add
+        field: resource.attributes["source.system"]
+        value: docker
+
+extensions:
+  file_storage:
+    directory: /var/lib/otelcol/storage
+    create_directory: true
+
+exporters:
+  opensearch:
+    # Buffer failed exports on disk while OpenSearch is starting or temporarily
+    # unavailable. The previous in-memory queue dropped these records.
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 0s
+    sending_queue:
+      enabled: true
+      storage: file_storage
+      queue_size: 10000
+
+service:
+  # This overlay is loaded last. Collector config arrays are replaced during
+  # merge, so retain the existing OpAMP extension as well as file storage.
+  extensions: [opamp, file_storage]
+  pipelines:
+    logs:
+      receivers: [otlp, filelog/docker]
+      processors: [resourcedetection, memory_limiter, transform/sanitize_logs]
+      exporters: [debug, opensearch]

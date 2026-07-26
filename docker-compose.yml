@@ -47,6 +47,27 @@ x-service-env: &service-env
   LOG_WATCH_PATHS: ${LOG_WATCH_PATHS:-}
   LOG_POLL_INTERVAL_SECONDS: ${LOG_POLL_INTERVAL_SECONDS:-30}
   LOG_DEFAULT_SERVICE: ${LOG_DEFAULT_SERVICE:-log-ingestion}
+  OPENSEARCH_LOG_INGESTION_ENABLED: ${OPENSEARCH_LOG_INGESTION_ENABLED:-false}
+  OPENSEARCH_LOG_URL: ${OPENSEARCH_LOG_URL:-http://host.docker.internal:9200}
+  OPENSEARCH_LOG_INDEX: ${OPENSEARCH_LOG_INDEX:-otel-*}
+  OPENSEARCH_LOG_DOCKER_API_URL: ${OPENSEARCH_LOG_DOCKER_API_URL:-http://docker-socket-proxy:2375}
+  OPENSEARCH_LOG_POLL_INTERVAL_SECONDS: ${OPENSEARCH_LOG_POLL_INTERVAL_SECONDS:-30}
+  OPENSEARCH_LOG_LOOKBACK_SECONDS: ${OPENSEARCH_LOG_LOOKBACK_SECONDS:-300}
+  OPENSEARCH_LOG_BATCH_SIZE: ${OPENSEARCH_LOG_BATCH_SIZE:-100}
+  OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING: ${OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING:-true}
+  OPENSEARCH_LOG_JIRA_ROUTING_ENABLED: ${OPENSEARCH_LOG_JIRA_ROUTING_ENABLED:-false}
+  PROMETHEUS_JIRA_ROUTING_ENABLED: ${PROMETHEUS_JIRA_ROUTING_ENABLED:-false}
+  EMAIL_JIRA_ROUTING_ENABLED: ${EMAIL_JIRA_ROUTING_ENABLED:-false}
+  JIRA_TRIGGER_TROUBLESHOOTING: ${JIRA_TRIGGER_TROUBLESHOOTING:-true}
+  JIRA_TRIGGER_ON_COMMENT: ${JIRA_TRIGGER_ON_COMMENT:-false}
+  JIRA_RECURRENCE_WINDOW_SECONDS: ${JIRA_RECURRENCE_WINDOW_SECONDS:-300}
+  JIRA_COMMENT_COOLDOWN_SECONDS: ${JIRA_COMMENT_COOLDOWN_SECONDS:-900}
+  JIRA_MAX_NEW_ISSUES_PER_HOUR: ${JIRA_MAX_NEW_ISSUES_PER_HOUR:-5}
+  JIRA_LOG_MIN_OCCURRENCES: ${JIRA_LOG_MIN_OCCURRENCES:-3}
+  JIRA_PROMETHEUS_MIN_OCCURRENCES: ${JIRA_PROMETHEUS_MIN_OCCURRENCES:-1}
+  JIRA_EMAIL_MIN_OCCURRENCES: ${JIRA_EMAIL_MIN_OCCURRENCES:-1}
+  JIRA_ALLOWED_SEVERITIES: ${JIRA_ALLOWED_SEVERITIES:-warning,high,critical}
+  NONACTIONABLE_ALERT_PUBLISH_ENABLED: ${NONACTIONABLE_ALERT_PUBLISH_ENABLED:-false}
   EMAIL_INGESTION_ENABLED: ${EMAIL_INGESTION_ENABLED:-false}
   EMAIL_IMAP_HOST: ${EMAIL_IMAP_HOST:-}
   EMAIL_IMAP_PORT: ${EMAIL_IMAP_PORT:-993}
@@ -57,6 +78,7 @@ x-service-env: &service-env
   EMAIL_POLL_INTERVAL_SECONDS: ${EMAIL_POLL_INTERVAL_SECONDS:-60}
   EMAIL_POLL_BATCH_SIZE: ${EMAIL_POLL_BATCH_SIZE:-25}
   EMAIL_DEFAULT_SERVICE: ${EMAIL_DEFAULT_SERVICE:-email-inbox}
+  EMAIL_ALERT_SUBJECT_REGEX: ${EMAIL_ALERT_SUBJECT_REGEX:-(?i)\b(alert|incident|critical|warning|error|failure|failed|down|sev[1-5]|p[1-5])\b}
   EVALUATION_SERVICE_URL: http://evaluation-service:8000
   API_GATEWAY_URL: http://api-gateway:8000
   APPLICATION_ONBOARDING_URL: http://application-onboarding:8000
@@ -336,6 +358,7 @@ services:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
+      docker-socket-proxy: { condition: service_started }
 
   monitoring-ingestion-worker:
     image: ${MONITORING_ADAPTER_IMAGE:-kaiops_pubsub-monitoring-adapter:latest}
@@ -499,6 +522,7 @@ services:
       # raised max-connections above).
       DB_POOL_SIZE: ${ALERT_INTELLIGENCE_DB_POOL_SIZE:-20}
       DB_MAX_OVERFLOW: ${ALERT_INTELLIGENCE_DB_MAX_OVERFLOW:-30}
+      MESSAGE_BUS_WORKER_COUNT: ${ALERT_INTELLIGENCE_WORKER_COUNT:-4}
       # MESSAGE_BUS_WORKER_COUNT (shared default above) spins up N competing
       # consumer tasks in this one process/event loop - raising it adds I/O
       # concurrency (more DB round-trips/publishes in flight) but NOT CPU
@@ -574,6 +598,10 @@ services:
       JIRA_USER_EMAIL: ${JIRA_USER_EMAIL:-}
       JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
       JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:-}
+      DOCKER_LOG_DISCOVERY_ENABLED: ${DOCKER_LOG_DISCOVERY_ENABLED:-true}
+      DOCKER_LOG_DISCOVERY_MAX_CONTAINERS: ${DOCKER_LOG_DISCOVERY_MAX_CONTAINERS:-40}
+      DOCKER_LOG_DISCOVERY_TAIL: ${DOCKER_LOG_DISCOVERY_TAIL:-250}
+      DOCKER_LOG_DISCOVERY_HOST: docker-socket-proxy:2375
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/discovery-mcp
     ports: ["8021:8000"]
@@ -581,8 +609,23 @@ services:
       - ./:/workspace:ro
       - ./fault-lab:/data/fault-lab:ro
       - ./backend/ingested_alerts:/data/landing:ro
-      - ./backend/ingested_alerts:/data/landing:ro
       - ${KAI_OPS_TICKET_SAMPLE_PATH:-./backend/ingested_alerts}:/data/tickets:ro
+    depends_on:
+      docker-socket-proxy: { condition: service_started }
+
+  # Exposes a *read-only, containers-only* view of the Docker API over TCP so discovery-mcp
+  # never touches /var/run/docker.sock directly. A raw socket mount (even with ":ro" on the
+  # bind mount) grants the full Docker API -- create/exec/mount -- which is host-root
+  # equivalent; this proxy only allows GET requests against /containers*.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.2.0
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      POST: 0
+      LOG_LEVEL: warning
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
 
   model-router:
     build: *service-build

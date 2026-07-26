@@ -13,7 +13,7 @@ SPEC.loader.exec_module(module)
 
 def test_mcp_lists_read_only_discovery_tools() -> None:
     names = {row["name"] for row in module.TOOLS}
-    assert names == {"logs.search", "tickets.search", "code.search", "mysql.search"}
+    assert names == {"logs.search", "tickets.search", "code.search", "mysql.search", "telemetry.search"}
 
 
 def test_code_tool_returns_cited_redacted_evidence(tmp_path: Path, monkeypatch) -> None:
@@ -40,3 +40,41 @@ def test_ticket_tool_searches_jira_csv(tmp_path: Path, monkeypatch) -> None:
 
     assert result["result_count"] == 1
     assert result["evidence"][0]["evidence_id"].startswith("TICKET-")
+
+
+def test_code_search_uses_service_path_as_relevance_signal(tmp_path: Path, monkeypatch) -> None:
+    service_root = tmp_path / "otel-collector"
+    service_root.mkdir()
+    (service_root / "collector-config.yaml").write_text("receivers:\n  otlp:\n", encoding="utf-8")
+    monkeypatch.setenv("DISCOVERY_MCP_CODE_ROOTS", str(tmp_path))
+
+    result = module._call_tool("code.search", {"terms": ["otel-collector"], "limit": 4})
+
+    assert result["result_count"] > 0
+    assert "otel-collector" in result["evidence"][0]["uri"]
+
+
+def test_log_diagnosis_extracts_structured_signals() -> None:
+    evidence = [
+        module._evidence(
+            "log",
+            Path("runtime/service.log"),
+            1,
+            "dependency connection refused after request timeout",
+            ["service"],
+        )
+    ]
+
+    diagnosis = module._log_diagnosis(evidence, "api-gateway")
+
+    assert diagnosis is not None
+    assert diagnosis["signal_type"] == "log_diagnosis"
+    assert {"connection_refused", "timeout"} <= set(diagnosis["diagnostic_signals"])
+    assert diagnosis["supporting_evidence"] == [evidence[0]["evidence_id"]]
+
+
+def test_docker_multiplexed_log_stream_is_decoded() -> None:
+    line = b"2026-07-26T06:18:49Z Failed to export metrics: Deadline Exceeded\n"
+    frame = bytes([2, 0, 0, 0]) + len(line).to_bytes(4, "big") + line
+
+    assert module._decode_docker_log_stream(frame) == line.decode()

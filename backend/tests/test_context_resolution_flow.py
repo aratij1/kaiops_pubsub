@@ -4,7 +4,7 @@ import pytest
 from ai_workbench_common.memory_store import InMemoryStore
 from common.models import Alert, AlertSeverity, Incident
 from context_agent import ContextIntelligenceAgent
-from context_agent.connectors import VectorDBConnector
+from context_agent.connectors import DiscoveryMCPConnector, VectorDBConnector
 from model_router import ModelRouter
 from model_router.router import ModelProvider, ModelResponse, build_usage
 from resolution_agent import ResolutionIntelligenceAgent
@@ -52,6 +52,34 @@ class FallbackGateway:
                 "fallback": True,
             },
         }
+
+
+def test_discovery_promotes_application_errors_into_report_findings() -> None:
+    rows = [
+        {
+            "evidence_id": "LOG-timeout",
+            "source": "log",
+            "service": "recommendation",
+            "container": "telemetry-recommendation",
+            "uri": "docker://telemetry-recommendation#L1",
+            "snippet": "2026-07-26T06:18:49Z Failed to export metrics: Deadline Exceeded",
+            "diagnostic_signals": ["timeout", "error"],
+        },
+        {
+            "evidence_id": "LOG-summary",
+            "source": "log",
+            "signal_type": "log_diagnosis",
+            "snippet": "Structured log diagnosis",
+            "diagnostic_signals": ["timeout"],
+        },
+    ]
+
+    findings = DiscoveryMCPConnector._detected_errors(rows)
+
+    assert len(findings) == 1
+    assert findings[0]["service"] == "recommendation"
+    assert findings[0]["evidence_id"] == "LOG-timeout"
+    assert findings[0]["signals"] == ["timeout", "error"]
 
 
 def static_router() -> ModelRouter:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import email
 import imaplib
 import logging
+import re
 from dataclasses import dataclass
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
@@ -20,6 +21,8 @@ class ImapConfig:
     mailbox: str = "INBOX"
     use_ssl: bool = True
     mark_seen: bool = True
+    timeout_seconds: float = 20.0
+    subject_pattern: str = r"(?i)\b(alert|incident|critical|warning|error|failure|failed|down|sev[1-5]|p[1-5])\b"
 
 
 def _decode_mime_header(value: str | None) -> str:
@@ -61,7 +64,7 @@ def fetch_unseen_emails(config: ImapConfig, *, limit: int = 25) -> list[dict[str
     """
     results: list[dict[str, Any]] = []
     connection_cls = imaplib.IMAP4_SSL if config.use_ssl else imaplib.IMAP4
-    connection = connection_cls(config.host, config.port)
+    connection = connection_cls(config.host, config.port, timeout=max(1.0, config.timeout_seconds))
     try:
         connection.login(config.username, config.password)
         connection.select(config.mailbox)
@@ -76,6 +79,9 @@ def fetch_unseen_emails(config: ImapConfig, *, limit: int = 25) -> list[dict[str
                 continue
             raw_message = msg_data[0][1]
             message = email.message_from_bytes(raw_message)
+            subject = _decode_mime_header(message.get("Subject")) or "(no subject)"
+            if config.subject_pattern and re.search(config.subject_pattern, subject) is None:
+                continue
             received_at = ""
             try:
                 date_header = message.get("Date")
@@ -86,7 +92,7 @@ def fetch_unseen_emails(config: ImapConfig, *, limit: int = 25) -> list[dict[str
             results.append(
                 {
                     "message_id": _decode_mime_header(message.get("Message-ID")) or message_id.decode("utf-8", errors="replace"),
-                    "subject": _decode_mime_header(message.get("Subject")) or "(no subject)",
+                    "subject": subject,
                     "from": _decode_mime_header(message.get("From")),
                     "to": _decode_mime_header(message.get("To")),
                     "received_at": received_at,
