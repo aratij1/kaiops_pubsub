@@ -43,6 +43,7 @@ class ResolutionState(TypedDict, total=False):
     root_cause: str
     impact: str
     recommended_action: str
+    remediation_target: str
     confidence: float
     rationale: str
     commands: list[str]
@@ -78,7 +79,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
         self.evaluation_client = evaluation_client or AzureAIEvaluationClient(settings)
         self.evaluation_service_url = settings.evaluation_service_url
         # Bound each model call so a single blocked provider cannot stall event consumption.
-        self.model_step_timeout_seconds = 20.0
+        # Mirrors settings.llm_request_timeout_seconds so operators can raise/lower both the
+        # gateway's own timeout and this step-level guard from one place.
+        self.model_step_timeout_seconds = settings.llm_request_timeout_seconds
         # Keeps strong references to fire-and-forget evaluation-publish tasks so they
         # aren't garbage-collected mid-flight; discarded automatically once done.
         self._background_tasks: set[asyncio.Task[None]] = set()
@@ -94,21 +97,35 @@ class ResolutionIntelligenceAgent(BaseAgent):
             return []
         commands: list[str] = []
         seen: set[str] = set()
-        preferred_section = re.search(
-            r"##\s*Remediation Script\s*```(?:bash|sh|shell)?\s*([\s\S]*?)```",
+        # context-agent's write_rag_document emits one fenced ```bash block per remediation
+        # step under a single "## Remediation Script" heading (see context-agent/app.py,
+        # _execution_script_lines/write_rag_document). Scope to that section, then pull every
+        # fence inside it -- a single non-greedy regex spanning to the first ``` would only
+        # ever see the first step and silently drop the rest of a multi-command runbook.
+        section_match = re.search(
+            r"##\s*Remediation Script\s*([\s\S]*?)(?=\n##\s|\Z)",
             str(runbook),
             flags=re.IGNORECASE,
         )
-        if preferred_section:
-            script = " ".join(
-                line.strip()
-                for line in preferred_section.group(1).splitlines()
-                if line.strip() and not line.strip().startswith("#")
-            ).strip()
-            if script:
-                commands.append(script)
-                seen.add(script.lower())
-                return commands[:max_items]
+        if section_match:
+            fences = re.findall(
+                r"```(?:bash|sh|shell)?\s*([\s\S]*?)```",
+                section_match.group(1),
+                flags=re.IGNORECASE,
+            )
+            for fence in fences:
+                script = "; ".join(
+                    line.strip()
+                    for line in fence.splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                ).strip()
+                if script and script.lower() not in seen:
+                    commands.append(script)
+                    seen.add(script.lower())
+                if len(commands) >= max_items:
+                    return commands
+            if commands:
+                return commands
         for line in str(runbook).splitlines():
             token = line.strip().lstrip("- ").strip().strip("`")
             if not token:
@@ -606,6 +623,8 @@ class ResolutionIntelligenceAgent(BaseAgent):
             score += 0.05
         if state.get("commands"):
             score += 0.05
+        if state.get("gathered_context", {}).get("discovery_evidence"):
+            score += 0.05
 
         fallback_hits = 0
         for usage in state.get("model_usage", []):
@@ -623,6 +642,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
     async def resolve(self, context: Context) -> Recommendation:
         state = await self.graph.ainvoke({"context": context})
         runbook_present = bool((context.runbook or "").strip())
+        discovery_evidence = state.get("gathered_context", {}).get("discovery_evidence") or []
         evidence = [
             Evidence(
                 id=f"ctx:{context.incident_id}",
@@ -641,6 +661,22 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 content={"preview": (context.runbook or "")[:180]},
             ),
         ]
+        if discovery_evidence:
+            # collect_context already filtered discovery-mcp evidence down to items relevant
+            # to this alert's service/labels; surface that grounding on the recommendation
+            # instead of letting it disappear once the RCA/impact/fix prompts consume it.
+            evidence.append(
+                Evidence(
+                    id=f"discovery:{context.incident_id}",
+                    type="discovery",
+                    source="discovery-mcp",
+                    confidence=0.8,
+                    metadata={"item_count": len(discovery_evidence)},
+                    content={
+                        "sources": [str(item.get("source") or "") for item in discovery_evidence[:6] if item.get("source")],
+                    },
+                )
+            )
         recommendation = Recommendation(
             incident_id=context.incident_id,
             root_cause=state["root_cause"],
@@ -672,10 +708,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
             "requires_human_review": bool(fallback_usages) or recommendation.confidence < 0.75,
             "reason": "model fallback used" if fallback_usages else "confidence policy",
         }
-        recommendation.metadata["citations"] = [
-            f"runbook://{context.alert.service}",
-            f"incident://{context.incident_id}",
-        ]
+        citations = [f"incident://{context.incident_id}"]
+        if runbook_present:
+            citations.append(f"runbook://{context.alert.service}")
+        if discovery_evidence:
+            citations.append(f"discovery://{context.incident_id}")
+        recommendation.metadata["citations"] = citations
         external_judge = await self._judge_groundedness(
             prediction=f"{recommendation.root_cause} {recommendation.recommended_action} {recommendation.rationale}",
             context_text=context.runbook or "",
