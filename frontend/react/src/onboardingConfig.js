@@ -23,11 +23,11 @@ export const ONBOARDING_SOURCE_DOC_SAMPLE_FILES = {
 };
 
 export const ROLE_ALLOWED_TABS = {
-  administrator: ["home", "copilot", "approval", "executive", "admin", "trace", "safety", "rag", "closed", "summary"],
-  l1_operator: ["home"],
-  l2_engineer: ["home", "copilot", "approval", "trace", "safety", "rag", "closed", "summary"],
-  l3_engineer: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "closed", "summary"],
-  executive: ["home", "copilot", "approval", "executive", "trace", "safety", "rag", "closed", "summary"],
+  administrator: ["home", "stream", "copilot", "approval", "executive", "admin", "trace", "safety", "rag", "closed", "summary"],
+  l1_operator: ["home", "stream"],
+  l2_engineer: ["home", "stream", "copilot", "approval", "trace", "safety", "rag", "closed", "summary"],
+  l3_engineer: ["home", "stream", "copilot", "approval", "executive", "trace", "safety", "rag", "closed", "summary"],
+  executive: ["home", "stream", "copilot", "approval", "executive", "trace", "safety", "rag", "closed", "summary"],
 };
 
 export const APPROVAL_NAV_PRIMARY_ROLES = new Set(["administrator"]);

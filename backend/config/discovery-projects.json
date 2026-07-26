@@ -15,7 +15,7 @@
         "opensearch_index": "otel-*"
       },
       "ticket_sources": {
-        "zammad_url": "http://host.docker.internal:8081",
+        "jira_url": "",
         "landing_pad": "/data/landing/documents"
       },
       "email_sources": {

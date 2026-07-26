@@ -1263,6 +1263,86 @@ class ContextIntelligenceAgent(BaseAgent):
         local_evidence = by_name.get("local-evidence", {}) if isinstance(by_name.get("local-evidence"), dict) else {}
         discovery_report = by_name.get("discovery-mcp", {}) if isinstance(by_name.get("discovery-mcp"), dict) else {}
         discovery_report = self._merge_discovery_results(alert, discovery_report, local_evidence)
+        discovery_rows = discovery_report.get("evidence") if isinstance(discovery_report.get("evidence"), list) else []
+        retrieval_stages = discovery_report.get("retrieval_stages") if isinstance(discovery_report.get("retrieval_stages"), list) else []
+        source_aliases = {
+            "log": "logs",
+            "logs": "logs",
+            "opensearch": "logs",
+            "ticket": "tickets",
+            "tickets": "tickets",
+            "jira": "tickets",
+            "email": "tickets",
+            "code": "code",
+            "source": "code",
+            "telemetry": "telemetry",
+            "trace": "telemetry",
+            "metric": "telemetry",
+            "mysql": "database",
+            "database": "database",
+        }
+        evidence_buckets: dict[str, list[dict[str, Any]]] = {
+            "logs": [],
+            "tickets": [],
+            "code": [],
+            "telemetry": [],
+            "database": [],
+            "rag": [],
+            "other": [],
+        }
+        for row in discovery_rows:
+            if not isinstance(row, dict):
+                continue
+            source = str(row.get("source") or row.get("kind") or "other").strip().lower()
+            bucket = source_aliases.get(source, "other")
+            evidence_buckets[bucket].append(row)
+        evidence_buckets["rag"] = [
+            {
+                "source": "rag",
+                "kind": doc.get("kind"),
+                "title": doc.get("title"),
+                "path": doc.get("path"),
+                "snippet": str(doc.get("content") or doc.get("summary") or "")[:500],
+                "similarity": float(doc.get("_similarity", 0.0) or 0.0),
+                "match_confidence": float(doc.get("match_confidence", doc.get("_similarity", 0.0)) or 0.0),
+            }
+            for doc in vector_matches
+        ]
+        stage_by_name = {
+            str(stage.get("stage") or "").strip().lower(): stage
+            for stage in retrieval_stages
+            if isinstance(stage, dict)
+        }
+        source_stage_names = {
+            "logs": ("logs_search", "local_log_search"),
+            "tickets": ("tickets_search",),
+            "code": ("code_search", "local_code_search"),
+            "telemetry": ("telemetry_search",),
+            "database": ("mysql_search",),
+        }
+        context_source_manifest: dict[str, dict[str, Any]] = {}
+        for source_name, rows in evidence_buckets.items():
+            attempted_stages = [
+                stage_by_name[stage_name]
+                for stage_name in source_stage_names.get(source_name, ())
+                if stage_name in stage_by_name
+            ]
+            context_source_manifest[source_name] = {
+                "attempted": source_name == "rag" or bool(attempted_stages),
+                "status": (
+                    "collected"
+                    if rows
+                    else "failed"
+                    if any(str(stage.get("status") or "").lower() == "failed" for stage in attempted_stages)
+                    else "no_matches"
+                ),
+                "result_count": len(rows),
+                "evidence_ids": [
+                    str(row.get("evidence_id"))
+                    for row in rows
+                    if str(row.get("evidence_id") or "").strip()
+                ],
+            }
         context = Context(
             incident_id=incident.id,
             alert=alert,
@@ -1296,6 +1376,8 @@ class ContextIntelligenceAgent(BaseAgent):
                 "rag_index": vector_connector.index_info() if vector_connector else {},
                 "discovery_evidence": local_evidence,
                 "discovery_report": discovery_report,
+                "context_sources": context_source_manifest,
+                "context_evidence": evidence_buckets,
                 "context_graph": {
                     "enabled": True,
                     "stages": [*state.get("graph_stages", []), "assemble_context"],
