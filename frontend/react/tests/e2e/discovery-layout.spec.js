@@ -95,6 +95,16 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await page.getByRole("button", { name: "Sign In" }).click();
 
   await expect(page.getByRole("heading", { name: "KaiOps + Telemetry" })).toBeVisible();
+  await page.getByTitle("Alert Ingestion Stream").click();
+  await expect(page.getByRole("heading", { name: "Alert Ingestion Stream", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Email/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Logs \/ OpenSearch/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Prometheus/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Tickets \/ Jira/ })).toBeVisible();
+  await expect(page.locator(".ingestion-event.channel-email").filter({ hasText: "Pod crash loop" })).toBeVisible();
+  await expect(page.getByText("Checkout log error burst", { exact: true })).toBeVisible();
+  await page.getByTitle("Dashboard", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "KaiOps + Telemetry" })).toBeVisible();
   await expect(page.getByText("Pod crash loop", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("button", { name: "Open alert 11111111-1111-4111-8111-111111111111" })).toHaveCount(1);
   await expect(page.getByRole("button", { name: "Open alert email-pod-crash-duplicate.eml" })).toHaveCount(0);
@@ -113,6 +123,8 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await expect(firstAlert).toBeVisible({ timeout: 30_000 });
   await firstAlert.locator("button").first().click();
 
+  await expect(page.locator(".alert-details-cockpit .detail-context")).toContainText("11111111-1111-4111-8111-111111111111");
+  await expect(page.locator(".alert-details-cockpit .detail-context")).not.toContainText("email-pod-crash-duplicate.eml");
   await expect(page.getByRole("button", { name: "Incident Workspace", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Evidence", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Actions", exact: true })).toHaveCount(0);
@@ -136,12 +148,25 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await expect(discoveryTab).toBeVisible();
   await discoveryTab.click();
   await expect(page.getByRole("heading", { name: "Discovery + Context", exact: true })).toBeVisible();
-  await expect(page.locator(".analysis-journey")).toContainText("Connect context");
-  await expect(page.locator(".analysis-journey")).toContainText("Evidence-backed response");
+  await expect(page.locator(".investigation-story")).toContainText("Alert becomes a search plan");
+  await expect(page.locator(".investigation-story")).toContainText("Tools return source facts");
+  await expect(page.locator(".investigation-story")).toContainText("Facts are connected to operations");
+  await expect(page.locator(".investigation-story")).toContainText("RCA and impact are derived");
+  await expect(page.locator(".investigation-story")).toContainText("Evidence becomes an action");
+  const [completeDownload] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("button", { name: "Download complete investigation" }).click(),
+  ]);
+  expect(completeDownload.suggestedFilename()).toBe("kaiops-complete-investigation.json");
+  const [evidenceDownload] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("button", { name: "Download evidence & logs" }).click(),
+  ]);
+  expect(evidenceDownload.suggestedFilename()).toBe("kaiops-02-discover.json");
   await expect(page.getByText("Memory pressure in user-profile", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Evidence used", { exact: true }).first()).toBeVisible();
   await expect(page.getByText(/```json/)).toHaveCount(0);
-  await page.getByText("Technical deep dive", { exact: true }).click();
+  await page.getByText("Open technical retrieval trace", { exact: true }).click();
   await expect(page.locator(".combined-analysis-grid")).toBeVisible();
 
   const desktopOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1);

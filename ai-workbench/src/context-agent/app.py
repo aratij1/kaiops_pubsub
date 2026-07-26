@@ -125,6 +125,8 @@ async def _persist_context_event(
                     "document_available": bool(context.metadata.get("rag_service_tagged_match", False)),
                     "discovery_report": context.metadata.get("discovery_report", {}),
                     "discovery_evidence": context.metadata.get("discovery_evidence", {}),
+                    "context_sources": context.metadata.get("context_sources", {}),
+                    "context_evidence": context.metadata.get("context_evidence", {}),
                 },
             )
         )
@@ -167,6 +169,7 @@ def _build_context_event_payload(
             "transport_provider": provider_used,
             "topic": CONTEXT_EVENTS,
             "rag_document_count": context.metadata.get("rag_documents", 0),
+            "context_sources": context.metadata.get("context_sources", {}),
             "discovery": {
                 "protocol": discovery.get("protocol"),
                 "summary": report.get("summary"),

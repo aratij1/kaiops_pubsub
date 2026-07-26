@@ -561,8 +561,17 @@ function alertTimeMs(row) {
   );
 }
 
-function alertIdentityKey(row) {
+function alertIdentityKeys(row) {
+  // Different sources populate different identity fields for the *same* real-world alert:
+  // a landing-pad file listing carries no fingerprint/incident_id at all (see
+  // _landing_pad_file_rows on the backend, which never surfaces labels), while the
+  // primary /alerts/all API row for that same alert does. Returning every candidate key
+  // (instead of picking just the single highest-priority one) lets the caller union two
+  // rows together if ANY key overlaps, rather than requiring both sides to agree on which
+  // identity field happened to be available.
   const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
+  const keys = [];
+
   const fingerprint = String(
     row?.fingerprint
     || row?.alert_fingerprint
@@ -571,25 +580,38 @@ function alertIdentityKey(row) {
     || ""
   ).trim();
   if (fingerprint) {
-    return `fingerprint:${fingerprint.toLowerCase()}`;
+    keys.push(`fingerprint:${fingerprint.toLowerCase()}`);
   }
 
   const incidentId = String(row?.incident_id || "").trim();
   if (incidentId) {
-    return `incident:${incidentId.toLowerCase()}`;
+    keys.push(`incident:${incidentId.toLowerCase()}`);
   }
 
   const correlation = String(row?.correlation_id || row?.trace_id || "").trim();
   if (correlation) {
-    return `correlation:${correlation.toLowerCase()}`;
+    keys.push(`correlation:${correlation.toLowerCase()}`);
   }
 
   const name = String(row?.name || row?.alert_name || labels?.alertname || "").trim().toLowerCase();
   const service = String(row?.service || labels?.service || labels?.job || "").trim().toLowerCase();
-  const severity = String(row?.severity || labels?.severity || "").trim().toLowerCase();
-  const timestampMs = alertTimeMs(row);
-  const bucket = timestampMs > 0 ? Math.floor(timestampMs / (5 * 60 * 1000)) : 0;
-  return `composite:${name}|${service}|${severity}|${bucket}`;
+  if (name && service) {
+    const severity = String(row?.severity || labels?.severity || "").trim().toLowerCase();
+    const timestampMs = alertTimeMs(row);
+    const bucket = timestampMs > 0 ? Math.floor(timestampMs / (5 * 60 * 1000)) : 0;
+    keys.push(`composite:${name}|${service}|${severity}|${bucket}`);
+  }
+
+  return keys;
+}
+
+function alertApplicationCandidate(row) {
+  const application = String(row?.application || "").trim();
+  const service = String(row?.service || "").trim();
+  // An application value that's just a copy of the service name is almost always a bad
+  // fallback (some mappers default "application" to "service" when the real project/app
+  // name is unknown), not a genuine project label -- don't let it win over a real one.
+  return application && application.toLowerCase() !== service.toLowerCase() ? application : "";
 }
 
 function alertRowScore(row) {
@@ -600,13 +622,48 @@ function alertRowScore(row) {
   return openScore + dataScore;
 }
 
+function resolveCanonicalAlertRow(row, candidates) {
+  if (!row || typeof row !== "object") {
+    return row;
+  }
+  const rowKeys = new Set(alertIdentityKeys(row));
+  if (!rowKeys.size) {
+    return row;
+  }
+  const matches = (Array.isArray(candidates) ? candidates : []).filter((candidate) => {
+    if (!candidate || typeof candidate !== "object") {
+      return false;
+    }
+    return alertIdentityKeys(candidate).some((key) => rowKeys.has(key));
+  });
+  if (!matches.length) {
+    return row;
+  }
+  return matches
+    .slice()
+    .sort((left, right) => {
+      const leftCanonical = ALERT_UUID_PATTERN.test(String(left?.alert_id || left?.id || "")) ? 1 : 0;
+      const rightCanonical = ALERT_UUID_PATTERN.test(String(right?.alert_id || right?.id || "")) ? 1 : 0;
+      if (leftCanonical !== rightCanonical) {
+        return rightCanonical - leftCanonical;
+      }
+      const leftLanding = left?._stream_kind === "landing_pad" ? 1 : 0;
+      const rightLanding = right?._stream_kind === "landing_pad" ? 1 : 0;
+      if (leftLanding !== rightLanding) {
+        return leftLanding - rightLanding;
+      }
+      return alertRowScore(right) - alertRowScore(left);
+    })[0];
+}
+
 function dedupeAndConsolidateAlertRows(rows, options = {}) {
   const allowedChannels = new Set(
     Array.isArray(options.channels)
       ? options.channels
       : ["prometheus", "telemetry", "email", "ticket", "log"]
   );
-  const grouped = new Map();
+  const keyToGroup = new Map();
+  const groups = [];
 
   (Array.isArray(rows) ? rows : []).forEach((row) => {
     if (!row || typeof row !== "object") {
@@ -616,34 +673,54 @@ function dedupeAndConsolidateAlertRows(rows, options = {}) {
     if (!allowedChannels.has(channel)) {
       return;
     }
-    const key = alertIdentityKey(row);
-    const existing = grouped.get(key);
-    if (!existing) {
-      grouped.set(key, {
-        row: { ...row, source_channel: channel, source_channels: [channel] },
-        channels: new Set([channel]),
-      });
-      return;
+
+    const candidateKeys = alertIdentityKeys(row);
+    // A row with zero candidate keys (no name/service and no id at all) can't be matched
+    // to anything -- give it a unique key so it still shows up as its own row instead of
+    // silently colliding with every other keyless row under a single shared bucket.
+    const lookupKeys = candidateKeys.length ? candidateKeys : [`row:${groups.length}:${Math.random()}`];
+    let group = null;
+    for (const key of lookupKeys) {
+      if (keyToGroup.has(key)) {
+        group = keyToGroup.get(key);
+        break;
+      }
     }
 
-    existing.channels.add(channel);
-    const incomingScore = alertRowScore(row);
-    const existingScore = alertRowScore(existing.row);
-    const incomingTime = alertTimeMs(row);
-    const existingTime = alertTimeMs(existing.row);
-    const incomingIsLandingPad = row?._stream_kind === "landing_pad";
-    const existingIsLandingPad = existing.row?._stream_kind === "landing_pad";
-    const shouldReplace = existingIsLandingPad && !incomingIsLandingPad
-      ? true
-      : !existingIsLandingPad && incomingIsLandingPad
-        ? false
-        : incomingScore > existingScore || (incomingScore === existingScore && incomingTime > existingTime);
-    if (shouldReplace) {
-      existing.row = { ...row, source_channel: channel };
+    if (!group) {
+      group = { row: { ...row, source_channel: channel, source_channels: [channel] }, channels: new Set([channel]) };
+      groups.push(group);
+    } else {
+      group.channels.add(channel);
+      const incomingScore = alertRowScore(row);
+      const existingScore = alertRowScore(group.row);
+      const incomingTime = alertTimeMs(row);
+      const existingTime = alertTimeMs(group.row);
+      const incomingIsLandingPad = row?._stream_kind === "landing_pad";
+      const existingIsLandingPad = group.row?._stream_kind === "landing_pad";
+      const shouldReplace = existingIsLandingPad && !incomingIsLandingPad
+        ? true
+        : !existingIsLandingPad && incomingIsLandingPad
+          ? false
+          : incomingScore > existingScore || (incomingScore === existingScore && incomingTime > existingTime);
+      const priorApplication = alertApplicationCandidate(group.row);
+      const incomingApplication = alertApplicationCandidate(row);
+      if (shouldReplace) {
+        group.row = { ...row, source_channel: channel };
+        if (!alertApplicationCandidate(group.row) && priorApplication) {
+          group.row.application = priorApplication;
+        }
+      } else if (!priorApplication && incomingApplication) {
+        group.row.application = incomingApplication;
+      }
     }
+
+    // Register every candidate key from this row against the resolved group so a later
+    // row matching via a *different* one of these keys still merges into the same group.
+    lookupKeys.forEach((key) => keyToGroup.set(key, group));
   });
 
-  return Array.from(grouped.values())
+  return groups
     .map((entry) => ({
       ...entry.row,
       source_channels: Array.from(entry.channels).sort(),
@@ -3087,9 +3164,22 @@ function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
     { id: "validate", icon: "◎", label: "Validate", hint: "Recovery confirmed", match: ["validat", "closure", "closed", "health restored"] },
   ];
   const assigned = new Set();
+  // Lane text is built from curated, human-readable fields only -- NOT the raw
+  // inputValueText/outputValueText JSON blobs, which almost always carry a trace_id
+  // (matches "discover"'s "trace" token) or similar incidental substrings and would
+  // otherwise pull unrelated events (e.g. ingestion/topic-handoff rows) into the wrong lane.
+  const laneText = (row) => [row?.status, row?.stage, row?.detail, row?.agent, row?.service, row?.consumes, row?.publishes]
+    .map((item) => String(item || "").toLowerCase())
+    .join(" ");
   const laneRows = lanes.map((lane) => {
+    // A row is claimed by at most one lane: the first (in detect -> validate order) whose
+    // keywords match. Previously every lane re-tested every row independently, so a single
+    // event could match more than one lane's keywords and appear duplicated across phases.
     const matched = safeRows.filter((row, index) => {
-      const text = timelineRowText(row).toLowerCase();
+      if (assigned.has(index)) {
+        return false;
+      }
+      const text = laneText(row);
       const hit = lane.match.some((token) => text.includes(token));
       if (hit) assigned.add(index);
       return hit;
@@ -3159,11 +3249,18 @@ function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
                 <strong>{lane.rows.length}</strong>
                 <span>{lane.rows.length === 1 ? "event" : "events"}</span>
               </div>
-              <small className="timeline-phase-latest">
-                {lane.rows.length
-                  ? compactText(latest.stage || latest.agent || latest.service || latest.detail, 54)
-                  : "Not reached yet"}
-              </small>
+              {lane.rows.length ? (
+                <div className="timeline-phase-latest">
+                  <strong>{compactText(latest.stage || latest.agent || latest.service || `${lane.label} event`, 60)}</strong>
+                  <p>{compactText(latest.detail || latest.outputValueText || latest.inputValueText, 140) || "No additional detail was recorded for this event."}</p>
+                  <small>
+                    {latest.agent || latest.service || "KaiOps"} · {formatIstTimestamp(latest.timestamp || latest.created_at)}
+                    {latest.status || timelineRowStatus(latest) ? ` · ${latest.status || timelineRowStatus(latest)}` : ""}
+                  </small>
+                </div>
+              ) : (
+                <small className="timeline-phase-latest timeline-phase-latest-empty">Not reached yet</small>
+              )}
               {lane.rows.length ? (
                 <button
                   type="button"
@@ -3577,6 +3674,25 @@ function groundedIntelligenceDisplay(label, value) {
   return { headline, details };
 }
 
+function downloadInvestigationArtifact(filename, payload) {
+  const safeName = String(filename || "kaiops-investigation.json")
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/-+/g, "-")
+    .toLowerCase();
+  const content = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+  const blob = new Blob([content], {
+    type: typeof payload === "string" ? "text/plain;charset=utf-8" : "application/json;charset=utf-8",
+  });
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = safeName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
 function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocument }) {
   const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
   const context = safeWorkflow.context && typeof safeWorkflow.context === "object" ? safeWorkflow.context : {};
@@ -3613,6 +3729,77 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
     ...(Array.isArray(report.citations) ? report.citations : []),
     ...hypotheses.flatMap((item) => Array.isArray(item?.supporting_evidence) ? item.supporting_evidence : []),
   ].filter(Boolean)));
+  const queryTerms = Array.isArray(discovery.query_terms)
+    ? discovery.query_terms
+    : Array.isArray(metadata.query_terms)
+      ? metadata.query_terms
+      : [];
+  const recentChanges = Array.isArray(context.recent_changes) ? context.recent_changes : [];
+  const dependencies = Array.isArray(context.dependency_services) ? context.dependency_services : [];
+  const relatedIncidents = Array.isArray(context.related_incidents) ? context.related_incidents : [];
+  const reasoningConfidence = Number(recommendation.confidence ?? report.confidence_score ?? 0);
+  const storyStages = [
+    {
+      id: "signal",
+      number: "01",
+      eyebrow: "Question formed",
+      title: "Alert becomes a search plan",
+      summary: "Service, alert name, environment, symptoms, and scenario are converted into focused retrieval terms.",
+      metric: queryTerms.length || "Auto",
+      metricLabel: queryTerms.length === 1 ? "query term" : "query terms",
+      tags: queryTerms.slice(0, 5),
+      tone: "blue",
+    },
+    {
+      id: "discover",
+      number: "02",
+      eyebrow: "Read-only discovery",
+      title: "Tools return source facts",
+      summary: "Logs, tickets, traces, metrics, and code are searched. Every useful fact keeps its source and immutable evidence ID.",
+      metric: evidence.length,
+      metricLabel: evidence.length === 1 ? "grounded fact" : "grounded facts",
+      tags: Object.entries(sourceCounts).map(([source, count]) => `${source} ${count}`).slice(0, 5),
+      tone: "violet",
+    },
+    {
+      id: "context",
+      number: "03",
+      eyebrow: "Context retrieval",
+      title: "Facts are connected to operations",
+      summary: "Semantic and metadata search rank documents, then merge dependencies, recent changes, related incidents, and runbook guidance.",
+      metric: ragMatches.length || documents.length,
+      metricLabel: "ranked documents",
+      tags: [
+        dependencies.length ? `${dependencies.length} dependencies` : "",
+        recentChanges.length ? `${recentChanges.length} changes` : "",
+        relatedIncidents.length ? `${relatedIncidents.length} incidents` : "",
+        context.runbook ? "runbook found" : "",
+      ].filter(Boolean),
+      tone: "green",
+    },
+    {
+      id: "reason",
+      number: "04",
+      eyebrow: "Grounded reasoning",
+      title: "RCA and impact are derived",
+      summary: "The reasoning agent compares hypotheses against collected context, retains alternatives and missing evidence, and cites supporting facts.",
+      metric: Number.isFinite(reasoningConfidence) && reasoningConfidence > 0 ? `${Math.round(reasoningConfidence * 100)}%` : supportingIds.length,
+      metricLabel: Number.isFinite(reasoningConfidence) && reasoningConfidence > 0 ? "confidence" : "citations",
+      tags: supportingIds.slice(0, 4),
+      tone: "orange",
+    },
+    {
+      id: "act",
+      number: "05",
+      eyebrow: "Decision ready",
+      title: "Evidence becomes an action",
+      summary: "RCA, impact, and safety constraints produce an operator-readable recommendation for approval, execution, and validation.",
+      metric: recommendation.recommended_action ? "Ready" : "Pending",
+      metricLabel: "recommended action",
+      tags: ["approval gate", "guarded execution", "recovery validation"],
+      tone: "red",
+    },
+  ];
   const outputs = [
     {
       label: "RCA",
@@ -3627,6 +3814,33 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
       value: recommendation.recommended_action || (Array.isArray(report.recommended_next_checks) ? report.recommended_next_checks.join(" ") : "No action was produced."),
     },
   ].map((item) => ({ ...item, display: groundedIntelligenceDisplay(item.label, item.value) }));
+  const investigationPackage = {
+    generated_at: new Date().toISOString(),
+    alert: safeWorkflow.alert || {},
+    incident: safeWorkflow.incident || {},
+    query_plan: { query_terms: queryTerms, retrieval_stages: discovery.retrieval_stages || [] },
+    discovery_evidence: evidence,
+    assembled_context: context,
+    ranked_documents: ragMatches,
+    linked_documents: documents,
+    hypotheses,
+    citations: supportingIds,
+    recommendation,
+  };
+  const stageArtifact = (stageId) => {
+    if (stageId === "signal") return investigationPackage.query_plan;
+    if (stageId === "discover") return { source_counts: sourceCounts, evidence };
+    if (stageId === "context") return { context, ranked_documents: ragMatches, linked_documents: documents };
+    if (stageId === "reason") {
+      return { report, hypotheses, citations: supportingIds, root_cause: recommendation.root_cause, impact: recommendation.impact };
+    }
+    return {
+      recommended_action: recommendation.recommended_action,
+      preventive_action: recommendation.preventive_action,
+      validation: recommendation.validation || report.recommended_next_checks || [],
+      approval: safeWorkflow.approval || {},
+    };
+  };
 
   return (
     <section className="intelligence-connection">
@@ -3636,10 +3850,64 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
           <h3>Discovery Evidence → Context Assembly → RCA & Impact</h3>
           <p>This is the handoff between the two agents. Only retrieved evidence and assembled context should support downstream conclusions.</p>
         </div>
-        <span className={`workflow-pill ${evidence.length || contextItems.length ? "workflow-pill-active" : "workflow-pill-idle"}`}>
-          {evidence.length || contextItems.length ? "connected" : "no context"}
-        </span>
+        <div className="intelligence-header-actions">
+          <span className={`workflow-pill ${evidence.length || contextItems.length ? "workflow-pill-active" : "workflow-pill-idle"}`}>
+            {evidence.length || contextItems.length ? "connected" : "no context"}
+          </span>
+          <button type="button" className="button-primary" onClick={() => downloadInvestigationArtifact("kaiops-complete-investigation.json", investigationPackage)}>
+            Download complete investigation
+          </button>
+        </div>
       </header>
+      <div className="investigation-story">
+        <div className="investigation-story-intro">
+          <span>How KaiOps reached this conclusion</span>
+          <strong>Every conclusion moves through an observable, evidence-backed handoff.</strong>
+        </div>
+        <div className="investigation-story-track">
+          {storyStages.map((stage, index) => (
+            <div className="investigation-story-segment" key={stage.id}>
+              <article className={`investigation-story-card tone-${stage.tone}`}>
+                <header>
+                  <span className="investigation-story-number">{stage.number}</span>
+                  <div>
+                    <small>{stage.eyebrow}</small>
+                    <h4>{stage.title}</h4>
+                  </div>
+                </header>
+                <p>{stage.summary}</p>
+                <div className="investigation-story-metric">
+                  <strong>{stage.metric}</strong>
+                  <span>{stage.metricLabel}</span>
+                </div>
+                <div className="investigation-story-tags">
+                  {stage.tags.length
+                    ? stage.tags.map((tag) => <span key={`${stage.id}-${tag}`}>{compactText(tag, 30)}</span>)
+                    : <span>Awaiting persisted data</span>}
+                </div>
+                <button
+                  type="button"
+                  className="investigation-download-button"
+                  onClick={() => downloadInvestigationArtifact(`kaiops-${stage.number}-${stage.id}.json`, stageArtifact(stage.id))}
+                >
+                  Download {stage.id === "discover" ? "evidence & logs" : stage.id === "context" ? "context & documents" : stage.id === "reason" ? "RCA & impact" : stage.id === "act" ? "action plan" : "search plan"}
+                </button>
+              </article>
+              {index < storyStages.length - 1 ? (
+                <div className="investigation-story-handoff" aria-hidden="true">
+                  <i>→</i>
+                  <small>{index === 0 ? "query" : index === 1 ? "evidence" : index === 2 ? "context" : "decision"}</small>
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="intelligence-lineage-heading">
+        <span className="discovery-eyebrow">Live lineage from this alert</span>
+        <h4>Inspect exactly what entered each stage</h4>
+        <p>Source facts are shown on the left, assembled operational context in the middle, and the derived conclusions on the right.</p>
+      </div>
       <div className="intelligence-connection-flow">
         <article className="intelligence-column intelligence-discovery-column">
           <span className="intelligence-column-step">1</span>
@@ -3655,6 +3923,13 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
             <div className="intelligence-fact" key={`lineage-evidence-${item.evidence_id || index}`}>
               <strong>{item.evidence_id || `FACT-${index + 1}`}</strong>
               <span>{item.source || "source"} · {compactText(item.snippet, 150)}</span>
+              <button
+                type="button"
+                className="intelligence-inline-download"
+                onClick={() => downloadInvestigationArtifact(`kaiops-${item.source || "evidence"}-${item.evidence_id || index + 1}.json`, item)}
+              >
+                Download {String(item.source || "evidence").toLowerCase()}
+              </button>
             </div>
           ))}
         </article>
@@ -3691,6 +3966,18 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
                   ))}
                 </dl>
               ) : null}
+              <button
+                type="button"
+                className="intelligence-inline-download"
+                onClick={() => downloadInvestigationArtifact(`kaiops-${item.label}.json`, {
+                  type: item.label,
+                  value: item.value,
+                  display: item.display,
+                  citations: supportingIds,
+                })}
+              >
+                Download {item.label}
+              </button>
             </div>
           ))}
           <div className="intelligence-citations">
@@ -3699,6 +3986,19 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
           </div>
           <div className="intelligence-document-downloads">
             <strong>{documents.length} linked document(s)</strong>
+            {documents.length ? (
+              <button
+                type="button"
+                className="button-primary"
+                onClick={() => downloadInvestigationArtifact("kaiops-linked-document-package.json", {
+                  documents,
+                  ranked_matches: ragMatches,
+                  assembled_context: context,
+                })}
+              >
+                Download all documents + context
+              </button>
+            ) : null}
             {documents.slice(0, 6).map((doc, index) => (
               <button
                 type="button"
@@ -5941,6 +6241,8 @@ export default function App() {
   const [gatewayRecent, setGatewayRecent] = useState({ loading: false, rows: [], error: "" });
   const [modelProviderStatus, setModelProviderStatus] = useState({ loading: false, data: null, error: "" });
   const [landingPadRecent, setLandingPadRecent] = useState({ loading: false, rows: [], error: "" });
+  const [ingestionStreamChannel, setIngestionStreamChannel] = useState("all");
+  const [ingestionStreamQuery, setIngestionStreamQuery] = useState("");
   const [ragDocs, setRagDocs] = useState({ loading: false, rows: [], error: "" });
   const [guidanceQuery, setGuidanceQuery] = useState("");
   const [guidanceState, setGuidanceState] = useState({ loading: false, rows: [], error: "" });
@@ -6594,15 +6896,16 @@ export default function App() {
   }
 
   function openAlertDetails(row) {
-    const alertId = row?.alert_id || row?.id || row?.incident_id;
+    const canonicalRow = resolveCanonicalAlertRow(row, alerts.rows);
+    const alertId = canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id;
     if (!alertId) {
       return;
     }
     setSelectedAlertId(String(alertId));
     setActiveTab("home");
     setHomeDetailTab("timeline");
-    loadAlertDetails(alertId, row);
-    loadSelectedAlertDocumentLinks(alertId, row);
+    loadAlertDetails(alertId, canonicalRow);
+    loadSelectedAlertDocumentLinks(alertId, canonicalRow);
   }
 
   function openAlertDetailsFromIncident(row) {
@@ -6830,7 +7133,7 @@ export default function App() {
   async function loadLandingPadRecent() {
     setLandingPadRecent((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/landing-pad/recent?limit=50");
+      const payload = await fetchJson("/api-gateway/landing-pad/recent?limit=200");
       const data = unwrap(payload);
       const rows = data?.rows || [];
       setLandingPadRecent({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
@@ -9557,6 +9860,20 @@ export default function App() {
     loadMonitorApplications();
   }, [adminSession.accessToken]);
 
+  useEffect(() => {
+    if (
+      activeTab !== "stream"
+      || !Boolean(String(adminSession.accessToken || "").trim())
+    ) {
+      return undefined;
+    }
+    loadLandingPadRecent();
+    const timer = window.setInterval(() => {
+      loadLandingPadRecent();
+    }, 10_000);
+    return () => window.clearInterval(timer);
+  }, [activeTab, adminSession.accessToken]);
+
   const latestWorkflow = useMemo(() => {
     return workflowState?.result?.data || {};
   }, [workflowState]);
@@ -11312,6 +11629,19 @@ export default function App() {
     return pendingApprovals.find((row) => String(row?.service || "").trim().toLowerCase() === service) || null;
   }
 
+  // Single source of truth for "what is the approval status of the selected alert" so the
+  // Decision Gate, Decision & Approval section, and any other view agree instead of each
+  // computing their own answer from a different subset of fields.
+  const selectedMatchedApproval = useMemo(
+    () => resolvePendingApprovalFromAlertRow(selectedAlertRow),
+    [selectedAlertRow, pendingApprovals, pendingApprovalByIncidentId],
+  );
+
+  const selectedApprovalStatus = useMemo(
+    () => normalizeApprovalStatus(selectedMatchedApproval?.status || selectedAlertWorkflow?.approval?.status),
+    [selectedMatchedApproval, selectedAlertWorkflow?.approval?.status],
+  );
+
   function selectApprovalFromAlertRow(alertRow) {
     const matchedRow = resolvePendingApprovalFromAlertRow(alertRow);
     if (!matchedRow) {
@@ -11815,6 +12145,7 @@ export default function App() {
 
   const tabs = [
     { id: "home", label: "Dashboard" },
+    { id: "stream", label: "Alert Ingestion Stream" },
     { id: "copilot", label: "Copilot Studio" },
     { id: "executive", label: "Executive Dashboard" },
     { id: "admin", label: "Admin Center" },
@@ -11828,6 +12159,7 @@ export default function App() {
 
   const sidebarSections = [
     { id: "home", icon: "DB", shortLabel: "Dashboard", label: "Dashboard", tone: "ops" },
+    { id: "stream", icon: "LS", shortLabel: "Live Stream", label: "Alert Ingestion Stream", tone: "meta" },
     { id: "approval", icon: "AL", shortLabel: "Approval", label: "Human Approval", tone: "risk" },
     { id: "executive", icon: "EX", shortLabel: "Executive", label: "Executive Dashboard", tone: "meta" },
     { id: "admin", icon: "AD", shortLabel: "Admin", label: "Admin Center", tone: "bus" },
@@ -11884,6 +12216,57 @@ export default function App() {
     }),
     [sidebarSections, allowedTabs, currentRole],
   );
+  const ingestionStreamRows = useMemo(
+    () => (Array.isArray(landingPadRecent.rows) ? landingPadRecent.rows : [])
+      .map((row, index) => {
+        const mapped = mapLandingPadRowToAlertStreamRow(row, index);
+        return {
+          ...mapped,
+          file: row?.file || "-",
+          path: row?.path || "",
+          error: row?.error || "",
+          source_channel: normalizeAlertChannel(mapped),
+        };
+      })
+      .sort((left, right) => alertTimeMs(right) - alertTimeMs(left)),
+    [landingPadRecent.rows],
+  );
+  const ingestionStreamCounts = useMemo(() => {
+    const counts = { all: ingestionStreamRows.length, email: 0, log: 0, prometheus: 0, telemetry: 0, ticket: 0, failed: 0 };
+    ingestionStreamRows.forEach((row) => {
+      const channel = String(row?.source_channel || "prometheus");
+      counts[channel] = Number(counts[channel] || 0) + 1;
+      if (String(row?.status || "").toLowerCase() === "failed" || row?.error) {
+        counts.failed += 1;
+      }
+    });
+    return counts;
+  }, [ingestionStreamRows]);
+  const visibleIngestionStreamRows = useMemo(() => {
+    const query = String(ingestionStreamQuery || "").trim().toLowerCase();
+    return ingestionStreamRows.filter((row) => {
+      const failed = String(row?.status || "").toLowerCase() === "failed" || Boolean(row?.error);
+      if (ingestionStreamChannel === "failed" && !failed) {
+        return false;
+      }
+      if (!["all", "failed"].includes(ingestionStreamChannel) && row.source_channel !== ingestionStreamChannel) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      return [
+        row.name,
+        row.service,
+        row.application,
+        row.project_name,
+        row.source,
+        row.file,
+        row.status,
+        row.error,
+      ].map((value) => String(value || "").toLowerCase()).join(" ").includes(query);
+    });
+  }, [ingestionStreamRows, ingestionStreamChannel, ingestionStreamQuery]);
   const isAuthenticated = Boolean(String(adminSession.accessToken || "").trim());
   const isAdministrator = currentRole === "administrator";
   const canUseApprovalActions = allowedTabs.includes("approval");
@@ -13070,6 +13453,113 @@ export default function App() {
             ) : null}
           </section>
 
+          {activeTab === "stream" ? (
+            <section className="grid single-col ingestion-stream-page">
+              <article className="ingestion-stream-hero">
+                <div>
+                  <span className="discovery-eyebrow">Live multi-source intake</span>
+                  <h2>Alert Ingestion Stream</h2>
+                  <p>Email, logs, Prometheus, Telemetry, and ticketing events as they land in KaiOps.</p>
+                </div>
+                <div className="ingestion-live-state">
+                  <span className={`ingestion-live-dot ${landingPadRecent.loading ? "is-loading" : ""}`} aria-hidden="true" />
+                  <div>
+                    <strong>{landingPadRecent.loading ? "Syncing now" : "Live · 10s refresh"}</strong>
+                    <small>{visibleIngestionStreamRows.length} of {ingestionStreamRows.length} arrivals shown</small>
+                  </div>
+                  <button type="button" className="button-secondary" onClick={loadLandingPadRecent} disabled={landingPadRecent.loading}>
+                    {landingPadRecent.loading ? "Refreshing..." : "Refresh now"}
+                  </button>
+                </div>
+              </article>
+
+              <div className="ingestion-channel-grid" aria-label="Alert source counts">
+                {[
+                  ["all", "ALL", "All arrivals", ingestionStreamCounts.all],
+                  ["prometheus", "PR", "Prometheus", ingestionStreamCounts.prometheus],
+                  ["telemetry", "OT", "Telemetry", ingestionStreamCounts.telemetry],
+                  ["email", "EM", "Email", ingestionStreamCounts.email],
+                  ["log", "LG", "Logs / OpenSearch", ingestionStreamCounts.log],
+                  ["ticket", "TK", "Tickets / Jira", ingestionStreamCounts.ticket],
+                  ["failed", "!", "Failed intake", ingestionStreamCounts.failed],
+                ].map(([channel, icon, label, count]) => (
+                  <button
+                    type="button"
+                    key={`stream-channel-${channel}`}
+                    className={`ingestion-channel-card channel-${channel} ${ingestionStreamChannel === channel ? "is-active" : ""}`}
+                    onClick={() => setIngestionStreamChannel(channel)}
+                    aria-pressed={ingestionStreamChannel === channel}
+                  >
+                    <span>{icon}</span>
+                    <div><strong>{count}</strong><small>{label}</small></div>
+                  </button>
+                ))}
+              </div>
+
+              <article className="panel ingestion-stream-panel">
+                <div className="ingestion-stream-toolbar">
+                  <div>
+                    <span className="discovery-eyebrow">Landing-pad events</span>
+                    <h3>
+                      {ingestionStreamChannel === "all"
+                        ? "All source activity"
+                        : ingestionStreamChannel === "failed"
+                          ? "Failed ingestion activity"
+                          : `${sourceChannelLabel(ingestionStreamChannel)} activity`}
+                    </h3>
+                  </div>
+                  <label>
+                    <span>Search stream</span>
+                    <input
+                      value={ingestionStreamQuery}
+                      onChange={(event) => setIngestionStreamQuery(event.target.value)}
+                      placeholder="Alert, service, project, source, file"
+                    />
+                  </label>
+                </div>
+                {landingPadRecent.error ? <p className="error">{landingPadRecent.error}</p> : null}
+                <div className="ingestion-stream-list">
+                  {visibleIngestionStreamRows.map((row, index) => {
+                    const channel = row.source_channel || "prometheus";
+                    const failed = String(row.status || "").toLowerCase() === "failed" || Boolean(row.error);
+                    return (
+                      <article className={`ingestion-event channel-${channel} ${failed ? "is-failed" : ""}`} key={`${row.file || row.id || "arrival"}-${index}`}>
+                        <div className="ingestion-event-marker">
+                          <span>{channel === "email" ? "EM" : channel === "log" ? "LG" : channel === "ticket" ? "TK" : channel === "telemetry" ? "OT" : "PR"}</span>
+                          <i aria-hidden="true" />
+                        </div>
+                        <div className="ingestion-event-main">
+                          <header>
+                            <div>
+                              <strong>{row.name || row.alert_name || "Unnamed alert"}</strong>
+                              <span className={`source-badge source-${channel}`}>{sourceChannelLabel(channel)}</span>
+                              <span className={`pill ${failed ? "status-failed" : statusPillClass(row.status || "processed")}`}>{row.status || "processed"}</span>
+                            </div>
+                            <time>{formatIstTimestamp(row.received_at || row.created_at || row.modified_at)}</time>
+                          </header>
+                          <p>{row.description || row.annotations?.description || row.error || "Alert received and normalized by the landing pad."}</p>
+                          <footer>
+                            <span><b>Service</b>{row.service || "-"}</span>
+                            <span><b>Project</b>{row.application || row.project_name || row.project || "-"}</span>
+                            <span><b>Severity</b>{String(row.severity || "-").toUpperCase()}</span>
+                            <span title={row.file}><b>File</b>{compactText(row.file, 44)}</span>
+                          </footer>
+                          {row.error ? <small className="ingestion-event-error">{row.error}</small> : null}
+                        </div>
+                      </article>
+                    );
+                  })}
+                  {!visibleIngestionStreamRows.length && !landingPadRecent.loading ? (
+                    <div className="ingestion-stream-empty">
+                      <strong>No arrivals match this view.</strong>
+                      <p>Choose another source, clear the search, or verify that its connector is delivering files or webhooks to the landing pad.</p>
+                    </div>
+                  ) : null}
+                </div>
+              </article>
+            </section>
+          ) : null}
+
           {activeTab === "home" ? (
             <section className="grid single-col">
               <article className="panel monitoring-projects-panel">
@@ -13562,15 +14052,12 @@ export default function App() {
                   </div>
 
                   {(() => {
-                    const matchedApproval = resolvePendingApprovalFromAlertRow(selectedAlertRow);
+                    const matchedApproval = selectedMatchedApproval;
                     const incidentId = approvalIncidentId(matchedApproval)
                       || selectedAlertWorkflow?.incident?.id
                       || selectedAlertWorkflow?.incident_id
                       || "";
-                    const approvalStatus = normalizeApprovalStatus(
-                      matchedApproval?.status
-                      || selectedAlertWorkflow?.approval?.status
-                    );
+                    const approvalStatus = selectedApprovalStatus;
                     const isResolved = isApprovalResolvedStatus(approvalStatus);
                     const requiresApproval = Boolean(
                       matchedApproval
@@ -13580,10 +14067,7 @@ export default function App() {
                       || selectedAlertWorkflow?.decision?.requires_approval
                       || isApprovalPendingStatus(approvalStatus)
                     );
-                    const hasActionableApproval = Boolean(
-                      resolvePendingApprovalFromAlertRow(selectedAlertRow)
-                      && !isResolved
-                    );
+                    const hasActionableApproval = Boolean(matchedApproval && !isResolved);
 
                     if (!requiresApproval) {
                       return null;
@@ -13725,22 +14209,6 @@ export default function App() {
                         <span className="source-badge source-ticket">Jira / tickets</span>
                         <span className="source-badge">Source code</span>
                       </div>
-                      <div className="analysis-journey" aria-label="Connected investigation journey">
-                        {[
-                          ["01", "Discover", "Signals and source facts"],
-                          ["02", "Connect context", "Documents, changes, and dependencies"],
-                          ["03", "Explain", "Grounded RCA and impact"],
-                          ["04", "Act", "Evidence-backed response"],
-                        ].map(([number, label, detail], index) => (
-                          <div className="analysis-journey-segment" key={label}>
-                            <article>
-                              <span>{number}</span>
-                              <div><strong>{label}</strong><small>{detail}</small></div>
-                            </article>
-                            {index < 3 ? <i aria-hidden="true">→</i> : null}
-                          </div>
-                        ))}
-                      </div>
                       <IntelligenceConnectionView
                         workflow={selectedAlertWorkflow}
                         documents={selectedAlertRagDocuments}
@@ -13749,8 +14217,8 @@ export default function App() {
                       <details className="investigation-deep-dive">
                         <summary>
                           <span>
-                            <strong>Technical deep dive</strong>
-                            <small>Agent trace, retrieval pipeline, source metadata, and raw evidence</small>
+                            <strong>Open technical retrieval trace</strong>
+                            <small>Inspect every discovery query, context lookup, document score, agent handoff, and raw evidence record</small>
                           </span>
                           <b>Expand</b>
                         </summary>
@@ -13800,6 +14268,15 @@ export default function App() {
                         rows={selectedAlertTimelineRows}
                         documents={selectedAlertRagDocuments}
                       />
+                      <details className="panel incident-workspace-section workspace-collapsible" open>
+                      <summary className="panel-head">
+                        <div>
+                          <span className="workspace-section-number">01</span>
+                          <h3>Incident Overview</h3>
+                          <p>Alert identity, status, root cause, quality metrics, and stage completeness.</p>
+                        </div>
+                        <span className="section-toggle-indicator" />
+                      </summary>
                       <div className="table-wrap table-wrap-scroll-x incident-overview-table">
                         <table>
                           <tbody>
@@ -13933,18 +14410,20 @@ export default function App() {
                           {" "}({selectedStageCompleteness.data?.stage_completion?.percentage ?? 0}%)
                         </p>
                       ) : null}
+                      </details>
                     </>
                   ) : null}
 
                   {homeDetailTab === "timeline" ? (
-                    <article className="panel incident-workspace-section evidence-workspace">
-                      <div className="panel-head">
+                    <details className="panel incident-workspace-section workspace-collapsible evidence-workspace">
+                      <summary className="panel-head">
                         <div>
                           <span className="workspace-section-number">02</span>
                           <h3>Evidence & Trust</h3>
                           <p>Canonical identity, traceability, linked knowledge, and evaluation quality.</p>
                         </div>
-                      </div>
+                        <span className="section-toggle-indicator" />
+                      </summary>
                       <div className="table-wrap table-wrap-scroll-x">
                         <table>
                           <tbody>
@@ -13955,7 +14434,7 @@ export default function App() {
                             <tr><th>Trace ID</th><td>{selectedAlertDocumentContract?.observability?.trace_id || selectedAlertRow?.trace_id || "-"}</td></tr>
                             <tr><th>Correlation ID</th><td>{selectedAlertDocumentContract?.canonical_alert?.correlation_id || selectedAlertRow?.correlation_id || "-"}</td></tr>
                             <tr><th>Document Link Contract</th><td>{selectedAlertDocumentContract?.document_link_summary?.contract_version || "-"}</td></tr>
-                            <tr><th>Linked Document Count</th><td>{selectedAlertDocumentContract?.document_link_summary?.count ?? selectedAlertRagDocuments.length}</td></tr>
+                            <tr><th>Linked Document Count</th><td>{selectedAlertRagDocuments.length}</td></tr>
                             <tr><th>Evaluation Contract</th><td>{selectedAlertEvaluation.contractVersion}</td></tr>
                             <tr><th>Overall Evaluation</th><td>{formatQualityPercent(selectedAlertEvaluation.overallScore)} ({selectedAlertEvaluation.qualityLabel})</td></tr>
                             <tr><th>Confidence Score</th><td>{formatQualityPercent(selectedAlertEvaluation.confidenceScore)}</td></tr>
@@ -13967,24 +14446,25 @@ export default function App() {
                           </tbody>
                         </table>
                       </div>
-                    </article>
+                    </details>
                   ) : null}
 
                   {homeDetailTab === "timeline" ? (
-                    <article className="panel incident-workspace-section approval-workspace">
-                      <div className="panel-head">
+                    <details className="panel incident-workspace-section workspace-collapsible approval-workspace" open>
+                      <summary className="panel-head">
                         <div>
                           <span className="workspace-section-number">03</span>
                           <h3>Decision & Approval</h3>
                           <p>Review evidence quality and approve, reject, or modify the proposed response.</p>
                         </div>
-                      </div>
+                        <span className="section-toggle-indicator" />
+                      </summary>
                       <div className="table-wrap">
                         <table>
                           <tbody>
                             <tr><th>Incident</th><td>{approvalForm.incident_id || selectedAlertWorkflow?.incident?.id || "-"}</td></tr>
                             <tr><th>Recommendation</th><td>{approvalForm.recommendation_id || "-"}</td></tr>
-                            <tr><th>Current Approval Status</th><td>{selectedAlertWorkflow?.approval?.status || "pending"}</td></tr>
+                            <tr><th>Current Approval Status</th><td>{selectedApprovalStatus || (selectedMatchedApproval ? "pending" : "not active")}</td></tr>
                             <tr><th>Role Eligible</th><td>{canUseApprovalActions ? "yes" : "no"}</td></tr>
                             <tr><th>Evaluation Quality</th><td>{formatQualityPercent(selectedAlertEvaluation.overallScore)} ({selectedAlertEvaluation.qualityLabel})</td></tr>
                             <tr><th>Grounding / Hallucination Risk</th><td>{formatQualityPercent(selectedAlertEvaluation.groundingScore)} / {formatQualityPercent(selectedAlertEvaluation.hallucinationRisk)}</td></tr>
@@ -14022,15 +14502,18 @@ export default function App() {
                       ) : (
                         <p className="subtitle">Login with an approval-eligible role to submit actions. You can still view full approval context here.</p>
                       )}
-                    </article>
+                    </details>
                   ) : null}
 
                   {homeDetailTab === "timeline" ? (
-                    <article className="panel alert-documents-panel incident-workspace-section">
-                      <div className="panel-head">
-                        <h3>Alert Documents</h3>
-                        <p>Download backend-linked documents for the selected alert.</p>
-                      </div>
+                    <details className="panel alert-documents-panel incident-workspace-section workspace-collapsible">
+                      <summary className="panel-head">
+                        <div>
+                          <h3>Alert Documents</h3>
+                          <p>Download backend-linked documents for the selected alert.</p>
+                        </div>
+                        <span className="section-toggle-indicator" />
+                      </summary>
                       {ragDocs.error ? <p className="error">{ragDocs.error}</p> : null}
                       {selectedAlertDocumentLinks.error ? (
                         <p className="subtitle">Backend document-link contract unavailable; using local fallback matcher. {selectedAlertDocumentLinks.error}</p>
@@ -14039,7 +14522,7 @@ export default function App() {
                       {selectedAlertDocumentContract?.document_link_summary ? (
                         <p className="subtitle">
                           Source: {selectedAlertDocumentContract.document_link_summary.source}
-                          {" | "}Matches: {selectedAlertDocumentContract.document_link_summary.count}
+                          {" | "}Matches: {selectedAlertRagDocuments.length}
                           {" | "}Reasons: {(selectedAlertDocumentContract.document_link_summary.match_reasons || []).join(", ") || "-"}
                         </p>
                       ) : null}
@@ -14125,7 +14608,7 @@ export default function App() {
                           ) : null}
                         </div>
                       )}
-                    </article>
+                    </details>
                   ) : null}
 
                   {homeDetailTab === "diagnostics" && diagnosticsDetailTab === "pipeline" ? (
@@ -14296,14 +14779,15 @@ export default function App() {
 
                   {homeDetailTab === "timeline" ? (
                     <>
-                      <article className="panel remediation-workspace incident-workspace-section">
-                        <div className="panel-head">
+                      <details className="panel remediation-workspace incident-workspace-section workspace-collapsible" open>
+                        <summary className="panel-head">
                           <div>
                             <span className="workspace-section-number">04</span>
                             <h3>Resolution & Remediation</h3>
                             <p>Confirm the decision, review the guarded plan, execute, and validate recovery.</p>
                           </div>
-                        </div>
+                          <span className="section-toggle-indicator" />
+                        </summary>
                         <div className="workflow-guide-grid remediation-flow-grid">
                           {selectedWorkflowFlowStages.map((stage) => (
                             <div className="workflow-guide-card remediation-flow-card" key={stage.id}>
@@ -14482,7 +14966,7 @@ export default function App() {
                             </tbody>
                           </table>
                         </div>
-                      </article>
+                      </details>
                       <ExecutionPlanGraph plan={selectedExecutionPlan} />
                     </>
                   ) : null}
