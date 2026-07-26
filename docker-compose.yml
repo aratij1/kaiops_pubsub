@@ -570,8 +570,14 @@ services:
       DISCOVERY_MCP_MYSQL_MAX_ROWS: "140"
       DISCOVERY_MCP_PROJECTS_FILE: /workspace/backend/config/discovery-projects.json
       DISCOVERY_MCP_TELEMETRY_TIMEOUT_SECONDS: "6"
-      JIRA_URL: ${JIRA_URL:-}
-      JIRA_USER_EMAIL: ${JIRA_USER_EMAIL:-}
+      # This service's Jira evidence search (discovery-mcp/app.py) uses a
+      # different env var naming convention than monitoring-adapter's
+      # outbound Jira client (JIRA_API_BASE_URL/JIRA_API_EMAIL) — these
+      # were previously pointed at undefined JIRA_URL/JIRA_USER_EMAIL host
+      # vars (always empty), silently disabling live Jira evidence search.
+      # Aliased to the same real credentials instead of a second secret set.
+      JIRA_URL: ${JIRA_API_BASE_URL:-}
+      JIRA_USER_EMAIL: ${JIRA_API_EMAIL:-}
       JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
       JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:-}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
@@ -674,6 +680,360 @@ services:
       api-gateway: { condition: service_healthy }
       approval-service: { condition: service_started }
       monitoring-adapter: { condition: service_started }
+
+  # --- Online Boutique (GoogleCloudPlatform/microservices-demo) ---
+  # No official docker-compose.yml exists upstream (it's Kubernetes/Skaffold-
+  # native), so this references the same pinned v0.10.6 images the official
+  # Kubernetes release manifest uses, not a rebuild from source. Verified
+  # against the actual source: these services have no app-level Prometheus
+  # metrics (initStats() is an unimplemented TODO in every service), so
+  # metrics come from ob-cadvisor (real per-container signals) and the
+  # existing blackbox-exporter (real HTTP probes), not fabricated numbers.
+  # All service names are ob-prefixed to avoid colliding with this
+  # project's own redis/mysql/etc.
+  ob-redis-cart:
+    image: redis:alpine
+    restart: unless-stopped
+
+  ob-currencyservice:
+    image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/currencyservice:v0.10.6
+    restart: unless-stopped
+    environment:
+      PORT: "7000"
+      DISABLE_PROFILER: "1"
+
+  ob-productcatalogservice:
+    image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/productcatalogservice:v0.10.6
+    restart: unless-stopped
+    environment:
+      PORT: "3550"
+      DISABLE_PROFILER: "1"
+
+  ob-paymentservice:
+    image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/paymentservice:v0.10.6
+    restart: unless-stopped
+    environment:
+      PORT: "50051"
+      DISABLE_PROFILER: "1"
+
+  ob-shippingservice:
+    image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/shippingservice:v0.10.6
+    restart: unless-stopped
+    environment:
+      PORT: "50051"
+      DISABLE_PROFILER: "1"
+
+  ob-emailservice:
+    image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/emailservice:v0.10.6
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      DISABLE_PROFILER: "1"
+
+  ob-adservice:
+    image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/adservice:v0.10.6
+    restart: unless-stopped
+    environment:
+      PORT: "9555"
+
+  ob-cartservice:
+    image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/cartservice:v0.10.6
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: ob-redis-cart:6379
+    depends_on:
+      - ob-redis-cart
+
+  ob-recommendationservice:
+    image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/recommendationservice:v0.10.6
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      PRODUCT_CATALOG_SERVICE_ADDR: ob-productcatalogservice:3550
+      DISABLE_PROFILER: "1"
+    depends_on:
+      - ob-productcatalogservice
+
+  ob-checkoutservice:
+    image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/checkoutservice:v0.10.6
+    restart: unless-stopped
+    environment:
+      PORT: "5050"
+      PRODUCT_CATALOG_SERVICE_ADDR: ob-productcatalogservice:3550
+      SHIPPING_SERVICE_ADDR: ob-shippingservice:50051
+      PAYMENT_SERVICE_ADDR: ob-paymentservice:50051
+      EMAIL_SERVICE_ADDR: ob-emailservice:8080
+      CURRENCY_SERVICE_ADDR: ob-currencyservice:7000
+      CART_SERVICE_ADDR: ob-cartservice:7070
+    depends_on:
+      - ob-productcatalogservice
+      - ob-shippingservice
+      - ob-paymentservice
+      - ob-emailservice
+      - ob-currencyservice
+      - ob-cartservice
+
+  ob-frontend:
+    image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/frontend:v0.10.6
+    restart: unless-stopped
+    ports:
+      - "8081:8080"   # 8080 already used by fault-lab
+    environment:
+      PORT: "8080"
+      PRODUCT_CATALOG_SERVICE_ADDR: ob-productcatalogservice:3550
+      CURRENCY_SERVICE_ADDR: ob-currencyservice:7000
+      CART_SERVICE_ADDR: ob-cartservice:7070
+      RECOMMENDATION_SERVICE_ADDR: ob-recommendationservice:8080
+      SHIPPING_SERVICE_ADDR: ob-shippingservice:50051
+      CHECKOUT_SERVICE_ADDR: ob-checkoutservice:5050
+      AD_SERVICE_ADDR: ob-adservice:9555
+      # Required by mustMapEnv() even though we don't run this optional AI
+      # feature — gRPC dials are lazy, so an unreachable placeholder is
+      # enough to satisfy startup without crashing frontend.
+      SHOPPING_ASSISTANT_SERVICE_ADDR: ob-shopping-assistant:8080
+    depends_on:
+      - ob-productcatalogservice
+      - ob-currencyservice
+      - ob-cartservice
+      - ob-recommendationservice
+      - ob-shippingservice
+      - ob-checkoutservice
+      - ob-adservice
+
+  ob-loadgenerator:
+    image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/loadgenerator:v0.10.6
+    restart: unless-stopped
+    environment:
+      FRONTEND_ADDR: ob-frontend:8080
+      USERS: "10"
+      RATE: "1"
+    depends_on:
+      - ob-frontend
+
+  # Real per-container metrics (CPU, memory, network, restart count) — the
+  # only genuine metrics source available since Online Boutique has no
+  # app-level /metrics endpoint anywhere.
+  ob-cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+
+  # --- Robot Shop (instana/robot-shop) ---
+  # Deliberately different failure surface from Online Boutique: real
+  # RabbitMQ queue, real MongoDB/MySQL/Redis datastores. Uses the public
+  # pre-built robotshop/rs-*:2.1.0 images (REPO=robotshop, TAG=2.1.0 per
+  # upstream's own .env), not a rebuild from source. rs-cart and
+  # rs-payment already expose real Prometheus /metrics natively; standard
+  # community exporters are added for the rest.
+  #
+  # IMPORTANT: rs-web's nginx config is baked into the image at build time
+  # with hardcoded upstream hostnames (catalogue, user, shipping, payment,
+  # etc — confirmed live: renaming those services crash-looped rs-web with
+  # "host not found in upstream 'catalogue'"). These aren't
+  # env-var-configurable. So every Robot Shop service keeps a unique
+  # compose key (rs-*, to avoid colliding with this project's own
+  # redis/mysql/rabbitmq) but is given a network alias equal to the short
+  # name its siblings expect, scoped to the isolated robot-shop-net network
+  # below — the alias never collides with the main project's own
+  # redis/mysql/rabbitmq because it only exists inside that isolated
+  # network, not the default one.
+  rs-mongodb:
+    image: robotshop/rs-mongodb:2.1.0
+    restart: unless-stopped
+    networks:
+      robot-shop-net:
+        aliases: [mongodb]
+
+  rs-redis:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    networks:
+      robot-shop-net:
+        aliases: [redis]
+
+  rs-rabbitmq:
+    image: rabbitmq:3.8-management-alpine
+    restart: unless-stopped
+    networks:
+      robot-shop-net:
+        aliases: [rabbitmq]
+
+  rs-mysql:
+    image: robotshop/rs-mysql-db:2.1.0
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    networks:
+      robot-shop-net:
+        aliases: [mysql]
+
+  rs-catalogue:
+    image: robotshop/rs-catalogue:2.1.0
+    restart: unless-stopped
+    networks:
+      robot-shop-net:
+        aliases: [catalogue]
+    depends_on:
+      - rs-mongodb
+
+  rs-user:
+    image: robotshop/rs-user:2.1.0
+    restart: unless-stopped
+    networks:
+      robot-shop-net:
+        aliases: [user]
+    depends_on:
+      - rs-mongodb
+      - rs-redis
+
+  rs-cart:
+    image: robotshop/rs-cart:2.1.0
+    restart: unless-stopped
+    networks:
+      robot-shop-net:
+        aliases: [cart]
+      default: {}
+    depends_on:
+      - rs-redis
+
+  rs-shipping:
+    image: robotshop/rs-shipping:2.1.0
+    restart: unless-stopped
+    networks:
+      robot-shop-net:
+        aliases: [shipping]
+    depends_on:
+      - rs-mysql
+
+  rs-ratings:
+    image: robotshop/rs-ratings:2.1.0
+    restart: unless-stopped
+    environment:
+      APP_ENV: prod
+    networks:
+      robot-shop-net:
+        aliases: [ratings]
+    depends_on:
+      - rs-mysql
+
+  rs-payment:
+    image: robotshop/rs-payment:2.1.0
+    restart: unless-stopped
+    networks:
+      robot-shop-net:
+        aliases: [payment]
+      default: {}
+    depends_on:
+      - rs-rabbitmq
+
+  rs-dispatch:
+    image: robotshop/rs-dispatch:2.1.0
+    restart: unless-stopped
+    networks:
+      robot-shop-net:
+        aliases: [dispatch]
+    depends_on:
+      - rs-rabbitmq
+
+  rs-web:
+    image: robotshop/rs-web:2.1.0
+    restart: unless-stopped
+    ports:
+      - "8090:8080"
+    networks:
+      robot-shop-net:
+        aliases: [web]
+    depends_on:
+      - rs-catalogue
+      - rs-user
+      - rs-shipping
+      - rs-payment
+
+  # robotshop/rs-load-gen isn't published to Docker Hub (upstream builds it
+  # from source only) — using the standard public locustio/locust image
+  # with a minimal locustfile instead, same effect: continuous real traffic.
+  rs-load-gen:
+    image: locustio/locust:2.32.4
+    restart: unless-stopped
+    volumes:
+      - ./realistic-apps/robot-shop/locustfile.py:/mnt/locust/locustfile.py:ro
+    command: -f /mnt/locust/locustfile.py --host http://web:8080 --headless -u 5 -r 1
+    networks:
+      - robot-shop-net
+    depends_on:
+      - rs-web
+
+  # cart/payment already expose real Prometheus /metrics natively — these
+  # exporters also join "default" so the main project's Prometheus (which
+  # is not on robot-shop-net) can scrape them.
+  rs-mysqld-exporter:
+    image: prom/mysqld-exporter:v0.19.0
+    restart: unless-stopped
+    # v0.19.0 dropped DATA_SOURCE_NAME env var support in favor of a
+    # .my.cnf file (confirmed live: env-var-only config crash-looped with
+    # "no user specified in section or parent").
+    command:
+      - "--config.my-cnf=/etc/mysql/my.cnf"
+    volumes:
+      - ./realistic-apps/robot-shop/my.cnf:/etc/mysql/my.cnf:ro
+    networks:
+      - robot-shop-net
+      - default
+    depends_on:
+      - rs-mysql
+
+  rs-redis-exporter:
+    image: oliver006/redis_exporter:v1.88.0
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    networks:
+      - robot-shop-net
+      - default
+    depends_on:
+      - rs-redis
+
+  rs-rabbitmq-exporter:
+    image: kbudde/rabbitmq-exporter:1.0.0
+    restart: unless-stopped
+    environment:
+      RABBIT_URL: http://rabbitmq:15672
+      RABBIT_USER: guest
+      RABBIT_PASSWORD: guest
+      PUBLISH_PORT: "9419"
+    networks:
+      - robot-shop-net
+      - default
+    depends_on:
+      - rs-rabbitmq
+
+  rs-mongodb-exporter:
+    image: percona/mongodb_exporter:0.51.0
+    restart: unless-stopped
+    command:
+      - "--mongodb.uri=mongodb://mongodb:27017"
+      - "--collect-all"
+    networks:
+      - robot-shop-net
+      - default
+    depends_on:
+      - rs-mongodb
+
+networks:
+  default: {}
+  # Isolated network for Robot Shop's internal service mesh — its images
+  # have hostnames like "mongodb"/"redis"/"mysql"/"rabbitmq"/"catalogue"
+  # baked in at build time (nginx config, not env-var configurable), which
+  # would collide with this project's own services of the same name if
+  # placed on the shared default network. See the comment above the
+  # Robot Shop services for details.
+  robot-shop-net: {}
 
 volumes:
   mysql-data:

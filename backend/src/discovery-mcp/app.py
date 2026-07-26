@@ -210,6 +210,34 @@ def _search_tickets(terms: list[str], limit: int) -> list[dict[str, Any]]:
     return [row[1] for row in ranked[:limit]]
 
 
+def _adf_to_text(node: Any, *, max_chars: int = 400) -> str:
+    """Flattens Jira API v3's Atlassian Document Format (a nested JSON tree,
+    not plain text) into a plain string. /rest/api/3/search returns
+    `description` in this shape; naively str()-ing it produces an
+    unreadable Python dict repr instead of the actual ticket narrative."""
+    parts: list[str] = []
+
+    def walk(value: Any) -> None:
+        if len(" ".join(parts)) >= max_chars:
+            return
+        if isinstance(value, dict):
+            text = value.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+            content = value.get("content")
+            if isinstance(content, list):
+                for child in content:
+                    walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    if isinstance(node, str):
+        return node.strip()[:max_chars]
+    walk(node)
+    return " ".join(parts).strip()[:max_chars]
+
+
 async def _search_jira_tickets(arguments: dict[str, Any], terms: list[str], limit: int) -> list[dict[str, Any]]:
     _, project = _project_for(arguments)
     ticket_sources = project.get("ticket_sources") if isinstance(project.get("ticket_sources"), dict) else {}
@@ -220,8 +248,14 @@ async def _search_jira_tickets(arguments: dict[str, Any], terms: list[str], limi
     if not jira_url or not user_email or not api_token or not terms:
         return []
 
-    search_text = " ".join(terms[:8]).replace('"', '\\"')
-    clauses = [f'text ~ "{search_text}"']
+    # Previously joined all terms into one `text ~ "a b c"` clause, which Jira
+    # treats as a phrase requiring co-occurrence — realistic multi-word alerts
+    # almost always matched zero tickets. OR-ing individual term clauses lets
+    # any one matching word surface a ticket, matching how `matched_terms`
+    # below already treats term matching (any, not all).
+    safe_terms = [term.replace('"', '\\"') for term in terms[:8] if term.strip()]
+    text_clause = " OR ".join(f'text ~ "{term}"' for term in safe_terms)
+    clauses = [f"({text_clause})"] if len(safe_terms) > 1 else [f'text ~ "{safe_terms[0]}"']
     if project_key:
         safe_project = re.sub(r"[^A-Za-z0-9_-]", "", project_key)
         if safe_project:
@@ -229,8 +263,12 @@ async def _search_jira_tickets(arguments: dict[str, Any], terms: list[str], limi
     jql = " AND ".join(clauses) + " ORDER BY updated DESC"
     timeout = httpx.Timeout(max(2.0, min(float(os.getenv("JIRA_TIMEOUT_SECONDS", "8")), 30.0)))
     async with httpx.AsyncClient(timeout=timeout, auth=(user_email, api_token)) as client:
+        # Atlassian removed GET/POST /rest/api/3/search (returns 410 Gone as
+        # of the "Enhanced JQL" migration, CHANGE-2046) — confirmed live
+        # while testing this change. /rest/api/3/search/jql is the
+        # replacement, same params for a non-paginated call like this one.
         response = await client.get(
-            f"{jira_url}/rest/api/3/search",
+            f"{jira_url}/rest/api/3/search/jql",
             params={
                 "jql": jql,
                 "maxResults": limit,
@@ -250,9 +288,25 @@ async def _search_jira_tickets(arguments: dict[str, Any], terms: list[str], limi
         summary = str(fields.get("summary") or "").strip()
         status = fields.get("status") if isinstance(fields.get("status"), dict) else {}
         priority = fields.get("priority") if isinstance(fields.get("priority"), dict) else {}
+        # These four were already being fetched from the Jira API (see the
+        # "fields" param above) but discarded before reaching the RCA
+        # evidence snippet — description in particular is often the single
+        # highest-value field for root-cause grounding.
+        issuetype = fields.get("issuetype") if isinstance(fields.get("issuetype"), dict) else {}
+        description_text = _adf_to_text(fields.get("description"))
+        labels = [str(label) for label in fields.get("labels", []) if isinstance(fields.get("labels"), list) and str(label).strip()]
+        components = [
+            str(component.get("name") or "").strip()
+            for component in (fields.get("components") or [])
+            if isinstance(component, dict) and str(component.get("name") or "").strip()
+        ]
         snippet = (
-            f"{key} {summary}; status={status.get('name', 'unknown')}; "
-            f"priority={priority.get('name', 'unknown')}; updated={fields.get('updated', '')}"
+            f"{key} {summary}; type={issuetype.get('name', 'unknown')}; "
+            f"status={status.get('name', 'unknown')}; priority={priority.get('name', 'unknown')}; "
+            f"updated={fields.get('updated', '')}"
+            + (f"; labels={','.join(labels)}" if labels else "")
+            + (f"; components={','.join(components)}" if components else "")
+            + (f"; description={description_text}" if description_text else "")
         )
         matched = [term for term in terms if term in snippet.lower()] or terms[:1]
         item = _evidence("ticket", Path(f"jira/{key or index}"), 1, snippet, matched)
@@ -264,6 +318,10 @@ async def _search_jira_tickets(arguments: dict[str, Any], terms: list[str], limi
                 "title": summary,
                 "status": status.get("name"),
                 "priority": priority.get("name"),
+                "issue_type": issuetype.get("name"),
+                "labels": labels,
+                "components": components,
+                "description": description_text,
             }
         )
         evidence.append(item)

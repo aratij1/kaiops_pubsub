@@ -3627,8 +3627,18 @@ function intelligenceListText(value) {
   return String(value || "").trim();
 }
 
-function groundedIntelligenceDisplay(label, value) {
-  const parsed = parseStructuredIntelligence(value);
+function groundedIntelligenceDisplay(label, value, structuredOverride) {
+  // structuredOverride is recommendation.metadata.grounding — the RCA
+  // model's full structured response (evidence_used/alternative_causes/
+  // missing_evidence/grounding_notes/confidence_score), preserved
+  // server-side instead of being discarded. root_cause itself is always
+  // plain text (never JSON), so it isn't in this object — headline still
+  // falls back to `value` below.
+  const hasOverride =
+    structuredOverride &&
+    typeof structuredOverride === "object" &&
+    Object.values(structuredOverride).some((entry) => entry !== null && entry !== undefined && entry !== "");
+  const parsed = hasOverride ? { ...(parseStructuredIntelligence(value) || {}), ...structuredOverride } : parseStructuredIntelligence(value);
   if (!parsed) {
     return { headline: cleanRecommendationText(value, `No ${label.toLowerCase()} was produced.`), details: [] };
   }
@@ -3636,7 +3646,7 @@ function groundedIntelligenceDisplay(label, value) {
   const isImpact = label === "Impact";
   const headline = String(
     isRca
-      ? parsed.root_cause || parsed.cause || parsed.summary
+      ? parsed.root_cause || parsed.cause || parsed.summary || value
       : isImpact
         ? parsed.impact_summary || parsed.service_impact || parsed.customer_impact || parsed.severity_rationale || parsed.summary
         : parsed.recommended_action || parsed.action || parsed.summary
@@ -3813,7 +3823,10 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
       label: "Recommended action",
       value: recommendation.recommended_action || (Array.isArray(report.recommended_next_checks) ? report.recommended_next_checks.join(" ") : "No action was produced."),
     },
-  ].map((item) => ({ ...item, display: groundedIntelligenceDisplay(item.label, item.value) }));
+  ].map((item) => ({
+    ...item,
+    display: groundedIntelligenceDisplay(item.label, item.value, item.label === "RCA" ? recommendation.metadata?.grounding : null),
+  }));
   const investigationPackage = {
     generated_at: new Date().toISOString(),
     alert: safeWorkflow.alert || {},

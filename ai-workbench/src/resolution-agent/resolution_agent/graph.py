@@ -41,6 +41,7 @@ class ResolutionState(TypedDict, total=False):
     context: Context
     gathered_context: dict[str, Any]
     root_cause: str
+    rca_grounding: dict[str, Any]
     impact: str
     recommended_action: str
     remediation_target: str
@@ -499,6 +500,20 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
         state["root_cause"] = self._infer_root_cause(context, content)
         state["rationale"] = f"Model {response['model']} linked symptoms to {state['root_cause']}"
+        # Preserve the model's full structured RCA response instead of
+        # discarding everything except root_cause/cause/summary — the
+        # prompt explicitly asks for evidence_used/alternative_causes/
+        # missing_evidence/grounding_notes/confidence_score, and these are
+        # what the "Grounded intelligence produced" UI card is meant to
+        # show, but were previously parsed and thrown away here.
+        parsed_rca = self._extract_model_object(response["content"]) or {}
+        state["rca_grounding"] = {
+            "evidence_used": parsed_rca.get("evidence_used"),
+            "alternative_causes": parsed_rca.get("alternative_causes"),
+            "missing_evidence": parsed_rca.get("missing_evidence"),
+            "grounding_notes": parsed_rca.get("grounding_notes"),
+            "confidence_score": parsed_rca.get("confidence_score"),
+        }
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
             {
@@ -690,6 +705,13 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
         recommendation.metadata["model_usage"] = state.get("model_usage", [])
         recommendation.metadata["model_calls"] = state.get("model_calls", [])
+        # Full structured RCA response (evidence_used, alternative_causes,
+        # missing_evidence, grounding_notes, confidence_score) — see
+        # generate_rca. Surfaced here, not only in raw model_calls, so the
+        # frontend's Discovery + Context "Grounded intelligence produced"
+        # card can render it directly instead of trying to re-parse
+        # recommendation.root_cause (which is always plain text) as JSON.
+        recommendation.metadata["grounding"] = state.get("rca_grounding", {})
         recommendation.metadata["evidence"] = [item.model_dump(mode="json") for item in evidence]
         recommendation.metadata["evidence_ids"] = [item.id for item in evidence]
         recommendation.metadata["reasoning"] = state.get("rationale", "")

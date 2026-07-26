@@ -381,3 +381,84 @@ groups:
         annotations:
           summary: "KaiOps Fault Lab is unavailable"
           description: "Prometheus cannot scrape the fault-lab /metrics endpoint."
+
+  - name: robot-shop
+    rules:
+      - alert: RobotShopServiceDown
+        expr: up{job=~"robot-shop-.*"} == 0
+        for: 20s
+        labels:
+          severity: critical
+          source: robot-shop
+        annotations:
+          summary: "Robot Shop dependency {{ $labels.job }} is unreachable"
+          description: "Prometheus cannot scrape {{ $labels.job }} for more than 20s."
+
+      - alert: RobotShopMySQLTooManyConnections
+        expr: mysql_global_status_threads_connected > 50
+        for: 30s
+        labels:
+          severity: warning
+          source: robot-shop
+        annotations:
+          summary: "Robot Shop MySQL connections high"
+          description: "mysql_global_status_threads_connected is {{ $value }}."
+
+      - alert: RobotShopRabbitMQQueueBacklog
+        expr: sum(rabbitmq_queue_messages_ready) > 100
+        for: 30s
+        labels:
+          severity: warning
+          source: robot-shop
+        annotations:
+          summary: "Robot Shop RabbitMQ queue backlog"
+          description: "{{ $value }} messages ready and unconsumed across queues."
+
+      - alert: RobotShopRedisDown
+        expr: redis_up == 0
+        for: 20s
+        labels:
+          severity: critical
+          source: robot-shop
+        annotations:
+          summary: "Robot Shop Redis is unreachable"
+          description: "redis_exporter cannot reach the Redis instance."
+
+      - alert: RobotShopMongoDown
+        expr: mongodb_up == 0
+        for: 20s
+        labels:
+          severity: critical
+          source: robot-shop
+        annotations:
+          summary: "Robot Shop MongoDB is unreachable"
+          description: "mongodb_exporter cannot reach the MongoDB instance."
+
+  - name: online-boutique
+    rules:
+      # Online Boutique has no app-level metrics anywhere (verified against
+      # source), so its only real signal today is this HTTP health probe.
+      # NOTE: a per-container cAdvisor CPU/restart rule was deliberately
+      # NOT added here — verified live that this cAdvisor version doesn't
+      # expose a "name" label matching container names, so a label-matched
+      # rule would silently never fire. Not fixed here; flagged as a known
+      # gap.
+      - alert: OnlineBoutiqueFrontendDown
+        expr: probe_success{job="blackbox", instance="http://ob-frontend:8080/_healthz"} == 0
+        for: 15s
+        labels:
+          severity: critical
+          source: online-boutique
+        annotations:
+          summary: "Online Boutique frontend is not responding"
+          description: "blackbox probe against ob-frontend /_healthz has been failing for 15s."
+
+      - alert: OnlineBoutiqueFrontendSlow
+        expr: probe_duration_seconds{job="blackbox", instance="http://ob-frontend:8080/_healthz"} > 1
+        for: 30s
+        labels:
+          severity: warning
+          source: online-boutique
+        annotations:
+          summary: "Online Boutique frontend responding slowly"
+          description: "Health-check probe duration is {{ $value }}s."
