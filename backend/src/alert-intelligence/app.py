@@ -66,11 +66,15 @@ async def _llm_discovery(alert: Alert) -> dict[str, Any]:
     if not DISCOVERY_LLM_ENABLED:
         return {}
     prompt = (
-        "Return strict JSON only for incident discovery. Required keys: title, description, service, environment, "
+        "Act as an SRE discovery agent. Return one strict JSON object only. Required keys: "
+        "title, description, service, environment, "
         "category, initial_hypothesis, technical_impact, business_impact, affected_users, scope, urgency, "
-        "actionable, actionability_reason, recommended_severity, confidence, reasoning. Set actionable=true only when "
+        "actionable, actionability_reason, recommended_severity, confidence, reasoning, evidence_used, "
+        "missing_evidence, alternative_hypotheses, impact_basis. Set actionable=true only when "
         "operator intervention or investigation is required; routine cleanup, retry noise, test signals, and KaiOps' "
-        "own integration errors are not actionable. Ground every conclusion in the supplied alert; do not invent evidence."
+        "own integration errors are not actionable. confidence must be 0..1. Treat the supplied alert as an observation, "
+        "not proof of root cause or customer impact. evidence_used must contain only identifiers or fields present in the "
+        "payload. Separate observed impact from possible risk, list unknowns in missing_evidence, and never invent evidence."
     )
     try:
         response = await ai_client.route_model(
