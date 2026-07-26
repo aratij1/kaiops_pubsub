@@ -117,12 +117,66 @@ backend/
   database/migrations/       Schema migrations and backfills for metadata/RBAC
   rag/                       Markdown RAG corpus for runbooks, incidents, changes, dependencies
   ingested_alerts/           Raw/processed/failed alert samples ingested by monitoring-adapter
+realistic-apps/
+  robot-shop/                Support files (locustfile.py, my.cnf) for the Robot Shop demo app —
+                              see "Realistic Demo Applications" below
 frontend/
   react/                     React incident operations dashboard
 k8s/                         Namespace, ConfigMap, generated Secret workflow, Deployments, Services, Ingress, HPA
 scripts/                     Local dev, RAG validation, and smoke-test tooling
 .github/workflows/ci.yml     Lint, test, Docker build, Kubernetes validation
 ```
+
+## Realistic Demo Applications
+
+Two real, multi-service demo applications generate live traffic, logs, and
+failures for the monitoring pipeline to ingest — complementary to Fault Lab's
+synthetic scenarios. Both are wired directly into `docker-compose.yml`, like
+Fault Lab, not a separate compose file.
+
+- **Online Boutique** (`GoogleCloudPlatform/microservices-demo`) — 11
+  polyglot gRPC microservices (Go/Java/Python/Node/C#), prefixed `ob-*`.
+  Pinned public images (no local build). Has no app-level Prometheus metrics
+  (verified against source — every service's `initStats()` is an
+  unimplemented stub), so its signal comes from `ob-cadvisor`
+  (per-container CPU/memory/restart) and the existing `blackbox-exporter`
+  probing `ob-frontend:8080/_healthz`.
+- **Robot Shop** (`instana/robot-shop`) — a deliberately different failure
+  surface: real RabbitMQ queue, real MongoDB/MySQL/Redis. Pinned public
+  images (`robotshop/rs-*:2.1.0`), prefixed `rs-*`. `rs-cart`/`rs-payment`
+  expose real `/metrics` natively; standard exporters
+  (`mysqld-exporter`, `redis_exporter`, `rabbitmq-exporter`,
+  `mongodb_exporter`) cover the rest.
+
+  Robot Shop's own images have hostnames like `catalogue`/`user`/`mysql`/
+  `redis`/`rabbitmq` **baked into their nginx/app config at build time**
+  (not env-var configurable) — renaming those services breaks them. Every
+  Robot Shop service therefore keeps a unique `rs-*` compose key (avoiding
+  collisions with this project's own `redis`/`mysql`/`rabbitmq`) but joins
+  an isolated `robot-shop-net` network with a short alias (`redis`,
+  `mysql`, ...) matching what its sibling containers expect — the alias
+  only exists on that isolated network, so it never collides with the
+  main project's own services of the same name on the default network.
+
+Start them:
+```bash
+docker compose up -d ob-redis-cart ob-currencyservice ob-productcatalogservice \
+  ob-paymentservice ob-shippingservice ob-emailservice ob-adservice ob-cartservice \
+  ob-recommendationservice ob-checkoutservice ob-frontend ob-loadgenerator ob-cadvisor
+docker compose up -d rs-mongodb rs-redis rs-rabbitmq rs-mysql rs-catalogue rs-user \
+  rs-cart rs-shipping rs-ratings rs-payment rs-dispatch rs-web rs-load-gen \
+  rs-mysqld-exporter rs-redis-exporter rs-rabbitmq-exporter rs-mongodb-exporter
+```
+- Online Boutique storefront: <http://localhost:8081>
+- Robot Shop storefront: <http://localhost:8090>
+- cAdvisor UI: <http://localhost:8082>
+
+Both apps' Prometheus scrape targets and alert rules
+(`RobotShop*`/`OnlineBoutique*`) live in `observability/prometheus.yml` and
+`observability/alert.rules.yml` alongside every other KaiOps alert source —
+alerts from either app flow through the exact same
+`/alerts/alertmanager` → centralized dedup → Jira → Landing Pad pipeline as
+Fault Lab and real production alerts, no special-casing.
 
 ## Core APIs
 
