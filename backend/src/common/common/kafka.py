@@ -103,6 +103,9 @@ class KafkaConsumer:
                 group_id=f"{self._settings.kafka_group_id}.{self._settings.service_name}.{self._topic}",
                 value_deserializer=lambda value: json.loads(value.decode("utf-8")),
                 enable_auto_commit=False,
+                session_timeout_ms=self._settings.kafka_session_timeout_ms,
+                heartbeat_interval_ms=self._settings.kafka_heartbeat_interval_ms,
+                max_poll_interval_ms=self._settings.kafka_max_poll_interval_ms,
             )
             try:
                 await consumer.start()
