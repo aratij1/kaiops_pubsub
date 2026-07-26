@@ -10,12 +10,15 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl default-mysql-client \
     && rm -rf /var/lib/apt/lists/*
 
+COPY deploy/docker/requirements.service.txt ./requirements.service.txt
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.service.txt
+
 COPY pyproject.toml README.md ./
 COPY backend/src ./backend/src
 COPY backend/rag ./rag
 COPY scripts/remediation ./scripts/remediation
 COPY ai-workbench/src ./ai-workbench/src
-
-RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir .
 
 EXPOSE 8000

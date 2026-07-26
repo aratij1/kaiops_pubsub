@@ -449,6 +449,13 @@ function isEphemeralProjectName(value) {
 function normalizeAlertChannel(row) {
   const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
   const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
+  const projectName = String(
+    row?.project_name
+    || row?.application
+    || labels?.project_name
+    || labels?.application
+    || ""
+  ).trim().toLowerCase();
   const explicitOrigin = String(
     labels?.origin_system
     || labels?.source_system
@@ -463,6 +470,10 @@ function normalizeAlertChannel(row) {
     || row?.ingestion_channel
     || ""
   ).trim().toLowerCase();
+  // OpenSearch is the transport for logs from both KaiOps and the
+  // OpenTelemetry demo. Preserve the owning project before classifying the
+  // transport as a generic log channel.
+  if (projectName === "telemetry" || projectName === "astronomy-shop") return "telemetry";
   if (explicitOrigin.includes("telemetry") || explicitOrigin.includes("opentelemetry")) return "telemetry";
   if (explicitOrigin.includes("email") || explicitChannel.includes("email")) return "email";
   if (explicitOrigin.includes("jira") || explicitOrigin.includes("ticket") || explicitChannel.includes("ticket")) return "ticket";
@@ -3735,9 +3746,20 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
     evidence.length ? { label: "Discovery evidence", value: `${evidence.length} grounded fact(s)`, source: "Discovery MCP" } : null,
   ].filter(Boolean);
   const hypotheses = Array.isArray(report.hypotheses) ? report.hypotheses : [];
+  const recommendationMetadata = recommendation.metadata && typeof recommendation.metadata === "object"
+    ? recommendation.metadata
+    : {};
+  const detectedErrors = Array.isArray(report.detected_errors)
+    ? report.detected_errors
+    : Array.isArray(discovery.detected_errors)
+      ? discovery.detected_errors
+      : Array.isArray(recommendationMetadata.detected_errors)
+        ? recommendationMetadata.detected_errors
+        : [];
   const supportingIds = Array.from(new Set([
     ...(Array.isArray(report.citations) ? report.citations : []),
     ...hypotheses.flatMap((item) => Array.isArray(item?.supporting_evidence) ? item.supporting_evidence : []),
+    ...detectedErrors.map((item) => item?.evidence_id),
   ].filter(Boolean)));
   const queryTerms = Array.isArray(discovery.query_terms)
     ? discovery.query_terms
@@ -3837,6 +3859,7 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
     ranked_documents: ragMatches,
     linked_documents: documents,
     hypotheses,
+    detected_errors: detectedErrors,
     citations: supportingIds,
     recommendation,
   };
@@ -3965,6 +3988,29 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
           <span className="intelligence-column-step">3</span>
           <h4>Grounded intelligence produced</h4>
           <p className="subtitle">RCA, impact, and action generated from the context shown to the left.</p>
+          {detectedErrors.length ? (
+            <div className="intelligence-output-item">
+              <strong>Detected application errors ({detectedErrors.length})</strong>
+              {detectedErrors.map((error, index) => (
+                <div className="intelligence-fact" key={`detected-error-${error?.evidence_id || index}`}>
+                  <strong>{error?.service || error?.container || `Application error ${index + 1}`}</strong>
+                  <span>{compactText(error?.message, 320)}</span>
+                  <small>
+                    {[error?.timestamp, ...(Array.isArray(error?.signals) ? error.signals : []), error?.evidence_id]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </small>
+                </div>
+              ))}
+              <button
+                type="button"
+                className="intelligence-inline-download"
+                onClick={() => downloadInvestigationArtifact("kaiops-detected-application-errors.json", detectedErrors)}
+              >
+                Download detected errors
+              </button>
+            </div>
+          ) : null}
           {outputs.map((item) => (
             <div className="intelligence-output-item" key={`output-${item.label}`}>
               <strong>{item.label}</strong>

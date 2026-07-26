@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -33,13 +34,18 @@ class JiraClient:
         labels: dict[str, str] | None = None,
     ) -> str:
         """Creates a new Jira issue and returns its key (e.g. "KAI-123")."""
+        jira_labels = [f"kaiops-severity-{severity}", "kaiops-auto-created"]
+        for key, value in (labels or {}).items():
+            safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", f"kaiops-{key}-{value}")[:255]
+            if safe:
+                jira_labels.append(safe)
         payload: dict[str, Any] = {
             "fields": {
                 "project": {"key": self.project_key},
                 "summary": summary[:255],
                 "description": description,
                 "issuetype": {"name": "Bug"},
-                "labels": [f"kaiops-severity-{severity}", "kaiops-auto-created"],
+                "labels": jira_labels,
             }
         }
         async with httpx.AsyncClient(auth=self._auth, timeout=15.0) as client:
@@ -51,6 +57,23 @@ class JiraClient:
             raise JiraClientError(f"Jira issue creation returned no key: {response.text[:500]}")
         logger.info("created jira issue %s", issue_key)
         return issue_key
+
+    async def find_open_issue_by_label(self, label: str) -> str | None:
+        """Finds a matching open Jira incident so dedup survives local state loss."""
+        safe_label = str(label).replace('"', '\\"')
+        jql = (
+            f'project = "{self.project_key}" AND labels = "{safe_label}" '
+            "AND statusCategory != Done ORDER BY updated DESC"
+        )
+        async with httpx.AsyncClient(auth=self._auth, timeout=15.0) as client:
+            response = await client.get(
+                f"{self.base_url}/rest/api/3/search/jql",
+                params={"jql": jql, "fields": "key,status", "maxResults": 1},
+            )
+        if response.status_code >= 400:
+            raise JiraClientError(f"Jira search failed ({response.status_code}): {response.text[:500]}")
+        issues = response.json().get("issues", []) if isinstance(response.json(), dict) else []
+        return str(issues[0].get("key")) if issues and isinstance(issues[0], dict) else None
 
     async def add_comment(self, issue_key: str, body: str) -> None:
         """Comments on an existing issue — used when a duplicate (same

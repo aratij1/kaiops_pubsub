@@ -1,4 +1,5 @@
 RAW_ALERTS = "raw-alerts"
+JIRA_INVESTIGATIONS = "jira-investigations"
 ENRICHED_ALERTS = "enriched-alerts"
 ORCHESTRATION_EVENTS = "orchestration-events"
 CONTEXT_EVENTS = "context-events"
@@ -40,6 +41,7 @@ NOTIFICATIONS_TOPIC_V1 = "kaiops.notifications.v1"
 
 ALL_TOPICS = [
     RAW_ALERTS,
+    JIRA_INVESTIGATIONS,
     ENRICHED_ALERTS,
     ORCHESTRATION_EVENTS,
     CONTEXT_EVENTS,
