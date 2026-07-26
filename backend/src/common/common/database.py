@@ -518,6 +518,25 @@ class MonitoringConnectionAuditRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
+class JiraTicketLinkRecord(Base, TimestampMixin):
+    """Maps an alert fingerprint to the Jira ticket currently open for it —
+    the centralized dedup store: Prometheus/log/email ingestion looks this
+    up before deciding whether to create a new Jira issue or comment on an
+    existing one, so the same underlying problem never produces duplicate
+    tickets."""
+
+    __tablename__ = "jira_ticket_links"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    fingerprint: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    jira_issue_key: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="open", index=True)
+    source: Mapped[str] = mapped_column(String(64), index=True)
+    occurrence_count: Mapped[int] = mapped_column(Integer, default=1)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
 class EvaluationRecord(Base, TimestampMixin):
     __tablename__ = "evaluation_records"
     __table_args__ = (Index("idx_evaluation_records_incident_created", "incident_id", "created_at"),)

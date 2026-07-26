@@ -26,6 +26,7 @@ from common.database import (
     IncidentEventRecord,
     IncidentRecord,
     IncidentProjectionRecord,
+    JiraTicketLinkRecord,
     KnowledgeBaseRecord,
     MonitoringProfileRecord,
     MonitoringIntegrationRecord,
@@ -587,6 +588,70 @@ class IncidentRepository:
                 payload=alert.model_dump(mode="json"),
             )
         )
+
+    async def get_open_jira_ticket_link(self, fingerprint: str) -> dict[str, Any] | None:
+        """Centralized dedup lookup: is there already an open Jira ticket
+        for this alert fingerprint? Ingestion paths (Prometheus/log/email)
+        call this before deciding whether to create a new Jira issue or
+        comment on the existing one."""
+        result = await self.session.execute(
+            select(JiraTicketLinkRecord).where(
+                JiraTicketLinkRecord.fingerprint == self._require("fingerprint", fingerprint),
+                JiraTicketLinkRecord.status == "open",
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return {
+            "fingerprint": row.fingerprint,
+            "jira_issue_key": row.jira_issue_key,
+            "status": row.status,
+            "source": row.source,
+            "occurrence_count": row.occurrence_count,
+            "first_seen_at": row.first_seen_at,
+            "last_seen_at": row.last_seen_at,
+        }
+
+    async def save_jira_ticket_link(self, *, fingerprint: str, jira_issue_key: str, source: str) -> None:
+        """Records a newly-created Jira issue against its alert fingerprint."""
+        now = utc_now()
+        await self.session.merge(
+            JiraTicketLinkRecord(
+                id=uuid4(),
+                fingerprint=self._require("fingerprint", fingerprint),
+                jira_issue_key=self._require("jira_issue_key", jira_issue_key),
+                status="open",
+                source=self._require("source", source),
+                occurrence_count=1,
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+        )
+
+    async def bump_jira_ticket_occurrence(self, fingerprint: str) -> None:
+        """Records a repeat occurrence against an already-open Jira ticket
+        (a comment was added rather than a new issue created)."""
+        result = await self.session.execute(
+            select(JiraTicketLinkRecord).where(JiraTicketLinkRecord.fingerprint == self._require("fingerprint", fingerprint))
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return
+        row.occurrence_count += 1
+        row.last_seen_at = utc_now()
+
+    async def close_jira_ticket_link(self, jira_issue_key: str) -> None:
+        """Marks the link closed once the Jira ticket itself is resolved/closed,
+        so the next occurrence of the same fingerprint opens a fresh ticket
+        instead of commenting on a closed one."""
+        result = await self.session.execute(
+            select(JiraTicketLinkRecord).where(JiraTicketLinkRecord.jira_issue_key == self._require("jira_issue_key", jira_issue_key))
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return
+        row.status = "closed"
 
     async def list_alerts(self, limit: int = 500, include_incident_context: bool = True) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 5000))
