@@ -23,6 +23,7 @@ class ImapConfig:
     mark_seen: bool = True
     timeout_seconds: float = 20.0
     subject_pattern: str = r"(?i)\b(alert|incident|critical|warning|error|failure|failed|down|sev[1-5]|p[1-5])\b"
+    search_criterion: str = "UNSEEN"
 
 
 def _decode_mime_header(value: str | None) -> str:
@@ -68,11 +69,14 @@ def fetch_unseen_emails(config: ImapConfig, *, limit: int = 25) -> list[dict[str
     try:
         connection.login(config.username, config.password)
         connection.select(config.mailbox)
-        status, data = connection.search(None, "UNSEEN")
+        criterion = str(config.search_criterion or "UNSEEN").strip().upper()
+        if criterion not in {"UNSEEN", "ALL"}:
+            criterion = "UNSEEN"
+        status, data = connection.search(None, criterion)
         if status != "OK":
             logger.warning("IMAP search failed: %s", status)
             return results
-        message_ids = data[0].split()[:limit]
+        message_ids = data[0].split()[-limit:]
         for message_id in message_ids:
             status, msg_data = connection.fetch(message_id, "(RFC822)")
             if status != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
