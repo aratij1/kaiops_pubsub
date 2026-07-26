@@ -51,6 +51,7 @@ class ResolutionState(TypedDict, total=False):
     model_calls: list[dict[str, Any]]
     rca_analysis: dict[str, Any]
     impact_analysis: dict[str, Any]
+    remediation_analysis: dict[str, Any]
 
 
 class ResolutionIntelligenceAgent(BaseAgent):
@@ -686,6 +687,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
             payload=payload,
             fallback_content=f"Investigate {context.alert.service} health and apply documented runbook remediation",
         )
+        parsed = self._extract_model_object(response["content"]) or {}
         model_action = self._extract_model_text(
             response["content"],
             keys=("recommended_action", "action", "summary"),
@@ -718,6 +720,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
         state["recommended_action"] = action
         state["commands"] = commands
+        state["remediation_analysis"] = {
+            **parsed,
+            "recommended_action": action,
+            "commands": commands,
+            "remediation_target": remediation_target,
+        }
         return state
 
     async def confidence_scoring(self, state: ResolutionState) -> ResolutionState:
@@ -809,6 +817,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         recommendation.metadata["reasoning"] = state.get("rationale", "")
         recommendation.metadata["rca_analysis"] = state.get("rca_analysis", {})
         recommendation.metadata["impact_analysis"] = state.get("impact_analysis", {})
+        recommendation.metadata["remediation_analysis"] = state.get("remediation_analysis", {})
         recommendation.metadata["detected_errors"] = state.get("gathered_context", {}).get("detected_errors", [])
         recommendation.metadata["detected_error_count"] = len(recommendation.metadata["detected_errors"])
         recommendation.metadata["service"] = str(context.alert.service or "")
