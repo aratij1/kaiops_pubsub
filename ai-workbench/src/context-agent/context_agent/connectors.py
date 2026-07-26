@@ -1314,6 +1314,12 @@ class ContextIntelligenceAgent(BaseAgent):
                         raise ValueError("connector payload must include alert and incident objects")
                     alert = Alert.model_validate(alert_payload)
                     incident = Incident.model_validate(incident_payload)
+                    if _connector.name in {"vector-db", "local-evidence"}:
+                        # These connectors perform CPU/file work and synchronous embedding HTTP.
+                        # Keep them off the consumer event loop so Kafka heartbeats remain timely.
+                        return await asyncio.to_thread(
+                            lambda: asyncio.run(_connector.fetch(alert, incident))
+                        )
                     return await _connector.fetch(alert, incident)
 
                 self.tool_registry.register(
