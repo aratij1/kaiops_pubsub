@@ -37,7 +37,7 @@ DISCOVERY_WARNING_MIN_CONFIDENCE = max(
     DISCOVERY_MIN_CONFIDENCE,
     min(1.0, float(os.getenv("DISCOVERY_WARNING_MIN_CONFIDENCE", "0.80") or 0.80)),
 )
-JIRA_MAX_NEW_ISSUES_PER_HOUR = max(1, int(os.getenv("JIRA_MAX_NEW_ISSUES_PER_HOUR", "2") or 2))
+JIRA_MAX_NEW_ISSUES_PER_HOUR = max(1, int(os.getenv("JIRA_MAX_NEW_ISSUES_PER_HOUR", "10") or 10))
 MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
     os.getenv("MESSAGE_BUS_DUAL_CONSUME_ENABLED", "false")
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -66,11 +66,15 @@ async def _llm_discovery(alert: Alert) -> dict[str, Any]:
     if not DISCOVERY_LLM_ENABLED:
         return {}
     prompt = (
-        "Return strict JSON only for incident discovery. Required keys: title, description, service, environment, "
+        "Act as an SRE discovery agent. Return one strict JSON object only. Required keys: "
+        "title, description, service, environment, "
         "category, initial_hypothesis, technical_impact, business_impact, affected_users, scope, urgency, "
-        "actionable, actionability_reason, recommended_severity, confidence, reasoning. Set actionable=true only when "
+        "actionable, actionability_reason, recommended_severity, confidence, reasoning, evidence_used, "
+        "missing_evidence, alternative_hypotheses, impact_basis. Set actionable=true only when "
         "operator intervention or investigation is required; routine cleanup, retry noise, test signals, and KaiOps' "
-        "own integration errors are not actionable. Ground every conclusion in the supplied alert; do not invent evidence."
+        "own integration errors are not actionable. confidence must be 0..1. Treat the supplied alert as an observation, "
+        "not proof of root cause or customer impact. evidence_used must contain only identifiers or fields present in the "
+        "payload. Separate observed impact from possible risk, list unknowns in missing_evidence, and never invent evidence."
     )
     try:
         response = await ai_client.route_model(
@@ -113,11 +117,23 @@ def _qualify_candidate_for_jira(candidate: dict[str, Any]) -> tuple[bool, str]:
     confidence = float(candidate.get("confidence") or 0.0)
     severity = str(candidate.get("final_severity") or candidate.get("recommended_severity") or "").lower()
     threshold = DISCOVERY_WARNING_MIN_CONFIDENCE if severity == "warning" else DISCOVERY_MIN_CONFIDENCE
+    evidence_rows = candidate.get("evidence") if isinstance(candidate.get("evidence"), list) else []
+    occurrence_count = 1
+    for row in evidence_rows:
+        attributes = row.get("attributes") if isinstance(row, dict) and isinstance(row.get("attributes"), dict) else {}
+        try:
+            occurrence_count = max(occurrence_count, int(str(attributes.get("occurrence_count") or "1")))
+        except ValueError:
+            continue
+    if severity == "critical" and evidence_rows:
+        threshold = min(threshold, 0.45)
+    elif severity == "high" and occurrence_count >= 3:
+        threshold = min(threshold, 0.60)
     if severity not in {"warning", "high", "critical"}:
         return False, f"final severity {severity or 'unknown'} is below Jira threshold"
     if confidence < threshold:
         return False, f"confidence {confidence:.2f} is below {threshold:.2f}"
-    if not candidate.get("evidence"):
+    if not evidence_rows:
         return False, "candidate has no evidence references"
     return True, "qualified by actionability, severity, confidence, and evidence policy"
 
@@ -270,6 +286,30 @@ async def _sync_candidate_to_jira(incident: Any) -> str | None:
     return jira_key
 
 
+async def _reuse_correlated_jira(incident: Any) -> str | None:
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        return None
+    metadata = incident.metadata if isinstance(incident.metadata, dict) else {}
+    candidate = metadata.get("incident_candidate") if isinstance(metadata.get("incident_candidate"), dict) else {}
+    correlation_key = str(candidate.get("correlation_key") or "").strip()
+    if not correlation_key:
+        return None
+    async with app.state.session_factory() as session:
+        jira_key = await IncidentRepository(session).find_open_jira_by_correlation_key(correlation_key)
+    if jira_key:
+        incident.ticket_id = jira_key
+        candidate["jira_key"] = jira_key
+        metadata["incident_candidate"] = candidate
+        incident.metadata = metadata
+        logger.info(
+            "incident_pipeline stage=jira_match outcome=reused incident=%s issue=%s correlation_key=%s",
+            incident.id,
+            jira_key,
+            correlation_key,
+        )
+    return jira_key
+
+
 def _build_alert_enriched_envelope(alert: Alert, incident: Any) -> dict[str, Any]:
     severity = str(getattr(alert.severity, "value", alert.severity) or "warning").strip().lower() or "warning"
     return build_event_envelope(
@@ -372,6 +412,7 @@ async def startup(app: FastAPI) -> None:
         alert, incident = await agent.process(alert_input, llm_discovery)
         jira_key: str | None = None
         try:
+            await _reuse_correlated_jira(incident)
             jira_key = await _sync_candidate_to_jira(incident)
         except Exception:
             logger.exception("failed to synchronize incident candidate to Jira incident=%s", incident.id)
@@ -382,15 +423,19 @@ async def startup(app: FastAPI) -> None:
                 await repo.save_incident(incident)
                 await repo.save_incident_event(_build_alert_enriched_envelope(alert, incident))
                 await session.commit()
-        if jira_key:
-            await app.state.producer.publish(
-                ENRICHED_ALERTS,
-                {"alert": alert, "incident": incident},
-                key=str(alert.correlation_id or alert.service),
-            )
-        else:
+        # Investigation must not be gated on Jira ticket creation succeeding —
+        # see the matching fix in process() below for the full rationale.
+        # This handle() function is the real message-bus consumer for every
+        # live alert (RAW_ALERTS); process() is a manual-test-only HTTP
+        # endpoint. Only this path actually mattered for the bug.
+        await app.state.producer.publish(
+            ENRICHED_ALERTS,
+            {"alert": alert, "incident": incident},
+            key=str(alert.correlation_id or alert.service),
+        )
+        if not jira_key:
             logger.info(
-                "incident_pipeline stage=downstream outcome=suppressed incident=%s reason=no qualified Jira incident",
+                "incident_pipeline stage=jira outcome=no_ticket incident=%s reason=not qualified for a Jira ticket, investigating anyway",
                 incident.id,
             )
         EVENTS_PROCESSED.labels(settings.service_name, RAW_ALERTS, "ok").inc()
@@ -413,9 +458,25 @@ async def process(alert: Alert) -> dict:
     enriched, incident = await agent.process(alert, await _llm_discovery(alert))
     jira_key: str | None = None
     try:
+        await _reuse_correlated_jira(incident)
         jira_key = await _sync_candidate_to_jira(incident)
     except Exception:
         logger.exception("failed to synchronize incident candidate to Jira incident=%s", incident.id)
-    if jira_key:
-        await app.state.producer.publish(ENRICHED_ALERTS, {"alert": enriched, "incident": incident}, key=alert.service)
+    if settings.database_enabled:
+        async with app.state.session_factory() as session:
+            repo = IncidentRepository(session)
+            await repo.save_alert(enriched)
+            await repo.save_incident(incident)
+            await repo.save_incident_event(_build_alert_enriched_envelope(enriched, incident))
+            await session.commit()
+    # Investigation (context-agent -> resolution-agent RCA/impact/fix) must not
+    # be gated on Jira ticket creation succeeding. Previously this only fired
+    # `if jira_key:`, so any alert the actionability/confidence qualification
+    # judged not worth a ticket (test signals, low-confidence noise, or a rate
+    # limit) got zero investigation and permanently showed an empty RCA in the
+    # UI with no indication why. Ticket-worthiness and investigation-worthiness
+    # are different questions — every alert that reaches this point already
+    # passed LLM discovery and deserves an explanation, even when it doesn't
+    # deserve a ticket.
+    await app.state.producer.publish(ENRICHED_ALERTS, {"alert": enriched, "incident": incident}, key=alert.service)
     return {"alert": enriched, "incident": incident, "jira_qualified": bool(jira_key)}

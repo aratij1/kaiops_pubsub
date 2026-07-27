@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
@@ -21,6 +22,9 @@ settings = get_settings()
 settings.service_name = "resolution-agent"
 agent = ResolutionIntelligenceAgent()
 tasks: list[asyncio.Task] = []
+MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
+    os.getenv("MESSAGE_BUS_DUAL_CONSUME_ENABLED", "false")
+).strip().lower() in {"1", "true", "yes", "on"}
 
 ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any, Any, None]]
 
@@ -150,7 +154,7 @@ async def startup(app: FastAPI) -> None:
     consumers: list[tuple[str, Any, ConsumeRunner]] = []
     for worker in range(workers):
         consumers.append((f"rabbitmq-w{worker + 1}", RabbitMQConsumer(settings, CONTEXT_EVENTS), consume_rabbitmq_forever))
-    if settings.kafka_enabled:
+    if settings.kafka_enabled and MESSAGE_BUS_DUAL_CONSUME_ENABLED:
         for worker in range(workers):
             consumers.insert(
                 worker,

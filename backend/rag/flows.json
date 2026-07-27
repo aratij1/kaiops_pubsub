@@ -370,6 +370,22 @@
     "source": "rag-incident"
   },
   {
+    "id": "mysql-exporter-privilege-denied",
+    "alert_id": "MYSQL-EXPORTER-PRIVILEGE-DENIED",
+    "alert_name": "mysql-exporter Error from scraper",
+    "alert_type": "exporter_scrape_privilege_denied",
+    "title": "mysql-exporter Error from scraper",
+    "service": "mysql-exporter",
+    "severity": "WARNING",
+    "summary": "mysqld_exporter scraper fails with \"Access denied; you need (at least one of) the SUPER or REPLICATION CLIENT privilege(s)\".",
+    "recommended_action": "Investigate issue",
+    "description": "mysqld_exporter scraper fails with \"Access denied; you need (at least one of) the SUPER or REPLICATION CLIENT privilege(s)\".",
+    "execution_plan": "1. Identify which MySQL user mysqld_exporter is configured with (--mysqld.username / MYSQLD_EXPORTER_PASSWORD or the DSN).",
+    "root_cause": "['The MySQL account mysqld_exporter authenticates with lacks the global PROCESS and REPLICATION CLIENT privileges its default scrapers (slave_status', 'global_status', \"global_variables) require. Reusing the application's database user for the exporter is the most common way this happens\", 'since that user is typically scoped to GRANT ALL PRIVILEGES ON <app_db>.* only \u2014 full rights on the application schema', 'but no global/server-level rights at all.']",
+    "impact": "[\"mysqld_exporter's slave_status (and related) scrapers fail every scrape interval; MySQL-related Prometheus metrics for replication/server status are missing or stale\", 'degrading downstream dashboards and alerting for database health.']",
+    "source": "rag-incident"
+  },
+  {
     "id": "new-alert-onboarding",
     "alert_id": "NEW-ALERT-ONBOARDING",
     "alert_name": "New Alert Onboarding",
@@ -380,20 +396,6 @@
     "summary": "create rule for checking the alerts are getting ingested  every 10 mins",
     "recommended_action": "Investigate issue",
     "description": "create rule for checking the alerts are getting ingested  every 10 mins",
-    "source": "rag-incident"
-  },
-  {
-    "id": "new-kaiops-rule-onboarding",
-    "alert_id": "new_kaiops-rule-onboarding",
-    "alert_name": "new_kaiops Monitoring Rule Onboarding",
-    "alert_type": "monitoring-rule-onboarding",
-    "title": "new_kaiops Monitoring Rule Onboarding",
-    "service": "new_kaiops",
-    "severity": "HIGH",
-    "summary": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "recommended_action": "Review generated rules and approve production deployment.",
-    "description": "Plain-language monitoring requirements were converted to prometheus rules.",
-    "deployment": "prod",
     "source": "rag-incident"
   },
   {

@@ -103,3 +103,18 @@ class JiraClient:
         fields = response.json().get("fields", {}) if isinstance(response.json(), dict) else {}
         status = fields.get("status", {}) if isinstance(fields.get("status"), dict) else {}
         return str(status.get("name") or "")
+
+    async def list_recent_issues(self, *, limit: int = 25) -> list[dict[str, Any]]:
+        """Return recently updated issues for read-only source ingestion."""
+        jql = f'project = "{self.project_key}" ORDER BY updated DESC'
+        fields = "summary,description,status,priority,reporter,assignee,labels,updated,created"
+        async with httpx.AsyncClient(auth=self._auth, timeout=20.0) as client:
+            response = await client.get(
+                f"{self.base_url}/rest/api/3/search/jql",
+                params={"jql": jql, "fields": fields, "maxResults": max(1, min(limit, 100))},
+            )
+        if response.status_code >= 400:
+            raise JiraClientError(f"Jira recent issue search failed ({response.status_code}): {response.text[:500]}")
+        payload = response.json()
+        issues = payload.get("issues", []) if isinstance(payload, dict) else []
+        return [issue for issue in issues if isinstance(issue, dict)]

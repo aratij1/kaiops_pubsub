@@ -394,6 +394,72 @@ class GeminiModelProvider(ModelProvider):
 
 
 @dataclass
+class AzureOpenAIModelProvider(ModelProvider):
+    """Azure OpenAI chat-completions, distinct from OpenAIModelProvider: different
+    auth header (api-key, not Bearer), different URL shape (deployment-scoped,
+    not model-scoped), and Azure's response is the standard chat/completions
+    shape rather than OpenAI's newer /responses shape."""
+
+    model: str = "gpt-4o"
+    api_key: str | None = None
+    base_url: str = ""
+    api_version: str = "2024-06-01"
+    timeout_seconds: float = 45.0
+    input_cost_per_million: float = 0.0
+    output_cost_per_million: float = 0.0
+
+    async def generate(self, prompt: str, payload: dict[str, Any]) -> ModelResponse:
+        self._ensure_available()
+        if not self.api_key or not self.base_url:
+            self.breaker.record_failure()
+            raise RuntimeError(f"{self.name} unavailable: AZURE_OPENAI_ENDPOINT/AZURE_OPENAI_API_KEY are not configured")
+
+        prompt_text = render_task_payload_prompt(prompt, payload)
+        request_payload = {
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT_SRE},
+                {"role": "user", "content": prompt_text},
+            ],
+            "temperature": 0.2,
+        }
+        url = f"{self.base_url.rstrip('/')}/openai/deployments/{self.model}/chat/completions"
+        headers = {"api-key": self.api_key, "Content-Type": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.post(
+                    url, params={"api-version": self.api_version}, headers=headers, json=request_payload
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPStatusError as exc:
+            self.breaker.record_failure()
+            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
+        except Exception:
+            self.breaker.record_failure()
+            raise
+
+        self.breaker.record_success()
+        choices = data.get("choices") if isinstance(data.get("choices"), list) else []
+        content_text = ""
+        if choices:
+            message = choices[0].get("message") if isinstance(choices[0], dict) else {}
+            content_text = str(message.get("content") or "")
+        if not content_text:
+            raise RuntimeError(f"{self.name} returned no text")
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        model_usage = build_usage(
+            provider=self.name,
+            model=str(data.get("model") or self.model),
+            input_tokens=int(usage.get("prompt_tokens", estimate_tokens(prompt_text))),
+            output_tokens=int(usage.get("completion_tokens", estimate_tokens(content_text))),
+            input_cost_per_million=self.input_cost_per_million,
+            output_cost_per_million=self.output_cost_per_million,
+            estimated=not bool(usage),
+        )
+        return ModelResponse(content=content_text, usage=model_usage)
+
+
+@dataclass
 class OllamaModelProvider(ModelProvider):
     endpoint: str = "http://ollama:11434"
     model: str = "llama3.1"
@@ -441,11 +507,12 @@ class ModelRouter:
     settings: Settings = field(default_factory=get_settings)
     failover_chain: dict[str, list[str]] = field(
         default_factory=lambda: {
-            "gpt-5": ["gpt-4o", "gemini", "groq", "local-llama"],
-            "gpt-4o": ["gpt-5", "gemini", "groq", "local-llama"],
-            "gemini": ["gpt-4o", "gpt-5", "groq", "local-llama"],
-            "groq": ["gpt-4o", "gemini", "local-llama"],
-            "local-llama": ["gpt-4o", "gemini", "groq"],
+            "azure-openai": ["gpt-4o", "gpt-5", "gemini", "groq", "local-llama"],
+            "gpt-5": ["azure-openai", "gpt-4o", "gemini", "groq", "local-llama"],
+            "gpt-4o": ["azure-openai", "gpt-5", "gemini", "groq", "local-llama"],
+            "gemini": ["azure-openai", "gpt-4o", "gpt-5", "groq", "local-llama"],
+            "groq": ["azure-openai", "gpt-4o", "gemini", "local-llama"],
+            "local-llama": ["azure-openai", "gpt-4o", "gemini", "groq"],
         }
     )
     prompt_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = field(default_factory=OrderedDict)
@@ -658,6 +725,14 @@ def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
         )
 
     return {
+        "azure-openai": AzureOpenAIModelProvider(
+            name="azure-openai",
+            model=settings.azure_openai_chat_deployment,
+            api_key=settings.azure_openai_api_key,
+            base_url=settings.azure_openai_endpoint,
+            api_version=settings.azure_openai_api_version,
+            timeout_seconds=settings.llm_request_timeout_seconds,
+        ),
         "gpt-5": OpenAIModelProvider(
             name="gpt-5",
             model=settings.openai_gpt5_model,

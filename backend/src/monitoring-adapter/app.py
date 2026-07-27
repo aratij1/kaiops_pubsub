@@ -102,7 +102,7 @@ from monitoring_adapter.existing_monitoring import (
 )
 from monitoring_adapter.landing_pad_normalizer import normalize_landing_pad_alert
 from monitoring_adapter.landing_pad_sources import SUPPORTED_SUFFIXES, load_landing_pad_file
-from monitoring_adapter.email_ingestion import ImapConfig, email_to_alert_payload, fetch_unseen_emails
+from monitoring_adapter.email_ingestion import EmailPollState, ImapConfig, email_to_alert_payload, fetch_unseen_emails
 from monitoring_adapter.dedup import compute_fingerprint
 from monitoring_adapter.jira_client import JiraClient, JiraClientError
 from monitoring_adapter.jira_admission import JiraAdmissionState
@@ -329,6 +329,7 @@ OPENSEARCH_LOG_POLL_INTERVAL_SECONDS = max(
 OPENSEARCH_LOG_LOOKBACK_SECONDS = max(30, int(os.getenv("OPENSEARCH_LOG_LOOKBACK_SECONDS", "300") or 300))
 OPENSEARCH_LOG_BATCH_SIZE = max(1, min(int(os.getenv("OPENSEARCH_LOG_BATCH_SIZE", "100") or 100), 500))
 OPENSEARCH_LOG_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "opensearch_log_ingestion_state.json"
+EMAIL_POLL_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "email_ingestion_state.json"
 OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING = str(
     os.getenv("OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING", "true")
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -367,6 +368,12 @@ JIRA_ALLOWED_SEVERITIES = {
     for item in os.getenv("JIRA_ALLOWED_SEVERITIES", "warning,high,critical").split(",")
     if item.strip()
 }
+JIRA_POLLING_ENABLED = str(os.getenv("JIRA_POLLING_ENABLED", "true")).strip().lower() in {
+    "1", "true", "yes", "on"
+}
+JIRA_POLL_INTERVAL_SECONDS = max(30.0, float(os.getenv("JIRA_POLL_INTERVAL_SECONDS", "60") or 60))
+JIRA_POLL_BATCH_SIZE = max(1, min(int(os.getenv("JIRA_POLL_BATCH_SIZE", "25") or 25), 100))
+_JIRA_SESSION_VERSIONS: set[str] = set()
 NONACTIONABLE_ALERT_PUBLISH_ENABLED = str(
     os.getenv("NONACTIONABLE_ALERT_PUBLISH_ENABLED", "false")
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -412,6 +419,8 @@ EMAIL_IMAP_USER = str(os.getenv("EMAIL_IMAP_USER", "") or "").strip()
 EMAIL_IMAP_PASSWORD = str(os.getenv("EMAIL_IMAP_PASSWORD", "") or "").strip()
 EMAIL_IMAP_MAILBOX = str(os.getenv("EMAIL_IMAP_MAILBOX", "INBOX") or "INBOX").strip()
 EMAIL_IMAP_USE_SSL = str(os.getenv("EMAIL_IMAP_USE_SSL", "true")).strip().lower() in {"1", "true", "yes", "on"}
+EMAIL_IMAP_SEARCH_CRITERIA = str(os.getenv("EMAIL_IMAP_SEARCH_CRITERIA", "UNSEEN") or "UNSEEN").strip().upper()
+EMAIL_IMAP_MARK_SEEN = str(os.getenv("EMAIL_IMAP_MARK_SEEN", "true")).strip().lower() in {"1", "true", "yes", "on"}
 EMAIL_POLL_INTERVAL_SECONDS = max(15.0, float(os.getenv("EMAIL_POLL_INTERVAL_SECONDS", "60") or 60))
 EMAIL_POLL_BATCH_SIZE = max(1, min(int(os.getenv("EMAIL_POLL_BATCH_SIZE", "25") or 25), 100))
 EMAIL_DEFAULT_SERVICE = str(os.getenv("EMAIL_DEFAULT_SERVICE", "email-inbox") or "email-inbox").strip()
@@ -421,11 +430,13 @@ EMAIL_ALERT_SUBJECT_REGEX = str(
         r"(?i)\b(alert|incident|critical|warning|error|failure|failed|down|sev[1-5]|p[1-5])\b",
     )
 )
+_EMAIL_SESSION_MESSAGE_IDS: set[str] = set()
 
 WORKER_FAILURE_COUNTS: dict[str, int] = {
     "incident_projection_worker": 0,
     "landing_pad_file_watcher": 0,
     "email_poll_worker": 0,
+    "jira_poll_worker": 0,
     "landing_pad_archive_worker": 0,
     "log_poll_worker": 0,
     "opensearch_log_poll_worker": 0,
@@ -1449,6 +1460,19 @@ async def _process_polled_email(message: dict[str, Any]) -> None:
     mapped_payload = email_to_alert_payload(message, default_service=EMAIL_DEFAULT_SERVICE)
 
     if CENTRALIZED_JIRA_ROUTING_ENABLED or EMAIL_JIRA_ROUTING_ENABLED:
+        try:
+            alert = _build_alert_from_payload(mapped_payload)
+            await _publish_ingested_alert(alert)
+            mapped_payload["labels"] = dict(alert.labels)
+            _persist_alert_to_landing_pad(mapped_payload, message, status="processed")
+        except Exception as exc:
+            logger.exception("failed to expose polled email %s in live stream", message.get("message_id"))
+            _persist_alert_to_landing_pad(mapped_payload, message, status="failed", error=str(exc))
+            return
+        # raw-alerts is the single automatic path into Discovery and Jira.
+        # Publishing again through the legacy direct-routing helper would
+        # create two incident candidates for the same message.
+        return
         # Same reasoning as the Alertmanager path: email no longer
         # shortcuts into the landing pad — routes through centralized
         # dedup and Jira create-or-update instead.
@@ -1478,14 +1502,24 @@ async def _email_poll_worker() -> None:
         password=EMAIL_IMAP_PASSWORD,
         mailbox=EMAIL_IMAP_MAILBOX,
         use_ssl=EMAIL_IMAP_USE_SSL,
+        mark_seen=EMAIL_IMAP_MARK_SEEN,
+        search_criterion=EMAIL_IMAP_SEARCH_CRITERIA,
         subject_pattern=EMAIL_ALERT_SUBJECT_REGEX,
     )
+    poll_state = EmailPollState(EMAIL_POLL_STATE_FILE)
     while not stop_event.is_set():
         try:
             # imaplib is blocking/sync — run it off the event loop thread.
-            messages = await asyncio.to_thread(fetch_unseen_emails, imap_config, limit=EMAIL_POLL_BATCH_SIZE)
+            messages = await asyncio.to_thread(
+                fetch_unseen_emails, imap_config, limit=EMAIL_POLL_BATCH_SIZE, state=poll_state
+            )
             for message in messages:
+                message_id = str(message.get("message_id") or "").strip()
+                if message_id and message_id in _EMAIL_SESSION_MESSAGE_IDS:
+                    continue
                 await _process_polled_email(message)
+                if message_id:
+                    _EMAIL_SESSION_MESSAGE_IDS.add(message_id)
             logger.info("email_poll_complete mailbox=%s fetched=%s", EMAIL_IMAP_MAILBOX, len(messages))
             _record_worker_success("email_poll_worker")
         except Exception as exc:
@@ -1577,6 +1611,50 @@ async def _opensearch_log_poll_worker() -> None:
             continue
 
 
+async def _jira_poll_worker() -> None:
+    """Project recent Jira tickets without requiring a publicly reachable webhook."""
+    stop_event = app.state.monitoring_adapter_stop_event
+    client = _jira_api_client()
+    if client is None:
+        logger.warning("jira_poll_disabled reason=api credentials are incomplete")
+        return
+    while not stop_event.is_set():
+        try:
+            issues = await client.list_recent_issues(limit=JIRA_POLL_BATCH_SIZE)
+            ingested = 0
+            for issue in reversed(issues):
+                fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+                version = f"{issue.get('key')}:{fields.get('updated') or fields.get('created') or ''}"
+                if version in _JIRA_SESSION_VERSIONS:
+                    continue
+                payload = {"webhookEvent": "jira:poll", "issue": issue, "event_origin": "jira"}
+                mapped_payload, _ = _jira_payload_to_alert_payload(payload)
+                alert = _build_alert_from_payload(mapped_payload)
+                labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
+                managed = "managed_by_kaiops" in labels or "kaiops-auto-created" in labels or any(
+                    str(label).startswith(("kaiops_incident_", "kaiops-candidate-")) for label in labels
+                )
+                if managed and settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
+                    async with app.state.session_factory() as session:
+                        await IncidentRepository(session).save_alert(alert)
+                        await session.commit()
+                    RECENT_ALERTS.appendleft(alert.model_dump(mode="json"))
+                else:
+                    await _publish_ingested_alert(alert)
+                mapped_payload["labels"] = dict(alert.labels)
+                _persist_alert_to_landing_pad(mapped_payload, payload, status="processed")
+                _JIRA_SESSION_VERSIONS.add(version)
+                ingested += 1
+            logger.info("jira_poll_complete project=%s fetched=%s ingested=%s", JIRA_PROJECT_KEY, len(issues), ingested)
+            _record_worker_success("jira_poll_worker")
+        except Exception as exc:
+            _record_worker_failure("jira_poll_worker", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=float(JIRA_POLL_INTERVAL_SECONDS))
+        except asyncio.TimeoutError:
+            continue
+
+
 async def _on_startup(_: Any) -> None:
     app.state.monitoring_adapter_stop_event = asyncio.Event()
     if INCIDENT_PROJECTION_WORKER_ENABLED:
@@ -1593,6 +1671,11 @@ async def _on_startup(_: Any) -> None:
                 "EMAIL_INGESTION_ENABLED is true but EMAIL_IMAP_HOST/EMAIL_IMAP_USER/EMAIL_IMAP_PASSWORD "
                 "are not fully configured — email polling will not start."
             )
+    if JIRA_POLLING_ENABLED:
+        if JIRA_API_BASE_URL and JIRA_API_EMAIL and JIRA_API_TOKEN and JIRA_PROJECT_KEY:
+            app.state.jira_poll_task = asyncio.create_task(_jira_poll_worker())
+        else:
+            logger.warning("JIRA_POLLING_ENABLED is true but Jira API credentials are incomplete")
     if LOG_INGESTION_ENABLED:
         if LOG_WATCH_PATHS:
             app.state.log_poll_task = asyncio.create_task(_log_poll_worker())
@@ -1651,6 +1734,13 @@ async def _on_shutdown(_: Any) -> None:
         opensearch_log_task.cancel()
         try:
             await opensearch_log_task
+        except asyncio.CancelledError:
+            pass
+    jira_task = getattr(app.state, "jira_poll_task", None)
+    if jira_task is not None:
+        jira_task.cancel()
+        try:
+            await jira_task
         except asyncio.CancelledError:
             pass
 

@@ -6,6 +6,7 @@ import heapq
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypedDict
@@ -188,6 +189,16 @@ class DiscoveryMCPConnector(BaseConnector):
         self.model_router_url = os.getenv("MODEL_ROUTER_URL", "http://model-router:8000").rstrip("/")
         self.timeout = max(2.0, min(float(os.getenv("DISCOVERY_MCP_TIMEOUT_SECONDS", "15")), 60.0))
         self.max_evidence = max(3, min(int(os.getenv("DISCOVERY_MCP_MAX_EVIDENCE", "18")), 40))
+        self.external_knowledge_enabled = str(
+            os.getenv("RCA_EXTERNAL_KNOWLEDGE_ENABLED", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.external_tools_enabled = str(
+            os.getenv("RCA_EXTERNAL_TOOLS_ENABLED", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.external_escalation_threshold = max(
+            0.0,
+            min(1.0, float(os.getenv("RCA_EXTERNAL_ESCALATION_CONFIDENCE_THRESHOLD", "0.65"))),
+        )
 
     @staticmethod
     def _query_terms(alert: Alert, incident: Incident) -> list[str]:
@@ -239,6 +250,24 @@ class DiscoveryMCPConnector(BaseConnector):
         if isinstance(payload.get("error"), dict):
             raise RuntimeError(str(payload["error"].get("message") or "MCP tool failed"))
         return payload.get("result") if isinstance(payload.get("result"), dict) else {}
+
+    @staticmethod
+    def _json_object(content: Any) -> dict[str, Any] | None:
+        text = str(content or "").strip()
+        fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+        candidates = [fenced.group(1).strip()] if fenced else []
+        candidates.append(text)
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            candidates.append(text[start:end + 1])
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
 
     @staticmethod
     def _fallback_report(evidence: list[dict[str, Any]], stages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -333,10 +362,7 @@ class DiscoveryMCPConnector(BaseConnector):
         response.raise_for_status()
         routed = response.json()
         content = routed.get("content")
-        try:
-            report = json.loads(content) if isinstance(content, str) else content
-        except json.JSONDecodeError:
-            report = None
+        report = self._json_object(content) if isinstance(content, str) else content
         if (
             str(routed.get("model") or "").lower() == "heuristic-fallback"
             or not isinstance(report, dict)
@@ -345,6 +371,63 @@ class DiscoveryMCPConnector(BaseConnector):
             or "insufficient_evidence" not in report
         ):
             report = self._fallback_report(evidence, stages)
+        hypotheses = report.get("hypotheses") if isinstance(report.get("hypotheses"), list) else []
+        confidence_values: list[float] = []
+        for item in hypotheses:
+            if not isinstance(item, dict):
+                continue
+            try:
+                confidence_values.append(float(item.get("confidence") or 0.0))
+            except (TypeError, ValueError):
+                continue
+        best_confidence = max(confidence_values, default=0.0)
+        needs_external_knowledge = bool(report.get("insufficient_evidence")) or best_confidence < self.external_escalation_threshold
+        report["external_knowledge_eligible"] = needs_external_knowledge
+        report["external_knowledge_used"] = False
+        report["external_tools_used"] = sorted(
+            {
+                str(row.get("tool") or row.get("source"))
+                for row in evidence
+                if isinstance(row, dict)
+                and str(row.get("source") or row.get("tool") or "").lower()
+                in {"external", "external.search", "web", "web-search"}
+            }
+        )
+        if self.external_knowledge_enabled and needs_external_knowledge:
+            external_prompt = (
+                "Use general SRE and product knowledge only to propose diagnostic hypotheses for the supplied local "
+                "evidence. Return strict JSON with summary, hypotheses (cause, confidence 0..1, supporting_evidence, "
+                "contradicting_evidence, knowledge_basis), affected_components, recommended_next_checks, "
+                "insufficient_evidence, and citations. Never present external knowledge as an observed fact. "
+                "Prefix knowledge-only citations with external-knowledge:// and cap confidence at 0.60 unless local "
+                "evidence directly supports the hypothesis."
+            )
+            try:
+                external_response = await client.post(
+                    f"{self.model_router_url}/route",
+                    json={
+                        "severity": str(getattr(alert.severity, "value", alert.severity)),
+                        "task": "rca",
+                        "prompt": external_prompt,
+                        "payload": {"alert": request_payload["alert"], "local_evidence": compact, "local_analysis": report},
+                    },
+                )
+                external_response.raise_for_status()
+                external_routed = external_response.json()
+                external_content = external_routed.get("content")
+                external_report = self._json_object(external_content) if isinstance(external_content, str) else external_content
+                if isinstance(external_report, dict):
+                    report = {
+                        **external_report,
+                        "external_knowledge_eligible": True,
+                        "external_knowledge_used": True,
+                        "external_tools_used": report.get("external_tools_used", []),
+                        "local_analysis": report,
+                    }
+                    routed = external_routed
+                    content = external_content
+            except Exception as exc:
+                report["external_knowledge_error"] = str(exc)[:300]
         report["retrieval_stages"] = stages
         report["evidence_count"] = len(evidence)
         report["model"] = routed.get("model", "unknown")
@@ -367,27 +450,34 @@ class DiscoveryMCPConnector(BaseConnector):
         stages: list[dict[str, Any]] = [{"stage": "query_planned", "status": "completed", "terms": terms}]
         evidence_by_tool: dict[str, list[dict[str, Any]]] = {}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
+            discovery_tools = ["logs.search", "tickets.search", "code.search", "mysql.search", "telemetry.search"]
+            if self.external_tools_enabled:
+                discovery_tools.append("external.search")
             results = await asyncio.gather(
                 *(
                     self._call_mcp(client, tool, terms, alert)
-                    for tool in ("logs.search", "tickets.search", "code.search", "mysql.search", "telemetry.search")
+                    for tool in discovery_tools
                 ),
                 return_exceptions=True,
             )
-            for tool, result in zip(
-                ("logs.search", "tickets.search", "code.search", "mysql.search", "telemetry.search"),
-                results,
-                strict=True,
-            ):
+            for tool, result in zip(discovery_tools, results, strict=True):
                 if isinstance(result, Exception):
                     stages.append({"stage": tool.replace(".", "_"), "status": "failed", "error": str(result)[:240]})
                     continue
                 rows = result.get("evidence", []) if isinstance(result.get("evidence"), list) else []
                 evidence_by_tool[tool] = [row for row in rows if isinstance(row, dict)]
-                stages.append({"stage": tool.replace(".", "_"), "status": "completed", "result_count": len(rows)})
+                provider_status = str(result.get("provider_status") or "completed")
+                stages.append(
+                    {
+                        "stage": tool.replace(".", "_"),
+                        "status": provider_status,
+                        "result_count": len(rows),
+                        "error": result.get("provider_error"),
+                    }
+                )
             deduped: list[dict[str, Any]] = []
             seen: set[str] = set()
-            tool_order = ("logs.search", "tickets.search", "code.search", "mysql.search", "telemetry.search")
+            tool_order = tuple(discovery_tools)
             max_rows = max((len(evidence_by_tool.get(tool, [])) for tool in tool_order), default=0)
             for index in range(max_rows):
                 for tool in tool_order:
@@ -632,13 +722,19 @@ class VectorDBConnector(BaseConnector):
     documents: list[dict[str, Any]] = field(default_factory=list)
     _document_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     _remote_store: AzureAISearchVectorStore | None = field(default=None, init=False)
+    _load_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if not self.documents:
-            self.documents = self.load_documents()
+        # Loading performs remote embedding calls. Keep construction/startup
+        # side-effect free so message-bus consumers become available first.
+        pass
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
+        if not self.documents:
+            with self._load_lock:
+                if not self.documents:
+                    self.documents = self.load_documents()
         query = " ".join(
             [
                 str(alert.service or ""),
@@ -1233,13 +1329,27 @@ class ContextIntelligenceAgent(BaseAgent):
                         raise ValueError("connector payload must include alert and incident objects")
                     alert = Alert.model_validate(alert_payload)
                     incident = Incident.model_validate(incident_payload)
+                    if _connector.name in {"vector-db", "local-evidence"}:
+                        # These connectors perform CPU/file work and synchronous embedding HTTP.
+                        # Keep them off the consumer event loop so Kafka heartbeats remain timely.
+                        return await asyncio.to_thread(
+                            lambda: asyncio.run(_connector.fetch(alert, incident))
+                        )
                     return await _connector.fetch(alert, incident)
 
                 self.tool_registry.register(
                     ToolSpec(
                         name=tool_name,
                         handler=_handler,
-                        timeout_seconds=45.0 if connector.name == "discovery-mcp" else 10.0,
+                        timeout_seconds=(
+                            300.0
+                            if connector.name == "vector-db"
+                            else 45.0
+                            if connector.name == "discovery-mcp"
+                            else 30.0
+                            if connector.name == "local-evidence"
+                            else 10.0
+                        ),
                         permissions={"context-agent"},
                     )
                 )

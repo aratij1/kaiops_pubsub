@@ -98,6 +98,10 @@ class Settings(BaseSettings):
     rag_embedding_retry_backoff_seconds: float = Field(default=1.0, alias="RAG_EMBEDDING_RETRY_BACKOFF_SECONDS")
     openai_embedding_model: str = Field(default="text-embedding-3-large", alias="OPENAI_EMBEDDING_MODEL")
     openai_embeddings_timeout_seconds: float = Field(default=15.0, alias="OPENAI_EMBEDDINGS_TIMEOUT_SECONDS")
+    rag_embedding_max_input_chars: int = Field(default=12000, alias="RAG_EMBEDDING_MAX_INPUT_CHARS")
+    kafka_session_timeout_ms: int = Field(default=45000, alias="KAFKA_SESSION_TIMEOUT_MS")
+    kafka_heartbeat_interval_ms: int = Field(default=15000, alias="KAFKA_HEARTBEAT_INTERVAL_MS")
+    kafka_max_poll_interval_ms: int = Field(default=300000, alias="KAFKA_MAX_POLL_INTERVAL_MS")
     azure_ai_search_enabled: bool = Field(default=False, alias="AZURE_AI_SEARCH_ENABLED")
     azure_ai_search_endpoint: str = Field(default="", alias="AZURE_AI_SEARCH_ENDPOINT")
     azure_ai_search_api_key: str | None = Field(default=None, alias="AZURE_AI_SEARCH_API_KEY")
@@ -145,6 +149,13 @@ class Settings(BaseSettings):
     groq_api_key: str | None = Field(default=None, alias="GROQ_API_KEY")
     groq_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_MODEL")
     groq_base_url: str = Field(default="https://api.groq.com/openai/v1", alias="GROQ_BASE_URL")
+    # Separate from azure_openai_embeddings_deployment above (used only for RAG
+    # embeddings) and azure_ai_evaluation_deployment (used only for the LLM-judge
+    # groundedness scorer) — this is the deployment model-router's own
+    # AzureOpenAIModelProvider calls for RCA/impact/fix chat completions.
+    # Defaults to "gpt-4o" since that's the deployment already proven live on
+    # this endpoint via the evaluation client.
+    azure_openai_chat_deployment: str = Field(default="gpt-4o", alias="AZURE_OPENAI_CHAT_DEPLOYMENT")
     llm_request_timeout_seconds: float = Field(default=120.0, alias="LLM_REQUEST_TIMEOUT_SECONDS")
     model_router_prompt_cache_enabled: bool = Field(default=True, alias="MODEL_ROUTER_PROMPT_CACHE_ENABLED")
     model_router_prompt_cache_ttl_seconds: float = Field(default=300.0, alias="MODEL_ROUTER_PROMPT_CACHE_TTL_SECONDS")
