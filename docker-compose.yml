@@ -574,7 +574,6 @@ services:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       context-agent: { condition: service_started }
-      resolution-agent: { condition: service_started }
 
   context-agent:
     build: *service-build
