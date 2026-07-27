@@ -247,6 +247,17 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Summary:** Real Prometheus-based MySQL exporter and DB signal monitoring
 - **Recommended Action:** Investigate issue
 
+## mysql-exporter Error from scraper
+- **Service:** mysql-exporter
+- **Severity:** WARNING
+- **Alert Type:** exporter_scrape_privilege_denied
+- **Alert ID:** MYSQL-EXPORTER-PRIVILEGE-DENIED
+- **Summary:** mysqld_exporter scraper fails with "Access denied; you need (at least one of) the SUPER or REPLICATION CLIENT privilege(s)".
+- **Recommended Action:** Investigate issue
+- **Root Cause:** ['The MySQL account mysqld_exporter authenticates with lacks the global PROCESS and REPLICATION CLIENT privileges its default scrapers (slave_status', 'global_status', "global_variables) require. Reusing the application's database user for the exporter is the most common way this happens", 'since that user is typically scoped to GRANT ALL PRIVILEGES ON <app_db>.* only — full rights on the application schema', 'but no global/server-level rights at all.']
+- **Impact:** ["mysqld_exporter's slave_status (and related) scrapers fail every scrape interval; MySQL-related Prometheus metrics for replication/server status are missing or stale", 'degrading downstream dashboards and alerting for database health.']
+- **Execution Plan:** 1. Identify which MySQL user mysqld_exporter is configured with (--mysqld.username / MYSQLD_EXPORTER_PASSWORD or the DSN).
+
 ## New Alert Onboarding
 - **Service:** payments
 - **Severity:** HIGH
@@ -254,15 +265,6 @@ _Auto-generated from RAG incident documents whenever flows.json is rebuilt. Edit
 - **Alert ID:** NEW-ALERT-ONBOARDING
 - **Summary:** create rule for checking the alerts are getting ingested  every 10 mins
 - **Recommended Action:** Investigate issue
-
-## new_kaiops Monitoring Rule Onboarding
-- **Service:** new_kaiops
-- **Severity:** HIGH
-- **Alert Type:** monitoring-rule-onboarding
-- **Alert ID:** new_kaiops-rule-onboarding
-- **Summary:** Plain-language monitoring requirements were converted to prometheus rules.
-- **Recommended Action:** Review generated rules and approve production deployment.
-- **Deployment:** prod
 
 ## Orders database replica lag
 - **Service:** orders-db

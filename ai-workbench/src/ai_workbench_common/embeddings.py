@@ -55,6 +55,7 @@ class AzureOpenAIEmbeddingModel(Embeddings):
         self._api_version = str(getattr(settings, "azure_openai_api_version", "2024-06-01") or "2024-06-01").strip()
         self._timeout_seconds = float(getattr(settings, "azure_openai_embeddings_timeout_seconds", 8.0) or 8.0)
         self._batch_size = max(1, int(getattr(settings, "rag_embedding_batch_size", 24) or 24))
+        self._max_input_chars = max(1000, int(getattr(settings, "rag_embedding_max_input_chars", 12000) or 12000))
         self._max_retries = max(1, int(getattr(settings, "rag_embedding_max_retries", 3) or 3))
         self._retry_backoff_seconds = max(
             0.1,
@@ -95,7 +96,9 @@ class AzureOpenAIEmbeddingModel(Embeddings):
             texts=texts,
             cache=self._cache,
             batch_size=self._batch_size,
-            remote_embed=self._embed_remote_batch,
+            remote_embed=lambda batch: self._embed_remote_batch(
+                [(str(text or "").strip()[: self._max_input_chars] or "[empty document]") for text in batch]
+            ),
             fallback_embed=self._fallback.embed_documents,
         )
 
@@ -144,6 +147,7 @@ class OpenAIEmbeddingModel(Embeddings):
         self._model = str(getattr(settings, "openai_embedding_model", "text-embedding-3-large") or "text-embedding-3-large").strip()
         self._timeout_seconds = float(getattr(settings, "openai_embeddings_timeout_seconds", 15.0) or 15.0)
         self._batch_size = max(1, int(getattr(settings, "rag_embedding_batch_size", 24) or 24))
+        self._max_input_chars = max(1000, int(getattr(settings, "rag_embedding_max_input_chars", 12000) or 12000))
         self._max_retries = max(1, int(getattr(settings, "rag_embedding_max_retries", 3) or 3))
         self._retry_backoff_seconds = max(
             0.1,
@@ -182,7 +186,9 @@ class OpenAIEmbeddingModel(Embeddings):
             texts=texts,
             cache=self._cache,
             batch_size=self._batch_size,
-            remote_embed=self._embed_remote_batch,
+            remote_embed=lambda batch: self._embed_remote_batch(
+                [(str(text or "").strip()[: self._max_input_chars] or "[empty document]") for text in batch]
+            ),
             fallback_embed=self._fallback.embed_documents,
         )
 
@@ -201,7 +207,6 @@ class OpenAIEmbeddingModel(Embeddings):
                 backoff_seconds=self._retry_backoff_seconds,
             )
         except Exception as exc:
-            self.fallback_active = True
             self.last_error = str(exc)
             raise
 
@@ -309,6 +314,8 @@ def _request_with_retries(
             response = getattr(exc, "response", None)
             if response is not None:
                 retry_after = float(str(response.headers.get("retry-after") or "0") or 0)
+                body = str(getattr(response, "text", "") or "")[:500]
+                last_error = RuntimeError(f"embedding HTTP {response.status_code}: {body}")
             if attempt + 1 >= max_retries:
                 break
             time.sleep(max(retry_after, backoff_seconds * (2**attempt)))

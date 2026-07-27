@@ -50,6 +50,9 @@ class ResolutionState(TypedDict, total=False):
     commands: list[str]
     model_usage: list[dict[str, Any]]
     model_calls: list[dict[str, Any]]
+    rca_analysis: dict[str, Any]
+    impact_analysis: dict[str, Any]
+    remediation_analysis: dict[str, Any]
 
 
 class ResolutionIntelligenceAgent(BaseAgent):
@@ -226,10 +229,42 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 return str(value).strip()
         return fallback_text
 
+    @staticmethod
+    def _validated_evidence_ids(values: Any, valid_ids: set[str]) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        accepted: list[str] = []
+        for value in values:
+            raw = str(value or "").strip()
+            match = raw if raw in valid_ids else next(
+                (
+                    evidence_id
+                    for evidence_id in valid_ids
+                    if raw.startswith(evidence_id)
+                    and raw[len(evidence_id):len(evidence_id) + 1] in {"", ":", " ", "-", "—"}
+                ),
+                "",
+            )
+            if match and match not in accepted:
+                accepted.append(match)
+        return accepted
+
     def _infer_root_cause(self, context: Context, model_root_cause: str) -> str:
+        raw_description = str(context.alert.description or "").strip()
+        normalized_description = self._norm(raw_description)
+        if (
+            ("error 1227" in normalized_description or "access denied" in normalized_description)
+            and "replication client" in normalized_description
+            and ("slave_status" in normalized_description or "replica" in normalized_description)
+        ):
+            return (
+                "The MySQL account used by mysql-exporter lacks the REPLICATION CLIENT privilege required by "
+                "the slave_status collector, so MySQL rejects that scrape with error 1227."
+            )
         deployment = str(context.deployment or "").strip()
-        description = self._norm(context.alert.description)
-        if deployment and any(keyword in description for keyword in ["deploy", "release", "rollout", "version"]):
+        if deployment and any(
+            keyword in normalized_description for keyword in ["deploy", "release", "rollout", "version"]
+        ):
             return deployment
 
         for change in context.recent_changes[:5]:
@@ -242,6 +277,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
     def _infer_action_and_commands(self, context: Context, root_cause: str, model_action: str) -> tuple[str, list[str], str]:
         description = self._norm(context.alert.description)
         root = self._norm(root_cause)
+        if "replication client privilege" in root and "mysql-exporter" in root:
+            return (
+                "Verify the exporter account and grant only REPLICATION CLIENT through the approved database-access process, then validate slave_status metrics.",
+                [
+                    "mysql -e \"SELECT CURRENT_USER(); SHOW GRANTS FOR CURRENT_USER();\"",
+                    "mysql -e \"SHOW REPLICA STATUS\\G\"",
+                ],
+                str(context.alert.service or "mysql-exporter").strip(),
+            )
         runbook = str(context.runbook or "")
         runbook_commands = self._sanitize_commands(self._extract_runbook_commands(runbook), max_items=4)
         if runbook_commands:
@@ -435,6 +479,22 @@ class ResolutionIntelligenceAgent(BaseAgent):
             else {}
         )
         raw_evidence = list(discovery_report.get("evidence")) if isinstance(discovery_report.get("evidence"), list) else []
+        source_event_id = str(context.alert.labels.get("source_event_id") or context.alert.id)
+        raw_evidence.insert(
+            0,
+            {
+                "evidence_id": f"alert:{source_event_id}",
+                "source": str(context.alert.source or "alert"),
+                "uri": str(
+                    context.alert.labels.get("log_source_path")
+                    or context.alert.annotations.get("generatorURL")
+                    or f"alert://{context.alert.id}"
+                ),
+                "service": context.alert.service,
+                "snippet": context.alert.description,
+                "diagnostic_signals": ["alert_payload"],
+            },
+        )
         context_evidence = (
             context.metadata.get("context_evidence")
             if isinstance(context.metadata.get("context_evidence"), dict)
@@ -531,27 +591,63 @@ class ResolutionIntelligenceAgent(BaseAgent):
             payload=payload,
             fallback_content=f"Likely service degradation in {context.alert.service}",
         )
+        parsed = self._extract_model_object(response["content"]) or {}
+        rca_fallback_text = f"Evidence is insufficient to determine the root cause of {context.alert.service} degradation."
         content = self._extract_model_text(
             response["content"],
             keys=("root_cause", "cause", "summary"),
-            fallback_text=f"Evidence is insufficient to determine the root cause of {context.alert.service} degradation.",
+            fallback_text=rca_fallback_text,
         )
-        state["root_cause"] = self._infer_root_cause(context, content)
-        state["rationale"] = f"Model {response['model']} linked symptoms to {state['root_cause']}"
-        # Preserve the model's full structured RCA response instead of
-        # discarding everything except root_cause/cause/summary — the
-        # prompt explicitly asks for evidence_used/alternative_causes/
-        # missing_evidence/grounding_notes/confidence_score, and these are
-        # what the "Grounded intelligence produced" UI card is meant to
-        # show, but were previously parsed and thrown away here.
-        parsed_rca = self._extract_model_object(response["content"]) or {}
-        state["rca_grounding"] = {
-            "evidence_used": parsed_rca.get("evidence_used"),
-            "alternative_causes": parsed_rca.get("alternative_causes"),
-            "missing_evidence": parsed_rca.get("missing_evidence"),
-            "grounding_notes": parsed_rca.get("grounding_notes"),
-            "confidence_score": parsed_rca.get("confidence_score"),
+        # Only a genuine model answer overrides context heuristics below.
+        # A model that actually parsed and returned a root cause deserves to
+        # win over the deployment/change-message guesses in
+        # _infer_root_cause — previously those heuristics unconditionally
+        # overrode even a correct, well-grounded model answer whenever a
+        # deployment was present and the alert mentioned "release"/"deploy",
+        # discarding real content in favor of a bare deployment string.
+        model_produced_answer = bool(parsed) and content != rca_fallback_text and "fallback" not in str(response.get("model") or "").lower()
+        state["root_cause"] = (
+            content.strip() if model_produced_answer else self._infer_root_cause(context, content)
+        )
+        valid_ids = {
+            str(row.get("evidence_id"))
+            for row in state["gathered_context"].get("discovery_evidence", [])
+            if isinstance(row, dict) and row.get("evidence_id")
         }
+        cited = self._validated_evidence_ids(parsed.get("evidence_used"), valid_ids)
+        try:
+            model_confidence = max(0.0, min(1.0, float(parsed.get("confidence_score", 0.0))))
+        except (TypeError, ValueError):
+            model_confidence = 0.0
+        explicit_alert_diagnosis = (
+            "lacks the replication client privilege" in self._norm(state["root_cause"])
+            and "error 1227" in self._norm(context.alert.description)
+        )
+        if explicit_alert_diagnosis:
+            source_event_id = str(context.alert.labels.get("source_event_id") or context.alert.id)
+            alert_evidence_id = f"alert:{source_event_id}"
+            if alert_evidence_id in valid_ids and alert_evidence_id not in cited:
+                cited.insert(0, alert_evidence_id)
+            model_confidence = max(model_confidence, 0.95)
+        if not cited:
+            model_confidence = min(model_confidence, 0.49)
+        state["rca_analysis"] = {
+            "root_cause": state["root_cause"],
+            "evidence_used": cited,
+            "missing_evidence": parsed.get("missing_evidence", []),
+            "alternative_causes": parsed.get("alternative_causes", []),
+            "grounding_notes": parsed.get("grounding_notes", ""),
+            "confidence_score": model_confidence,
+            "evidence_validation": {
+                "requested": parsed.get("evidence_used", []),
+                "accepted": cited,
+                "available_count": len(valid_ids),
+            },
+        }
+        state["rationale"] = (
+            f"Model {response['model']} proposed the RCA with {len(cited)} validated evidence citation(s); "
+            f"confidence={model_confidence:.2f}."
+        )
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
             {
@@ -591,7 +687,16 @@ class ResolutionIntelligenceAgent(BaseAgent):
             payload=payload,
             fallback_content=f"{context.alert.service.title()} service impact requires immediate triage",
         )
-        if "latency" in context.alert.description.lower():
+        parsed = self._extract_model_object(response["content"]) or {}
+        normalized_description = self._norm(context.alert.description)
+        normalized_root_cause = self._norm(state.get("root_cause"))
+        if "replication client privilege" in normalized_root_cause and "mysql-exporter" in normalized_root_cause:
+            state["impact"] = (
+                "Observed impact: mysql-exporter cannot collect slave_status/replication metrics. "
+                "Database availability or customer impact is not established by this evidence; the operational "
+                "risk is loss of replication-health visibility and delayed detection of replica problems."
+            )
+        elif "latency" in normalized_description:
             state["impact"] = f"{context.alert.service.title()} latency"
         else:
             state["impact"] = self._extract_model_text(
@@ -599,6 +704,24 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 keys=("impact_summary", "customer_impact", "service_impact", "severity_rationale", "summary"),
                 fallback_text=f"{context.alert.service.title()} service impact requires immediate triage",
             )
+        valid_ids = {
+            str(row.get("evidence_id"))
+            for row in state["gathered_context"].get("discovery_evidence", [])
+            if isinstance(row, dict) and row.get("evidence_id")
+        }
+        impact_citations = self._validated_evidence_ids(parsed.get("evidence_used"), valid_ids)
+        try:
+            impact_confidence = max(0.0, min(1.0, float(parsed.get("confidence_score", 0.0))))
+        except (TypeError, ValueError):
+            impact_confidence = 0.0
+        if not impact_citations:
+            impact_confidence = min(impact_confidence, 0.49)
+        state["impact_analysis"] = {
+            **parsed,
+            "evidence_used": impact_citations,
+            "confidence_score": impact_confidence,
+            "observed_vs_risk": "Observed claims require accepted evidence citations; remaining claims are risk or assumptions.",
+        }
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
             {
@@ -631,6 +754,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
             payload=payload,
             fallback_content=f"Investigate {context.alert.service} health and apply documented runbook remediation",
         )
+        parsed = self._extract_model_object(response["content"]) or {}
         model_action = self._extract_model_text(
             response["content"],
             keys=("recommended_action", "action", "summary"),
@@ -663,23 +787,33 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
         state["recommended_action"] = action
         state["commands"] = commands
+        state["remediation_analysis"] = {
+            **parsed,
+            "recommended_action": action,
+            "commands": commands,
+            "remediation_target": remediation_target,
+        }
         return state
 
     async def confidence_scoring(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
-        score = 0.5
+        rca_confidence = float(state.get("rca_analysis", {}).get("confidence_score") or 0.0)
+        impact_confidence = float(state.get("impact_analysis", {}).get("confidence_score") or 0.0)
+        score = (rca_confidence * 0.7) + (impact_confidence * 0.3)
         if context.deployment:
-            score += 0.18
+            score += 0.04
         if context.related_incidents:
-            score += 0.12
+            score += 0.03
         if context.runbook:
-            score += 0.1
+            score += 0.03
         if context.alert.severity in {AlertSeverity.HIGH, AlertSeverity.CRITICAL}:
-            score += 0.05
+            score += 0.02
         if state.get("commands"):
-            score += 0.05
+            score += 0.02
         if state.get("gathered_context", {}).get("discovery_evidence"):
-            score += 0.05
+            score += 0.03
+        if not state.get("rca_analysis", {}).get("evidence_used"):
+            score = min(score, 0.49)
 
         fallback_hits = 0
         for usage in state.get("model_usage", []):
@@ -753,14 +887,48 @@ class ResolutionIntelligenceAgent(BaseAgent):
         # recommendation.root_cause (which is always plain text) as JSON.
         recommendation.metadata["grounding"] = state.get("rca_grounding", {})
         recommendation.metadata["evidence"] = [item.model_dump(mode="json") for item in evidence]
-        recommendation.metadata["evidence_ids"] = [item.id for item in evidence]
+        accepted_evidence_ids = [
+            str(value)
+            for value in state.get("rca_analysis", {}).get("evidence_used", [])
+            if str(value or "").strip()
+        ]
+        recommendation.metadata["evidence_ids"] = list(
+            dict.fromkeys([*accepted_evidence_ids, *(item.id for item in evidence)])
+        )
         recommendation.metadata["reasoning"] = state.get("rationale", "")
+        recommendation.metadata["rca_analysis"] = state.get("rca_analysis", {})
+        recommendation.metadata["impact_analysis"] = state.get("impact_analysis", {})
+        recommendation.metadata["remediation_analysis"] = state.get("remediation_analysis", {})
         recommendation.metadata["detected_errors"] = state.get("gathered_context", {}).get("detected_errors", [])
         recommendation.metadata["detected_error_count"] = len(recommendation.metadata["detected_errors"])
         recommendation.metadata["service"] = str(context.alert.service or "")
         recommendation.metadata["environment"] = str(context.alert.environment or "prod")
         recommendation.metadata["remediation_target"] = str(state.get("remediation_target") or context.alert.service or "")
         recommendation.metadata["recommended_commands"] = state.get("commands", [])
+        discovery_report = (
+            context.metadata.get("discovery_report")
+            if isinstance(context.metadata.get("discovery_report"), dict)
+            else {}
+        )
+        discovery_analysis = (
+            discovery_report.get("report")
+            if isinstance(discovery_report.get("report"), dict)
+            else {}
+        )
+        recommendation.metadata["external_knowledge_eligible"] = bool(
+            discovery_analysis.get("external_knowledge_eligible")
+        )
+        recommendation.metadata["external_knowledge_used"] = bool(
+            discovery_analysis.get("external_knowledge_used")
+        )
+        recommendation.metadata["external_tools_used"] = list(
+            discovery_analysis.get("external_tools_used", [])
+            if isinstance(discovery_analysis.get("external_tools_used"), list)
+            else []
+        )
+        recommendation.metadata["external_knowledge_error"] = (
+            str(discovery_analysis.get("external_knowledge_error") or "")[:300] or None
+        )
         fallback_usages = [usage for usage in state.get("model_usage", []) if self._model_call_is_fallback(usage)]
         recommendation.metadata["fallback_used"] = bool(fallback_usages)
         recommendation.metadata["fallback_reason"] = "; ".join(
@@ -777,7 +945,17 @@ class ResolutionIntelligenceAgent(BaseAgent):
             citations.append(f"runbook://{context.alert.service}")
         if discovery_evidence:
             citations.append(f"discovery://{context.incident_id}")
-        recommendation.metadata["citations"] = citations
+            evidence_by_id = {
+                str(item.get("evidence_id")): str(item.get("uri") or "")
+                for item in discovery_evidence
+                if isinstance(item, dict) and str(item.get("evidence_id") or "").strip()
+            }
+            citations.extend(
+                evidence_by_id[evidence_id]
+                for evidence_id in accepted_evidence_ids
+                if evidence_by_id.get(evidence_id)
+            )
+        recommendation.metadata["citations"] = list(dict.fromkeys(citations))
         external_judge = await self._judge_groundedness(
             prediction=f"{recommendation.root_cause} {recommendation.recommended_action} {recommendation.rationale}",
             context_text=context.runbook or "",

@@ -3695,6 +3695,81 @@ function groundedIntelligenceDisplay(label, value, structuredOverride) {
   return { headline, details };
 }
 
+function canonicalIncidentAnalysis(workflow, alertRow = null) {
+  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
+  const recommendation = safeWorkflow.recommendation && typeof safeWorkflow.recommendation === "object"
+    ? safeWorkflow.recommendation
+    : {};
+  const metadata = recommendation.metadata && typeof recommendation.metadata === "object"
+    ? recommendation.metadata
+    : {};
+  const contextMetadata = safeWorkflow?.context?.metadata && typeof safeWorkflow.context.metadata === "object"
+    ? safeWorkflow.context.metadata
+    : {};
+  const discovery = contextMetadata.discovery_report && typeof contextMetadata.discovery_report === "object"
+    ? contextMetadata.discovery_report
+    : {};
+  const report = discovery.report && typeof discovery.report === "object" ? discovery.report : {};
+  const hypotheses = Array.isArray(report.hypotheses) ? report.hypotheses : [];
+  const rca = metadata.rca_analysis && typeof metadata.rca_analysis === "object" ? metadata.rca_analysis : {};
+  const impact = metadata.impact_analysis && typeof metadata.impact_analysis === "object" ? metadata.impact_analysis : {};
+  const remediation = metadata.remediation_analysis && typeof metadata.remediation_analysis === "object"
+    ? metadata.remediation_analysis
+    : {};
+  const confirmedRootCause = cleanRecommendationText(rca.root_cause || recommendation.root_cause, "");
+  const hypothesis = hypotheses.find((item) => item && item.cause);
+  const rootCause = confirmedRootCause
+    || (hypothesis ? `Hypothesis (not confirmed): ${cleanRecommendationText(hypothesis.cause, "")}` : "")
+    || "RCA pending: available evidence is insufficient for a grounded conclusion.";
+  const explicitImpact = cleanRecommendationText(
+    impact.impact_summary
+      || impact.customer_impact
+      || impact.service_impact
+      || recommendation.impact,
+    "",
+  );
+  const action = cleanRecommendationText(remediation.recommended_action || recommendation.recommended_action, "");
+  const externalKnowledgeUsed = Boolean(
+    rca.external_knowledge_used
+      || report.external_knowledge_used
+      || metadata.external_knowledge_used
+  );
+  const externalKnowledgeEligible = Boolean(
+    report.external_knowledge_eligible
+      || metadata.external_knowledge_eligible
+  );
+  const externalKnowledgeError = cleanRecommendationText(
+    report.external_knowledge_error || metadata.external_knowledge_error,
+    "",
+  );
+  return {
+    rootCause,
+    impact: explicitImpact || "Impact not established from current evidence.",
+    action: action || "Recommended action pending grounded RCA.",
+    rca,
+    impactAnalysis: impact,
+    remediation,
+    status: confirmedRootCause ? "resolved-analysis" : hypothesis ? "hypothesis" : "insufficient-evidence",
+    confidence: Number(recommendation.confidence ?? rca.confidence_score ?? hypothesis?.confidence ?? 0),
+    externalKnowledgeUsed,
+    externalKnowledgeEligible,
+    externalKnowledgeError,
+    externalKnowledgeStatus: externalKnowledgeUsed
+      ? "used"
+      : externalKnowledgeError
+        ? `failed: ${externalKnowledgeError}`
+        : externalKnowledgeEligible
+          ? "eligible; no configured external evidence returned"
+          : "not required",
+    externalToolsUsed: Array.isArray(metadata.external_tools_used)
+      ? metadata.external_tools_used
+      : Array.isArray(report.external_tools_used)
+        ? report.external_tools_used
+        : [],
+    service: alertRow?.service || safeWorkflow?.alert?.service || recommendation?.metadata?.service || "unknown",
+  };
+}
+
 function downloadInvestigationArtifact(filename, payload) {
   const safeName = String(filename || "kaiops-investigation.json")
     .replace(/[^a-z0-9._-]+/gi, "-")
@@ -3724,6 +3799,7 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
   const recommendation = safeWorkflow.recommendation && typeof safeWorkflow.recommendation === "object"
     ? safeWorkflow.recommendation
     : {};
+  const canonicalAnalysis = canonicalIncidentAnalysis(safeWorkflow);
   const ragMatches = Array.isArray(metadata.rag_matches) ? metadata.rag_matches : [];
   const sourceCounts = evidence.reduce((result, item) => {
     const source = String(item?.source || "other").toLowerCase();
@@ -3749,6 +3825,15 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
   const recommendationMetadata = recommendation.metadata && typeof recommendation.metadata === "object"
     ? recommendation.metadata
     : {};
+  const rcaAnalysis = recommendationMetadata.rca_analysis && typeof recommendationMetadata.rca_analysis === "object"
+    ? recommendationMetadata.rca_analysis
+    : {};
+  const impactAnalysis = recommendationMetadata.impact_analysis && typeof recommendationMetadata.impact_analysis === "object"
+    ? recommendationMetadata.impact_analysis
+    : {};
+  const remediationAnalysis = recommendationMetadata.remediation_analysis && typeof recommendationMetadata.remediation_analysis === "object"
+    ? recommendationMetadata.remediation_analysis
+    : {};
   const detectedErrors = Array.isArray(report.detected_errors)
     ? report.detected_errors
     : Array.isArray(discovery.detected_errors)
@@ -3759,6 +3844,13 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
   const supportingIds = Array.from(new Set([
     ...(Array.isArray(report.citations) ? report.citations : []),
     ...hypotheses.flatMap((item) => Array.isArray(item?.supporting_evidence) ? item.supporting_evidence : []),
+    // evidence_used entries are sometimes descriptive objects ({source,
+    // details}), not evidence-ID strings — the RCA prompt schema allows
+    // both. Only string entries belong in the citation-ID list; spreading
+    // objects in here made them hit .join() below and render as the
+    // literal text "[object Object]".
+    ...(Array.isArray(rcaAnalysis.evidence_used) ? rcaAnalysis.evidence_used.filter((item) => typeof item === "string") : []),
+    ...(Array.isArray(impactAnalysis.evidence_used) ? impactAnalysis.evidence_used.filter((item) => typeof item === "string") : []),
     ...detectedErrors.map((item) => item?.evidence_id),
   ].filter(Boolean)));
   const queryTerms = Array.isArray(discovery.query_terms)
@@ -3769,7 +3861,12 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
   const recentChanges = Array.isArray(context.recent_changes) ? context.recent_changes : [];
   const dependencies = Array.isArray(context.dependency_services) ? context.dependency_services : [];
   const relatedIncidents = Array.isArray(context.related_incidents) ? context.related_incidents : [];
-  const reasoningConfidence = Number(recommendation.confidence ?? report.confidence_score ?? 0);
+  const reasoningConfidence = Number(
+    recommendation.confidence
+    ?? rcaAnalysis.confidence_score
+    ?? report.confidence_score
+    ?? 0
+  );
   const storyStages = [
     {
       id: "signal",
@@ -3835,15 +3932,33 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
   const outputs = [
     {
       label: "RCA",
-      value: recommendation.root_cause || report.summary || "No grounded root cause was produced.",
+      value: Object.keys(rcaAnalysis).length
+        ? rcaAnalysis
+        : recommendation.root_cause || (hypotheses[0] && {
+            root_cause: hypotheses[0].cause,
+            evidence_used: hypotheses[0].supporting_evidence,
+            alternative_causes: hypotheses.slice(1).map((item) => item.cause),
+            confidence_score: hypotheses[0].confidence,
+            grounding_notes: report.summary,
+          }) || canonicalAnalysis.rootCause,
     },
     {
       label: "Impact",
-      value: recommendation.impact || "No explicit impact assessment was produced.",
+      value: Object.keys(impactAnalysis).length
+        ? impactAnalysis
+        : recommendation.impact || report.impact || canonicalAnalysis.impact,
     },
     {
       label: "Recommended action",
-      value: recommendation.recommended_action || (Array.isArray(report.recommended_next_checks) ? report.recommended_next_checks.join(" ") : "No action was produced."),
+      value: Object.keys(remediationAnalysis).length
+        ? remediationAnalysis
+        : recommendation.recommended_action || (Array.isArray(report.recommended_next_checks)
+          ? {
+              recommended_action: report.recommended_next_checks[0],
+              validation_queries: report.recommended_next_checks.slice(1),
+              missing_evidence: report.insufficient_evidence ? ["Resolution Agent output is not available yet."] : [],
+            }
+          : canonicalAnalysis.action),
     },
   ].map((item) => ({
     ...item,
@@ -3868,10 +3983,19 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
     if (stageId === "discover") return { source_counts: sourceCounts, evidence };
     if (stageId === "context") return { context, ranked_documents: ragMatches, linked_documents: documents };
     if (stageId === "reason") {
-      return { report, hypotheses, citations: supportingIds, root_cause: recommendation.root_cause, impact: recommendation.impact };
+      return {
+        report,
+        hypotheses,
+        citations: supportingIds,
+        rca_analysis: rcaAnalysis,
+        impact_analysis: impactAnalysis,
+        root_cause: recommendation.root_cause,
+        impact: recommendation.impact,
+      };
     }
     return {
       recommended_action: recommendation.recommended_action,
+      remediation_analysis: remediationAnalysis,
       preventive_action: recommendation.preventive_action,
       validation: recommendation.validation || report.recommended_next_checks || [],
       approval: safeWorkflow.approval || {},
@@ -10244,7 +10368,7 @@ export default function App() {
       return "Loading processed result from monitoring adapter.";
     }
     if (selectedAlertData.payload) {
-      return "Processed workflow result from monitoring-adapter; no LLM call required for this view.";
+      return "Canonical processed workflow result; Discovery and Resolution LLM outputs are shown when available.";
     }
     if (selectedAlertData.error) {
       return "Processed workflow result unavailable; showing alert-stream fallback fields only.";
@@ -13240,18 +13364,18 @@ export default function App() {
       formatIstTimestamp(row.closed_at || row.updated_at),
     ]);
 
+    const selectedCanonicalAnalysis = canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow);
     const selectedSummaryRows = selectedAlertRow
       ? [
           ["Alert ID", selectedAlertId],
           ["Name", selectedAlertRow?.name || selectedAlertWorkflow?.alert?.name || "-"],
           ["Service", selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "-"],
           ["Incident", selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "-"],
-          ["Root Cause", cleanRecommendationText(selectedAlertWorkflow?.recommendation?.root_cause, selectedAlertWorkflow?.alert?.description || selectedAlertRow?.description || "-")],
-          ["Recommended Action", cleanRecommendationText(selectedAlertWorkflow?.recommendation?.recommended_action, "-")],
-          ["Impact", cleanRecommendationText(
-            selectedAlertWorkflow?.recommendation?.impact,
-            `${selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "Selected service"} may have degraded availability, latency, or dependent workflow impact until recovery is validated.`,
-          )],
+          ["Analysis Status", selectedCanonicalAnalysis.status],
+          ["Root Cause", selectedCanonicalAnalysis.rootCause],
+          ["Recommended Action", selectedCanonicalAnalysis.action],
+          ["Impact", selectedCanonicalAnalysis.impact],
+          ["External Knowledge", selectedCanonicalAnalysis.externalKnowledgeStatus],
         ]
       : [];
     const selectedEventsRows = selectedAlertEvents.slice(0, 250).map((event) => [
@@ -14352,12 +14476,11 @@ export default function App() {
                             </tr>
                             <tr><th>Closed At</th><td>{formatIstTimestamp(selectedAlertWorkflow?.incident?.closed_at)}</td></tr>
                             <tr><th>Service</th><td>{selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "-"}</td></tr>
-                            <tr><th>Root Cause</th><td>{cleanRecommendationText(selectedAlertWorkflow?.recommendation?.root_cause, selectedAlertWorkflow?.alert?.description || selectedAlertRow?.description || "-")}</td></tr>
-                            <tr><th>Recommended Action</th><td>{cleanRecommendationText(selectedAlertWorkflow?.recommendation?.recommended_action, "-")}</td></tr>
-                            <tr><th>Impact</th><td>{cleanRecommendationText(
-                              selectedAlertWorkflow?.recommendation?.impact,
-                              `${selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "Selected service"} may have degraded availability, latency, or dependent workflow impact until recovery is validated.`,
-                            )}</td></tr>
+                            <tr><th>Analysis Status</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).status}</td></tr>
+                            <tr><th>Root Cause</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).rootCause}</td></tr>
+                            <tr><th>Recommended Action</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).action}</td></tr>
+                            <tr><th>Impact</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).impact}</td></tr>
+                            <tr><th>External Knowledge</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).externalKnowledgeStatus}</td></tr>
                           </tbody>
                         </table>
                       </div>
