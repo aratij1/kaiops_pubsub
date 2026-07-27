@@ -544,6 +544,47 @@ def _persist_alert_to_landing_pad(
         return None
 
 
+def _record_live_stream_event(
+    *,
+    origin_system: str,
+    name: str,
+    service: str = "",
+    severity: str = "",
+    description: str = "",
+    source: str = "",
+) -> None:
+    """Append an outbound KaiOps action (e.g. Jira ticket created, email sent)
+    to the same in-memory buffer GET /landing-pad/recent serves, so it shows
+    up in the Live Stream UI. These actions have their own system of record
+    (jira_ticket_links, SMTP) and don't need a landing-pad file — only visibility."""
+    now = datetime.now(timezone.utc)
+    RECENT_INGESTION_EVENTS.appendleft(
+        {
+            "file": None,
+            "path": None,
+            "modified_at": now.isoformat(),
+            "received_at": now.isoformat(),
+            "status": "processed",
+            "error": None,
+            "source": source or origin_system,
+            "name": name,
+            "service": service,
+            "environment": None,
+            "severity": severity,
+            "description": description,
+            "application": None,
+            "project": None,
+            "project_name": None,
+            "labels": {"origin_system": origin_system},
+            "annotations": {},
+            "origin_system": origin_system,
+            "ingestion_channel": origin_system,
+            "alert_status": None,
+            "alertname": name,
+        }
+    )
+
+
 def _write_alert_to_landing_pad_input(mapped_payload: dict[str, Any], raw_alert: dict[str, Any]) -> Path:
     LANDING_PAD_INPUT_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
@@ -4998,6 +5039,14 @@ async def _route_alert_through_jira(mapped_payload: dict[str, Any], raw_item: di
                     fingerprint,
                     issue_key,
                 )
+                _record_live_stream_event(
+                    origin_system="jira",
+                    name=f"{issue_key} commented: {summary}",
+                    service=str(normalized.get("service") or ""),
+                    severity=severity,
+                    description=description,
+                    source=source,
+                )
                 return {
                     "routed": True,
                     "action": "commented",
@@ -5023,6 +5072,14 @@ async def _route_alert_through_jira(mapped_payload: dict[str, Any], raw_item: di
                 source,
                 fingerprint,
                 issue_key,
+            )
+            _record_live_stream_event(
+                origin_system="jira",
+                name=f"{issue_key} created: {summary}",
+                service=str(normalized.get("service") or ""),
+                severity=severity,
+                description=description,
+                source=source,
             )
             return {
                 "routed": True,
@@ -5403,6 +5460,26 @@ async def delete_onboarding_state(project_name: str, provider_name: str | None =
         "provider_name": normalized_provider,
         "message": "Onboarding state deleted" if deleted > 0 else "Onboarding state row not found (already deleted)",
     }
+
+
+@app.post("/landing-pad/events")
+def post_landing_pad_event(payload: dict = Body(...)) -> dict[str, Any]:
+    """Lets other services (e.g. notification-service, which sends outbound
+    emails from a separate process and has no access to RECENT_INGESTION_EVENTS)
+    record an outbound action so it appears in the Live Stream UI."""
+    origin_system = str(payload.get("origin_system") or "").strip()
+    name = str(payload.get("name") or "").strip()
+    if not origin_system or not name:
+        raise HTTPException(status_code=400, detail="origin_system and name are required")
+    _record_live_stream_event(
+        origin_system=origin_system,
+        name=name,
+        service=str(payload.get("service") or ""),
+        severity=str(payload.get("severity") or ""),
+        description=str(payload.get("description") or ""),
+        source=str(payload.get("source") or ""),
+    )
+    return {"recorded": True}
 
 
 @app.get("/landing-pad/recent")
