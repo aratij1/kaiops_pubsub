@@ -59,8 +59,15 @@ services:
     container_name: telemetry-valkey-cart
   otel-collector:
     container_name: telemetry-otel-collector
+    # Upstream 3.0.0's compose.observability.yaml added an otelcol-config-full.yml
+    # layer between config.yml and config-observability.yml that this override
+    # (written against an earlier version) didn't know about. Since `command`
+    # is replaced wholesale rather than merged across compose files, omitting
+    # it here would have silently dropped that config layer instead of adding
+    # to it. Re-added in the same position upstream uses it.
     command: !override
       - --config=/etc/otelcol-config.yml
+      - --config=/etc/otelcol-config-full.yml
       - --config=/etc/otelcol-config-observability.yml
       - --config=/etc/otelcol-config-extras.yml
       - --config=/etc/otelcol-docker-logs.yml
