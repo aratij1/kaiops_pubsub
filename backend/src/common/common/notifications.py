@@ -33,6 +33,20 @@ def _send_email_sync(settings: Settings, subject: str, body: str, recipients: li
         client.send_message(message)
 
 
+async def _record_live_stream_email(settings: Settings, *, subject: str, body: str) -> None:
+    """Outbound emails have no writer into monitoring-adapter's in-memory
+    Live Stream buffer (notification-service is a separate process) — post
+    to it so sent notifications become visible there, same as inbound alerts."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{settings.monitoring_adapter_url}/landing-pad/events",
+                json={"origin_system": "email", "name": subject, "description": body, "source": "notification-service"},
+            )
+    except Exception as exc:
+        logger.debug("live_stream_email_event_failed", extra={"error": str(exc)})
+
+
 async def send_email(settings: Settings, *, subject: str, body: str) -> bool:
     if not settings.smtp_enabled or not settings.smtp_host:
         return False
@@ -42,6 +56,7 @@ async def send_email(settings: Settings, *, subject: str, body: str) -> bool:
         return False
     try:
         await asyncio.to_thread(_send_email_sync, settings, subject, body, recipients)
+        await _record_live_stream_email(settings, subject=subject, body=body)
         return True
     except Exception as exc:
         logger.warning("email_notification_failed", extra={"error": str(exc)})
