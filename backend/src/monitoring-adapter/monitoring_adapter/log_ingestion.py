@@ -180,12 +180,17 @@ async def fetch_opensearch_error_logs(
     timeout_seconds: float = 15.0,
     docker_api_endpoint: str = "",
 ) -> list[dict[str, Any]]:
-    """Fetch fresh error documents with an overlapping window and ID checkpoint."""
+    """Fetch the newest error documents with an overlapping ID checkpoint.
+
+    Newest-first ordering is intentional: a noisy source can produce more than
+    ``batch_size`` matches per poll. Oldest-first ordering would then keep the
+    alert stream permanently behind the live edge.
+    """
 
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(30, lookback_seconds))
     body = {
         "size": max(1, min(batch_size, 500)),
-        "sort": [{"@timestamp": {"order": "asc", "unmapped_type": "date"}}],
+        "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}],
         "query": {
             "bool": {
                 "filter": [{"range": {"@timestamp": {"gte": cutoff.isoformat()}}}],

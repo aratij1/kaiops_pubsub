@@ -1,4 +1,15 @@
-from monitoring_adapter.log_ingestion import log_line_to_alert_payload, readable_error_title, stable_error_signature
+from pathlib import Path
+
+import httpx
+import pytest
+
+from monitoring_adapter.log_ingestion import (
+    OpenSearchLogState,
+    fetch_opensearch_error_logs,
+    log_line_to_alert_payload,
+    readable_error_title,
+    stable_error_signature,
+)
 
 
 def test_stable_error_signature_groups_volatile_values() -> None:
@@ -54,3 +65,30 @@ def test_machine_formatted_log_gets_readable_title() -> None:
 
     assert title == "[WARNING] alertmanager: Notify attempt failed, will retry later: connection refused"
     assert "ts=" not in title
+
+
+@pytest.mark.asyncio
+async def test_opensearch_fetch_prioritizes_latest_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured_body: dict = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(__import__("json").loads(request.content))
+        return httpx.Response(200, json={"hits": {"hits": []}})
+
+    transport = httpx.MockTransport(handler)
+    original_client = httpx.AsyncClient
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    await fetch_opensearch_error_logs(
+        endpoint="http://opensearch:9200",
+        index_pattern="otel-*",
+        state=OpenSearchLogState(tmp_path / "state.json"),
+        batch_size=100,
+    )
+
+    assert captured_body["sort"] == [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}]

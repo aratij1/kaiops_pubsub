@@ -92,6 +92,11 @@ def _code_roots(arguments: dict[str, Any]) -> list[Path]:
     if configured:
         roots = [Path(str(root)) for root in configured if str(root).strip()]
         service = re.sub(r"[^a-zA-Z0-9_-]", "", str(arguments.get("service") or "").strip())
+        service = {
+            "log-ingestion": "monitoring-adapter",
+            "email-inbox": "monitoring-adapter",
+            "common.rabbitmq": "common",
+        }.get(service.lower(), service)
         catalog_root = str(project.get("service_catalog_root") or "").strip()
         if service and catalog_root:
             service_root = Path(catalog_root) / service
@@ -121,6 +126,38 @@ def _terms(arguments: dict[str, Any]) -> list[str]:
     for value in values:
         tokens.extend(re.findall(r"[a-zA-Z0-9_.-]{3,}", str(value).lower()))
     return list(dict.fromkeys(tokens))[:24]
+
+
+def _code_search_terms(arguments: dict[str, Any]) -> list[str]:
+    """Keep code retrieval focused on stable service and component tokens."""
+
+    generic_terms = {
+        str(arguments.get("project") or "").strip().lower(),
+        str(arguments.get("application") or "").strip().lower(),
+        str(arguments.get("environment") or "").strip().lower(),
+        "prod", "production", "stage", "staging", "test", "dev", "warning",
+        "failed", "failure", "error", "request", "list", "from", "with",
+        "into", "unable", "resource", "service", "message",
+    }
+    service = str(arguments.get("service") or "").strip().lower()
+    candidates = [service, *_terms(arguments)]
+    selected: list[str] = []
+    for term in candidates:
+        token = str(term or "").strip().lower()
+        if not token or token in generic_terms or token.isdigit():
+            continue
+        if re.fullmatch(r"[0-9a-f]{16,}", token) or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f-]{27,}", token
+        ):
+            continue
+        if re.match(r"^\d{4}-\d{2}-\d{2}", token):
+            continue
+        if len(token) < 4 or token in selected:
+            continue
+        selected.append(token)
+        if len(selected) >= 8:
+            break
+    return selected
 
 
 def _evidence(kind: str, path: Path, line: int, snippet: str, matched: list[str]) -> dict[str, Any]:
@@ -765,28 +802,7 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     terms = _terms(arguments)
     limit = max(1, min(int(arguments.get("limit", 8)), 20))
     if name == "code.search":
-        generic_terms = {
-            str(arguments.get("project") or "").strip().lower(),
-            str(arguments.get("application") or "").strip().lower(),
-            str(arguments.get("environment") or "").strip().lower(),
-            "prod",
-            "production",
-            "stage",
-            "staging",
-            "test",
-            "dev",
-            "warning",
-            "failed",
-            "failure",
-            "error",
-            "request",
-            "list",
-            "from",
-            "with",
-            "into",
-            "unable",
-        }
-        terms = [term for term in terms if term not in generic_terms]
+        terms = _code_search_terms(arguments)
         rows = _search_text_files(
             _code_roots(arguments),
             CODE_SUFFIXES - {".md"},

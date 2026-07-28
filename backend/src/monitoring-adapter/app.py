@@ -296,8 +296,13 @@ JIRA_WEBHOOK_SECRET = str(os.getenv("JIRA_WEBHOOK_SECRET", "") or "").strip()
 # Jira's own webhook (unchanged, JIRA_WEBHOOK_SECRET above) becomes the
 # only door back into the landing pad. Off by default so this can be
 # rolled out only once real Jira credentials are configured.
-JIRA_API_BASE_URL = str(os.getenv("JIRA_API_BASE_URL", "") or "").strip()
-JIRA_API_EMAIL = str(os.getenv("JIRA_API_EMAIL", "") or "").strip()
+# Accept connection-layer aliases used by existing deployments as well as the
+# adapter-specific names. Otherwise valid Jira credentials silently disable
+# polling and Jira disappears from the live stream.
+JIRA_API_BASE_URL = str(
+    os.getenv("JIRA_API_BASE_URL") or os.getenv("JIRA_BASE_URL") or os.getenv("JIRA_URL") or ""
+).strip()
+JIRA_API_EMAIL = str(os.getenv("JIRA_API_EMAIL") or os.getenv("JIRA_USER_EMAIL") or "").strip()
 JIRA_API_TOKEN = str(os.getenv("JIRA_API_TOKEN", "") or "").strip()
 JIRA_PROJECT_KEY = str(os.getenv("JIRA_PROJECT_KEY", "") or "").strip()
 CENTRALIZED_JIRA_ROUTING_ENABLED = str(os.getenv("CENTRALIZED_JIRA_ROUTING_ENABLED", "false")).strip().lower() in {
@@ -509,7 +514,9 @@ def _persist_alert_to_landing_pad(
         # those readers.
         target_dir = _date_partition_dir(base_dir, now)
         target_dir.mkdir(parents=True, exist_ok=True)
-        alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))
+        # Preserve the full title in the JSON payload while keeping the path
+        # below common 255-byte per-component filesystem limits.
+        alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))[:160] or "alert"
         labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
         fingerprint = str(labels.get("alert_fingerprint") or "no-fingerprint").strip() or "no-fingerprint"
         safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:24]
@@ -594,6 +601,29 @@ def _record_live_stream_event(
             "alertname": name,
         }
     )
+
+
+async def _forward_live_stream_event(mapped_payload: dict[str, Any]) -> None:
+    """Expose worker-owned ingestion events in the API process's live buffer."""
+
+    adapter_url = str(os.getenv("MONITORING_ADAPTER_URL", "") or "").rstrip("/")
+    if not adapter_url:
+        return
+    labels = mapped_payload.get("labels") if isinstance(mapped_payload.get("labels"), dict) else {}
+    payload = {
+        "origin_system": mapped_payload.get("origin_system") or labels.get("origin_system") or "logs",
+        "source": mapped_payload.get("source") or "logs",
+        "name": mapped_payload.get("name") or "log-alert",
+        "service": mapped_payload.get("service") or "",
+        "severity": mapped_payload.get("severity") or "warning",
+        "description": mapped_payload.get("description") or "",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.post(f"{adapter_url}/landing-pad/events", json=payload)
+            response.raise_for_status()
+    except httpx.HTTPError:
+        logger.warning("unable to forward ingestion event to shared live stream", exc_info=True)
 
 
 def _write_alert_to_landing_pad_input(mapped_payload: dict[str, Any], raw_alert: dict[str, Any]) -> Path:
@@ -1634,6 +1664,7 @@ async def _process_log_line(record: dict[str, Any]) -> None:
             description=str(mapped_payload.get("description") or ""),
             source="logs",
         )
+        await _forward_live_stream_event(mapped_payload)
         logger.info(
             "jira_pipeline stage=classification outcome=live_stream_only source=logs log_source=%s "
             "reason=jira routing disabled",
@@ -1649,6 +1680,7 @@ async def _process_log_line(record: dict[str, Any]) -> None:
         return
     mapped_payload["labels"] = dict(alert.labels)
     _persist_alert_to_landing_pad(mapped_payload, record, status="processed")
+    await _forward_live_stream_event(mapped_payload)
 
 
 async def _log_poll_worker() -> None:
@@ -5673,7 +5705,7 @@ def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> di
     """
     safe_limit = max(1, min(int(limit), 200))
     live_rows = list(RECENT_INGESTION_EVENTS)[:safe_limit]
-    if live_rows:
+    if live_rows and not include_archive:
         return {
             "processed_dir": str(LANDING_PAD_PROCESSED_DIR),
             "failed_dir": str(LANDING_PAD_FAILED_DIR),
@@ -5781,18 +5813,33 @@ def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> di
             entry["parse_error"] = "invalid_json"
         rows.append(entry)
 
-    if input_snapshot_rows:
-        rows = sorted(
-            [*rows, *input_snapshot_rows],
-            key=lambda row: str(row.get("modified_at") or row.get("received_at") or ""),
-            reverse=True,
-        )[:safe_limit]
+    combined_rows = [*live_rows, *rows, *input_snapshot_rows]
+    deduplicated_rows: list[dict[str, Any]] = []
+    seen_rows: set[str] = set()
+    for row in sorted(
+        combined_rows,
+        key=lambda item: str(item.get("modified_at") or item.get("received_at") or ""),
+        reverse=True,
+    ):
+        identity = str(
+            row.get("path")
+            or row.get("file")
+            or f"{row.get('source')}:{row.get('name')}:{row.get('received_at') or row.get('modified_at')}"
+        )
+        if identity in seen_rows:
+            continue
+        seen_rows.add(identity)
+        deduplicated_rows.append(row)
+        if len(deduplicated_rows) >= safe_limit:
+            break
+    rows = deduplicated_rows
 
     return {
         "processed_dir": str(LANDING_PAD_PROCESSED_DIR),
         "failed_dir": str(LANDING_PAD_FAILED_DIR),
         "partition_scheme": "YYYY/MM/DD",
         "listing_lookback_days": recent_lookback_days,
+        "source": "merged-live-and-archive",
         "rows": rows,
         "count": len(rows),
     }
