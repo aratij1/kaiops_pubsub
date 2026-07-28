@@ -41,6 +41,12 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger("kaiops-fault-lab")
 
+TELEMETRY_DEMO_SCENARIOS = (
+    "kaiops-scenario-42",  # Prometheus scrape targets partially unavailable.
+    "kaiops-scenario-43",  # Telemetry agent export gap.
+    "kaiops-scenario-22",  # Queue backlog while requests remain accepted.
+)
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -196,6 +202,10 @@ class FaultLab:
             "ticket_example": scenario["ticket_example"],
             "alert_name": scenario["alert_name"],
             "fault_id": fault["fault_id"],
+            "root_cause": scenario["root_cause"],
+            "resolution_steps": scenario["resolution_steps"],
+            "validation": scenario["validation"],
+            "runbook_id": scenario["runbook_id"],
             "synthetic": True,
         }
         with self.lock:
@@ -245,6 +255,16 @@ class FaultLab:
             return 401, {"error": "simulated authorization failure", "scenario_id": sid}, 0.01
         if behavior in {"backlog", "pipeline"}:
             return 202, {"status": "accepted", "warning": "processing delayed", "scenario_id": sid}, 0.04
+        if behavior == "telemetry":
+            # An observability fault must never become an application outage.
+            # The workload remains successful while logs and metrics expose the
+            # degraded monitoring signal for the KaiOps investigation pipeline.
+            return 200, {
+                "service": service,
+                "status": "ok",
+                "warning": "telemetry degraded",
+                "scenario_id": sid,
+            }, 0.03
         if behavior in {"capacity", "saturation"}:
             return 503, {"error": "simulated resource saturation", "scenario_id": sid}, 0.12
         if behavior == "certificate":
@@ -359,6 +379,26 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        demo_match = re.fullmatch(r"/api/demos/telemetry/(start|stop)", parsed.path)
+        if demo_match:
+            action = demo_match.group(1)
+            duration = int(query.get("duration", ["120"])[0])
+            results = []
+            for sid in TELEMETRY_DEMO_SCENARIOS:
+                if action == "start":
+                    ok, body = self.lab.start_fault(sid, duration)
+                else:
+                    ok, body = self.lab.stop_fault(sid, "telemetry_demo_stopped")
+                results.append({"scenario_id": sid, "ok": ok, **body})
+            return self.send_body(
+                HTTPStatus.ACCEPTED if action == "start" else HTTPStatus.OK,
+                {
+                    "demo": "telemetry-agent-investigation",
+                    "action": action,
+                    "application_available": True,
+                    "results": results,
+                },
+            )
         match = re.fullmatch(r"/api/faults/(kaiops-scenario-\d{2})/(start|stop)", parsed.path)
         if not match:
             return self.send_body(404, {"error": "Endpoint not found"})

@@ -547,7 +547,12 @@ async def proxy(
         "/landing-pad/recent",
         "/onboarding/state",
     }
-    request_timeout = 12.0 if is_fast_read else settings.gateway_request_timeout_seconds
+    if normalized_method == "GET" and path.split("?", 1)[0] == "/landing-pad/recent":
+        # Landing-pad scans may include archive + in-memory merge work and can
+        # exceed the generic fast-read budget under active ingestion.
+        request_timeout = max(45.0, float(settings.gateway_request_timeout_seconds))
+    else:
+        request_timeout = 12.0 if is_fast_read else settings.gateway_request_timeout_seconds
     timeout = httpx.Timeout(request_timeout, connect=5.0, pool=5.0)
     max_attempts = 2 if normalized_method in {"GET", "HEAD", "OPTIONS"} else 1
 
@@ -880,6 +885,23 @@ async def get_all_alerts(
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
     path = f"/alerts/all?{urlencode({'limit': str(limit)})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/alerts/{alert_id}/processed-result")
+async def get_alert_processed_result(
+    alert_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/alerts/{alert_id}/processed-result"
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -1329,9 +1351,10 @@ async def get_incident_stage_completeness(
 async def get_landing_pad_recent(
     request: Request,
     limit: int = 20,
+    include_archive: bool = False,
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    path = f"/landing-pad/recent?{urlencode({'limit': str(limit)})}"
+    path = f"/landing-pad/recent?{urlencode({'limit': str(limit), 'include_archive': str(include_archive).lower()})}"
     return await guarded_proxy(
         request=request,
         method="GET",

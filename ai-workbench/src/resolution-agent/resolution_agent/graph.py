@@ -192,6 +192,23 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
 
     @staticmethod
+    def _looks_like_instruction_template(value: str) -> bool:
+        text = str(value or "").strip().lower()
+        if not text:
+            return False
+        markers = [
+            "scenario:",
+            "immediate triage:",
+            "remediation:",
+            "verification:",
+            "identify the most likely root cause using only supplied incident",
+            "assess customer, service, dependency, and business impact",
+            "apply a low-risk mitigation",
+            "confirm recovery in dashboards and logs",
+        ]
+        return sum(1 for marker in markers if marker in text) >= 2
+
+    @staticmethod
     def _extract_model_object(content: Any) -> dict[str, Any] | None:
         text = str(content or "").strip()
         if not text:
@@ -217,6 +234,8 @@ class ResolutionIntelligenceAgent(BaseAgent):
         text = str(content or "").strip()
         if not text:
             return fallback_text
+        if ResolutionIntelligenceAgent._looks_like_instruction_template(text):
+            return fallback_text
         parsed = ResolutionIntelligenceAgent._extract_model_object(text)
         if parsed is None:
             return text
@@ -225,8 +244,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
             return fallback_text
         for key in keys:
             value = parsed.get(key)
-            if str(value or "").strip():
-                return str(value).strip()
+            candidate = str(value or "").strip()
+            if candidate and not ResolutionIntelligenceAgent._looks_like_instruction_template(candidate):
+                return candidate
         return fallback_text
 
     @staticmethod
@@ -248,6 +268,154 @@ class ResolutionIntelligenceAgent(BaseAgent):
             if match and match not in accepted:
                 accepted.append(match)
         return accepted
+
+    @staticmethod
+    def _is_insufficient_analysis_text(value: str, *, service: str) -> bool:
+        text = ResolutionIntelligenceAgent._norm(value)
+        if not text:
+            return True
+        generic_markers = [
+            "evidence is insufficient",
+            "unable to determine root cause",
+            "insufficient information",
+            "model synthesis was unavailable",
+            "model synthesis unavailable",
+            "likely service degradation",
+            "requires immediate triage",
+        ]
+        if any(marker in text for marker in generic_markers):
+            return True
+        service_token = ResolutionIntelligenceAgent._norm(service)
+        if service_token and text in {
+            service_token,
+            f"{service_token} latency",
+            f"likely degradation in {service_token}",
+        }:
+            return True
+        return False
+
+    @staticmethod
+    def _discovery_report_analysis(context: Context) -> dict[str, Any]:
+        discovery_report = (
+            context.metadata.get("discovery_report")
+            if isinstance(context.metadata.get("discovery_report"), dict)
+            else {}
+        )
+        analysis = discovery_report.get("report") if isinstance(discovery_report.get("report"), dict) else {}
+        return analysis
+
+    def _build_external_rca_fallback(
+        self,
+        *,
+        context: Context,
+        gathered_context: dict[str, Any],
+        current_text: str,
+    ) -> tuple[str, dict[str, Any]]:
+        analysis = self._discovery_report_analysis(context)
+        hypotheses = analysis.get("hypotheses") if isinstance(analysis.get("hypotheses"), list) else []
+        primary = hypotheses[0] if hypotheses and isinstance(hypotheses[0], dict) else {}
+        cause = str(primary.get("cause") or primary.get("summary") or analysis.get("summary") or "").strip()
+        confidence_raw = primary.get("confidence")
+        try:
+            confidence = max(0.0, min(0.6, float(confidence_raw)))
+        except (TypeError, ValueError):
+            confidence = 0.45
+
+        code_review = gathered_context.get("code_review") if isinstance(gathered_context.get("code_review"), dict) else {}
+        code_findings = code_review.get("findings") if isinstance(code_review.get("findings"), list) else []
+        grounded_code_finding = next((item for item in code_findings if isinstance(item, dict)), {})
+        detected_errors = gathered_context.get("detected_errors") if isinstance(gathered_context.get("detected_errors"), list) else []
+        first_error = detected_errors[0] if detected_errors and isinstance(detected_errors[0], dict) else {}
+        first_signal = str(first_error.get("message") or "").strip()
+        if not first_signal:
+            log_rows = gathered_context.get("log_intelligence") if isinstance(gathered_context.get("log_intelligence"), list) else []
+            if log_rows and isinstance(log_rows[0], dict):
+                first_signal = str(log_rows[0].get("snippet") or "").strip()
+        first_signal = first_signal[:240]
+
+        finding_title = str(grounded_code_finding.get("title") or "").strip()
+        finding_explanation = str(grounded_code_finding.get("explanation") or "").strip()
+        finding_source = str(grounded_code_finding.get("source_uri") or "").strip()
+        if finding_title:
+            finding_detail = finding_explanation or finding_title
+            source_suffix = f" in {finding_source}" if finding_source else ""
+            cause = (
+                f"Code review identified '{finding_title}'{source_suffix}: {finding_detail}. "
+                "This is an evidence-grounded candidate contributor, not a confirmed root cause"
+            )
+        if not cause:
+            cause = str(current_text or "").strip()
+        if self._is_insufficient_analysis_text(cause, service=str(context.alert.service or "")):
+            alert_name = str(context.alert.name or "unnamed alert").strip()
+            alert_description = str(context.alert.description or "").strip()[:300]
+            observed = f" The alert reports: {alert_description}." if alert_description else ""
+            cause = (
+                f"No unique root cause has been validated for {context.alert.service}/{alert_name}."
+                f"{observed} Additional correlated evidence is required"
+            )
+
+        cause = cause.rstrip(" .")
+        first_signal = first_signal.rstrip(" .")
+        signal_fragment = f" Observed local signal: {first_signal}." if first_signal else ""
+        synthesized = (
+            f"Alert-specific RCA hypothesis: {cause}. "
+            "Treat this as provisional until telemetry, logs, and the cited source-code evidence agree."
+            f"{signal_fragment}"
+        ).strip()
+
+        citations = analysis.get("citations") if isinstance(analysis.get("citations"), list) else []
+        metadata = {
+            "used": bool(
+                grounded_code_finding
+                or analysis.get("external_knowledge_used")
+                or analysis.get("external_knowledge_eligible")
+                or hypotheses
+            ),
+            "eligible": bool(analysis.get("external_knowledge_eligible")),
+            "tools": list(analysis.get("external_tools_used", [])) if isinstance(analysis.get("external_tools_used"), list) else [],
+            "citations": [str(item) for item in citations if str(item or "").strip()][:8],
+            "confidence": confidence,
+            "code_review_finding_used": bool(grounded_code_finding),
+        }
+        return synthesized, metadata
+
+    def _build_external_impact_fallback(
+        self,
+        *,
+        context: Context,
+        gathered_context: dict[str, Any],
+        current_text: str,
+    ) -> tuple[str, dict[str, Any]]:
+        analysis = self._discovery_report_analysis(context)
+        affected_components = (
+            analysis.get("affected_components") if isinstance(analysis.get("affected_components"), list) else []
+        )
+        affected_preview = ", ".join(str(item) for item in affected_components[:4] if str(item or "").strip())
+        dependency_services = gathered_context.get("dependency_services") if isinstance(gathered_context.get("dependency_services"), list) else []
+        dependency_preview = ", ".join(str(item) for item in dependency_services[:3] if str(item or "").strip())
+        impact_basis = str(analysis.get("summary") or current_text or "").strip()
+        if self._is_insufficient_analysis_text(impact_basis, service=str(context.alert.service or "")):
+            impact_basis = (
+                f"{context.alert.service.title()} may impact user-facing reliability, alerting quality, and downstream dependencies "
+                "until remediation is validated"
+            )
+
+        scope_bits = []
+        if affected_preview:
+            scope_bits.append(f"affected components: {affected_preview}")
+        if dependency_preview:
+            scope_bits.append(f"dependency watchlist: {dependency_preview}")
+        scope_text = f" ({'; '.join(scope_bits)})" if scope_bits else ""
+        synthesized = f"Knowledge-assisted impact assessment: {impact_basis}.{scope_text}".strip()
+
+        citations = analysis.get("citations") if isinstance(analysis.get("citations"), list) else []
+        metadata = {
+            "used": bool(analysis.get("external_knowledge_used") or analysis.get("external_knowledge_eligible") or affected_components),
+            "eligible": bool(analysis.get("external_knowledge_eligible")),
+            "tools": list(analysis.get("external_tools_used", [])) if isinstance(analysis.get("external_tools_used"), list) else [],
+            "citations": [str(item) for item in citations if str(item or "").strip()][:8],
+        }
+        return synthesized, metadata
 
     def _infer_root_cause(self, context: Context, model_root_cause: str) -> str:
         raw_description = str(context.alert.description or "").strip()
@@ -551,6 +719,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
             if isinstance(discovery_report.get("report"), dict)
             else {}
         )
+        code_review = (
+            discovery_analysis.get("code_review")
+            if isinstance(discovery_analysis.get("code_review"), dict)
+            else {}
+        )
         detected_errors = (
             discovery_analysis.get("detected_errors")
             if isinstance(discovery_analysis.get("detected_errors"), list)
@@ -571,6 +744,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
             "discovery_evidence": relevant_evidence,
             "log_intelligence": log_evidence[:8],
             "code_evidence": code_evidence[:8],
+            "code_review": code_review,
             "detected_errors": detected_errors[:12],
             "deployment": context.deployment,
             "related_incidents": related_incident_preview,
@@ -591,6 +765,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
             payload=payload,
             fallback_content=f"Likely service degradation in {context.alert.service}",
         )
+        model_fallback = self._model_call_is_fallback(response.get("usage")) or "fallback" in str(response.get("model") or "").lower()
         parsed = self._extract_model_object(response["content"]) or {}
         rca_fallback_text = f"Evidence is insufficient to determine the root cause of {context.alert.service} degradation."
         content = self._extract_model_text(
@@ -598,6 +773,8 @@ class ResolutionIntelligenceAgent(BaseAgent):
             keys=("root_cause", "cause", "summary"),
             fallback_text=rca_fallback_text,
         )
+        if model_fallback:
+            content = rca_fallback_text
         # Only a genuine model answer overrides context heuristics below.
         # A model that actually parsed and returned a root cause deserves to
         # win over the deployment/change-message guesses in
@@ -605,16 +782,39 @@ class ResolutionIntelligenceAgent(BaseAgent):
         # overrode even a correct, well-grounded model answer whenever a
         # deployment was present and the alert mentioned "release"/"deploy",
         # discarding real content in favor of a bare deployment string.
-        model_produced_answer = bool(parsed) and content != rca_fallback_text and "fallback" not in str(response.get("model") or "").lower()
-        state["root_cause"] = (
-            content.strip() if model_produced_answer else self._infer_root_cause(context, content)
+        content_is_insufficient = self._is_insufficient_analysis_text(content, service=str(context.alert.service or ""))
+        model_produced_answer = bool(parsed) and content != rca_fallback_text and not model_fallback and not content_is_insufficient
+        inferred_root_cause = content.strip() if model_produced_answer else self._infer_root_cause(context, content)
+        external_rca_text, external_rca_meta = self._build_external_rca_fallback(
+            context=context,
+            gathered_context=state.get("gathered_context", {}),
+            current_text=inferred_root_cause,
         )
-        valid_ids = {
+        use_external_rca = self._is_insufficient_analysis_text(
+            inferred_root_cause,
+            service=str(context.alert.service or ""),
+        ) and bool(external_rca_meta.get("used"))
+        state["root_cause"] = external_rca_text if use_external_rca else inferred_root_cause
+        ordered_valid_ids = [
             str(row.get("evidence_id"))
             for row in state["gathered_context"].get("discovery_evidence", [])
             if isinstance(row, dict) and row.get("evidence_id")
-        }
+        ]
+        valid_ids = set(ordered_valid_ids)
         cited = self._validated_evidence_ids(parsed.get("evidence_used"), valid_ids)
+        code_review = state["gathered_context"].get("code_review")
+        code_findings = code_review.get("findings", []) if isinstance(code_review, dict) else []
+        code_finding_ids = [
+            str(finding.get("evidence_id"))
+            for finding in code_findings
+            if isinstance(finding, dict) and str(finding.get("evidence_id") or "") in valid_ids
+        ]
+        if code_findings:
+            cited = list(dict.fromkeys([*code_finding_ids, *cited]))
+        if not cited and ordered_valid_ids:
+            # Preserve grounded evidence visibility even when the model omits
+            # the evidence_used field or returns a non-JSON answer.
+            cited = list(dict.fromkeys(ordered_valid_ids))[:6]
         try:
             model_confidence = max(0.0, min(1.0, float(parsed.get("confidence_score", 0.0))))
         except (TypeError, ValueError):
@@ -629,6 +829,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
             if alert_evidence_id in valid_ids and alert_evidence_id not in cited:
                 cited.insert(0, alert_evidence_id)
             model_confidence = max(model_confidence, 0.95)
+        if use_external_rca:
+            model_confidence = max(model_confidence, float(external_rca_meta.get("confidence") or 0.45))
+            model_confidence = min(model_confidence, 0.65)
+        elif cited and model_confidence <= 0.0:
+            model_confidence = 0.35 if model_fallback else 0.58
         if not cited:
             model_confidence = min(model_confidence, 0.49)
         state["rca_analysis"] = {
@@ -643,11 +848,21 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "accepted": cited,
                 "available_count": len(valid_ids),
             },
+            "external_knowledge_used": bool(external_rca_meta.get("used") and use_external_rca),
+            "external_knowledge_eligible": bool(external_rca_meta.get("eligible")),
+            "external_tools_used": external_rca_meta.get("tools", []),
+            "external_citations": external_rca_meta.get("citations", []),
+            "code_review_findings": code_findings,
+            "code_review_finding_evidence_ids": code_finding_ids,
         }
         state["rationale"] = (
             f"Model {response['model']} proposed the RCA with {len(cited)} validated evidence citation(s); "
             f"confidence={model_confidence:.2f}."
         )
+        if use_external_rca:
+            state["rationale"] = (
+                f"{state['rationale']} External knowledge fallback was used because grounded RCA text was insufficient."
+            )
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
             {
@@ -687,10 +902,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
             payload=payload,
             fallback_content=f"{context.alert.service.title()} service impact requires immediate triage",
         )
+        model_fallback = self._model_call_is_fallback(response.get("usage")) or "fallback" in str(response.get("model") or "").lower()
         parsed = self._extract_model_object(response["content"]) or {}
         normalized_description = self._norm(context.alert.description)
         normalized_root_cause = self._norm(state.get("root_cause"))
-        if "replication client privilege" in normalized_root_cause and "mysql-exporter" in normalized_root_cause:
+        has_specific_mysql_exporter_impact = (
+            "replication client privilege" in normalized_root_cause
+            and "mysql-exporter" in normalized_root_cause
+        )
+        if has_specific_mysql_exporter_impact:
             state["impact"] = (
                 "Observed impact: mysql-exporter cannot collect slave_status/replication metrics. "
                 "Database availability or customer impact is not established by this evidence; the operational "
@@ -704,16 +924,39 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 keys=("impact_summary", "customer_impact", "service_impact", "severity_rationale", "summary"),
                 fallback_text=f"{context.alert.service.title()} service impact requires immediate triage",
             )
-        valid_ids = {
+        if model_fallback and not has_specific_mysql_exporter_impact:
+            state["impact"] = (
+                f"{context.alert.service.title()} may have degraded availability, latency, or dependency behavior until validated recovery is confirmed."
+            )
+        impact_external_text, impact_external_meta = self._build_external_impact_fallback(
+            context=context,
+            gathered_context=state.get("gathered_context", {}),
+            current_text=str(state.get("impact") or ""),
+        )
+        use_external_impact = self._is_insufficient_analysis_text(
+            str(state.get("impact") or ""),
+            service=str(context.alert.service or ""),
+        ) and bool(impact_external_meta.get("used"))
+        if use_external_impact:
+            state["impact"] = impact_external_text
+        ordered_valid_ids = [
             str(row.get("evidence_id"))
             for row in state["gathered_context"].get("discovery_evidence", [])
             if isinstance(row, dict) and row.get("evidence_id")
-        }
+        ]
+        valid_ids = set(ordered_valid_ids)
         impact_citations = self._validated_evidence_ids(parsed.get("evidence_used"), valid_ids)
+        if not impact_citations and ordered_valid_ids:
+            impact_citations = list(dict.fromkeys(ordered_valid_ids))[:6]
         try:
             impact_confidence = max(0.0, min(1.0, float(parsed.get("confidence_score", 0.0))))
         except (TypeError, ValueError):
             impact_confidence = 0.0
+        if use_external_impact:
+            impact_confidence = max(impact_confidence, 0.45)
+            impact_confidence = min(impact_confidence, 0.65)
+        elif impact_citations and impact_confidence <= 0.0:
+            impact_confidence = 0.3 if model_fallback else 0.52
         if not impact_citations:
             impact_confidence = min(impact_confidence, 0.49)
         state["impact_analysis"] = {
@@ -721,6 +964,10 @@ class ResolutionIntelligenceAgent(BaseAgent):
             "evidence_used": impact_citations,
             "confidence_score": impact_confidence,
             "observed_vs_risk": "Observed claims require accepted evidence citations; remaining claims are risk or assumptions.",
+            "external_knowledge_used": bool(impact_external_meta.get("used") and use_external_impact),
+            "external_knowledge_eligible": bool(impact_external_meta.get("eligible")),
+            "external_tools_used": impact_external_meta.get("tools", []),
+            "external_citations": impact_external_meta.get("citations", []),
         }
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
@@ -754,12 +1001,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
             payload=payload,
             fallback_content=f"Investigate {context.alert.service} health and apply documented runbook remediation",
         )
+        model_fallback = self._model_call_is_fallback(response.get("usage")) or "fallback" in str(response.get("model") or "").lower()
         parsed = self._extract_model_object(response["content"]) or {}
         model_action = self._extract_model_text(
             response["content"],
             keys=("recommended_action", "action", "summary"),
             fallback_text=f"Investigate {context.alert.service} health and apply documented runbook remediation",
         )
+        if model_fallback:
+            model_action = f"Investigate {context.alert.service} health and apply documented runbook remediation"
         action, commands, remediation_target = self._infer_action_and_commands(
             context,
             str(state.get("root_cause") or ""),
@@ -915,17 +1165,27 @@ class ResolutionIntelligenceAgent(BaseAgent):
             if isinstance(discovery_report.get("report"), dict)
             else {}
         )
+        rca_analysis = state.get("rca_analysis", {}) if isinstance(state.get("rca_analysis"), dict) else {}
+        impact_analysis = state.get("impact_analysis", {}) if isinstance(state.get("impact_analysis"), dict) else {}
         recommendation.metadata["external_knowledge_eligible"] = bool(
             discovery_analysis.get("external_knowledge_eligible")
+            or rca_analysis.get("external_knowledge_eligible")
+            or impact_analysis.get("external_knowledge_eligible")
         )
         recommendation.metadata["external_knowledge_used"] = bool(
             discovery_analysis.get("external_knowledge_used")
+            or rca_analysis.get("external_knowledge_used")
+            or impact_analysis.get("external_knowledge_used")
         )
-        recommendation.metadata["external_tools_used"] = list(
-            discovery_analysis.get("external_tools_used", [])
-            if isinstance(discovery_analysis.get("external_tools_used"), list)
-            else []
-        )
+        external_tools: list[str] = []
+        for tool_list in (
+            discovery_analysis.get("external_tools_used"),
+            rca_analysis.get("external_tools_used"),
+            impact_analysis.get("external_tools_used"),
+        ):
+            if isinstance(tool_list, list):
+                external_tools.extend(str(item) for item in tool_list if str(item or "").strip())
+        recommendation.metadata["external_tools_used"] = list(dict.fromkeys(external_tools))
         recommendation.metadata["external_knowledge_error"] = (
             str(discovery_analysis.get("external_knowledge_error") or "")[:300] or None
         )
@@ -955,6 +1215,16 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 for evidence_id in accepted_evidence_ids
                 if evidence_by_id.get(evidence_id)
             )
+        citations.extend(
+            str(item)
+            for item in rca_analysis.get("external_citations", [])
+            if str(item or "").strip()
+        )
+        citations.extend(
+            str(item)
+            for item in impact_analysis.get("external_citations", [])
+            if str(item or "").strip()
+        )
         recommendation.metadata["citations"] = list(dict.fromkeys(citations))
         external_judge = await self._judge_groundedness(
             prediction=f"{recommendation.root_cause} {recommendation.recommended_action} {recommendation.rationale}",

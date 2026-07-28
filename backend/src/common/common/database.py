@@ -295,6 +295,9 @@ class AgentWorkItemRecord(Base, TimestampMixin):
 
 class IncidentEventRecord(Base):
     __tablename__ = "incident_events"
+    __table_args__ = (
+        Index("idx_incident_events_incident_created", "incident_id", "created_at"),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)

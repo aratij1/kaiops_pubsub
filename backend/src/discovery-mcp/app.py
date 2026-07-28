@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import aiomysql
+import asyncio
 import csv
 import hashlib
 import json
@@ -283,6 +284,8 @@ def _search_text_files(
     ranked: list[tuple[int, int, dict[str, Any]]] = []
     max_files = max(10, min(int(os.getenv("DISCOVERY_MCP_MAX_FILES", "60")), 400))
     excluded_dirs = {".git", ".claiming", "node_modules", "dist", "build", "__pycache__", "ingested_alerts", ".venv", "kaiops.egg-info"}
+    if kind == "code":
+        excluded_dirs.update({".github", ".devcontainer"})
     for root_index, root in enumerate(roots):
         if not root.is_dir():
             continue
@@ -305,13 +308,27 @@ def _search_text_files(
                     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[:5000]
                 except OSError:
                     continue
-                path_lowered = path.as_posix().lower()
+                try:
+                    # Match only the path *inside* the configured project root.
+                    # Absolute roots such as ".../external/telemetry/..." otherwise
+                    # make the generic project term "telemetry" match every file.
+                    path_lowered = path.relative_to(root).as_posix().lower()
+                except ValueError:
+                    path_lowered = path.name.lower()
                 path_matches = [term for term in terms if term in path_lowered]
                 for line_no, line in enumerate(lines, 1):
                     lowered = line.lower()
                     matched = list(dict.fromkeys([*path_matches, *(term for term in terms if term in lowered)]))
                     if matched:
-                        ranked.append((len(matched), -root_index, _evidence(kind, path, line_no, line, matched)))
+                        snippet = line
+                        if kind == "code":
+                            start = max(0, line_no - 4)
+                            end = min(len(lines), line_no + 3)
+                            snippet = "\n".join(
+                                f"{context_line_no + 1}: {lines[context_line_no]}"
+                                for context_line_no in range(start, end)
+                            )
+                        ranked.append((len(matched), -root_index, _evidence(kind, path, line_no, snippet, matched)))
             if scanned >= root_budget:
                 break
         if root_index == 0 and len(ranked) >= limit:
@@ -748,9 +765,31 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     terms = _terms(arguments)
     limit = max(1, min(int(arguments.get("limit", 8)), 20))
     if name == "code.search":
+        generic_terms = {
+            str(arguments.get("project") or "").strip().lower(),
+            str(arguments.get("application") or "").strip().lower(),
+            str(arguments.get("environment") or "").strip().lower(),
+            "prod",
+            "production",
+            "stage",
+            "staging",
+            "test",
+            "dev",
+            "warning",
+            "failed",
+            "failure",
+            "error",
+            "request",
+            "list",
+            "from",
+            "with",
+            "into",
+            "unable",
+        }
+        terms = [term for term in terms if term not in generic_terms]
         rows = _search_text_files(
             _code_roots(arguments),
-            CODE_SUFFIXES,
+            CODE_SUFFIXES - {".md"},
             terms,
             "code",
             limit,

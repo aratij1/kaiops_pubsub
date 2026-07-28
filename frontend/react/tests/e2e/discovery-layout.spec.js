@@ -2,6 +2,45 @@ import { expect, test } from "@playwright/test";
 
 test("discovery is a first-class responsive alert view", async ({ page }) => {
   test.setTimeout(45_000);
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  const workflow = {
+    alert: { id: "alert-discovery-1", name: "Pod crash loop", service: "user-profile", severity: "critical" },
+    incident: { id: "incident-discovery-1", status: "investigating" },
+    context: {
+      metadata: {
+        discovery_report: {
+          protocol: "mcp-jsonrpc-2.0",
+          retrieval_stages: [
+            { stage: "query_planned", status: "completed" },
+            { stage: "logs_search", status: "completed", result_count: 2 },
+            { stage: "tickets_search", status: "completed", result_count: 1 },
+            { stage: "code_search", status: "completed", result_count: 1 },
+            { stage: "evidence_correlated", status: "completed", result_count: 4 },
+            { stage: "llm_analysis", status: "completed" },
+            { stage: "discovery_completed", status: "completed" },
+          ],
+          evidence: [
+            { evidence_id: "LOG-1", source: "log", uri: "log://runtime/app.log#L12", snippet: "Secret lookup failed." },
+            { evidence_id: "TICKET-1", source: "ticket", uri: "ticket://OPS-9", snippet: "Previous secret rotation incident." },
+            { evidence_id: "CODE-1", source: "code", uri: "code://settings.py#L30", snippet: "Required startup secret validation." },
+          ],
+          report: {
+            model: "gpt",
+            summary: "Startup failed after a required secret could not be loaded.",
+            insufficient_evidence: false,
+            hypotheses: [{ cause: "Missing application secret", confidence: 0.91, supporting_evidence: ["LOG-1", "TICKET-1", "CODE-1"] }],
+          },
+        },
+      },
+    },
+    recommendation: {
+      root_cause: "Given the evidence:\\n```json\\n{\"root_cause\":\"Memory pressure in user-profile\",\"evidence_used\":[\"Container memory limit reached\"],\"missing_evidence\":[\"Heap profile\"],\"confidence_score\":0.72}\\n```",
+      impact: "```json\\n{\"impacted_services\":[\"user-profile\"],\"customer_impact\":\"Intermittent profile failures\",\"blast_radius\":\"Single service\",\"confidence_score\":0.64}\\n```",
+      recommended_action: "Restart the affected pod after approval and validate memory.",
+      metadata: {},
+    },
+  };
 
   await page.route("**/api-gateway/**", async (route) => {
     const path = new URL(route.request().url()).pathname.replace(/^\/api-gateway/, "");
@@ -9,7 +48,9 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
       ? { access_token: "admin-token", refresh_token: "refresh-token", user: { id: 1, username: "admin", role_name: "Administrator" } }
       : path === "/healthz"
         ? { status: "ok", service: "api-gateway" }
-        : path.startsWith("/alerts/all")
+          : path.endsWith("/processed-result")
+            ? { data: { workflow } }
+          : path.startsWith("/alerts/all")
           ? { data: { rows: [
               { alert_id: "11111111-1111-4111-8111-111111111111", id: "11111111-1111-4111-8111-111111111111", name: "Pod crash loop", service: "user-profile", application: "kaiops-core1", labels: { project_name: "KaiOps", alert_fingerprint: "email-pod-crash-1" }, severity: "critical", status: "active", source: "email" },
               { alert_id: "alert-telemetry-1", id: "alert-telemetry-1", name: "Telemetry signals missing", service: "astronomy-shop", application: "Telemetry", labels: { project_name: "Telemetry", origin_system: "telemetry", ingestion_channel: "monitoring" }, severity: "warning", status: "active", source: "telemetry" },
@@ -50,43 +91,6 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
   });
   await page.route("**/monitoring-adapter/**", async (route) => {
-    const workflow = {
-      alert: { id: "alert-discovery-1", name: "Pod crash loop", service: "user-profile", severity: "critical" },
-      incident: { id: "incident-discovery-1", status: "investigating" },
-      context: {
-        metadata: {
-          discovery_report: {
-            protocol: "mcp-jsonrpc-2.0",
-            retrieval_stages: [
-              { stage: "query_planned", status: "completed" },
-              { stage: "logs_search", status: "completed", result_count: 2 },
-              { stage: "tickets_search", status: "completed", result_count: 1 },
-              { stage: "code_search", status: "completed", result_count: 1 },
-              { stage: "evidence_correlated", status: "completed", result_count: 4 },
-              { stage: "llm_analysis", status: "completed" },
-              { stage: "discovery_completed", status: "completed" },
-            ],
-            evidence: [
-              { evidence_id: "LOG-1", source: "log", uri: "log://runtime/app.log#L12", snippet: "Secret lookup failed." },
-              { evidence_id: "TICKET-1", source: "ticket", uri: "ticket://OPS-9", snippet: "Previous secret rotation incident." },
-              { evidence_id: "CODE-1", source: "code", uri: "code://settings.py#L30", snippet: "Required startup secret validation." },
-            ],
-            report: {
-              model: "gpt",
-              summary: "Startup failed after a required secret could not be loaded.",
-              insufficient_evidence: false,
-              hypotheses: [{ cause: "Missing application secret", confidence: 0.91, supporting_evidence: ["LOG-1", "TICKET-1", "CODE-1"] }],
-            },
-          },
-        },
-      },
-      recommendation: {
-        root_cause: "Given the evidence:\\n```json\\n{\"root_cause\":\"Memory pressure in user-profile\",\"evidence_used\":[\"Container memory limit reached\"],\"missing_evidence\":[\"Heap profile\"],\"confidence_score\":0.72}\\n```",
-        impact: "```json\\n{\"impacted_services\":[\"user-profile\"],\"customer_impact\":\"Intermittent profile failures\",\"blast_radius\":\"Single service\",\"confidence_score\":0.64}\\n```",
-        recommended_action: "Restart the affected pod after approval and validate memory.",
-        metadata: {},
-      },
-    };
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { workflow } }) });
   });
   await page.goto("/");
@@ -148,6 +152,7 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await expect(discoveryTab).toBeVisible();
   await discoveryTab.click();
   await expect(page.getByRole("heading", { name: "Discovery + Context", exact: true })).toBeVisible();
+  expect(pageErrors).toEqual([]);
   await expect(page.locator(".investigation-story")).toContainText("Alert becomes a search plan");
   await expect(page.locator(".investigation-story")).toContainText("Tools return source facts");
   await expect(page.locator(".investigation-story")).toContainText("Facts are connected to operations");
