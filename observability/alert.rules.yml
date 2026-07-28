@@ -6,6 +6,8 @@ groups:
         for: 1m
         labels:
           severity: critical
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "KaiOps service is down"
           description: "Service {{ $labels.job }} is not reachable by Prometheus for more than 1 minute."
@@ -17,6 +19,8 @@ groups:
           severity: warning
           category: latency
           landing_pad: realtime
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "High p95 latency in KaiOps service"
           description: "Service {{ $labels.service }} operation {{ $labels.operation }} p95 latency is above 2s."
@@ -28,6 +32,8 @@ groups:
           severity: critical
           category: latency
           landing_pad: realtime
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "Critical p99 latency in KaiOps service"
           description: "Service {{ $labels.service }} operation {{ $labels.operation }} p99 latency is above 3s."
@@ -44,6 +50,8 @@ groups:
           severity: warning
           category: latency
           landing_pad: realtime
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "Latency SLI regression detected"
           description: "Under 95% of requests are completing within 1 second for {{ $labels.service }} / {{ $labels.operation }} over the last 10 minutes."
@@ -55,6 +63,8 @@ groups:
         for: 1m
         labels:
           severity: critical
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "MySQL exporter is down"
           description: "mysql-exporter is not reachable by Prometheus."
@@ -64,6 +74,8 @@ groups:
         for: 5m
         labels:
           severity: warning
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "MySQL connections are high"
           description: "MySQL threads_connected is {{ $value }} which is above threshold 150."
@@ -146,6 +158,8 @@ groups:
         for: 2m
         labels:
           severity: critical
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "Service down"
           description: "Endpoint {{ $labels.job }} is unreachable."
@@ -155,6 +169,8 @@ groups:
         for: 5m
         labels:
           severity: critical
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "High application error rate"
           description: "Gateway non-ok status ratio is above threshold for the last 5 minutes."
@@ -164,6 +180,8 @@ groups:
         for: 10m
         labels:
           severity: warning
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "High request latency"
           description: "P95 latency is above 500ms for {{ $labels.service }} {{ $labels.operation }}."
@@ -173,6 +191,8 @@ groups:
         for: 15m
         labels:
           severity: warning
+          project_name: KaiOps
+          application: KaiOps
         annotations:
           summary: "Low request throughput"
           description: "Request throughput dropped below expected baseline."

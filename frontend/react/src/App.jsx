@@ -259,8 +259,17 @@ function isKaiopsCoreAlert(row) {
 
 const PROMPT_FRAGMENT_PATTERNS = [
   "identify the most likely root cause using only",
+  "identify the most likely root cause using only supplied incident",
   "assess customer, service, dependency, and business impact",
   "generate an operator-safe remediation",
+  "scenario:",
+  "immediate triage:",
+  "verification:",
+  "apply a low-risk mitigation",
+  "confirm recovery in dashboards and logs",
+  "fallback rca (model unavailable)",
+  "fallback impact analysis (model unavailable)",
+  "fallback remediation guidance (model unavailable)",
 ];
 
 function isPromptFragment(value) {
@@ -268,16 +277,42 @@ function isPromptFragment(value) {
   return PROMPT_FRAGMENT_PATTERNS.some((fragment) => text.includes(fragment));
 }
 
+function isPlaceholderRecommendationText(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) {
+    return true;
+  }
+  return [
+    "undefined",
+    "null",
+    "none",
+    "n/a",
+    "na",
+    "unknown",
+    "tbd",
+    "-",
+  ].includes(text);
+}
+
 function cleanRecommendationText(value, fallback = "-") {
   if (value == null) {
     return fallback;
   }
   const text = String(value).trim();
-  if (!text) {
+  if (!text || isPlaceholderRecommendationText(text)) {
     return fallback;
   }
   const payload = parseStructuredIntelligence(text);
   if (payload) {
+    const payloadMetadata = payload.metadata && typeof payload.metadata === "object" ? payload.metadata : {};
+    const fallbackDetected = Boolean(
+      payload?.fallback
+      || payloadMetadata?.fallback
+      || String(payload?.source || "").trim().toLowerCase().includes("fallback")
+    );
+    if (fallbackDetected) {
+      return fallback;
+    }
     const keys = [
       "root_cause",
       "cause",
@@ -295,16 +330,13 @@ function cleanRecommendationText(value, fallback = "-") {
     ];
     for (const key of keys) {
       const candidate = String(payload[key] || "").trim();
-      if (candidate && !isPromptFragment(candidate)) {
+      if (candidate && !isPromptFragment(candidate) && !isPlaceholderRecommendationText(candidate)) {
         return candidate;
       }
     }
-    if (payload.metadata?.fallback) {
-      return fallback;
-    }
     return fallback;
   }
-  return isPromptFragment(text) ? fallback : text;
+  return (isPromptFragment(text) || isPlaceholderRecommendationText(text)) ? fallback : text;
 }
 
 function filterAlertsForMonitor(rows, applicationToMonitor) {
@@ -319,6 +351,12 @@ function filterAlertsForMonitor(rows, applicationToMonitor) {
   if (target === TEST_USE_CASE_SCOPE) {
     return alertRows.filter((row) => isGeneratedOrTestAlert(row));
   }
+  if (target === "telemetry") {
+    return alertRows.filter((row) => inferMonitorScope(row) === "telemetry");
+  }
+  if (isKaiopsCoreSelection(target)) {
+    return alertRows.filter((row) => inferMonitorScope(row) === "kaiops");
+  }
   return alertRows.filter((row) => {
     const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
     const explicitProject = String(
@@ -330,15 +368,6 @@ function filterAlertsForMonitor(rows, applicationToMonitor) {
       || labels?.application
       || ""
     ).trim().toLowerCase();
-    if (target === "telemetry") {
-      return explicitProject === "telemetry" || explicitProject === "astronomy-shop";
-    }
-    if (isKaiopsCoreSelection(target) && (explicitProject === "telemetry" || explicitProject === "astronomy-shop")) {
-      return false;
-    }
-    if (isKaiopsCoreSelection(target)) {
-      return isKaiopsCoreAlert(row);
-    }
     const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
     const candidates = [
       row?.application,
@@ -383,12 +412,13 @@ function filterRowsForMonitor(rows, applicationToMonitor) {
   if (target === TEST_USE_CASE_SCOPE) {
     return items.filter((row) => isGeneratedOrTestAlert(row));
   }
+  if (target === "telemetry") {
+    return items.filter((row) => inferMonitorScope(row) === "telemetry");
+  }
+  if (isKaiopsCoreSelection(target)) {
+    return items.filter((row) => inferMonitorScope(row) === "kaiops");
+  }
   return items.filter((row) => {
-    if (isKaiopsCoreSelection(target)) {
-      const service = String(row?.service || "").trim().toLowerCase();
-      const owner = String(row?.owner || row?.owner_team || "").trim().toLowerCase();
-      return KAIOPS_CORE_SERVICE_SET.has(service) || owner === "platform-ops" || owner === "kaiops";
-    }
     const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
     const candidates = [
       row?.application,
@@ -418,6 +448,49 @@ function filterRowsForMonitor(rows, applicationToMonitor) {
         hasTokenOverlap(value, target)
     );
   });
+}
+
+function inferMonitorScope(row) {
+  const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
+  const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
+  const explicitProject = String(
+    row?.project_name
+    || labels?.project_name
+    || row?.project
+    || labels?.project
+    || row?.application
+    || labels?.application
+    || metadata?.project_name
+    || metadata?.project
+    || metadata?.application
+    || ""
+  ).trim().toLowerCase();
+  if (explicitProject.includes("telemetry") || explicitProject.includes("astronomy")) {
+    return "telemetry";
+  }
+  if (explicitProject.includes("kaiops") || explicitProject.includes("kai-ops")) {
+    return "kaiops";
+  }
+
+  const sourcePath = String(row?.path || row?.file || row?.source_path || "").trim().toLowerCase();
+  if (sourcePath.includes("opensearch://otel-") || sourcePath.includes("astronomy") || sourcePath.includes("telemetry")) {
+    return "telemetry";
+  }
+
+  const namespace = String(labels?.namespace || metadata?.namespace || "").trim().toLowerCase();
+  if (namespace.includes("otel") || namespace.includes("astronomy")) {
+    return "telemetry";
+  }
+
+  const service = String(row?.service || labels?.service || labels?.job || "").trim().toLowerCase();
+  if (KAIOPS_CORE_SERVICE_SET.has(service) || service.startsWith("kaiops-") || service.startsWith("kaiops_")) {
+    return "kaiops";
+  }
+
+  if (isKaiopsCoreAlert(row)) {
+    return "kaiops";
+  }
+  return "";
 }
 
 function isGeneratedOrTestAlert(row) {
@@ -470,14 +543,14 @@ function normalizeAlertChannel(row) {
     || row?.ingestion_channel
     || ""
   ).trim().toLowerCase();
+  if (explicitOrigin.includes("email") || explicitChannel.includes("email")) return "email";
+  if (explicitOrigin.includes("jira") || explicitOrigin.includes("ticket") || explicitChannel.includes("ticket")) return "ticket";
+  if (explicitOrigin.includes("log") || explicitOrigin.includes("opensearch") || explicitChannel.includes("log")) return "log";
   // OpenSearch is the transport for logs from both KaiOps and the
   // OpenTelemetry demo. Preserve the owning project before classifying the
   // transport as a generic log channel.
   if (projectName === "telemetry" || projectName === "astronomy-shop") return "telemetry";
   if (explicitOrigin.includes("telemetry") || explicitOrigin.includes("opentelemetry")) return "telemetry";
-  if (explicitOrigin.includes("email") || explicitChannel.includes("email")) return "email";
-  if (explicitOrigin.includes("jira") || explicitOrigin.includes("ticket") || explicitChannel.includes("ticket")) return "ticket";
-  if (explicitOrigin.includes("log") || explicitOrigin.includes("opensearch") || explicitChannel.includes("log")) return "log";
   const source = [
     row?.source,
     row?.provider,
@@ -552,6 +625,74 @@ function sourceChannelLabel(value) {
   if (key === "log") return "Logs / OpenSearch";
   if (key === "other") return "Other";
   return key || "Unknown";
+}
+
+const ALERT_SOURCE_CHANNELS = ["prometheus", "telemetry", "email", "ticket", "log"];
+const MAX_LATEST_ALERTS_PER_SOURCE = 30;
+const MIN_VISIBLE_ALERTS_BY_SOURCE = { prometheus: 5, email: 5, log: 5 };
+
+function capLatestAlertsPerSource(rows, maxPerSource = MAX_LATEST_ALERTS_PER_SOURCE) {
+  const safeMax = Math.max(1, Number(maxPerSource) || MAX_LATEST_ALERTS_PER_SOURCE);
+  const counters = Object.fromEntries(ALERT_SOURCE_CHANNELS.map((channel) => [channel, 0]));
+  return (Array.isArray(rows) ? rows : [])
+    .slice()
+    .sort((left, right) => alertTimeMs(right) - alertTimeMs(left))
+    .filter((row) => {
+      const channel = normalizeAlertChannel(row);
+      if (!ALERT_SOURCE_CHANNELS.includes(channel)) {
+        return false;
+      }
+      if (counters[channel] >= safeMax) {
+        return false;
+      }
+      counters[channel] += 1;
+      return true;
+    });
+}
+
+function ensureMinimumAlertsBySource(rows, sourceRows, minimums = MIN_VISIBLE_ALERTS_BY_SOURCE) {
+  const selected = (Array.isArray(rows) ? rows : []).slice();
+  const candidates = (Array.isArray(sourceRows) ? sourceRows : [])
+    .slice()
+    .sort((left, right) => alertTimeMs(right) - alertTimeMs(left));
+  const seen = new Set(
+    selected.map((row) => String(
+      row?.alert_id
+      || row?.id
+      || row?.event_id
+      || row?.file
+      || `${normalizeAlertChannel(row)}:${row?.name || ""}:${row?.created_at || row?.received_at || ""}`
+    ))
+  );
+  const counts = Object.fromEntries(
+    Object.keys(minimums).map((channel) => [
+      channel,
+      selected.filter((row) => normalizeAlertChannel(row) === channel).length,
+    ])
+  );
+
+  for (const row of candidates) {
+    const channel = normalizeAlertChannel(row);
+    const required = Number(minimums[channel] || 0);
+    if (!required || counts[channel] >= required) {
+      continue;
+    }
+    const identity = String(
+      row?.alert_id
+      || row?.id
+      || row?.event_id
+      || row?.file
+      || `${channel}:${row?.name || ""}:${row?.created_at || row?.received_at || ""}`
+    );
+    if (seen.has(identity)) {
+      continue;
+    }
+    seen.add(identity);
+    selected.push(row);
+    counts[channel] += 1;
+  }
+
+  return selected.sort((left, right) => alertTimeMs(right) - alertTimeMs(left));
 }
 
 function monitorScopeLabel(scope) {
@@ -3655,13 +3796,17 @@ function groundedIntelligenceDisplay(label, value, structuredOverride) {
   }
   const isRca = label === "RCA";
   const isImpact = label === "Impact";
-  const headline = String(
+  const isCodeReview = label === "Code review";
+  const headlineCandidate = String(
     isRca
       ? parsed.root_cause || parsed.cause || parsed.summary || value
       : isImpact
         ? parsed.impact_summary || parsed.service_impact || parsed.customer_impact || parsed.severity_rationale || parsed.summary
+        : isCodeReview
+          ? parsed.summary || parsed.findings_summary || parsed.defensive_coding_summary || parsed.review_summary || parsed.recommended_action || parsed.action
         : parsed.recommended_action || parsed.action || parsed.summary
-  ).trim() || `No ${label.toLowerCase()} was produced.`;
+  ).trim();
+  const headline = cleanRecommendationText(headlineCandidate, `No ${label.toLowerCase()} was produced.`);
   const detailCandidates = isRca
     ? [
         ["Evidence used", parsed.evidence_used],
@@ -3679,6 +3824,20 @@ function groundedIntelligenceDisplay(label, value, structuredOverride) {
           ["Missing evidence", parsed.missing_evidence],
           ["Assumptions", parsed.assumptions],
         ]
+      : isCodeReview
+        ? [
+            ["Reviewed source code", parsed.reviewed_sources],
+            ["Reviewed evidence IDs", parsed.reviewed_evidence_ids],
+            ["Defensive coding required", parsed.defensive_coding_required],
+            ["Issues", parsed.issues],
+            ["Potential bugs", parsed.potential_bugs],
+            ["Missing guards", parsed.missing_guards],
+            ["Findings", parsed.findings],
+            ["Proposed patches", parsed.code_patches],
+            ["Evidence gaps", parsed.evidence_gaps],
+            ["Review notes", parsed.review_notes],
+            ["Recommended fix", parsed.recommended_fix],
+          ]
       : [
           ["Why", parsed.why_this_action],
           ["Validation", parsed.validation_queries],
@@ -3789,7 +3948,11 @@ function downloadInvestigationArtifact(filename, payload) {
   URL.revokeObjectURL(objectUrl);
 }
 
-function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocument }) {
+function IntelligenceConnectionView({
+  workflow,
+  documents = [],
+  onDownloadDocument,
+}) {
   const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
   const context = safeWorkflow.context && typeof safeWorkflow.context === "object" ? safeWorkflow.context : {};
   const metadata = context.metadata && typeof context.metadata === "object" ? context.metadata : {};
@@ -3933,7 +4096,21 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
     {
       label: "RCA",
       value: Object.keys(rcaAnalysis).length
-        ? rcaAnalysis
+        ? {
+            ...rcaAnalysis,
+            root_cause: cleanRecommendationText(
+              rcaAnalysis.root_cause
+              || recommendation.root_cause
+              || (hypotheses[0]?.cause ? `Hypothesis (needs validation): ${hypotheses[0].cause}` : ""),
+              "RCA pending: available evidence is insufficient for a grounded conclusion.",
+            ),
+            evidence_used: Array.isArray(rcaAnalysis.evidence_used) && rcaAnalysis.evidence_used.length
+              ? rcaAnalysis.evidence_used
+              : (hypotheses[0]?.supporting_evidence || supportingIds || []).filter((item) => typeof item === "string"),
+            confidence_score: Number.isFinite(Number(rcaAnalysis.confidence_score)) && Number(rcaAnalysis.confidence_score) > 0
+              ? Number(rcaAnalysis.confidence_score)
+              : Number(recommendation.confidence ?? report.confidence_score ?? hypotheses[0]?.confidence ?? 0),
+          }
         : recommendation.root_cause || (hypotheses[0] && {
             root_cause: hypotheses[0].cause,
             evidence_used: hypotheses[0].supporting_evidence,
@@ -3945,8 +4122,58 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
     {
       label: "Impact",
       value: Object.keys(impactAnalysis).length
-        ? impactAnalysis
+        ? {
+            ...impactAnalysis,
+            impact_summary: cleanRecommendationText(
+              impactAnalysis.impact_summary
+              || impactAnalysis.customer_impact
+              || impactAnalysis.service_impact
+              || recommendation.impact
+              || report.impact,
+              "Impact not established from current evidence.",
+            ),
+            evidence_used: Array.isArray(impactAnalysis.evidence_used) && impactAnalysis.evidence_used.length
+              ? impactAnalysis.evidence_used
+              : (supportingIds || []).filter((item) => typeof item === "string"),
+            confidence_score: Number.isFinite(Number(impactAnalysis.confidence_score)) && Number(impactAnalysis.confidence_score) > 0
+              ? Number(impactAnalysis.confidence_score)
+              : Number(recommendation.confidence ?? report.confidence_score ?? 0),
+          }
         : recommendation.impact || report.impact || canonicalAnalysis.impact,
+    },
+    {
+      label: "Code review",
+      value: report.code_review && typeof report.code_review === "object"
+        ? {
+            ...report.code_review,
+            reviewed_sources: (Array.isArray(report.code_review.reviewed_sources) ? report.code_review.reviewed_sources : [])
+              .map((source) => ({
+                evidence_id: source?.evidence_id,
+                source_uri: source?.source_uri,
+                snippet: source?.snippet,
+              })),
+            findings: (Array.isArray(report.code_review.findings) ? report.code_review.findings : []).map((finding) => ({
+              title: finding?.title,
+              severity: finding?.severity,
+              explanation: finding?.explanation,
+              evidence_id: finding?.evidence_id,
+              source_uri: finding?.source_uri,
+              patch_limitations: finding?.patch_limitations,
+            })),
+            code_patches: (Array.isArray(report.code_review.findings) ? report.code_review.findings : [])
+              .filter((finding) => String(finding?.patch || "").trim())
+              .map((finding) => ({
+                evidence_id: finding?.evidence_id,
+                source_uri: finding?.source_uri,
+                unified_diff: finding.patch,
+              })),
+          }
+        : {
+            summary: "Code review not available for this analysis.",
+            insufficient_context: true,
+            findings: [],
+            code_patches: [],
+          },
     },
     {
       label: "Recommended action",
@@ -4149,6 +4376,34 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
                   ))}
                 </dl>
               ) : null}
+              {item.label === "Code review" && Array.isArray(item.value?.reviewed_sources)
+                ? item.value.reviewed_sources.map((source, sourceIndex) => (
+                    <div
+                      className="code-review-patch"
+                      key={`code-review-source-${source?.evidence_id || sourceIndex}`}
+                    >
+                      <strong>{source?.source_uri || `Reviewed source ${sourceIndex + 1}`}</strong>
+                      <small>Reviewed as {source?.evidence_id || "code evidence"}</small>
+                      {String(source?.snippet || "").trim() ? (
+                        <pre><code>{source.snippet}</code></pre>
+                      ) : (
+                        <span>No source excerpt was returned for this evidence item.</span>
+                      )}
+                    </div>
+                  ))
+                : null}
+              {item.label === "Code review" && Array.isArray(item.value?.code_patches)
+                ? item.value.code_patches.map((patch, patchIndex) => (
+                    <div
+                      className="code-review-patch"
+                      key={`code-review-patch-${patch?.evidence_id || patchIndex}`}
+                    >
+                      <strong>{patch?.source_uri || patch?.evidence_id || `Patch ${patchIndex + 1}`}</strong>
+                      <small>Grounded by {patch?.evidence_id || "unknown evidence"}</small>
+                      <pre><code>{patch?.unified_diff}</code></pre>
+                    </div>
+                  ))
+                : null}
               <button
                 type="button"
                 className="intelligence-inline-download"
@@ -4304,7 +4559,9 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
   const docCount = Number.isFinite(reportedDocCount) && reportedDocCount > 0 ? reportedDocCount : 0;
   const reportedIndexedCount = Number(ragIndex.embedded_document_count ?? ragIndex.metadata_embedding_count ?? 0);
   const indexedCount = Number.isFinite(reportedIndexedCount) && reportedIndexedCount > 0 ? reportedIndexedCount : 0;
-  const touchedDocuments = (safeDocuments.length ? safeDocuments : ragMatches).slice(0, 8);
+  const touchedDocuments = (safeDocuments.length ? safeDocuments : ragMatches)
+    .filter((doc) => doc && typeof doc === "object")
+    .slice(0, 8);
   const bestMatch = touchedDocuments[0] || {};
   const hasIndexInfo = hasMeaningfulValue(ragIndex) || hasMeaningfulValue(embeddingModel) || hasMeaningfulValue(vectorStore);
   const embeddingProvider = embeddingModel.provider || (hasIndexInfo ? "configured by backend" : "not reported");
@@ -4563,8 +4820,8 @@ function ContextRetrievalGraph({ workflow, timelineRows, documents, evaluation, 
           {touchedDocuments.length ? (
             <div className="context-doc-list">
               {touchedDocuments.map((doc, index) => (
-                <div className="context-doc-row" key={`${doc.document_id || doc.path || doc.title || index}`}>
-                  <strong>{doc.title || doc.path || `Document ${index + 1}`}</strong>
+                <div className="context-doc-row" key={`${doc?.document_id || doc?.path || doc?.title || index}`}>
+                  <strong>{doc?.title || doc?.path || `Document ${index + 1}`}</strong>
                   <span>{doc.kind || doc.document_kind || "document"} | confidence {Math.round(Number(doc.match_confidence || doc._similarity || doc.score || 0) * 100) || "-"}%</span>
                   <small>semantic {Math.round(Number(doc.semantic_score || doc._semantic_score || 0) * 100) || "-"}% | metadata {Math.round(Number(doc.metadata_match_score || doc._metadata_match_score || 0) * 100) || "-"}%</small>
                   <div className="context-doc-highlight">
@@ -6417,6 +6674,7 @@ export default function App() {
   const [alertSeverityDrafts, setAlertSeverityDrafts] = useState({});
   const [dashboardAlertQuery, setDashboardAlertQuery] = useState("");
   const [dashboardAlertFocus, setDashboardAlertFocus] = useState("all");
+  const [dashboardAlertSource, setDashboardAlertSource] = useState("all");
   const [incidentMetadata, setIncidentMetadata] = useState({ loading: false, rows: [], error: "" });
   const [closedIncidents, setClosedIncidents] = useState({ loading: false, rows: [], error: "" });
   const [flows, setFlows] = useState({ loading: false, rows: [], error: "" });
@@ -6442,9 +6700,12 @@ export default function App() {
     error: "",
   });
   const [selectedAlertId, setSelectedAlertId] = useState("");
+  const selectedAlertAnalysisPollRef = useRef({ alertId: "", attempts: 0 });
   const alertStreamRefreshInFlight = useRef(false);
+  const landingPadStreamRefreshInFlight = useRef(false);
   const [selectedApprovalIncidentId, setSelectedApprovalIncidentId] = useState("");
   const [selectedAlertData, setSelectedAlertData] = useState({ loading: false, payload: null, error: "", alertId: "" });
+  const [selectedAlertRegeneration, setSelectedAlertRegeneration] = useState({ loading: false, message: "", error: "" });
   const [selectedAlertDocumentLinks, setSelectedAlertDocumentLinks] = useState({
     loading: false,
     alertId: "",
@@ -6658,6 +6919,7 @@ export default function App() {
   const monitoringInspectRef = useRef(null);
   const alertKnowledgeRef = useRef(null);
   const approvalIncidentRequestRef = useRef({ incidentId: "", inFlight: false, lastFetchedAt: 0 });
+  const selectedAlertDetailsRetryRef = useRef({ alertId: "", lastAttemptAt: 0 });
   const healthRequestRef = useRef(0);
   const recentAlertsRequestRef = useRef({ inFlight: false, requestId: "", startedAt: 0 });
   const incidentMetadataRequestRef = useRef(false);
@@ -6704,15 +6966,16 @@ export default function App() {
       return;
     }
     const requestId = `${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const sourceBalancedFetchLimit = Math.max(Number(alertsLimit) || 0, MAX_LATEST_ALERTS_PER_SOURCE * ALERT_SOURCE_CHANNELS.length, 200);
     recentAlertsRequestRef.current = { inFlight: true, requestId, startedAt: Date.now() };
     setAlerts((prev) => ({ ...prev, loading: !background, error: "" }));
     try {
       const [payload, landingPayload] = await Promise.all([
-        fetchJson(`/api-gateway/alerts/all?limit=${alertsLimit}`, {
+        fetchJson(`/api-gateway/alerts/all?limit=${sourceBalancedFetchLimit}`, {
           timeoutMs: background ? 6000 : 7000,
           maxAttempts: 1,
         }),
-        fetchJson(`/api-gateway/landing-pad/recent?limit=${Math.min(Math.max(alertsLimit, 50), 200)}`, {
+        fetchJson(`/api-gateway/landing-pad/recent?limit=${Math.min(Math.max(sourceBalancedFetchLimit, 50), 300)}`, {
           timeoutMs: background ? 6000 : 7000,
           maxAttempts: 1,
         }).catch(() => null),
@@ -6727,10 +6990,11 @@ export default function App() {
         ...(Array.isArray(rows) ? rows : []),
         ...landingRows,
       ]);
+      const balancedRows = capLatestAlertsPerSource(mergedRows);
       if (recentAlertsRequestRef.current.requestId !== requestId) {
         return;
       }
-      setAlerts({ loading: false, rows: mergedRows, error: "" });
+      setAlerts({ loading: false, rows: balancedRows, error: "" });
     } catch (error) {
       if (background) {
         if (recentAlertsRequestRef.current.requestId !== requestId) {
@@ -6744,12 +7008,14 @@ export default function App() {
         return;
       }
       try {
-        const fallbackPayload = await fetchJson(`/api-gateway/landing-pad/recent?limit=${alertsLimit}`, {
+        const fallbackPayload = await fetchJson(`/api-gateway/landing-pad/recent?limit=${Math.min(Math.max(sourceBalancedFetchLimit, 50), 300)}`, {
           timeoutMs: 7000,
           maxAttempts: 1,
         });
         const fallbackRowsRaw = unwrap(fallbackPayload)?.rows;
-        const fallbackRows = (Array.isArray(fallbackRowsRaw) ? fallbackRowsRaw : []).map((row, index) => mapLandingPadRowToAlertStreamRow(row, index));
+        const fallbackRows = capLatestAlertsPerSource(
+          (Array.isArray(fallbackRowsRaw) ? fallbackRowsRaw : []).map((row, index) => mapLandingPadRowToAlertStreamRow(row, index))
+        );
         if (recentAlertsRequestRef.current.requestId !== requestId) {
           return;
         }
@@ -6967,7 +7233,7 @@ export default function App() {
       alertId: normalized,
     }));
     try {
-      const payload = await fetchJson(`/monitoring-adapter/alerts/${normalized}/processed-result`, { timeoutMs: 25000 });
+      const payload = await fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, { timeoutMs: 25000 });
       setSelectedAlertData((prev) => {
         if (String(prev.alertId || "") !== normalized) {
           return prev;
@@ -7160,8 +7426,18 @@ export default function App() {
       (row) => String(row?.alert_id || row?.id || row?.incident_id || "") === selectedAlertId
     );
     if (selectedExists) {
-      if (String(selectedAlertData.alertId || "") !== String(selectedAlertId || "")) {
+      const normalizedSelectedAlertId = String(selectedAlertId || "");
+      if (String(selectedAlertData.alertId || "") !== normalizedSelectedAlertId) {
         loadAlertDetails(selectedAlertId);
+      } else if (!selectedAlertData.payload && !selectedAlertData.loading) {
+        const now = Date.now();
+        const retryState = selectedAlertDetailsRetryRef.current;
+        const sameAlert = String(retryState.alertId || "") === normalizedSelectedAlertId;
+        const elapsedMs = now - Number(retryState.lastAttemptAt || 0);
+        if (!sameAlert || elapsedMs > 15000) {
+          selectedAlertDetailsRetryRef.current = { alertId: normalizedSelectedAlertId, lastAttemptAt: now };
+          loadAlertDetails(selectedAlertId);
+        }
       }
       if (String(selectedAlertDocumentLinks.alertId || "") !== String(selectedAlertId || "")) {
         loadSelectedAlertDocumentLinks(selectedAlertId);
@@ -7170,6 +7446,28 @@ export default function App() {
     }
     openAlertDetails(scopedRows[0]);
   }, [activeTab, alerts.rows, closedIncidents.rows, applicationToMonitor, selectedAlertId, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId, selectedAlertDocumentLinks.alertId]);
+
+  useEffect(() => {
+    const alertId = String(selectedAlertId || "").trim();
+    if (activeTab !== "home" || !ALERT_UUID_PATTERN.test(alertId)) {
+      selectedAlertAnalysisPollRef.current = { alertId: "", attempts: 0 };
+      return undefined;
+    }
+    if (alertAnalysisReady(selectedAlertData.payload)) {
+      selectedAlertAnalysisPollRef.current = { alertId, attempts: 0 };
+      return undefined;
+    }
+    const previous = selectedAlertAnalysisPollRef.current;
+    const attempts = previous.alertId === alertId ? Number(previous.attempts || 0) : 0;
+    if (attempts >= 40) {
+      return undefined;
+    }
+    selectedAlertAnalysisPollRef.current = { alertId, attempts: attempts + 1 };
+    const timer = window.setTimeout(() => {
+      loadAlertDetails(alertId);
+    }, 3000);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, selectedAlertId, selectedAlertData.payload]);
 
   async function loadIncidentMetadata() {
     if (incidentMetadataRequestRef.current) {
@@ -7316,12 +7614,18 @@ export default function App() {
   async function loadLandingPadRecent() {
     setLandingPadRecent((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/landing-pad/recent?limit=200");
+      const payload = await fetchJson("/api-gateway/landing-pad/recent?limit=200&include_archive=true", {
+        timeoutMs: 45000,
+        maxAttempts: 2,
+      });
       const data = unwrap(payload);
       const rows = data?.rows || [];
-      setLandingPadRecent({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
+      const balancedRows = capLatestAlertsPerSource(
+        (Array.isArray(rows) ? rows : []).map((row, index) => mapLandingPadRowToAlertStreamRow(row, index))
+      );
+      setLandingPadRecent({ loading: false, rows: balancedRows, error: "" });
     } catch (error) {
-      setLandingPadRecent({ loading: false, rows: [], error: error.message });
+      setLandingPadRecent((prev) => ({ ...prev, loading: false, error: error.message }));
     }
   }
 
@@ -7422,6 +7726,206 @@ export default function App() {
       await Promise.all([loadRecentAlerts(), loadGatewaySummary(), loadGatewayRecent(), loadIncidentMetadata(), loadClosedIncidents()]);
     } catch (error) {
       setWorkflowState({ loading: false, result: null, error: error.message });
+    }
+  }
+
+  function normalizeMetadataMap(value) {
+    if (!value || typeof value !== "object") {
+      return {};
+    }
+    return Object.fromEntries(
+      Object.entries(value)
+        .map(([key, raw]) => [String(key || "").trim(), String(raw ?? "").trim()])
+        .filter(([key, item]) => key && item)
+    );
+  }
+
+  function coerceText(value, fallback = "") {
+    const text = String(value ?? "").trim();
+    return text || fallback;
+  }
+
+  function alertAnalysisReady(payload) {
+    const data = unwrap(payload);
+    const workflow = data?.workflow && typeof data.workflow === "object" ? data.workflow : data;
+    const recommendation = workflow?.recommendation && typeof workflow.recommendation === "object"
+      ? workflow.recommendation
+      : data?.recommendation && typeof data.recommendation === "object"
+        ? data.recommendation
+        : {};
+    const metadata = recommendation?.metadata && typeof recommendation.metadata === "object"
+      ? recommendation.metadata
+      : {};
+    const rcaAnalysis = metadata?.rca_analysis && typeof metadata.rca_analysis === "object"
+      ? metadata.rca_analysis
+      : {};
+    const impactAnalysis = metadata?.impact_analysis && typeof metadata.impact_analysis === "object"
+      ? metadata.impact_analysis
+      : {};
+    const hasRcaText = Boolean(
+      coerceText(data?.rootCause)
+      || coerceText(recommendation?.root_cause)
+      || coerceText(rcaAnalysis?.root_cause)
+    );
+    const hasImpactText = Boolean(
+      coerceText(data?.impact)
+      || coerceText(recommendation?.impact)
+      || coerceText(impactAnalysis?.impact_summary)
+      || coerceText(impactAnalysis?.customer_impact)
+      || coerceText(impactAnalysis?.service_impact)
+    );
+    const hasEvidence = Array.isArray(rcaAnalysis?.evidence_used) && rcaAnalysis.evidence_used.length > 0;
+    const discovery = metadata?.discovery_report && typeof metadata.discovery_report === "object"
+      ? metadata.discovery_report
+      : workflow?.context?.metadata?.discovery_report && typeof workflow.context.metadata.discovery_report === "object"
+        ? workflow.context.metadata.discovery_report
+        : {};
+    const discoveryEvidence = Array.isArray(discovery?.evidence) ? discovery.evidence : [];
+    const isProvisional = workflow?.mode === "alert-only-fallback"
+      || metadata?.fallback === true
+      || metadata?.fallback_reason === "No linked incident projection exists for this alert yet.";
+    return !isProvisional
+      && hasRcaText
+      && hasImpactText
+      && (hasEvidence || discoveryEvidence.length > 0);
+  }
+
+  async function waitForAlertAnalysis(alertId, options = {}) {
+    const normalized = String(alertId || "").trim();
+    if (!normalized) {
+      return { ready: false, payload: null, attempts: 0 };
+    }
+    const attempts = Number(options.attempts || 40);
+    const intervalMs = Number(options.intervalMs || 3000);
+    let latestPayload = null;
+    for (let index = 0; index < attempts; index += 1) {
+      try {
+        const payload = await fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, {
+          timeoutMs: 25000,
+          maxAttempts: 1,
+        });
+        latestPayload = payload;
+        if (alertAnalysisReady(payload)) {
+          return { ready: true, payload, attempts: index + 1 };
+        }
+      } catch (_error) {
+        // Regenerated alerts can race backend indexing; retry until timeout.
+      }
+      if (index < attempts - 1) {
+        await new Promise((resolve) => {
+          window.setTimeout(resolve, intervalMs);
+        });
+      }
+    }
+    return { ready: false, payload: latestPayload, attempts };
+  }
+
+  async function regenerateSelectedAlertAnalysis() {
+    if (!selectedAlertRow || selectedAlertRegeneration.loading) {
+      return;
+    }
+    const workflowAlert = selectedAlertWorkflow?.alert && typeof selectedAlertWorkflow.alert === "object"
+      ? selectedAlertWorkflow.alert
+      : {};
+    const rowLabels = normalizeMetadataMap(selectedAlertRow?.labels);
+    const workflowLabels = normalizeMetadataMap(workflowAlert?.labels);
+    const rowAnnotations = normalizeMetadataMap(selectedAlertRow?.annotations);
+    const workflowAnnotations = normalizeMetadataMap(workflowAlert?.annotations);
+    const labels = { ...workflowLabels, ...rowLabels };
+    const annotations = { ...workflowAnnotations, ...rowAnnotations };
+    const description = coerceText(
+      selectedAlertRow?.description
+      || workflowAlert?.description
+      || annotations?.description
+      || annotations?.summary
+      || "",
+      "Alert re-submitted from cockpit for refreshed RCA/impact generation.",
+    );
+    const summary = coerceText(
+      selectedAlertRow?.summary
+      || workflowAlert?.summary
+      || annotations?.summary
+      || description,
+      "Regenerated alert submitted from cockpit",
+    );
+    const source = coerceText(selectedAlertRow?.source || workflowAlert?.source, "monitoring-adapter").toLowerCase();
+    const name = coerceText(
+      selectedAlertRow?.name
+      || selectedAlertRow?.alert_name
+      || workflowAlert?.name
+      || labels?.alertname,
+      "RegeneratedAlert",
+    );
+    const service = coerceText(selectedAlertRow?.service || workflowAlert?.service || labels?.service, "unknown-service");
+    const environment = coerceText(selectedAlertRow?.environment || workflowAlert?.environment || labels?.environment, "prod");
+    const severity = coerceText(selectedAlertRow?.severity || workflowAlert?.severity || labels?.severity, "warning").toLowerCase();
+    const payload = {
+      source,
+      name,
+      service,
+      environment,
+      severity,
+      summary,
+      description,
+      labels,
+      annotations,
+      metadata: {
+        regenerated_from_alert_id: String(selectedAlertRow?.id || selectedAlertRow?.alert_id || selectedAlertId || "").trim(),
+        regenerated_from_incident_id: String(selectedAlertRow?.incident_id || selectedAlertWorkflow?.incident?.id || "").trim(),
+        regenerate_requested_at: new Date().toISOString(),
+      },
+      event: {
+        source,
+        name,
+        service,
+        environment,
+        severity,
+        summary,
+        description,
+        labels,
+        annotations,
+      },
+    };
+    setSelectedAlertRegeneration({ loading: true, message: "", error: "" });
+    try {
+      const response = await fetchJson("/api-gateway/alerts", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      const created = unwrap(response);
+      const newAlertId = String(created?.id || created?.alert_id || "").trim();
+      await Promise.all([loadRecentAlerts(), loadLandingPadRecent(), loadGatewayRecent(), loadGatewaySummary()]);
+      if (newAlertId) {
+        setSelectedAlertId(newAlertId);
+        const analysisState = await waitForAlertAnalysis(newAlertId, { attempts: 10, intervalMs: 1800 });
+        if (analysisState?.payload) {
+          setSelectedAlertData({ loading: false, payload: analysisState.payload, error: "", alertId: newAlertId });
+        } else {
+          await loadAlertDetails(newAlertId);
+        }
+        await loadSelectedAlertDocumentLinks(newAlertId);
+        setSelectedAlertRegeneration({
+          loading: false,
+          message: analysisState?.ready
+            ? `RCA regeneration complete. Opened refreshed alert ${newAlertId}.`
+            : `Alert ${newAlertId} created. Analysis is still warming up; click Reload Alert Details in a few seconds if RCA is pending.`,
+          error: "",
+        });
+        return;
+      }
+      setSelectedAlertRegeneration({
+        loading: false,
+        message: newAlertId
+          ? `RCA regeneration triggered. Opened refreshed alert ${newAlertId}.`
+          : "RCA regeneration triggered. Refreshing latest alert details.",
+        error: "",
+      });
+    } catch (error) {
+      setSelectedAlertRegeneration({
+        loading: false,
+        message: "",
+        error: String(error?.message || "Unable to regenerate selected alert analysis"),
+      });
     }
   }
 
@@ -9919,9 +10423,6 @@ export default function App() {
     if (!Boolean(String(adminSession.accessToken || "").trim())) {
       return;
     }
-    if (alertsLimit === 50) {
-      return;
-    }
     loadRecentAlerts();
   }, [adminSession.accessToken, alertsLimit]);
 
@@ -9950,6 +10451,32 @@ export default function App() {
     const timer = window.setInterval(refreshAlertStream, 30000);
     return () => window.clearInterval(timer);
   }, [adminSession.accessToken, activeTab, alertsLimit, applicationToMonitor]);
+
+  useEffect(() => {
+    if (!Boolean(String(adminSession.accessToken || "").trim())) {
+      return;
+    }
+    if (activeTab !== "stream") {
+      return undefined;
+    }
+    const refreshLandingPadStream = async () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        return;
+      }
+      if (landingPadStreamRefreshInFlight.current) {
+        return;
+      }
+      landingPadStreamRefreshInFlight.current = true;
+      try {
+        await loadLandingPadRecent();
+      } finally {
+        landingPadStreamRefreshInFlight.current = false;
+      }
+    };
+    refreshLandingPadStream();
+    const timer = window.setInterval(refreshLandingPadStream, 10000);
+    return () => window.clearInterval(timer);
+  }, [adminSession.accessToken, activeTab]);
 
   useEffect(() => {
     if (activeTab !== "home") {
@@ -10043,20 +10570,6 @@ export default function App() {
     loadMonitorApplications();
   }, [adminSession.accessToken]);
 
-  useEffect(() => {
-    if (
-      activeTab !== "stream"
-      || !Boolean(String(adminSession.accessToken || "").trim())
-    ) {
-      return undefined;
-    }
-    loadLandingPadRecent();
-    const timer = window.setInterval(() => {
-      loadLandingPadRecent();
-    }, 10_000);
-    return () => window.clearInterval(timer);
-  }, [activeTab, adminSession.accessToken]);
-
   const latestWorkflow = useMemo(() => {
     return workflowState?.result?.data || {};
   }, [workflowState]);
@@ -10070,7 +10583,10 @@ export default function App() {
   }, [latestWorkflow]);
 
   const monitorScopedAlerts = useMemo(() => {
-    return filterAlertsForMonitor(alerts.rows, applicationToMonitor);
+    const scopedRows = filterAlertsForMonitor(alerts.rows, applicationToMonitor);
+    return capLatestAlertsPerSource(
+      ensureMinimumAlertsBySource(scopedRows, alerts.rows)
+    );
   }, [alerts.rows, applicationToMonitor]);
 
   const monitorScopedRecentClosedAlerts = useMemo(() => {
@@ -10116,6 +10632,12 @@ export default function App() {
       const severity = String(row?.severity || "").toLowerCase();
       const status = String(row?.status || row?.state || "open").toLowerCase();
       const generatedOrTest = isGeneratedOrTestAlert(row);
+      const sourceChannels = Array.isArray(row?.source_channels) && row.source_channels.length
+        ? row.source_channels.map((channel) => String(channel || "").trim().toLowerCase())
+        : [normalizeAlertChannel(row)];
+      if (dashboardAlertSource !== "all" && !sourceChannels.includes(dashboardAlertSource)) {
+        return false;
+      }
       if (dashboardAlertFocus === "ops" && generatedOrTest) {
         return false;
       }
@@ -10155,7 +10677,7 @@ export default function App() {
         .join(" ");
       return haystack.includes(query);
     });
-  }, [visibleAlerts, dashboardAlertFocus, dashboardAlertQuery]);
+  }, [visibleAlerts, dashboardAlertFocus, dashboardAlertQuery, dashboardAlertSource]);
 
   const monitorScopedIncidentMetadata = useMemo(() => {
     return filterRowsForMonitor(incidentMetadata.rows, applicationToMonitor);
@@ -10470,25 +10992,64 @@ export default function App() {
       ? selectedAlertWorkflow.recommendation
       : {};
     const metadata = recommendation?.metadata && typeof recommendation.metadata === "object" ? recommendation.metadata : {};
-    const evaluation = metadata?.evaluation && typeof metadata.evaluation === "object" ? metadata.evaluation : {};
+    const workflowIncidentId = String(selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "").trim();
+    const incidentMetaMatch = [
+      ...monitorScopedIncidentMetadata,
+      ...incidentMetadata.rows,
+    ].find((row) => {
+      const rowIncidentId = String(row?.incident_id || "").trim();
+      const rowAlertId = String(row?.alert_id || "").trim();
+      return (workflowIncidentId && rowIncidentId === workflowIncidentId)
+        || (selectedAlertId && rowAlertId === selectedAlertId);
+    }) || null;
+    const projectionPayload =
+      incidentMetaMatch?.projection_payload && typeof incidentMetaMatch.projection_payload === "object"
+        ? incidentMetaMatch.projection_payload
+        : {};
+    const projectionEventPayload =
+      projectionPayload?.event_payload && typeof projectionPayload.event_payload === "object"
+        ? projectionPayload.event_payload
+        : {};
+    const projectedEvaluation =
+      (projectionEventPayload?.evaluation && typeof projectionEventPayload.evaluation === "object" && projectionEventPayload.evaluation)
+      || (projectionPayload?.evaluation && typeof projectionPayload.evaluation === "object" && projectionPayload.evaluation)
+      || {};
+    const evaluation =
+      (metadata?.evaluation && typeof metadata.evaluation === "object" && metadata.evaluation)
+      || projectedEvaluation
+      || {};
     const ragMatches = Array.isArray(metadata.rag_matches) ? metadata.rag_matches : [];
     const bestRagMatch = ragMatches.reduce((best, row) => {
       const value = Number(row?.match_confidence ?? row?._similarity ?? row?.similarity ?? row?.score ?? 0);
       return Number.isFinite(value) ? Math.max(best, value) : best;
     }, Number(metadata.rag_top_similarity || 0) || 0);
+    const projectedCitationCoverage = Number(projectedEvaluation?.citation_coverage ?? projectedEvaluation?.citationCoverage);
+    const projectedEvidenceCoverage = Number(projectedEvaluation?.evidence_coverage ?? projectedEvaluation?.evidenceCoverage);
+    const projectedConfidence = Number(projectedEvaluation?.confidence_score ?? projectedEvaluation?.confidenceScore);
+    const projectedRagMatch = Number(projectedEvaluation?.rag_match_score ?? projectedEvaluation?.ragMatchScore);
     const citations = Array.isArray(metadata.citations) ? metadata.citations : [];
     return normalizeEvaluationEnvelope(evaluation, {
-      confidence: recommendation?.confidence,
-      ragMatchScore: bestRagMatch,
-      citationCoverage: Math.min(citations.length / 3, 1),
-      evidenceCoverage: Math.min(
+      confidence: Number.isFinite(projectedConfidence) ? projectedConfidence : recommendation?.confidence,
+      ragMatchScore: bestRagMatch || (Number.isFinite(projectedRagMatch) ? projectedRagMatch : 0),
+      citationCoverage: Number.isFinite(projectedCitationCoverage)
+        ? projectedCitationCoverage
+        : Math.min(citations.length / 3, 1),
+      evidenceCoverage: Number.isFinite(projectedEvidenceCoverage)
+        ? projectedEvidenceCoverage
+        : Math.min(
         (metadata.runbook_found ? 0.35 : 0)
         + (ragMatches.length ? 0.4 : 0)
         + (selectedAlertRagDocuments.length ? 0.25 : 0),
         1,
       ),
     });
-  }, [selectedAlertWorkflow, selectedAlertRagDocuments.length]);
+  }, [
+    selectedAlertWorkflow,
+    selectedAlertRagDocuments.length,
+    monitorScopedIncidentMetadata,
+    incidentMetadata.rows,
+    selectedAlertId,
+  ]);
 
   const selectedIncidentId = useMemo(() => {
     return String(selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "").trim();
@@ -11154,6 +11715,11 @@ export default function App() {
   }, [panelWorkflowUsage, selectedAlertUsage, latestWorkflow, monitorScopedIncidentMetadata, gatewayRecent.rows]);
 
   useEffect(() => {
+    const validDiagnosticsTabs = new Set(["pipeline", "processing", "timeline", "context", "events", "finops", "api", "raw"]);
+    if (!validDiagnosticsTabs.has(diagnosticsDetailTab)) {
+      setDiagnosticsDetailTab("pipeline");
+      return;
+    }
     if (diagnosticsDetailTab === "application" || diagnosticsDetailTab === "topics") {
       setDiagnosticsDetailTab("processing");
     }
@@ -12399,8 +12965,8 @@ export default function App() {
     }),
     [sidebarSections, allowedTabs, currentRole],
   );
-  const ingestionStreamRows = useMemo(
-    () => (Array.isArray(landingPadRecent.rows) ? landingPadRecent.rows : [])
+  const ingestionStreamRows = useMemo(() => {
+    const landingRows = (Array.isArray(landingPadRecent.rows) ? landingPadRecent.rows : [])
       .map((row, index) => {
         const mapped = mapLandingPadRowToAlertStreamRow(row, index);
         return {
@@ -12410,10 +12976,27 @@ export default function App() {
           error: row?.error || "",
           source_channel: normalizeAlertChannel(mapped),
         };
-      })
-      .sort((left, right) => alertTimeMs(right) - alertTimeMs(left)),
-    [landingPadRecent.rows],
-  );
+      });
+
+    const alertRows = (Array.isArray(alerts.rows) ? alerts.rows : []).map((row, index) => {
+      const mapped = mapLandingPadRowToAlertStreamRow({ ...row, _stream_kind: row?._stream_kind || "alerts_api" }, index);
+      return {
+        ...mapped,
+        file: row?.file || "-",
+        path: row?.path || "",
+        error: row?.error || "",
+        source_channel: normalizeAlertChannel(mapped),
+      };
+    });
+
+    const allStreamRows = [...landingRows, ...alertRows];
+    const consolidatedRows = dedupeAndConsolidateAlertRows(allStreamRows, {
+        channels: ALERT_SOURCE_CHANNELS,
+      });
+    return capLatestAlertsPerSource(
+      ensureMinimumAlertsBySource(consolidatedRows, allStreamRows)
+    );
+  }, [landingPadRecent.rows, alerts.rows]);
   const ingestionStreamCounts = useMemo(() => {
     const counts = { all: ingestionStreamRows.length, email: 0, log: 0, prometheus: 0, telemetry: 0, ticket: 0, failed: 0 };
     ingestionStreamRows.forEach((row) => {
@@ -13846,15 +14429,29 @@ export default function App() {
                 </div>
                 <p className="subtitle">
                   Showing {dashboardVisibleAlerts.length} of {visibleAlerts.length} alerts for {selectedMonitorScopeLabel}.
+                  {dashboardAlertSource !== "all" ? ` Source filter: ${sourceChannelLabel(dashboardAlertSource)}.` : ""}
                   {dashboardAlertFocus === "ops" && dashboardAlertSummary.test > 0 ? ` ${dashboardAlertSummary.test} smoke/stress alerts are hidden in Ops view.` : ""}
                   {monitorScopedRecentClosedAlerts.length > 0 ? ` Includes ${monitorScopedRecentClosedAlerts.length} recent closed incident(s).` : ""}
                 </p>
-                <div className="alert-source-breakdown" aria-label="Alert source visibility">
-                  <span className="source-badge source-prometheus">Prometheus {visibleAlertSourceSummary.prometheus}</span>
-                  <span className="source-badge source-telemetry">Telemetry {visibleAlertSourceSummary.telemetry}</span>
-                  <span className="source-badge source-email">Email {visibleAlertSourceSummary.email}</span>
-                  <span className="source-badge source-ticket">Ticket {visibleAlertSourceSummary.ticket}</span>
-                  <span className="source-badge source-log">Logs {visibleAlertSourceSummary.log}</span>
+                <div className="alert-source-breakdown" role="group" aria-label="Filter dashboard alerts by source">
+                  {[
+                    ["all", "All", visibleAlerts.length],
+                    ["prometheus", "Prometheus", visibleAlertSourceSummary.prometheus],
+                    ["telemetry", "Telemetry", visibleAlertSourceSummary.telemetry],
+                    ["email", "Email", visibleAlertSourceSummary.email],
+                    ["ticket", "Ticket", visibleAlertSourceSummary.ticket],
+                    ["log", "Logs", visibleAlertSourceSummary.log],
+                  ].map(([channel, label, count]) => (
+                    <button
+                      type="button"
+                      key={`dashboard-source-${channel}`}
+                      className={`source-badge source-filter source-${channel} ${dashboardAlertSource === channel ? "is-active" : ""}`}
+                      onClick={() => setDashboardAlertSource((current) => current === channel && channel !== "all" ? "all" : channel)}
+                      aria-pressed={dashboardAlertSource === channel}
+                    >
+                      {label} {count}
+                    </button>
+                  ))}
                 </div>
                 {canManageSeverityOverride ? (
                   <p className="subtitle">L2/L3/Admin can set future severity overrides by alert name + service + environment.</p>
@@ -14365,8 +14962,19 @@ export default function App() {
                       >
                         {selectedAlertData.loading ? "Refreshing..." : "Reload Alert Details"}
                       </button>
+                      <button
+                        type="button"
+                        className="button-secondary"
+                        onClick={regenerateSelectedAlertAnalysis}
+                        disabled={selectedAlertData.loading || selectedAlertRegeneration.loading}
+                        style={{ marginLeft: 8 }}
+                      >
+                        {selectedAlertRegeneration.loading ? "Regenerating RCA..." : "Regenerate RCA For This Alert"}
+                      </button>
                     </div>
                   ) : null}
+                  {selectedAlertRegeneration.error ? <p className="error">{selectedAlertRegeneration.error}</p> : null}
+                  {selectedAlertRegeneration.message ? <p className="subtitle">{selectedAlertRegeneration.message}</p> : null}
 
                   {homeDetailTab === "discovery" ? (
                     <section className="combined-analysis-page">

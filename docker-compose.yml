@@ -390,7 +390,10 @@ services:
       SERVICE_NAME: monitoring-ingestion-worker
       LANDING_PAD_FILE_WATCHER_ENABLED: "true"
       INCIDENT_PROJECTION_WORKER_ENABLED: "true"
-      EMAIL_INGESTION_ENABLED: "false"
+      LOG_INGESTION_ENABLED: "true"
+      LOG_WATCH_PATHS: /app/backend/runtime:/app/fault-lab/runtime:/app/observability
+      OPENSEARCH_LOG_INGESTION_ENABLED: "true"
+      EMAIL_INGESTION_ENABLED: ${EMAIL_INGESTION_ENABLED:-false}
       JIRA_POLLING_ENABLED: "false"
       DB_POOL_SIZE: ${MONITORING_WORKER_DB_POOL_SIZE:-10}
       DB_MAX_OVERFLOW: ${MONITORING_WORKER_DB_MAX_OVERFLOW:-10}
@@ -399,11 +402,15 @@ services:
     volumes:
       - ./backend/rag:/app/rag
       - ${INGESTED_ALERTS_HOST_PATH:-./backend/ingested_alerts}:/app/ingested_alerts
+      - ./backend/runtime:/app/backend/runtime:ro
+      - ./fault-lab/runtime:/app/fault-lab/runtime:ro
+      - ./observability:/app/observability:ro
     depends_on:
       kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
+      docker-socket-proxy: { condition: service_started }
 
   application-onboarding:
     build: *service-build

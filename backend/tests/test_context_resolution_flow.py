@@ -83,6 +83,99 @@ def test_discovery_promotes_application_errors_into_report_findings() -> None:
     assert findings[0]["signals"] == ["timeout", "error"]
 
 
+def test_detected_errors_exclude_unrelated_global_log_signals() -> None:
+    alert = Alert(
+        source="email",
+        name="Payment API unavailable",
+        service="payment",
+        severity=AlertSeverity.CRITICAL,
+        description="Payment requests are failing.",
+        labels={"application": "robot-shop"},
+    )
+    incident = Incident(service="payment", severity=AlertSeverity.CRITICAL, title="payment unavailable")
+    rows = [
+        {
+            "evidence_id": "LOG-rabbitmq",
+            "source": "log",
+            "service": "rabbitmq",
+            "container": "kaiops-rabbitmq",
+            "snippet": "Queue depth critical; threshold exceeded.",
+            "diagnostic_signals": ["resource_exhaustion", "error"],
+            "matched_terms": ["critical"],
+        },
+        {
+            "evidence_id": "LOG-payment",
+            "source": "log",
+            "service": "payment",
+            "container": "robot-shop-payment",
+            "snippet": "Payment provider connection refused.",
+            "diagnostic_signals": ["connection_refused", "error"],
+            "matched_terms": ["payment"],
+        },
+    ]
+
+    findings = DiscoveryMCPConnector._detected_errors(rows, alert, incident)
+
+    assert [row["evidence_id"] for row in findings] == ["LOG-payment"]
+
+
+def test_code_review_keeps_only_evidence_linked_unified_diff_patches() -> None:
+    evidence = [
+        {
+            "evidence_id": "CODE-settings",
+            "source": "code",
+            "uri": "code://app/settings.py#L30",
+            "snippet": "29: value = config.get('token')\n30: return value.strip()",
+        },
+        {"evidence_id": "LOG-error", "source": "log", "uri": "log://app.log#L1", "snippet": "token missing"},
+    ]
+    report = {
+        "code_review": {
+            "summary": "One source-grounded issue.",
+            "findings": [
+                {
+                    "title": "Missing null guard",
+                    "severity": "high",
+                    "explanation": "strip() can be called when token is absent.",
+                    "evidence_id": "CODE-settings",
+                    "patch": "--- a/app/settings.py\n+++ b/app/settings.py\n@@ -29,2 +29,2 @@\n-value = config.get('token')\n+value = config.get('token') or ''",
+                },
+                {
+                    "title": "Log-only guess",
+                    "evidence_id": "LOG-error",
+                    "patch": "--- a/unknown.py\n+++ b/unknown.py\n@@ -1 +1 @@\n-bad\n+good",
+                },
+            ],
+        }
+    }
+
+    review = DiscoveryMCPConnector._validated_code_review(report, evidence)
+
+    assert review["status"] == "completed"
+    assert review["reviewed_evidence_ids"] == ["CODE-settings"]
+    assert review["reviewed_sources"] == [
+        {
+            "evidence_id": "CODE-settings",
+            "source_uri": "code://app/settings.py#L30",
+            "snippet": "29: value = config.get('token')\n30: return value.strip()",
+        }
+    ]
+    assert len(review["findings"]) == 1
+    assert review["findings"][0]["source_uri"] == "code://app/settings.py#L30"
+    assert review["findings"][0]["patch"].startswith("--- a/app/settings.py")
+
+
+def test_code_review_does_not_claim_findings_without_code_evidence() -> None:
+    review = DiscoveryMCPConnector._validated_code_review(
+        {"code_review": {"summary": "Invented", "findings": [{"evidence_id": "LOG-1"}]}},
+        [{"evidence_id": "LOG-1", "source": "log", "snippet": "error"}],
+    )
+
+    assert review["status"] == "not_performed"
+    assert review["findings"] == []
+    assert review["insufficient_context"] is True
+
+
 def static_router() -> ModelRouter:
     return ModelRouter(
         providers={

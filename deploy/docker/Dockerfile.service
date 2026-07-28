@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY pyproject.toml README.md ./
 COPY backend/src ./backend/src
+COPY backend/config ./backend/config
 COPY backend/rag ./rag
 COPY scripts/remediation ./scripts/remediation
 COPY ai-workbench/src ./ai-workbench/src

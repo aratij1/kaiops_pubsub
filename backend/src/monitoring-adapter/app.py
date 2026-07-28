@@ -608,7 +608,7 @@ def _write_alert_to_landing_pad_input(mapped_payload: dict[str, Any], raw_alert:
     tmp_path = out_path.with_suffix(".tmp")
     payload = {
         "received_at": now.isoformat(),
-        "source": "prometheus-alertmanager",
+        "source": str(mapped_payload.get("source") or "prometheus-alertmanager"),
         "status": "received",
         "alert": mapped_payload,
         "raw": raw_alert,
@@ -632,17 +632,28 @@ def _landing_pad_file_rows(source_dir: Path, limit: int, *, partitioned: bool = 
             for path in source_dir.rglob("*")
             if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
         ]
-    files = heapq.nlargest(limit, candidates, key=lambda path: path.stat().st_mtime)
+    def _safe_mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except FileNotFoundError:
+            return float("-inf")
+
+    files = [path for path in heapq.nlargest(limit, candidates, key=_safe_mtime) if _safe_mtime(path) != float("-inf")]
     rows: list[dict[str, Any]] = []
     for path in files:
+        try:
+            stat_info = path.stat()
+        except FileNotFoundError:
+            # The watcher may move files between discovery and parse; skip stale entries.
+            continue
         entry: dict[str, Any] = {
             "file": path.name,
             "path": str(path),
-            "modified_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
-            "size_bytes": int(path.stat().st_size),
+            "modified_at": datetime.fromtimestamp(stat_info.st_mtime, tz=timezone.utc).isoformat(),
+            "size_bytes": int(stat_info.st_size),
         }
         try:
-            if path.suffix.lower() == ".json" and path.stat().st_size <= LANDING_PAD_SCAN_MAX_PARSE_BYTES:
+            if path.suffix.lower() == ".json" and stat_info.st_size <= LANDING_PAD_SCAN_MAX_PARSE_BYTES:
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 alert = payload.get("alert") if isinstance(payload, dict) and isinstance(payload.get("alert"), dict) else payload
             elif path.suffix.lower() == ".json":
@@ -664,6 +675,14 @@ def _landing_pad_file_rows(source_dir: Path, limit: int, *, partitioned: bool = 
                     "name": alert.get("name") if isinstance(alert, dict) else None,
                     "service": alert.get("service") if isinstance(alert, dict) else None,
                     "severity": alert.get("severity") if isinstance(alert, dict) else None,
+                    "application": alert.get("application") if isinstance(alert, dict) else None,
+                    "project": alert.get("project") if isinstance(alert, dict) else None,
+                    "project_name": alert.get("project_name") if isinstance(alert, dict) else None,
+                    "origin_system": alert.get("origin_system") if isinstance(alert, dict) else None,
+                    "ingestion_channel": alert.get("ingestion_channel") if isinstance(alert, dict) else None,
+                    "source_path": alert.get("source_path") if isinstance(alert, dict) else None,
+                    "labels": labels,
+                    "annotations": annotations,
                     "alert_status": labels.get("alert_status") or labels.get("status"),
                     "alertname": labels.get("alertname"),
                     "summary": annotations.get("summary"),
@@ -692,6 +711,44 @@ def _landing_pad_input_files(limit: int) -> list[Path]:
         if scanned >= LANDING_PAD_SCAN_MAX_FILES:
             break
     return heapq.nsmallest(limit, candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _landing_pad_recent_input_snapshot(limit: int) -> list[dict[str, Any]]:
+    """Build a recent feed from landing-pad input/replayed/failed files.
+
+    This keeps Live Stream useful across monitoring-adapter restarts when the
+    in-memory ring buffer is empty.
+    """
+    safe_limit = max(1, min(int(limit), 200))
+    pending_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_DIR, safe_limit)
+    additional_rows: list[dict[str, Any]] = []
+    for directory in LANDING_PAD_ADDITIONAL_INPUT_DIRS:
+        additional_rows.extend(_landing_pad_file_rows(directory, safe_limit))
+    replayed_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_REPLAYED_DIR, safe_limit, partitioned=True)
+    failed_rows = _landing_pad_file_rows(LANDING_PAD_INPUT_FAILED_DIR, safe_limit, partitioned=True)
+
+    combined: list[dict[str, Any]] = []
+
+    def _push(rows: list[dict[str, Any]], *, status: str, bucket: str) -> None:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            normalized = dict(row)
+            normalized.setdefault("status", status)
+            normalized.setdefault("source", "landing-pad-file")
+            normalized["bucket"] = bucket
+            combined.append(normalized)
+
+    _push(pending_rows, status="pending", bucket="pending")
+    _push(additional_rows, status="pending", bucket="pending")
+    _push(replayed_rows, status="processed", bucket="replayed")
+    _push(failed_rows, status="failed", bucket="failed")
+
+    combined.sort(
+        key=lambda row: str(row.get("modified_at") or row.get("received_at") or ""),
+        reverse=True,
+    )
+    return combined[:safe_limit]
 
 
 def _mapped_alerts_from_landing_pad_payload(payload: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -1550,6 +1607,33 @@ async def _process_log_line(record: dict[str, Any]) -> None:
             logger.exception("failed to route log alert through jira: %s", record.get("source_path"))
         return
     if not NONACTIONABLE_ALERT_PUBLISH_ENABLED:
+        source_path = str(record.get("source_path") or "").lower()
+        telemetry_log = source_path.startswith("opensearch://otel-") or "opentelemetry" in source_path or "astronomy" in source_path
+        origin_system = "telemetry" if telemetry_log else "logs"
+        labels = dict(mapped_payload.get("labels") or {})
+        labels.setdefault("origin_system", origin_system)
+        labels.setdefault("ingestion_channel", "logs")
+        if telemetry_log:
+            labels.setdefault("project_name", "telemetry")
+            labels.setdefault("application", "telemetry")
+            mapped_payload.setdefault("project_name", "telemetry")
+            mapped_payload.setdefault("application", "telemetry")
+        mapped_payload["labels"] = labels
+        mapped_payload.setdefault("origin_system", origin_system)
+        mapped_payload.setdefault("ingestion_channel", "logs")
+        mapped_payload.setdefault("source", "logs")
+
+        # Keep log/telemetry detections visible in /landing-pad/recent even
+        # when Jira routing and nonactionable publishing are disabled.
+        _persist_alert_to_landing_pad(mapped_payload, record, status="processed")
+        _record_live_stream_event(
+            origin_system=origin_system,
+            name=str(mapped_payload.get("name") or "log-alert"),
+            service=str(mapped_payload.get("service") or ""),
+            severity=str(mapped_payload.get("severity") or "warning"),
+            description=str(mapped_payload.get("description") or ""),
+            source="logs",
+        )
         logger.info(
             "jira_pipeline stage=classification outcome=live_stream_only source=logs log_source=%s "
             "reason=jira routing disabled",
@@ -3754,13 +3838,19 @@ def _build_alert_from_payload(payload: dict[str, Any], trace_id: str | None = No
 
     labels.setdefault("support_tier", _severity_to_support_tier(severity_value))
 
+    source_value = str(payload.get("source", payload.get("generatorURL", "unknown")) or "unknown")
+    name_value = str(payload.get("name", payload.get("alertname", labels.get("alertname", "unknown-alert"))) or "unknown-alert")
+    service_value = str(payload.get("service", labels.get("service", labels.get("job", "unknown"))) or "unknown")
+    environment_value = str(payload.get("environment", labels.get("env", labels.get("environment", "prod"))) or "prod")
+    description_value = str(payload.get("description", annotations.get("summary", "")) or "")
+
     return Alert(
-        source=payload.get("source", payload.get("generatorURL", "unknown")),
-        name=payload.get("name", payload.get("alertname", labels.get("alertname", "unknown-alert"))),
-        service=payload.get("service", labels.get("service", labels.get("job", "unknown"))),
-        environment=payload.get("environment", labels.get("env", labels.get("environment", "prod"))),
+        source=source_value,
+        name=name_value,
+        service=service_value,
+        environment=environment_value,
         severity=AlertSeverity(severity_value),
-        description=payload.get("description", annotations.get("summary", "")),
+        description=description_value,
         labels=labels,
         annotations=annotations,
         correlation_id=str(payload.get("correlation_id") or labels.get("incident_correlation_id") or "") or None,
@@ -5593,6 +5683,19 @@ def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> di
             "rows": live_rows,
             "count": len(live_rows),
         }
+
+    input_snapshot_rows = _landing_pad_recent_input_snapshot(safe_limit)
+    if input_snapshot_rows and not include_archive:
+        return {
+            "processed_dir": str(LANDING_PAD_PROCESSED_DIR),
+            "failed_dir": str(LANDING_PAD_FAILED_DIR),
+            "partition_scheme": "YYYY/MM/DD",
+            "listing_lookback_days": 0,
+            "source": "landing-pad-input-snapshot",
+            "rows": input_snapshot_rows,
+            "count": len(input_snapshot_rows),
+        }
+
     if not include_archive:
         return {
             "processed_dir": str(LANDING_PAD_PROCESSED_DIR),
@@ -5677,6 +5780,13 @@ def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> di
         except Exception:
             entry["parse_error"] = "invalid_json"
         rows.append(entry)
+
+    if input_snapshot_rows:
+        rows = sorted(
+            [*rows, *input_snapshot_rows],
+            key=lambda row: str(row.get("modified_at") or row.get("received_at") or ""),
+            reverse=True,
+        )[:safe_limit]
 
     return {
         "processed_dir": str(LANDING_PAD_PROCESSED_DIR),

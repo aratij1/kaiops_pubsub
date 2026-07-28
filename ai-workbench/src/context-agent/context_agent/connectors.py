@@ -220,6 +220,76 @@ class DiscoveryMCPConnector(BaseConnector):
             terms.extend(re.findall(r"[a-zA-Z0-9_.-]{3,}", str(value or "").lower()))
         return list(dict.fromkeys(terms))[:24]
 
+    @staticmethod
+    def _validated_code_review(report: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any]:
+        """Keep only code-review findings grounded in retrieved source evidence."""
+        code_evidence = {
+            str(row.get("evidence_id")): row
+            for row in evidence
+            if isinstance(row, dict)
+            and str(row.get("source") or "").strip().lower() == "code"
+            and str(row.get("evidence_id") or "").strip()
+        }
+        candidate = report.get("code_review") if isinstance(report.get("code_review"), dict) else {}
+        findings = candidate.get("findings") if isinstance(candidate.get("findings"), list) else []
+        reviewed_sources = []
+        for evidence_id, source in code_evidence.items():
+            reviewed_sources.append(
+                {
+                    "evidence_id": evidence_id,
+                    "source_uri": str(source.get("uri") or source.get("path") or "").strip()[:1000],
+                    "snippet": str(
+                        source.get("snippet")
+                        or source.get("content")
+                        or source.get("summary")
+                        or ""
+                    ).strip()[:1200],
+                }
+            )
+        validated: list[dict[str, Any]] = []
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            evidence_id = str(finding.get("evidence_id") or "").strip()
+            if evidence_id not in code_evidence:
+                continue
+            source = code_evidence[evidence_id]
+            patch = str(finding.get("patch") or "").strip()
+            # A displayed patch must be a recognizable unified diff, not prose
+            # presented as code.
+            if patch and not ("--- " in patch and "+++ " in patch and "@@" in patch):
+                patch = ""
+            validated.append(
+                {
+                    "title": str(finding.get("title") or "Source-code finding").strip()[:200],
+                    "severity": str(finding.get("severity") or "review").strip().lower()[:20],
+                    "explanation": str(finding.get("explanation") or "").strip()[:1200],
+                    "evidence_id": evidence_id,
+                    "source_uri": str(source.get("uri") or source.get("path") or ""),
+                    "patch": patch[:8000],
+                    "patch_limitations": str(finding.get("patch_limitations") or "").strip()[:600],
+                }
+            )
+        return {
+            "status": "completed" if code_evidence else "not_performed",
+            "summary": (
+                str(
+                    candidate.get("summary")
+                    or (
+                        f"{len(validated)} evidence-grounded code finding(s) were identified."
+                        if validated
+                        else "Source code was reviewed, but no evidence-grounded issue or safe patch was identified."
+                    )
+                ).strip()[:600]
+                if code_evidence
+                else "No source-code evidence was retrieved, so no code review or patch was produced."
+            ),
+            "findings": validated,
+            "reviewed_evidence_ids": list(code_evidence),
+            "reviewed_sources": reviewed_sources,
+            "insufficient_context": bool(candidate.get("insufficient_context")) or not bool(code_evidence),
+        }
+
     async def _call_mcp(
         self,
         client: httpx.AsyncClient,
@@ -283,9 +353,53 @@ class DiscoveryMCPConnector(BaseConnector):
         }
 
     @staticmethod
-    def _detected_errors(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _detected_errors(
+        evidence: list[dict[str, Any]],
+        alert: Alert | None = None,
+        incident: Incident | None = None,
+    ) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
+        generic_terms = {
+            "alert",
+            "application",
+            "critical",
+            "error",
+            "failed",
+            "failure",
+            "high",
+            "incident",
+            "prod",
+            "production",
+            "service",
+            "warning",
+        }
+        identity_values = [
+            getattr(alert, "service", None),
+            getattr(incident, "service", None),
+        ]
+        if alert is not None:
+            identity_values.extend(
+                (alert.labels or {}).get(key)
+                for key in ("application", "project", "project_name", "component")
+            )
+        identity_tokens = {
+            token
+            for value in identity_values
+            for token in re.findall(r"[a-zA-Z0-9_.-]{3,}", str(value or "").lower())
+            if token not in generic_terms
+        }
+        correlation_values = {
+            str(value).strip().lower()
+            for value in (
+                getattr(alert, "id", None),
+                getattr(alert, "trace_id", None),
+                getattr(alert, "correlation_id", None),
+                getattr(incident, "id", None),
+                getattr(incident, "trace_id", None),
+            )
+            if str(value or "").strip()
+        }
         significant_signals = {
             "connection_refused",
             "timeout",
@@ -304,6 +418,22 @@ class DiscoveryMCPConnector(BaseConnector):
             if not signals:
                 continue
             snippet = str(row.get("snippet") or "").strip()
+            if alert is not None or incident is not None:
+                row_identity = " ".join(
+                    str(row.get(key) or "").lower()
+                    for key in ("service", "container", "uri", "path")
+                )
+                searchable = f"{row_identity} {snippet.lower()}"
+                matched_terms = {
+                    str(term).strip().lower()
+                    for term in (row.get("matched_terms") or [])
+                    if str(term).strip().lower() not in generic_terms
+                }
+                identity_match = any(token in searchable for token in identity_tokens)
+                correlation_match = any(value in searchable for value in correlation_values)
+                query_match = bool(matched_terms)
+                if not (identity_match or correlation_match or query_match):
+                    continue
             identity = (str(row.get("container") or row.get("service") or ""), snippet)
             if identity in seen:
                 continue
@@ -339,8 +469,17 @@ class DiscoveryMCPConnector(BaseConnector):
         prompt = (
             "Analyze only the supplied evidence. Return strict JSON with summary, hypotheses "
             "(cause, confidence 0..1, supporting_evidence, contradicting_evidence), "
-            "affected_components, recommended_next_checks, insufficient_evidence, and citations. "
-            "Every factual conclusion must cite evidence_id. Never invent a root cause."
+            "affected_components, recommended_next_checks, insufficient_evidence, citations, and code_review. "
+            "Every factual conclusion must cite evidence_id. Never invent a root cause. "
+            "code_review must be an object with summary, insufficient_context, and findings. Each finding must "
+            "contain title, severity, explanation, evidence_id, patch, and patch_limitations. Review only evidence "
+            "whose source is exactly 'code'. A finding is allowed only when its evidence_id identifies the exact "
+            "source snippet supporting it. patch must be a minimal unified diff with ---/+++/@@ headers, preserving "
+            "the source URI path, and must address only the cited issue. If the supplied snippet does not contain "
+            "enough surrounding code to construct a safe patch, return an empty patch and explain what context is "
+            "missing in patch_limitations. Never infer a file, function, variable, dependency, or replacement code "
+            "that is absent from the supplied code evidence. If there is no code evidence, return findings: [], "
+            "insufficient_context: true."
         )
         request_payload = {
             "alert": {
@@ -371,6 +510,7 @@ class DiscoveryMCPConnector(BaseConnector):
             or "insufficient_evidence" not in report
         ):
             report = self._fallback_report(evidence, stages)
+        report["code_review"] = self._validated_code_review(report, evidence)
         hypotheses = report.get("hypotheses") if isinstance(report.get("hypotheses"), list) else []
         confidence_values: list[float] = []
         for item in hypotheses:
@@ -511,9 +651,18 @@ class DiscoveryMCPConnector(BaseConnector):
                     "response_received": None,
                 }
                 stages.append({"stage": "llm_analysis", "status": "failed", "error": str(exc)[:240]})
-        detected_errors = self._detected_errors(deduped)
+        error_candidates = [
+            row
+            for row in deduped
+            if isinstance(row, dict)
+            and str(row.get("signal_type") or "") != "log_diagnosis"
+            and isinstance(row.get("diagnostic_signals"), list)
+            and row.get("diagnostic_signals")
+        ]
+        detected_errors = self._detected_errors(deduped, alert, incident)
         report["detected_errors"] = detected_errors
         report["detected_error_count"] = len(detected_errors)
+        report["detected_error_candidates_excluded"] = max(0, len(error_candidates) - len(detected_errors))
         stages.append({"stage": "discovery_completed", "status": "completed"})
         report["retrieval_stages"] = stages
         return {

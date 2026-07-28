@@ -3460,6 +3460,33 @@ th {
   overflow-wrap: anywhere;
 }
 
+.code-review-patch {
+  display: grid;
+  gap: 5px;
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid #dbe8f2;
+}
+
+.code-review-patch small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.code-review-patch pre {
+  max-width: 100%;
+  margin: 0;
+  padding: 9px;
+  overflow: auto;
+  border: 1px solid #d7e3ec;
+  border-radius: 7px;
+  background: #101820;
+  color: #e8f2f8;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre;
+}
+
 .intelligence-document-downloads {
   display: flex;
   align-items: center;
@@ -3547,6 +3574,35 @@ th {
   font-weight: 700;
   padding: 2px 9px;
   white-space: nowrap;
+}
+
+.source-badge.source-filter {
+  appearance: none;
+  cursor: pointer;
+  font-family: inherit;
+  line-height: inherit;
+  transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+}
+
+.source-badge.source-filter:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 3px 8px rgba(20, 46, 70, 0.14);
+}
+
+.source-badge.source-filter:focus-visible {
+  outline: 2px solid #2674a8;
+  outline-offset: 2px;
+}
+
+.source-badge.source-filter.is-active {
+  border-color: #1e6f9f;
+  box-shadow: 0 0 0 2px rgba(30, 111, 159, 0.16);
+}
+
+.source-badge.source-all {
+  border-color: #aebfce;
+  background: #f4f7fa;
+  color: #31475a;
 }
 
 .source-badge.source-prometheus {
