@@ -106,8 +106,10 @@ x-service-env: &service-env
   MODEL_ROUTER_CRITICAL_PROVIDER: ${MODEL_ROUTER_CRITICAL_PROVIDER:-gpt-5}
   MODEL_ROUTER_RCA_PROVIDER: ${MODEL_ROUTER_RCA_PROVIDER:-gpt-4o}
   MODEL_ROUTER_DEFAULT_PROVIDER: ${MODEL_ROUTER_DEFAULT_PROVIDER:-gpt-4o}
-  RCA_EXTERNAL_KNOWLEDGE_ENABLED: ${RCA_EXTERNAL_KNOWLEDGE_ENABLED:-true}
-  RCA_EXTERNAL_TOOLS_ENABLED: ${RCA_EXTERNAL_TOOLS_ENABLED:-true}
+  # Keep the live alert path deterministic and bounded. Operators can opt in
+  # to external enrichment, but local logs/metrics/code remain the default.
+  RCA_EXTERNAL_KNOWLEDGE_ENABLED: ${RCA_EXTERNAL_KNOWLEDGE_ENABLED:-false}
+  RCA_EXTERNAL_TOOLS_ENABLED: ${RCA_EXTERNAL_TOOLS_ENABLED:-false}
   EXTERNAL_KNOWLEDGE_SEARCH_URL: ${EXTERNAL_KNOWLEDGE_SEARCH_URL:-}
   EXTERNAL_KNOWLEDGE_SEARCH_TOKEN: ${EXTERNAL_KNOWLEDGE_SEARCH_TOKEN:-}
   EXTERNAL_KNOWLEDGE_SEARCH_TIMEOUT_SECONDS: ${EXTERNAL_KNOWLEDGE_SEARCH_TIMEOUT_SECONDS:-12}
@@ -129,7 +131,11 @@ x-service-env: &service-env
   RABBITMQ_URL: ${RABBITMQ_URL:-amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672/}
   RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-kaiops.events}
   RABBITMQ_QUEUE_PREFIX: ${RABBITMQ_QUEUE_PREFIX:-kaiops}
-  RABBITMQ_CONSUMER_MAX_RETRIES: "3"
+  # Expensive context/RCA handlers must not reserve ten messages per worker.
+  # Small prefetch keeps recent alerts moving and bounds CPU/memory pressure.
+  RABBITMQ_CONSUMER_PREFETCH_COUNT: ${RABBITMQ_CONSUMER_PREFETCH_COUNT:-2}
+  RABBITMQ_HANDLER_TIMEOUT_SECONDS: ${RABBITMQ_HANDLER_TIMEOUT_SECONDS:-60}
+  RABBITMQ_CONSUMER_MAX_RETRIES: ${RABBITMQ_CONSUMER_MAX_RETRIES:-1}
   RABBITMQ_DLQ_SUFFIX: .dlq
   DATABASE_ENABLED: "true"
   AZURE_SERVICE_BUS_ENABLED: ${AZURE_SERVICE_BUS_ENABLED:-false}
@@ -351,7 +357,6 @@ services:
       blackbox-exporter: { condition: service_started }
       kafka-exporter: { condition: service_started }
       alertmanager: { condition: service_started }
-      fault-lab: { condition: service_started }
 
   monitoring-adapter:
     image: ${MONITORING_ADAPTER_IMAGE:-kaiops_pubsub-monitoring-adapter:latest}
@@ -392,8 +397,13 @@ services:
       INCIDENT_PROJECTION_WORKER_ENABLED: "true"
       LOG_INGESTION_ENABLED: "true"
       LOG_WATCH_PATHS: /app/backend/runtime:/app/fault-lab/runtime:/app/observability
-      OPENSEARCH_LOG_INGESTION_ENABLED: "true"
-      EMAIL_INGESTION_ENABLED: ${EMAIL_INGESTION_ENABLED:-false}
+      # The separate telemetry demo can emit its own exporter retry storm.
+      # Do not recursively convert those infrastructure retries into KaiOps
+      # incidents; enable this explicitly only for a healthy OpenSearch source.
+      OPENSEARCH_LOG_INGESTION_ENABLED: ${KAI_OPS_OPENSEARCH_LOG_INGESTION_ENABLED:-false}
+      # Avoid background DNS/retry loops when inherited host variables contain
+      # stale IMAP settings. Enable explicitly for this compose stack.
+      EMAIL_INGESTION_ENABLED: ${KAI_OPS_EMAIL_INGESTION_ENABLED:-false}
       JIRA_POLLING_ENABLED: "false"
       DB_POOL_SIZE: ${MONITORING_WORKER_DB_POOL_SIZE:-10}
       DB_MAX_OVERFLOW: ${MONITORING_WORKER_DB_MAX_OVERFLOW:-10}
@@ -554,6 +564,10 @@ services:
       DB_POOL_SIZE: ${ALERT_INTELLIGENCE_DB_POOL_SIZE:-20}
       DB_MAX_OVERFLOW: ${ALERT_INTELLIGENCE_DB_MAX_OVERFLOW:-30}
       MESSAGE_BUS_WORKER_COUNT: ${ALERT_INTELLIGENCE_WORKER_COUNT:-4}
+      # Correlation/qualification already has a deterministic implementation.
+      # One remote model call per raw alert created the ingestion backlog and
+      # delayed context/RCA for newer alerts.
+      DISCOVERY_LLM_ENABLED: ${DISCOVERY_LLM_ENABLED:-false}
       # MESSAGE_BUS_WORKER_COUNT (shared default above) spins up N competing
       # consumer tasks in this one process/event loop - raising it adds I/O
       # concurrency (more DB round-trips/publishes in flight) but NOT CPU
@@ -589,12 +603,16 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: context-agent
+      MESSAGE_BUS_WORKER_COUNT: ${CONTEXT_AGENT_WORKER_COUNT:-2}
       DISCOVERY_MCP_URL: http://discovery-mcp:8000/mcp
-      DISCOVERY_MCP_TIMEOUT_SECONDS: "45"
-      DISCOVERY_MCP_MAX_EVIDENCE: "24"
+      DISCOVERY_MCP_TIMEOUT_SECONDS: ${DISCOVERY_MCP_TIMEOUT_SECONDS:-15}
+      DISCOVERY_MCP_MAX_EVIDENCE: ${DISCOVERY_MCP_MAX_EVIDENCE:-12}
+      # Context retrieves and persists evidence; resolution performs the single
+      # synchronous RCA synthesis. This avoids duplicate LLM calls per alert.
+      CONTEXT_DISCOVERY_MODEL_ANALYSIS_ENABLED: ${CONTEXT_DISCOVERY_MODEL_ANALYSIS_ENABLED:-false}
       CODE_DISCOVERY_ROOTS: /app/backend/src,/app/ai-workbench/src,/app/scripts,/app/config,/app/observability,/app/backend/rag,/app/fault-lab
       LOG_DISCOVERY_ROOTS: /data/fault-lab/runtime,/data/landing,/app/observability,/app/backend/runtime,/app/backend/ingested_alerts
-      DISCOVERY_MAX_FILES: "180"
+      DISCOVERY_MAX_FILES: ${DISCOVERY_MAX_FILES:-60}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/ai-workbench/src/context-agent
     ports: ["8004:8000"]
@@ -621,9 +639,9 @@ services:
       DISCOVERY_MCP_LOG_ROOTS: /data/fault-lab/runtime,/data/landing,/workspace/fault-lab/runtime,/workspace/backend/ingested_alerts,/workspace/observability,/workspace/backend/runtime
       DISCOVERY_MCP_TICKET_ROOTS: /workspace/backend/rag,/data/tickets,/data/landing/documents
       DISCOVERY_MCP_MYSQL_TABLES: alerts,incident_projections,incidents,closed_incidents,onboarding_state
-      DISCOVERY_MCP_MAX_FILES: "60"
-      DISCOVERY_MCP_MAX_TICKET_FILES: "80"
-      DISCOVERY_MCP_MYSQL_MAX_ROWS: "140"
+      DISCOVERY_MCP_MAX_FILES: ${DISCOVERY_MCP_MAX_FILES:-30}
+      DISCOVERY_MCP_MAX_TICKET_FILES: ${DISCOVERY_MCP_MAX_TICKET_FILES:-40}
+      DISCOVERY_MCP_MYSQL_MAX_ROWS: ${DISCOVERY_MCP_MYSQL_MAX_ROWS:-50}
       DISCOVERY_MCP_PROJECTS_FILE: /workspace/backend/config/discovery-projects.json
       DISCOVERY_MCP_TELEMETRY_TIMEOUT_SECONDS: "6"
       # This service's Jira evidence search (discovery-mcp/app.py) uses a
@@ -637,8 +655,8 @@ services:
       JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
       JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:-}
       DOCKER_LOG_DISCOVERY_ENABLED: ${DOCKER_LOG_DISCOVERY_ENABLED:-true}
-      DOCKER_LOG_DISCOVERY_MAX_CONTAINERS: ${DOCKER_LOG_DISCOVERY_MAX_CONTAINERS:-40}
-      DOCKER_LOG_DISCOVERY_TAIL: ${DOCKER_LOG_DISCOVERY_TAIL:-250}
+      DOCKER_LOG_DISCOVERY_MAX_CONTAINERS: ${DOCKER_LOG_DISCOVERY_MAX_CONTAINERS:-12}
+      DOCKER_LOG_DISCOVERY_TAIL: ${DOCKER_LOG_DISCOVERY_TAIL:-80}
       DOCKER_LOG_DISCOVERY_HOST: docker-socket-proxy:2375
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/discovery-mcp
@@ -679,7 +697,11 @@ services:
   resolution-agent:
     build: *service-build
     restart: unless-stopped
-    environment: { <<: *service-env, SERVICE_NAME: resolution-agent }
+    environment:
+      <<: *service-env
+      SERVICE_NAME: resolution-agent
+      MESSAGE_BUS_WORKER_COUNT: ${RESOLUTION_AGENT_WORKER_COUNT:-2}
+      RESOLUTION_DEEP_ANALYSIS_ENABLED: ${RESOLUTION_DEEP_ANALYSIS_ENABLED:-false}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/ai-workbench/src/resolution-agent
     ports: ["8006:8000"]

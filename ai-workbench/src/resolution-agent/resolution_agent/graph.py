@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from enum import StrEnum
 from typing import Any, TypedDict
@@ -86,6 +87,13 @@ class ResolutionIntelligenceAgent(BaseAgent):
         # Mirrors settings.llm_request_timeout_seconds so operators can raise/lower both the
         # gateway's own timeout and this step-level guard from one place.
         self.model_step_timeout_seconds = settings.llm_request_timeout_seconds
+        # RCA is the only model step required on the synchronous alert path.
+        # Impact and remediation already have evidence-aware deterministic
+        # builders below; making two additional remote calls serialized every
+        # alert added 30-90 seconds without being required to persist an RCA.
+        self.deep_analysis_enabled = str(
+            os.getenv("RESOLUTION_DEEP_ANALYSIS_ENABLED", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
         # Keeps strong references to fire-and-forget evaluation-publish tasks so they
         # aren't garbage-collected mid-flight; discarded automatically once done.
         self._background_tasks: set[asyncio.Task[None]] = set()
@@ -895,13 +903,29 @@ class ResolutionIntelligenceAgent(BaseAgent):
             "log_intelligence": state["gathered_context"].get("log_intelligence", []),
             "detected_errors": state["gathered_context"].get("detected_errors", []),
         }
-        response = await self._generate_with_fallback(
-            context=context,
-            task=ModelTask.IMPACT,
-            prompt=prompt,
-            payload=payload,
-            fallback_content=f"{context.alert.service.title()} service impact requires immediate triage",
-        )
+        if self.deep_analysis_enabled:
+            response = await self._generate_with_fallback(
+                context=context,
+                task=ModelTask.IMPACT,
+                prompt=prompt,
+                payload=payload,
+                fallback_content=f"{context.alert.service.title()} service impact requires immediate triage",
+            )
+        else:
+            response = {
+                "model": "deterministic-fast-path",
+                "content": f"{context.alert.service.title()} service impact requires immediate triage",
+                "usage": {
+                    "provider": "deterministic",
+                    "model": "deterministic-fast-path",
+                    "task": ModelTask.IMPACT.value,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "total_cost_usd": 0.0,
+                    "estimated": False,
+                },
+            }
         model_fallback = self._model_call_is_fallback(response.get("usage")) or "fallback" in str(response.get("model") or "").lower()
         parsed = self._extract_model_object(response["content"]) or {}
         normalized_description = self._norm(context.alert.description)
@@ -994,13 +1018,29 @@ class ResolutionIntelligenceAgent(BaseAgent):
         context = state["context"]
         prompt = PROMPT_RECOMMEND_REMEDIATION
         payload = {"service": context.alert.service, "runbook": context.runbook, "root_cause": state.get("root_cause", "")}
-        response = await self._generate_with_fallback(
-            context=context,
-            task=ModelTask.FIX,
-            prompt=prompt,
-            payload=payload,
-            fallback_content=f"Investigate {context.alert.service} health and apply documented runbook remediation",
-        )
+        if self.deep_analysis_enabled:
+            response = await self._generate_with_fallback(
+                context=context,
+                task=ModelTask.FIX,
+                prompt=prompt,
+                payload=payload,
+                fallback_content=f"Investigate {context.alert.service} health and apply documented runbook remediation",
+            )
+        else:
+            response = {
+                "model": "deterministic-fast-path",
+                "content": f"Investigate {context.alert.service} health and apply documented runbook remediation",
+                "usage": {
+                    "provider": "deterministic",
+                    "model": "deterministic-fast-path",
+                    "task": ModelTask.FIX.value,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "total_cost_usd": 0.0,
+                    "estimated": False,
+                },
+            }
         model_fallback = self._model_call_is_fallback(response.get("usage")) or "fallback" in str(response.get("model") or "").lower()
         parsed = self._extract_model_object(response["content"]) or {}
         model_action = self._extract_model_text(

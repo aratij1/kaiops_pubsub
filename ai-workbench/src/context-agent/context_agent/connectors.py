@@ -189,6 +189,9 @@ class DiscoveryMCPConnector(BaseConnector):
         self.model_router_url = os.getenv("MODEL_ROUTER_URL", "http://model-router:8000").rstrip("/")
         self.timeout = max(2.0, min(float(os.getenv("DISCOVERY_MCP_TIMEOUT_SECONDS", "15")), 60.0))
         self.max_evidence = max(3, min(int(os.getenv("DISCOVERY_MCP_MAX_EVIDENCE", "18")), 40))
+        self.model_analysis_enabled = str(
+            os.getenv("CONTEXT_DISCOVERY_MODEL_ANALYSIS_ENABLED", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self.external_knowledge_enabled = str(
             os.getenv("RCA_EXTERNAL_KNOWLEDGE_ENABLED", "false")
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -637,8 +640,19 @@ class DiscoveryMCPConnector(BaseConnector):
                     break
             stages.append({"stage": "evidence_correlated", "status": "completed", "result_count": len(deduped)})
             try:
-                report, usage, model_interaction = await self._analyze(client, alert, deduped, stages)
-                stages.append({"stage": "llm_analysis", "status": "completed", "model": report.get("model")})
+                if not self.model_analysis_enabled:
+                    report = self._fallback_report(deduped, stages)
+                    usage = {}
+                    model_interaction = {
+                        "task": "rca",
+                        "status": "deferred_to_resolution_agent",
+                        "request_payload": {"evidence_count": len(deduped)},
+                        "response_received": None,
+                    }
+                    stages.append({"stage": "llm_analysis", "status": "deferred_to_resolution_agent"})
+                else:
+                    report, usage, model_interaction = await self._analyze(client, alert, deduped, stages)
+                    stages.append({"stage": "llm_analysis", "status": "completed", "model": report.get("model")})
             except Exception as exc:
                 report = self._fallback_report(deduped, stages)
                 usage = {}

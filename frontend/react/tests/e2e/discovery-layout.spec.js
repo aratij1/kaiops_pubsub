@@ -105,7 +105,7 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await expect(page.getByRole("button", { name: /Logs \/ OpenSearch/ })).toBeVisible();
   await expect(page.getByRole("button", { name: /Prometheus/ })).toBeVisible();
   await expect(page.getByRole("button", { name: /Tickets \/ Jira/ })).toBeVisible();
-  await expect(page.locator(".ingestion-event.channel-email").filter({ hasText: "Pod crash loop" })).toBeVisible();
+  await expect(page.locator(".ingestion-event.channel-email").filter({ hasText: "Pod crash loop" }).first()).toBeVisible();
   await expect(page.getByText("Checkout log error burst", { exact: true })).toBeVisible();
   await page.getByTitle("Dashboard", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "KaiOps + Telemetry" })).toBeVisible();
@@ -115,6 +115,8 @@ test("discovery is a first-class responsive alert view", async ({ page }) => {
   await expect(page.locator(".source-email").filter({ hasText: "Email" }).first()).toBeVisible();
   await expect(page.getByText("Checkout log error burst", { exact: true }).first()).toBeVisible();
   await expect(page.locator(".source-log").filter({ hasText: "Logs / OpenSearch" }).first()).toBeVisible();
+  await page.getByRole("button", { name: "Open alert 11111111-1111-4111-8111-111111111111" }).click();
+  await expect(page.getByRole("heading", { name: "Alert Details Cockpit" })).toBeVisible();
   const telemetryProject = page.getByRole("button", { name: /Telemetry telemetry namespace/ });
   await expect(telemetryProject).toBeVisible();
   await expect(page.getByText("Telemetry signals missing", { exact: true })).toHaveCount(0);

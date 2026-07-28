@@ -629,7 +629,7 @@ function sourceChannelLabel(value) {
 
 const ALERT_SOURCE_CHANNELS = ["prometheus", "telemetry", "email", "ticket", "log"];
 const MAX_LATEST_ALERTS_PER_SOURCE = 30;
-const MIN_VISIBLE_ALERTS_BY_SOURCE = { prometheus: 5, email: 5, log: 5 };
+const MIN_VISIBLE_ALERTS_BY_SOURCE = { prometheus: 5, email: 2, ticket: 2, log: 5 };
 
 function capLatestAlertsPerSource(rows, maxPerSource = MAX_LATEST_ALERTS_PER_SOURCE) {
   const safeMax = Math.max(1, Number(maxPerSource) || MAX_LATEST_ALERTS_PER_SOURCE);
@@ -708,9 +708,46 @@ function monitorScopeLabel(scope) {
 
 function alertTimeMs(row) {
   return (
-    parseUtcTimestamp(row?.created_at || row?.starts_at || row?.closed_at || row?.updated_at)?.getTime()
+    parseUtcTimestamp(
+      row?.created_at
+      || row?.received_at
+      || row?.modified_at
+      || row?.starts_at
+      || row?.closed_at
+      || row?.updated_at
+    )?.getTime()
     || 0
   );
+}
+
+function stableCrossSourceAlertSignature(row) {
+  const labels = typeof row?.labels === "object" && row.labels ? row.labels : {};
+  const text = String(
+    labels?.error_signature
+    || row?.error_signature
+    || row?.name
+    || row?.alert_name
+    || row?.description
+    || row?.annotations?.summary
+    || ""
+  ).toLowerCase();
+  const ignored = new Set([
+    "alert", "warning", "critical", "high", "error", "failed", "failure",
+    "email", "ticket", "jira", "prometheus", "opensearch", "telemetry",
+    "from", "with", "this", "that", "into", "prod", "production",
+  ]);
+  return Array.from(new Set(
+    text
+      .replace(/\b\d{4}-\d{2}-\d{2}[t\s][\d:.+\-z]+\b/gi, " ")
+      .replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/gi, " ")
+      .replace(/\b[0-9a-f]{16,}\b/gi, " ")
+      .replace(/\b\d+\b/g, " ")
+      .match(/[a-z][a-z0-9_.-]{2,}/g) || []
+  ))
+    .filter((token) => !ignored.has(token))
+    .sort()
+    .slice(0, 14)
+    .join("|");
 }
 
 function alertIdentityKeys(row) {
@@ -745,6 +782,21 @@ function alertIdentityKeys(row) {
     keys.push(`correlation:${correlation.toLowerCase()}`);
   }
 
+  [
+    row?.ticket_key,
+    row?.issue_key,
+    row?.jira_issue_key,
+    labels?.ticket_key,
+    labels?.issue_key,
+    labels?.jira_issue_key,
+    labels?.source_alert_id,
+  ].forEach((value) => {
+    const identity = String(value || "").trim().toLowerCase();
+    if (identity) {
+      keys.push(`external:${identity}`);
+    }
+  });
+
   const name = String(row?.name || row?.alert_name || labels?.alertname || "").trim().toLowerCase();
   const service = String(row?.service || labels?.service || labels?.job || "").trim().toLowerCase();
   if (name && service) {
@@ -752,6 +804,13 @@ function alertIdentityKeys(row) {
     const timestampMs = alertTimeMs(row);
     const bucket = timestampMs > 0 ? Math.floor(timestampMs / (5 * 60 * 1000)) : 0;
     keys.push(`composite:${name}|${service}|${severity}|${bucket}`);
+  }
+
+  const semanticSignature = stableCrossSourceAlertSignature(row);
+  if (service && semanticSignature.split("|").length >= 2) {
+    const timestampMs = alertTimeMs(row);
+    const bucket = timestampMs > 0 ? Math.floor(timestampMs / (10 * 60 * 1000)) : 0;
+    keys.push(`cross-source:${service}|${semanticSignature}|${bucket}`);
   }
 
   return keys;
@@ -6700,6 +6759,7 @@ export default function App() {
     error: "",
   });
   const [selectedAlertId, setSelectedAlertId] = useState("");
+  const [selectedAlertSnapshot, setSelectedAlertSnapshot] = useState(null);
   const selectedAlertAnalysisPollRef = useRef({ alertId: "", attempts: 0 });
   const alertStreamRefreshInFlight = useRef(false);
   const landingPadStreamRefreshInFlight = useRef(false);
@@ -6720,7 +6780,7 @@ export default function App() {
     error: "",
     incidentId: "",
   });
-  const [homeDetailTab, setHomeDetailTab] = useState("timeline");
+  const [homeDetailTab, setHomeDetailTab] = useState("discovery");
   const [diagnosticsDetailTab, setDiagnosticsDetailTab] = useState("pipeline");
   const [approvalForm, setApprovalForm] = useState({
     action: "approve",
@@ -6921,7 +6981,12 @@ export default function App() {
   const approvalIncidentRequestRef = useRef({ incidentId: "", inFlight: false, lastFetchedAt: 0 });
   const selectedAlertDetailsRetryRef = useRef({ alertId: "", lastAttemptAt: 0 });
   const healthRequestRef = useRef(0);
-  const recentAlertsRequestRef = useRef({ inFlight: false, requestId: "", startedAt: 0 });
+  const recentAlertsRequestRef = useRef({
+    inFlight: false,
+    requestId: "",
+    startedAt: 0,
+    lastFetchedAt: 0,
+  });
   const incidentMetadataRequestRef = useRef(false);
   const closedIncidentsRequestRef = useRef(false);
 
@@ -6954,10 +7019,21 @@ export default function App() {
 
   async function loadRecentAlerts(options = {}) {
     const background = Boolean(options && options.background);
+    if (
+      background
+      && Date.now() - Number(recentAlertsRequestRef.current.lastFetchedAt || 0) < 45000
+    ) {
+      return;
+    }
     if (recentAlertsRequestRef.current.inFlight) {
       const startedAt = Number(recentAlertsRequestRef.current.startedAt || 0);
       if (startedAt && Date.now() - startedAt > 15000) {
-        recentAlertsRequestRef.current = { inFlight: false, requestId: "", startedAt: 0 };
+        recentAlertsRequestRef.current = {
+          ...recentAlertsRequestRef.current,
+          inFlight: false,
+          requestId: "",
+          startedAt: 0,
+        };
       } else {
         return;
       }
@@ -6966,8 +7042,22 @@ export default function App() {
       return;
     }
     const requestId = `${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    const sourceBalancedFetchLimit = Math.max(Number(alertsLimit) || 0, MAX_LATEST_ALERTS_PER_SOURCE * ALERT_SOURCE_CHANNELS.length, 200);
-    recentAlertsRequestRef.current = { inFlight: true, requestId, startedAt: Date.now() };
+    // Fetch enough candidates before balancing. During log bursts the newest
+    // 200 rows can all be logs, hiding otherwise valid Email and Jira rows.
+    const sourceBalancedFetchLimit = Math.min(
+      200,
+      Math.max(
+        Number(alertsLimit) || 0,
+        MAX_LATEST_ALERTS_PER_SOURCE * ALERT_SOURCE_CHANNELS.length,
+        100,
+      ),
+    );
+    recentAlertsRequestRef.current = {
+      ...recentAlertsRequestRef.current,
+      inFlight: true,
+      requestId,
+      startedAt: Date.now(),
+    };
     setAlerts((prev) => ({ ...prev, loading: !background, error: "" }));
     try {
       const [payload, landingPayload] = await Promise.all([
@@ -7038,7 +7128,12 @@ export default function App() {
       }));
     } finally {
       if (recentAlertsRequestRef.current.requestId === requestId) {
-        recentAlertsRequestRef.current = { inFlight: false, requestId: "", startedAt: 0 };
+        recentAlertsRequestRef.current = {
+          inFlight: false,
+          requestId: "",
+          startedAt: 0,
+          lastFetchedAt: Date.now(),
+        };
       }
     }
   }
@@ -7197,8 +7292,9 @@ export default function App() {
     }
   }
 
-  async function loadAlertDetails(alertId, fallbackRow = null) {
+  async function loadAlertDetails(alertId, fallbackRow = null, options = {}) {
     const normalized = String(alertId || "").trim();
+    const background = Boolean(options?.background);
     if (!normalized) {
       return;
     }
@@ -7227,7 +7323,7 @@ export default function App() {
       return;
     }
     setSelectedAlertData((prev) => ({
-      loading: true,
+      loading: background ? prev.loading : true,
       payload: String(prev.alertId || "") === normalized ? prev.payload : null,
       error: "",
       alertId: normalized,
@@ -7346,15 +7442,19 @@ export default function App() {
 
   function openAlertDetails(row) {
     const canonicalRow = resolveCanonicalAlertRow(row, alerts.rows);
-    const alertId = canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id;
+    const canonicalAlertId = canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id;
+    const clickedAlertId = row?.alert_id || row?.id || row?.incident_id;
+    const alertId = canonicalAlertId || clickedAlertId;
     if (!alertId) {
       return;
     }
+    const selectedRow = canonicalAlertId ? canonicalRow : row;
+    setSelectedAlertSnapshot(selectedRow);
     setSelectedAlertId(String(alertId));
     setActiveTab("home");
-    setHomeDetailTab("timeline");
-    loadAlertDetails(alertId, canonicalRow);
-    loadSelectedAlertDocumentLinks(alertId, canonicalRow);
+    setHomeDetailTab("discovery");
+    loadAlertDetails(alertId, selectedRow);
+    loadSelectedAlertDocumentLinks(alertId, selectedRow);
   }
 
   function openAlertDetailsFromIncident(row) {
@@ -7459,13 +7559,13 @@ export default function App() {
     }
     const previous = selectedAlertAnalysisPollRef.current;
     const attempts = previous.alertId === alertId ? Number(previous.attempts || 0) : 0;
-    if (attempts >= 40) {
+    if (attempts >= 12) {
       return undefined;
     }
     selectedAlertAnalysisPollRef.current = { alertId, attempts: attempts + 1 };
     const timer = window.setTimeout(() => {
-      loadAlertDetails(alertId);
-    }, 3000);
+      loadAlertDetails(alertId, null, { background: true });
+    }, 10000);
     return () => window.clearTimeout(timer);
   }, [activeTab, selectedAlertId, selectedAlertData.payload]);
 
@@ -7603,7 +7703,7 @@ export default function App() {
   async function loadGatewayRecent() {
     setGatewayRecent((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/observability/recent");
+      const payload = await fetchJson("/api-gateway/observability/recent?limit=5");
       const rows = payload?.events || [];
       setGatewayRecent({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
     } catch (error) {
@@ -7614,9 +7714,9 @@ export default function App() {
   async function loadLandingPadRecent() {
     setLandingPadRecent((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/landing-pad/recent?limit=200&include_archive=true", {
-        timeoutMs: 45000,
-        maxAttempts: 2,
+      const payload = await fetchJson("/api-gateway/landing-pad/recent?limit=200", {
+        timeoutMs: 7000,
+        maxAttempts: 1,
       });
       const data = unwrap(payload);
       const rows = data?.rows || [];
@@ -7859,6 +7959,15 @@ export default function App() {
     const service = coerceText(selectedAlertRow?.service || workflowAlert?.service || labels?.service, "unknown-service");
     const environment = coerceText(selectedAlertRow?.environment || workflowAlert?.environment || labels?.environment, "prod");
     const severity = coerceText(selectedAlertRow?.severity || workflowAlert?.severity || labels?.severity, "warning").toLowerCase();
+    const regenerationId = typeof crypto?.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `regenerate-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const regenerationLabels = {
+      ...labels,
+      source_event_id: regenerationId,
+      alert_fingerprint: regenerationId,
+      regeneration_requested: "true",
+    };
     const payload = {
       source,
       name,
@@ -7867,7 +7976,7 @@ export default function App() {
       severity,
       summary,
       description,
-      labels,
+      labels: regenerationLabels,
       annotations,
       metadata: {
         regenerated_from_alert_id: String(selectedAlertRow?.id || selectedAlertRow?.alert_id || selectedAlertId || "").trim(),
@@ -7882,7 +7991,7 @@ export default function App() {
         severity,
         summary,
         description,
-        labels,
+        labels: regenerationLabels,
         annotations,
       },
     };
@@ -7894,7 +8003,17 @@ export default function App() {
       });
       const created = unwrap(response);
       const newAlertId = String(created?.id || created?.alert_id || "").trim();
-      await Promise.all([loadRecentAlerts(), loadLandingPadRecent(), loadGatewayRecent(), loadGatewaySummary()]);
+      setSelectedAlertRegeneration({
+        loading: Boolean(newAlertId),
+        message: newAlertId
+          ? `RCA regeneration triggered. Opened refreshed alert ${newAlertId}.`
+          : "RCA regeneration triggered. Refreshing latest alert details.",
+        error: "",
+      });
+      // List/summary queries can be slow with a large retained alert history.
+      // They should never block acknowledgement or selected-alert RCA polling.
+      void Promise.all([loadRecentAlerts(), loadLandingPadRecent(), loadGatewayRecent(), loadGatewaySummary()])
+        .catch(() => {});
       if (newAlertId) {
         setSelectedAlertId(newAlertId);
         const analysisState = await waitForAlertAnalysis(newAlertId, { attempts: 10, intervalMs: 1800 });
@@ -10293,7 +10412,6 @@ export default function App() {
     window.setTimeout(() => {
       Promise.allSettled([
         loadGatewaySummary(),
-        loadGatewayRecent(),
         loadIncidentMetadata(),
       ]).catch(() => {});
     }, 1500);
@@ -10448,7 +10566,7 @@ export default function App() {
         alertStreamRefreshInFlight.current = false;
       }
     };
-    const timer = window.setInterval(refreshAlertStream, 30000);
+    const timer = window.setInterval(refreshAlertStream, 60000);
     return () => window.clearInterval(timer);
   }, [adminSession.accessToken, activeTab, alertsLimit, applicationToMonitor]);
 
@@ -10474,7 +10592,7 @@ export default function App() {
       }
     };
     refreshLandingPadStream();
-    const timer = window.setInterval(refreshLandingPadStream, 10000);
+    const timer = window.setInterval(refreshLandingPadStream, 60000);
     return () => window.clearInterval(timer);
   }, [adminSession.accessToken, activeTab]);
 
@@ -10501,7 +10619,12 @@ export default function App() {
       if (!requestState.inFlight || ageMs <= 16000) {
         return;
       }
-      recentAlertsRequestRef.current = { inFlight: false, requestId: "", startedAt: 0 };
+      recentAlertsRequestRef.current = {
+        ...recentAlertsRequestRef.current,
+        inFlight: false,
+        requestId: "",
+        startedAt: 0,
+      };
       setAlerts((prev) => ({
         ...prev,
         loading: false,
@@ -10705,8 +10828,20 @@ export default function App() {
   }, [visibleAlerts]);
 
   const selectedAlertRow = useMemo(() => {
-    return visibleAlerts.find((row) => String(row?.alert_id || row?.id || row?.incident_id || "") === selectedAlertId) || null;
-  }, [visibleAlerts, selectedAlertId]);
+    const matchedRow = visibleAlerts.find(
+      (row) => String(row?.alert_id || row?.id || row?.incident_id || "") === selectedAlertId
+    );
+    if (matchedRow) {
+      return matchedRow;
+    }
+    const snapshotId = String(
+      selectedAlertSnapshot?.alert_id
+      || selectedAlertSnapshot?.id
+      || selectedAlertSnapshot?.incident_id
+      || ""
+    );
+    return snapshotId === selectedAlertId ? selectedAlertSnapshot : null;
+  }, [visibleAlerts, selectedAlertId, selectedAlertSnapshot]);
 
   const selectedAlertPayload = useMemo(() => {
     return selectedAlertData?.payload?.data || selectedAlertData?.payload || {};
@@ -13000,8 +13135,12 @@ export default function App() {
   const ingestionStreamCounts = useMemo(() => {
     const counts = { all: ingestionStreamRows.length, email: 0, log: 0, prometheus: 0, telemetry: 0, ticket: 0, failed: 0 };
     ingestionStreamRows.forEach((row) => {
-      const channel = String(row?.source_channel || "prometheus");
-      counts[channel] = Number(counts[channel] || 0) + 1;
+      const channels = Array.isArray(row?.source_channels) && row.source_channels.length
+        ? row.source_channels
+        : [String(row?.source_channel || "prometheus")];
+      Array.from(new Set(channels)).forEach((channel) => {
+        counts[channel] = Number(counts[channel] || 0) + 1;
+      });
       if (String(row?.status || "").toLowerCase() === "failed" || row?.error) {
         counts.failed += 1;
       }
@@ -13015,7 +13154,10 @@ export default function App() {
       if (ingestionStreamChannel === "failed" && !failed) {
         return false;
       }
-      if (!["all", "failed"].includes(ingestionStreamChannel) && row.source_channel !== ingestionStreamChannel) {
+      const rowChannels = Array.isArray(row?.source_channels) && row.source_channels.length
+        ? row.source_channels
+        : [row.source_channel];
+      if (!["all", "failed"].includes(ingestionStreamChannel) && !rowChannels.includes(ingestionStreamChannel)) {
         return false;
       }
       if (!query) {
@@ -14230,7 +14372,7 @@ export default function App() {
                 <div className="ingestion-live-state">
                   <span className={`ingestion-live-dot ${landingPadRecent.loading ? "is-loading" : ""}`} aria-hidden="true" />
                   <div>
-                    <strong>{landingPadRecent.loading ? "Syncing now" : "Live · 10s refresh"}</strong>
+                    <strong>{landingPadRecent.loading ? "Syncing now" : "Live · 60s refresh"}</strong>
                     <small>{visibleIngestionStreamRows.length} of {ingestionStreamRows.length} arrivals shown</small>
                   </div>
                   <button type="button" className="button-secondary" onClick={loadLandingPadRecent} disabled={landingPadRecent.loading}>
