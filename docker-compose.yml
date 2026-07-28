@@ -326,6 +326,8 @@ services:
       monitoring-adapter: { condition: service_started }
 
   fault-lab:
+    profiles:
+      - fault-lab
     build: ./fault-lab
     restart: unless-stopped
     # Produces the bounded application symptoms (HTTP errors, JSON logs, breached
