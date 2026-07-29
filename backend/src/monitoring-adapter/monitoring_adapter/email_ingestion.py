@@ -125,7 +125,15 @@ def fetch_unseen_emails(
             # "UID x:*" can return the mailbox's single highest UID even when
             # it's <= x (RFC 3501 edge case on some servers) — filter it out
             # explicitly rather than trusting the search result verbatim.
-            uids = [uid for uid in data[0].split() if int(uid) > last_uid][:limit]
+            candidate_uids = [uid for uid in data[0].split() if int(uid) > last_uid]
+            # On first connection, start from the newest messages instead of
+            # replaying an entire long-lived mailbox from UID 1. Subsequent
+            # polls remain ascending so no newly arrived messages are skipped.
+            uids = (
+                candidate_uids[-limit:]
+                if last_uid <= 0
+                else candidate_uids[:limit]
+            )
             max_uid_seen = last_uid
             for uid in uids:
                 status, msg_data = connection.uid("fetch", uid, "(RFC822)")
