@@ -6,6 +6,7 @@ from pathlib import Path
 
 from monitoring_adapter.landing_pad_sources import load_landing_pad_file
 from monitoring_adapter.email_ingestion import email_to_alert_payload
+from monitoring_adapter.jira_client import jira_rich_text_to_plain_text
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -89,3 +90,36 @@ def test_email_transport_is_not_reported_as_the_affected_service() -> None:
     assert checkout["service"] == "checkout-api"
     assert unknown["service"] == "unresolved-service"
     assert unknown["labels"]["origin_system"] == "email"
+
+
+def test_jira_adf_is_flattened_instead_of_stringified() -> None:
+    adf = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "AI-discovered incident"}],
+            },
+            {
+                "type": "bulletList",
+                "content": [
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": "Service: rs-dispatch"}],
+                            }
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
+
+    plain = jira_rich_text_to_plain_text(adf)
+
+    assert plain == "AI-discovered incident\nService: rs-dispatch"
+    assert "'type': 'doc'" not in plain

@@ -832,19 +832,44 @@ class IncidentRepository:
             )
 
             service_name = str(alert_payload.get("service") or "selected service").strip() or "selected service"
-            description = str(alert_payload.get("description") or "").strip()
+            hypotheses = discovery_report.get("hypotheses") if isinstance(discovery_report.get("hypotheses"), list) else []
+            first_hypothesis = hypotheses[0] if hypotheses and isinstance(hypotheses[0], dict) else {}
+            evidence_ids = [
+                str(item.get("evidence_id"))
+                for item in discovery_evidence
+                if isinstance(item, dict) and str(item.get("evidence_id") or "").strip()
+            ]
+            fallback_root_cause = str(first_hypothesis.get("cause") or "").strip() or (
+                f"RCA pending: evidence for {service_name} has been collected but no validated causal conclusion exists yet."
+            )
+            fallback_impact = (
+                f"No direct customer or service impact is established by the collected evidence for {service_name}; "
+                "validate availability, latency, error rate, and dependency health before assigning impact."
+            )
             recommendation = {
                 "id": str(uuid4()),
                 "incident_id": None,
-                "root_cause": description or f"{service_name} is degraded according to active alert telemetry.",
-                "impact": f"{service_name} may have degraded availability or latency until recovery is validated.",
+                "root_cause": fallback_root_cause,
+                "impact": fallback_impact,
                 "recommended_action": "Review discovery evidence, verify logs and linked tickets, then run the approved remediation runbook.",
-                "confidence": 0.64,
+                "confidence": min(float(first_hypothesis.get("confidence") or 0.0), 0.49),
                 "metadata": {
                     "fallback": True,
                     "fallback_reason": "No linked incident projection exists for this alert yet.",
                     "discovery_report": discovery_report,
                     "discovery_evidence": discovery_evidence,
+                    "rca_analysis": {
+                        "root_cause": fallback_root_cause,
+                        "evidence_used": evidence_ids,
+                        "confidence_score": min(float(first_hypothesis.get("confidence") or 0.0), 0.49),
+                        "missing_evidence": ["A linked incident projection and Resolution Agent result are not available yet."],
+                    },
+                    "impact_analysis": {
+                        "impact_summary": fallback_impact,
+                        "evidence_used": [],
+                        "confidence_score": 0.0,
+                        "missing_evidence": ["No direct service or customer-impact measurement was cited."],
+                    },
                     "model_usage": [],
                 },
             }
