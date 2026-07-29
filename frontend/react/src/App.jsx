@@ -494,7 +494,25 @@ function inferMonitorScope(row) {
 }
 
 function isGeneratedOrTestAlert(row) {
+  const labels = typeof row?.labels === "object" && row.labels ? row.labels : {};
+  const metadata = typeof row?.metadata === "object" && row.metadata ? row.metadata : {};
+  const annotations = typeof row?.annotations === "object" && row.annotations ? row.annotations : {};
+  const explicitTestFlag = [
+    row?.is_test,
+    row?.test_alert,
+    labels?.is_test,
+    labels?.test_alert,
+    labels?.onboarding_test,
+    metadata?.is_test,
+    metadata?.test_alert,
+  ].some((value) => ["1", "true", "yes", "test"].includes(String(value || "").trim().toLowerCase()));
+  if (explicitTestFlag) {
+    return true;
+  }
   const tokens = [
+    row?.id,
+    row?.alert_id,
+    row?.incident_id,
     row?.name,
     row?.alert_name,
     row?.rule_name,
@@ -505,8 +523,26 @@ function isGeneratedOrTestAlert(row) {
     row?.application,
     row?.project_name,
     row?.project,
+    row?.environment,
+    row?.description,
+    row?.summary,
+    row?.source_path,
+    labels?.application,
+    labels?.project,
+    labels?.project_name,
+    labels?.environment,
+    labels?.namespace,
+    labels?.tenant,
+    labels?.job,
+    labels?.alertname,
+    annotations?.summary,
+    annotations?.description,
+    metadata?.application,
+    metadata?.project,
+    metadata?.project_name,
+    metadata?.environment,
   ].map((value) => String(value || "").toLowerCase()).join(" ");
-  return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test)([-_\s]|$)/i.test(tokens)
+  return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test|test\d*|testing|demo|sample|mock|synthetic|fake|dummy)([-_\s]|$)/i.test(tokens)
     || tokens.includes("stresspipelinealert")
     || tokens.includes("onboarding-smoke-test");
 }
@@ -10714,7 +10750,9 @@ export default function App() {
   const monitorScopedAlerts = useMemo(() => {
     const scopedRows = filterAlertsForMonitor(alerts.rows, applicationToMonitor);
     return capLatestAlertsPerSource(
-      ensureMinimumAlertsBySource(scopedRows, alerts.rows)
+      // Source balancing must never escape the selected application scope.
+      // Using the global list here reintroduced test/demo alerts into Real.
+      ensureMinimumAlertsBySource(scopedRows, scopedRows)
     );
   }, [alerts.rows, applicationToMonitor]);
 
