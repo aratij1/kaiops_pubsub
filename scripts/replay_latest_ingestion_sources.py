@@ -9,22 +9,28 @@ from urllib.request import Request, urlopen
 def classify(payload: dict) -> tuple[str, dict]:
     alert = payload.get("alert") if isinstance(payload.get("alert"), dict) else payload
     labels = alert.get("labels") if isinstance(alert.get("labels"), dict) else {}
-    origin = str(
-        alert.get("origin_system")
-        or labels.get("origin_system")
-        or alert.get("source")
-        or payload.get("source")
-        or ""
-    ).strip().lower()
-    if "telemetry" in origin or "opentelemetry" in origin:
+    tokens = " ".join(
+        str(value or "").strip().lower()
+        for value in (
+            alert.get("origin_system"),
+            labels.get("origin_system"),
+            alert.get("source"),
+            payload.get("source"),
+            alert.get("project_name"),
+            labels.get("project_name"),
+            alert.get("application"),
+            labels.get("application"),
+        )
+    )
+    if "telemetry" in tokens or "opentelemetry" in tokens or "astronomy" in tokens:
         return "telemetry", alert
-    if "prometheus" in origin or "alertmanager" in origin:
+    if "prometheus" in tokens or "alertmanager" in tokens:
         return "prometheus", alert
-    if "email" in origin or "mail" in origin:
+    if "email" in tokens or "mail" in tokens:
         return "email", alert
-    if "jira" in origin or "ticket" in origin:
+    if "jira" in tokens or "ticket" in tokens:
         return "jira", alert
-    if "log" in origin or "opensearch" in origin:
+    if "log" in tokens or "opensearch" in tokens or "docker" in tokens:
         return "logs", alert
     return "", alert
 
