@@ -1578,6 +1578,7 @@ async def _process_polled_email(message: dict[str, Any]) -> None:
         return
     mapped_payload["labels"] = dict(alert.labels)
     _persist_alert_to_landing_pad(mapped_payload, message, status="processed")
+    await _forward_live_stream_event(mapped_payload)
 
 
 async def _email_poll_worker() -> None:
