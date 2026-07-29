@@ -611,7 +611,12 @@ async def _forward_live_stream_event(mapped_payload: dict[str, Any]) -> None:
         return
     labels = mapped_payload.get("labels") if isinstance(mapped_payload.get("labels"), dict) else {}
     payload = {
-        "origin_system": mapped_payload.get("origin_system") or labels.get("origin_system") or "logs",
+        "origin_system": (
+            mapped_payload.get("origin_system")
+            or labels.get("origin_system")
+            or mapped_payload.get("source")
+            or "logs"
+        ),
         "source": mapped_payload.get("source") or "logs",
         "name": mapped_payload.get("name") or "log-alert",
         "service": mapped_payload.get("service") or "",
