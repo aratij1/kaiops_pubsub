@@ -771,18 +771,32 @@ class IncidentRepository:
             return None
 
         alert_payload = alert_record.payload if isinstance(alert_record.payload, dict) else {}
+        alert_labels = alert_payload.get("labels") if isinstance(alert_payload.get("labels"), dict) else {}
+        explicit_incident_id = str(
+            alert_payload.get("incident_id")
+            or alert_labels.get("kaiops_incident_id")
+            or ""
+        ).strip()
 
-        incident_rows = await self.session.execute(
-            select(IncidentRecord).order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc()).limit(300)
-        )
         incident_record = None
-        for record in incident_rows.scalars().all():
-            payload = record.payload if isinstance(record.payload, dict) else {}
-            linked_alert_ids = payload.get("alert_ids", []) if isinstance(payload.get("alert_ids"), list) else []
-            linked_as_strings = {str(item) for item in linked_alert_ids}
-            if normalized_alert_id in linked_as_strings:
-                incident_record = record
-                break
+        explicit_incident_uuid = self._parse_uuid(explicit_incident_id)
+        if explicit_incident_uuid is not None:
+            explicit_result = await self.session.execute(
+                select(IncidentRecord).where(IncidentRecord.id == explicit_incident_uuid)
+            )
+            incident_record = explicit_result.scalar_one_or_none()
+
+        if incident_record is None:
+            incident_rows = await self.session.execute(
+                select(IncidentRecord).order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc()).limit(300)
+            )
+            for record in incident_rows.scalars().all():
+                payload = record.payload if isinstance(record.payload, dict) else {}
+                linked_alert_ids = payload.get("alert_ids", []) if isinstance(payload.get("alert_ids"), list) else []
+                linked_as_strings = {str(item) for item in linked_alert_ids}
+                if normalized_alert_id in linked_as_strings:
+                    incident_record = record
+                    break
 
         if incident_record is None:
             # Fallback: match by service and severity for latest likely incident.
