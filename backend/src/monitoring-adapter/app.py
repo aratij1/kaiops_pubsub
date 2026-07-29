@@ -1760,6 +1760,7 @@ async def _jira_poll_worker() -> None:
                     await _publish_ingested_alert(alert)
                 mapped_payload["labels"] = dict(alert.labels)
                 _persist_alert_to_landing_pad(mapped_payload, payload, status="processed")
+                await _forward_live_stream_event(mapped_payload)
                 _JIRA_SESSION_VERSIONS.add(version)
                 ingested += 1
             logger.info("jira_poll_complete project=%s fetched=%s ingested=%s", JIRA_PROJECT_KEY, len(issues), ingested)
