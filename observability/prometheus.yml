@@ -136,10 +136,10 @@ scrape_configs:
     static_configs:
       - targets: ["rs-mongodb-exporter:9216"]
 
-  - job_name: kafka-exporter
+  - job_name: kaiops-rabbitmq
     metrics_path: /metrics
     static_configs:
-      - targets: ["kafka-exporter:9308"]
+      - targets: ["rabbitmq:15692"]
 
   - job_name: kaiops-dynamic-applications
     honor_labels: true

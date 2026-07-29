@@ -107,7 +107,7 @@ class JiraClient:
     async def list_recent_issues(self, *, limit: int = 25) -> list[dict[str, Any]]:
         """Return recently updated issues for read-only source ingestion."""
         jql = f'project = "{self.project_key}" ORDER BY updated DESC'
-        fields = "summary,description,status,priority,reporter,assignee,labels,updated,created"
+        fields = "summary,description,status,priority,reporter,assignee,labels,components,updated,created"
         async with httpx.AsyncClient(auth=self._auth, timeout=20.0) as client:
             response = await client.get(
                 f"{self.base_url}/rest/api/3/search/jql",

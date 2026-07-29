@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -24,6 +26,7 @@ from pydantic import BaseModel, Field
 
 settings = get_settings()
 settings.service_name = "context-agent"
+logger = logging.getLogger("context-agent")
 agent = ContextIntelligenceAgent()
 tasks: list[asyncio.Task] = []
 MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
@@ -248,6 +251,13 @@ async def startup(app: FastAPI) -> None:
         alert = Alert.model_validate(payload["alert"])
         incident = Incident.model_validate(payload["incident"])
         context = await agent.collect_with_runtime(alert, incident)
+        try:
+            create_evidence_rag_draft(alert=alert, incident=incident, context=context)
+        except Exception:
+            logger.exception(
+                "failed to create evidence RAG draft for alert_id=%s",
+                alert.alert_id,
+            )
         provider = _extract_message_bus_provider(payload)
         provider_used = await _publish_context_event(
             app=app,
@@ -311,6 +321,19 @@ class RagDocumentRequest(BaseModel):
 
 class RagDocumentUpdateRequest(RagDocumentRequest):
     path: str = Field(min_length=3)
+
+
+class EvidenceRagDraftReviewRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=3, max_length=160)
+    content: str | None = Field(default=None, min_length=20)
+    reviewed_by: str = Field(min_length=2, max_length=120)
+    review_notes: str | None = Field(default=None, max_length=2000)
+
+
+class EvidenceRagDraftApproveRequest(BaseModel):
+    approved_by: str = Field(min_length=2, max_length=120)
+    title: str | None = Field(default=None, min_length=3, max_length=160)
+    content: str | None = Field(default=None, min_length=20)
 
 
 def _metadata_value(metadata: dict[str, str], *keys: str, default: str = "") -> str:
@@ -699,6 +722,107 @@ def write_rag_document_to_path(request: RagDocumentRequest, path: str) -> dict[s
     return {"path": str(target), "document_count": count, "index": connector.index_info()}
 
 
+def _evidence_draft_dir() -> Path:
+    # JSON drafts deliberately live outside the Markdown index. They cannot
+    # participate in grounding until an explicit approval promotes them.
+    target = vector_connector().root_path() / "_review"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _draft_path(draft_id: str) -> Path:
+    safe_id = slugify(draft_id)
+    target = (_evidence_draft_dir() / f"{safe_id}.json").resolve()
+    if _evidence_draft_dir().resolve() not in target.parents:
+        raise HTTPException(status_code=400, detail="invalid draft id")
+    return target
+
+
+def _read_evidence_draft(draft_id: str) -> dict[str, Any]:
+    path = _draft_path(draft_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="evidence RAG draft not found")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail="evidence RAG draft is unreadable") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=500, detail="evidence RAG draft is invalid")
+    return payload
+
+
+def _write_evidence_draft(payload: dict[str, Any]) -> dict[str, Any]:
+    draft_id = str(payload.get("draft_id") or "").strip()
+    if not draft_id:
+        raise ValueError("draft_id is required")
+    _draft_path(draft_id).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+def create_evidence_rag_draft(*, alert: Alert, incident: Incident, context: Context) -> dict[str, Any] | None:
+    metadata = context.metadata if isinstance(context.metadata, dict) else {}
+    discovery = metadata.get("discovery_report") if isinstance(metadata.get("discovery_report"), dict) else {}
+    report = discovery.get("report") if isinstance(discovery.get("report"), dict) else {}
+    evidence = discovery.get("evidence") if isinstance(discovery.get("evidence"), list) else []
+    grounded = [row for row in evidence if isinstance(row, dict) and str(row.get("evidence_id") or "").strip()]
+    if not grounded:
+        return None
+    draft_id = f"evidence-{alert.id}"
+    path = _draft_path(draft_id)
+    if path.exists():
+        return _read_evidence_draft(draft_id)
+    evidence_lines = [
+        f"- [{row.get('evidence_id')}] {row.get('source', 'evidence')}: "
+        f"{str(row.get('snippet') or row.get('summary') or '').strip()[:1200]} "
+        f"({row.get('uri') or row.get('path') or 'source unavailable'})"
+        for row in grounded[:40]
+    ]
+    hypotheses = report.get("hypotheses") if isinstance(report.get("hypotheses"), list) else []
+    hypothesis_lines = [
+        f"- {str(item.get('cause') or '').strip()} (confidence {item.get('confidence', 0)})"
+        for item in hypotheses[:8]
+        if isinstance(item, dict) and str(item.get("cause") or "").strip()
+    ]
+    content = "\n".join(
+        [
+            "## Alert",
+            f"{alert.name} on {alert.service} ({alert.environment})",
+            "",
+            "## Evidence-backed summary",
+            str(report.get("summary") or "Evidence collected; user review is required before grounding."),
+            "",
+            "## Hypotheses",
+            *(hypothesis_lines or ["- No grounded hypothesis was produced."]),
+            "",
+            "## Collected evidence",
+            *evidence_lines,
+        ]
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    return _write_evidence_draft(
+        {
+            "draft_id": draft_id,
+            "status": "draft",
+            "alert_id": str(alert.id),
+            "incident_id": str(incident.id),
+            "alert_type": alert.name,
+            "severity": str(getattr(alert.severity, "value", alert.severity)),
+            "title": f"Evidence review: {alert.name}",
+            "content": content,
+            "services": [alert.service],
+            "evidence_ids": [str(row["evidence_id"]) for row in grounded],
+            "source_uris": [str(row.get("uri") or row.get("path") or "") for row in grounded if row.get("uri") or row.get("path")],
+            "created_at": now,
+            "updated_at": now,
+            "reviewed_by": None,
+            "review_notes": None,
+            "approved_by": None,
+            "approved_at": None,
+            "rag_document_path": None,
+        }
+    )
+
+
 def _normalize_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
@@ -840,6 +964,92 @@ async def ingest_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
             document_flag_updated = await repo.update_projection_document_flag(request.alert_id, True)
             await session.commit()
     return {"status": "ingested", "document_flag_updated": document_flag_updated, **result}
+
+
+@app.get("/rag/evidence-drafts")
+async def list_evidence_rag_drafts(alert_id: str | None = None, status: str | None = None) -> dict[str, Any]:
+    drafts: list[dict[str, Any]] = []
+    for path in sorted(_evidence_draft_dir().glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if alert_id and str(payload.get("alert_id") or "") != alert_id:
+            continue
+        if status and str(payload.get("status") or "").lower() != status.lower():
+            continue
+        drafts.append(payload)
+    return {"count": len(drafts), "drafts": drafts}
+
+
+@app.put("/rag/evidence-drafts/{draft_id}")
+async def review_evidence_rag_draft(
+    draft_id: str,
+    request: EvidenceRagDraftReviewRequest,
+) -> dict[str, Any]:
+    draft = _read_evidence_draft(draft_id)
+    if str(draft.get("status") or "") == "approved":
+        raise HTTPException(status_code=409, detail="approved evidence documents cannot be edited")
+    if request.title is not None:
+        draft["title"] = request.title.strip()
+    if request.content is not None:
+        draft["content"] = request.content.strip()
+    draft["status"] = "reviewed"
+    draft["reviewed_by"] = request.reviewed_by.strip()
+    draft["review_notes"] = str(request.review_notes or "").strip() or None
+    draft["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return {"status": "reviewed", "draft": _write_evidence_draft(draft)}
+
+
+@app.post("/rag/evidence-drafts/{draft_id}/approve")
+async def approve_evidence_rag_draft(
+    draft_id: str,
+    request: EvidenceRagDraftApproveRequest,
+) -> dict[str, Any]:
+    draft = _read_evidence_draft(draft_id)
+    if str(draft.get("status") or "") == "approved":
+        return {"status": "approved", "draft": draft, "already_approved": True}
+    title = str(request.title or draft.get("title") or "").strip()
+    content = str(request.content or draft.get("content") or "").strip()
+    if len(content) < 20:
+        raise HTTPException(status_code=422, detail="approved evidence content is too short")
+    approved_at = datetime.now(timezone.utc).isoformat()
+    rag_request = RagDocumentRequest(
+        kind="incident",
+        alert_id=str(draft.get("alert_id") or "") or None,
+        alert_type=str(draft.get("alert_type") or "") or None,
+        severity=str(draft.get("severity") or "") or None,
+        title=title,
+        summary="User-reviewed evidence document approved for future grounding.",
+        content=content,
+        services=[str(item) for item in draft.get("services", []) if str(item).strip()],
+        source_system="kaiops-evidence-review",
+        source_ref=f"evidence-draft://{draft_id}",
+        resolved_by=request.approved_by.strip(),
+        metadata={
+            "approval_status": "approved",
+            "approved_by": request.approved_by.strip(),
+            "approved_at": approved_at,
+            "incident_id": str(draft.get("incident_id") or ""),
+            "evidence_ids": ", ".join(str(item) for item in draft.get("evidence_ids", [])),
+        },
+    )
+    result = write_rag_document(rag_request)
+    draft.update(
+        {
+            "status": "approved",
+            "title": title,
+            "content": content,
+            "approved_by": request.approved_by.strip(),
+            "approved_at": approved_at,
+            "updated_at": approved_at,
+            "rag_document_path": result["path"],
+        }
+    )
+    _write_evidence_draft(draft)
+    return {"status": "approved", "draft": draft, "rag_document": result}
 
 
 @app.post("/knowledge-pack/draft")

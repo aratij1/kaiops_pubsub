@@ -1,5 +1,8 @@
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from common.config import Settings
 from ai_workbench_common.embeddings import HashingEmbeddingModel
@@ -43,6 +46,63 @@ def test_rag_ingestion_writes_reloads_and_searches(tmp_path) -> None:
     public_doc = module._public_rag_document(connector.documents[0], connector)
     assert public_doc["embedding_status"] in {"embedded", "metadata-only"}
     assert public_doc["vector_store"]["provider"] == "file-backed-memory"
+
+
+@pytest.mark.asyncio
+async def test_evidence_draft_requires_review_approval_before_grounding(tmp_path) -> None:
+    module = load_context_app_module()
+    connector = VectorDBConnector(rag_root=tmp_path)
+    module.agent = ContextIntelligenceAgent(connectors=[connector])
+    alert = SimpleNamespace(
+        id="11111111-1111-1111-1111-111111111111",
+        name="Checkout error rate",
+        service="checkout-api",
+        environment="production",
+        severity=SimpleNamespace(value="high"),
+    )
+    incident = SimpleNamespace(id="22222222-2222-2222-2222-222222222222")
+    context = SimpleNamespace(
+        metadata={
+            "discovery_report": {
+                "report": {
+                    "summary": "Error rate increased after the latest deployment.",
+                    "hypotheses": [{"cause": "Bad checkout deployment", "confidence": 0.82}],
+                },
+                "evidence": [
+                    {
+                        "evidence_id": "LOG-123",
+                        "source": "logs",
+                        "snippet": "checkout returned HTTP 500",
+                        "uri": "logs://checkout/123",
+                    }
+                ],
+            }
+        }
+    )
+
+    draft = module.create_evidence_rag_draft(alert=alert, incident=incident, context=context)
+
+    assert draft["status"] == "draft"
+    assert not list(tmp_path.rglob("*.md"))
+    assert connector.search("checkout returned HTTP 500", limit=3) == []
+
+    reviewed = await module.review_evidence_rag_draft(
+        draft["draft_id"],
+        module.EvidenceRagDraftReviewRequest(
+            reviewed_by="Operations Reviewer",
+            content=draft["content"] + "\n\nReviewed against the incident timeline.",
+        ),
+    )
+    assert reviewed["draft"]["status"] == "reviewed"
+    assert not list(tmp_path.rglob("*.md"))
+
+    approved = await module.approve_evidence_rag_draft(
+        draft["draft_id"],
+        module.EvidenceRagDraftApproveRequest(approved_by="Operations Approver"),
+    )
+    assert approved["draft"]["status"] == "approved"
+    assert list(tmp_path.rglob("*.md"))
+    assert connector.search("checkout returned HTTP 500", limit=3)[0]["kind"] == "incident"
 
 
 def test_azure_ai_search_vector_store_builds_hybrid_search_request(monkeypatch) -> None:

@@ -579,14 +579,13 @@ function normalizeAlertChannel(row) {
     || row?.ingestion_channel
     || ""
   ).trim().toLowerCase();
+  // OpenSearch can transport OpenTelemetry application logs. Classify the
+  // owning workload before classifying the transport.
+  if (projectName === "telemetry" || projectName === "astronomy-shop") return "telemetry";
+  if (explicitOrigin.includes("telemetry") || explicitOrigin.includes("opentelemetry")) return "telemetry";
   if (explicitOrigin.includes("email") || explicitChannel.includes("email")) return "email";
   if (explicitOrigin.includes("jira") || explicitOrigin.includes("ticket") || explicitChannel.includes("ticket")) return "ticket";
   if (explicitOrigin.includes("log") || explicitOrigin.includes("opensearch") || explicitChannel.includes("log")) return "log";
-  // OpenSearch is the transport for logs from both KaiOps and the
-  // OpenTelemetry demo. Preserve the owning project before classifying the
-  // transport as a generic log channel.
-  if (projectName === "telemetry" || projectName === "astronomy-shop") return "telemetry";
-  if (explicitOrigin.includes("telemetry") || explicitOrigin.includes("opentelemetry")) return "telemetry";
   const source = [
     row?.source,
     row?.provider,
@@ -4049,6 +4048,121 @@ function downloadInvestigationArtifact(filename, payload) {
   URL.revokeObjectURL(objectUrl);
 }
 
+function EvidenceRagReview({ alertId }) {
+  const [state, setState] = useState({ loading: false, draft: null, error: "", success: "" });
+  const [reviewer, setReviewer] = useState("");
+  const [content, setContent] = useState("");
+
+  async function loadDraft() {
+    const normalized = String(alertId || "").trim();
+    if (!normalized || !ALERT_UUID_PATTERN.test(normalized)) {
+      setState({ loading: false, draft: null, error: "", success: "" });
+      return;
+    }
+    setState((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const response = await fetchJson(
+        `/api-gateway/rag/evidence-drafts?alert_id=${encodeURIComponent(normalized)}`,
+        { timeoutMs: 10000 },
+      );
+      const payload = response?.data || response || {};
+      const draft = Array.isArray(payload?.drafts) ? payload.drafts[0] || null : null;
+      setContent(String(draft?.content || ""));
+      setState({ loading: false, draft, error: "", success: "" });
+    } catch (error) {
+      setState({ loading: false, draft: null, error: String(error?.message || "Unable to load evidence draft"), success: "" });
+    }
+  }
+
+  useEffect(() => {
+    loadDraft();
+  }, [alertId]);
+
+  async function reviewDraft() {
+    if (!state.draft || !reviewer.trim()) {
+      setState((current) => ({ ...current, error: "Enter the reviewer name before saving review.", success: "" }));
+      return;
+    }
+    try {
+      const response = await fetchJson(
+        `/api-gateway/rag/evidence-drafts/${encodeURIComponent(state.draft.draft_id)}`,
+        {
+          method: "PUT",
+          body: JSON.stringify({ reviewed_by: reviewer.trim(), content }),
+        },
+      );
+      const payload = response?.data || response || {};
+      const draft = payload?.draft || state.draft;
+      setState({ loading: false, draft, error: "", success: "Review saved. This document is still excluded from grounding." });
+    } catch (error) {
+      setState((current) => ({ ...current, error: String(error?.message || "Unable to save review"), success: "" }));
+    }
+  }
+
+  async function approveDraft() {
+    if (!state.draft || !reviewer.trim()) {
+      setState((current) => ({ ...current, error: "Enter the approver name before approval.", success: "" }));
+      return;
+    }
+    try {
+      const response = await fetchJson(
+        `/api-gateway/rag/evidence-drafts/${encodeURIComponent(state.draft.draft_id)}/approve`,
+        {
+          method: "POST",
+          body: JSON.stringify({ approved_by: reviewer.trim(), content }),
+        },
+      );
+      const payload = response?.data || response || {};
+      const draft = payload?.draft || state.draft;
+      setState({ loading: false, draft, error: "", success: "Approved and promoted into RAG for future grounding." });
+    } catch (error) {
+      setState((current) => ({ ...current, error: String(error?.message || "Unable to approve evidence document"), success: "" }));
+    }
+  }
+
+  if (!alertId) return null;
+  return (
+    <article className="panel">
+      <div className="section-heading">
+        <div>
+          <span className="discovery-eyebrow">Evidence knowledge lifecycle</span>
+          <h3>Review before future grounding</h3>
+          <p>Evidence creates a non-searchable draft automatically. Only explicit approval promotes it into RAG.</p>
+        </div>
+        <button type="button" className="button-secondary" onClick={loadDraft} disabled={state.loading}>
+          {state.loading ? "Loading..." : "Refresh draft"}
+        </button>
+      </div>
+      {!state.draft && !state.loading ? <p className="subtitle">No evidence draft exists yet for this alert.</p> : null}
+      {state.draft ? (
+        <>
+          <div className="workflow-pill-row">
+            <span className={`workflow-pill ${state.draft.status === "approved" ? "workflow-pill-clear" : "workflow-pill-warn"}`}>
+              {state.draft.status}
+            </span>
+            <span className="workflow-pill">{state.draft.evidence_ids?.length || 0} evidence IDs</span>
+            <span className="workflow-pill">{state.draft.status === "approved" ? "grounding enabled" : "grounding blocked"}</span>
+          </div>
+          <label>
+            Reviewer / approver
+            <input value={reviewer} onChange={(event) => setReviewer(event.target.value)} placeholder="Your name" />
+          </label>
+          <label>
+            Evidence-derived document
+            <textarea rows={16} value={content} onChange={(event) => setContent(event.target.value)} disabled={state.draft.status === "approved"} />
+          </label>
+          <div className="button-row">
+            <button type="button" className="button-secondary" onClick={reviewDraft} disabled={state.draft.status === "approved"}>Save review</button>
+            <button type="button" className="button-primary" onClick={approveDraft} disabled={state.draft.status === "approved"}>Approve for RAG</button>
+          </div>
+        </>
+      ) : null}
+      {state.error ? <p className="error">{state.error}</p> : null}
+      {state.success ? <p className="success">{state.success}</p> : null}
+    </article>
+  );
+}
+
 function IntelligenceConnectionView({
   workflow,
   documents = [],
@@ -4270,7 +4384,8 @@ function IntelligenceConnectionView({
               })),
           }
         : {
-            summary: "Code review not available for this analysis.",
+            status: "not_performed",
+            summary: "Code review was not performed because discovery returned no source=\"code\" evidence for this alert. This is an evidence-coverage issue, not a performance timeout.",
             insufficient_context: true,
             findings: [],
             code_patches: [],
@@ -15191,6 +15306,7 @@ export default function App() {
                         documents={selectedAlertRagDocuments}
                         onDownloadDocument={downloadRagDocument}
                       />
+                      <EvidenceRagReview alertId={selectedAlertId} />
                       <details className="investigation-deep-dive">
                         <summary>
                           <span>
