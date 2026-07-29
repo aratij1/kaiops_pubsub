@@ -1898,6 +1898,59 @@ async def ingest_rag_document(
     )
 
 
+@app.get("/rag/evidence-drafts")
+async def list_evidence_rag_drafts(
+    request: Request,
+    alert_id: str | None = None,
+    status: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    params = {key: value for key, value in {"alert_id": alert_id, "status": status}.items() if value}
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/rag/evidence-drafts",
+        target_base=settings.context_agent_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+        params=params,
+    )
+
+
+@app.put("/rag/evidence-drafts/{draft_id}")
+async def review_evidence_rag_draft(
+    draft_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="PUT",
+        path=f"/rag/evidence-drafts/{draft_id}",
+        target_base=settings.context_agent_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/rag/evidence-drafts/{draft_id}/approve")
+async def approve_evidence_rag_draft(
+    draft_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/rag/evidence-drafts/{draft_id}/approve",
+        target_base=settings.context_agent_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.post("/knowledge-pack/draft")
 async def draft_knowledge_pack(
     request: Request,

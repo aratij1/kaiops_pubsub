@@ -233,23 +233,23 @@ groups:
           summary: "High network packet loss"
           description: "HTTP probe success ratio dropped below 95% for target {{ $labels.instance }}."
 
-      - alert: KafkaConsumerLag
-        expr: sum(kafka_consumergroup_lag) > 50000
+      - alert: RabbitMQQueueBacklog
+        expr: sum(rabbitmq_queue_messages_ready) > 50000
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Kafka consumer lag high"
-          description: "Kafka consumer lag is above 10,000 messages."
+          summary: "RabbitMQ queue backlog high"
+          description: "More than 50,000 messages are waiting across KaiOps RabbitMQ queues."
 
-      - alert: KafkaBrokerDown
-        expr: up{job=~".*kafka.*"} == 0
+      - alert: RabbitMQBrokerDown
+        expr: up{job="kaiops-rabbitmq"} == 0
         for: 2m
         labels:
           severity: critical
         annotations:
-          summary: "Kafka broker down"
-          description: "Kafka broker target {{ $labels.instance }} is not responding."
+          summary: "RabbitMQ broker down"
+          description: "The KaiOps RabbitMQ broker is not responding."
 
       - alert: DatabaseConnectionFailure
         expr: (rate(mysql_global_status_aborted_connects[5m]) > 0.1) or ((mysql_global_status_threads_connected / clamp_min(mysql_global_variables_max_connections, 1)) > 0.98)
@@ -314,14 +314,14 @@ groups:
           summary: "Vector DB high latency"
           description: "Context agent execute-stage P95 latency is above 3 seconds."
 
-      - alert: KafkaTopicBacklog
-        expr: sum(kafka_topic_partition_current_offset - kafka_topic_partition_oldest_offset) > 250000
+      - alert: RabbitMQUnackedBacklog
+        expr: sum(rabbitmq_queue_messages_unacked) > 250000
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Kafka topic backlog high"
-          description: "Kafka topic backlog exceeded threshold."
+          summary: "RabbitMQ unacknowledged backlog high"
+          description: "RabbitMQ unacknowledged messages exceeded the operational threshold."
 
       - alert: AgentProcessingTimeout
         expr: histogram_quantile(0.95, sum(rate(kaiops_agent_stage_latency_seconds_bucket[5m])) by (le, agent)) > 90

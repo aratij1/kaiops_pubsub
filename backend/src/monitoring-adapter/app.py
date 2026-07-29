@@ -102,7 +102,13 @@ from monitoring_adapter.existing_monitoring import (
 )
 from monitoring_adapter.landing_pad_normalizer import normalize_landing_pad_alert
 from monitoring_adapter.landing_pad_sources import SUPPORTED_SUFFIXES, load_landing_pad_file
-from monitoring_adapter.email_ingestion import EmailPollState, ImapConfig, email_to_alert_payload, fetch_unseen_emails
+from monitoring_adapter.email_ingestion import (
+    EmailPollState,
+    ImapConfig,
+    email_to_alert_payload,
+    fetch_unseen_emails,
+    infer_affected_service,
+)
 from monitoring_adapter.dedup import compute_fingerprint
 from monitoring_adapter.jira_client import JiraClient, JiraClientError
 from monitoring_adapter.jira_admission import JiraAdmissionState
@@ -333,6 +339,9 @@ OPENSEARCH_LOG_POLL_INTERVAL_SECONDS = max(
 )
 OPENSEARCH_LOG_LOOKBACK_SECONDS = max(30, int(os.getenv("OPENSEARCH_LOG_LOOKBACK_SECONDS", "300") or 300))
 OPENSEARCH_LOG_BATCH_SIZE = max(1, min(int(os.getenv("OPENSEARCH_LOG_BATCH_SIZE", "100") or 100), 500))
+OPENSEARCH_LOG_TIMEOUT_SECONDS = max(
+    3.0, min(float(os.getenv("OPENSEARCH_LOG_TIMEOUT_SECONDS", "10") or 10), 30.0)
+)
 OPENSEARCH_LOG_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "opensearch_log_ingestion_state.json"
 EMAIL_POLL_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "email_ingestion_state.json"
 OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING = str(
@@ -1719,6 +1728,7 @@ async def _opensearch_log_poll_worker() -> None:
                 state=state,
                 lookback_seconds=OPENSEARCH_LOG_LOOKBACK_SECONDS,
                 batch_size=OPENSEARCH_LOG_BATCH_SIZE,
+                timeout_seconds=OPENSEARCH_LOG_TIMEOUT_SECONDS,
                 docker_api_endpoint=OPENSEARCH_LOG_DOCKER_API_URL,
             )
             for record in records:
@@ -5338,6 +5348,20 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
     assignee = fields.get("assignee", {}) if isinstance(fields.get("assignee"), dict) else {}
     webhook_event = str(payload.get("webhookEvent") or "").strip()
     jira_labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
+    components = fields.get("components") if isinstance(fields.get("components"), list) else []
+    component_names = [
+        str(component.get("name") or "").strip()
+        for component in components
+        if isinstance(component, dict) and str(component.get("name") or "").strip()
+    ]
+    description = str(fields.get("description") or summary)
+    affected_service = infer_affected_service(
+        *component_names,
+        *jira_labels,
+        summary,
+        description,
+        fallback="unresolved-service",
+    )
     managed = "managed_by_kaiops" in jira_labels
     kaiops_incident_label = next(
         (str(label) for label in jira_labels if str(label).startswith("kaiops_incident_")),
@@ -5347,13 +5371,17 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
     mapped_payload = {
         "source": "jira",
         "name": summary,
-        "service": str(project.get("key") or "jira-tickets"),
+        "service": affected_service,
         "environment": "prod",
         "severity": _jira_priority_to_severity(str(priority.get("name") or "")),
-        "description": str(fields.get("description") or summary),
+        "description": description,
         "labels": {
             "alert_status": "firing",
+            "origin_system": "jira",
+            "ingestion_channel": "ticket",
             "ticket_id": issue_key,
+            "jira_project_key": str(project.get("key") or ""),
+            "jira_components": ",".join(component_names),
             "jira_issue_id": issue_id,
             "jira_status": str(status_field.get("name") or ""),
             "jira_priority": str(priority.get("name") or ""),

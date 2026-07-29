@@ -54,6 +54,7 @@ x-service-env: &service-env
   OPENSEARCH_LOG_POLL_INTERVAL_SECONDS: ${OPENSEARCH_LOG_POLL_INTERVAL_SECONDS:-30}
   OPENSEARCH_LOG_LOOKBACK_SECONDS: ${OPENSEARCH_LOG_LOOKBACK_SECONDS:-300}
   OPENSEARCH_LOG_BATCH_SIZE: ${OPENSEARCH_LOG_BATCH_SIZE:-100}
+  OPENSEARCH_LOG_TIMEOUT_SECONDS: ${OPENSEARCH_LOG_TIMEOUT_SECONDS:-10}
   OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING: ${OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING:-true}
   OPENSEARCH_LOG_JIRA_ROUTING_ENABLED: ${OPENSEARCH_LOG_JIRA_ROUTING_ENABLED:-false}
   PROMETHEUS_JIRA_ROUTING_ENABLED: ${PROMETHEUS_JIRA_ROUTING_ENABLED:-false}
@@ -120,7 +121,7 @@ x-service-env: &service-env
   ALERTMANAGER_DEDUP_MAX_ENTRIES: ${ALERTMANAGER_DEDUP_MAX_ENTRIES:-10000}
   INCIDENT_PROJECTION_INTERVAL_SECONDS: ${INCIDENT_PROJECTION_INTERVAL_SECONDS:-60}
   INCIDENT_PROJECTION_BATCH_SIZE: ${INCIDENT_PROJECTION_BATCH_SIZE:-100}
-  KAFKA_ENABLED: ${KAFKA_ENABLED:-true}
+  KAFKA_ENABLED: ${KAFKA_ENABLED:-false}
   EVENT_BUS_PROVIDER: ${EVENT_BUS_PROVIDER:-rabbitmq}
   MESSAGE_BUS_DYNAMIC_ROUTING: "true"
   MESSAGE_BUS_STREAM_THRESHOLD: "500"
@@ -219,6 +220,7 @@ services:
       retries: 20
 
   zookeeper:
+    profiles: ["kafka"]
     image: confluentinc/cp-zookeeper:7.7.1
     restart: unless-stopped
     environment:
@@ -228,6 +230,7 @@ services:
       - zookeeper-log:/var/lib/zookeeper/log
 
   kafka:
+    profiles: ["kafka"]
     image: confluentinc/cp-kafka:7.7.1
     restart: unless-stopped
     depends_on: [zookeeper]
@@ -305,6 +308,7 @@ services:
     ports: ["9115:9115"]
 
   kafka-exporter:
+    profiles: ["kafka"]
     image: danielqsj/kafka-exporter:v1.7.0
     restart: unless-stopped
     command:
@@ -357,7 +361,6 @@ services:
       mysql-exporter: { condition: service_started }
       node-exporter: { condition: service_started }
       blackbox-exporter: { condition: service_started }
-      kafka-exporter: { condition: service_started }
       alertmanager: { condition: service_started }
 
   monitoring-adapter:
@@ -383,7 +386,6 @@ services:
       - ./backend/rag:/app/rag
       - ${INGESTED_ALERTS_HOST_PATH:-./backend/ingested_alerts}:/app/ingested_alerts
     depends_on:
-      kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -418,7 +420,6 @@ services:
       - ./fault-lab/runtime:/app/fault-lab/runtime:ro
       - ./observability:/app/observability:ro
     depends_on:
-      kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -581,7 +582,7 @@ services:
     working_dir: /app/backend/src/alert-intelligence
     ports: ["8002:8000"]
     depends_on:
-      kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
 
@@ -593,7 +594,6 @@ services:
     working_dir: /app/backend/src/orchestrator
     ports: ["8003:8000"]
     depends_on:
-      kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       context-agent: { condition: service_started }
@@ -627,7 +627,6 @@ services:
       - ./backend/ingested_alerts:/app/backend/ingested_alerts:ro
     depends_on:
       discovery-mcp: { condition: service_started }
-      kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
@@ -693,7 +692,7 @@ services:
     working_dir: /app/ai-workbench/src/model-router
     ports: ["8005:8000"]
     depends_on:
-      kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
   resolution-agent:
@@ -708,7 +707,7 @@ services:
     working_dir: /app/ai-workbench/src/resolution-agent
     ports: ["8006:8000"]
     depends_on:
-      kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       model-router: { condition: service_started }
 
@@ -720,7 +719,6 @@ services:
     working_dir: /app/backend/src/approval-service
     ports: ["8007:8000"]
     depends_on:
-      kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
@@ -732,7 +730,6 @@ services:
     working_dir: /app/backend/src/notification-service
     ports: ["8019:8000"]
     depends_on:
-      kafka: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
@@ -755,7 +752,7 @@ services:
     working_dir: /app/backend/src/remediation-engine
     ports: ["8008:8000"]
     depends_on:
-      kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
   closure-service:
@@ -766,7 +763,7 @@ services:
     working_dir: /app/backend/src/closure-service
     ports: ["8009:8000"]
     depends_on:
-      kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
   ui:

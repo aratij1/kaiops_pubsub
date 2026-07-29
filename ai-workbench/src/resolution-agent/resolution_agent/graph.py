@@ -894,6 +894,25 @@ class ResolutionIntelligenceAgent(BaseAgent):
 
     async def impact_analysis(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
+        service_name = str(context.alert.service or "").strip()
+        source_only_services = {
+            "email",
+            "email-inbox",
+            "jira",
+            "jira-tickets",
+            "ticket",
+            "tickets",
+            "logs",
+            "prometheus",
+            "telemetry",
+            "unresolved-service",
+        }
+        affected_service = service_name if service_name.lower() not in source_only_services else ""
+        evidence_safe_fallback = (
+            f"No direct customer or service impact is established by the collected evidence"
+            f"{f' for {affected_service}' if affected_service else ''}; validate availability, latency, "
+            "error rate, and dependency health before assigning impact."
+        )
         prompt = PROMPT_ASSESS_IMPACT
         payload = {
             "alert": state["gathered_context"].get("alert", {}),
@@ -909,12 +928,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 task=ModelTask.IMPACT,
                 prompt=prompt,
                 payload=payload,
-                fallback_content=f"{context.alert.service.title()} service impact requires immediate triage",
+                fallback_content=evidence_safe_fallback,
             )
         else:
             response = {
                 "model": "deterministic-fast-path",
-                "content": f"{context.alert.service.title()} service impact requires immediate triage",
+                "content": evidence_safe_fallback,
                 "usage": {
                     "provider": "deterministic",
                     "model": "deterministic-fast-path",
@@ -940,18 +959,16 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "Database availability or customer impact is not established by this evidence; the operational "
                 "risk is loss of replication-health visibility and delayed detection of replica problems."
             )
-        elif "latency" in normalized_description:
-            state["impact"] = f"{context.alert.service.title()} latency"
+        elif "latency" in normalized_description and affected_service:
+            state["impact"] = f"Observed alert condition indicates latency for {affected_service}; customer impact is not established."
         else:
             state["impact"] = self._extract_model_text(
                 response["content"],
                 keys=("impact_summary", "customer_impact", "service_impact", "severity_rationale", "summary"),
-                fallback_text=f"{context.alert.service.title()} service impact requires immediate triage",
+                fallback_text=evidence_safe_fallback,
             )
         if model_fallback and not has_specific_mysql_exporter_impact:
-            state["impact"] = (
-                f"{context.alert.service.title()} may have degraded availability, latency, or dependency behavior until validated recovery is confirmed."
-            )
+            state["impact"] = evidence_safe_fallback
         impact_external_text, impact_external_meta = self._build_external_impact_fallback(
             context=context,
             gathered_context=state.get("gathered_context", {}),
@@ -970,8 +987,6 @@ class ResolutionIntelligenceAgent(BaseAgent):
         ]
         valid_ids = set(ordered_valid_ids)
         impact_citations = self._validated_evidence_ids(parsed.get("evidence_used"), valid_ids)
-        if not impact_citations and ordered_valid_ids:
-            impact_citations = list(dict.fromkeys(ordered_valid_ids))[:6]
         try:
             impact_confidence = max(0.0, min(1.0, float(parsed.get("confidence_score", 0.0))))
         except (TypeError, ValueError):

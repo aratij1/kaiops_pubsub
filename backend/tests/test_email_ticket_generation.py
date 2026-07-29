@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from monitoring_adapter.landing_pad_sources import load_landing_pad_file
+from monitoring_adapter.email_ingestion import email_to_alert_payload
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -67,3 +68,24 @@ def test_generate_email_tickets_respects_count(tmp_path: Path) -> None:
 
     written = gen.generate(source, input_dir, count=1, sender="alerts@kaiops.local")
     assert len(written) == 1
+
+
+def test_email_transport_is_not_reported_as_the_affected_service() -> None:
+    checkout = email_to_alert_payload(
+        {
+            "subject": "Critical alert on checkout-api",
+            "body": "HTTP 500 rate exceeded the threshold.",
+            "from": "monitoring@example.com",
+        }
+    )
+    unknown = email_to_alert_payload(
+        {
+            "subject": "Critical infrastructure alert",
+            "body": "The affected workload was not included.",
+            "from": "monitoring@example.com",
+        }
+    )
+
+    assert checkout["service"] == "checkout-api"
+    assert unknown["service"] == "unresolved-service"
+    assert unknown["labels"]["origin_system"] == "email"
