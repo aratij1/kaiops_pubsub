@@ -629,7 +629,13 @@ function sourceChannelLabel(value) {
 
 const ALERT_SOURCE_CHANNELS = ["prometheus", "telemetry", "email", "ticket", "log"];
 const MAX_LATEST_ALERTS_PER_SOURCE = 30;
-const MIN_VISIBLE_ALERTS_BY_SOURCE = { prometheus: 5, email: 2, ticket: 2, log: 5 };
+const MIN_VISIBLE_ALERTS_BY_SOURCE = {
+  prometheus: 2,
+  telemetry: 2,
+  email: 2,
+  ticket: 2,
+  log: 2,
+};
 
 function capLatestAlertsPerSource(rows, maxPerSource = MAX_LATEST_ALERTS_PER_SOURCE) {
   const safeMax = Math.max(1, Number(maxPerSource) || MAX_LATEST_ALERTS_PER_SOURCE);
