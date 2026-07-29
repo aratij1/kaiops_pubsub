@@ -19,6 +19,29 @@ class JiraClientError(Exception):
     pass
 
 
+def jira_rich_text_to_plain_text(value: Any) -> str:
+    """Flatten Jira ADF into readable text while preserving paragraph breaks."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(filter(None, (jira_rich_text_to_plain_text(item) for item in value))).strip()
+    if not isinstance(value, dict):
+        return str(value).strip()
+
+    node_type = str(value.get("type") or "").strip().lower()
+    if node_type == "text":
+        return str(value.get("text") or "").strip()
+    if node_type == "hardbreak":
+        return "\n"
+
+    children = value.get("content") if isinstance(value.get("content"), list) else []
+    child_text = [jira_rich_text_to_plain_text(item) for item in children]
+    separator = "\n" if node_type in {"doc", "heading", "paragraph", "bulletlist", "orderedlist", "listitem"} else " "
+    return separator.join(item for item in child_text if item).strip()
+
+
 class JiraClient:
     def __init__(self, base_url: str, email: str, api_token: str, project_key: str) -> None:
         self.base_url = base_url.rstrip("/")

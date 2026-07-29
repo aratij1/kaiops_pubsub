@@ -110,7 +110,7 @@ from monitoring_adapter.email_ingestion import (
     infer_affected_service,
 )
 from monitoring_adapter.dedup import compute_fingerprint
-from monitoring_adapter.jira_client import JiraClient, JiraClientError
+from monitoring_adapter.jira_client import JiraClient, JiraClientError, jira_rich_text_to_plain_text
 from monitoring_adapter.jira_admission import JiraAdmissionState
 from monitoring_adapter.log_ingestion import (
     LogWatchState,
@@ -5354,7 +5354,7 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
         for component in components
         if isinstance(component, dict) and str(component.get("name") or "").strip()
     ]
-    description = str(fields.get("description") or summary)
+    description = jira_rich_text_to_plain_text(fields.get("description")) or summary
     affected_service = infer_affected_service(
         *component_names,
         *jira_labels,
@@ -5394,7 +5394,7 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
         },
         "annotations": {
             "summary": summary,
-            "description": str(fields.get("description") or ""),
+            "description": description,
         },
     }
     return mapped_payload, issue_key

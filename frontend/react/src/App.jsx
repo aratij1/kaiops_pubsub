@@ -4229,6 +4229,7 @@ function IntelligenceConnectionView({
     // literal text "[object Object]".
     ...(Array.isArray(rcaAnalysis.evidence_used) ? rcaAnalysis.evidence_used.filter((item) => typeof item === "string") : []),
     ...(Array.isArray(impactAnalysis.evidence_used) ? impactAnalysis.evidence_used.filter((item) => typeof item === "string") : []),
+    ...evidence.map((item) => item?.evidence_id),
     ...detectedErrors.map((item) => item?.evidence_id),
   ].filter(Boolean)));
   const queryTerms = Array.isArray(discovery.query_terms)
