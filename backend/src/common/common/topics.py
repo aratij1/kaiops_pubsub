@@ -3,10 +3,12 @@ JIRA_INVESTIGATIONS = "jira-investigations"
 ENRICHED_ALERTS = "enriched-alerts"
 ORCHESTRATION_EVENTS = "orchestration-events"
 CONTEXT_EVENTS = "context-events"
+CODE_ANALYSIS_EVENTS = "code-analysis-events"
 RESOLUTION_EVENTS = "resolution-events"
 APPROVAL_EVENTS = "approval-events"
 REMEDIATION_EVENTS = "remediation-events"
 CLOSURE_EVENTS = "closure-events"
+LEARNING_EVENTS = "learning-events"
 APPLICATION_ONBOARD_REQUESTED = "application.onboard.requested"
 APPLICATION_DISCOVERY_COMPLETED = "application.discovery.completed"
 APPLICATION_METRICS_VALIDATED = "application.metrics.validated"
@@ -45,10 +47,12 @@ ALL_TOPICS = [
     ENRICHED_ALERTS,
     ORCHESTRATION_EVENTS,
     CONTEXT_EVENTS,
+    CODE_ANALYSIS_EVENTS,
     RESOLUTION_EVENTS,
     APPROVAL_EVENTS,
     REMEDIATION_EVENTS,
     CLOSURE_EVENTS,
+    LEARNING_EVENTS,
     APPLICATION_ONBOARD_REQUESTED,
     APPLICATION_DISCOVERY_COMPLETED,
     APPLICATION_METRICS_VALIDATED,
