@@ -450,7 +450,16 @@ class ResolutionIntelligenceAgent(BaseAgent):
 
         return str(model_root_cause or f"Likely degradation in {context.alert.service}").strip()
 
-    def _infer_action_and_commands(self, context: Context, root_cause: str, model_action: str) -> tuple[str, list[str], str]:
+    def _infer_action_and_commands(
+        self, context: Context, root_cause: str, model_action: str
+    ) -> tuple[str, list[str], str, list[str], str]:
+        """Returns (action, commands, remediation_target, validation_queries, rollback_plan).
+
+        validation_queries/rollback_plan are deterministic defaults for the fast path
+        (RESOLUTION_DEEP_ANALYSIS_ENABLED=false) where no model ever supplies them.
+        `commands` is unchanged from before this field was added -- remediation-engine
+        reads recommendation.commands directly to execute, so its contents must not
+        shift based on this addition."""
         description = self._norm(context.alert.description)
         root = self._norm(root_cause)
         if "replication client privilege" in root and "mysql-exporter" in root:
@@ -461,6 +470,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
                     "mysql -e \"SHOW REPLICA STATUS\\G\"",
                 ],
                 str(context.alert.service or "mysql-exporter").strip(),
+                ["mysql -e \"SHOW REPLICA STATUS\\G\" -- confirm replication resumes after the grant"],
+                "No rollback needed: granting REPLICATION CLIENT is read-only and does not modify data. "
+                "If the privilege should not be permanent, revoke it: REVOKE REPLICATION CLIENT ON *.* FROM CURRENT_USER();",
             )
         runbook = str(context.runbook or "")
         runbook_commands = self._sanitize_commands(self._extract_runbook_commands(runbook), max_items=4)
@@ -470,6 +482,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "Execute approved runbook remediation script and validation checks",
                 runbook_commands,
                 target,
+                ["Re-check the alert or dashboard that triggered this incident for recovery"],
+                "Follow the runbook's own rollback guidance if remediation does not resolve the incident; "
+                "no automated rollback is defined for custom runbook steps.",
             )
 
         if any(keyword in root for keyword in ["deploy", "release", "rollout", "version"]):
@@ -478,6 +493,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "Rollback deployment",
                 runbook_commands or [f"kubectl rollout undo deployment/{target} -n prod"],
                 target,
+                [f"kubectl rollout status deployment/{target} -n prod --timeout=180s"],
+                f"This action is itself a rollback. If it does not resolve the incident, inspect prior revisions "
+                f"with: kubectl rollout history deployment/{target} -n prod",
             )
 
         if "pod" in description or "oom" in description or "crashloop" in description:
@@ -486,6 +504,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "Restart pod",
                 runbook_commands or [f"kubectl rollout restart deployment/{target} -n prod"],
                 target,
+                [
+                    f"kubectl rollout status deployment/{target} -n prod --timeout=180s",
+                    f"kubectl get pods -n prod | findstr {target}",
+                ],
+                f"If the crash loop persists after restart, roll back to the previous deployment revision: "
+                f"kubectl rollout undo deployment/{target} -n prod",
             )
 
         if "latency" in description or "timeout" in description:
@@ -494,6 +518,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "Scale deployment and validate latency reduction",
                 runbook_commands or [f"kubectl scale deployment/{target} --replicas=3 -n prod"],
                 target,
+                [f"kubectl get hpa {target} -n prod", f"kubectl top pods -n prod | findstr {target}"],
+                f"If scaling does not improve latency, scale back to the original replica count: "
+                f"kubectl scale deployment/{target} --replicas=<original> -n prod",
             )
 
         if "database" in description or "replica" in description:
@@ -502,17 +529,31 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "Fail over database and validate replication health",
                 runbook_commands or ["mysql -e \"SHOW REPLICA STATUS;\""],
                 target,
+                ["mysql -e \"SHOW REPLICA STATUS\\G\" -- confirm the new primary is healthy"],
+                "Database failover is high-risk and not automatically reversible. Confirm replication health "
+                "before failing back, and involve a DBA before reversing this action.",
             )
 
         target = str(context.alert.service or "service").strip()
         action = str(model_action or "Investigate service and apply runbook remediation").strip()
+        default_validation = [f"kubectl rollout status deployment/{target} -n prod --timeout=180s"]
+        default_rollback = (
+            "No automated rollback is defined for this action; manually verify service health and revert "
+            "any applied change if the incident persists."
+        )
         if runbook_commands:
-            return action, runbook_commands, target
+            return action, runbook_commands, target, default_validation, default_rollback
         fallback_commands = [
             f"kubectl rollout status deployment/{target} -n prod --timeout=180s",
             f"kubectl get pods -n prod | findstr {target}",
         ]
-        return action, self._sanitize_commands(fallback_commands, max_items=4), target
+        return (
+            action,
+            self._sanitize_commands(fallback_commands, max_items=4),
+            target,
+            default_validation,
+            default_rollback,
+        )
 
     async def _generate_with_fallback(
         self,
@@ -1065,7 +1106,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
         if model_fallback:
             model_action = f"Investigate {context.alert.service} health and apply documented runbook remediation"
-        action, commands, remediation_target = self._infer_action_and_commands(
+        action, commands, remediation_target, default_validation_queries, default_rollback_plan = self._infer_action_and_commands(
             context,
             str(state.get("root_cause") or ""),
             model_action,
@@ -1093,6 +1134,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
         state["recommended_action"] = action
         state["commands"] = commands
         state["remediation_analysis"] = {
+            # Deterministic defaults first, so a real model answer (when
+            # RESOLUTION_DEEP_ANALYSIS_ENABLED=true) always wins if it supplies its
+            # own validation_queries/rollback_plan; the fast path always keeps these.
+            "validation_queries": default_validation_queries,
+            "rollback_plan": default_rollback_plan,
             **parsed,
             "recommended_action": action,
             "commands": commands,
@@ -1171,6 +1217,14 @@ class ResolutionIntelligenceAgent(BaseAgent):
                     },
                 )
             )
+        severity_risk = "high" if context.alert.severity == AlertSeverity.CRITICAL else "medium"
+        # PROMPT_RECOMMEND_REMEDIATION asks the model for a risk_level reflecting the
+        # actual remediation action (e.g. a read-only check vs. a database failover),
+        # which is more precise than the alert's severity alone. Only trust it when it's
+        # one of the known values; the deterministic fast path never sets this key, so
+        # this is a no-op there and behavior is unchanged from before.
+        model_risk = str(state.get("remediation_analysis", {}).get("risk_level") or "").strip().lower()
+        risk = model_risk if model_risk in {"low", "medium", "high", "critical"} else severity_risk
         recommendation = Recommendation(
             incident_id=context.incident_id,
             root_cause=state["root_cause"],
@@ -1180,7 +1234,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
             severity=context.alert.severity,
             rationale=state["rationale"],
             commands=state.get("commands", []),
-            risk="high" if context.alert.severity == AlertSeverity.CRITICAL else "medium",
+            risk=risk,
         )
         recommendation.metadata["model_usage"] = state.get("model_usage", [])
         recommendation.metadata["model_calls"] = state.get("model_calls", [])
