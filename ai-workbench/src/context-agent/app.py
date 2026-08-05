@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
 import re
+from time import perf_counter
 from typing import Any
 
 from common.config import get_settings
@@ -17,7 +19,13 @@ from common.models import Alert, Incident
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app
-from common.telemetry import EVENTS_PROCESSED
+from common.telemetry import (
+    CONTEXT_KNOWLEDGE_OPERATIONS,
+    CONTEXT_KNOWLEDGE_REUSE_COUNT,
+    CONTEXT_STRATEGY_DURATION,
+    CONTEXT_STRATEGY_REQUESTS,
+    EVENTS_PROCESSED,
+)
 from common.topics import CONTEXT_EVENTS, ORCHESTRATION_EVENTS
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import VectorDBConnector
@@ -32,6 +40,135 @@ tasks: list[asyncio.Task] = []
 MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
     os.getenv("MESSAGE_BUS_DUAL_CONSUME_ENABLED", "false")
 ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _context_strategy(override: str | None = None) -> str:
+    strategy = str(override or getattr(settings, "context_strategy", "continuous") or "continuous").strip().lower()
+    return strategy if strategy in {"immediate", "continuous"} else "continuous"
+
+
+def _context_identity(alert: Alert) -> tuple[str, str, str, str]:
+    metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
+    labels = alert.labels if isinstance(alert.labels, dict) else {}
+    tenant_id = str(metadata.get("tenant_id") or labels.get("tenant_id") or "default").strip() or "default"
+    service = str(alert.service or "unknown").strip().lower() or "unknown"
+    environment = str(alert.environment or labels.get("environment") or "prod").strip().lower() or "prod"
+    stable_labels = {
+        key: str(labels.get(key) or "").strip().lower()
+        for key in ("application", "project", "namespace", "category", "alert_family")
+        if str(labels.get(key) or "").strip()
+    }
+    signature_input = {
+        "source": str(alert.source or "").strip().lower(),
+        "name": str(alert.name or "").strip().lower(),
+        "service": service,
+        "environment": environment,
+        "labels": stable_labels,
+    }
+    signature = hashlib.sha256(
+        json.dumps(signature_input, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return tenant_id, service, environment, signature
+
+
+async def _collect_context_with_strategy(
+    app: FastAPI,
+    alert: Alert,
+    incident: Incident,
+    strategy_override: str | None = None,
+) -> Context:
+    started = perf_counter()
+    strategy = _context_strategy(strategy_override)
+    tenant_id, service, environment, signature = _context_identity(alert)
+    session_factory = getattr(app.state, "session_factory", None)
+    database_available = bool(settings.database_enabled and session_factory is not None)
+
+    if strategy == "continuous" and database_available:
+        ttl_seconds = max(60, int(getattr(settings, "context_knowledge_ttl_seconds", 604800) or 604800))
+        try:
+            async with session_factory() as session:
+                repo = IncidentRepository(session)
+                cached = await repo.find_context_knowledge(
+                    tenant_id=tenant_id,
+                    service=service,
+                    environment=environment,
+                    alert_signature=signature,
+                    not_before=datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds),
+                )
+                CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "hit" if cached else "miss").inc()
+                if cached:
+                    try:
+                        context = Context.model_validate(cached.get("payload", {})).model_copy(
+                            update={"incident_id": incident.id, "alert": alert}
+                        )
+                    except Exception:
+                        CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "invalid").inc()
+                        logger.exception("invalid cached context knowledge id=%s; refreshing", cached.get("id"))
+                    else:
+                        reuse_count = int(cached.get("reuse_count", 1) or 1)
+                        context.metadata = {
+                            **(context.metadata if isinstance(context.metadata, dict) else {}),
+                            "context_strategy": "continuous",
+                            "context_reused": True,
+                            "context_knowledge_id": cached.get("id"),
+                            "context_source_alert_id": cached.get("source_alert_id"),
+                            "context_source_incident_id": cached.get("source_incident_id"),
+                            "context_collected_at": cached.get("collected_at"),
+                            "context_reuse_count": reuse_count,
+                            "context_signature": signature,
+                            "prior_resolution": cached.get("resolution_payload", {}),
+                        }
+                        await session.commit()
+                        CONTEXT_KNOWLEDGE_REUSE_COUNT.observe(reuse_count)
+                        CONTEXT_STRATEGY_REQUESTS.labels("continuous", "cache_hit").inc()
+                        CONTEXT_STRATEGY_DURATION.labels("continuous", "reused").observe(
+                            max(0.0, perf_counter() - started)
+                        )
+                        return context
+        except Exception:
+            CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "error").inc()
+            logger.exception("context knowledge lookup failed; continuing with fresh discovery")
+
+    if strategy == "continuous" and not database_available:
+        CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "unavailable").inc()
+
+    try:
+        context = await agent.collect_with_runtime(alert, incident)
+    except Exception:
+        CONTEXT_STRATEGY_REQUESTS.labels(strategy, "discovery_error").inc()
+        CONTEXT_STRATEGY_DURATION.labels(strategy, "error").observe(max(0.0, perf_counter() - started))
+        raise
+    context.metadata = {
+        **(context.metadata if isinstance(context.metadata, dict) else {}),
+        "context_strategy": strategy,
+        "context_reused": False,
+        "context_signature": signature,
+        "context_collected_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if database_available:
+        try:
+            async with session_factory() as session:
+                repo = IncidentRepository(session)
+                knowledge_id = await repo.save_context_knowledge(
+                    tenant_id=tenant_id,
+                    service=service,
+                    environment=environment,
+                    alert_name=str(alert.name or "unknown"),
+                    alert_signature=signature,
+                    source_alert_id=alert.id,
+                    source_incident_id=incident.id,
+                    payload=context.model_dump(mode="json"),
+                )
+                context.metadata["context_knowledge_id"] = knowledge_id
+                await session.commit()
+            CONTEXT_KNOWLEDGE_OPERATIONS.labels("store", "success").inc()
+        except Exception:
+            CONTEXT_KNOWLEDGE_OPERATIONS.labels("store", "error").inc()
+            logger.exception("context knowledge persistence failed; returning freshly collected context")
+    outcome = "fresh" if strategy == "immediate" else "cache_miss"
+    CONTEXT_STRATEGY_REQUESTS.labels(strategy, outcome).inc()
+    CONTEXT_STRATEGY_DURATION.labels(strategy, "fresh_discovery").observe(max(0.0, perf_counter() - started))
+    return context
 
 
 def _extract_message_bus_provider(payload: dict[str, Any]) -> str:
@@ -250,7 +387,8 @@ async def startup(app: FastAPI) -> None:
     async def handle(payload: dict) -> None:
         alert = Alert.model_validate(payload["alert"])
         incident = Incident.model_validate(payload["incident"])
-        context = await agent.collect_with_runtime(alert, incident)
+        decision = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
+        context = await _collect_context_with_strategy(app, alert, incident, decision.get("context_strategy"))
         try:
             create_evidence_rag_draft(alert=alert, incident=incident, context=context)
         except Exception:
@@ -936,20 +1074,35 @@ def read_flow_catalog(connector: VectorDBConnector) -> list[dict[str, Any]]:
 
 
 @app.post("/collect", response_model=Context)
-async def collect(payload: dict) -> Context:
+async def collect(payload: dict, publish_events: bool = True) -> Context:
     alert = Alert.model_validate(payload["alert"])
     incident = Incident.model_validate(payload["incident"])
-    context = await agent.collect(alert, incident)
-    await app.state.producer.publish(
-        CONTEXT_EVENTS,
-        {
-            "context": context,
-            "incident": incident,
-            "decision": payload.get("decision"),
-        },
-        key=alert.service,
-    )
+    context = await _collect_context_with_strategy(app, alert, incident, payload.get("context_strategy"))
+    if publish_events:
+        await app.state.producer.publish(
+            CONTEXT_EVENTS,
+            {
+                "context": context,
+                "incident": incident,
+                "decision": payload.get("decision"),
+            },
+            key=alert.service,
+        )
     return context
+
+
+@app.get("/context/strategy")
+async def context_strategy_status() -> dict[str, Any]:
+    return {
+        "default": _context_strategy(),
+        "supported": ["immediate", "continuous"],
+        "continuous": {
+            "cache_aside": True,
+            "ttl_seconds": max(60, int(getattr(settings, "context_knowledge_ttl_seconds", 604800) or 604800)),
+            "match_scope": ["tenant", "service", "environment", "alert-family"],
+        },
+        "immediate": {"always_refresh": True},
+    }
 
 
 @app.post("/rag/documents")
@@ -1129,7 +1282,13 @@ def _public_rag_document(doc: dict[str, Any], connector: VectorDBConnector) -> d
 
 
 @app.get("/rag/documents")
-async def list_rag_documents() -> dict[str, Any]:
+def list_rag_documents() -> dict[str, Any]:
+    """Build the potentially large catalog on FastAPI's worker pool.
+
+    Connector metadata and document projection are synchronous and can take
+    seconds for a large RAG corpus. A synchronous route keeps that work off
+    the event loop so health checks and incident consumers stay responsive.
+    """
     connector = vector_connector()
     documents = [doc for doc in connector.documents if not doc.get("_synthetic")]
     return {

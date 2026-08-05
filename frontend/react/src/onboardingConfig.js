@@ -22,14 +22,4 @@ export const ONBOARDING_SOURCE_DOC_SAMPLE_FILES = {
   other: { href: "/source_doc_sample_past_ticket.md", label: "Download evidence sample" },
 };
 
-export const ROLE_ALLOWED_TABS = {
-  administrator: ["home", "stream", "copilot", "approval", "executive", "admin", "trace", "safety", "rag", "closed", "summary"],
-  l1_operator: ["home", "stream"],
-  l2_engineer: ["home", "stream", "copilot", "approval", "trace", "safety", "rag", "closed", "summary"],
-  l3_engineer: ["home", "stream", "copilot", "approval", "executive", "trace", "safety", "rag", "closed", "summary"],
-  executive: ["home", "stream", "copilot", "approval", "executive", "trace", "safety", "rag", "closed", "summary"],
-};
-
-export const APPROVAL_NAV_PRIMARY_ROLES = new Set(["administrator"]);
-
 export const DOCUMENT_PROVIDER_ROLES = new Set(["administrator", "l2_engineer", "l3_engineer"]);

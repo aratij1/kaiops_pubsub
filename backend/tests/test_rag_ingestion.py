@@ -35,7 +35,7 @@ def test_rag_ingestion_writes_reloads_and_searches(tmp_path) -> None:
     result = module.write_rag_document(request)
 
     assert result["document_count"] == 1
-    assert result["index"]["vector_store"]["provider"] == "file-backed-memory"
+    assert result["index"]["vector_store"]["provider"] == "local-hybrid-vector-index"
     assert result["index"]["embedding_model"]["model"] == "hashing-token-counter-v1"
     assert result["index"]["metadata_embedding_count"] == 1
     assert Path(result["path"]).exists()
@@ -45,7 +45,7 @@ def test_rag_ingestion_writes_reloads_and_searches(tmp_path) -> None:
 
     public_doc = module._public_rag_document(connector.documents[0], connector)
     assert public_doc["embedding_status"] in {"embedded", "metadata-only"}
-    assert public_doc["vector_store"]["provider"] == "file-backed-memory"
+    assert public_doc["vector_store"]["provider"] == "local-hybrid-vector-index"
 
 
 @pytest.mark.asyncio

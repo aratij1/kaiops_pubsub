@@ -7,7 +7,6 @@ dependencies = [
     "aio-pika>=9.4.0",
     "aiokafka>=0.12.0",
     "aiomysql>=0.2.0",
-    "asyncpg>=0.30.0",
     "fastapi>=0.115.0",
     "httpx>=0.28.0",
     "langchain>=0.3.0",
@@ -15,7 +14,9 @@ dependencies = [
     "numpy>=2.0.0",
     "opentelemetry-api>=1.29.0",
     "opentelemetry-exporter-otlp>=1.29.0",
-    "opentelemetry-instrumentation-fastapi>=0.50b0",
+  "opentelemetry-instrumentation-fastapi>=0.50b0",
+  "opentelemetry-instrumentation-httpx>=0.50b0",
+  "opentelemetry-instrumentation-sqlalchemy>=0.50b0",
     "opentelemetry-sdk>=1.29.0",
     "prometheus-client>=0.21.0",
     "pydantic>=2.10.0",
@@ -27,7 +28,10 @@ dependencies = [
     "redis>=5.2.0",
     "azure-servicebus>=7.13.0",
     "azure-monitor-opentelemetry-exporter>=1.0.0b35",
+    "azure-storage-blob>=12.25.0",
+    "boto3>=1.35.0",
     "sqlalchemy[asyncio]>=2.0.0",
+    "temporalio>=1.9.0,<2.0.0",
     "uvicorn[standard]>=0.34.0",
 ]
 
@@ -58,6 +62,7 @@ where = [
     "backend/src/audit-service",
     "backend/src/monitoring-adapter",
     "backend/src/notification-service",
+    "backend/src/temporal-pilot",
 ]
 include = [
     "common*",
@@ -81,6 +86,7 @@ include = [
     "monitoring_adapter*",
     "notification_service*",
     "evaluation_service*",
+    "temporal_pilot*",
 ]
 
 [project.optional-dependencies]

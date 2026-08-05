@@ -13,7 +13,7 @@ from common.models import Incident, Recommendation
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app
-from common.telemetry import EVENTS_PROCESSED
+from common.telemetry import CONTEXT_KNOWLEDGE_OPERATIONS, EVENTS_PROCESSED
 from common.topics import CONTEXT_EVENTS, RESOLUTION_EVENTS
 from fastapi import FastAPI
 from resolution_agent import ResolutionIntelligenceAgent
@@ -147,6 +147,23 @@ async def _persist_resolution_event(
             )
         )
         await session.commit()
+    knowledge_id = str(context.metadata.get("context_knowledge_id") or "").strip()
+    if not knowledge_id:
+        CONTEXT_KNOWLEDGE_OPERATIONS.labels("attach_resolution", "not_linked").inc()
+        return
+    try:
+        async with app.state.session_factory() as session:
+            repo = IncidentRepository(session)
+            attached = await repo.attach_context_knowledge_resolution(
+                knowledge_id,
+                recommendation.model_dump(mode="json"),
+            )
+            await session.commit()
+        CONTEXT_KNOWLEDGE_OPERATIONS.labels(
+            "attach_resolution", "success" if attached else "not_found"
+        ).inc()
+    except Exception:
+        CONTEXT_KNOWLEDGE_OPERATIONS.labels("attach_resolution", "error").inc()
 
 
 async def startup(app: FastAPI) -> None:
@@ -223,7 +240,7 @@ app = create_app(title="KaiMS Resolution Intelligence Agent", settings=settings,
 
 
 @app.post("/resolve", response_model=Recommendation)
-async def resolve(context: Context) -> Recommendation:
+async def resolve(context: Context, publish_events: bool = True) -> Recommendation:
     recommendation = await agent.resolve_with_runtime(context)
     recommendation.trace_id = str(context.alert.trace_id or "") or None
     recommendation.metadata["rag_documents"] = context.metadata.get("rag_documents", 0)
@@ -245,5 +262,6 @@ async def resolve(context: Context) -> Recommendation:
         recommendation=recommendation,
         decision_payload={},
     )
-    await app.state.producer.publish(RESOLUTION_EVENTS, payload_out)
+    if publish_events:
+        await app.state.producer.publish(RESOLUTION_EVENTS, payload_out)
     return recommendation

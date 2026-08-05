@@ -16,13 +16,13 @@ def _settings(**overrides) -> Settings:
 def test_get_embedding_model_defaults_to_hashing() -> None:
     model = get_embedding_model(_settings())
     assert isinstance(model, HashingEmbeddingModel)
-    assert describe_embedding_model(model) == {
-        "provider": "local",
-        "model": "hashing-token-counter-v1",
-        "dimensions": 128,
-        "fallback_supported": False,
-        "fallback_model": None,
-    }
+    description = describe_embedding_model(model)
+    assert description["provider"] == "local"
+    assert description["model"] == "hashing-token-counter-v1"
+    assert description["dimensions"] == 128
+    assert description["fallback_supported"] is False
+    assert description["fallback_model"] is None
+    assert description["fallback_active"] is False
 
 
 def test_get_embedding_model_returns_azure_when_enabled() -> None:

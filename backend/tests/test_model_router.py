@@ -50,8 +50,8 @@ def test_default_gpt_provider_model_names() -> None:
 
     assert providers["gpt-5"].model == "gpt-5"
     assert providers["gpt-4o"].model == "gpt-4o"
-    assert "gemini" not in providers
-    assert "groq" not in providers
+    assert providers["gemini"].model == "gemini-2.5-flash"
+    assert providers["groq"].model == "llama-3.3-70b-versatile"
 
 
 def test_provider_error_message_redacts_query_string() -> None:

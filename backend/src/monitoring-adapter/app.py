@@ -36,7 +36,8 @@ from common.models import (
     RemediationStatus,
     ResolutionReport,
 )
-from common.repository import IncidentRepository
+from common.repository import IncidentRepository, ObjectStorageRepository
+from common.object_storage import build_object_storage
 from common.service import create_app
 from common.telemetry import EVENT_CONTRACTS_EMITTED, EVENT_PUBLISH_LATENCY
 from common.topics import (
@@ -53,6 +54,7 @@ from common.topics import (
 from ai_workbench_common.prompts import PROMPT_SUMMARIZE_RCA
 import httpx
 from fastapi import BackgroundTasks, Body, Header, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from monitoring_adapter.state import (
     ALERT_SEVERITY_OVERRIDES_FILE,
@@ -102,15 +104,9 @@ from monitoring_adapter.existing_monitoring import (
 )
 from monitoring_adapter.landing_pad_normalizer import normalize_landing_pad_alert
 from monitoring_adapter.landing_pad_sources import SUPPORTED_SUFFIXES, load_landing_pad_file
-from monitoring_adapter.email_ingestion import (
-    EmailPollState,
-    ImapConfig,
-    email_to_alert_payload,
-    fetch_unseen_emails,
-    infer_affected_service,
-)
+from monitoring_adapter.email_ingestion import EmailPollState, ImapConfig, email_to_alert_payload, fetch_unseen_emails
 from monitoring_adapter.dedup import compute_fingerprint
-from monitoring_adapter.jira_client import JiraClient, JiraClientError, jira_rich_text_to_plain_text
+from monitoring_adapter.jira_client import JiraClient, JiraClientError
 from monitoring_adapter.jira_admission import JiraAdmissionState
 from monitoring_adapter.log_ingestion import (
     LogWatchState,
@@ -302,13 +298,8 @@ JIRA_WEBHOOK_SECRET = str(os.getenv("JIRA_WEBHOOK_SECRET", "") or "").strip()
 # Jira's own webhook (unchanged, JIRA_WEBHOOK_SECRET above) becomes the
 # only door back into the landing pad. Off by default so this can be
 # rolled out only once real Jira credentials are configured.
-# Accept connection-layer aliases used by existing deployments as well as the
-# adapter-specific names. Otherwise valid Jira credentials silently disable
-# polling and Jira disappears from the live stream.
-JIRA_API_BASE_URL = str(
-    os.getenv("JIRA_API_BASE_URL") or os.getenv("JIRA_BASE_URL") or os.getenv("JIRA_URL") or ""
-).strip()
-JIRA_API_EMAIL = str(os.getenv("JIRA_API_EMAIL") or os.getenv("JIRA_USER_EMAIL") or "").strip()
+JIRA_API_BASE_URL = str(os.getenv("JIRA_API_BASE_URL", "") or "").strip()
+JIRA_API_EMAIL = str(os.getenv("JIRA_API_EMAIL", "") or "").strip()
 JIRA_API_TOKEN = str(os.getenv("JIRA_API_TOKEN", "") or "").strip()
 JIRA_PROJECT_KEY = str(os.getenv("JIRA_PROJECT_KEY", "") or "").strip()
 CENTRALIZED_JIRA_ROUTING_ENABLED = str(os.getenv("CENTRALIZED_JIRA_ROUTING_ENABLED", "false")).strip().lower() in {
@@ -339,9 +330,6 @@ OPENSEARCH_LOG_POLL_INTERVAL_SECONDS = max(
 )
 OPENSEARCH_LOG_LOOKBACK_SECONDS = max(30, int(os.getenv("OPENSEARCH_LOG_LOOKBACK_SECONDS", "300") or 300))
 OPENSEARCH_LOG_BATCH_SIZE = max(1, min(int(os.getenv("OPENSEARCH_LOG_BATCH_SIZE", "100") or 100), 500))
-OPENSEARCH_LOG_TIMEOUT_SECONDS = max(
-    3.0, min(float(os.getenv("OPENSEARCH_LOG_TIMEOUT_SECONDS", "10") or 10), 30.0)
-)
 OPENSEARCH_LOG_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "opensearch_log_ingestion_state.json"
 EMAIL_POLL_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "email_ingestion_state.json"
 OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING = str(
@@ -523,8 +511,7 @@ def _persist_alert_to_landing_pad(
         # those readers.
         target_dir = _date_partition_dir(base_dir, now)
         target_dir.mkdir(parents=True, exist_ok=True)
-        # Preserve the full title in the JSON payload while keeping the path
-        # below common 255-byte per-component filesystem limits.
+        # Preserve the title in the payload while bounding the filesystem path.
         alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))[:160] or "alert"
         labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
         fingerprint = str(labels.get("alert_fingerprint") or "no-fingerprint").strip() or "no-fingerprint"
@@ -610,34 +597,6 @@ def _record_live_stream_event(
             "alertname": name,
         }
     )
-
-
-async def _forward_live_stream_event(mapped_payload: dict[str, Any]) -> None:
-    """Expose worker-owned ingestion events in the API process's live buffer."""
-
-    adapter_url = str(os.getenv("MONITORING_ADAPTER_URL", "") or "").rstrip("/")
-    if not adapter_url:
-        return
-    labels = mapped_payload.get("labels") if isinstance(mapped_payload.get("labels"), dict) else {}
-    payload = {
-        "origin_system": (
-            mapped_payload.get("origin_system")
-            or labels.get("origin_system")
-            or mapped_payload.get("source")
-            or "logs"
-        ),
-        "source": mapped_payload.get("source") or "logs",
-        "name": mapped_payload.get("name") or "log-alert",
-        "service": mapped_payload.get("service") or "",
-        "severity": mapped_payload.get("severity") or "warning",
-        "description": mapped_payload.get("description") or "",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.post(f"{adapter_url}/landing-pad/events", json=payload)
-            response.raise_for_status()
-    except httpx.HTTPError:
-        logger.warning("unable to forward ingestion event to shared live stream", exc_info=True)
 
 
 def _write_alert_to_landing_pad_input(mapped_payload: dict[str, Any], raw_alert: dict[str, Any]) -> Path:
@@ -811,8 +770,6 @@ def _mapped_alerts_from_landing_pad_payload(payload: dict[str, Any]) -> list[tup
         if not isinstance(item, dict):
             continue
         status = str(item.get("status") or payload.get("status") or "firing").strip().lower()
-        if status != "firing":
-            continue
         labels = item.get("labels", {}) if isinstance(item.get("labels"), dict) else {}
         annotations = item.get("annotations", {}) if isinstance(item.get("annotations"), dict) else {}
         merged_labels = {**common_labels, **labels}
@@ -1102,6 +1059,12 @@ class OnboardingProject(BaseModel):
     owner_team: str
     environment: str
     region: str
+    description: str = ""
+    business_service: str = ""
+    owner_email: str = ""
+    criticality: str = "medium"
+    cost_center: str = ""
+    repository_url: str = ""
 
     @model_validator(mode="after")
     def _validate_project(self) -> "OnboardingProject":
@@ -1117,6 +1080,38 @@ class OnboardingProject(BaseModel):
             raise ValueError("project.environment must be one of dev, staging, prod")
         if not self.region:
             raise ValueError("project.region is required")
+        self.description = str(self.description or "").strip()
+        self.business_service = str(self.business_service or "").strip()
+        self.owner_email = str(self.owner_email or "").strip()
+        self.criticality = str(self.criticality or "medium").strip().lower()
+        if self.criticality not in {"low", "medium", "high", "critical"}:
+            raise ValueError("project.criticality must be one of low, medium, high, critical")
+        self.cost_center = str(self.cost_center or "").strip()
+        self.repository_url = str(self.repository_url or "").strip()
+        return self
+
+
+class OnboardingMonitoringSource(BaseModel):
+    provider: str
+    endpoint_url: str = ""
+    signal_types: list[str] = Field(default_factory=list)
+    auth_type: str = "none"
+    secret_ref: str = ""
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> "OnboardingMonitoringSource":
+        self.provider = str(self.provider or "").strip().lower().replace(" ", "_")
+        if not self.provider:
+            raise ValueError("monitoring_sources.provider is required")
+        self.endpoint_url = OnboardingConnectivityPayload._normalize_endpoint(self.endpoint_url, "monitoring_sources.endpoint_url")
+        self.signal_types = list(dict.fromkeys(str(item or "").strip().lower() for item in self.signal_types if str(item or "").strip()))
+        self.auth_type = str(self.auth_type or "none").strip().lower()
+        if self.auth_type not in {"none", "basic", "bearer", "api_key", "oauth2", "managed_identity"}:
+            raise ValueError("monitoring_sources.auth_type is invalid")
+        self.secret_ref = str(self.secret_ref or "").strip()
+        if self.auth_type != "none" and not self.secret_ref:
+            raise ValueError("monitoring_sources.secret_ref is required when authentication is enabled")
         return self
 
 
@@ -1126,6 +1121,14 @@ class OnboardingConnectivityPayload(BaseModel):
     prometheus_url: str = ""
     new_relic_url: str = ""
     datadog_url: str = ""
+    monitoring_sources: list[OnboardingMonitoringSource] = Field(default_factory=list)
+    healthcheck_url: str = ""
+    logs_url: str = ""
+    traces_url: str = ""
+    telemetry_url: str = ""
+    ticketing_url: str = ""
+    network_zone: str = ""
+    context_strategy: str = "continuous"
     azure_subscription_id: str = ""
     azure_resource_group: str = ""
     azure_service_bus_namespace: str = ""
@@ -1217,6 +1220,15 @@ class OnboardingConnectivityPayload(BaseModel):
         self.prometheus_url = self._normalize_endpoint(self.prometheus_url, "prometheus_url")
         self.new_relic_url = self._normalize_endpoint(self.new_relic_url, "new_relic_url")
         self.datadog_url = self._normalize_endpoint(self.datadog_url, "datadog_url")
+        self.healthcheck_url = self._normalize_endpoint(self.healthcheck_url, "healthcheck_url")
+        self.logs_url = self._normalize_endpoint(self.logs_url, "logs_url")
+        self.traces_url = self._normalize_endpoint(self.traces_url, "traces_url")
+        self.telemetry_url = self._normalize_endpoint(self.telemetry_url, "telemetry_url")
+        self.ticketing_url = self._normalize_endpoint(self.ticketing_url, "ticketing_url")
+        self.network_zone = str(self.network_zone or "").strip()
+        self.context_strategy = str(self.context_strategy or "continuous").strip().lower()
+        if self.context_strategy not in {"immediate", "continuous"}:
+            raise ValueError("context_strategy must be one of immediate, continuous")
         self.azure_subscription_id = str(self.azure_subscription_id or "").strip()
         self.azure_resource_group = str(self.azure_resource_group or "").strip()
         self.azure_service_bus_namespace = str(self.azure_service_bus_namespace or "").strip()
@@ -1248,6 +1260,14 @@ class OnboardingConnectivitySnapshot(BaseModel):
     prometheus_url: str = ""
     new_relic_url: str = ""
     datadog_url: str = ""
+    monitoring_sources: list[dict[str, Any]] = Field(default_factory=list)
+    healthcheck_url: str = ""
+    logs_url: str = ""
+    traces_url: str = ""
+    telemetry_url: str = ""
+    ticketing_url: str = ""
+    network_zone: str = ""
+    context_strategy: str = "continuous"
     azure_subscription_id: str = ""
     azure_resource_group: str = ""
     azure_service_bus_namespace: str = ""
@@ -1315,6 +1335,7 @@ class OnboardingCompletePayload(BaseModel):
 
 
 OnboardingProject.model_rebuild()
+OnboardingMonitoringSource.model_rebuild()
 OnboardingConnectivityPayload.model_rebuild()
 OnboardingConnectivitySnapshot.model_rebuild()
 OnboardingConnectivityResponse.model_rebuild()
@@ -1592,7 +1613,6 @@ async def _process_polled_email(message: dict[str, Any]) -> None:
         return
     mapped_payload["labels"] = dict(alert.labels)
     _persist_alert_to_landing_pad(mapped_payload, message, status="processed")
-    await _forward_live_stream_event(mapped_payload)
 
 
 async def _email_poll_worker() -> None:
@@ -1679,7 +1699,6 @@ async def _process_log_line(record: dict[str, Any]) -> None:
             description=str(mapped_payload.get("description") or ""),
             source="logs",
         )
-        await _forward_live_stream_event(mapped_payload)
         logger.info(
             "jira_pipeline stage=classification outcome=live_stream_only source=logs log_source=%s "
             "reason=jira routing disabled",
@@ -1695,7 +1714,6 @@ async def _process_log_line(record: dict[str, Any]) -> None:
         return
     mapped_payload["labels"] = dict(alert.labels)
     _persist_alert_to_landing_pad(mapped_payload, record, status="processed")
-    await _forward_live_stream_event(mapped_payload)
 
 
 async def _log_poll_worker() -> None:
@@ -1728,7 +1746,6 @@ async def _opensearch_log_poll_worker() -> None:
                 state=state,
                 lookback_seconds=OPENSEARCH_LOG_LOOKBACK_SECONDS,
                 batch_size=OPENSEARCH_LOG_BATCH_SIZE,
-                timeout_seconds=OPENSEARCH_LOG_TIMEOUT_SECONDS,
                 docker_api_endpoint=OPENSEARCH_LOG_DOCKER_API_URL,
             )
             for record in records:
@@ -1775,7 +1792,6 @@ async def _jira_poll_worker() -> None:
                     await _publish_ingested_alert(alert)
                 mapped_payload["labels"] = dict(alert.labels)
                 _persist_alert_to_landing_pad(mapped_payload, payload, status="processed")
-                await _forward_live_stream_event(mapped_payload)
                 _JIRA_SESSION_VERSIONS.add(version)
                 ingested += 1
             logger.info("jira_poll_complete project=%s fetched=%s ingested=%s", JIRA_PROJECT_KEY, len(issues), ingested)
@@ -4861,6 +4877,7 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
 
     received = len(alerts_payload)
     queued_rows: list[dict[str, Any]] = []
+    observed_rows: list[dict[str, Any]] = []
     skipped_rows: list[dict[str, Any]] = []
 
     for item in alerts_payload:
@@ -4881,16 +4898,6 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
         ).strip().lower() or "prometheus"
         delivery_key = _alertmanager_delivery_key(item, merged_labels, status)
 
-        if status != "firing":
-            skipped_rows.append(
-                {
-                    "status": status,
-                    "alertname": str(merged_labels.get("alertname") or "unknown-alert"),
-                    "service": str(merged_labels.get("service") or merged_labels.get("job") or "unknown"),
-                    "reason": "Only firing alerts are sent to landing pad",
-                }
-            )
-            continue
         if not _claim_alertmanager_delivery(delivery_key):
             skipped_rows.append(
                 {
@@ -4924,6 +4931,21 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 "generatorURL": str(item.get("generatorURL") or ""),
             },
         }
+        if status != "firing":
+            # Resolved/inactive notifications are operationally important: they
+            # close the lifecycle in the intake stream even though they must not
+            # start a new investigation. Persist them as observations only.
+            landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item, status="processed")
+            observed_rows.append(
+                {
+                    "status": status,
+                    "alertname": mapped_payload["name"],
+                    "service": mapped_payload["service"],
+                    "landing_pad_file": landing_pad_file,
+                    "investigation_started": False,
+                }
+            )
+            continue
         if CENTRALIZED_JIRA_ROUTING_ENABLED or PROMETHEUS_JIRA_ROUTING_ENABLED:
             # Prometheus no longer shortcuts into the landing pad — it
             # routes through centralized dedup and Jira create-or-update.
@@ -4983,15 +5005,19 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                     "status": status,
                     "alertname": mapped_payload["name"],
                     "service": mapped_payload["service"],
-                    "reason": f"landing pad enqueue failed: {exc}",
+                    "reason": f"landing pad ingestion failed: {exc}",
                 }
             )
 
     return {
         "received": received,
+        "ingested": len(queued_rows),
         "queued": len(queued_rows),
         "skipped": len(skipped_rows),
+        "alerts": queued_rows,
         "rows": queued_rows,
+        "observed": len(observed_rows),
+        "observed_rows": observed_rows,
         "skipped_rows": skipped_rows,
     }
 
@@ -5348,20 +5374,6 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
     assignee = fields.get("assignee", {}) if isinstance(fields.get("assignee"), dict) else {}
     webhook_event = str(payload.get("webhookEvent") or "").strip()
     jira_labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
-    components = fields.get("components") if isinstance(fields.get("components"), list) else []
-    component_names = [
-        str(component.get("name") or "").strip()
-        for component in components
-        if isinstance(component, dict) and str(component.get("name") or "").strip()
-    ]
-    description = jira_rich_text_to_plain_text(fields.get("description")) or summary
-    affected_service = infer_affected_service(
-        *component_names,
-        *jira_labels,
-        summary,
-        description,
-        fallback="unresolved-service",
-    )
     managed = "managed_by_kaiops" in jira_labels
     kaiops_incident_label = next(
         (str(label) for label in jira_labels if str(label).startswith("kaiops_incident_")),
@@ -5371,17 +5383,13 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
     mapped_payload = {
         "source": "jira",
         "name": summary,
-        "service": affected_service,
+        "service": str(project.get("key") or "jira-tickets"),
         "environment": "prod",
         "severity": _jira_priority_to_severity(str(priority.get("name") or "")),
-        "description": description,
+        "description": str(fields.get("description") or summary),
         "labels": {
             "alert_status": "firing",
-            "origin_system": "jira",
-            "ingestion_channel": "ticket",
             "ticket_id": issue_key,
-            "jira_project_key": str(project.get("key") or ""),
-            "jira_components": ",".join(component_names),
             "jira_issue_id": issue_id,
             "jira_status": str(status_field.get("name") or ""),
             "jira_priority": str(priority.get("name") or ""),
@@ -5394,7 +5402,7 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
         },
         "annotations": {
             "summary": summary,
-            "description": description,
+            "description": str(fields.get("description") or ""),
         },
     }
     return mapped_payload, issue_key
@@ -5526,13 +5534,13 @@ async def delete_alert_severity_override(
 
 
 @app.get("/alerts/recent")
-async def get_recent_alerts(limit: int = 50) -> dict[str, Any]:
+async def get_recent_alerts(limit: int = 50, tenant_id: str | None = None) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 200))
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
-            rows = await repo.list_alerts(limit=safe_limit, include_incident_context=False)
+            rows = await repo.list_alerts_source_balanced(limit=safe_limit, tenant_id=tenant_id)
         return {"rows": rows, "count": len(rows)}
 
     rows = list(RECENT_ALERTS)[:safe_limit]
@@ -5540,13 +5548,13 @@ async def get_recent_alerts(limit: int = 50) -> dict[str, Any]:
 
 
 @app.get("/alerts/all")
-async def get_all_alerts(limit: int = 500) -> dict[str, Any]:
+async def get_all_alerts(limit: int = 500, tenant_id: str | None = None) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 5000))
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
-            rows = await repo.list_alerts(limit=safe_limit, include_incident_context=False)
+            rows = await repo.list_alerts_source_balanced(limit=safe_limit, tenant_id=tenant_id)
         return {"rows": rows, "count": len(rows)}
 
     rows = list(RECENT_ALERTS)[:safe_limit]
@@ -5730,7 +5738,7 @@ def post_landing_pad_event(payload: dict = Body(...)) -> dict[str, Any]:
 
 
 @app.get("/landing-pad/recent")
-def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> dict[str, Any]:
+async def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> dict[str, Any]:
     """Read landing-pad audit files on FastAPI's bounded worker threadpool.
 
     The archive can contain thousands of files during an alert burst. Keeping
@@ -5773,14 +5781,34 @@ def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> di
             "rows": [],
             "count": 0,
         }
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="MySQL object metadata is required for archive queries")
+    async with session_factory() as session:
+        stored = await ObjectStorageRepository(session).list(limit=safe_limit)
+    metadata_rows = [
+        {
+            "object_id": str(row.id), "file": Path(row.object_key).name, "object_uri": row.object_uri,
+            "source": row.source, "application": row.application, "environment": row.environment,
+            "received_at": row.ingested_at.isoformat() if row.ingested_at else None,
+            "modified_at": row.created_at.isoformat() if row.created_at else None,
+            "status": row.processing_status, "size_bytes": row.size_bytes,
+            "checksum_sha256": row.checksum_sha256, "retention_policy": row.retention_policy,
+            "security_classification": row.security_classification,
+            **(row.metadata_payload if isinstance(row.metadata_payload, dict) else {}),
+        }
+        for row in stored
+    ]
+    return {"source": "mysql-object-metadata", "rows": [*live_rows, *metadata_rows][:safe_limit], "count": min(safe_limit, len(live_rows) + len(metadata_rows))}
     LANDING_PAD_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     LANDING_PAD_FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
     recent_lookback_days = min(LANDING_PAD_LISTING_LOOKBACK_DAYS, 3)
     scan_cap = max(safe_limit * 3, 80)
 
+    archive_scan_limit = min(scan_cap, max(safe_limit, 240))
     files = heapq.nlargest(
-        safe_limit,
+        archive_scan_limit,
         [
             *_collect_partitioned_json_files(
                 LANDING_PAD_PROCESSED_DIR,
@@ -5865,8 +5893,42 @@ def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> di
             continue
         seen_rows.add(identity)
         deduplicated_rows.append(row)
-        if len(deduplicated_rows) >= safe_limit:
-            break
+    def _source_bucket(row: dict[str, Any]) -> str:
+        labels = row.get("labels") if isinstance(row.get("labels"), dict) else {}
+        source_text = " ".join(
+            str(value or "").strip().lower()
+            for value in (
+                row.get("source"),
+                row.get("origin_system"),
+                row.get("ingestion_channel"),
+                labels.get("origin_system"),
+                labels.get("ingestion_channel"),
+            )
+        )
+        if any(token in source_text for token in ("email", "mail", "smtp")):
+            return "email"
+        if any(token in source_text for token in ("jira", "ticket", "servicenow", "itsm")):
+            return "ticket"
+        if any(token in source_text for token in ("log", "opensearch", "elasticsearch", "loki")):
+            return "log"
+        if any(token in source_text for token in ("telemetry", "otel", "opentelemetry", "trace")):
+            return "telemetry"
+        return "prometheus"
+
+    # High-volume Prometheus traffic must not crowd lower-volume or inactive
+    # sources out of the UI response. Reserve the latest row from every source
+    # represented in the bounded archive scan, then fill remaining slots by time.
+    latest_by_source: dict[str, dict[str, Any]] = {}
+    for row in deduplicated_rows:
+        latest_by_source.setdefault(_source_bucket(row), row)
+    reserved_ids = {id(row) for row in latest_by_source.values()}
+    selected_rows = [*latest_by_source.values()]
+    selected_rows.extend(row for row in deduplicated_rows if id(row) not in reserved_ids)
+    deduplicated_rows = sorted(
+        selected_rows[:safe_limit],
+        key=lambda item: str(item.get("modified_at") or item.get("received_at") or ""),
+        reverse=True,
+    )
     rows = deduplicated_rows
 
     return {
@@ -5940,15 +6002,47 @@ async def process_landing_pad_input(payload: dict[str, Any] = Body(default={})) 
 @app.get("/landing-pad/archive")
 async def get_landing_pad_archive(limit: int = 50) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 200))
-    rows = _landing_pad_file_rows(LANDING_PAD_ARCHIVE_DIR, safe_limit)
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="MySQL object metadata is required for archive queries")
+    async with session_factory() as session:
+        stored = await ObjectStorageRepository(session).list(limit=safe_limit)
+    rows = [{"object_id": str(row.id), "object_key": row.object_key, "object_uri": row.object_uri, "object_type": row.object_type, "application": row.application, "environment": row.environment, "source": row.source, "status": row.processing_status, "created_at": row.created_at.isoformat(), "size_bytes": row.size_bytes, "checksum_sha256": row.checksum_sha256, "retention_policy": row.retention_policy, "security_classification": row.security_classification} for row in stored]
     return {
-        "archive_dir": str(LANDING_PAD_ARCHIVE_DIR),
-        "archive_enabled": LANDING_PAD_ARCHIVE_ENABLED,
+        "source": "mysql-object-metadata",
+        "archive_enabled": settings.object_storage_enabled,
         "archive_after_days": LANDING_PAD_ARCHIVE_AFTER_DAYS,
         "archive_interval_seconds": LANDING_PAD_ARCHIVE_INTERVAL_SECONDS,
         "rows": rows,
         "count": len(rows),
     }
+
+
+@app.get("/landing-pad/objects/{object_id}/download")
+async def download_landing_pad_object(object_id: UUID) -> StreamingResponse:
+    if not settings.object_storage_enabled:
+        raise HTTPException(status_code=503, detail="Object storage is not enabled")
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="MySQL object metadata is required")
+    async with session_factory() as session:
+        row = await ObjectStorageRepository(session).get(object_id)
+    if row is None or row.processing_status != "stored":
+        raise HTTPException(status_code=404, detail="Stored object not found")
+    storage = build_object_storage(settings)
+    return StreamingResponse(storage.stream(row.object_key), media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{Path(row.object_key).name}"', "X-Content-SHA256": row.checksum_sha256})
+
+
+@app.get("/landing-pad/objects/{object_id}/access")
+async def get_landing_pad_object_access(object_id: UUID) -> dict[str, Any]:
+    if not settings.object_storage_enabled:
+        raise HTTPException(status_code=503, detail="Object storage is not enabled")
+    async with app.state.session_factory() as session:
+        row = await ObjectStorageRepository(session).get(object_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Stored object not found")
+    url = await build_object_storage(settings).signed_url(row.object_key, settings.object_storage_signed_url_seconds)
+    return {"object_id": str(row.id), "expires_in": settings.object_storage_signed_url_seconds, "signed_url": url or None, "controlled_download": f"/landing-pad/objects/{row.id}/download"}
 
 
 @app.post("/landing-pad/archive/run")

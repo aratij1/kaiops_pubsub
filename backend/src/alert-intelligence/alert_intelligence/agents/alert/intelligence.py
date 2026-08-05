@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -46,7 +48,11 @@ class AlertIntelligenceAgent(BaseAgent):
     retention_minutes: int | None = None
     alert_history_repository: AlertHistoryRepository = field(default_factory=InMemoryAlertHistoryRepository)
     name: str = "alert-intelligence-agent"
-    _embedding_cache: dict[str, list[float]] = field(default_factory=dict)
+    # Bounded FIFO cache: an unbounded dict here grows for the life of the
+    # process (one entry per distinct alert text seen), which is a slow
+    # memory leak across a multi-day soak at 10k alerts/day.
+    _embedding_cache: OrderedDict[str, list[float]] = field(default_factory=OrderedDict)
+    _embedding_cache_max_size: int = 5000
 
     def __post_init__(self) -> None:
         settings = get_settings()
@@ -55,23 +61,31 @@ class AlertIntelligenceAgent(BaseAgent):
         if self.retention_minutes is None:
             self.retention_minutes = int(getattr(settings, "alert_retention_minutes", 30))
 
-    async def deduplicate_alerts(self, alert: Alert) -> Alert:
+    async def deduplicate_alerts(self, alert: Alert, candidates: Sequence[Alert] | None = None) -> Alert:
         fingerprint = self._fingerprint(alert)
         alert.fingerprint = fingerprint
         cutoff = utc_now() - timedelta(minutes=int(self.retention_minutes or 30))
+        if candidates is None:
+            candidates = await self.alert_history_repository.list_recent_alerts(
+                environment=alert.environment, tenant_id=alert.tenant_id
+            )
         matches = [
             item
-            for item in await self.alert_history_repository.list_recent_alerts()
+            for item in candidates
             if item.fingerprint == fingerprint and item.starts_at >= cutoff and item.ends_at is None
         ]
         alert.deduplicated_count = len(matches) + 1
         return alert
 
-    async def correlate_alerts(self, alert: Alert) -> Alert:
+    async def correlate_alerts(self, alert: Alert, candidates: Sequence[Alert] | None = None) -> Alert:
+        if candidates is None:
+            candidates = await self.alert_history_repository.list_recent_alerts(
+                environment=alert.environment, tenant_id=alert.tenant_id
+            )
         best_match: Alert | None = None
         best_score = 0.0
         best_evidence: dict[str, Any] = {}
-        for candidate in await self.alert_history_repository.list_recent_alerts():
+        for candidate in candidates:
             candidate_score, evidence = self._correlation_score(alert, candidate)
             if candidate_score > best_score:
                 best_match = candidate
@@ -137,8 +151,14 @@ class AlertIntelligenceAgent(BaseAgent):
         return alert, incident
 
     async def process(self, alert: Alert, llm_discovery: dict[str, Any] | None = None) -> tuple[Alert, Incident]:
-        alert = await self.deduplicate_alerts(alert)
-        alert = await self.correlate_alerts(alert)
+        # Dedup and correlation both need a recent-alert candidate pool; fetch
+        # it once (environment-scoped) instead of two independent unfiltered
+        # history scans per incoming alert.
+        candidates = await self.alert_history_repository.list_recent_alerts(
+            environment=alert.environment, tenant_id=alert.tenant_id
+        )
+        alert = await self.deduplicate_alerts(alert, candidates)
+        alert = await self.correlate_alerts(alert, candidates)
         alert = self.classify_severity(alert)
         alert, incident = await self.enrich_alert(alert)
         candidate = build_incident_candidate(alert, incident, llm_discovery)
@@ -319,9 +339,12 @@ class AlertIntelligenceAgent(BaseAgent):
 
     def _embed(self, text: str) -> list[float]:
         cached = self._embedding_cache.get(text)
-        if cached is None:
-            cached = self.embedding_model.embed(text)
-            self._embedding_cache[text] = cached
+        if cached is not None:
+            return cached
+        cached = self.embedding_model.embed(text)
+        self._embedding_cache[text] = cached
+        if len(self._embedding_cache) > self._embedding_cache_max_size:
+            self._embedding_cache.popitem(last=False)
         return cached
 
     def _source_category(self, source: str) -> str:

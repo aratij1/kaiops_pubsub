@@ -292,9 +292,7 @@ class RestPublisher(NoOpPublisher):
 
 
 def build_event_publisher(settings: Settings) -> EventPublisher:
-    provider = getattr(settings, "event_bus_provider", "kafka").strip().lower()
-    if not settings.kafka_enabled and provider == "kafka":
-        return NoOpPublisher(settings)
+    provider = selected_event_bus_provider(settings)
     if provider == "noop":
         return NoOpPublisher(settings)
     if provider == "rabbitmq":
@@ -303,4 +301,40 @@ def build_event_publisher(settings: Settings) -> EventPublisher:
         return AzureServiceBusPublisher(settings)
     if provider == "rest":
         return RestPublisher(settings)
-    return KafkaPublisher(settings)
+    if provider == "kafka":
+        return KafkaPublisher(settings)
+    raise ValueError(f"Unsupported EVENT_BUS_PROVIDER '{provider}'")
+
+
+def selected_event_bus_provider(settings: Settings) -> str:
+    aliases = {
+        "azure": "azure-service-bus",
+        "servicebus": "azure-service-bus",
+        "azure_service_bus": "azure-service-bus",
+    }
+    provider = aliases.get(str(getattr(settings, "event_bus_provider", "rabbitmq") or "").strip().lower(), str(getattr(settings, "event_bus_provider", "rabbitmq") or "").strip().lower())
+    if provider == "kafka" and not settings.kafka_enabled:
+        raise ValueError("EVENT_BUS_PROVIDER=kafka requires KAFKA_ENABLED=true")
+    if provider == "azure-service-bus" and (not settings.azure_service_bus_enabled or not str(settings.azure_service_bus_connection_string or "").strip()):
+        raise ValueError("Azure Service Bus requires AZURE_SERVICE_BUS_ENABLED=true and a connection string")
+    if provider not in {"rabbitmq", "kafka", "azure-service-bus", "noop", "rest"}:
+        raise ValueError(f"Unsupported EVENT_BUS_PROVIDER '{provider}'")
+    return provider
+
+
+def build_event_consumer(settings: Settings, topic: str) -> tuple[Any, Any, str]:
+    """Return one deployment-selected consumer and its loop; never switch mid-workflow."""
+    provider = selected_event_bus_provider(settings)
+    if provider == "rabbitmq":
+        from common.rabbitmq import RabbitMQConsumer, consume_forever
+
+        return RabbitMQConsumer(settings, topic), consume_forever, provider
+    if provider == "kafka":
+        from common.kafka import KafkaConsumer, consume_forever
+
+        return KafkaConsumer(settings, topic), consume_forever, provider
+    if provider == "azure-service-bus":
+        from common.servicebus import AzureServiceBusConsumer, consume_forever
+
+        return AzureServiceBusConsumer(settings, topic), consume_forever, provider
+    raise ValueError(f"Provider '{provider}' does not support consumers")

@@ -12,14 +12,24 @@ x-service-env: &service-env
   DB_PASSWORD: ${COMPOSE_DB_PASSWORD:-kaiops}
   DB_DATABASE: ${COMPOSE_DB_DATABASE:-kaiops}
   JWT_SECRET_KEY: ${JWT_SECRET_KEY:-kaiops-local-demo-secret-key-change-me}
+  AUTH_MODE: ${AUTH_MODE:-local}
+  OIDC_ISSUER: ${OIDC_ISSUER:-}
+  OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+  OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+  OIDC_ROLE_CLAIM: ${OIDC_ROLE_CLAIM:-roles}
+  OIDC_TENANT_CLAIM: ${OIDC_TENANT_CLAIM:-tenant_id}
+  OIDC_ROLE_MAPPINGS: ${OIDC_ROLE_MAPPINGS:-{}}
+  OIDC_STEP_UP_VALUES: ${OIDC_STEP_UP_VALUES:-mfa,c2,c3}
   ADMIN_USER_PASSWORD: ${ADMIN_USER_PASSWORD:-Admin@123456}
   EXECUTIVE_USER_PASSWORD: ${EXECUTIVE_USER_PASSWORD:-Executive@123456}
   L3_USER_PASSWORD: ${L3_USER_PASSWORD:-L3Engineer@123456}
   L2_USER_PASSWORD: ${L2_USER_PASSWORD:-L2Engineer@123456}
   L1_USER_PASSWORD: ${L1_USER_PASSWORD:-L1Operator@123456}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
   CONTEXT_AGENT_URL: http://context-agent:8000
   RESOLUTION_AGENT_URL: http://resolution-agent:8000
   APPROVAL_SERVICE_URL: http://approval-service:8000
+  ORCHESTRATOR_URL: http://orchestrator:8000
   MODEL_ROUTER_URL: http://model-router:8000
   MONITORING_ADAPTER_URL: http://monitoring-adapter:8000
   LANDING_PAD_FILE_WATCHER_ENABLED: ${LANDING_PAD_FILE_WATCHER_ENABLED:-false}
@@ -127,6 +137,11 @@ x-service-env: &service-env
   MESSAGE_BUS_STREAM_THRESHOLD: "500"
   MESSAGE_BUS_DEFAULT_PROVIDER: ${MESSAGE_BUS_DEFAULT_PROVIDER:-rabbitmq}
   MESSAGE_BUS_WORKER_COUNT: ${MESSAGE_BUS_WORKER_COUNT:-1}
+  TEMPORAL_PILOT_ENABLED: ${TEMPORAL_PILOT_ENABLED:-true}
+  TEMPORAL_ADDRESS: ${TEMPORAL_ADDRESS:-temporal:7233}
+  TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+  TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-kaiops-incident-pilot}
+  TEMPORAL_APPROVAL_TIMEOUT_HOURS: ${TEMPORAL_APPROVAL_TIMEOUT_HOURS:-24}
   KAFKA_CONSUMER_MAX_RETRIES: "3"
   KAFKA_DLQ_SUFFIX: .dlq
   RABBITMQ_URL: ${RABBITMQ_URL:-amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672/}
@@ -190,9 +205,16 @@ services:
     restart: unless-stopped
     # Raised from the image default so per-service DB_POOL_SIZE/DB_MAX_OVERFLOW
     # increases (needed for a 10k-alert burst) don't exhaust connections across
-    # the ~24 services sharing this one instance. Verify the effective value
-    # for your environment (SHOW VARIABLES LIKE 'max_connections') and adjust.
-    command: ["--max-connections=${MYSQL_MAX_CONNECTIONS:-400}"]
+    # the ~24 services sharing this one instance. The previous default (400)
+    # was tuned per-service but never summed: 21 services depend on mysql,
+    # 3 with a raised pool (monitoring-adapter 20+30, monitoring-ingestion-worker
+    # 10+10, alert-intelligence 20+30 = 120) and 18 at the shared default
+    # (10+20=30 each = 540), for a worst-case ceiling of ~660 pooled
+    # connections before counting mysql-exporter or any manual/admin session.
+    # 900 leaves real headroom over that sum. Verify the effective value for
+    # your environment (SHOW VARIABLES LIKE 'max_connections') and adjust if
+    # you raise any individual service's DB_POOL_SIZE/DB_MAX_OVERFLOW further.
+    command: ["--max-connections=${MYSQL_MAX_CONNECTIONS:-900}"]
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-kaiops}
@@ -206,6 +228,36 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+
+  temporal:
+    image: temporalio/auto-setup:1.27.2
+    restart: unless-stopped
+    environment:
+      DB: mysql8
+      DB_PORT: 3306
+      MYSQL_SEEDS: mysql
+      MYSQL_USER: root
+      MYSQL_PWD: ${MYSQL_ROOT_PASSWORD:-root}
+      DYNAMIC_CONFIG_FILE_PATH: /etc/temporal/config/dynamicconfig/docker.yaml
+    ports: ["7233:7233"]
+    depends_on:
+      mysql: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  temporal-ui:
+    image: temporalio/ui:2.34.0
+    restart: unless-stopped
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:8501
+    ports: ["8088:8080"]
+    depends_on:
+      temporal: { condition: service_healthy }
 
   redis:
     image: redis:7
@@ -341,6 +393,26 @@ services:
     volumes:
       - ./fault-lab/runtime:/app/runtime
 
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.117.0
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yml"]
+    volumes:
+      - ./observability/otel-collector.yml:/etc/otelcol/config.yml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    depends_on:
+      jaeger: { condition: service_started }
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+
   prometheus:
     image: prom/prometheus:v2.54.1
     restart: unless-stopped
@@ -362,6 +434,24 @@ services:
       node-exporter: { condition: service_started }
       blackbox-exporter: { condition: service_started }
       alertmanager: { condition: service_started }
+      otel-collector: { condition: service_started }
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./observability/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus: { condition: service_started }
 
   monitoring-adapter:
     image: ${MONITORING_ADAPTER_IMAGE:-kaiops_pubsub-monitoring-adapter:latest}
@@ -598,6 +688,7 @@ services:
       mysql: { condition: service_healthy }
       context-agent: { condition: service_started }
       resolution-agent: { condition: service_started }
+      temporal: { condition: service_healthy }
 
   context-agent:
     build: *service-build
@@ -605,6 +696,10 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: context-agent
+      # Continuous knowledge mode is the production default. Set a per-event
+      # decision.context_strategy=immediate when fresh discovery is mandatory.
+      CONTEXT_STRATEGY: ${CONTEXT_STRATEGY:-continuous}
+      CONTEXT_KNOWLEDGE_TTL_SECONDS: ${CONTEXT_KNOWLEDGE_TTL_SECONDS:-604800}
       MESSAGE_BUS_WORKER_COUNT: ${CONTEXT_AGENT_WORKER_COUNT:-2}
       DISCOVERY_MCP_URL: http://discovery-mcp:8000/mcp
       DISCOVERY_MCP_TIMEOUT_SECONDS: ${DISCOVERY_MCP_TIMEOUT_SECONDS:-15}
@@ -743,6 +838,17 @@ services:
     depends_on:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
+      temporal: { condition: service_healthy }
+
+  temporal-pilot-worker:
+    build: *service-build
+    restart: unless-stopped
+    environment: { <<: *service-env, SERVICE_NAME: temporal-pilot-worker, TEMPORAL_PILOT_ENABLED: "true" }
+    command: ["python", "-m", "temporal_pilot.worker"]
+    working_dir: /app
+    depends_on:
+      mysql: { condition: service_healthy }
+      temporal: { condition: service_healthy }
 
   remediation-engine:
     build: *service-build
@@ -1139,3 +1245,4 @@ volumes:
   zookeeper-log:
   kafka-data:
   rabbitmq-data:
+  grafana-data:

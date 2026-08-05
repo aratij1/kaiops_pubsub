@@ -234,13 +234,18 @@ groups:
           description: "HTTP probe success ratio dropped below 95% for target {{ $labels.instance }}."
 
       - alert: RabbitMQQueueBacklog
-        expr: sum(rabbitmq_queue_messages_ready) > 50000
+        # Sized for a 10k-alerts/day workload (~7/min average, bursts of a
+        # few hundred/hour during an incident storm), not a much larger
+        # deployment: 500 ready messages held for 10m is already well beyond
+        # a burst working itself through the pipeline and indicates a
+        # stalled consumer, not just momentary queueing.
+        expr: sum(rabbitmq_queue_messages_ready) > 500
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "RabbitMQ queue backlog high"
-          description: "More than 50,000 messages are waiting across KaiOps RabbitMQ queues."
+          description: "More than 500 messages are waiting across KaiOps RabbitMQ queues."
 
       - alert: RabbitMQBrokerDown
         expr: up{job="kaiops-rabbitmq"} == 0
@@ -315,7 +320,12 @@ groups:
           description: "Context agent execute-stage P95 latency is above 3 seconds."
 
       - alert: RabbitMQUnackedBacklog
-        expr: sum(rabbitmq_queue_messages_unacked) > 250000
+        # Sized for 10k-alerts/day: consumer prefetch counts are small
+        # (RABBITMQ_CONSUMER_PREFETCH_COUNT default 2), so unacked should
+        # stay in the tens even under burst. 2,000 held for 10m indicates
+        # consumers are stuck processing (or crash-looping before ack), not
+        # normal in-flight work.
+        expr: sum(rabbitmq_queue_messages_unacked) > 2000
         for: 10m
         labels:
           severity: warning
@@ -457,3 +467,116 @@ groups:
         annotations:
           summary: "Online Boutique frontend responding slowly"
           description: "Health-check probe duration is {{ $value }}s."
+
+  - name: kaiops-context-knowledge-telemetry
+    rules:
+      - record: kaiops:context_cache_hit_ratio:5m
+        expr: sum(rate(kaiops_context_strategy_requests_total{strategy="continuous",outcome="cache_hit"}[5m])) / clamp_min(sum(rate(kaiops_context_strategy_requests_total{strategy="continuous",outcome=~"cache_hit|cache_miss"}[5m])), 0.000001)
+
+      - record: kaiops:context_reused_latency_p95_seconds:5m
+        expr: histogram_quantile(0.95, sum(rate(kaiops_context_strategy_duration_seconds_bucket{strategy="continuous",path="reused"}[5m])) by (le))
+
+      - record: kaiops:context_fresh_latency_p95_seconds:5m
+        expr: histogram_quantile(0.95, sum(rate(kaiops_context_strategy_duration_seconds_bucket{path="fresh_discovery"}[5m])) by (le, strategy))
+
+      - alert: KaiOpsContextDiscoveryFailures
+        expr: sum(increase(kaiops_context_strategy_requests_total{outcome="discovery_error"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: context-knowledge
+        annotations:
+          summary: "Context discovery is failing"
+          description: "{{ $value }} context discovery failures occurred in the last five minutes."
+
+      - alert: KaiOpsContextKnowledgeRepositoryErrors
+        expr: sum(increase(kaiops_context_knowledge_operations_total{result=~"error|invalid"}[10m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+          component: context-knowledge
+        annotations:
+          summary: "Context knowledge repository operations are failing"
+          description: "Lookup, persistence, validation, or RCA attachment errors were observed in the last ten minutes. Fresh discovery remains the fallback path."
+
+      - alert: KaiOpsContextCacheHitRatioLow
+        expr: kaiops:context_cache_hit_ratio:5m < 0.20 and sum(increase(kaiops_context_strategy_requests_total{strategy="continuous",outcome=~"cache_hit|cache_miss"}[15m])) >= 20
+        for: 15m
+        labels:
+          severity: warning
+          component: context-knowledge
+        annotations:
+          summary: "Continuous context cache hit ratio is low"
+          description: "Cache hit ratio has remained below 20% with sufficient traffic. Check alert signatures, TTL, and knowledge persistence."
+
+      - alert: KaiOpsReusedContextLatencyHigh
+        expr: kaiops:context_reused_latency_p95_seconds:5m > 2
+        for: 10m
+        labels:
+          severity: warning
+          component: context-knowledge
+        annotations:
+          summary: "Reused context retrieval is slow"
+          description: "p95 reused-context latency is {{ $value }} seconds, above the 2 second objective."
+
+      - alert: KaiOpsFreshContextLatencyHigh
+        expr: kaiops:context_fresh_latency_p95_seconds:5m > 60
+        for: 10m
+        labels:
+          severity: warning
+          component: context-discovery
+        annotations:
+          summary: "Fresh context discovery is slow"
+          description: "p95 fresh-discovery latency is {{ $value }} seconds, above the 60 second objective."
+
+      - alert: KaiOpsResolutionKnowledgeNotFound
+        expr: sum(increase(kaiops_context_knowledge_operations_total{operation="attach_resolution",result="not_found"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: context-knowledge
+        annotations:
+          summary: "RCA could not be attached to context knowledge"
+          description: "Resolution completed but its context knowledge record was not found."
+
+  - name: kaiops-production-telemetry
+    rules:
+      - alert: KaiOpsSSEDisconnected
+        expr: sum(kaiops_sse_connections) == 0
+        for: 15m
+        labels: {severity: warning, component: sse}
+        annotations:
+          summary: "No KaiOps live-update clients are connected"
+          description: "No authenticated SSE connection has been observed for 15 minutes; clients may be using polling fallback."
+
+      - alert: KaiOpsDeadLettersIncreasing
+        expr: sum(increase(kaiops_dead_letter_events_total[10m])) > 0
+        for: 2m
+        labels: {severity: critical, component: message-bus}
+        annotations:
+          summary: "KaiOps events are entering dead-letter queues"
+          description: "{{ $value }} events entered a dead-letter path in the last ten minutes."
+
+      - alert: KaiOpsWorkflowFailures
+        expr: sum(increase(kaiops_workflow_failures_total[10m])) > 0
+        for: 2m
+        labels: {severity: critical, component: workflow}
+        annotations:
+          summary: "KaiOps durable workflow activity failures detected"
+          description: "{{ $value }} workflow activity failures occurred in the last ten minutes."
+
+      - alert: KaiOpsMySQLP95LatencyHigh
+        expr: histogram_quantile(0.95, sum(rate(kaiops_mysql_query_latency_seconds_bucket[5m])) by (le)) > 1
+        for: 10m
+        labels: {severity: warning, component: mysql}
+        annotations:
+          summary: "KaiOps MySQL p95 query latency is high"
+          description: "MySQL p95 query latency has exceeded one second for ten minutes."
+
+      - alert: KaiOpsModelFallbackRateHigh
+        expr: sum(rate(kaiops_llm_fallback_total[10m])) > 0.1
+        for: 10m
+        labels: {severity: warning, component: model-router}
+        annotations:
+          summary: "KaiOps model fallback rate is elevated"
+          description: "Model fallbacks exceed 0.1 per second; inspect provider health and quota."

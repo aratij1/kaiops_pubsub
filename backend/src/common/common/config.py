@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     context_agent_url: str = Field(default="http://context-agent:8000", alias="CONTEXT_AGENT_URL")
     resolution_agent_url: str = Field(default="http://resolution-agent:8000", alias="RESOLUTION_AGENT_URL")
     approval_service_url: str = Field(default="http://approval-service:8000", alias="APPROVAL_SERVICE_URL")
+    orchestrator_url: str = Field(default="http://orchestrator:8000", alias="ORCHESTRATOR_URL")
     remediation_engine_url: str = Field(default="http://remediation-engine:8000", alias="REMEDIATION_ENGINE_URL")
     monitoring_adapter_url: str = Field(default="http://monitoring-adapter:8000", alias="MONITORING_ADAPTER_URL")
     evaluation_service_url: str = Field(default="http://evaluation-service:8000", alias="EVALUATION_SERVICE_URL")
@@ -66,10 +67,21 @@ class Settings(BaseSettings):
     ai_layer_mode: str = Field(default="endpoint", alias="AI_LAYER_MODE")
     ai_layer_request_timeout_seconds: float = Field(default=120.0, alias="AI_LAYER_REQUEST_TIMEOUT_SECONDS")
     ai_layer_auth_token: str = Field(default="", alias="AI_LAYER_AUTH_TOKEN")
+    context_strategy: str = Field(default="continuous", alias="CONTEXT_STRATEGY")
+    context_knowledge_ttl_seconds: int = Field(default=604800, alias="CONTEXT_KNOWLEDGE_TTL_SECONDS")
+    object_storage_enabled: bool = Field(default=False, alias="OBJECT_STORAGE_ENABLED")
+    object_storage_provider: str = Field(default="s3", alias="OBJECT_STORAGE_PROVIDER")
+    object_storage_bucket: str = Field(default="kaiops-archive", alias="OBJECT_STORAGE_BUCKET")
+    object_storage_endpoint_url: str = Field(default="", alias="OBJECT_STORAGE_ENDPOINT_URL")
+    object_storage_region: str = Field(default="us-east-1", alias="OBJECT_STORAGE_REGION")
+    object_storage_access_key: str = Field(default="", alias="OBJECT_STORAGE_ACCESS_KEY")
+    object_storage_secret_key: str = Field(default="", alias="OBJECT_STORAGE_SECRET_KEY")
+    azure_blob_connection_string: str = Field(default="", alias="AZURE_BLOB_CONNECTION_STRING")
+    object_storage_signed_url_seconds: int = Field(default=300, alias="OBJECT_STORAGE_SIGNED_URL_SECONDS")
     prometheus_url: str = Field(default="http://prometheus:9090", alias="PROMETHEUS_URL")
     grafana_url: str = Field(default="http://grafana:3000", alias="GRAFANA_URL")
     kafka_enabled: bool = Field(default=True, alias="KAFKA_ENABLED")
-    event_bus_provider: str = Field(default="kafka", alias="EVENT_BUS_PROVIDER")
+    event_bus_provider: str = Field(default="rabbitmq", alias="EVENT_BUS_PROVIDER")
     message_bus_dynamic_routing: bool = Field(default=True, alias="MESSAGE_BUS_DYNAMIC_ROUTING")
     message_bus_stream_threshold: int = Field(default=500, alias="MESSAGE_BUS_STREAM_THRESHOLD")
     message_bus_default_provider: str = Field(default="rabbitmq", alias="MESSAGE_BUS_DEFAULT_PROVIDER")
@@ -120,6 +132,11 @@ class Settings(BaseSettings):
     orchestration_config_path: str = Field(default="", alias="ORCHESTRATION_CONFIG_PATH")
     connection_config_path: str = Field(default="backend/config/kaiops-connections.json", alias="CONNECTION_CONFIG_PATH")
     message_bus_worker_count: int = Field(default=1, alias="MESSAGE_BUS_WORKER_COUNT")
+    temporal_pilot_enabled: bool = Field(default=False, alias="TEMPORAL_PILOT_ENABLED")
+    temporal_address: str = Field(default="temporal:7233", alias="TEMPORAL_ADDRESS")
+    temporal_namespace: str = Field(default="default", alias="TEMPORAL_NAMESPACE")
+    temporal_task_queue: str = Field(default="kaiops-incident-pilot", alias="TEMPORAL_TASK_QUEUE")
+    temporal_approval_timeout_hours: int = Field(default=24, alias="TEMPORAL_APPROVAL_TIMEOUT_HOURS")
     orchestration_llm_planner_enabled: bool = Field(default=False, alias="ORCHESTRATION_LLM_PLANNER_ENABLED")
     kafka_startup_attempts: int = Field(default=30, alias="KAFKA_STARTUP_ATTEMPTS")
     kafka_startup_retry_seconds: float = Field(default=2.0, alias="KAFKA_STARTUP_RETRY_SECONDS")
@@ -179,6 +196,15 @@ class Settings(BaseSettings):
     auth_failed_login_attempts: int = Field(default=5, alias="AUTH_FAILED_LOGIN_ATTEMPTS")
     auth_lock_minutes: int = Field(default=15, alias="AUTH_LOCK_MINUTES")
     auth_password_expiry_days: int = Field(default=90, alias="AUTH_PASSWORD_EXPIRY_DAYS")
+    auth_mode: str = Field(default="local", alias="AUTH_MODE")
+    oidc_issuer: str = Field(default="", alias="OIDC_ISSUER")
+    oidc_audience: str = Field(default="", alias="OIDC_AUDIENCE")
+    oidc_client_id: str = Field(default="", alias="OIDC_CLIENT_ID")
+    oidc_role_claim: str = Field(default="roles", alias="OIDC_ROLE_CLAIM")
+    oidc_tenant_claim: str = Field(default="tenant_id", alias="OIDC_TENANT_CLAIM")
+    oidc_role_mappings: str = Field(default="", alias="OIDC_ROLE_MAPPINGS")
+    oidc_jwks_cache_seconds: int = Field(default=3600, alias="OIDC_JWKS_CACHE_SECONDS")
+    oidc_step_up_values: str = Field(default="mfa,c2,c3", alias="OIDC_STEP_UP_VALUES")
     trust_x_forwarded_for: bool = Field(default=False, alias="TRUST_X_FORWARDED_FOR")
     admin_user_password: str = Field(default="Admin@123456", alias="ADMIN_USER_PASSWORD")
     executive_user_password: str = Field(default="Executive@123456", alias="EXECUTIVE_USER_PASSWORD")
@@ -229,21 +255,42 @@ class Settings(BaseSettings):
         self.cloud_provider = provider_aliases.get(provider, provider)
 
         if self.database_url and self.database_url != _LOCAL_MYSQL_DEFAULT_URL:
+            normalized_url = self.database_url.strip().lower()
+            sqlite_test_url = normalized_url.startswith("sqlite") and self.environment.strip().lower() in {"local", "demo", "test"}
+            if not normalized_url.startswith(("mysql://", "mysql+aiomysql://")) and not sqlite_test_url:
+                raise ValueError("KaiOps production persistence supports only MySQL DATABASE_URL values")
             self._validate_auth_secrets()
             return self
 
-        if self.db.lower() == "mysql":
-            self.database_url = (
-                f"mysql+aiomysql://{quote_plus(self.db_user)}:{quote_plus(self.db_password)}"
-                f"@{self.db_host}:{self.db_port}/{self.db_database}"
-            )
+        if self.db.lower() != "mysql":
+            raise ValueError("DB must be mysql; alternate relational databases are prohibited")
+        self.database_url = (
+            f"mysql+aiomysql://{quote_plus(self.db_user)}:{quote_plus(self.db_password)}"
+            f"@{self.db_host}:{self.db_port}/{self.db_database}"
+        )
 
         self._validate_auth_secrets()
         return self
 
     def _validate_auth_secrets(self) -> None:
-        if self.environment.strip().lower() in {"local", "demo", "test"}:
+        environment = self.environment.strip().lower()
+        auth_mode = self.auth_mode.strip().lower()
+        if auth_mode not in {"local", "oidc"}:
+            raise ValueError("AUTH_MODE must be local or oidc")
+        self.auth_mode = auth_mode
+        if environment in {"local", "demo", "test"}:
             return
+
+        if auth_mode != "oidc":
+            raise ValueError("Production requires AUTH_MODE=oidc; local password authentication is development-only")
+        missing_oidc = [name for name in ("oidc_issuer", "oidc_audience", "oidc_client_id") if not str(getattr(self, name)).strip()]
+        if missing_oidc:
+            raise ValueError(f"Missing production OIDC settings: {', '.join(name.upper() for name in missing_oidc)}")
+        if not self.oidc_issuer.lower().startswith("https://"):
+            raise ValueError("Production OIDC_ISSUER must use HTTPS")
+        # Local JWT keys and seeded passwords are not authentication inputs in
+        # OIDC mode; do not force operators to create unused production secrets.
+        return
 
         placeholder_fields = [
             field_name

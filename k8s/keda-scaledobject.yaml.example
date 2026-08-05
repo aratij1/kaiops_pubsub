@@ -1,0 +1,82 @@
+# Example only — NOT applied by `kubectl apply -f k8s/` (the .example suffix
+# keeps it out of the plain YAML glob). Requires the KEDA operator installed
+# on the target cluster (https://keda.sh); this repo does not install it.
+#
+# hpa.yaml's CPU/memory HorizontalPodAutoscaler for alert-intelligence scales
+# on resource usage only. Under a 10k-alert burst, a consumer that's mostly
+# waiting on RabbitMQ ack / DB writes / LLM calls can stay CPU-idle while its
+# queue backs up — CPU/memory HPA won't fire on that. A KEDA ScaledObject
+# with a RabbitMQ queue-length trigger scales on the actual backlog instead.
+#
+# A ScaledObject creates its own HPA under the hood, so a Deployment can be
+# targeted by either an hpa.yaml HorizontalPodAutoscaler OR a ScaledObject,
+# not both. This example folds the existing CPU/memory triggers from
+# alert-intelligence-hpa (k8s/hpa.yaml) into the same ScaledObject alongside
+# the new queue-length trigger, so adopting it means deleting the standalone
+# alert-intelligence-hpa entry from hpa.yaml rather than running both.
+#
+# RabbitMQ queue name matches the convention in
+# backend/src/common/common/rabbitmq.py RabbitMQConsumer.start():
+# "{rabbitmq_queue_prefix}.{service_name}.{topic}" ->
+# kaiops.alert-intelligence.raw-alerts (see the Kafka Handoff Matrix in
+# README.md for the full topic list per service).
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: rabbitmq-trigger-auth
+  namespace: kaiops
+spec:
+  secretTargetRef:
+    - parameter: host
+      name: kaiops-secrets
+      key: RABBITMQ_URL
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: alert-intelligence-scaledobject
+  namespace: kaiops
+spec:
+  scaleTargetRef:
+    name: alert-intelligence
+  minReplicaCount: 2
+  maxReplicaCount: 12
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+          policies:
+            - { type: Percent, value: 100, periodSeconds: 60 }
+            - { type: Pods, value: 4, periodSeconds: 60 }
+          selectPolicy: Max
+        scaleDown:
+          stabilizationWindowSeconds: 1200
+          policies:
+            - { type: Percent, value: 25, periodSeconds: 300 }
+  triggers:
+    # Same targets as the CPU/memory metrics in k8s/hpa.yaml's
+    # alert-intelligence-hpa — carried over so this ScaledObject can fully
+    # replace it instead of adding a second, conflicting autoscaler.
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        value: "65"
+    - type: memory
+      metricType: Utilization
+      metadata:
+        value: "75"
+    # New: scale on actual RabbitMQ backlog for the queue this service
+    # consumes. "value" is the target queue length per replica — tune against
+    # observed steady-state depth, not copy-pasted; start conservative (e.g.
+    # a fraction of the 500-message RabbitMQQueueBacklog alert threshold in
+    # observability/alert.rules.yml) so scale-up triggers well before that
+    # alert would page.
+    - type: rabbitmq
+      metadata:
+        queueName: kaiops.alert-intelligence.raw-alerts
+        mode: QueueLength
+        value: "50"
+      authenticationRef:
+        name: rabbitmq-trigger-auth

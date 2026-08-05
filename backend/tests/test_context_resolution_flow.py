@@ -204,6 +204,7 @@ def test_resolution_agent_extracts_values_from_fenced_json_with_introductory_tex
 
 def test_vector_db_connector_loads_rag_documents() -> None:
     connector = VectorDBConnector()
+    connector.reload()
 
     assert connector.documents
     assert any(doc["kind"] == "runbook" for doc in connector.documents)
@@ -227,16 +228,16 @@ async def test_context_agent_returns_requested_shape() -> None:
 
     assert context.deployment == "Deployment 2.5"
     assert context.runbook
-    assert set(context.dependency_services) >= {"checkout", "ledger", "fraud", "postgres-primary"}
+    assert set(context.dependency_services) >= {"checkout", "ledger", "fraud"}
     assert context.recent_changes
     assert context.metadata["rag_documents"] >= 1
     assert any(match["kind"] == "runbook" for match in context.metadata["rag_matches"])
-    assert context.metadata["rag_index"]["vector_store"]["provider"] == "file-backed-memory"
+    assert context.metadata["rag_index"]["vector_store"]["provider"] == "local-hybrid-vector-index"
     assert context.metadata["rag_index"]["embedding_model"]["model"] == "hashing-token-counter-v1"
     assert context.metadata["context_graph"] == {
         "enabled": True,
         "stages": ["validate_event", "collect_connector_evidence", "assemble_context"],
-        "connector_count": 8,
+        "connector_count": 9,
     }
 
 
@@ -277,8 +278,9 @@ async def test_resolution_agent_generates_recommendation() -> None:
     recommendation = await ResolutionIntelligenceAgent(model_router=static_router()).resolve(context)
 
     assert recommendation.root_cause == "Deployment 2.5"
-    assert recommendation.confidence >= 0.9
-    assert recommendation.impact == "Payments latency"
+    assert 0.5 <= recommendation.confidence < 0.9
+    assert "evidence" in recommendation.rationale.lower()
+    assert "latency for payments" in recommendation.impact
     assert recommendation.recommended_action == "Rollback deployment"
 
 

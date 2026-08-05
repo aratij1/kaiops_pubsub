@@ -12,7 +12,7 @@ def select_publisher(
     publishers: dict[str, Any],
     default_publisher: Any,
 ) -> tuple[Any, str]:
-    provider = requested_provider.strip().lower() or "kafka"
+    provider = requested_provider.strip().lower() or "rabbitmq"
     selected = publishers.get(provider)
     if selected is not None:
         return selected, provider
@@ -30,8 +30,10 @@ async def publish_orchestration_event(
     alert: Alert,
     incident: Incident,
     decision: dict[str, Any],
+    deployment_provider: str | None = None,
 ) -> str:
-    requested_provider = str(decision.get("message_bus_provider", "kafka"))
+    # Provider is deployment configuration, not a per-incident AI/policy choice.
+    requested_provider = str(deployment_provider or "rabbitmq")
     selected_publisher, provider_used = select_publisher(
         requested_provider=requested_provider,
         publishers=publishers,

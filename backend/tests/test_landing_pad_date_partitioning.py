@@ -126,8 +126,9 @@ def test_dedup_ignores_partitions_outside_lookback_window(monitoring_app) -> Non
     assert module._processed_landing_pad_match_exists(mapped) is False
 
 
-def test_landing_pad_recent_lists_files_across_date_partitions(monitoring_app) -> None:
+def test_landing_pad_recent_does_not_scan_date_partitions(monitoring_app, monkeypatch: pytest.MonkeyPatch) -> None:
     module = monitoring_app
+    monkeypatch.setattr(module, "_collect_partitioned_json_files", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("archive scan attempted")))
     for index in range(3):
         module._persist_alert_to_landing_pad(
             {"name": f"alert-{index}", "labels": {"alert_fingerprint": f"fp-{index}"}},
@@ -135,14 +136,15 @@ def test_landing_pad_recent_lists_files_across_date_partitions(monitoring_app) -
             status="processed",
         )
 
-    response = module.get_landing_pad_recent(limit=10)
+    import asyncio
+
+    response = asyncio.run(module.get_landing_pad_recent(limit=10))
     assert response["count"] == 3
     assert response["partition_scheme"] == "YYYY/MM/DD"
-    names = {row["name"] for row in response["rows"]}
-    assert names == {"alert-0", "alert-1", "alert-2"}
+    assert response["source"] == "live-memory-buffer"
 
 
-def test_landing_pad_recent_merges_live_memory_and_archive(monitoring_app) -> None:
+def test_landing_pad_recent_returns_live_memory_without_archive_scan(monitoring_app) -> None:
     module = monitoring_app
     module._persist_alert_to_landing_pad(
         {"name": "archived-log", "source": "logs", "labels": {"alert_fingerprint": "log-1"}},
@@ -152,10 +154,47 @@ def test_landing_pad_recent_merges_live_memory_and_archive(monitoring_app) -> No
     module.RECENT_INGESTION_EVENTS.clear()
     module._record_live_stream_event(origin_system="email", name="live-email", source="email")
 
-    response = module.get_landing_pad_recent(limit=10, include_archive=True)
+    import asyncio
 
-    assert response["source"] == "merged-live-and-archive"
-    assert {row["name"] for row in response["rows"]} == {"archived-log", "live-email"}
+    response = asyncio.run(module.get_landing_pad_recent(limit=10, include_archive=False))
+
+    assert response["source"] == "live-memory-buffer"
+    assert {row["name"] for row in response["rows"]} == {"live-email"}
+
+
+def test_landing_pad_recent_requires_mysql_for_archive_history(monitoring_app) -> None:
+    module = monitoring_app
+    module._persist_alert_to_landing_pad(
+        {
+            "name": "resolved-email",
+            "source": "email",
+            "labels": {
+                "alert_fingerprint": "email-resolved-1",
+                "origin_system": "email",
+                "ingestion_channel": "email",
+                "alert_status": "resolved",
+            },
+        },
+        {},
+        status="processed",
+    )
+    for index in range(6):
+        module._persist_alert_to_landing_pad(
+            {
+                "name": f"prometheus-{index}",
+                "source": "prometheus",
+                "labels": {"alert_fingerprint": f"prom-{index}", "alert_status": "firing"},
+            },
+            {},
+            status="processed",
+        )
+    module.RECENT_INGESTION_EVENTS.clear()
+
+    import asyncio
+
+    with pytest.raises(module.HTTPException) as exc_info:
+        asyncio.run(module.get_landing_pad_recent(limit=3, include_archive=True))
+    assert exc_info.value.status_code == 503
 
 
 def test_landing_pad_input_lists_partitioned_replayed_and_failed(monitoring_app, tmp_path: Path) -> None:

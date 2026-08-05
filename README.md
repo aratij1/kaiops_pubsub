@@ -20,6 +20,7 @@ validation, and knowledge capture.
 - Azure Foundry provisioning script (resource bootstrap): [scripts/provision-azure-foundry.ps1](scripts/provision-azure-foundry.ps1)
 - Azure VM deployment script (SSH + Docker Compose): [scripts/deploy-to-azure-vm.ps1](scripts/deploy-to-azure-vm.ps1)
 - Cloud-agnostic scaling and migration runbook: [docs/CLOUD_AGNOSTIC_SCALING.md](docs/CLOUD_AGNOSTIC_SCALING.md)
+- Queue-depth (KEDA) autoscaling for RabbitMQ-consuming services: [docs/QUEUE_DEPTH_AUTOSCALING.md](docs/QUEUE_DEPTH_AUTOSCALING.md)
 - Cloud-neutral VM deployment script: [scripts/deploy-to-vm.ps1](scripts/deploy-to-vm.ps1)
 - Standard connection architecture: [docs/CONNECTION_ARCHITECTURE.md](docs/CONNECTION_ARCHITECTURE.md)
 - AI/application layer separation: [docs/AI_APPLICATION_LAYER_SEPARATION.md](docs/AI_APPLICATION_LAYER_SEPARATION.md)

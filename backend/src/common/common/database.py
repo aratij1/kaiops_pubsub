@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+from time import perf_counter
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Index, JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, MetaData, String, Text, Uuid, text
+from sqlalchemy import Index, JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, MetaData, String, Text, Uuid, event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -15,6 +16,9 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from common.config import Settings
 from common.models import utc_now
+from common.resilience import CircuitBreaker, CircuitOpenError
+from common.telemetry import MYSQL_QUERY_LATENCY
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 
 metadata = MetaData()
 
@@ -28,11 +32,40 @@ class TimestampMixin:
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 
+class ObjectStorageRecord(Base, TimestampMixin):
+    __tablename__ = "object_storage_metadata"
+    __table_args__ = (
+        Index("idx_object_storage_scope_created", "application", "environment", "created_at"),
+        Index("idx_object_storage_relation", "incident_id", "alert_id"),
+        Index("idx_object_storage_status_created", "processing_status", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    object_key: Mapped[str] = mapped_column(String(512), unique=True)
+    object_uri: Mapped[str] = mapped_column(String(1536))
+    object_type: Mapped[str] = mapped_column(String(64), index=True)
+    application: Mapped[str | None] = mapped_column(String(255), index=True)
+    environment: Mapped[str | None] = mapped_column(String(64), index=True)
+    incident_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    alert_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    source: Mapped[str | None] = mapped_column(String(128), index=True)
+    occurrence_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    ingested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    checksum_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    retention_policy: Mapped[str] = mapped_column(String(64), default="standard", index=True)
+    security_classification: Mapped[str] = mapped_column(String(64), default="internal", index=True)
+    processing_status: Mapped[str] = mapped_column(String(32), default="stored", index=True)
+    metadata_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 class AlertRecord(Base, TimestampMixin):
     __tablename__ = "alerts"
     __table_args__ = (Index("idx_alerts_created_at", "created_at"),)
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     source: Mapped[str] = mapped_column(String(64), index=True)
     name: Mapped[str] = mapped_column(String(255), index=True)
     service: Mapped[str] = mapped_column(String(128), index=True)
@@ -47,6 +80,7 @@ class IncidentRecord(Base, TimestampMixin):
     __tablename__ = "incidents"
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     service: Mapped[str] = mapped_column(String(128), index=True)
     environment: Mapped[str] = mapped_column(String(64), index=True)
     severity: Mapped[str] = mapped_column(String(32), index=True)
@@ -60,6 +94,7 @@ class ApprovalRecord(Base, TimestampMixin):
     __tablename__ = "approvals"
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     recommendation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     decision: Mapped[str] = mapped_column(String(32), index=True)
@@ -67,13 +102,43 @@ class ApprovalRecord(Base, TimestampMixin):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class ApprovalCapacityRecord(Base, TimestampMixin):
+    __tablename__ = "approval_capacity"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    username: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    resource_names: Mapped[list[str]] = mapped_column(JSON, default=list)
+    weekly_hours: Mapped[int] = mapped_column(Integer, default=0)
+    timezone: Mapped[str] = mapped_column(String(64), default="UTC")
+    working_days: Mapped[list[int]] = mapped_column(JSON, default=lambda: [0, 1, 2, 3, 4])
+    work_start: Mapped[str] = mapped_column(String(5), default="09:00")
+    work_end: Mapped[str] = mapped_column(String(5), default="17:00")
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class ApprovalAssignmentRecord(Base, TimestampMixin):
+    __tablename__ = "approval_assignments"
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    incident_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    assignee: Mapped[str] = mapped_column(String(255), index=True)
+    service: Mapped[str] = mapped_column(String(128), index=True)
+    estimated_hours: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(32), default="assigned", index=True)
+    assignment_reason: Mapped[str] = mapped_column(Text)
+
+
 class ActionRecord(Base, TimestampMixin):
     __tablename__ = "actions"
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     action_type: Mapped[str] = mapped_column(String(128), index=True)
     target: Mapped[str] = mapped_column(String(255), index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), unique=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
 
@@ -82,6 +147,7 @@ class RcaReportRecord(Base, TimestampMixin):
     __tablename__ = "rca_reports"
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     root_cause: Mapped[str] = mapped_column(String(255))
     impact: Mapped[str] = mapped_column(String(255))
@@ -92,6 +158,7 @@ class KnowledgeBaseRecord(Base, TimestampMixin):
     __tablename__ = "knowledge_base"
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     service: Mapped[str] = mapped_column(String(128), index=True)
     title: Mapped[str] = mapped_column(String(255))
     content: Mapped[str] = mapped_column(Text)
@@ -99,16 +166,68 @@ class KnowledgeBaseRecord(Base, TimestampMixin):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class ContextKnowledgeRecord(Base, TimestampMixin):
+    """Reusable context snapshot for a tenant-scoped alert family."""
+
+    __tablename__ = "context_knowledge"
+    __table_args__ = (
+        Index(
+            "idx_context_knowledge_lookup",
+            "tenant_id",
+            "service",
+            "environment",
+            "alert_signature",
+            "updated_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    service: Mapped[str] = mapped_column(String(128), index=True)
+    environment: Mapped[str] = mapped_column(String(64), index=True)
+    alert_name: Mapped[str] = mapped_column(String(255), index=True)
+    alert_signature: Mapped[str] = mapped_column(String(64), index=True)
+    source_alert_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    source_incident_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    reuse_count: Mapped[int] = mapped_column(Integer, default=0)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    resolution_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 class AuditLogRecord(Base, TimestampMixin):
     __tablename__ = "audit_logs"
     __table_args__ = (Index("idx_audit_logs_resource_action_created", "resource_type", "action", "created_at"),)
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     actor: Mapped[str] = mapped_column(String(255), index=True)
     action: Mapped[str] = mapped_column(String(255), index=True)
     resource_type: Mapped[str] = mapped_column(String(128), index=True)
     resource_id: Mapped[str] = mapped_column(String(128), index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class HumanCorrectionRecord(Base, TimestampMixin):
+    """Immutable, tenant-scoped feedback on an automated decision."""
+
+    __tablename__ = "human_corrections"
+    __table_args__ = (
+        Index("idx_human_corrections_entity_created", "tenant_id", "entity_type", "entity_id", "created_at"),
+        Index("idx_human_corrections_type_created", "tenant_id", "correction_type", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    entity_type: Mapped[str] = mapped_column(String(64), index=True)
+    entity_id: Mapped[str] = mapped_column(String(255), index=True)
+    correction_type: Mapped[str] = mapped_column(String(64), index=True)
+    original_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    corrected_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    reason: Mapped[str] = mapped_column(Text)
+    actor: Mapped[str] = mapped_column(String(255), index=True)
+    actor_role: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="recorded", index=True)
 
 
 class OnboardingStateRecord(Base, TimestampMixin):
@@ -375,6 +494,7 @@ class UserRecord(Base, TimestampMixin):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
@@ -557,18 +677,54 @@ class EvaluationRecord(Base, TimestampMixin):
     feedback_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
 
 
+def install_db_circuit_breaker(engine: AsyncEngine, breaker: CircuitBreaker) -> None:
+    """Fail fast on new DB work while the database is down, instead of every
+    one of ~21 services independently waiting out its own pool/connect
+    timeout on every request. `checkout` gates new connection use before a
+    query is attempted; `handle_error` counts real DB failures. No explicit
+    success signal is wired up: CircuitBreaker.allow() already self-heals
+    after `recovery_seconds` and only reopens if the next attempt(s) fail
+    again, so a healthy database naturally keeps the breaker closed.
+    """
+    sync_engine = engine.sync_engine
+
+    @event.listens_for(sync_engine, "checkout")
+    def _on_checkout(dbapi_connection, connection_record, connection_proxy) -> None:
+        if not breaker.allow():
+            raise CircuitOpenError("database circuit breaker open: refusing new connection checkout")
+
+    @event.listens_for(sync_engine, "handle_error")
+    def _on_handle_error(exception_context) -> None:
+        breaker.record_failure()
+
+
 def create_engine(settings: Settings) -> AsyncEngine:
     if settings.database_url.startswith("sqlite"):
         # aiosqlite's pool class doesn't accept pool_size/max_overflow kwargs.
-        return create_async_engine(settings.database_url, pool_pre_ping=True)
-    return create_async_engine(
-        settings.database_url,
-        pool_pre_ping=True,
-        pool_size=settings.db_pool_size,
-        max_overflow=settings.db_max_overflow,
-        pool_timeout=settings.db_pool_timeout_seconds,
-        pool_recycle=settings.db_pool_recycle_seconds,
-    )
+        engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+    else:
+        engine = create_async_engine(
+            settings.database_url,
+            pool_pre_ping=True,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_timeout=settings.db_pool_timeout_seconds,
+            pool_recycle=settings.db_pool_recycle_seconds,
+        )
+    install_db_circuit_breaker(engine, CircuitBreaker())
+    if isinstance(engine, AsyncEngine):
+        SQLAlchemyInstrumentor().instrument(engine=engine.sync_engine)
+        @event.listens_for(engine.sync_engine, "before_cursor_execute")
+        def _query_start(_connection, _cursor, statement, _parameters, context, _executemany):
+            context._kaiops_query_started = perf_counter()
+            context._kaiops_query_operation = str(statement or "query").lstrip().split(None, 1)[0].upper()[:16]
+
+        @event.listens_for(engine.sync_engine, "after_cursor_execute")
+        def _query_end(_connection, _cursor, _statement, _parameters, context, _executemany):
+            started = getattr(context, "_kaiops_query_started", None)
+            if started is not None:
+                MYSQL_QUERY_LATENCY.labels(settings.db_database, getattr(context, "_kaiops_query_operation", "QUERY")).observe(perf_counter() - started)
+    return engine
 
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
@@ -577,9 +733,7 @@ def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessi
 
 async def create_schema(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
-        if engine.dialect.name == "postgresql":
-            await connection.execute(text("SELECT pg_advisory_lock(742031991)"))
-        elif engine.dialect.name == "mysql":
+        if engine.dialect.name == "mysql":
             # Serialize schema migrations across concurrently starting services.
             await connection.execute(text("SELECT GET_LOCK('kaiops_schema_lock', 30)"))
         try:
@@ -770,7 +924,5 @@ async def create_schema(engine: AsyncEngine) -> None:
                             text("ALTER TABLE incident_projections ADD COLUMN document_available BOOLEAN NULL")
                         )
         finally:
-            if engine.dialect.name == "postgresql":
-                await connection.execute(text("SELECT pg_advisory_unlock(742031991)"))
-            elif engine.dialect.name == "mysql":
+            if engine.dialect.name == "mysql":
                 await connection.execute(text("SELECT RELEASE_LOCK('kaiops_schema_lock')"))

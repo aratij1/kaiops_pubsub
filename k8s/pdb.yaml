@@ -1,0 +1,48 @@
+# PodDisruptionBudgets for the ingestion-hot-path services that run
+# minReplicas: 2 in hpa.yaml. Without these, a voluntary node
+# drain/maintenance event can legally evict both replicas of one of these
+# deployments at the same time, taking it fully offline mid-burst.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: monitoring-adapter-pdb
+  namespace: kaiops
+spec:
+  minAvailable: 1
+  selector: { matchLabels: { app: monitoring-adapter } }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: alert-intelligence-pdb
+  namespace: kaiops
+spec:
+  minAvailable: 1
+  selector: { matchLabels: { app: alert-intelligence } }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: context-agent-pdb
+  namespace: kaiops
+spec:
+  minAvailable: 1
+  selector: { matchLabels: { app: context-agent } }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: resolution-agent-pdb
+  namespace: kaiops
+spec:
+  minAvailable: 1
+  selector: { matchLabels: { app: resolution-agent } }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: remediation-engine-pdb
+  namespace: kaiops
+spec:
+  minAvailable: 1
+  selector: { matchLabels: { app: remediation-engine } }

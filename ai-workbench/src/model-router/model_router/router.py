@@ -16,10 +16,17 @@ from ai_workbench_common.model_evaluation import VertexEvaluationClient
 from common.models import AlertSeverity
 from ai_workbench_common.prompts import SYSTEM_PROMPT_SRE, render_task_payload_prompt
 from common.resilience import CircuitBreaker
+from common.telemetry import LLM_COST_USD, LLM_FALLBACKS, LLM_LATENCY, LLM_TOKENS
 
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT_HASH = hashlib.sha256(SYSTEM_PROMPT_SRE.encode("utf-8")).hexdigest()[:16]
+
+
+def _observe_model_usage(provider: str, usage: dict[str, Any]) -> None:
+    LLM_TOKENS.labels(provider, "input").inc(max(0, int(usage.get("input_tokens") or 0)))
+    LLM_TOKENS.labels(provider, "output").inc(max(0, int(usage.get("output_tokens") or 0)))
+    LLM_COST_USD.labels(provider).inc(max(0.0, float(usage.get("total_cost_usd") or 0.0)))
 
 
 def _normalize_prompt(prompt: str) -> str:
@@ -649,10 +656,15 @@ class ModelRouter:
             if provider is None:
                 errors.append(f"{provider_name}: provider is not registered")
                 continue
+            started = _time.monotonic()
             try:
                 response = await provider.generate(prompt, payload)
                 usage = response.usage.as_dict()
                 usage["task"] = task.value
+                LLM_LATENCY.labels(provider_name, task.value, "ok").observe(_time.monotonic() - started)
+                _observe_model_usage(provider_name, usage)
+                if provider_name != primary:
+                    LLM_FALLBACKS.labels(primary, provider_name).inc()
                 result = {"model": provider_name, "content": response.content, "usage": usage}
                 result = await self._attach_evaluation(result, payload=payload)
                 if self.settings.model_router_prompt_cache_enabled:
@@ -664,6 +676,7 @@ class ModelRouter:
                     )
                 return result
             except Exception as exc:
+                LLM_LATENCY.labels(provider_name, task.value, "error").observe(_time.monotonic() - started)
                 errors.append(f"{provider_name}: {exc}")
 
         raise RuntimeError("; ".join(errors))
@@ -695,9 +708,16 @@ class ModelRouter:
         if cached is not None:
             logger.debug("Prompt cache hit (provider): %s", cache_key[:12])
             return _mark_usage_as_cached(cached)
-        response = await provider.generate(prompt, payload)
+        started = _time.monotonic()
+        try:
+            response = await provider.generate(prompt, payload)
+        except Exception:
+            LLM_LATENCY.labels(provider_name, task.value, "error").observe(_time.monotonic() - started)
+            raise
         usage = response.usage.as_dict()
         usage["task"] = task.value
+        LLM_LATENCY.labels(provider_name, task.value, "ok").observe(_time.monotonic() - started)
+        _observe_model_usage(provider_name, usage)
         result = {"model": provider_name, "content": response.content, "usage": usage}
         result = await self._attach_evaluation(result, payload=payload)
         if self.settings.model_router_prompt_cache_enabled:
