@@ -1,0 +1,16 @@
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY frontend/react/package.json frontend/react/package-lock.json ./
+RUN npm ci
+COPY frontend/react/ .
+RUN npm run build:budget
+
+FROM nginx:1.27-alpine
+ENV API_GATEWAY_HOST=kaiops-prod-api-gateway \
+    MONITORING_ADAPTER_HOST=kaiops-prod-monitoring-adapter \
+    APPROVAL_SERVICE_HOST=kaiops-prod-approval-service \
+    NGINX_ENVSUBST_FILTER="API_GATEWAY_HOST|MONITORING_ADAPTER_HOST|APPROVAL_SERVICE_HOST"
+COPY frontend/react/nginx/azure-container-apps.conf.template /etc/nginx/templates/default.conf.template
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]

@@ -80,19 +80,26 @@ def _query_alertmanager(alertmanager_url: str, alert_name: str, timeout_seconds:
 
 
 def _query_gateway_recent(gateway_url: str, alert_name: str, limit: int, timeout_seconds: float) -> tuple[bool, int, dict[str, Any] | None]:
-    payload = _http_json(f"{gateway_url.rstrip('/')}/alerts/recent?limit={limit}", timeout_seconds=timeout_seconds)
-    data = payload.get("data") if isinstance(payload, dict) else {}
-    if not isinstance(data, dict):
-        return False, 0, None
-
-    rows = data.get("rows")
-    if not isinstance(rows, list):
-        return False, 0, None
-
-    for row in rows:
-        if isinstance(row, dict) and str(row.get("name") or "") == alert_name:
-            return True, len(rows), row
-    return False, len(rows), None
+    # The recent feed is deliberately bounded and can evict the target during a
+    # load test. Fall back to the durable database-backed feed before declaring
+    # an end-to-end delivery failure.
+    largest_row_count = 0
+    for path, query_limit in (("alerts/recent", limit), ("alerts/all", max(limit, 5000))):
+        payload = _http_json(
+            f"{gateway_url.rstrip('/')}/{path}?limit={query_limit}",
+            timeout_seconds=timeout_seconds,
+        )
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        if not isinstance(data, dict):
+            continue
+        rows = data.get("rows")
+        if not isinstance(rows, list):
+            continue
+        largest_row_count = max(largest_row_count, len(rows))
+        for row in rows:
+            if isinstance(row, dict) and str(row.get("name") or "") == alert_name:
+                return True, len(rows), row
+    return False, largest_row_count, None
 
 
 def collect_snapshot(args: argparse.Namespace) -> PipelineSnapshot:

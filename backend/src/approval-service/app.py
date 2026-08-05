@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from common.config import get_settings
+from common.database import ApprovalAssignmentRecord, ApprovalCapacityRecord
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Approval, ApprovalDecision
@@ -17,6 +20,7 @@ from common.service import create_app
 from common.topics import APPROVAL_EVENTS, RESOLUTION_EVENTS
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 
 settings = get_settings()
 settings.service_name = "approval-service"
@@ -133,6 +137,146 @@ class ApprovalRequest(BaseModel):
 
 class ModifyRequest(ApprovalRequest):
     modified_action: str
+
+
+class CapacityRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=255)
+    resource_names: list[str] = Field(min_length=1, max_length=50)
+    weekly_hours: int = Field(ge=1, le=168)
+    timezone: str = Field(default="UTC", max_length=64)
+    working_days: list[int] = Field(default=[0, 1, 2, 3, 4], min_length=1, max_length=7)
+    work_start: str = Field(default="09:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    work_end: str = Field(default="17:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    active: bool = True
+
+
+class AssignmentTicket(BaseModel):
+    incident_id: str = Field(min_length=1, max_length=128)
+    service: str = Field(default="unknown", max_length=128)
+    severity: str = Field(default="medium", max_length=32)
+    resource_names: list[str] = Field(default_factory=list, max_length=50)
+    estimated_hours: int | None = Field(default=None, ge=1, le=168)
+
+
+class AutoAssignRequest(BaseModel):
+    tickets: list[AssignmentTicket] = Field(min_length=1, max_length=500)
+
+
+def _capacity_payload(row: ApprovalCapacityRecord, allocated: int = 0) -> dict[str, Any]:
+    return {
+        "id": str(row.id), "username": row.username, "resource_names": row.resource_names or [],
+        "weekly_hours": row.weekly_hours, "allocated_hours": allocated,
+        "remaining_hours": max(0, row.weekly_hours - allocated), "timezone": row.timezone,
+        "working_days": row.working_days or [], "work_start": row.work_start,
+        "work_end": row.work_end, "active": row.active,
+    }
+
+
+def _is_working_now(row: ApprovalCapacityRecord) -> bool:
+    try:
+        local = datetime.now(ZoneInfo(row.timezone))
+    except ZoneInfoNotFoundError:
+        return False
+    current = local.strftime("%H:%M")
+    return local.weekday() in set(row.working_days or []) and row.work_start <= current < row.work_end
+
+
+def _current_week_start() -> datetime:
+    now = datetime.now(timezone.utc)
+    return (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+@app.get("/capacity")
+async def list_capacity() -> dict[str, Any]:
+    async with app.state.session_factory() as session:
+        capacities = list((await session.scalars(select(ApprovalCapacityRecord).order_by(ApprovalCapacityRecord.username))).all())
+        allocated = dict((await session.execute(
+            select(ApprovalAssignmentRecord.assignee, func.coalesce(func.sum(ApprovalAssignmentRecord.estimated_hours), 0))
+            .where(
+                ApprovalAssignmentRecord.status.in_(["assigned", "in_progress"]),
+                ApprovalAssignmentRecord.created_at >= _current_week_start(),
+            )
+            .group_by(ApprovalAssignmentRecord.assignee)
+        )).all())
+    return {"rows": [_capacity_payload(row, int(allocated.get(row.username, 0))) for row in capacities]}
+
+
+@app.put("/capacity/{username}")
+async def upsert_capacity(username: str, request: CapacityRequest) -> dict[str, Any]:
+    if username.strip().lower() != request.username.strip().lower():
+        raise HTTPException(status_code=422, detail="Path username must match payload username")
+    if any(day < 0 or day > 6 for day in request.working_days) or request.work_start >= request.work_end:
+        raise HTTPException(status_code=422, detail="Working days and start/end hours are invalid")
+    try:
+        ZoneInfo(request.timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise HTTPException(status_code=422, detail="Unknown timezone") from exc
+    resources = sorted({value.strip().lower() for value in request.resource_names if value.strip()})
+    if not resources:
+        raise HTTPException(status_code=422, detail="At least one resource name is required")
+    async with app.state.session_factory() as session:
+        row = await session.scalar(select(ApprovalCapacityRecord).where(func.lower(ApprovalCapacityRecord.username) == request.username.strip().lower()))
+        values = request.model_dump()
+        values["username"] = request.username.strip()
+        values["resource_names"] = resources
+        values["working_days"] = sorted(set(request.working_days))
+        if row is None:
+            row = ApprovalCapacityRecord(**values)
+            session.add(row)
+        else:
+            for key, value in values.items():
+                setattr(row, key, value)
+        await session.commit()
+        await session.refresh(row)
+    return _capacity_payload(row)
+
+
+@app.get("/assignments")
+async def list_assignments() -> dict[str, Any]:
+    async with app.state.session_factory() as session:
+        rows = list((await session.scalars(select(ApprovalAssignmentRecord).order_by(ApprovalAssignmentRecord.created_at.desc()).limit(250))).all())
+    return {"rows": [{"incident_id": row.incident_id, "assignee": row.assignee, "service": row.service, "estimated_hours": row.estimated_hours, "status": row.status, "assignment_reason": row.assignment_reason, "created_at": row.created_at.isoformat() if row.created_at else None} for row in rows]}
+
+
+@app.post("/auto-assign")
+async def auto_assign(request: AutoAssignRequest) -> dict[str, Any]:
+    severity_hours = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    results: list[dict[str, Any]] = []
+    async with app.state.session_factory() as session:
+        capacities = list((await session.scalars(select(ApprovalCapacityRecord).where(ApprovalCapacityRecord.active.is_(True)))).all())
+        existing = {row.incident_id for row in (await session.scalars(select(ApprovalAssignmentRecord))).all()}
+        allocated = dict((await session.execute(
+            select(ApprovalAssignmentRecord.assignee, func.coalesce(func.sum(ApprovalAssignmentRecord.estimated_hours), 0))
+            .where(
+                ApprovalAssignmentRecord.status.in_(["assigned", "in_progress"]),
+                ApprovalAssignmentRecord.created_at >= _current_week_start(),
+            )
+            .group_by(ApprovalAssignmentRecord.assignee)
+        )).all())
+        for ticket in request.tickets:
+            if ticket.incident_id in existing:
+                results.append({"incident_id": ticket.incident_id, "status": "already_assigned"})
+                continue
+            hours = ticket.estimated_hours or severity_hours.get(ticket.severity.lower(), 2)
+            required = {ticket.service.strip().lower(), *(value.strip().lower() for value in ticket.resource_names)} - {"", "unknown"}
+            eligible = []
+            for capacity in capacities:
+                skills = set(capacity.resource_names or [])
+                remaining = capacity.weekly_hours - int(allocated.get(capacity.username, 0))
+                matches = not required or bool(required & skills) or "all" in skills or "*" in skills
+                if remaining >= hours and matches and _is_working_now(capacity):
+                    eligible.append((remaining, -int(allocated.get(capacity.username, 0)), capacity.username, capacity))
+            if not eligible:
+                results.append({"incident_id": ticket.incident_id, "status": "unassigned", "reason": "No on-duty responder has matching resources and remaining capacity."})
+                continue
+            _, _, _, selected = max(eligible)
+            reason = f"Matched {ticket.service} resources; {selected.weekly_hours - int(allocated.get(selected.username, 0))}h capacity available before assignment."
+            session.add(ApprovalAssignmentRecord(incident_id=ticket.incident_id, assignee=selected.username, service=ticket.service, estimated_hours=hours, assignment_reason=reason))
+            allocated[selected.username] = int(allocated.get(selected.username, 0)) + hours
+            existing.add(ticket.incident_id)
+            results.append({"incident_id": ticket.incident_id, "status": "assigned", "assignee": selected.username, "estimated_hours": hours, "reason": reason})
+        await session.commit()
+    return {"rows": results, "assigned": sum(1 for row in results if row["status"] == "assigned")}
 
 
 @app.post("/approve", response_model=Approval)
@@ -375,7 +519,19 @@ async def _store_and_publish(approval: Approval) -> None:
             )
             await session.commit()
     payload = _build_approval_event_payload(approval)
-    await app.state.producer.publish(APPROVAL_EVENTS, payload, key=str(approval.incident_id))
+    if settings.temporal_pilot_enabled:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    f"{settings.orchestrator_url.rstrip('/')}/temporal/workflows/{approval.incident_id}/approval",
+                    json=approval.model_dump(mode="json"),
+                )
+                response.raise_for_status()
+        except Exception:
+            logger.exception("temporal approval signal failed; publishing existing approval event fallback")
+            await app.state.producer.publish(APPROVAL_EVENTS, payload, key=str(approval.incident_id))
+    else:
+        await app.state.producer.publish(APPROVAL_EVENTS, payload, key=str(approval.incident_id))
     _publish_evaluation_feedback(approval)
 
 

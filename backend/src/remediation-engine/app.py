@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 from uuid import UUID
@@ -345,10 +346,32 @@ async def execute_approval(approval: Approval) -> RemediationAction:
             action.error = f"Action type '{action.action_type}' is not allowlisted"
             action.output = "remediation blocked by allowlist policy"
         else:
+            action.idempotency_key = _build_action_idempotency_key(approval, action.action_type)
+            existing = await _find_existing_action(app, action.idempotency_key)
+            if existing is not None:
+                # A redelivered approval/resolution message (e.g. after a consumer
+                # crash between plugin execution and ack) reaches this same branch
+                # with the same deterministic key. Return the prior result instead
+                # of re-running a real plugin (K8s restart, Jenkins rollback, etc.)
+                # a second time.
+                return existing
             action = await engine.execute(action)
 
     await _persist_action(app, action)
     return action
+
+
+def _build_action_idempotency_key(approval: Approval, action_type: str) -> str:
+    raw = f"{approval.incident_id}:{approval.recommendation_id}:{action_type}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+async def _find_existing_action(app: FastAPI, idempotency_key: str | None) -> RemediationAction | None:
+    if not settings.database_enabled or not idempotency_key:
+        return None
+    async with app.state.session_factory() as session:
+        repo = IncidentRepository(session)
+        return await repo.find_action_by_idempotency_key(idempotency_key)
 
 
 async def _persist_action(app: FastAPI, action: RemediationAction) -> None:

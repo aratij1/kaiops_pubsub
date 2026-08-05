@@ -15,7 +15,9 @@ from common.repository import IncidentRepository
 
 
 class AlertHistoryRepository(Protocol):
-    async def list_recent_alerts(self) -> Sequence[Alert]: ...
+    async def list_recent_alerts(
+        self, *, environment: str | None = None, tenant_id: str | None = None
+    ) -> Sequence[Alert]: ...
     async def record_alert(self, alert: Alert) -> None: ...
 
 
@@ -27,8 +29,15 @@ class InMemoryAlertHistoryRepository:
     def __post_init__(self) -> None:
         self._items = deque(maxlen=self.max_items)
 
-    async def list_recent_alerts(self) -> Sequence[Alert]:
-        return tuple(self._items)
+    async def list_recent_alerts(
+        self, *, environment: str | None = None, tenant_id: str | None = None
+    ) -> Sequence[Alert]:
+        items = self._items
+        if environment is not None:
+            items = [item for item in items if item.environment == environment]
+        if tenant_id is not None:
+            items = [item for item in items if item.tenant_id == tenant_id]
+        return tuple(items)
 
     async def record_alert(self, alert: Alert) -> None:
         self._items.append(alert)
@@ -39,13 +48,24 @@ class SqlAlertHistoryRepository:
     session_factory: async_sessionmaker[AsyncSession]
     max_items: int = 1000
 
-    async def list_recent_alerts(self) -> Sequence[Alert]:
+    async def list_recent_alerts(
+        self, *, environment: str | None = None, tenant_id: str | None = None
+    ) -> Sequence[Alert]:
         safe_limit = max(1, min(int(self.max_items), 5000))
         async with self.session_factory() as session:
+            query = select(AlertRecord)
+            if environment:
+                # Bounds the correlation/dedup candidate scan to the incoming
+                # alert's own environment (prod/staging/... never legitimately
+                # correlate) instead of scanning across every environment.
+                # Backed by idx_alerts_service_env_created.
+                query = query.where(AlertRecord.environment == environment)
+            if tenant_id:
+                # Different tenants' alerts must never correlate with each
+                # other. Backed by idx_alerts_tenant.
+                query = query.where(AlertRecord.tenant_id == tenant_id)
             result = await session.execute(
-                select(AlertRecord)
-                .order_by(AlertRecord.created_at.desc(), AlertRecord.updated_at.desc())
-                .limit(safe_limit)
+                query.order_by(AlertRecord.created_at.desc(), AlertRecord.updated_at.desc()).limit(safe_limit)
             )
             rows = result.scalars().all()
 

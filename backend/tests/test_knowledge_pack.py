@@ -8,7 +8,7 @@ from context_agent.connectors import VectorDBConnector
 
 
 def load_context_app_module():
-    module_path = Path("backend/src/context-agent/app.py")
+    module_path = Path("ai-workbench/src/context-agent/app.py")
     spec = importlib.util.spec_from_file_location("context_agent_app", module_path)
     assert spec is not None
     assert spec.loader is not None

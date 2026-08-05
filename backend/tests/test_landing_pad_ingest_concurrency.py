@@ -207,9 +207,15 @@ async def test_alertmanager_webhook_parallel_path_matches_sequential_semantics(m
 
     assert response["received"] == 7
     assert response["ingested"] == 4
-    assert response["skipped"] == 3
+    assert response["observed"] == 1
+    assert response["skipped"] == 2
     assert len(response["alerts"]) == 4
+    assert response["observed_rows"][0]["status"] == "resolved"
+    assert response["observed_rows"][0]["investigation_started"] is False
+    assert any(
+        row.get("name") == "ResolvedAlert" and row.get("alert_status") == "resolved"
+        for row in module.RECENT_INGESTION_EVENTS
+    )
     reasons = [str(row.get("reason")) for row in response["skipped_rows"]]
     assert any("landing pad ingestion failed" in reason for reason in reasons)
     assert any(reason == "non-object alert item" for reason in reasons)
-    assert any("Only firing alerts" in reason for reason in reasons)

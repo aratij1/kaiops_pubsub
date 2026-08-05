@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+test.skip(!process.env.KAIOPS_LIVE_E2E, "Set KAIOPS_LIVE_E2E=1 to run against a live API stack");
+
 test("live alert row opens the details cockpit", async ({ page }) => {
   test.setTimeout(120_000);
   const pageErrors = [];

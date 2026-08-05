@@ -139,10 +139,12 @@ class UserRepository:
         resource_type: str,
         resource_id: str,
         payload: dict,
+        tenant_id: str = "default",
     ) -> None:
         self.session.add(
             AuditLogRecord(
                 id=uuid4(),
+                tenant_id=tenant_id or "default",
                 actor=actor,
                 action=action,
                 resource_type=resource_type,

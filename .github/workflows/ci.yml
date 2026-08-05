@@ -4,6 +4,23 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      total_alerts:
+        description: "Number of alerts to send"
+        default: "2000"
+      concurrency:
+        description: "Concurrent in-flight requests"
+        default: "50"
+      p95_threshold_ms:
+        description: "Fail the job if p95 latency exceeds this (milliseconds)"
+        default: "2000"
+      p99_threshold_ms:
+        description: "Fail the job if p99 latency exceeds this (milliseconds)"
+        default: "5000"
+      min_acceptance_pct:
+        description: "Fail the job if acceptance percentage falls below this"
+        default: "99"
 
 jobs:
   test:
@@ -63,3 +80,47 @@ jobs:
       - uses: azure/setup-kubectl@v4
       - name: Validate manifests
         run: kubectl apply --dry-run=client -f k8s/
+
+  # Manual only (workflow_dispatch) — brings up the real ingestion path
+  # against Docker Compose and gates on measured latency, not just
+  # acceptance count. Acceptance-count-only stress runs can't prove an SLO;
+  # this produces the p95/p99 evidence the release-readiness doc calls for.
+  load-test:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install stress harness dependency
+        run: pip install httpx
+      - name: Start ingestion path
+        run: docker compose up -d --build mysql rabbitmq redis monitoring-adapter alert-intelligence api-gateway
+      - name: Wait for gateway health
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8010/healthz >/dev/null 2>&1; then
+              echo "gateway healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "gateway did not become healthy in time" >&2
+          docker compose logs --tail 100
+          exit 1
+      - name: Run stress load with latency gate
+        run: |
+          python scripts/stress_ingest_gateway_alerts.py \
+            --base-url http://localhost:8010 \
+            --total "${{ github.event.inputs.total_alerts }}" \
+            --concurrency "${{ github.event.inputs.concurrency }}" \
+            --p95-threshold-ms "${{ github.event.inputs.p95_threshold_ms }}" \
+            --p99-threshold-ms "${{ github.event.inputs.p99_threshold_ms }}" \
+            --min-acceptance-pct "${{ github.event.inputs.min_acceptance_pct }}"
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

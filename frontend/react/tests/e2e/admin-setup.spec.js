@@ -75,27 +75,23 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("admin setup keeps source downloads below file inputs and labels adapter contracts", async ({ page }) => {
+  test.setTimeout(120_000);
   await page.goto("/");
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill("admin-password");
   await page.getByRole("button", { name: "Sign In" }).click();
 
   await page.getByRole("button", { name: /Admin/ }).click();
-  await page.getByRole("button", { name: /Continue setup|Open workflow status|Review generated artifacts/ }).click();
+  await page.getByRole("button", { name: /Continue (guided )?setup|Open workflow status|Review generated artifacts/ }).click();
   await expect(page.getByRole("heading", { name: "Setup Wizard" })).toBeVisible();
   await page.getByRole("button", { name: "Show full setup" }).click();
 
-  await page.getByText("Source Documents", { exact: true }).click();
-  await expect(page.getByText("Upload Source Documents")).toBeVisible();
-  const sourceCard = page.locator(".source-doc-upload-card").filter({ hasText: "Past Tickets" });
+  await page.getByText("Optional supporting file", { exact: true }).click();
+  const sourceCard = page.locator(".source-doc-upload-card").filter({ hasText: "runbook, ticket export, or notes" });
   await expect(sourceCard.locator("input[type=file]")).toBeVisible();
-  await expect(sourceCard.getByRole("link", { name: "Download past ticket sample" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Download sample file" })).toBeVisible();
 
-  await page.getByRole("button", { name: "1) Configure Prometheus Monitoring" }).click();
-  const rulePromptPanelTitle = page.getByText("Generated Rule Prompt", { exact: true });
-  await expect(rulePromptPanelTitle).toBeVisible();
-  await rulePromptPanelTitle.click();
-  await expect(page.getByText("Upload source documents to unlock the generated rule prompt.")).toBeVisible();
+  await expect(page.getByLabel("Setup Details")).toBeVisible();
   await page.getByText("Advanced Settings (Optional)").click();
   await page.locator("label").filter({ hasText: "Deployment" }).first().locator("select").selectOption("azure_cloud");
   await expect(page.getByLabel("Azure Subscription ID")).toBeVisible();

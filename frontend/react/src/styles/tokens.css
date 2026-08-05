@@ -1,0 +1,53 @@
+:root {
+  --k-color-critical: #b4233b;
+  --k-color-warning: #b45309;
+  --k-color-success: #15803d;
+  --k-color-info: #2563a8;
+  --k-color-inactive: #64748b;
+  --k-color-surface: #ffffff;
+  --k-color-surface-subtle: #f6f9fc;
+  --k-color-text: #0f172a;
+  --k-color-text-muted: #526173;
+  --k-color-border: #cbd8e6;
+  --k-color-focus: #0b78d0;
+  --k-font-body: "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
+  --k-font-heading: "Space Grotesk", "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
+  --k-space-1: 0.25rem;
+  --k-space-2: 0.5rem;
+  --k-space-3: 0.75rem;
+  --k-space-4: 1rem;
+  --k-space-5: 1.5rem;
+  --k-space-6: 2rem;
+  --k-radius-sm: 0.375rem;
+  --k-radius-md: 0.625rem;
+  --k-radius-lg: 1rem;
+  --k-border-width: 1px;
+  --k-shadow-panel: 0 10px 30px rgba(15, 23, 42, 0.1);
+  --k-z-sticky: 20;
+  --k-z-overlay: 100;
+  --k-breakpoint-sm: 640px;
+  --k-breakpoint-md: 850px;
+  --k-breakpoint-lg: 1100px;
+  --k-table-row-comfortable: 2.75rem;
+  --k-table-row-compact: 2.125rem;
+  --k-focus-ring: 0 0 0 3px rgba(11, 120, 208, 0.32);
+  --k-motion-fast: 120ms;
+  --k-motion-normal: 200ms;
+}
+
+.dm-theme-dark {
+  --k-color-surface: #101a2c;
+  --k-color-surface-subtle: #162238;
+  --k-color-text: #edf4ff;
+  --k-color-text-muted: #adbbce;
+  --k-color-border: #354762;
+  --k-color-focus: #6bbcff;
+  --k-shadow-panel: 0 14px 32px rgba(0, 0, 0, 0.28);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --k-motion-fast: 0ms;
+    --k-motion-normal: 0ms;
+  }
+}

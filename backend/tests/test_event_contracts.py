@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,7 @@ _API_GATEWAY_APP_PATH = Path(__file__).resolve().parents[1] / "src" / "api-gatew
 _API_GATEWAY_SPEC = importlib.util.spec_from_file_location("api_gateway_app", _API_GATEWAY_APP_PATH)
 assert _API_GATEWAY_SPEC is not None and _API_GATEWAY_SPEC.loader is not None
 api_gateway_app = importlib.util.module_from_spec(_API_GATEWAY_SPEC)
+sys.modules[_API_GATEWAY_SPEC.name] = api_gateway_app
 _API_GATEWAY_SPEC.loader.exec_module(api_gateway_app)
 
 

@@ -214,6 +214,7 @@ class MonitoringAuditEvent(BaseEvent):
 
 
 class Alert(BaseEvent):
+    tenant_id: str = "default"
     source: str
     name: str
     service: str
@@ -342,6 +343,7 @@ class JiraIncidentSnapshot(BaseModel):
 
 
 class Incident(BaseEvent):
+    tenant_id: str = "default"
     alert_ids: list[UUID] = Field(default_factory=list)
     service: str
     environment: str = "prod"
@@ -367,6 +369,7 @@ class Recommendation(BaseEvent):
 
 
 class Approval(BaseEvent):
+    tenant_id: str = "default"
     incident_id: UUID
     recommendation_id: UUID
     decision: ApprovalDecision = ApprovalDecision.PENDING
@@ -377,10 +380,16 @@ class Approval(BaseEvent):
 
 
 class RemediationAction(BaseEvent):
+    tenant_id: str = "default"
     incident_id: UUID
     approval_id: UUID | None = None
     action_type: str
     target: str
+    # Deterministic sha256(incident_id:recommendation_id:action_type). Stable
+    # across a redelivered approval/resolution message even though `id`
+    # above is a fresh uuid4 every time — used to detect and skip re-executing
+    # a remediation that already ran. None for actions with no execution risk.
+    idempotency_key: str | None = None
     parameters: dict[str, Any] = Field(default_factory=dict)
     status: RemediationStatus = RemediationStatus.PENDING
     started_at: datetime | None = None

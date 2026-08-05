@@ -3,12 +3,21 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from uuid import uuid4
+
+import pytest
 from common.models import SafetyDecision
+from common.database import AuditLogRecord, HumanCorrectionRecord
 from ai_workbench_common.model_evaluation import build_quality_evaluation
 from api_gateway.auth_policy import route_auth_rule
+from pydantic import ValidationError
+from sqlalchemy import func, select
 
 
 def load_api_gateway_app_module():
+    existing = sys.modules.get("api_gateway_app")
+    if existing is not None:
+        return existing
     module_path = Path("backend/src/api-gateway/app.py")
     spec = importlib.util.spec_from_file_location("api_gateway_app", module_path)
     assert spec is not None
@@ -17,6 +26,79 @@ def load_api_gateway_app_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_triage_correction_contract_requires_governed_feedback() -> None:
+    module = load_api_gateway_app_module()
+    payload = module.TriageCorrectionCreate(
+        entity_id="alert-123",
+        correction_type="severity",
+        original_payload={"severity": "warning"},
+        corrected_payload={"severity": "critical"},
+        reason="Customer checkout is unavailable in production.",
+    )
+    assert payload.entity_type == "alert"
+    assert payload.reason.startswith("Customer checkout")
+
+    with pytest.raises(ValidationError):
+        module.TriageCorrectionCreate(
+            entity_id="alert-123",
+            corrected_payload={"severity": "high"},
+            reason="too short",
+        )
+
+    with pytest.raises(ValidationError):
+        module.TriageCorrectionCreate(
+            entity_id="alert-123",
+            corrected_payload={"severity": "high"},
+            reason="Valid operational evidence is available.",
+            unexpected=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_human_correction_and_audit_persist_in_shared_schema(sqlite_session_factory) -> None:
+    correction_id = uuid4()
+    async with sqlite_session_factory() as session:
+        session.add(
+            HumanCorrectionRecord(
+                id=correction_id,
+                tenant_id="tenant-a",
+                entity_type="alert",
+                entity_id="alert-123",
+                correction_type="severity",
+                original_payload={"severity": "warning"},
+                corrected_payload={"severity": "critical"},
+                reason="Production checkout is unavailable for all customers.",
+                actor="l2-user",
+                actor_role="L2 Engineer",
+                status="recorded",
+            )
+        )
+        session.add(
+            AuditLogRecord(
+                tenant_id="tenant-a",
+                actor="l2-user",
+                action="triage.correction.recorded",
+                resource_type="alert",
+                resource_id="alert-123",
+                payload={"correction_id": str(correction_id)},
+            )
+        )
+        await session.commit()
+
+        correction_count = await session.scalar(
+            select(func.count()).select_from(HumanCorrectionRecord).where(HumanCorrectionRecord.tenant_id == "tenant-a")
+        )
+        audit_statement = (
+            select(func.count())
+            .select_from(AuditLogRecord)
+            .where(AuditLogRecord.action == "triage.correction.recorded")
+        )
+        audit_count = await session.scalar(audit_statement)
+
+    assert correction_count == 1
+    assert audit_count == 1
 
 
 def test_safety_analyzer_allows_normal_alert_payload() -> None:
@@ -146,6 +228,7 @@ def test_gateway_operational_auth_policy_marks_admin_routes() -> None:
     assert route_auth_rule("GET", "/monitoring/integrations") == {"Administrator"}
     assert route_auth_rule("POST", "/rag/documents") == {"Administrator", "L2 Engineer", "L3 Engineer"}
     assert route_auth_rule("POST", "/approval/approve") is None
+    assert route_auth_rule("GET", "/events/operations") is None
     assert route_auth_rule("POST", "/api/v1/alerts/prometheus") is False
 
 

@@ -1,5 +1,6 @@
 CREATE TABLE IF NOT EXISTS alerts (
     id CHAR(32) PRIMARY KEY,
+    tenant_id VARCHAR(128) NOT NULL DEFAULT 'default',
     source VARCHAR(64) NOT NULL,
     name VARCHAR(255) NOT NULL,
     service VARCHAR(128) NOT NULL,
@@ -11,11 +12,16 @@ CREATE TABLE IF NOT EXISTS alerts (
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     KEY idx_alerts_service_severity (service, severity),
-    KEY idx_alerts_created_at (created_at DESC)
+    KEY idx_alerts_created_at (created_at DESC),
+    KEY idx_alerts_tenant (tenant_id),
+    -- Lets alert-intelligence scope correlation/dedup candidate scans to the
+    -- same service+environment instead of a cluster-wide unfiltered scan.
+    KEY idx_alerts_service_env_created (service, environment, created_at DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS incidents (
     id CHAR(32) PRIMARY KEY,
+    tenant_id VARCHAR(128) NOT NULL DEFAULT 'default',
     service VARCHAR(128) NOT NULL,
     environment VARCHAR(64) NOT NULL,
     severity VARCHAR(32) NOT NULL,
@@ -25,11 +31,13 @@ CREATE TABLE IF NOT EXISTS incidents (
     payload JSON NOT NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-    KEY idx_incidents_status_severity (status, severity)
+    KEY idx_incidents_status_severity (status, severity),
+    KEY idx_incidents_tenant (tenant_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS approvals (
     id CHAR(32) PRIMARY KEY,
+    tenant_id VARCHAR(128) NOT NULL DEFAULT 'default',
     incident_id CHAR(32) NOT NULL,
     recommendation_id CHAR(32) NOT NULL,
     decision VARCHAR(32) NOT NULL,
@@ -38,24 +46,36 @@ CREATE TABLE IF NOT EXISTS approvals (
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     KEY idx_approvals_incident (incident_id),
+    KEY idx_approvals_tenant (tenant_id),
     CONSTRAINT fk_approvals_incident FOREIGN KEY (incident_id) REFERENCES incidents(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS actions (
     id CHAR(32) PRIMARY KEY,
+    tenant_id VARCHAR(128) NOT NULL DEFAULT 'default',
     incident_id CHAR(32) NOT NULL,
     action_type VARCHAR(128) NOT NULL,
     target VARCHAR(255) NOT NULL,
+    -- Deterministic sha256(incident_id:recommendation_id:action_type), set by
+    -- remediation-engine before executing. NULL for actions where no
+    -- execution risk exists (rejected/policy-blocked). Redelivered
+    -- approval/resolution messages compute the same key, so this UNIQUE
+    -- constraint plus a check-before-execute lookup prevents a message
+    -- redelivery from re-running a real remediation plugin twice.
+    idempotency_key VARCHAR(64),
     status VARCHAR(32) NOT NULL,
     payload JSON NOT NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     KEY idx_actions_incident (incident_id),
+    KEY idx_actions_tenant (tenant_id),
+    UNIQUE KEY uq_actions_idempotency (idempotency_key),
     CONSTRAINT fk_actions_incident FOREIGN KEY (incident_id) REFERENCES incidents(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS rca_reports (
     id CHAR(32) PRIMARY KEY,
+    tenant_id VARCHAR(128) NOT NULL DEFAULT 'default',
     incident_id CHAR(32) NOT NULL,
     root_cause VARCHAR(255) NOT NULL,
     impact VARCHAR(255) NOT NULL,
@@ -63,11 +83,13 @@ CREATE TABLE IF NOT EXISTS rca_reports (
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     KEY idx_rca_reports_incident (incident_id),
+    KEY idx_rca_reports_tenant (tenant_id),
     CONSTRAINT fk_rca_reports_incident FOREIGN KEY (incident_id) REFERENCES incidents(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS knowledge_base (
     id CHAR(32) PRIMARY KEY,
+    tenant_id VARCHAR(128) NOT NULL DEFAULT 'default',
     service VARCHAR(128) NOT NULL,
     title VARCHAR(255) NOT NULL,
     content TEXT NOT NULL,
@@ -75,11 +97,13 @@ CREATE TABLE IF NOT EXISTS knowledge_base (
     payload JSON,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-    KEY idx_knowledge_base_service (service)
+    KEY idx_knowledge_base_service (service),
+    KEY idx_knowledge_base_tenant (tenant_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS audit_logs (
     id CHAR(32) PRIMARY KEY,
+    tenant_id VARCHAR(128) NOT NULL DEFAULT 'default',
     actor VARCHAR(255) NOT NULL,
     action VARCHAR(255) NOT NULL,
     resource_type VARCHAR(128) NOT NULL,
@@ -87,6 +111,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     payload JSON,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    KEY idx_audit_logs_tenant (tenant_id),
     KEY idx_audit_logs_actor (actor),
     KEY idx_audit_logs_action (action),
     KEY idx_audit_logs_resource (resource_type, resource_id)
@@ -232,6 +257,7 @@ CREATE TABLE IF NOT EXISTS roles (
 
 CREATE TABLE IF NOT EXISTS users (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    tenant_id VARCHAR(128) NOT NULL DEFAULT 'default',
     username VARCHAR(64) UNIQUE NOT NULL,
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
@@ -248,6 +274,7 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     KEY idx_users_role (role_id),
     KEY idx_users_status (status),
+    KEY idx_users_tenant (tenant_id),
     CONSTRAINT fk_users_role FOREIGN KEY (role_id) REFERENCES roles(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

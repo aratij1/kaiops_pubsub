@@ -1,11 +1,28 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from functools import wraps
 
 import pytest_asyncio
+from common.config import Settings
 from common.database import create_schema
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
+
+
+# Unit and contract tests must never inherit developer credentials, live
+# provider switches, or infrastructure addresses from the repository `.env`.
+# Individual tests can still supply explicit values or an explicit _env_file.
+_settings_init = Settings.__init__
+
+
+@wraps(_settings_init)
+def _isolated_settings_init(self, *args, **kwargs):
+    kwargs.setdefault("_env_file", None)
+    _settings_init(self, *args, **kwargs)
+
+
+Settings.__init__ = _isolated_settings_init
 
 
 @pytest_asyncio.fixture

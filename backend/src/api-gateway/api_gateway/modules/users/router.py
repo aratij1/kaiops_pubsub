@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, Request
+from datetime import UTC, datetime
+from hashlib import sha256
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from api_gateway.modules.users.permissions import AuthContext, current_auth_context, get_user_service, require_roles
 from api_gateway.modules.users.schemas import (
@@ -54,6 +57,8 @@ async def auth_login(
 
 @router.post("/auth/refresh", response_model=AuthTokenResponse)
 async def auth_refresh(payload: AuthRefreshRequest, user_service: UserService = Depends(get_user_service)):
+    if settings.auth_mode != "local":
+        raise HTTPException(status_code=404, detail="Local token refresh is disabled")
     data = await user_service.refresh(refresh_token=payload.refresh_token)
     return AuthTokenResponse(**data)
 
@@ -63,6 +68,8 @@ async def auth_logout(
     auth: AuthContext = Depends(current_auth_context),
     user_service: UserService = Depends(get_user_service),
 ):
+    if auth.external:
+        return {"status": "signed_out", "provider_session": "must be ended at the identity provider"}
     return await user_service.logout(session_jti=auth.session_jti, user_id=auth.user_id)
 
 
@@ -71,7 +78,30 @@ async def auth_me(
     auth: AuthContext = Depends(current_auth_context),
     user_service: UserService = Depends(get_user_service),
 ):
+    if auth.external:
+        now = datetime.now(UTC)
+        role_ids = {role.value: index + 1 for index, role in enumerate(SystemRole)}
+        stable_id = int.from_bytes(sha256(str(auth.user_id).encode()).digest()[:4], "big")
+        return AuthMeResponse(user={
+            "id": stable_id, "tenant_id": auth.tenant_id, "username": auth.username,
+            "email": auth.email, "first_name": auth.first_name, "last_name": auth.last_name,
+            "role_id": role_ids.get(auth.role, 0), "role_name": auth.role, "status": "active",
+            "is_active": True, "last_login": now, "failed_login_attempts": 0,
+            "locked_until": None, "created_at": now, "updated_at": now,
+        })
     return AuthMeResponse(**(await user_service.me(user_id=auth.user_id)))
+
+
+@router.get("/auth/config")
+async def auth_config():
+    return {
+        "mode": settings.auth_mode,
+        "local_development_only": settings.auth_mode == "local",
+        "issuer": settings.oidc_issuer if settings.auth_mode == "oidc" else None,
+        "client_id": settings.oidc_client_id if settings.auth_mode == "oidc" else None,
+        "audience": settings.oidc_audience if settings.auth_mode == "oidc" else None,
+        "pkce_required": settings.auth_mode == "oidc",
+    }
 
 
 @router.get("/roles", response_model=list[RoleRead])

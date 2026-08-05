@@ -16,9 +16,15 @@ from common.database import create_engine
 def test_create_engine_sqlite_skips_pool_kwargs() -> None:
     # aiosqlite may not be installed in every environment; assert the guard
     # behavior (no pool_size/max_overflow passed for sqlite) by inspecting the
-    # call rather than requiring the real driver.
+    # call rather than requiring the real driver. install_db_circuit_breaker
+    # is also mocked out here since it registers real SQLAlchemy event
+    # listeners that require a genuine Engine, not this mocked one — the
+    # mechanism itself is covered by test_database_circuit_breaker.py.
     settings = Settings(DATABASE_URL="sqlite+aiosqlite:///:memory:")
-    with patch("common.database.create_async_engine") as mock_create:
+    with (
+        patch("common.database.create_async_engine") as mock_create,
+        patch("common.database.install_db_circuit_breaker"),
+    ):
         create_engine(settings)
     _args, kwargs = mock_create.call_args
     assert "pool_size" not in kwargs

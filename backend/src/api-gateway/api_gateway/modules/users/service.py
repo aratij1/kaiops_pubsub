@@ -9,6 +9,7 @@ import jwt
 from fastapi import HTTPException
 
 from api_gateway.modules.users.models import SystemRole
+from api_gateway.oidc import OidcTokenValidator
 from api_gateway.modules.users.repository import UserRepository, run_in_session
 from api_gateway.modules.users.schemas import UserCreate, UserUpdate
 from common.config import Settings
@@ -19,6 +20,7 @@ class UserService:
     def __init__(self, *, settings: Settings, session_factory) -> None:
         self.settings = settings
         self.session_factory = session_factory
+        self.oidc = OidcTokenValidator(settings) if settings.auth_mode == "oidc" else None
 
     def _password_regex(self) -> re.Pattern[str]:
         return re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^\w\s]).{12,}$")
@@ -75,6 +77,7 @@ class UserService:
         *,
         user_id: int,
         role: str,
+        tenant_id: str,
         token_type: str,
         expires_delta: timedelta,
         jwt_id: str,
@@ -84,6 +87,7 @@ class UserService:
         payload = {
             "sub": str(user_id),
             "role": role,
+            "tenant_id": tenant_id or "default",
             "type": token_type,
             "jti": jwt_id,
             "sid": session_jti,
@@ -100,6 +104,11 @@ class UserService:
             return payload
         except jwt.PyJWTError as exc:
             raise HTTPException(status_code=401, detail=f"Invalid token: {exc}") from exc
+
+    async def decode_access_token(self, token: str) -> dict:
+        if self.oidc is not None:
+            return await self.oidc.validate(token)
+        return self.decode_token(token)
 
     async def ensure_active_session(self, *, session_jti: str, user_id: int) -> None:
         async def op(repo: UserRepository):
@@ -118,6 +127,7 @@ class UserService:
         normalized_email = self._normalize_local_email(user.username, user.email)
         return {
             "id": user.id,
+            "tenant_id": user.tenant_id,
             "username": user.username,
             "email": normalized_email,
             "first_name": user.first_name,
@@ -169,6 +179,9 @@ class UserService:
             for role_name, desc in role_descriptions.items():
                 await repo.ensure_role(name=role_name, description=desc, is_system_role=True)
 
+            if self.settings.auth_mode != "local":
+                return
+
             for username, env_key, role_name, first_name, last_name, email in default_users:
                 role = await repo.get_role_by_name(role_name)
                 if role is None:
@@ -200,6 +213,7 @@ class UserService:
                 await repo.create_user(user)
                 await repo.add_audit(
                     actor="system",
+                    tenant_id=user.tenant_id,
                     action="user.seeded",
                     resource_type="user",
                     resource_id=str(user.id),
@@ -209,6 +223,8 @@ class UserService:
         await run_in_session(self.session_factory, op)
 
     async def login(self, *, username: str, password: str, ip_address: str | None, device: str | None) -> dict:
+        if self.settings.auth_mode != "local" or self.settings.environment.strip().lower() not in {"local", "demo", "test"}:
+            raise HTTPException(status_code=404, detail="Local password login is disabled")
         async def op(repo: UserRepository):
             user = await repo.get_user_by_username(username)
             if user is None:
@@ -239,6 +255,7 @@ class UserService:
                     user.locked_until = now + timedelta(minutes=self.settings.auth_lock_minutes)
                 await repo.add_audit(
                     actor=user.username,
+                    tenant_id=user.tenant_id,
                     action="login.failed",
                     resource_type="user",
                     resource_id=str(user.id),
@@ -257,6 +274,7 @@ class UserService:
             access_token = self._encode_token(
                 user_id=user.id,
                 role=role_name,
+                tenant_id=user.tenant_id,
                 token_type="access",
                 expires_delta=access_expires,
                 jwt_id=access_jti,
@@ -265,6 +283,7 @@ class UserService:
             refresh_token = self._encode_token(
                 user_id=user.id,
                 role=role_name,
+                tenant_id=user.tenant_id,
                 token_type="refresh",
                 expires_delta=refresh_expires,
                 jwt_id=refresh_jti,
@@ -282,6 +301,7 @@ class UserService:
             )
             await repo.add_audit(
                 actor=user.username,
+                tenant_id=user.tenant_id,
                 action="login.success",
                 resource_type="user",
                 resource_id=str(user.id),
@@ -332,6 +352,7 @@ class UserService:
             access_token = self._encode_token(
                 user_id=user.id,
                 role=role_name,
+                tenant_id=user.tenant_id,
                 token_type="access",
                 expires_delta=access_expires,
                 jwt_id=access_jti,
@@ -340,6 +361,7 @@ class UserService:
             rotated_refresh_token = self._encode_token(
                 user_id=user.id,
                 role=role_name,
+                tenant_id=user.tenant_id,
                 token_type="refresh",
                 expires_delta=refresh_expires,
                 jwt_id=new_refresh_jti,
@@ -358,6 +380,7 @@ class UserService:
 
             await repo.add_audit(
                 actor=user.username,
+                tenant_id=user.tenant_id,
                 action="token.refresh",
                 resource_type="session",
                 resource_id=str(session.id),
@@ -389,6 +412,7 @@ class UserService:
             await repo.revoke_session(session_jti)
             await repo.add_audit(
                 actor=user.username if user else "unknown",
+                tenant_id=user.tenant_id if user else "default",
                 action="logout",
                 resource_type="session",
                 resource_id=session_jti,
@@ -427,6 +451,7 @@ class UserService:
                 raise HTTPException(status_code=404, detail="Role not found")
 
             rec = UserRecord(
+                tenant_id=payload.tenant_id or "default",
                 username=payload.username,
                 email=str(payload.email),
                 password_hash=self.hash_password(payload.password),
@@ -439,6 +464,7 @@ class UserService:
             rec = await repo.create_user(rec)
             await repo.add_audit(
                 actor=actor,
+                tenant_id=rec.tenant_id,
                 action="user.created",
                 resource_type="user",
                 resource_id=str(rec.id),
@@ -514,6 +540,7 @@ class UserService:
             updated = self._user_to_dict(user, role.name if role else "Unknown")
             await repo.add_audit(
                 actor=actor,
+                tenant_id=user.tenant_id,
                 action="user.updated",
                 resource_type="user",
                 resource_id=str(user.id),
@@ -542,6 +569,7 @@ class UserService:
             updated = self._user_to_dict(user, role.name if role else "Unknown")
             await repo.add_audit(
                 actor=actor,
+                tenant_id=user.tenant_id,
                 action="user.status.updated",
                 resource_type="user",
                 resource_id=str(user.id),
@@ -562,6 +590,7 @@ class UserService:
             user.password_changed_at = datetime.now(UTC)
             await repo.add_audit(
                 actor=actor,
+                tenant_id=user.tenant_id,
                 action="user.password.reset",
                 resource_type="user",
                 resource_id=str(user.id),
@@ -580,6 +609,7 @@ class UserService:
             user.locked_until = None
             await repo.add_audit(
                 actor=actor,
+                tenant_id=user.tenant_id,
                 action="user.unlocked",
                 resource_type="user",
                 resource_id=str(user.id),
@@ -597,6 +627,7 @@ class UserService:
             await repo.session.delete(user)
             await repo.add_audit(
                 actor=actor,
+                tenant_id=user.tenant_id,
                 action="user.deleted",
                 resource_type="user",
                 resource_id=str(user_id),

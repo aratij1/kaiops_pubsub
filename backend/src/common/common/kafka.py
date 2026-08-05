@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from common.config import Settings
 from common.logging import get_logger
 from common.message_processing import ProcessedMessageCache, extract_message_identity
-from common.resilience import retry_async
+from common.resilience import CircuitBreaker, CircuitOpenError, retry_async
 
 logger = get_logger(__name__)
 T = TypeVar("T", bound=BaseModel)
@@ -32,6 +32,11 @@ class KafkaProducer:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._producer: AIOKafkaProducer | None = None
+        # retry_async below already retries a transient send failure; this
+        # breaker additionally stops retrying-and-failing on every publish
+        # during a sustained broker outage, so callers fail fast instead of
+        # eating the full retry backoff on every message.
+        self._publish_breaker = CircuitBreaker()
 
     async def start(self) -> None:
         if not self._settings.kafka_enabled:
@@ -72,12 +77,20 @@ class KafkaProducer:
         if self._producer is None:
             logger.info("kafka disabled; event logged", extra={"topic": topic, "payload": payload})
             return
+        if not self._publish_breaker.allow():
+            raise CircuitOpenError("kafka publish circuit breaker open: broker appears unreachable")
 
         async def send() -> None:
             assert self._producer is not None
             await self._producer.send_and_wait(topic, payload, key=key.encode("utf-8") if key else None)
 
-        await retry_async(send)
+        try:
+            await retry_async(send)
+        except Exception:
+            self._publish_breaker.record_failure()
+            raise
+        else:
+            self._publish_breaker.record_success()
 
 
 class KafkaConsumer:

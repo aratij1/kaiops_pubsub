@@ -29,6 +29,7 @@ def test_jwt_encode_decode_round_trip() -> None:
     token = svc._encode_token(
         user_id=7,
         role="Administrator",
+        tenant_id="acme",
         token_type="access",
         expires_delta=__import__("datetime").timedelta(minutes=5),
         jwt_id="abc123",
@@ -37,6 +38,7 @@ def test_jwt_encode_decode_round_trip() -> None:
     payload = svc.decode_token(token)
     assert payload["sub"] == "7"
     assert payload["role"] == "Administrator"
+    assert payload["tenant_id"] == "acme"
     assert payload["type"] == "access"
     assert payload["sid"] == "session-123"
 
@@ -183,6 +185,7 @@ def test_refresh_rotates_session_and_tokens(monkeypatch) -> None:
     refresh_token = svc._encode_token(
         user_id=1,
         role="Administrator",
+        tenant_id="default",
         token_type="refresh",
         expires_delta=__import__("datetime").timedelta(minutes=30),
         jwt_id="refresh-jti",

@@ -1,5 +1,6 @@
 from alert_intelligence import AlertIntelligenceAgent
 from common.models import Alert, AlertSeverity
+from common.repository_interfaces import InMemoryAlertHistoryRepository
 import pytest
 
 
@@ -95,3 +96,43 @@ async def test_alert_intelligence_does_not_correlate_unrelated_services() -> Non
 
     assert unrelated.correlation_id != first.correlation_id
     assert unrelated.metadata["correlation"]["matched"] is False
+
+
+@pytest.mark.asyncio
+async def test_process_fetches_alert_history_once_per_alert() -> None:
+    """Dedup and correlation previously issued two independent unfiltered
+    history scans per incoming alert. process() must now share a single
+    environment-scoped fetch between both steps."""
+
+    class CountingRepository(InMemoryAlertHistoryRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.list_calls: list[str | None] = []
+
+        async def list_recent_alerts(self, *, environment: str | None = None, tenant_id: str | None = None):
+            self.list_calls.append(environment)
+            return await super().list_recent_alerts(environment=environment, tenant_id=tenant_id)
+
+    repository = CountingRepository()
+    agent = AlertIntelligenceAgent(alert_history_repository=repository)
+
+    await agent.process(make_alert())
+
+    assert repository.list_calls == ["prod"]
+
+
+def test_embedding_cache_is_bounded() -> None:
+    """The embedding cache used to be an unbounded dict that grew for the
+    life of the process. It must now evict the oldest entry once the cap is
+    exceeded instead of leaking memory across a long-running soak."""
+    agent = AlertIntelligenceAgent()
+    agent._embedding_cache_max_size = 3
+
+    agent._embed("alert-text-1")
+    agent._embed("alert-text-2")
+    agent._embed("alert-text-3")
+    agent._embed("alert-text-4")
+
+    assert len(agent._embedding_cache) == 3
+    assert "alert-text-1" not in agent._embedding_cache
+    assert "alert-text-4" in agent._embedding_cache

@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -46,6 +46,42 @@ def test_noise_is_classified_without_ai() -> None:
     assert ticket.false_positive is True
 
 
+def test_triage_uses_business_environment_frequency_and_sla_factors() -> None:
+    ticket = DeterministicTicketTriage().triage(
+        alert(
+            title="Checkout latency increased",
+            description="Requests are slow",
+            observed_severity="warning",
+            labels={
+                "owner_team": "checkout-sre",
+                "service_criticality": "critical",
+                "affected_users": "250",
+                "occurrence_count": "12",
+                "sla_minutes": "30",
+            },
+        )
+    )
+    assert ticket.severity == TicketSeverity.P2
+    assert ticket.priority == 75
+    assert ticket.category == "performance"
+    assert ticket.subcategory == "latency-or-saturation"
+    assert ticket.assigned_team == "checkout-sre"
+    assert ticket.sla_deadline == ticket.created_at + timedelta(minutes=30)
+    assert "production-critical-service" in ticket.audit_metadata.rules_fired
+    assert "material-user-impact" in ticket.audit_metadata.rules_fired
+    assert "high-alert-frequency" in ticket.audit_metadata.rules_fired
+    assert "affected_users=250" in ticket.audit_metadata.rationale
+
+
+def test_non_production_priority_is_reduced_without_hiding_severity() -> None:
+    ticket = DeterministicTicketTriage().triage(
+        alert(environment="staging", observed_severity="high", title="Service degraded", description="Major timeout")
+    )
+    assert ticket.severity == TicketSeverity.P2
+    assert ticket.priority == 65
+    assert "non-production-priority-adjustment" in ticket.audit_metadata.rules_fired
+
+
 def test_ai_decision_requires_provider_model_and_evidence() -> None:
     with pytest.raises(ValidationError):
         AuditMetadata(tenant_id="t1", rationale="model classification", ai_used=True)
@@ -74,4 +110,3 @@ def test_event_envelope_rejects_unknown_fields() -> None:
     assert event.schema_version == "1.0"
     with pytest.raises(ValidationError):
         EventEnvelopeV1.model_validate({**event.model_dump(), "unexpected": True})
-

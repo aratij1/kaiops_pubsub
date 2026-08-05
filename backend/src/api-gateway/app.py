@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlencode
@@ -13,20 +14,22 @@ import httpx
 import pymysql
 from api_gateway import SafetyAnalyzer
 from api_gateway.auth_policy import route_auth_rule
-from api_gateway.modules.users.permissions import AuthContext
+from api_gateway.modules.users.models import SystemRole
+from api_gateway.modules.users.permissions import AuthContext, current_auth_context, current_tenant_id, require_roles
 from api_gateway.modules.users.router import router as user_management_router
 from api_gateway.modules.users.service import UserService
 from common.config import get_settings
-from common.database import AuditLogRecord
+from common.database import ActionRecord, AlertRecord, ApprovalRecord, AuditLogRecord, HumanCorrectionRecord, IncidentProjectionRecord, MonitoringConnectionHealthRecord
 from common.event_publishers import build_agent_event_contract
 from common.kafka import normalize_payload
 from common.models import GatewayAuditEvent, SafetyDecision
 from common.service import create_app
 from common.telemetry import REQUEST_LATENCY
-from fastapi import Body, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from opentelemetry import trace
 from prometheus_client import Counter, Gauge
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 
 REQUEST_BODY = Body(default={})
@@ -36,6 +39,40 @@ settings.service_name = "api-gateway"
 analyzer = SafetyAnalyzer()
 AUDIT_EVENTS: deque[GatewayAuditEvent] = deque(maxlen=200)
 logger = logging.getLogger("api-gateway")
+
+
+class TriageCorrectionCreate(BaseModel):
+    """Governed feedback contract for a human correction to automation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_type: str = Field(default="alert", min_length=1, max_length=64)
+    entity_id: str = Field(min_length=1, max_length=255)
+    correction_type: str = Field(default="severity", min_length=1, max_length=64)
+    original_payload: dict[str, Any] = Field(default_factory=dict)
+    corrected_payload: dict[str, Any]
+    reason: str = Field(min_length=10, max_length=4000)
+
+    @field_validator("entity_type")
+    @classmethod
+    def validate_entity_type(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"alert", "ticket", "incident", "rca", "recommendation"}:
+            raise ValueError("unsupported entity_type")
+        return normalized
+
+    @field_validator("correction_type")
+    @classmethod
+    def validate_correction_type(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"severity", "priority", "category", "ownership", "rca", "recommendation"}:
+            raise ValueError("unsupported correction_type")
+        return normalized
+
+    @field_validator("entity_id", "reason")
+    @classmethod
+    def strip_required_text(cls, value: str) -> str:
+        return value.strip()
 
 
 def require_object_payload(payload: Any, label: str = "request body") -> dict[str, Any]:
@@ -80,40 +117,62 @@ async def _auth_context_from_request(request: Request) -> AuthContext:
     if user_service is None:
         raise HTTPException(status_code=500, detail="User service is not configured")
 
-    payload = user_service.decode_token(token.strip())
+    payload = await user_service.decode_access_token(token.strip())
     if str(payload.get("type") or "") != "access":
         raise HTTPException(status_code=401, detail="Access token required")
+    external = bool(payload.get("external"))
     session_jti = str(payload.get("sid") or "").strip()
-    if not session_jti:
+    if not external and not session_jti:
         raise HTTPException(status_code=401, detail="Access token is missing session binding")
-    user_id = int(payload.get("sub", "0"))
-    await user_service.ensure_active_session(session_jti=session_jti, user_id=user_id)
+    user_id: int | str = str(payload.get("sub")) if external else int(payload.get("sub", "0"))
+    if not external:
+        await user_service.ensure_active_session(session_jti=session_jti, user_id=int(user_id))
     return AuthContext(
         user_id=user_id,
         role=str(payload.get("role") or ""),
+        tenant_id=str(payload.get("tenant_id") or "default"),
         jwt_id=str(payload.get("jti") or ""),
         session_jti=session_jti,
         token_type="access",
+        external=external,
+        username=str(payload.get("preferred_username") or payload.get("upn") or payload.get("name") or payload.get("sub") or ""),
+        email=str(payload.get("email") or payload.get("preferred_username") or "unknown@kaiops.example.com"),
+        first_name=str(payload.get("given_name") or payload.get("name") or "External"),
+        last_name=str(payload.get("family_name") or "User"),
+        acr=str(payload.get("acr") or ""),
+        amr=tuple(str(item) for item in (payload.get("amr") or []) if item),
     )
 
 
 async def _persist_gateway_audit_event(app: FastAPI, event: GatewayAuditEvent) -> None:
+    """Persist observability data without breaking the proxied business request.
+
+    Gateway audit storage is secondary telemetry. A database outage or an open
+    database circuit must not replace a successful downstream response with a
+    gateway HTTP 500.
+    """
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
         return
     payload = event.model_dump(mode="json")
-    async with session_factory() as session:
-        session.add(
-            AuditLogRecord(
-                id=event.id,
-                actor="api-gateway",
-                action="gateway.request",
-                resource_type="gateway",
-                resource_id=str(event.trace_id or event.id),
-                payload=payload,
+    try:
+        async with session_factory() as session:
+            session.add(
+                AuditLogRecord(
+                    id=event.id,
+                    actor="api-gateway",
+                    action="gateway.request",
+                    resource_type="gateway",
+                    resource_id=str(event.trace_id or event.id),
+                    payload=payload,
+                )
             )
+            await session.commit()
+    except Exception as exc:
+        logger.warning(
+            "gateway_audit_persistence_skipped",
+            extra={"trace_id": event.trace_id, "error_type": type(exc).__name__},
         )
-        await session.commit()
 
 
 def _gateway_event_from_audit_payload(payload: dict[str, Any]) -> GatewayAuditEvent | None:
@@ -255,6 +314,11 @@ async def enforce_operational_auth(request: Request, call_next):
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     if role_rule is not None and auth.role not in role_rule:
         return JSONResponse(status_code=403, content={"detail": "Insufficient role permissions"})
+    if settings.auth_mode == "oidc" and request.method == "POST" and request.url.path in {"/approval/approve", "/approval/modify", "/remediation/execute"}:
+        accepted = {item.strip().lower() for item in settings.oidc_step_up_values.split(",") if item.strip()}
+        observed = {auth.acr.lower(), *(item.lower() for item in auth.amr)}
+        if not accepted.intersection(observed):
+            return JSONResponse(status_code=403, content={"detail": "Step-up authentication is required for this sensitive action"})
     request.state.auth = auth
     return await call_next(request)
 
@@ -268,6 +332,8 @@ GATEWAY_SAFETY_BLOCKS = Counter(
     "API gateway blocked requests by category",
     ["category"],
 )
+SSE_CONNECTIONS = Gauge("kaiops_sse_connections", "Active authenticated operational SSE connections", ["role"])
+SSE_EVENTS = Counter("kaiops_sse_events_total", "Operational SSE events emitted", ["event_type"])
 ALERTS_TABLE_ROWS = Gauge(
     "kaiops_mysql_alerts_table_rows",
     "Current number of records in MySQL alerts table",
@@ -277,6 +343,76 @@ ALERTS_TABLE_ROWS = Gauge(
 
 def trace_id_from_header(value: str | None) -> str:
     return value or uuid4().hex
+
+
+def _sse_message(event_id: str, event_type: str, payload: dict[str, Any]) -> str:
+    return f"id: {event_id}\nevent: {event_type}\ndata: {json.dumps(payload, default=str, separators=(',', ':'))}\n\n"
+
+
+@app.get("/events/operations")
+async def stream_operational_events(request: Request) -> StreamingResponse:
+    """Emit tenant-scoped change notifications; clients fetch canonical rows through Query caches."""
+    auth = getattr(request.state, "auth", None)
+    tenant_id = auth.tenant_id if auth is not None else "default"
+    role = auth.role if auth is not None else "local-development"
+    last_event_id = str(request.headers.get("last-event-id") or request.query_params.get("last_event_id") or "").strip()
+    try:
+        cursor_ms = int(last_event_id.split("-", 1)[0])
+        cursor = datetime.fromtimestamp(cursor_ms / 1000, timezone.utc)
+    except (TypeError, ValueError, OSError):
+        cursor = datetime.now(timezone.utc) - timedelta(seconds=5)
+
+    async def events():
+        nonlocal cursor
+        SSE_CONNECTIONS.labels(role).inc()
+        sequence = 0
+        try:
+            yield "retry: 2000\n\n"
+            while not await request.is_disconnected():
+                emitted = False
+                session_factory = getattr(app.state, "session_factory", None)
+                if settings.database_enabled and session_factory is not None:
+                    async with session_factory() as session:
+                        queries = (
+                            ("alert.created", AlertRecord, AlertRecord.id, None),
+                            ("incident.status", IncidentProjectionRecord, IncidentProjectionRecord.incident_id, IncidentProjectionRecord.status),
+                            ("approval.state", ApprovalRecord, ApprovalRecord.id, ApprovalRecord.decision),
+                            ("remediation.progress", ActionRecord, ActionRecord.id, ActionRecord.status),
+                        )
+                        newest = cursor
+                        for event_type, model, identity, state in queries:
+                            stmt = select(model).where(model.tenant_id == tenant_id, model.updated_at > cursor).order_by(model.updated_at.asc()).limit(100)
+                            for row in (await session.execute(stmt)).scalars().all():
+                                updated_at = row.updated_at.replace(tzinfo=timezone.utc) if row.updated_at.tzinfo is None else row.updated_at
+                                newest = max(newest, updated_at)
+                                sequence += 1
+                                event_id = f"{int(updated_at.timestamp() * 1000)}-{sequence}"
+                                payload = {"entity_id": str(getattr(row, identity.key)), "changed_at": updated_at.isoformat(), "tenant_id": tenant_id}
+                                if state is not None:
+                                    payload["state"] = str(getattr(row, state.key))
+                                yield _sse_message(event_id, event_type, payload)
+                                SSE_EVENTS.labels(event_type).inc()
+                                emitted = True
+                        if role == "Administrator":
+                            stmt = select(MonitoringConnectionHealthRecord).where(MonitoringConnectionHealthRecord.updated_at > cursor).order_by(MonitoringConnectionHealthRecord.updated_at.asc()).limit(100)
+                            for row in (await session.execute(stmt)).scalars().all():
+                                updated_at = row.updated_at.replace(tzinfo=timezone.utc) if row.updated_at.tzinfo is None else row.updated_at
+                                newest = max(newest, updated_at)
+                                sequence += 1
+                                event_id = f"{int(updated_at.timestamp() * 1000)}-{sequence}"
+                                yield _sse_message(event_id, "connector.health", {"entity_id": str(row.integration_id), "provider": row.provider, "state": row.status, "changed_at": updated_at.isoformat()})
+                                SSE_EVENTS.labels("connector.health").inc()
+                                emitted = True
+                        cursor = newest
+                if not emitted:
+                    sequence += 1
+                    now = datetime.now(timezone.utc)
+                    yield _sse_message(f"{int(now.timestamp() * 1000)}-{sequence}", "heartbeat", {"at": now.isoformat(), "queue_health": "polling-fallback"})
+                await asyncio.sleep(5)
+        finally:
+            SSE_CONNECTIONS.labels(role).dec()
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
 
 def preview(payload: Any) -> dict[str, Any]:
@@ -531,6 +667,7 @@ async def proxy(
     payload: Any,
     trace_id: str,
     params: dict[str, str] | None = None,
+    timeout_seconds: float | None = None,
 ) -> tuple[int, dict[str, Any]]:
     target_url = f"{target_base.rstrip('/')}/{path.lstrip('/')}"
     headers = {"x-trace-id": trace_id}
@@ -547,7 +684,9 @@ async def proxy(
         "/landing-pad/recent",
         "/onboarding/state",
     }
-    if normalized_method == "GET" and path.split("?", 1)[0] == "/landing-pad/recent":
+    if timeout_seconds is not None:
+        request_timeout = max(0.5, float(timeout_seconds))
+    elif normalized_method == "GET" and path.split("?", 1)[0] == "/landing-pad/recent":
         # Landing-pad scans may include archive + in-memory merge work and can
         # exceed the generic fast-read budget under active ingestion.
         request_timeout = max(45.0, float(settings.gateway_request_timeout_seconds))
@@ -591,6 +730,7 @@ async def guarded_proxy(
     payload: Any,
     trace_id: str,
     params: dict[str, str] | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     start = perf_counter()
     safety = analyzer.analyze({"path": path, "payload": payload})
@@ -638,6 +778,7 @@ async def guarded_proxy(
                 payload=payload,
                 trace_id=trace_id,
                 params=params,
+                timeout_seconds=timeout_seconds,
             )
             status = "ok"
         except httpx.HTTPStatusError as exc:
@@ -708,6 +849,24 @@ async def ingest_alert(
         method="POST",
         path="/alerts",
         target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/evaluations/by-recommendation/{recommendation_id}/feedback")
+async def submit_evaluation_feedback(
+    recommendation_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Expose the existing evaluation feedback loop through the authenticated gateway."""
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/evaluations/by-recommendation/{recommendation_id}/feedback",
+        target_base=settings.evaluation_service_url,
         payload=payload,
         trace_id=trace_id_from_header(x_trace_id),
     )
@@ -866,8 +1025,9 @@ async def get_recent_alerts(
     request: Request,
     limit: int = 50,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    path = f"/alerts/recent?{urlencode({'limit': str(limit)})}"
+    path = f"/alerts/recent?{urlencode({'limit': str(limit), 'tenant_id': tenant_id})}"
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -883,8 +1043,13 @@ async def get_all_alerts(
     request: Request,
     limit: int = 500,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    path = f"/alerts/all?{urlencode({'limit': str(limit)})}"
+    # tenant_id resolves to "default" for a caller with no/invalid bearer
+    # token (this endpoint doesn't otherwise require auth, matching
+    # api_gateway.auth_policy's read-routes-open convention) and to the
+    # authenticated caller's own tenant otherwise — see current_tenant_id.
+    path = f"/alerts/all?{urlencode({'limit': str(limit), 'tenant_id': tenant_id})}"
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -946,13 +1111,30 @@ async def get_alert_linked_documents(
         payload={},
         trace_id=trace_id,
     )
-    _, docs_payload = await proxy(
-        method="GET",
-        path="/rag/documents",
-        target_base=settings.context_agent_url,
-        payload={},
-        trace_id=trace_id,
-    )
+    documents_degraded = False
+    documents_warning = ""
+    try:
+        _, docs_payload = await proxy(
+            method="GET",
+            path="/rag/documents",
+            target_base=settings.context_agent_url,
+            payload={},
+            trace_id=trace_id,
+            timeout_seconds=8.0,
+        )
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        # Document evidence enriches the RCA view but is not required to show
+        # the alert or its stored analysis. Keep the primary experience usable
+        # when the context service is saturated or temporarily unavailable.
+        documents_degraded = True
+        documents_warning = "Document evidence is temporarily unavailable. The stored RCA result is still available."
+        docs_payload = {"documents": []}
+        logger.warning(
+            "linked_documents_degraded alert_id=%s trace_id=%s error_type=%s",
+            str(alert_id or "").strip(),
+            trace_id,
+            type(exc).__name__,
+        )
     alerts_data = _payload_data(alerts_payload)
     docs_data = _payload_data(docs_payload)
     rows = alerts_data.get("rows") or alerts_data.get("alerts") or []
@@ -998,6 +1180,8 @@ async def get_alert_linked_documents(
             "source": "api-gateway.alert-linked-documents",
             "contract_version": "kaiops.alert-document-link.v1",
             "match_reasons": sorted({str(doc.get("match_reason") or "") for doc in linked_documents if doc.get("match_reason")}),
+            "degraded": documents_degraded,
+            "warning": documents_warning,
         },
         **contract,
     }
@@ -1051,6 +1235,118 @@ async def delete_alert_severity_override(
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
+
+
+@app.post("/triage/corrections", status_code=201)
+@app.post("/api/v1/triage/corrections", status_code=201, include_in_schema=False)
+async def create_triage_correction(
+    request: Request,
+    payload: TriageCorrectionCreate,
+    auth: AuthContext = Depends(
+        require_roles(
+            SystemRole.ADMINISTRATOR.value,
+            SystemRole.L3_ENGINEER.value,
+            SystemRole.L2_ENGINEER.value,
+        )
+    ),
+) -> dict[str, Any]:
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Correction persistence is unavailable")
+
+    correction_id = uuid4()
+    actor = str(auth.username or auth.email or auth.user_id).strip()
+    correction = HumanCorrectionRecord(
+        id=correction_id,
+        tenant_id=auth.tenant_id,
+        entity_type=payload.entity_type,
+        entity_id=payload.entity_id,
+        correction_type=payload.correction_type,
+        original_payload=payload.original_payload,
+        corrected_payload=payload.corrected_payload,
+        reason=payload.reason,
+        actor=actor,
+        actor_role=auth.role,
+        status="recorded",
+    )
+    audit = AuditLogRecord(
+        tenant_id=auth.tenant_id,
+        actor=actor,
+        action="triage.correction.recorded",
+        resource_type=payload.entity_type,
+        resource_id=payload.entity_id,
+        payload={
+            "correction_id": str(correction_id),
+            "correction_type": payload.correction_type,
+            "reason": payload.reason,
+            "actor_role": auth.role,
+        },
+    )
+    async with session_factory() as session:
+        session.add(correction)
+        session.add(audit)
+        await session.commit()
+
+    return {
+        "correction": {
+            "id": str(correction_id),
+            "tenant_id": auth.tenant_id,
+            "entity_type": payload.entity_type,
+            "entity_id": payload.entity_id,
+            "correction_type": payload.correction_type,
+            "original_payload": payload.original_payload,
+            "corrected_payload": payload.corrected_payload,
+            "reason": payload.reason,
+            "actor": actor,
+            "actor_role": auth.role,
+            "status": "recorded",
+        }
+    }
+
+
+@app.get("/triage/corrections")
+@app.get("/api/v1/triage/corrections", include_in_schema=False)
+async def list_triage_corrections(
+    request: Request,
+    entity_id: str = "",
+    correction_type: str = "",
+    limit: int = 50,
+    auth: AuthContext = Depends(current_auth_context),
+) -> dict[str, Any]:
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Correction persistence is unavailable")
+
+    safe_limit = max(1, min(int(limit), 200))
+    statement = select(HumanCorrectionRecord).where(HumanCorrectionRecord.tenant_id == auth.tenant_id)
+    if entity_id.strip():
+        statement = statement.where(HumanCorrectionRecord.entity_id == entity_id.strip())
+    if correction_type.strip():
+        statement = statement.where(HumanCorrectionRecord.correction_type == correction_type.strip().lower())
+    async with session_factory() as session:
+        result = await session.execute(statement.order_by(HumanCorrectionRecord.created_at.desc()).limit(safe_limit))
+        rows = result.scalars().all()
+
+    return {
+        "rows": [
+            {
+                "id": str(row.id),
+                "entity_type": row.entity_type,
+                "entity_id": row.entity_id,
+                "correction_type": row.correction_type,
+                "original_payload": row.original_payload or {},
+                "corrected_payload": row.corrected_payload or {},
+                "reason": row.reason,
+                "actor": row.actor,
+                "actor_role": row.actor_role,
+                "status": row.status,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ],
+        "count": len(rows),
+        "tenant_id": auth.tenant_id,
+    }
 
 
 @app.post("/sample/payment-latency")
@@ -1363,6 +1659,55 @@ async def get_landing_pad_recent(
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
+
+
+@app.get("/landing-pad/archive")
+async def get_landing_pad_archive(
+    request: Request,
+    limit: int = 100,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/landing-pad/archive?{urlencode({'limit': str(limit)})}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/landing-pad/objects/{object_id}/access")
+async def get_landing_pad_object_access(
+    object_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/landing-pad/objects/{object_id}/access",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/landing-pad/objects/{object_id}/download")
+async def download_landing_pad_object(object_id: str, request: Request) -> StreamingResponse:
+    """Stream an authorized object without buffering it in the gateway."""
+    target_url = f"{settings.monitoring_adapter_url.rstrip('/')}/landing-pad/objects/{object_id}/download"
+
+    async def content():
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0)) as client:
+            async with client.stream("GET", target_url, headers={"X-Trace-Id": trace_id_from_header(request.headers.get("x-trace-id"))}) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    raise HTTPException(status_code=response.status_code, detail=body.decode("utf-8", errors="replace"))
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+
+    return StreamingResponse(content(), media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{object_id}"'})
 
 
 @app.get("/landing-pad/input")
@@ -1898,6 +2243,21 @@ async def ingest_rag_document(
     )
 
 
+@app.get("/context/strategy")
+async def get_context_strategy(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/context/strategy",
+        target_base=settings.context_agent_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/rag/evidence-drafts")
 async def list_evidence_rag_drafts(
     request: Request,
@@ -2007,14 +2367,31 @@ async def list_rag_documents(
     request: Request,
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="GET",
-        path="/rag/documents",
-        target_base=settings.context_agent_url,
-        payload={},
-        trace_id=trace_id_from_header(x_trace_id),
-    )
+    trace_id = trace_id_from_header(x_trace_id)
+    try:
+        return await guarded_proxy(
+            request=request,
+            method="GET",
+            path="/rag/documents",
+            target_base=settings.context_agent_url,
+            payload={},
+            trace_id=trace_id,
+            # Knowledge inventory enriches Copilot but must never hold the
+            # application open while the context agent rebuilds its index.
+            timeout_seconds=5.0,
+        )
+    except HTTPException as exc:
+        if exc.status_code != 502:
+            raise
+        logger.warning("rag_documents_degraded trace_id=%s", trace_id)
+        return {
+            "trace_id": trace_id,
+            "data": {
+                "documents": [],
+                "degraded": True,
+                "warning": "Knowledge inventory is temporarily unavailable. Other Copilot workflows remain available.",
+            },
+        }
 
 
 @app.get("/rag/documents/content")
@@ -2190,6 +2567,41 @@ async def get_incident(
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
+
+
+@app.get("/approval/capacity")
+async def get_approval_capacity(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path="/capacity", target_base=settings.approval_service_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=8.0)
+
+
+@app.put("/approval/capacity/{username}")
+async def put_approval_capacity(
+    username: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="PUT", path=f"/capacity/{username}", target_base=settings.approval_service_url, payload=payload, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=8.0)
+
+
+@app.get("/approval/assignments")
+async def get_approval_assignments(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path="/assignments", target_base=settings.approval_service_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=8.0)
+
+
+@app.post("/approval/auto-assign")
+async def post_approval_auto_assign(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="POST", path="/auto-assign", target_base=settings.approval_service_url, payload=payload, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=12.0)
 
 
 @app.post("/security/check")

@@ -28,6 +28,7 @@ from common.database import (
     IncidentProjectionRecord,
     JiraTicketLinkRecord,
     KnowledgeBaseRecord,
+    ContextKnowledgeRecord,
     MonitoringProfileRecord,
     MonitoringIntegrationRecord,
     MonitoringCredentialRecord,
@@ -42,9 +43,73 @@ from common.database import (
     PrometheusConfigRecord,
     RecordingRuleRecord,
     OnboardingStateRecord,
+    ObjectStorageRecord,
     PendingWorkflowRecord,
     ValidationHistoryRecord,
 )
+
+
+class ObjectStorageRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def upsert(self, values: dict[str, Any]) -> ObjectStorageRecord:
+        object_key = str(values["object_key"])
+        row = (await self.session.execute(select(ObjectStorageRecord).where(ObjectStorageRecord.object_key == object_key))).scalar_one_or_none()
+        if row is None:
+            row = ObjectStorageRecord(**values)
+            self.session.add(row)
+        else:
+            for key, value in values.items():
+                if key not in {"id", "object_key", "created_at"} and hasattr(row, key):
+                    setattr(row, key, value)
+        await self.session.flush()
+        return row
+
+    async def list(
+        self,
+        *,
+        limit: int = 100,
+        status: str | None = None,
+        application: str | None = None,
+        environment: str | None = None,
+        incident_id: UUID | None = None,
+        alert_id: UUID | None = None,
+    ) -> list[ObjectStorageRecord]:
+        stmt = select(ObjectStorageRecord)
+        if status:
+            stmt = stmt.where(ObjectStorageRecord.processing_status == status)
+        if application:
+            stmt = stmt.where(ObjectStorageRecord.application == application)
+        if environment:
+            stmt = stmt.where(ObjectStorageRecord.environment == environment)
+        if incident_id:
+            stmt = stmt.where(ObjectStorageRecord.incident_id == incident_id)
+        if alert_id:
+            stmt = stmt.where(ObjectStorageRecord.alert_id == alert_id)
+        result = await self.session.execute(stmt.order_by(ObjectStorageRecord.created_at.desc()).limit(max(1, min(int(limit), 500))))
+        return list(result.scalars().all())
+
+    async def get(self, object_id: UUID) -> ObjectStorageRecord | None:
+        return (await self.session.execute(select(ObjectStorageRecord).where(ObjectStorageRecord.id == object_id))).scalar_one_or_none()
+
+    async def retention_candidates(self, *, before: datetime, limit: int = 500) -> list[ObjectStorageRecord]:
+        stmt = (
+            select(ObjectStorageRecord)
+            .where(
+                ObjectStorageRecord.processing_status == "stored",
+                ObjectStorageRecord.ingested_at.is_not(None),
+                ObjectStorageRecord.ingested_at < before,
+            )
+            .order_by(ObjectStorageRecord.ingested_at.asc())
+            .limit(max(1, min(int(limit), 5000)))
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def mark_deleted(self, row: ObjectStorageRecord, *, deleted_at: datetime) -> None:
+        row.processing_status = "deleted"
+        row.metadata_payload = {**(row.metadata_payload or {}), "deleted_at": deleted_at.isoformat()}
+        await self.session.flush()
 from common.models import (
     Alert,
     Approval,
@@ -578,6 +643,7 @@ class IncidentRepository:
         await self.session.merge(
             AlertRecord(
                 id=self._require("alert.id", alert.id),
+                tenant_id=alert.tenant_id or "default",
                 source=self._require("alert.source", alert.source),
                 name=self._require("alert.name", alert.name),
                 service=self._require("alert.service", alert.service),
@@ -733,6 +799,64 @@ class IncidentRepository:
             enriched_rows.append(payload)
 
         return enriched_rows
+
+    async def list_alerts_source_balanced(self, limit: int = 500, tenant_id: str | None = None) -> list[dict[str, Any]]:
+        """Return recent alerts while reserving the latest row per durable source.
+
+        A global LIMIT alone lets bursty sources crowd low-volume sources out of
+        the intake UI. This performs one indexed latest-row lookup per distinct
+        source and fills the rest from the normal recent window.
+
+        `tenant_id`: when provided, scopes every query to that tenant only
+        (backed by idx_alerts_tenant). None returns across all tenants, which
+        callers should only do for internal/trusted contexts, not for a
+        caller-facing list endpoint.
+        """
+        safe_limit = max(1, min(int(limit), 5000))
+        sources_query = select(AlertRecord.source).distinct()
+        if tenant_id is not None:
+            sources_query = sources_query.where(AlertRecord.tenant_id == tenant_id)
+        sources_result = await self.session.execute(sources_query)
+        sources = [str(row[0] or "").strip() for row in sources_result.all() if str(row[0] or "").strip()]
+
+        reserved: list[AlertRecord] = []
+        for source in sources:
+            query = (
+                select(AlertRecord)
+                .options(load_only(AlertRecord.id, AlertRecord.payload, AlertRecord.created_at))
+                .where(AlertRecord.source == source)
+            )
+            if tenant_id is not None:
+                query = query.where(AlertRecord.tenant_id == tenant_id)
+            result = await self.session.execute(query.order_by(AlertRecord.created_at.desc()).limit(1))
+            record = result.scalar_one_or_none()
+            if record is not None:
+                reserved.append(record)
+
+        recent_query = select(AlertRecord).options(
+            load_only(AlertRecord.id, AlertRecord.payload, AlertRecord.created_at)
+        )
+        if tenant_id is not None:
+            recent_query = recent_query.where(AlertRecord.tenant_id == tenant_id)
+        recent_result = await self.session.execute(
+            recent_query.order_by(AlertRecord.created_at.desc()).limit(safe_limit)
+        )
+        recent = list(recent_result.scalars().all())
+        selected: list[AlertRecord] = []
+        seen: set[UUID] = set()
+        for record in [*reserved, *recent]:
+            if record.id in seen:
+                continue
+            seen.add(record.id)
+            selected.append(record)
+        selected = sorted(selected, key=lambda row: row.created_at, reverse=True)
+
+        # Preserve source reservations even when source count approaches limit.
+        reserved_ids = {row.id for row in reserved}
+        output = [row for row in selected if row.id in reserved_ids]
+        output.extend(row for row in selected if row.id not in reserved_ids)
+        output = sorted(output[:safe_limit], key=lambda row: row.created_at, reverse=True)
+        return [dict(row.payload) if isinstance(row.payload, dict) else {} for row in output]
 
     async def update_projection_document_flag(self, alert_id: str, available: bool) -> bool:
         """Set incident_projections.document_available for the incident linked to alert_id.
@@ -1491,6 +1615,7 @@ class IncidentRepository:
         await self.session.merge(
             IncidentRecord(
                 id=self._require("incident.id", incident.id),
+                tenant_id=incident.tenant_id or "default",
                 service=self._require("incident.service", incident.service),
                 environment=self._require("incident.environment", incident.environment),
                 severity=self._require("incident.severity", incident.severity.value),
@@ -1561,6 +1686,7 @@ class IncidentRepository:
         await self.session.merge(
             ApprovalRecord(
                 id=self._require("approval.id", approval.id),
+                tenant_id=approval.tenant_id or "default",
                 incident_id=self._require("approval.incident_id", approval.incident_id),
                 recommendation_id=self._require("approval.recommendation_id", approval.recommendation_id),
                 decision=self._require("approval.decision", approval.decision.value),
@@ -1636,13 +1762,31 @@ class IncidentRepository:
         await self.session.merge(
             ActionRecord(
                 id=self._require("action.id", action.id),
+                tenant_id=action.tenant_id or "default",
                 incident_id=self._require("action.incident_id", action.incident_id),
                 action_type=self._require("action.action_type", action.action_type),
                 target=self._require("action.target", action.target),
+                idempotency_key=action.idempotency_key,
                 status=self._require("action.status", action.status.value),
                 payload=action.model_dump(mode="json"),
             )
         )
+
+    async def find_action_by_idempotency_key(self, idempotency_key: str) -> RemediationAction | None:
+        """Look up a previously-persisted action by its deterministic idempotency key.
+
+        Used by remediation-engine to detect a redelivered approval/resolution
+        message and skip re-running a remediation plugin that already executed.
+        """
+        if not idempotency_key:
+            return None
+        result = await self.session.execute(
+            select(ActionRecord).where(ActionRecord.idempotency_key == idempotency_key).limit(1)
+        )
+        record = result.scalar_one_or_none()
+        if record is None:
+            return None
+        return RemediationAction.model_validate(record.payload)
 
     async def save_action_audit(self, action: RemediationAction, actor: str = "remediation-engine") -> None:
         payload = action.model_dump(mode="json")
@@ -1656,6 +1800,7 @@ class IncidentRepository:
         await self.session.merge(
             AuditLogRecord(
                 id=uuid4(),
+                tenant_id=action.tenant_id or "default",
                 actor=self._require("audit.actor", actor),
                 action=self._require("audit.action", "remediation.executed"),
                 resource_type="incident",
@@ -1664,10 +1809,11 @@ class IncidentRepository:
             )
         )
 
-    async def save_report(self, report: ResolutionReport) -> None:
+    async def save_report(self, report: ResolutionReport, *, tenant_id: str = "default") -> None:
         await self.session.merge(
             RcaReportRecord(
                 id=self._require("report.id", report.id),
+                tenant_id=tenant_id or "default",
                 incident_id=self._require("report.incident_id", report.incident_id),
                 root_cause=self._require("report.root_cause", report.root_cause),
                 impact=self._require("report.impact", report.impact),
@@ -1675,10 +1821,11 @@ class IncidentRepository:
             )
         )
 
-    async def save_recommendation_as_audit(self, recommendation: Recommendation) -> None:
+    async def save_recommendation_as_audit(self, recommendation: Recommendation, *, tenant_id: str = "default") -> None:
         await self.session.merge(
             AuditLogRecord(
                 id=self._require("recommendation.id", recommendation.id),
+                tenant_id=tenant_id or "default",
                 actor=self._require("audit.actor", "resolution-agent"),
                 action=self._require("audit.action", "recommendation.generated"),
                 resource_type="incident",
@@ -1687,10 +1834,11 @@ class IncidentRepository:
             )
         )
 
-    async def save_knowledge_base(self, report: ResolutionReport, service: str = "unknown") -> None:
+    async def save_knowledge_base(self, report: ResolutionReport, service: str = "unknown", *, tenant_id: str = "default") -> None:
         await self.session.merge(
             KnowledgeBaseRecord(
                 id=self._require("knowledge_base.id", report.id),
+                tenant_id=tenant_id or "default",
                 service=self._require("knowledge_base.service", service),
                 title=self._require("knowledge_base.title", f"RCA for incident {report.incident_id}"),
                 content=self._require("knowledge_base.content", report.knowledge_base_entry),
@@ -1698,6 +1846,99 @@ class IncidentRepository:
                 payload=report.model_dump(mode="json"),
             )
         )
+
+    async def find_context_knowledge(
+        self,
+        *,
+        tenant_id: str,
+        service: str,
+        environment: str,
+        alert_signature: str,
+        not_before: datetime,
+    ) -> dict[str, Any] | None:
+        result = await self.session.execute(
+            select(ContextKnowledgeRecord)
+            .where(
+                ContextKnowledgeRecord.tenant_id == tenant_id,
+                ContextKnowledgeRecord.service == service,
+                ContextKnowledgeRecord.environment == environment,
+                ContextKnowledgeRecord.alert_signature == alert_signature,
+                ContextKnowledgeRecord.collected_at >= not_before,
+            )
+            .order_by(ContextKnowledgeRecord.collected_at.desc())
+            .limit(1)
+        )
+        record = result.scalar_one_or_none()
+        if record is None:
+            return None
+        record.reuse_count = int(record.reuse_count or 0) + 1
+        return {
+            "id": str(record.id),
+            "source_alert_id": str(record.source_alert_id) if record.source_alert_id else None,
+            "source_incident_id": str(record.source_incident_id) if record.source_incident_id else None,
+            "reuse_count": record.reuse_count,
+            "payload": record.payload if isinstance(record.payload, dict) else {},
+            "resolution_payload": record.resolution_payload if isinstance(record.resolution_payload, dict) else {},
+            "collected_at": record.collected_at.isoformat(),
+        }
+
+    async def save_context_knowledge(
+        self,
+        *,
+        tenant_id: str,
+        service: str,
+        environment: str,
+        alert_name: str,
+        alert_signature: str,
+        source_alert_id: UUID,
+        source_incident_id: UUID,
+        payload: dict[str, Any],
+    ) -> str:
+        result = await self.session.execute(
+            select(ContextKnowledgeRecord)
+            .where(
+                ContextKnowledgeRecord.tenant_id == tenant_id,
+                ContextKnowledgeRecord.service == service,
+                ContextKnowledgeRecord.environment == environment,
+                ContextKnowledgeRecord.alert_signature == alert_signature,
+            )
+            .order_by(ContextKnowledgeRecord.updated_at.desc())
+            .limit(1)
+        )
+        record = result.scalar_one_or_none()
+        if record is None:
+            record = ContextKnowledgeRecord(
+                tenant_id=tenant_id,
+                service=service,
+                environment=environment,
+                alert_name=alert_name,
+                alert_signature=alert_signature,
+            )
+            self.session.add(record)
+        record.alert_name = alert_name
+        record.source_alert_id = source_alert_id
+        record.source_incident_id = source_incident_id
+        record.collected_at = utc_now()
+        record.payload = payload
+        record.resolution_payload = {}
+        record.updated_at = utc_now()
+        await self.session.flush()
+        return str(record.id)
+
+    async def attach_context_knowledge_resolution(
+        self,
+        knowledge_id: str | UUID,
+        resolution_payload: dict[str, Any],
+    ) -> bool:
+        record_id = self._parse_uuid(knowledge_id)
+        if record_id is None:
+            return False
+        record = await self.session.get(ContextKnowledgeRecord, record_id)
+        if record is None:
+            return False
+        record.resolution_payload = resolution_payload
+        await self.session.flush()
+        return True
 
     async def save_application(self, application: ApplicationRegistration) -> None:
         await self.session.merge(
@@ -2347,6 +2588,7 @@ class IncidentRepository:
         )
         self.session.add(
             AuditLogRecord(
+                tenant_id=audit_event.tenant_id or "default",
                 actor=audit_event.actor,
                 action=audit_event.event_type,
                 resource_type="application",

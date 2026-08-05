@@ -1,0 +1,21 @@
+import { useState, type FormEvent } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useRouteRuntime } from "../../app/routeRuntime";
+import { applicationKeys, applicationsQueryOptions, createApplication } from "../../services/applications";
+import type { NewApplication } from "../../schemas/applications";
+
+const initialForm: NewApplication = { tenant_id: "default", name: "", owner_team: "platform-ops", owner_email: null, environment: "prod", namespace: "default", region: "us-east-1", technology: "python-fastapi", metrics_endpoint: "http://api-gateway:8000/metrics", monitoring_platform: "prometheus", labels: { security: "internal", compliance: "sox", workload_kind: "Deployment" } };
+
+export default function IntegrationsRoute() {
+  const { session } = useRouteRuntime();
+  const queryClient = useQueryClient();
+  const applications = useQuery(applicationsQueryOptions(session.accessToken));
+  const [form, setForm] = useState(initialForm);
+  const [labelsText, setLabelsText] = useState("security=internal,compliance=sox,workload_kind=Deployment");
+  const mutation = useMutation({ mutationKey: ["applications", "create"], mutationFn: (payload: NewApplication) => createApplication(session.accessToken, payload), onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: applicationKeys.all }); setForm((current) => ({ ...current, name: "", owner_email: null })); } });
+  const update = (name: keyof NewApplication, value: string) => setForm((current) => ({ ...current, [name]: value }));
+  const submit = (event: FormEvent) => { event.preventDefault(); const labels = Object.fromEntries(labelsText.split(",").map((entry) => entry.trim()).filter(Boolean).map((entry) => { const [key, ...value] = entry.split("="); return [key.trim(), value.join("=").trim()]; }).filter(([key]) => key)); mutation.mutate({ ...form, labels }); };
+  return <section className="grid single-col"><article className="panel"><div className="panel-head"><h2>Integrations & Monitoring</h2><p>Register an application and start the real discovery, validation, rules, Prometheus, and dashboard onboarding chain.</p></div><form className="form" onSubmit={submit}><div className="filter-grid">{(["tenant_id", "name", "owner_team", "owner_email"] as const).map((name) => <label key={name}>{name.replaceAll("_", " ")}<input value={String(form[name] || "")} onChange={(event) => update(name, event.target.value)} required={name !== "owner_email"} /></label>)}</div><div className="filter-grid"><label>Environment<select value={form.environment} onChange={(event) => update("environment", event.target.value)}><option value="dev">dev</option><option value="staging">staging</option><option value="prod">prod</option></select></label>{(["namespace", "region", "technology"] as const).map((name) => <label key={name}>{name}<input value={form[name]} onChange={(event) => update(name, event.target.value)} required /></label>)}</div><label>Metrics Endpoint<input value={form.metrics_endpoint} onChange={(event) => update("metrics_endpoint", event.target.value)} required /></label><label>Labels (comma-separated key=value)<input value={labelsText} onChange={(event) => setLabelsText(event.target.value)} /></label><button className="button-primary" type="submit" disabled={mutation.isPending}>{mutation.isPending ? "Registering..." : "Register Application"}</button></form>{mutation.error ? <p className="error">{mutation.error.message}</p> : null}{mutation.isSuccess ? <p className="subtitle">Application onboarding was accepted and the list is refreshing.</p> : null}</article>
+    <article className="panel"><div className="panel-head"><h3>Configured Monitoring Integrations</h3><button className="button-secondary" onClick={() => applications.refetch()} disabled={applications.isFetching}>Refresh</button></div><div className="table-wrap"><table><thead><tr><th>Application</th><th>Endpoint</th><th>Environment</th><th>Status</th></tr></thead><tbody>{applications.data?.map((row) => <tr key={row.id}><td>{row.name}</td><td>{row.metrics_endpoint || "-"}</td><td>{row.environment || "-"}</td><td>{row.status || "-"}</td></tr>)}{!applications.data?.length ? <tr><td colSpan={4}>No monitoring integrations registered.</td></tr> : null}</tbody></table></div></article>
+  </section>;
+}
