@@ -285,6 +285,126 @@ async def test_resolution_agent_generates_recommendation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolution_agent_uses_severity_heuristic_risk_when_model_omits_risk_level() -> None:
+    """Default (deterministic fast-path) behavior must be unchanged: the fix step never
+    returns a risk_level, so recommendation.risk keeps falling back to the severity-only
+    heuristic exactly as before this change."""
+    alert = Alert(
+        source="prometheus",
+        name="PaymentLatencyHigh",
+        service="payments",
+        severity=AlertSeverity.CRITICAL,
+        description="payment latency after deployment",
+        labels={"deployment": "payments-api"},
+    )
+    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+
+    recommendation = await ResolutionIntelligenceAgent(model_router=static_router()).resolve(context)
+
+    assert recommendation.risk == "high"
+
+
+@pytest.mark.asyncio
+async def test_resolution_agent_prefers_model_risk_level_over_severity_heuristic() -> None:
+    class RiskAwareGateway:
+        async def generate(self, request) -> dict:
+            if request.task == "fix":
+                content = {
+                    "recommended_action": "Restart the affected pod",
+                    "risk_level": "low",
+                    "validation_queries": ["kubectl rollout status deployment/checkout -n prod"],
+                    "rollback_plan": "kubectl rollout undo deployment/checkout -n prod",
+                    "confidence_score": 0.8,
+                }
+            else:
+                content = {"root_cause": "Pod crash loop", "confidence_score": 0.8, "evidence_used": []}
+            return {
+                "model": "test-model",
+                "content": json.dumps(content),
+                "usage": {"provider": "test", "model": "test-model", "task": request.task},
+            }
+
+    alert = Alert(
+        source="prometheus",
+        name="PodCrashLoop",
+        service="checkout",
+        # CRITICAL severity would normally force risk="high" via the old heuristic --
+        # proves the model's risk_level ("low") genuinely overrides it, not just falls
+        # back to matching the same value by coincidence.
+        severity=AlertSeverity.CRITICAL,
+        description="pod crashloop",
+    )
+    incident = Incident(service="checkout", severity=AlertSeverity.CRITICAL, title="pod crash")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+
+    agent = ResolutionIntelligenceAgent(model_gateway=RiskAwareGateway())
+    agent.deep_analysis_enabled = True
+    recommendation = await agent.resolve(context)
+
+    assert recommendation.risk == "low"
+
+
+@pytest.mark.asyncio
+async def test_resolution_agent_ignores_unrecognized_model_risk_level() -> None:
+    class BadRiskGateway:
+        async def generate(self, request) -> dict:
+            if request.task == "fix":
+                content = {"recommended_action": "Restart the affected pod", "risk_level": "not-a-real-risk-tier"}
+            else:
+                content = {"root_cause": "Pod crash loop", "confidence_score": 0.8, "evidence_used": []}
+            return {
+                "model": "test-model",
+                "content": json.dumps(content),
+                "usage": {"provider": "test", "model": "test-model", "task": request.task},
+            }
+
+    alert = Alert(
+        source="prometheus", name="PodCrashLoop", service="checkout",
+        severity=AlertSeverity.CRITICAL, description="pod crashloop",
+    )
+    incident = Incident(service="checkout", severity=AlertSeverity.CRITICAL, title="pod crash")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+
+    agent = ResolutionIntelligenceAgent(model_gateway=BadRiskGateway())
+    agent.deep_analysis_enabled = True
+    recommendation = await agent.resolve(context)
+
+    assert recommendation.risk == "high"
+
+
+@pytest.mark.asyncio
+async def test_resolution_agent_adds_validation_and_rollback_without_changing_commands() -> None:
+    """Default (deterministic) fast path: validation_queries/rollback_plan must now be
+    populated, while `commands` -- which remediation-engine reads directly to execute --
+    must be byte-for-byte identical to before this change. Calls the heuristic directly
+    (rather than through the full resolve() pipeline) so the test isn't at the mercy of
+    what a mocked model echoes back as root_cause text."""
+    alert = Alert(
+        source="prometheus",
+        name="PodCrashLoop",
+        service="checkout",
+        severity=AlertSeverity.HIGH,
+        description="pod crashloop detected",
+    )
+    incident = Incident(service="checkout", severity=AlertSeverity.HIGH, title="checkout pod crash loop")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+
+    agent = ResolutionIntelligenceAgent(model_router=static_router())
+    action, commands, target, validation_queries, rollback_plan = agent._infer_action_and_commands(
+        context, root_cause="pod crashloop detected", model_action=""
+    )
+
+    assert action == "Restart pod"
+    assert commands == ["kubectl rollout restart deployment/checkout -n prod"]
+    assert validation_queries == [
+        "kubectl rollout status deployment/checkout -n prod --timeout=180s",
+        "kubectl get pods -n prod | findstr checkout",
+    ]
+    assert "kubectl rollout undo deployment/checkout -n prod" in rollback_plan
+
+
+@pytest.mark.asyncio
 async def test_resolution_agent_clamps_all_model_fallback_confidence() -> None:
     alert = Alert(
         source="prometheus",

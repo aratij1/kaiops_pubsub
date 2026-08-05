@@ -6,6 +6,8 @@ import { alertRowsQueryOptions, landingPadRowsQueryOptions } from "./services/al
 import { useOperationalEvents } from "./services/operationalEvents";
 import { beginOidcLogin, completeOidcLogin } from "./services/oidcClient";
 import { RouteRuntimeProvider } from "./app/routeRuntime";
+import ResolutionPanel from "./routes/incidents/ResolutionPanel";
+import RcaPanel from "./routes/incidents/RcaPanel";
 import { breadcrumbForPath, groupedNavigationForRole, navigationItemForPath, TAB_SHORTCUT_BY_CODE, VALID_LEGACY_TABS } from "./app/navigation";
 import { allowedLegacyTabsForRole, canAccessDestination } from "./app/permissions";
 import {
@@ -89,7 +91,6 @@ import {
   formatUtcTimestamp,
   clampQualityScore,
   formatQualityPercent,
-  qualityToneFromScore,
   normalizeEvaluationEnvelope,
   elapsedSeconds,
   normalizeTraceServiceName,
@@ -133,14 +134,11 @@ import {
   HistoricalTicketDiscoveryPanel,
   FlowTimelineGraph,
   UnifiedIncidentTimeline,
-  DiscoveryFlowView,
   parseStructuredIntelligence,
   intelligenceListText,
   groundedIntelligenceDisplay,
   canonicalIncidentAnalysis,
   downloadInvestigationArtifact,
-  EvidenceRagReview,
-  IntelligenceConnectionView,
   ContextRetrievalGraph,
   AgentEventsGraph,
   TopicFlowGraph,
@@ -9533,127 +9531,26 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                   {selectedAlertRegeneration.message ? <p className="subtitle">{selectedAlertRegeneration.message}</p> : null}
 
                   {homeDetailTab === "rca" ? (
-                    <section className="combined-analysis-page">
-                      <header className="combined-analysis-hero">
-                        <div>
-                          <span className="discovery-eyebrow">Investigation overview</span>
-                          <h3>Discovery + Context</h3>
-                          <p>See what KaiOps found, what it means, and what to do next.</p>
-                        </div>
-                        <div className="combined-analysis-kpis">
-                          <span><strong>{selectedAlertTimelineRows.length}</strong> timeline stages</span>
-                          <span><strong>{selectedAlertRagDocuments.length}</strong> linked docs</span>
-                          <span><strong>{formatQualityPercent(selectedAlertEvaluation.overallScore)}</strong> quality</span>
-                          <span><strong>{Array.isArray(selectedAlertRow?.source_channels) ? selectedAlertRow.source_channels.map(sourceChannelLabel).join(" + ") : sourceChannelLabel(normalizeAlertChannel(selectedAlertRow))}</strong> sources</span>
-                        </div>
-                      </header>
-                      <nav className="rca-view-tabs" aria-label="RCA views">
-                        {[['summary', 'Summary'], ['evidence', `Evidence (${selectedAiTrust.evidence.length})`], ['technical', 'Technical analysis']].map(([id, label]) => <button key={id} type="button" className={rcaDetailView === id ? "active" : ""} aria-current={rcaDetailView === id ? "page" : undefined} onClick={() => setRcaDetailView(id)}>{label}</button>)}
-                      </nav>
-                      {rcaDetailView === "summary" ? <section className="rca-decision-brief" aria-labelledby="rca-decision-title">
-                        <header className="rca-decision-header">
-                          <div>
-                            <span className="discovery-eyebrow">Operator decision brief</span>
-                            <h3 id="rca-decision-title">What happened and who is affected</h3>
-                          </div>
-                          <div className={`rca-confidence is-${selectedRcaDecision.confidence >= 0.85 ? "high" : selectedRcaDecision.confidence >= 0.7 ? "medium" : "low"}`}>
-                            <strong>{formatQualityPercent(selectedRcaDecision.confidence)}</strong>
-                            <span>{selectedRcaDecision.confidenceLabel}</span>
-                          </div>
-                        </header>
-                        {selectedRcaDecision.reviewRequired ? <div className="rca-review-banner" role="status"><strong>Human review required</strong><span>{selectedAiTrust.missing.length ? `${selectedAiTrust.missing.length} evidence gap(s) remain.` : "Confidence or grounding is below the auto-action threshold."}</span></div> : <div className="rca-ready-banner" role="status"><strong>Evidence is sufficiently grounded</strong><span>Confirm the target and safeguards before execution.</span></div>}
-                        <div className="rca-decision-grid">
-                          <article className="rca-decision-card rca-cause-card"><span>Probable root cause</span><h4>{selectedRcaDecision.rootCause}</h4><p>{selectedRcaDecision.status === "hypothesis" ? "This is a hypothesis, not a confirmed cause." : selectedRcaDecision.status === "insufficient-evidence" ? "More evidence is required before assigning a cause." : "Supported by the currently linked evidence."}</p></article>
-                          <article className="rca-decision-card rca-impact-card"><span>Business and customer impact</span><h4>{selectedRcaDecision.customerImpact}</h4><dl><div><dt>Service</dt><dd>{selectedRcaDecision.serviceImpact}</dd></div><div><dt>Dependencies</dt><dd>{selectedRcaDecision.dependencyImpact}</dd></div><div><dt>Urgency</dt><dd>{selectedRcaDecision.urgency}</dd></div>{selectedRcaDecision.impactedServices.length ? <div><dt>Affected services</dt><dd>{selectedRcaDecision.impactedServices.join(", ")}</dd></div> : null}</dl></article>
-                          <article className="rca-decision-card rca-action-card"><span>Recommended response</span><h4>{selectedRcaDecision.action}</h4><div className="rca-decision-actions">{selectedAiTrust.missing.length ? <button type="button" className="button-primary" onClick={() => setRcaDetailView("evidence")}>Collect missing evidence</button> : selectedRcaDecision.reviewRequired ? <button type="button" className="button-primary" onClick={() => setHomeDetailTab("resolution")}>Review resolution</button> : <button type="button" className="button-primary" onClick={() => setHomeDetailTab("approval")}>Continue to approval</button>}<button type="button" className="button-secondary" onClick={() => setRcaDetailView("evidence")}>Inspect evidence</button></div></article>
-                        </div>
-                        <div className="rca-quality-strip" aria-label="RCA quality indicators"><span><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong> grounding</span><span><strong>{formatQualityPercent(selectedAlertEvaluation.citationCoverage)}</strong> citations</span><span><strong>{selectedAiTrust.evidence.length}</strong> evidence records</span><span><strong>{selectedAiTrust.missing.length}</strong> evidence gaps</span></div>
-                        <section className="rca-reasoning-chain" aria-label="RCA reasoning chain"><article><span>1 · Observed fact</span><p>{selectedAiTrust.evidence.length ? `${selectedAiTrust.evidence.length} linked record(s) were collected from the incident context.` : "No linked evidence records are available."}</p></article><i aria-hidden="true">→</i><article><span>2 · AI inference</span><p>{selectedRcaDecision.rootCause}</p></article><i aria-hidden="true">→</i><article><span>3 · Operator action</span><p>{selectedRcaDecision.action}</p></article></section>
-                        <footer className="rca-analysis-meta"><span>Analysis status: <strong>{selectedRcaDecision.status.replaceAll("-", " ")}</strong></span><span>Last evidence: <strong>{selectedAiTrust.evidence[0]?.timestamp ? formatUtcTimestamp(selectedAiTrust.evidence[0].timestamp) : "timestamp not supplied"}</strong></span><span>Version: <strong>current persisted analysis</strong></span></footer>
-                      </section> : null}
-                      {rcaDetailView === "technical" ? <div className="combined-analysis-source-rail">
-                        <strong>Connected evidence</strong>
-                        <span className="source-badge source-prometheus">Prometheus</span>
-                        <span className="source-badge">Jaeger traces</span>
-                        <span className="source-badge">OpenSearch logs</span>
-                        <span className="source-badge source-email">Email</span>
-                        <span className="source-badge source-ticket">Jira / tickets</span>
-                        <span className="source-badge">Source code</span>
-                      </div> : null}
-                      {rcaDetailView === "evidence" ? <section className="ai-trust-panel" aria-labelledby="ai-trust-title">
-                        <header>
-                          <div><span className="discovery-eyebrow">Evidence transparency</span><h4 id="ai-trust-title">Why KaiOps reached this recommendation</h4></div>
-                          <span className={`workflow-pill workflow-pill-${qualityToneFromScore(selectedAlertEvaluation.confidenceScore) === "success" ? "active" : "idle"}`}>{formatQualityPercent(selectedAlertEvaluation.confidenceScore)} confidence</span>
-                        </header>
-                        <div className="ai-trust-classification" aria-label="AI trust classifications">
-                          <span><strong>Direct observation</strong>{selectedAiTrust.evidence.length} linked record(s)</span>
-                          <span><strong>AI inference</strong>{selectedAiTrust.analysis.root_cause || canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).rootCause}</span>
-                          <span><strong>Cached context</strong>{selectedAiTrust.evidence.filter((row) => row.cached).length} record(s)</span>
-                          <span><strong>Fresh discovery</strong>{selectedAiTrust.evidence.filter((row) => !row.cached).length} record(s)</span>
-                          <span><strong>Conflicting evidence</strong>{selectedAiTrust.conflicting.length ? selectedAiTrust.conflicting.join(", ") : "None declared by the analysis"}</span>
-                          <span><strong>Missing evidence</strong>{selectedAiTrust.missing.length ? selectedAiTrust.missing.join(", ") : "None declared by the analysis"}</span>
-                        </div>
-                        {selectedAiTrust.evidence.some((row) => row.cached && row.freshness === "Stale") ? <p className="ai-trust-warning" role="status">Cached context may predate the current deployment. Validate the target before acting.</p> : null}
-                        <div className="ai-trust-summary-grid">
-                          <div><strong>Confidence reasons</strong><ul>{selectedAiTrust.confidenceReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></div>
-                          <div><strong>Model / provider</strong><p>{selectedAiTrust.providerRow ? `${selectedAiTrust.providerRow.model} / ${selectedAiTrust.providerRow.provider}` : "Not supplied by the workflow contract"}</p></div>
-                          <div><strong>Fallback model</strong><p>{selectedAiTrust.fallbackUsed ? "Used; review required" : "No fallback usage reported"}</p></div>
-                          <div><strong>Recommendation attempts</strong><p>{selectedAlertRegeneration.message || "One persisted attempt is available; comparison history was not supplied."}</p></div>
-                        </div>
-                        <div className="table-wrap table-wrap-scroll-x ai-evidence-table">
-                          <table>
-                            <thead><tr><th>Source</th><th>Timestamp</th><th>Age</th><th>Freshness</th><th>Citation</th><th>Context</th></tr></thead>
-                            <tbody>{selectedAiTrust.evidence.length ? selectedAiTrust.evidence.map((row) => (
-                              <tr key={row.id}><td>{row.source}</td><td>{row.timestamp ? formatUtcTimestamp(row.timestamp) : "Not supplied"}</td><td>{row.age}</td><td>{row.freshness}</td><td><code>{row.citation || "Not supplied"}</code></td><td>{row.cached ? "Cached" : "Fresh discovery"}</td></tr>
-                            )) : <tr><td colSpan={6}>No linked evidence records. Treat the recommendation as ungrounded and require human review.</td></tr>}</tbody>
-                          </table>
-                        </div>
-                        <div className="ai-feedback-actions" aria-label="Recommendation feedback">
-                          <span>Was this RCA useful?</span>
-                          {["helpful", "incorrect", "incomplete"].map((decision) => <button key={decision} type="button" className={aiFeedbackState.decision === decision ? "button-primary" : "button-secondary"} disabled={aiFeedbackState.loading || !selectedAlertRecommendationId} onClick={() => submitAiRecommendationFeedback(decision)}>{decision[0].toUpperCase() + decision.slice(1)}</button>)}
-                        </div>
-                        {aiFeedbackState.message ? <p className="success">{aiFeedbackState.message}</p> : null}
-                        {aiFeedbackState.error ? <p className="error">{aiFeedbackState.error}</p> : null}
-                      </section> : null}
-                      {rcaDetailView === "evidence" ? <><IntelligenceConnectionView
-                        workflow={selectedAlertWorkflow}
-                        documents={selectedAlertRagDocuments}
-                        onDownloadDocument={downloadRagDocument}
-                      />
-                      <EvidenceRagReview alertId={selectedAlertId} />
-                      </> : null}
-                      {rcaDetailView === "technical" ? <details className="investigation-deep-dive" open>
-                        <summary>
-                          <span>
-                            <strong>Open technical retrieval trace</strong>
-                            <small>Inspect every discovery query, context lookup, document score, agent handoff, and raw evidence record</small>
-                          </span>
-                          <b>Expand</b>
-                        </summary>
-                        <div className="combined-analysis-grid">
-                          <article className="combined-analysis-card combined-analysis-discovery">
-                            <DiscoveryFlowView
-                              workflow={selectedAlertWorkflow}
-                              timelineRows={selectedAlertTimelineRows}
-                              selectedAlert={selectedAlertRow}
-                              compact
-                            />
-                          </article>
-                          <article className="combined-analysis-card combined-analysis-context">
-                            <ContextRetrievalGraph
-                              workflow={selectedAlertWorkflow}
-                              timelineRows={selectedAlertTimelineRows}
-                              documents={selectedAlertRagDocuments}
-                              evaluation={selectedAlertEvaluation}
-                              documentContract={selectedAlertDocumentContract}
-                              onLoadDocumentContent={loadRagDocumentContent}
-                              onDownloadDocument={downloadRagDocument}
-                              compact
-                            />
-                          </article>
-                        </div>
-                      </details> : null}
-                    </section>
+                    <RcaPanel
+                      rcaDetailView={rcaDetailView}
+                      onSetRcaDetailView={setRcaDetailView}
+                      onSetHomeDetailTab={setHomeDetailTab}
+                      selectedAlertTimelineRows={selectedAlertTimelineRows}
+                      selectedAlertRagDocuments={selectedAlertRagDocuments}
+                      selectedAlertEvaluation={selectedAlertEvaluation}
+                      selectedAlertRow={selectedAlertRow}
+                      selectedRcaDecision={selectedRcaDecision}
+                      selectedAiTrust={selectedAiTrust}
+                      selectedAlertWorkflow={selectedAlertWorkflow}
+                      selectedAlertRegeneration={selectedAlertRegeneration}
+                      selectedAlertRecommendationId={selectedAlertRecommendationId}
+                      selectedAlertDocumentContract={selectedAlertDocumentContract}
+                      selectedAlertId={selectedAlertId}
+                      aiFeedbackState={aiFeedbackState}
+                      onDownloadRagDocument={downloadRagDocument}
+                      onLoadRagDocumentContent={loadRagDocumentContent}
+                      onSubmitAiRecommendationFeedback={submitAiRecommendationFeedback}
+                    />
                   ) : null}
 
                   {homeDetailTab === "overview" ? (
@@ -10187,30 +10084,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                   ) : null}
 
                   {homeDetailTab === "resolution" ? (
-                    <section className="panel incident-workspace-section incident-resolution-section" role="tabpanel">
-                      <div className="panel-head">
-                        <div>
-                          <span className="workspace-section-number">04</span>
-                          <h3>Resolution</h3>
-                          <p>Review the proposed outcome before approval or guarded execution.</p>
-                        </div>
-                      </div>
-                      <div className="table-wrap">
-                        <table><tbody>
-                          <tr><th>Probable Root Cause</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).rootCause}</td></tr>
-                          <tr><th>Business Impact</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).impact}</td></tr>
-                          <tr><th>Recommended Action</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).action}</td></tr>
-                          <tr><th>Confidence</th><td>{formatQualityPercent(selectedAlertEvaluation.confidenceScore)}</td></tr>
-                          <tr><th>Approval Required</th><td>{selectedExecutionPlan.requiresApproval ? "yes" : "no"}</td></tr>
-                          <tr><th>Risk Tier</th><td>{selectedExecutionPlan.riskTier || "-"}</td></tr>
-                          <tr><th>Execution Mode</th><td>{selectedExecutionPlan.executionMode || "-"}</td></tr>
-                        </tbody></table>
-                      </div>
-                      <div className="incident-section-actions">
-                        <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("rca")}>Review RCA</button>
-                        <button type="button" className="button-primary" onClick={() => setHomeDetailTab(selectedExecutionPlan.requiresApproval ? "approval" : "execution")}>{selectedExecutionPlan.requiresApproval ? "Continue to Approval" : "Continue to Execution"}</button>
-                      </div>
-                    </section>
+                    <ResolutionPanel
+                      workflow={selectedAlertWorkflow}
+                      alertRow={selectedAlertRow}
+                      confidenceScore={selectedAlertEvaluation.confidenceScore}
+                      executionPlan={selectedExecutionPlan}
+                      onNavigateTab={setHomeDetailTab}
+                    />
                   ) : null}
 
                   {homeDetailTab === "execution" ? (
