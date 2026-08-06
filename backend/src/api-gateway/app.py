@@ -2569,6 +2569,40 @@ async def get_incident(
     )
 
 
+@app.get("/knowledge-graph")
+async def get_knowledge_graph(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/knowledge-graph",
+        target_base=settings.context_agent_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/knowledge-graph/context")
+async def get_knowledge_graph_context(
+    request: Request,
+    service: str,
+    depth: int = 2,
+    limit: int = 80,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/knowledge-graph/context",
+        target_base=settings.context_agent_url,
+        payload={},
+        params={"service": service, "depth": depth, "limit": limit},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/approval/capacity")
 async def get_approval_capacity(
     request: Request,

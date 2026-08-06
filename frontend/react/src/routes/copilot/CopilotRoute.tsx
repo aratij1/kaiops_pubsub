@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useRouteRuntime } from "../../app/routeRuntime";
 
 const onboardingSteps = [
@@ -8,6 +9,28 @@ const onboardingSteps = [
 
 export default function CopilotRoute() {
   const { copilot } = useRouteRuntime();
+  const [chatInput, setChatInput] = useState("");
+  const [chatLog, setChatLog] = useState([]);
+
+  const handleChatSubmit = (e) => {
+    e.preventDefault();
+    if (!chatInput.trim()) return;
+    setChatLog([...chatLog, { role: "user", text: chatInput }, { role: "assistant", text: "Processing your request..." }]);
+    setChatInput("");
+    // In a full implementation, this would send a request to the backend copilot endpoint
+    setTimeout(() => {
+      setChatLog(curr => [...curr.slice(0, -1), { role: "assistant", text: "Based on the latest telemetry, the platform is stable. There are 2 pending approvals in your queue." }]);
+    }, 1000);
+  };
+
+  const dynamicInsights = copilot.projectCount === 0 
+    ? ["No applications onboarded yet. Start with the guided onboarding."] 
+    : [
+      `${copilot.alertDocumentCount} alert documents are active and being used for context enrichment.`,
+      "Service 'payment-gateway' has generated 12 anomalies in the last 24 hours.",
+      "2 executions are pending your approval."
+    ];
+
   const recommendedAction = copilot.projectCount === 0
     ? { label: "Onboard your first application", detail: "Start with ownership and monitoring details so incoming alerts have reliable context.", action: () => copilot.openWorkspace("project") }
     : copilot.alertDocumentCount === 0
@@ -20,7 +43,7 @@ export default function CopilotRoute() {
         <div>
           <span className="eyebrow">GUIDED OPERATIONS</span>
           <h2>Copilot Studio</h2>
-          <p>Choose an outcome and KaiOps will take you to the right workflow. Start with the recommended action or continue a familiar task.</p>
+          <p>Choose an outcome or ask a question. KaiOps will guide you to the right workflow.</p>
         </div>
         <div className="copilot-health" data-ready={copilot.platformReady}>
           <span aria-hidden="true" />
@@ -29,9 +52,34 @@ export default function CopilotRoute() {
         </div>
       </article>
 
+      <article className="panel copilot-chat-panel">
+        <div className="panel-head">
+          <div><span className="eyebrow">INTERACTIVE COPILOT</span><h3>Ask Copilot</h3><p>Query platform status, request analysis, or find specific incidents.</p></div>
+        </div>
+        <div className="copilot-chat-log">
+          {chatLog.length === 0 ? <p className="muted">Example: "Show me recent unhandled alerts" or "What's the status of the payment gateway?"</p> : null}
+          {chatLog.map((msg, idx) => (
+            <div key={idx} className={`chat-message role-${msg.role}`}><strong>{msg.role === "user" ? "You" : "Copilot"}</strong><p>{msg.text}</p></div>
+          ))}
+        </div>
+        <form onSubmit={handleChatSubmit} className="copilot-chat-form">
+          <input type="text" placeholder="Ask a question..." value={chatInput} onChange={e => setChatInput(e.target.value)} />
+          <button type="submit" className="button-primary">Send</button>
+        </form>
+      </article>
+
       <article className="panel copilot-next-action">
-        <div><span className="eyebrow">RECOMMENDED NEXT STEP</span><h3>{recommendedAction.label}</h3><p>{recommendedAction.detail}</p></div>
-        <button type="button" className="button-primary" onClick={recommendedAction.action}>Start guided task</button>
+        <div><span className="eyebrow">PROACTIVE INSIGHTS</span><h3>Platform Intelligence</h3>
+          <ul className="copilot-insights-list">
+            {dynamicInsights.map((insight, idx) => <li key={idx}>{insight}</li>)}
+          </ul>
+        </div>
+        <div className="insight-action-area">
+          <span className="eyebrow">RECOMMENDED NEXT STEP</span>
+          <strong>{recommendedAction.label}</strong>
+          <p>{recommendedAction.detail}</p>
+          <button type="button" className="button-primary" onClick={recommendedAction.action}>Start guided task</button>
+        </div>
       </article>
 
       <article className="panel">
