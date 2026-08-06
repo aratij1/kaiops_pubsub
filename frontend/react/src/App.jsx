@@ -12183,8 +12183,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             </tbody>
                           </table>
                         </div>
+                      </article>
                     ) : null}
-                  </section>
+                  </div>
                 ) : null}
 
               </div>
