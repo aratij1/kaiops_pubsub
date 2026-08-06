@@ -10320,8 +10320,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
                 <p className="subtitle">Navigate by stage: Access handles identity, Setup covers landing pad and approvals, Knowledge stores alert intelligence.</p>
                 <p className="subtitle"><strong>Current Stage:</strong> {adminWorkspaceCaptions[adminWorkspace] || "Administrative workspace controls."}</p>
+              </article>
 
-                {adminWorkspace === "users" ? (
+              {adminWorkspace === "users" ? (
                   <div className="grid single-col">
                     <article className="panel">
                       <h3>Session</h3>
@@ -12187,7 +12188,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                     ) : null}
                   </div>
                 ) : null}
-
+                </section>
               </div>
               <aside className={`global-copilot-drawer ${isCopilotOpen ? "open" : ""}`}>
                 <div className="global-copilot-drawer-header">
