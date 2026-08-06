@@ -22,6 +22,12 @@
   --ink: var(--dm-color-text);
   --muted: var(--dm-color-text-soft);
   --card: var(--dm-color-panel);
+  --panel: var(--card);
+  --text: var(--ink);
+  --surface: var(--card);
+  --surface-soft: var(--bg-soft);
+  --panel-muted: var(--bg-soft);
+  --border: var(--line);
   --line: var(--dm-color-border);
   --line-strong: #a9c1dc;
   --accent: var(--dm-color-primary-600);
@@ -59,8 +65,10 @@ h4,
 }
 
 .hero {
-  background: linear-gradient(122deg, var(--dm-color-primary-700) 0%, var(--dm-color-primary-600) 48%, var(--dm-color-primary-500) 100%);
-  color: #fff5f5;
+  background:
+    radial-gradient(circle at 92% 12%, rgba(229, 115, 115, 0.28), transparent 34%),
+    linear-gradient(122deg, #122d47 0%, #194d68 62%, #7f1010 100%);
+  color: #f7fbff;
 }
 
 .hero h1,
@@ -75,7 +83,7 @@ h4,
 }
 
 .hero .scope-note {
-  color: #ffd8ad;
+  color: #ffe2b8;
 }
 
 .button-primary,
