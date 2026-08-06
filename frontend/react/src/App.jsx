@@ -12183,12 +12183,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             </tbody>
                           </table>
                         </div>
-                      </article>
                     ) : null}
+                  </section>
                 ) : null}
-              </article>
-            </section>
-          ) : null}
 
               </div>
               <aside className={`global-copilot-drawer ${isCopilotOpen ? "open" : ""}`}>
