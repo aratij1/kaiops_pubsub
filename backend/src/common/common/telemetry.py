@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 from opentelemetry import trace
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+try:
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+except (ImportError, Exception):
+    try:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    except (ImportError, Exception):
+        OTLPSpanExporter = None
+
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.sdk.resources import Resource
@@ -120,8 +127,12 @@ LLM_FALLBACKS = Counter("kaiops_llm_fallback_total", "Model fallback attempts", 
 def setup_tracing(app, settings: Settings) -> None:
     resource = Resource.create({"service.name": settings.service_name})
     provider = TracerProvider(resource=resource)
-    if settings.otlp_endpoint:
-        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.otlp_endpoint)))
+    if settings.otlp_endpoint and OTLPSpanExporter is not None:
+        try:
+            provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.otlp_endpoint)))
+        except Exception as exc:
+            logger.warning("Failed to initialize OTLP Span Processor", extra={"error": str(exc)})
+
     if getattr(settings, "observability_azure_monitor_enabled", False):
         _add_azure_monitor_exporter(provider, settings)
     trace.set_tracer_provider(provider)

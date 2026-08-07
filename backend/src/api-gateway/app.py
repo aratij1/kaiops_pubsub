@@ -14,6 +14,15 @@ import httpx
 import pymysql
 from api_gateway import SafetyAnalyzer
 from api_gateway.auth_policy import route_auth_rule
+from api_gateway.copilot import (
+    classify_intent,
+    compose_assignment_answer,
+    compose_capacity_answer,
+    compose_forbidden_onboarding_answer,
+    compose_onboarding_answer,
+    compose_unsupported_answer,
+    extract_incident_id,
+)
 from api_gateway.modules.users.models import SystemRole
 from api_gateway.modules.users.permissions import AuthContext, current_auth_context, current_tenant_id, require_roles
 from api_gateway.modules.users.router import router as user_management_router
@@ -2602,6 +2611,70 @@ async def post_approval_auto_assign(
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
     return await guarded_proxy(request=request, method="POST", path="/auto-assign", target_base=settings.approval_service_url, payload=payload, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=12.0)
+
+
+@app.post("/copilot/query")
+async def post_copilot_query(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Phase 0 Copilot: deterministic intent matching only, no model-router call.
+
+    Reuses the exact same read-only proxy path (`proxy()` against the existing
+    /capacity, /assignments, /onboarding/state endpoints) that the Capacity,
+    Assignments, and Onboarding pages already use -- no assignment/onboarding
+    business logic is duplicated here, only composed into a plain-language
+    answer."""
+    query = str(payload.get("query") or "").strip()
+    trace_id = trace_id_from_header(x_trace_id)
+    if not query:
+        raise HTTPException(status_code=422, detail="query is required")
+
+    intent = classify_intent(query)
+    auth = getattr(request.state, "auth", None)
+
+    try:
+        if intent == "onboarding":
+            # /onboarding/* is Administrator-only per auth_policy.py's route table;
+            # /copilot/query is a different path prefix and would not otherwise
+            # inherit that check, so it is re-applied explicitly here. `auth` is
+            # only None when the auth middleware itself is bypassed (local/demo/
+            # test environment), matching every other route's behavior in that mode.
+            if auth is not None and auth.role != SystemRole.ADMINISTRATOR.value:
+                result = compose_forbidden_onboarding_answer()
+            else:
+                _, response_payload = await proxy(
+                    method="GET", path="/onboarding/state", target_base=settings.monitoring_adapter_url,
+                    payload={}, trace_id=trace_id,
+                )
+                rows = response_payload.get("rows", []) if isinstance(response_payload, dict) else []
+                result = compose_onboarding_answer(rows)
+        elif intent == "capacity":
+            _, response_payload = await proxy(
+                method="GET", path="/capacity", target_base=settings.approval_service_url,
+                payload={}, trace_id=trace_id,
+            )
+            rows = response_payload.get("rows", []) if isinstance(response_payload, dict) else []
+            result = compose_capacity_answer(rows)
+        elif intent == "assignment":
+            _, response_payload = await proxy(
+                method="GET", path="/assignments", target_base=settings.approval_service_url,
+                payload={}, trace_id=trace_id,
+            )
+            rows = response_payload.get("rows", []) if isinstance(response_payload, dict) else []
+            result = compose_assignment_answer(rows, extract_incident_id(query))
+        else:
+            result = compose_unsupported_answer(query)
+    except httpx.HTTPError:
+        result = {
+            "intent": intent,
+            "answer": "I couldn't reach the service that has this data right now. Please try again shortly.",
+            "data": {},
+            "links": [],
+        }
+
+    return {"trace_id": trace_id, **result}
 
 
 @app.post("/security/check")

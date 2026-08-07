@@ -5332,10 +5332,16 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         || recommendation?.policy_reason
         || "-",
       requiresApproval:
+        // Unlike the other fields on this object, this one is consumed as a
+        // boolean (ResolutionPanel: `requiresApproval ? "yes" : "no"` and to
+        // pick the "Continue to Approval"/"Continue to Execution" target) --
+        // the shared "-" unknown-value placeholder would be truthy there and
+        // silently read as "yes, approval required" when it really means
+        // "no routing/decision data available yet".
         selectedAlertRouting?.requires_approval
         ?? decision?.requires_approval
         ?? selectedAlertWorkflow?.approval?.required
-        ?? "-",
+        ?? false,
       workflow: selectedAlertRouting?.workflow || decision?.workflow || selectedAlertWorkflow?.scenario?.id || "-",
       executionMode: selectedAlertRouting?.execution_mode || decision?.execution_mode || "-",
       riskTier: selectedAlertRouting?.risk_tier || decision?.risk_tier || "-",

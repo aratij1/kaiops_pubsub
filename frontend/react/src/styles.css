@@ -425,6 +425,11 @@ body {
 .copilot-inventory dt { color: var(--muted); font-size: 12px; }
 .copilot-inventory dd { margin: 3px 0 0; font: 700 24px "Space Grotesk", sans-serif; }
 .copilot-help { padding: 12px; color: var(--muted); border-left: 3px solid #2f9077; background: #f2faf7; line-height: 1.45; }
+.copilot-ask-form { display: flex; gap: 10px; margin-top: 10px; }
+.copilot-ask-form input { flex: 1 1 auto; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; font-size: 14px; }
+.copilot-answer { margin-top: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); line-height: 1.5; }
+.copilot-answer-links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.copilot-ask-accomplish-head { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--line); }
 
 .copilot-tone-ops { border-color: #cfe0ff; background: linear-gradient(180deg, #f8fbff 0%, #eef4ff 100%); }
 .copilot-tone-bus { border-color: #c9ead6; background: linear-gradient(180deg, #f7fcf8 0%, #eef9f2 100%); }
