@@ -38,7 +38,7 @@ export default function CopilotRoute() {
         <div>
           <span className="eyebrow">GUIDED OPERATIONS</span>
           <h2>Copilot Studio</h2>
-          <p>Choose an outcome and KaiOps will take you to the right workflow. Start with the recommended action or continue a familiar task.</p>
+          <p>Choose an outcome or ask a question. KaiOps will guide you to the right workflow.</p>
         </div>
         <div className="copilot-health" data-ready={copilot.platformReady}>
           <span aria-hidden="true" />

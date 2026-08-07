@@ -233,6 +233,16 @@ groups:
           summary: "High network packet loss"
           description: "HTTP probe success ratio dropped below 95% for target {{ $labels.instance }}."
 
+      - alert: ExternalApplicationUnavailable
+        expr: probe_success{job="blackbox", external="true"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          source: public-internet-blackbox
+        annotations:
+          summary: "External application {{ $labels.application }} is unavailable"
+          description: "HTTPS probe failed for {{ $labels.instance }} in {{ $labels.environment }}. Synthetic={{ $labels.synthetic }}."
+
       - alert: RabbitMQQueueBacklog
         # Sized for a 10k-alerts/day workload (~7/min average, bursts of a
         # few hundred/hour during an incident storm), not a much larger

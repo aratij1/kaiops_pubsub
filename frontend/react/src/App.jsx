@@ -8,6 +8,7 @@ import { beginOidcLogin, completeOidcLogin } from "./services/oidcClient";
 import { RouteRuntimeProvider } from "./app/routeRuntime";
 import ResolutionPanel from "./routes/incidents/ResolutionPanel";
 import RcaPanel from "./routes/incidents/RcaPanel";
+import CopilotRoute from "./routes/copilot/CopilotRoute";
 import { breadcrumbForPath, groupedNavigationForRole, navigationItemForPath, TAB_SHORTCUT_BY_CODE, VALID_LEGACY_TABS } from "./app/navigation";
 import { allowedLegacyTabsForRole, canAccessDestination } from "./app/permissions";
 import {
@@ -356,6 +357,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const [applicationToMonitor, setApplicationToMonitor] = useState("KaiOps");
   const [monitorApplications, setMonitorApplications] = useState(defaultMonitorApplications);
   const [activeTab, setActiveTab] = useState(() => (VALID_LEGACY_TABS.has(initialTab) ? initialTab : "home"));
+  const [isCopilotOpen, setIsCopilotOpen] = useState(false);
   const [uiDensity, setUiDensity] = useState("comfortable");
   const [uiTheme, setUiTheme] = useState("auto");
   const [health, setHealth] = useState({ loading: false, ok: false, message: "Not checked" });
@@ -8654,6 +8656,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               <HealthBadge ok={health.ok} label={health.message} />
               <span className="subtitle">Monitoring: {selectedMonitorScopeLabel}</span>
               <span className="subtitle">Signed in: {adminSession?.user?.username || "-"} ({adminSession?.user?.role_name || "-"})</span>
+              <button className="button-primary" type="button" onClick={() => setIsCopilotOpen(!isCopilotOpen)}>
+                <Bot size={16} /> {isCopilotOpen ? "Close Copilot" : "Ask Copilot"}
+              </button>
               <button className="button-secondary" type="button" onClick={adminLogout}>Logout</button>
             </div>
             {currentNavigationItem.related?.length ? <nav className="contextual-navigation" aria-label="Related workflow destinations">
@@ -8927,9 +8932,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               update: updateAdminUser,
               reset: resetAdminUserPassword,
             },
-          }}>{routeOutlet}</RouteRuntimeProvider>
-
-          {activeTab === "home" ? (
+          }}>
+            <div className={`workspace-with-copilot ${isCopilotOpen ? "copilot-open" : ""}`}>
+              <div className="workspace-main-content">
+                {routeOutlet}
             <section className={`grid single-col ${routeOutlet ? "legacy-dashboard-cockpit" : ""}`}>
               <article className={`panel role-dashboard role-dashboard-${roleDashboard.kind.toLowerCase()}`}>
                 <div className="panel-head role-dashboard-header">
@@ -10282,7 +10288,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                 </article>
               )}
             </section>
-          ) : null}
 
           {activeTab === "admin" && isAdministrator && (!routeOutlet || currentSearch.includes("workspace=knowledge")) ? (
             <section className="grid single-col">
@@ -10320,8 +10325,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
                 <p className="subtitle">Navigate by stage: Access handles identity, Setup covers landing pad and approvals, Knowledge stores alert intelligence.</p>
                 <p className="subtitle"><strong>Current Stage:</strong> {adminWorkspaceCaptions[adminWorkspace] || "Administrative workspace controls."}</p>
+              </article>
 
-                {adminWorkspace === "users" ? (
+              {adminWorkspace === "users" ? (
                   <div className="grid single-col">
                     <article className="panel">
                       <h3>Session</h3>
@@ -12187,9 +12193,20 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                     ) : null}
                   </div>
                 ) : null}
-              </article>
-            </section>
-          ) : null}
+                </section>
+              ) : null}
+              </div>
+              <aside className={`global-copilot-drawer ${isCopilotOpen ? "open" : ""}`}>
+                <div className="global-copilot-drawer-header">
+                  <h3>Ask Copilot</h3>
+                  <button className="button-secondary" onClick={() => setIsCopilotOpen(false)}>Close</button>
+                </div>
+                <div className="global-copilot-drawer-body">
+                  <CopilotRoute />
+                </div>
+              </aside>
+            </div>
+          </RouteRuntimeProvider>
 
         </section>
       </div>
