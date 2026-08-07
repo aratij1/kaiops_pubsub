@@ -9,20 +9,20 @@ from enum import StrEnum
 from typing import Any, TypedDict
 
 import httpx
-
 from ai_workbench_common.agent_runtime import AgentRuntime, ContextFailure, ValidationError
 from ai_workbench_common.agentic import AgentContext, BaseAgent
 from ai_workbench_common.memory_store import InMemoryStore, MemoryStore
 from ai_workbench_common.model_evaluation import AzureAIEvaluationClient, EvaluationResult, build_quality_evaluation
 from ai_workbench_common.model_gateway import GenerationRequest, HttpModelGateway, ModelGateway, RouterModelGateway
 from ai_workbench_common.models import Context, Evidence
-from common.config import get_settings
-from common.models import AlertSeverity, Recommendation
 from ai_workbench_common.prompts import (
     PROMPT_ASSESS_IMPACT,
     PROMPT_IDENTIFY_ROOT_CAUSE,
     PROMPT_RECOMMEND_REMEDIATION,
 )
+from ai_workbench_common.resolution_quality import assess_evidence_quality, remediation_quality_gate
+from common.config import get_settings
+from common.models import AlertSeverity, Recommendation
 from langgraph.graph import END, StateGraph
 
 logger = logging.getLogger("kaiops.resolution_agent")
@@ -904,6 +904,21 @@ class ResolutionIntelligenceAgent(BaseAgent):
             "code_review_findings": code_findings,
             "code_review_finding_evidence_ids": code_finding_ids,
         }
+        evidence_quality = assess_evidence_quality(
+            state["gathered_context"].get("discovery_evidence", []),
+            accepted_ids=cited,
+            alternative_causes=parsed.get("alternative_causes", []),
+        )
+        model_confidence = min(model_confidence, evidence_quality.confidence_ceiling)
+        state["rca_analysis"]["confidence_score"] = model_confidence
+        state["rca_analysis"]["evidence_quality"] = {
+            "independent_sources": evidence_quality.independent_sources,
+            "direct_evidence": evidence_quality.direct_evidence,
+            "contradictory": evidence_quality.contradictory,
+            "sufficiency": evidence_quality.sufficiency,
+            "confidence_ceiling": evidence_quality.confidence_ceiling,
+            "reasons": list(evidence_quality.reasons),
+        }
         state["rationale"] = (
             f"Model {response['model']} proposed the RCA with {len(cited)} validated evidence citation(s); "
             f"confidence={model_confidence:.2f}."
@@ -1073,7 +1088,16 @@ class ResolutionIntelligenceAgent(BaseAgent):
     async def generate_fix(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
         prompt = PROMPT_RECOMMEND_REMEDIATION
-        payload = {"service": context.alert.service, "runbook": context.runbook, "root_cause": state.get("root_cause", "")}
+        payload = {
+            "service": context.alert.service,
+            "environment": context.alert.environment,
+            "runbook": context.runbook,
+            "root_cause": state.get("root_cause", ""),
+            "rca_analysis": state.get("rca_analysis", {}),
+            "impact_analysis": state.get("impact_analysis", {}),
+            "evidence": state.get("gathered_context", {}).get("discovery_evidence", []),
+            "recent_changes": state.get("gathered_context", {}).get("recent_changes", []),
+        }
         if self.deep_analysis_enabled:
             response = await self._generate_with_fallback(
                 context=context,
@@ -1165,6 +1189,10 @@ class ResolutionIntelligenceAgent(BaseAgent):
             score += 0.03
         if not state.get("rca_analysis", {}).get("evidence_used"):
             score = min(score, 0.49)
+        evidence_ceiling = float(
+            state.get("rca_analysis", {}).get("evidence_quality", {}).get("confidence_ceiling") or 0.49
+        )
+        score = min(score, evidence_ceiling)
 
         fallback_hits = 0
         for usage in state.get("model_usage", []):
@@ -1304,11 +1332,14 @@ class ResolutionIntelligenceAgent(BaseAgent):
             str(usage.get("error") or usage.get("fallback_reason") or "model-router fallback")
             for usage in fallback_usages
         )[:800] or None
-        recommendation.metadata["quality_gate"] = {
-            "trusted_for_auto_execution": not fallback_usages and recommendation.confidence >= 0.9,
-            "requires_human_review": bool(fallback_usages) or recommendation.confidence < 0.75,
-            "reason": "model fallback used" if fallback_usages else "confidence policy",
-        }
+        recommendation.metadata["quality_gate"] = remediation_quality_gate(
+            state.get("remediation_analysis", {}),
+            rca_confidence=float(rca_analysis.get("confidence_score") or 0.0),
+            impact_confidence=float(impact_analysis.get("confidence_score") or 0.0),
+            risk=recommendation.risk,
+            environment=str(context.alert.environment or "prod"),
+            fallback_used=bool(fallback_usages),
+        )
         citations = [f"incident://{context.incident_id}"]
         if runbook_present:
             citations.append(f"runbook://{context.alert.service}")

@@ -1,0 +1,31 @@
+[
+  {
+    "incident_id": "sample-checkout-001",
+    "service": "checkout",
+    "environment": "staging",
+    "alert_type": "http-500",
+    "symptoms": ["checkout requests return HTTP 500", "worker health check fails"],
+    "timestamps": ["2026-08-01T10:00:00Z"],
+    "affected_components": ["checkout-api", "checkout-worker"],
+    "logs": [{"evidence_id": "log-001", "source": "opensearch", "uri": "opensearch://sample/log-001", "summary": "worker pool exhausted", "confidence": 0.9, "attributes": {}}],
+    "metrics": [{"evidence_id": "metric-001", "source": "prometheus", "uri": "prometheus://sample/metric-001", "summary": "worker availability below SLO", "confidence": 0.95, "attributes": {}}],
+    "traces": [], "related_tickets": [], "recent_changes": [],
+    "dependencies": ["inventory"], "business_criticality": "high",
+    "error_codes": ["E500"], "resolution": "restart one unhealthy staging worker",
+    "resolution_successful": true, "reviewed": true
+  },
+  {
+    "incident_id": "sample-checkout-002",
+    "service": "checkout",
+    "environment": "staging",
+    "alert_type": "http-500",
+    "symptoms": ["checkout requests return HTTP 500", "worker health check fails"],
+    "timestamps": ["2026-08-02T10:00:00Z"],
+    "affected_components": ["checkout-api", "checkout-worker"],
+    "logs": [{"evidence_id": "ticket-002", "source": "jira", "uri": "jira://sample/INC-002", "summary": "engineer-confirmed worker exhaustion", "confidence": 1.0, "attributes": {}}],
+    "metrics": [], "traces": [], "related_tickets": [], "recent_changes": [],
+    "dependencies": ["inventory"], "business_criticality": "high",
+    "error_codes": ["E500"], "resolution": "restart one unhealthy staging worker",
+    "resolution_successful": true, "reviewed": true
+  }
+]

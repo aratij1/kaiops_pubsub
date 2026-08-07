@@ -9,12 +9,14 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi import HTTPException
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from common.config import Settings
 from common.database import create_engine, create_schema, create_session_factory
 from common.event_publishers import build_event_publisher
 from common.logging import configure_logging
+from common.resilience import CircuitOpenError
 from common.telemetry import metrics_response, setup_tracing
 
 _MAX_HTTP_BODY_LOG_BYTES = 4096
@@ -113,6 +115,17 @@ def create_app(
 
     app = FastAPI(title=title, lifespan=lifespan)
     setup_tracing(app, settings)
+
+    @app.exception_handler(CircuitOpenError)
+    async def database_circuit_open(_request: Request, exc: CircuitOpenError) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": "5"},
+            content={
+                "detail": "The database is recovering. Please retry in a few seconds.",
+                "code": "database_temporarily_unavailable",
+            },
+        )
 
     @app.middleware("http")
     async def log_http_io(request: Request, call_next):

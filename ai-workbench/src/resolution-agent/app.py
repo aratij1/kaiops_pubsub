@@ -262,6 +262,23 @@ async def resolve(context: Context, publish_events: bool = True) -> Recommendati
         recommendation=recommendation,
         decision_payload={},
     )
+    # Temporal invokes this endpoint with publish_events=false because it owns
+    # durable orchestration and must not create a second bus delivery. The
+    # recommendation is still a business result and must always be persisted;
+    # previously it was returned to Temporal and then lost from the incident
+    # projection, leaving the cockpit permanently stuck at "RCA pending".
+    if settings.database_enabled:
+        async with app.state.session_factory() as session:
+            repo = IncidentRepository(session)
+            await repo.save_recommendation_as_audit(recommendation)
+            await session.commit()
+    await _persist_resolution_event(
+        app=app,
+        context=context,
+        incident=synthetic_incident,
+        recommendation=recommendation,
+        decision_payload={},
+    )
     if publish_events:
         await app.state.producer.publish(RESOLUTION_EVENTS, payload_out)
     return recommendation

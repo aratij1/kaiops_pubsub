@@ -200,6 +200,33 @@ function redactOperationalSecrets(value) {
     .replace(/(authorization:\s*bearer\s+)[^\s'";]+/gi, "$1[REDACTED]");
 }
 
+function isTestApplicationRecord(row) {
+  const metadata = row?.metadata && typeof row.metadata === "object" ? row.metadata : {};
+  const labels = row?.labels && typeof row.labels === "object" ? row.labels : {};
+  const environment = String(row?.environment || metadata?.environment || labels?.environment || "").toLowerCase();
+  const projectType = String(row?.project_type || metadata?.project_type || labels?.project_type || "").toLowerCase();
+  const name = String(row?.name || row?.application || row?.project_name || row?.project || "").toLowerCase();
+  return isGeneratedOrTestAlert(row)
+    || ["test", "testing", "qa", "demo", "sandbox"].includes(environment)
+    || ["test", "demo", "sample"].includes(projectType)
+    || /(^|[-_\s])(test|demo|sample|sandbox)([-_\s]|$)/.test(name);
+}
+
+function uniqueMonitorApplications(names) {
+  const canonicalCore = new Map(CORE_MONITOR_PROJECTS.map((name) => [normalizeMonitorToken(name), name]));
+  const unique = new Map();
+  names.forEach((value) => {
+    const name = String(value || "").trim();
+    const key = normalizeMonitorToken(name);
+    if (!key || [normalizeMonitorToken(REAL_USE_CASE_SCOPE), normalizeMonitorToken(TEST_USE_CASE_SCOPE)].includes(key)) {
+      return;
+    }
+    const canonical = canonicalCore.get(key) || name;
+    if (!unique.has(key) || canonicalCore.has(key)) unique.set(key, canonical);
+  });
+  return Array.from(unique.values());
+}
+
 // Memoized so an unrelated App() state change (modal open, admin toggle, the
 // 4s live-stream staleness watchdog tick, ...) doesn't re-run the row-mapping
 // for the whole visible alert list on every render — only when these props
@@ -417,6 +444,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const [selectedApprovalIncidentId, setSelectedApprovalIncidentId] = useState("");
   const [selectedAlertData, setSelectedAlertData] = useState({ loading: false, payload: null, error: "", alertId: "" });
   const [selectedAlertRegeneration, setSelectedAlertRegeneration] = useState({ loading: false, message: "", error: "" });
+  const automaticRcaAttemptsRef = useRef(new Set());
   const [aiFeedbackState, setAiFeedbackState] = useState({ loading: false, decision: "", message: "", error: "" });
   const [selectedAlertDocumentLinks, setSelectedAlertDocumentLinks] = useState({
     loading: false,
@@ -1043,14 +1071,24 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       });
       return;
     }
+    const immediatePayload = fallbackRow && typeof fallbackRow === "object"
+      ? { data: { alert: fallbackRow, incident: null, context: { metadata: { processing_state: "loading" } }, timeline: [] } }
+      : null;
     setSelectedAlertData((prev) => ({
       loading: background ? prev.loading : true,
-      payload: String(prev.alertId || "") === normalized ? prev.payload : null,
+      payload: String(prev.alertId || "") === normalized ? prev.payload : immediatePayload,
       error: "",
       alertId: normalized,
     }));
     try {
-      const payload = await fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, { timeoutMs: 25000 });
+      const payload = await queryClient.fetchQuery({
+        queryKey: ["alert-processed-result", normalized],
+        queryFn: () => fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, {
+          timeoutMs: 12000,
+          maxAttempts: 1,
+        }),
+        staleTime: background ? 15000 : 5000,
+      });
       setSelectedAlertData((prev) => {
         if (String(prev.alertId || "") !== normalized) {
           return prev;
@@ -1175,6 +1213,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     setActiveTab("home");
     setHomeDetailTab("overview");
     loadAlertDetails(alertId, selectedRow);
+    onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(String(alertId))}`);
+    window.setTimeout(() => {
+      alertDetailsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      alertDetailsRef.current?.focus({ preventScroll: true });
+    }, 100);
   }
 
   function openAlertDetailsFromIncident(row) {
@@ -1498,15 +1541,17 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const data = unwrap(payload);
       const applicationRows = Array.isArray(data?.rows) ? data.rows : [];
       setMonitoringApps({ loading: false, rows: applicationRows, error: "" });
-      const registered = applicationRows
-        .map((row) => String(row?.name || "").trim())
+      const registered = [
+        ...applicationRows.map((row) => String(row?.name || row?.application || "").trim()),
+        ...alerts.rows.map((row) => String(
+          row?.application || row?.project_name || row?.project || row?.labels?.application || ""
+        ).trim()),
+      ]
         .filter(Boolean);
-      const ordered = Array.from(new Set([
+      const ordered = uniqueMonitorApplications([
         ...CORE_MONITOR_PROJECTS.filter((name) => registered.some((item) => item.toLowerCase() === name.toLowerCase())),
         ...registered,
-        REAL_USE_CASE_SCOPE,
-        TEST_USE_CASE_SCOPE,
-      ]));
+      ]);
       const options = ordered.length ? ordered : defaultMonitorApplications;
       setMonitorApplications(options);
       setApplicationToMonitor((current) => (
@@ -4661,6 +4706,19 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     loadMonitorApplications();
   }, [adminSession.accessToken]);
 
+  useEffect(() => {
+    const discovered = alerts.rows
+      .map((row) => String(
+        row?.application || row?.project_name || row?.project || row?.labels?.application || ""
+      ).trim())
+      .filter(Boolean);
+    if (!discovered.length) return;
+    setMonitorApplications((current) => {
+      const merged = uniqueMonitorApplications([...current, ...discovered]);
+      return merged.join("\u0000") === current.join("\u0000") ? current : merged;
+    });
+  }, [alerts.rows]);
+
   const latestWorkflow = useMemo(() => {
     return workflowState?.result?.data || {};
   }, [workflowState]);
@@ -4780,6 +4838,30 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     () => monitorScopeLabel(applicationToMonitor),
     [applicationToMonitor],
   );
+  const monitorApplicationGroups = useMemo(() => {
+    const rowByName = new Map();
+    monitoringApps.rows.forEach((row) => {
+      const name = String(row?.name || row?.application || "").trim();
+      if (name) rowByName.set(name.toLowerCase(), row);
+    });
+    alerts.rows.forEach((row) => {
+      const name = String(row?.application || row?.project_name || row?.project || "").trim();
+      if (name && !rowByName.has(name.toLowerCase())) rowByName.set(name.toLowerCase(), row);
+    });
+    const groups = { applications: [], tests: [], platform: [] };
+    monitorApplications.forEach((name) => {
+      if ([REAL_USE_CASE_SCOPE, TEST_USE_CASE_SCOPE].includes(name)) return;
+      const row = rowByName.get(String(name).toLowerCase());
+      if (CORE_MONITOR_PROJECTS.some((item) => item.toLowerCase() === String(name).toLowerCase())) {
+        groups.platform.push(name);
+      } else if (row && isTestApplicationRecord(row)) {
+        groups.tests.push(name);
+      } else {
+        groups.applications.push(name);
+      }
+    });
+    return groups;
+  }, [alerts.rows, monitorApplications, monitoringApps.rows]);
 
   const visibleAlertSourceSummary = useMemo(() => {
     const summary = { prometheus: 0, telemetry: 0, email: 0, ticket: 0, log: 0 };
@@ -4812,6 +4894,22 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     );
     return snapshotId === selectedAlertId ? selectedAlertSnapshot : null;
   }, [visibleAlerts, selectedAlertId, selectedAlertSnapshot]);
+
+  useEffect(() => {
+    const alertId = String(selectedAlertId || "").trim();
+    const payload = selectedAlertData.payload;
+    const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+    const historicalIncidentWithoutRca = data?.mode === "db-processed"
+      && Boolean(data?.incident?.id)
+      && !alertAnalysisReady(payload);
+    if (!alertId || selectedAlertData.loading || selectedAlertRegeneration.loading
+      || !selectedAlertRow || !historicalIncidentWithoutRca || automaticRcaAttemptsRef.current.has(alertId)) {
+      return undefined;
+    }
+    automaticRcaAttemptsRef.current.add(alertId);
+    const timer = window.setTimeout(() => { void regenerateSelectedAlertAnalysis(); }, 400);
+    return () => window.clearTimeout(timer);
+  }, [selectedAlertData.loading, selectedAlertData.payload, selectedAlertId, selectedAlertRegeneration.loading, selectedAlertRow]);
 
   const selectedAlertNavigation = useMemo(() => {
     const index = dashboardVisibleAlerts.findIndex((row) => String(row?.alert_id || row?.id || row?.incident_id || "") === selectedAlertId);
@@ -8547,9 +8645,32 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             <label>
               Application
               <select value={applicationToMonitor} onChange={(e) => setApplicationToMonitor(e.target.value)}>
-                {monitorApplications.map((app) => (
-                  <option key={app} value={app}>{monitorScopeLabel(app)}</option>
-                ))}
+                {!monitorApplicationGroups.applications.length
+                  && !monitorApplicationGroups.tests.length
+                  && !monitorApplicationGroups.platform.length ? (
+                    <option value={applicationToMonitor} disabled>No applications registered</option>
+                  ) : null}
+                {monitorApplicationGroups.applications.length ? (
+                  <optgroup label="Applications">
+                    {monitorApplicationGroups.applications.map((app) => (
+                      <option key={app} value={app}>{monitorScopeLabel(app)}</option>
+                    ))}
+                  </optgroup>
+                ) : null}
+                {monitorApplicationGroups.tests.length ? (
+                  <optgroup label="Test projects">
+                    {monitorApplicationGroups.tests.map((app) => (
+                      <option key={app} value={app}>{monitorScopeLabel(app)}</option>
+                    ))}
+                  </optgroup>
+                ) : null}
+                {monitorApplicationGroups.platform.length ? (
+                  <optgroup label="KaiOps platform">
+                    {monitorApplicationGroups.platform.map((app) => (
+                      <option key={app} value={app}>{monitorScopeLabel(app)}</option>
+                    ))}
+                  </optgroup>
+                ) : null}
               </select>
             </label>
             <HealthBadge ok={health.ok} label={health.message} />
@@ -8936,8 +9057,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             <div className={`workspace-with-copilot ${isCopilotOpen ? "copilot-open" : ""}`}>
               <div className="workspace-main-content">
                 {routeOutlet}
-            <section className={`grid single-col ${routeOutlet ? "legacy-dashboard-cockpit" : ""}`}>
-              <article className={`panel role-dashboard role-dashboard-${roleDashboard.kind.toLowerCase()}`}>
+                {activeTab === "home" && (!routeOutlet || currentSearch.includes("workspace=alert")) ? (
+                  <section className={`grid single-col ${routeOutlet ? "legacy-dashboard-cockpit" : ""}`}>
+                    <article className={`panel role-dashboard role-dashboard-${roleDashboard.kind.toLowerCase()}`}>
                 <div className="panel-head role-dashboard-header">
                   <div>
                     <span className="discovery-eyebrow">{roleDashboard.kind} dashboard</span>
@@ -8968,42 +9090,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                   <ul>{roleDashboard.cards.map((card) => <li key={`definition-${card.label}`}><strong>{card.label}:</strong> {card.detail}</li>)}</ul>
                   <p>Counts distinguish currently loaded alerts, incident projections, approval records, workflow events, and closures. They are not interchangeable totals.</p>
                 </details>
-              </article>
-              <article className="panel monitoring-projects-panel">
-                <div className="panel-head">
-                  <div>
-                    <span className="discovery-eyebrow">Monitoring projects</span>
-                    <h2>KaiOps + Telemetry</h2>
-                    <p>Select a project to scope alerts, incidents, discovery evidence, and timeline events.</p>
-                  </div>
-                  <button type="button" className="button-secondary" onClick={loadMonitorApplications}>Refresh Projects</button>
-                </div>
-                <div className="monitoring-project-grid">
-                  {CORE_MONITOR_PROJECTS.map((projectName) => {
-                    const project = (monitoringApps.rows || []).find(
-                      (row) => String(row?.name || "").trim().toLowerCase() === projectName.toLowerCase()
-                    );
-                    const selected = String(applicationToMonitor || "").toLowerCase() === projectName.toLowerCase();
-                    return (
-                      <button
-                        type="button"
-                        className={`monitoring-project-card ${selected ? "is-selected" : ""}`}
-                        key={projectName}
-                        onClick={() => setApplicationToMonitor(projectName)}
-                      >
-                        <span className="monitoring-project-icon">{projectName === "Telemetry" ? "OT" : "KO"}</span>
-                        <span className="monitoring-project-copy">
-                          <strong>{projectName}</strong>
-                          <small>{project?.namespace || (projectName === "Telemetry" ? "telemetry" : "kaiops")} namespace</small>
-                          <code>{project?.metrics_endpoint || (projectName === "Telemetry" ? "Prometheus :19090" : "API Gateway metrics")}</code>
-                        </span>
-                        <span className={`pill ${String(project?.status || "").includes("failed") ? "status-failed" : "status-closed"}`}>
-                          {project?.status || "registered"}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
               </article>
               <article className="panel workflow-guide-panel">
                 <div className="panel-head">
@@ -9354,7 +9440,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               ) : null}
 
               {selectedAlertRow ? (
-                <article className="panel alert-details-cockpit" ref={alertDetailsRef}>
+                <article className="panel alert-details-cockpit" ref={alertDetailsRef} tabIndex={-1}>
                   <div className="panel-head incident-sticky-header">
                     <div>
                       <span className="discovery-eyebrow">Active incident workspace</span>
