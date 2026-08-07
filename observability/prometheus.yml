@@ -97,6 +97,30 @@ scrape_configs:
           # service), so its uptime/latency signal comes from this same
           # blackbox-exporter probing its real health endpoint.
           - http://ob-frontend:8080/_healthz
+      - targets: ["https://opentelemetry.io/"]
+        labels:
+          application: opentelemetry-demo
+          project_name: KaiOps
+          service: opentelemetry-demo
+          environment: public-internet
+          external: "true"
+          synthetic: "false"
+      - targets: ["https://www.githubstatus.com/api/v2/status.json"]
+        labels:
+          application: github-status
+          project_name: KaiOps
+          service: github-status
+          environment: public-internet
+          external: "true"
+          synthetic: "false"
+      - targets: ["https://httpbin.org/status/503"]
+        labels:
+          application: httpbin-failure-lab
+          project_name: KaiOps
+          service: httpbin-failure-lab
+          environment: public-internet
+          external: "true"
+          synthetic: "true"
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target

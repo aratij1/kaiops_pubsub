@@ -15,6 +15,8 @@ import httpx
 from langchain_core.embeddings import Embeddings
 from langgraph.graph import END, StateGraph
 
+from context_agent.knowledge_graph import KnowledgeGraph
+
 from ai_workbench_common.agent_runtime import AgentRuntime, ContextFailure
 from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.config import get_settings
@@ -886,6 +888,7 @@ class VectorDBConnector(BaseConnector):
     _document_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     _remote_store: AzureAISearchVectorStore | None = field(default=None, init=False)
     _load_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _knowledge_graph: KnowledgeGraph | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Loading performs remote embedding calls. Keep construction/startup
@@ -898,6 +901,8 @@ class VectorDBConnector(BaseConnector):
             with self._load_lock:
                 if not self.documents:
                     self.documents = self.load_documents()
+        if self._knowledge_graph is None:
+            self._knowledge_graph = KnowledgeGraph.from_documents(self.documents)
         query = " ".join(
             [
                 str(alert.service or ""),
@@ -913,7 +918,11 @@ class VectorDBConnector(BaseConnector):
             preferred_kinds={"runbook", "incident", "deployment", "dependency", "change"},
             service=str(alert.service or "").strip(),
         )
-        return {"matches": ranked, "document_count": len(self.documents)}
+        return {
+            "matches": ranked,
+            "document_count": len(self.documents),
+            "knowledge_graph": self._knowledge_graph.context(str(alert.service or "").strip()),
+        }
 
     def load_documents(self) -> list[dict[str, Any]]:
         root = self.rag_root or self._discover_rag_root()
@@ -979,6 +988,7 @@ class VectorDBConnector(BaseConnector):
 
     def reload(self) -> int:
         self.documents = self.load_documents()
+        self._knowledge_graph = KnowledgeGraph.from_documents(self.documents)
         self.sync_remote_index()
         return len(self.documents)
 
@@ -1581,6 +1591,14 @@ class ContextIntelligenceAgent(BaseAgent):
             or deployment_doc.get("deployment")
         )
         dependencies = list(by_name["cmdb"].get("dependencies", []))
+        knowledge_graph = (
+            by_name["vector-db"].get("knowledge_graph", {})
+            if isinstance(by_name["vector-db"].get("knowledge_graph"), dict)
+            else {}
+        )
+        for dependency in knowledge_graph.get("dependencies", []):
+            if dependency not in dependencies:
+                dependencies.append(dependency)
         for doc in dependency_docs:
             for dependency in doc.get("dependencies", []):
                 if dependency not in dependencies:
@@ -1721,6 +1739,7 @@ class ContextIntelligenceAgent(BaseAgent):
                     "stages": [*state.get("graph_stages", []), "assemble_context"],
                     "connector_count": len(self.connectors),
                 },
+                "knowledge_graph": knowledge_graph,
             },
         )
         state["context"] = context

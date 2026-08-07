@@ -1,0 +1,10 @@
+ARG UI_TEST_DEPS_IMAGE=kaiops-ui-test:latest
+FROM ${UI_TEST_DEPS_IMAGE} AS ui-deps
+
+FROM mcr.microsoft.com/playwright:v1.62.1-jammy
+
+WORKDIR /app
+
+COPY --from=ui-deps /app/ /app/
+
+CMD ["npm", "run", "test:e2e"]

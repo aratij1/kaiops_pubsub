@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import os
 
-from common.ai_layer_client import AiLayerClient
 from common.config import get_settings
 from common.event_publishers import build_event_consumer, build_orchestration_envelope, selected_event_bus_provider
 from common.repository import IncidentRepository
@@ -19,7 +18,6 @@ from orchestrator import OrchestratorAgent
 settings = get_settings()
 settings.service_name = "orchestrator"
 agent = OrchestratorAgent()
-ai_client = AiLayerClient(settings)
 tasks: list[asyncio.Task] = []
 logger = get_logger(__name__)
 MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
@@ -40,43 +38,6 @@ async def _persist_orchestration_event(app: FastAPI, envelope: dict) -> None:
         repo = IncidentRepository(session)
         await repo.save_incident_event(envelope)
         await session.commit()
-
-
-async def _run_resolution_and_publish(
-    app: FastAPI,
-    *,
-    alert: Alert,
-    incident: Incident,
-    decision_dict: dict,
-) -> None:
-    # Orchestrator only *decided* a workflow above; nothing previously consumed
-    # ORCHESTRATION_EVENTS to actually run Context/Resolution, so real alerts
-    # never got a recommendation.generated audit row and the UI showed no RCA.
-    # This closes that gap using the same AiLayerClient methods the
-    # local-demo workflow (monitoring-adapter.run_local_payment_workflow)
-    # already calls, so Context/Resolution logic is not duplicated here.
-    context = await ai_client.collect_context(alert=alert, incident=incident)
-    recommendation = await ai_client.resolve(context=context)
-    recommendation.incident_id = incident.id
-    recommendation.metadata["orchestration_decision"] = decision_dict
-
-    session_factory = getattr(app.state, "session_factory", None)
-    if session_factory is not None:
-        async with session_factory() as session:
-            repo = IncidentRepository(session)
-            await repo.save_recommendation_as_audit(recommendation)
-            await session.commit()
-
-    await app.state.producer.publish(
-        RESOLUTION_EVENTS,
-        {
-            "alert": alert.model_dump(mode="json"),
-            "incident": incident.model_dump(mode="json"),
-            "decision": decision_dict,
-            "recommendation": recommendation.model_dump(mode="json"),
-        },
-        key=str(incident.id),
-    )
 
 
 def _build_ingress_consumers() -> list[tuple[str, object, object]]:

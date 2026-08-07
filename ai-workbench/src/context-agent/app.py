@@ -29,6 +29,7 @@ from common.telemetry import (
 from common.topics import CONTEXT_EVENTS, ORCHESTRATION_EVENTS
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import VectorDBConnector
+from context_agent.knowledge_graph import KnowledgeGraph
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -549,6 +550,15 @@ def vector_connector() -> VectorDBConnector:
         if isinstance(connector, VectorDBConnector):
             return connector
     raise RuntimeError("VectorDBConnector is not configured")
+
+
+def knowledge_graph() -> KnowledgeGraph:
+    connector = vector_connector()
+    if not connector.documents:
+        connector.documents = connector.load_documents()
+    if connector._knowledge_graph is None:
+        connector._knowledge_graph = KnowledgeGraph.from_documents(connector.documents)
+    return connector._knowledge_graph
 
 
 def slugify(value: str) -> str:
@@ -1322,6 +1332,17 @@ async def reload_rag() -> dict[str, Any]:
 async def get_rag_index() -> dict[str, Any]:
     connector = vector_connector()
     return connector.index_info()
+
+
+@app.get("/knowledge-graph")
+async def get_knowledge_graph() -> dict[str, Any]:
+    graph = knowledge_graph()
+    return {"status": "ready", "summary": graph.summary(), "nodes": list(graph.nodes.values()), "edges": graph.edges}
+
+
+@app.get("/knowledge-graph/context")
+async def get_knowledge_graph_context(service: str, depth: int = 2, limit: int = 80) -> dict[str, Any]:
+    return knowledge_graph().context(service, depth=max(0, min(depth, 4)), limit=max(1, min(limit, 250)))
 
 
 @app.post("/rag/index/sync")
