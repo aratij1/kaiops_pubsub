@@ -8,6 +8,7 @@ from uuid import UUID
 
 from ai_workbench_common.agent_runtime import PolicyViolation
 from common.config import get_settings
+from common.continuous_learning import validate_automatic_runbook_use
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus
@@ -16,7 +17,7 @@ from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
 from common.topics import APPROVAL_EVENTS, REMEDIATION_EVENTS, RESOLUTION_EVENTS
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from remediation_engine import RemediationEngine
 
 settings = get_settings()
@@ -302,6 +303,17 @@ async def startup(app: FastAPI) -> None:
         if approval is None:
             return
         approval = _enrich_approval_from_payload(approval, payload)
+        try:
+            await _require_persisted_approved_runbook(approval)
+        except PolicyViolation as exc:
+            blocked = _build_policy_blocked_action(payload, str(exc))
+            if blocked is None:
+                return
+            await _persist_action(app, blocked)
+            payload_out = _build_remediation_event_payload(action=blocked, source_payload=payload, source=RESOLUTION_EVENTS)
+            await app.state.producer.publish(REMEDIATION_EVENTS, payload_out, key=str(blocked.incident_id))
+            EVENTS_PROCESSED.labels(settings.service_name, RESOLUTION_EVENTS, "runbook-blocked").inc()
+            return
         action = await execute_approval(approval)
         await _persist_remediation_event(app=app, action=action, source_payload=payload, source=RESOLUTION_EVENTS)
         payload_out = _build_remediation_event_payload(action=action, source_payload=payload, source=RESOLUTION_EVENTS)
@@ -340,7 +352,13 @@ async def execute_approval(approval: Approval) -> RemediationAction:
             output="human rejected remediation",
         )
     else:
+        if approval.metadata.get("auto_approved"):
+            try:
+                await _require_persisted_approved_runbook(approval)
+            except PolicyViolation as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
         action = engine.build_action(approval)
+        _require_production_credential_reference(approval, action.action_type)
         if not engine.is_action_allowed(action.action_type):
             action.status = RemediationStatus.SKIPPED
             action.error = f"Action type '{action.action_type}' is not allowlisted"
@@ -359,6 +377,80 @@ async def execute_approval(approval: Approval) -> RemediationAction:
 
     await _persist_action(app, action)
     return action
+
+
+async def _require_persisted_approved_runbook(approval: Approval) -> None:
+    if not settings.database_enabled:
+        raise PolicyViolation("automatic execution requires durable runbook governance")
+    runbook_id = str(approval.metadata.get("runbook_id") or "").strip()
+    version = int(approval.metadata.get("runbook_version") or 1)
+    async with app.state.session_factory() as session:
+        governance = await IncidentRepository(session).get_runbook_governance(
+            runbook_id, version, tenant_id=approval.tenant_id or "default"
+        )
+    if not governance or governance.get("status") != "approved":
+        raise PolicyViolation("automatic execution blocked: runbook version is not durably approved or is suspended")
+
+
+@app.post("/dry-run")
+async def dry_run_approval(approval: Approval) -> dict[str, Any]:
+    """Build and policy-check an action without invoking its execution plugin."""
+    action = engine.build_action(approval)
+    _require_production_credential_reference(approval, action.action_type)
+    allowed = engine.is_action_allowed(action.action_type)
+    unsafe_reasons = _unsafe_plan_reasons(approval)
+    passed = allowed and not unsafe_reasons
+    return {
+        "status": "passed" if passed else "blocked",
+        "dry_run": True,
+        "executed": False,
+        "incident_id": str(approval.incident_id),
+        "recommendation_id": str(approval.recommendation_id),
+        "action_type": action.action_type,
+        "target": action.target,
+        "checks": {
+            "action_allowlisted": allowed,
+            "plan_safe": not unsafe_reasons,
+            "unsafe_reasons": unsafe_reasons,
+            "approval_decision": str(approval.decision.value),
+            "idempotency_key": _build_action_idempotency_key(approval, action.action_type),
+        },
+        "message": "Dry run passed; no command was executed." if passed else (unsafe_reasons[0] if unsafe_reasons else f"Action type '{action.action_type}' is not allowlisted."),
+    }
+
+
+def _unsafe_plan_reasons(approval: Approval) -> list[str]:
+    """Fail closed when an edited plan contains destructive shell/database actions."""
+    plan = approval.metadata.get("execution_plan") if isinstance(approval.metadata.get("execution_plan"), dict) else {}
+    values = [approval.modified_action or ""]
+    for key in ("commands", "scripts", "queries"):
+        item = plan.get(key, [])
+        values.extend(str(value) for value in (item if isinstance(item, list) else [item]))
+    text = "\n".join(values).lower()
+    markers = {
+        "recursive filesystem deletion": ("rm -rf", "remove-item -recurse", "rmdir /s"),
+        "database destruction": ("drop database", "drop table", "truncate table"),
+        "infrastructure destruction": ("terraform destroy", "kubectl delete namespace"),
+    }
+    return [f"Dry run blocked: {label} requires a separately reviewed, policy-authorized plan." for label, tokens in markers.items() if any(token in text for token in tokens)]
+
+
+def _require_production_credential_reference(approval: Approval, action_type: str) -> None:
+    profile = approval.metadata.get("connection_profile") if isinstance(approval.metadata.get("connection_profile"), dict) else {}
+    environment = str(profile.get("environment") or approval.metadata.get("environment") or "").strip().lower()
+    if environment not in {"prod", "production"}:
+        return
+    if str(action_type or "").strip().lower() in {"status", "query", "inspect", "noop"}:
+        return
+    credential_ref = str(profile.get("credential_ref") or "").strip()
+    valid_prefix = credential_ref.startswith(("vault://", "arn:aws:secretsmanager:", "gcp-secret://", "k8s-secret://")) or (
+        credential_ref.startswith("https://") and ".vault.azure.net/secrets/" in credential_ref
+    )
+    if not valid_prefix:
+        raise HTTPException(
+            status_code=422,
+            detail="Production remediation requires a valid enterprise secret-manager reference; secret values are not accepted.",
+        )
 
 
 def _build_action_idempotency_key(approval: Approval, action_type: str) -> str:
@@ -444,6 +536,9 @@ def _build_auto_approval(payload: dict[str, Any]) -> Approval | None:
         metadata["recommended_action"] = recommended_action
     if recommended_commands:
         metadata["recommended_commands"] = [str(item).strip() for item in recommended_commands if str(item).strip()]
+    for key in ("runbook_id", "runbook_version", "runbook_status", "runbook_match_score"):
+        if recommendation_metadata.get(key) is not None:
+            metadata[key] = recommendation_metadata[key]
 
     return Approval(
         incident_id=incident_id,
@@ -494,6 +589,9 @@ def _enrich_approval_from_payload(approval: Approval, payload: dict[str, Any]) -
         approval.metadata["recommended_action"] = recommended_action
     if recommended_commands and not isinstance(approval.metadata.get("recommended_commands"), list):
         approval.metadata["recommended_commands"] = [str(item).strip() for item in recommended_commands if str(item).strip()]
+    for key in ("runbook_id", "runbook_version", "runbook_status", "runbook_match_score"):
+        if approval.metadata.get(key) is None and recommendation_metadata.get(key) is not None:
+            approval.metadata[key] = recommendation_metadata[key]
 
     return approval
 
@@ -518,6 +616,16 @@ def _validate_auto_execution_policy(payload: dict[str, Any]) -> None:
     reasoning = str(metadata.get("reasoning") or "").strip()
     if not reasoning:
         raise PolicyViolation("auto execution blocked: missing reasoning")
+
+    try:
+        validate_automatic_runbook_use(
+            runbook_id=str(metadata.get("runbook_id") or ""),
+            runbook_status=str(metadata.get("runbook_status") or ""),
+            evidence_match_score=float(metadata.get("runbook_match_score") or 0.0),
+            minimum_match_score=float(getattr(settings, "auto_execute_min_confidence", 0.8) or 0.8),
+        )
+    except (TypeError, ValueError) as exc:
+        raise PolicyViolation(f"auto execution blocked: {exc}") from exc
 
     if risk_tier == "high" and confidence < 0.95:
         raise PolicyViolation("auto execution blocked: high-risk actions require confidence >= 0.95")

@@ -6,16 +6,16 @@ import {
   qualityToneFromScore,
   sourceChannelLabel,
   IntelligenceConnectionView,
-  EvidenceRagReview,
   DiscoveryFlowView,
   ContextRetrievalGraph,
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore - appHelpers.jsx is untyped legacy JS, no .d.ts yet.
 } from "../../appHelpers.jsx";
+import EvidenceDraftReview from "./EvidenceDraftReview";
+import "./RcaPanel.css";
 
 type RcaDetailView = "summary" | "evidence" | "technical";
 
-/* eslint-disable @typescript-eslint/no-explicit-any -- legacy untyped workflow/evaluation/trust shapes from App.jsx */
 interface RcaPanelProps {
   rcaDetailView: RcaDetailView;
   onSetRcaDetailView: (view: RcaDetailView) => void;
@@ -36,7 +36,6 @@ interface RcaPanelProps {
   onLoadRagDocumentContent: (...args: any[]) => any;
   onSubmitAiRecommendationFeedback: (decision: string) => any;
 }
-/* eslint-enable @typescript-eslint/no-explicit-any */
 
 export default function RcaPanel({
   rcaDetailView,
@@ -64,7 +63,7 @@ export default function RcaPanel({
         <div>
           <span className="discovery-eyebrow">Investigation overview</span>
           <h3>Discovery + Context</h3>
-          <p>See what KaiOps found, what it means, and what to do next.</p>
+          <p>See what KaiMS found, what it means, and what to do next.</p>
         </div>
         <div className="combined-analysis-kpis">
           <span><strong>{selectedAlertTimelineRows.length}</strong> timeline stages</span>
@@ -91,7 +90,7 @@ export default function RcaPanel({
         <div className="rca-decision-grid">
           <article className="rca-decision-card rca-cause-card"><span>Probable root cause</span><h4>{selectedRcaDecision.rootCause}</h4><p>{selectedRcaDecision.status === "hypothesis" ? "This is a hypothesis, not a confirmed cause." : selectedRcaDecision.status === "insufficient-evidence" ? "More evidence is required before assigning a cause." : "Supported by the currently linked evidence."}</p></article>
           <article className="rca-decision-card rca-impact-card"><span>Business and customer impact</span><h4>{selectedRcaDecision.customerImpact}</h4><dl><div><dt>Service</dt><dd>{selectedRcaDecision.serviceImpact}</dd></div><div><dt>Dependencies</dt><dd>{selectedRcaDecision.dependencyImpact}</dd></div><div><dt>Urgency</dt><dd>{selectedRcaDecision.urgency}</dd></div>{selectedRcaDecision.impactedServices.length ? <div><dt>Affected services</dt><dd>{selectedRcaDecision.impactedServices.join(", ")}</dd></div> : null}</dl></article>
-          <article className="rca-decision-card rca-action-card"><span>Recommended response</span><h4>{selectedRcaDecision.action}</h4><div className="rca-decision-actions">{selectedAiTrust.missing.length ? <button type="button" className="button-primary" onClick={() => onSetRcaDetailView("evidence")}>Collect missing evidence</button> : selectedRcaDecision.reviewRequired ? <button type="button" className="button-primary" onClick={() => onSetHomeDetailTab("resolution")}>Review resolution</button> : <button type="button" className="button-primary" onClick={() => onSetHomeDetailTab("approval")}>Continue to approval</button>}<button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("evidence")}>Inspect evidence</button></div></article>
+          <article className="rca-decision-card rca-action-card"><span>Recommended response</span><h4>{selectedRcaDecision.action}</h4><div className="rca-decision-actions">{selectedAiTrust.missing.length ? <button type="button" className="button-primary" onClick={() => onSetRcaDetailView("evidence")}>Collect missing evidence</button> : <button type="button" className="button-primary" onClick={() => onSetHomeDetailTab("execution")}>{selectedRcaDecision.reviewRequired ? "Review plan and decide" : "Continue to remediation"}</button>}<button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("evidence")}>Inspect evidence</button></div></article>
         </div>
         <div className="rca-quality-strip" aria-label="RCA quality indicators"><span><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong> grounding</span><span><strong>{formatQualityPercent(selectedAlertEvaluation.citationCoverage)}</strong> citations</span><span><strong>{selectedAiTrust.evidence.length}</strong> evidence records</span><span><strong>{selectedAiTrust.missing.length}</strong> evidence gaps</span></div>
         <section className="rca-reasoning-chain" aria-label="RCA reasoning chain"><article><span>1 · Observed fact</span><p>{selectedAiTrust.evidence.length ? `${selectedAiTrust.evidence.length} linked record(s) were collected from the incident context.` : "No linked evidence records are available."}</p></article><i aria-hidden="true">→</i><article><span>2 · AI inference</span><p>{selectedRcaDecision.rootCause}</p></article><i aria-hidden="true">→</i><article><span>3 · Operator action</span><p>{selectedRcaDecision.action}</p></article></section>
@@ -108,10 +107,10 @@ export default function RcaPanel({
       </div> : null}
       {rcaDetailView === "evidence" ? <section className="ai-trust-panel" aria-labelledby="ai-trust-title">
         <header>
-          <div><span className="discovery-eyebrow">Evidence transparency</span><h4 id="ai-trust-title">Why KaiOps reached this recommendation</h4></div>
+          <div><span className="discovery-eyebrow">Evidence transparency</span><h4 id="ai-trust-title">Why KaiMS reached this recommendation</h4></div>
           <span className={`workflow-pill workflow-pill-${qualityToneFromScore(selectedAlertEvaluation.confidenceScore) === "success" ? "active" : "idle"}`}>{formatQualityPercent(selectedAlertEvaluation.confidenceScore)} confidence</span>
         </header>
-        <div className="ai-trust-classification" aria-label="AI trust classifications">
+        <div className="ai-trust-classification ai-trust-classification-compact" aria-label="AI trust classifications">
           <span><strong>Direct observation</strong>{selectedAiTrust.evidence.length} linked record(s)</span>
           <span><strong>AI inference</strong>{selectedAiTrust.analysis.root_cause || canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).rootCause}</span>
           <span><strong>Cached context</strong>{selectedAiTrust.evidence.filter((row: any) => row.cached).length} record(s)</span>
@@ -120,20 +119,23 @@ export default function RcaPanel({
           <span><strong>Missing evidence</strong>{selectedAiTrust.missing.length ? selectedAiTrust.missing.join(", ") : "None declared by the analysis"}</span>
         </div>
         {selectedAiTrust.evidence.some((row: any) => row.cached && row.freshness === "Stale") ? <p className="ai-trust-warning" role="status">Cached context may predate the current deployment. Validate the target before acting.</p> : null}
-        <div className="ai-trust-summary-grid">
+        <div className="ai-trust-summary-grid ai-trust-summary-compact">
           <div><strong>Confidence reasons</strong><ul>{selectedAiTrust.confidenceReasons.map((reason: string) => <li key={reason}>{reason}</li>)}</ul></div>
           <div><strong>Model / provider</strong><p>{selectedAiTrust.providerRow ? `${selectedAiTrust.providerRow.model} / ${selectedAiTrust.providerRow.provider}` : "Not supplied by the workflow contract"}</p></div>
           <div><strong>Fallback model</strong><p>{selectedAiTrust.fallbackUsed ? "Used; review required" : "No fallback usage reported"}</p></div>
           <div><strong>Recommendation attempts</strong><p>{selectedAlertRegeneration.message || "One persisted attempt is available; comparison history was not supplied."}</p></div>
         </div>
-        <div className="table-wrap table-wrap-scroll-x ai-evidence-table">
-          <table>
-            <thead><tr><th>Source</th><th>Timestamp</th><th>Age</th><th>Freshness</th><th>Citation</th><th>Context</th></tr></thead>
-            <tbody>{selectedAiTrust.evidence.length ? selectedAiTrust.evidence.map((row: any) => (
-              <tr key={row.id}><td>{row.source}</td><td>{row.timestamp ? formatUtcTimestamp(row.timestamp) : "Not supplied"}</td><td>{row.age}</td><td>{row.freshness}</td><td><code>{row.citation || "Not supplied"}</code></td><td>{row.cached ? "Cached" : "Fresh discovery"}</td></tr>
-            )) : <tr><td colSpan={6}>No linked evidence records. Treat the recommendation as ungrounded and require human review.</td></tr>}</tbody>
-          </table>
-        </div>
+        <details className="evidence-ledger">
+          <summary><div><strong>Evidence ledger</strong><span>{selectedAiTrust.evidence.length} linked records · expand for citations and freshness</span></div><span>View records</span></summary>
+          <div className="table-wrap ai-evidence-table contained-table">
+            <table>
+              <thead><tr><th>Source</th><th>Observed</th><th>Freshness</th><th>Citation</th><th>Context</th></tr></thead>
+              <tbody>{selectedAiTrust.evidence.length ? selectedAiTrust.evidence.map((row: any) => (
+                <tr key={row.id}><td><span className="source-badge">{row.source}</span></td><td>{row.timestamp ? formatUtcTimestamp(row.timestamp) : "Timestamp unavailable"}<small className="table-secondary">{row.age}</small></td><td>{row.freshness}</td><td className="evidence-citation"><code title={row.citation || "Not supplied"}>{row.citation || "Not supplied"}</code></td><td>{row.cached ? "Cached context" : "Fresh discovery"}</td></tr>
+              )) : <tr><td colSpan={5}>No linked evidence records. Treat the recommendation as ungrounded and require human review.</td></tr>}</tbody>
+            </table>
+          </div>
+        </details>
         <div className="ai-feedback-actions" aria-label="Recommendation feedback">
           <span>Was this RCA useful?</span>
           {["helpful", "incorrect", "incomplete"].map((decision) => <button key={decision} type="button" className={aiFeedbackState.decision === decision ? "button-primary" : "button-secondary"} disabled={aiFeedbackState.loading || !selectedAlertRecommendationId} onClick={() => onSubmitAiRecommendationFeedback(decision)}>{decision[0].toUpperCase() + decision.slice(1)}</button>)}
@@ -146,7 +148,7 @@ export default function RcaPanel({
         documents={selectedAlertRagDocuments as any}
         onDownloadDocument={onDownloadRagDocument}
       />
-      <EvidenceRagReview alertId={selectedAlertId} />
+      <EvidenceDraftReview alertId={selectedAlertId} />
       </> : null}
       {rcaDetailView === "technical" ? <details className="investigation-deep-dive" open>
         <summary>

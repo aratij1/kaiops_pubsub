@@ -4,6 +4,29 @@ KaiMS is an end-to-end Python 3.12 microservice platform for agentic incident
 triage, root-cause analysis, human approval, automated remediation, closure
 validation, and knowledge capture.
 
+## Recommended local startup
+
+KaiMS defaults to the `cloud-neutral` deployment profile. Provider services
+(Azure Service Bus/Monitor/OpenAI, AWS object storage, and GCP integrations)
+remain optional adapters and are activated only by an explicit profile or
+environment configuration.
+
+```powershell
+python scripts/switch_service_profile.py --profile cloud-neutral --env-file .env
+```
+
+Use the lean runtime for normal operation. It preserves the end-to-end incident
+and learning workflow while reducing the default Compose topology from 39 to 22
+services:
+
+```powershell
+.\scripts\start-kaims.ps1
+```
+
+Observability, monitoring-rule authoring, evaluation, and full compatibility are
+available as opt-in profiles. See
+[`docs/operations/deployment-profiles.md`](docs/operations/deployment-profiles.md).
+
 ## Demo Guide
 
 - End user and executive demo script: [docs/DEMO_EXECUTIVE_AND_END_USER.md](docs/DEMO_EXECUTIVE_AND_END_USER.md)
@@ -34,20 +57,20 @@ validation, and knowledge capture.
 
 ```text
 Monitoring Tools
-  Prometheus | Grafana | Datadog | Splunk | Azure Monitor
-        -> Kafka raw-alerts
+  Prometheus | Grafana | Datadog | Splunk | cloud monitoring adapters
+        -> Event Bus (RabbitMQ | Kafka | provider adapter) raw-alerts
         -> Alert Intelligence Agent
-        -> Kafka enriched-alerts
+        -> Event Bus enriched-alerts
         -> Orchestrator Agent
-  -> Kafka orchestration-events
+  -> Event Bus orchestration-events
         -> Context Intelligence Agent
-        -> Kafka context-events
+        -> Event Bus context-events
         -> Resolution Intelligence Agent (LangGraph)
-        -> Kafka resolution-events
+        -> Event Bus resolution-events
         -> Remediation Automation Engine
-        -> Kafka remediation-events
+        -> Event Bus remediation-events
         -> Closure & Validation
-        -> Kafka closure-events
+        -> Event Bus closure-events
 ```
 
 ## Agentic Orchestration Architecture
@@ -132,8 +155,8 @@ scripts/                     Local dev, RAG validation, and smoke-test tooling
 
 Two real, multi-service demo applications generate live traffic, logs, and
 failures for the monitoring pipeline to ingest — complementary to Fault Lab's
-synthetic scenarios. Both are wired directly into `docker-compose.yml`, like
-Fault Lab, not a separate compose file.
+synthetic scenarios. Both are wired into `docker-compose.yml` as opt-in
+profiles, keeping the default KaiMS control-plane startup lean.
 
 - **Online Boutique** (`GoogleCloudPlatform/microservices-demo`) — 11
   polyglot gRPC microservices (Go/Java/Python/Node/C#), prefixed `ob-*`.
@@ -159,14 +182,15 @@ Fault Lab, not a separate compose file.
   only exists on that isolated network, so it never collides with the
   main project's own services of the same name on the default network.
 
-Start them:
+Start them only when their live telemetry is required:
 ```bash
-docker compose up -d ob-redis-cart ob-currencyservice ob-productcatalogservice \
-  ob-paymentservice ob-shippingservice ob-emailservice ob-adservice ob-cartservice \
-  ob-recommendationservice ob-checkoutservice ob-frontend ob-loadgenerator ob-cadvisor
-docker compose up -d rs-mongodb rs-redis rs-rabbitmq rs-mysql rs-catalogue rs-user \
-  rs-cart rs-shipping rs-ratings rs-payment rs-dispatch rs-web rs-load-gen \
-  rs-mysqld-exporter rs-redis-exporter rs-rabbitmq-exporter rs-mongodb-exporter
+docker compose --profile demo-online-boutique up -d
+docker compose --profile demo-robot-shop up -d
+```
+
+Stop demo compute without deleting its data:
+```bash
+powershell -File scripts/stop-demo-workloads.ps1
 ```
 - Online Boutique storefront: <http://localhost:8081>
 - Robot Shop storefront: <http://localhost:8090>
@@ -278,6 +302,8 @@ environment; do not hardcode keys in source files:
 
 ```bash
 export OPENAI_API_KEY="your-rotated-key"
+export REASONING_STANDARD_MODEL="gpt-5.6-terra"
+export REASONING_CRITICAL_MODEL="gpt-5.6-sol"
 export OPENAI_GPT5_MODEL="gpt-5"
 export OPENAI_GPT4O_MODEL="gpt-4o"
 ```
@@ -286,6 +312,9 @@ PowerShell:
 
 ```powershell
 $env:OPENAI_API_KEY = "your-rotated-key"
+$env:REASONING_STANDARD_MODEL = "gpt-5.6-terra"
+$env:REASONING_CRITICAL_MODEL = "gpt-5.6-sol"
+$env:MODEL_ROUTER_REASONING_BACKEND = "openai" # or azure-openai
 $env:OPENAI_GPT5_MODEL = "gpt-5"
 $env:OPENAI_GPT4O_MODEL = "gpt-4o"
 $env:GEMINI_API_KEY = "your-gemini-key"
@@ -294,6 +323,20 @@ $env:GROQ_API_KEY = "your-groq-key"
 $env:GROQ_MODEL = "llama-3.3-70b-versatile"
 $env:LLM_REQUEST_TIMEOUT_SECONDS = "120"
 ```
+
+`reasoning-standard` is the normal RCA route and `reasoning-critical` is the
+critical-incident route. Promote a candidate from confirmed incidents only
+after it passes the guarded evaluation thresholds:
+
+```powershell
+python scripts/evaluate_rca_predictions.py .\predictions\reasoning-standard.json `
+  --provider reasoning-standard --route '*:rca' `
+  --policy-output backend/evaluation/model-routing-policy.json
+```
+
+The model router reads that policy through a read-only Compose mount. Policies
+with fewer than 50 confirmed cases, unsafe actions, or inadequate RCA,
+citation, remediation, or abstention scores are ignored automatically.
 
 ## Kubernetes Secret Management
 
@@ -386,6 +429,17 @@ cd frontend/react && npm install && npm run dev
 
 On PowerShell, use `$env:KAFKA_ENABLED="false"` and
 `$env:DATABASE_ENABLED="false"` instead of `export`.
+
+For fast UI work without installing Node locally, keep the KaiMS backend in
+Docker and start the opt-in Vite/HMR container:
+
+```powershell
+.\scripts\start-ui-dev.ps1
+```
+
+Open <http://localhost:8502>. Source edits hot-reload without rebuilding the
+production Nginx image. When a production image is required, use
+`.\scripts\rebuild-ui.ps1`; add `-Validate` before a release or handoff.
 
 Windows users can start the local demo services and UI with:
 

@@ -22,7 +22,7 @@ const IntegrationsRoute = resilientLazy(() => import("../routes/integrations/Int
 
 function routeElement(RouteComponent: ComponentType) {
   return (
-    <Suspense fallback={null}>
+    <Suspense fallback={<section className="app-route-pending" aria-busy="true" aria-label="Loading workspace"><div className="app-route-pending-mark">K</div><div><strong>Preparing workspace</strong><span>Loading the requested KaiMS module…</span></div></section>}>
       <RouteComponent />
     </Suspense>
   );

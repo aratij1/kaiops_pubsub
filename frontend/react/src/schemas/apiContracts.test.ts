@@ -9,6 +9,15 @@ describe("internal API contract registry", () => {
   it("covers every internal endpoint family and fails closed for unknown paths", () => {
     expect(internalApiContractCount).toBeGreaterThanOrEqual(19);
     expect(parseInternalApiResponse("/api-gateway/healthz", "GET", { status: "ok" })).toMatchObject({ status: "ok" });
+    expect(parseInternalApiResponse("/api-gateway/operations/queue-health", "GET", {
+      status: "healthy",
+      provider: "rabbitmq",
+      healthy: true,
+      queues: 4,
+      messages: 2,
+      ready: 2,
+      unacknowledged: 0,
+    })).toMatchObject({ status: "healthy", healthy: true, queues: 4 });
     expect(parseInternalApiResponse("/api-gateway/incidents/metadata?limit=10", "GET", { rows: [] })).toMatchObject({ rows: [] });
     expect(() => parseInternalApiResponse("/api-gateway/unregistered", "GET", {})).toThrow(ApiValidationError);
   });

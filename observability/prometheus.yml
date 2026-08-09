@@ -113,6 +113,16 @@ scrape_configs:
           environment: public-internet
           external: "true"
           synthetic: "false"
+      - targets: ["https://parabank.parasoft.com/parabank/index.htm"]
+        labels:
+          application: parabank-public-demo
+          project_name: ParaBank Public Demo
+          service: parabank-web
+          environment: public-demo
+          owner_team: banking-platform
+          external: "true"
+          synthetic: "true"
+          load_test_allowed: "false"
       - targets: ["https://httpbin.org/status/503"]
         labels:
           application: httpbin-failure-lab

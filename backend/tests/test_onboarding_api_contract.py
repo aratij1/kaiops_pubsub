@@ -56,6 +56,18 @@ def valid_azure_payload() -> dict:
     return payload
 
 
+@pytest.mark.parametrize("deployment_mode", ["cloud_neutral", "on_prem", "private_cloud", "aws_cloud", "gcp_cloud"])
+def test_onboarding_accepts_portable_deployment_modes_without_azure_fields(deployment_mode: str) -> None:
+    module = load_monitoring_app_module()
+    payload = valid_payload()
+    payload["deployment_mode"] = deployment_mode
+
+    connectivity = module.OnboardingConnectivityPayload.model_validate(payload)
+
+    assert connectivity.deployment_mode == deployment_mode
+    assert connectivity.azure_subscription_id == ""
+
+
 @pytest.mark.asyncio
 async def test_onboarding_connectivity_preserves_user_assignments(monkeypatch: pytest.MonkeyPatch) -> None:
     module = load_monitoring_app_module()
@@ -241,6 +253,21 @@ def test_generated_onboarding_documents_use_rag_metadata_contract() -> None:
     assert {document["kind"] for document in documents} == {"incident", "runbook", "dependency", "change"}
     for document in documents:
         assert all(isinstance(value, str) for value in document.get("metadata", {}).values())
+
+
+def test_onboarding_accepts_application_email_and_multi_source_connections() -> None:
+    module = load_monitoring_app_module()
+    payload = valid_payload()
+    payload["email_url"] = "imaps://mail.example.com/INBOX"
+    payload["monitoring_sources"] = [
+        {"provider": "prometheus", "endpoint_url": "https://prom.example.com", "signal_types": ["metrics", "alerts"]},
+        {"provider": "logs", "endpoint_url": "https://logs.example.com", "signal_types": ["logs"]},
+        {"provider": "email", "endpoint_url": "https://hooks.example.com/email", "signal_types": ["email", "alerts"]},
+        {"provider": "itsm", "endpoint_url": "https://jira.example.com", "signal_types": ["tickets", "changes"]},
+    ]
+    connectivity = module.OnboardingConnectivityPayload.model_validate(payload)
+    assert connectivity.email_url.startswith("imaps://")
+    assert {source.provider for source in connectivity.monitoring_sources} == {"prometheus", "logs", "email", "itsm"}
 
 
 def test_simplified_admin_setup_uses_owner_team_as_required_rule_owners() -> None:

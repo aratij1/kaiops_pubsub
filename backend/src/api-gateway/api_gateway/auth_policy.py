@@ -13,6 +13,7 @@ AUTHENTICATED_WRITE_RULES: tuple[tuple[set[str] | None, str, set[str] | None], .
     (None, "/applications", {ADMIN_ROLE}),
     (None, "/onboarding", {ADMIN_ROLE}),
     (None, "/monitoring", {ADMIN_ROLE}),
+    (None, "/operations/queues", {ADMIN_ROLE}),
     ({"POST", "PUT", "DELETE", "PATCH"}, "/rag", DOCUMENT_PROVIDER_ROLES),
     ({"POST", "PUT", "DELETE", "PATCH"}, "/model", {ADMIN_ROLE}),
     ({"POST", "PUT", "DELETE", "PATCH"}, "/approval", None),

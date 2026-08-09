@@ -57,7 +57,9 @@ if ($Failed) {
 }
 
 Write-Host ""
-Write-Host "Local files look updated. Rebuild Docker with:" -ForegroundColor Cyan
-Write-Host "docker compose down -v --remove-orphans"
-Write-Host "docker compose build --no-cache"
-Write-Host "docker compose up"
+Write-Host "Local files look updated. Use the targeted cached rebuild:" -ForegroundColor Cyan
+Write-Host ".\scripts\rebuild-ui.ps1"
+Write-Host "For backend changes, rebuild only the affected service:" -ForegroundColor Cyan
+Write-Host "docker compose build <service>"
+Write-Host "docker compose up -d --no-deps <service>"
+Write-Host "Avoid 'down -v' and '--no-cache' unless you intentionally need destructive data reset or cache diagnostics." -ForegroundColor Yellow

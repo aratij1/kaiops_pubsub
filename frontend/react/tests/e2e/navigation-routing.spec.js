@@ -22,23 +22,23 @@ test("legacy bookmarks, canonical navigation and scroll state survive route chan
   await page.getByLabel("Password").fill("Admin@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
 
-  await expect(page).toHaveTitle("Approvals | KaiOps");
+  await expect(page).toHaveTitle("Approvals | KaiMS");
   await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText("Operations");
   await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText("Approvals");
   await expect(page.getByRole("button", { name: "Approvals", exact: true })).toHaveAttribute("aria-current", "page");
 
   await page.getByRole("button", { name: "Dashboard", exact: true }).click();
   await expect(page).toHaveURL(/\/$/);
-  await expect(page.getByRole("heading", { name: "KaiOps + Telemetry" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "Dashboard" })).toBeVisible();
   await page.evaluate(() => window.scrollTo(0, 500));
   const savedDashboardScroll = await page.evaluate(() => window.scrollY);
   expect(savedDashboardScroll).toBeGreaterThan(0);
 
   await page.getByRole("button", { name: "Live Alerts", exact: true }).click();
   await expect(page).toHaveURL(/\/alerts$/);
-  await expect(page).toHaveTitle("Live Alerts | KaiOps");
+  await expect(page).toHaveTitle("Live Alerts | KaiMS");
   await page.getByRole("button", { name: "Dashboard", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "KaiOps + Telemetry" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "Dashboard" })).toBeVisible();
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThanOrEqual(savedDashboardScroll - 2);
 
   await page.setViewportSize({ width: 390, height: 844 });
@@ -46,7 +46,7 @@ test("legacy bookmarks, canonical navigation and scroll state survive route chan
   await expect(mobileNavigation).toBeVisible();
   await mobileNavigation.selectOption("/applications");
   await expect(page).toHaveURL(/\/applications$/);
-  await expect(page).toHaveTitle("Applications | KaiOps");
+  await expect(page).toHaveTitle("Applications | KaiMS");
   await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText("Platform");
   await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText("Applications");
 });

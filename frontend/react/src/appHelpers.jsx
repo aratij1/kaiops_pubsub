@@ -14,8 +14,8 @@ const DEFAULT_ALERT = {
 
 const REAL_USE_CASE_SCOPE = "real-usecases";
 const TEST_USE_CASE_SCOPE = "test-usecases";
-const CORE_MONITOR_PROJECTS = ["KaiOps", "Telemetry"];
-const FIXED_MONITOR_SCOPES = [...CORE_MONITOR_PROJECTS, REAL_USE_CASE_SCOPE, TEST_USE_CASE_SCOPE];
+const CORE_MONITOR_PROJECTS = ["KaiMS", "Telemetry"];
+const FIXED_MONITOR_SCOPES = [...CORE_MONITOR_PROJECTS];
 
 const SERVICE_TOPIC_FLOW = [
   { service: "monitoring-adapter", consumes: "-", publishes: "raw-alerts", agent: "alert" },
@@ -199,7 +199,7 @@ function normalizeMonitorToken(value) {
 
 function isKaiopsCoreSelection(value) {
   const token = normalizeMonitorToken(value);
-  return token === "kaiops-core" || token === "kaiops-core1" || token === "kaiops" || token === "core";
+  return token === "kaims" || token === "kaims-core" || token === "kaiops-core" || token === "kaiops-core1" || token === "kaiops" || token === "core";
 }
 
 function isKaiopsCoreAlert(row) {
@@ -708,6 +708,9 @@ function ensureMinimumAlertsBySource(rows, sourceRows, minimums = MIN_VISIBLE_AL
 
 function monitorScopeLabel(scope) {
   const key = String(scope || "").trim().toLowerCase();
+  if (["kaiops", "kaims", "kaiops-core", "kaims-core"].includes(key)) {
+    return "KaiMS";
+  }
   if (key === REAL_USE_CASE_SCOPE) {
     return "Real Use Cases";
   }
@@ -3524,7 +3527,7 @@ function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
                   <strong>{compactText(latest.stage || latest.agent || latest.service || `${lane.label} event`, 60)}</strong>
                   <p>{compactText(latest.detail || latest.outputValueText || latest.inputValueText, 140) || "No additional detail was recorded for this event."}</p>
                   <small>
-                    {latest.agent || latest.service || "KaiOps"} · {formatIstTimestamp(latest.timestamp || latest.created_at)}
+                    {latest.agent || latest.service || "KaiMS"} · {formatIstTimestamp(latest.timestamp || latest.created_at)}
                     {latest.status || timelineRowStatus(latest) ? ` · ${latest.status || timelineRowStatus(latest)}` : ""}
                   </small>
                 </div>
@@ -3569,7 +3572,7 @@ function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
                   </header>
                   <p>{compactText(row.detail || row.outputValueText || row.inputValueText, 360) || "Stage completed."}</p>
                   <small>
-                    {row.agent || row.service || "KaiOps"} · {formatIstTimestamp(row.timestamp || row.created_at)}
+                    {row.agent || row.service || "KaiMS"} · {formatIstTimestamp(row.timestamp || row.created_at)}
                     {row.executionTimeMs || row.execution_time_ms ? ` · ${row.executionTimeMs || row.execution_time_ms} ms` : ""}
                   </small>
                 </div>
@@ -3677,7 +3680,7 @@ function DiscoveryFlowView({ workflow, timelineRows = [], selectedAlert = null, 
     if (name.includes("log_search") || name.includes("logs_search")) return "Search runtime and landing-pad logs and preserve matching lines with source URIs.";
     if (name.includes("ticket_search") || name.includes("tickets_search")) return "Search Jira CSV, email, historical incidents, and landing-pad ticket content.";
     if (name.includes("code_search")) return "Search the affected service source first, then the full project repository.";
-    if (name.includes("mysql_search")) return "Search KaiOps incident projections and related operational records.";
+    if (name.includes("mysql_search")) return "Search KaiMS incident projections and related operational records.";
     if (name.includes("telemetry_search")) return "Correlate Prometheus metrics, Jaeger traces, and OpenSearch logs by service and trace ID.";
     if (name.includes("onboarding_context_merge")) return "Merge application ownership, environment, namespace, monitoring, and onboarding metadata into context.";
     if (name.includes("evidence_correlated")) return "Deduplicate and rank facts while retaining evidence IDs and provenance.";
@@ -4087,121 +4090,6 @@ function downloadInvestigationArtifact(filename, payload) {
   URL.revokeObjectURL(objectUrl);
 }
 
-function EvidenceRagReview({ alertId }) {
-  const [state, setState] = useState({ loading: false, draft: null, error: "", success: "" });
-  const [reviewer, setReviewer] = useState("");
-  const [content, setContent] = useState("");
-
-  async function loadDraft() {
-    const normalized = String(alertId || "").trim();
-    if (!normalized || !ALERT_UUID_PATTERN.test(normalized)) {
-      setState({ loading: false, draft: null, error: "", success: "" });
-      return;
-    }
-    setState((current) => ({ ...current, loading: true, error: "" }));
-    try {
-      const response = await fetchJson(
-        `/api-gateway/rag/evidence-drafts?alert_id=${encodeURIComponent(normalized)}`,
-        { timeoutMs: 10000 },
-      );
-      const payload = response?.data || response || {};
-      const draft = Array.isArray(payload?.drafts) ? payload.drafts[0] || null : null;
-      setContent(String(draft?.content || ""));
-      setState({ loading: false, draft, error: "", success: "" });
-    } catch (error) {
-      setState({ loading: false, draft: null, error: String(error?.message || "Unable to load evidence draft"), success: "" });
-    }
-  }
-
-  useEffect(() => {
-    loadDraft();
-  }, [alertId]);
-
-  async function reviewDraft() {
-    if (!state.draft || !reviewer.trim()) {
-      setState((current) => ({ ...current, error: "Enter the reviewer name before saving review.", success: "" }));
-      return;
-    }
-    try {
-      const response = await fetchJson(
-        `/api-gateway/rag/evidence-drafts/${encodeURIComponent(state.draft.draft_id)}`,
-        {
-          method: "PUT",
-          body: JSON.stringify({ reviewed_by: reviewer.trim(), content }),
-        },
-      );
-      const payload = response?.data || response || {};
-      const draft = payload?.draft || state.draft;
-      setState({ loading: false, draft, error: "", success: "Review saved. This document is still excluded from grounding." });
-    } catch (error) {
-      setState((current) => ({ ...current, error: String(error?.message || "Unable to save review"), success: "" }));
-    }
-  }
-
-  async function approveDraft() {
-    if (!state.draft || !reviewer.trim()) {
-      setState((current) => ({ ...current, error: "Enter the approver name before approval.", success: "" }));
-      return;
-    }
-    try {
-      const response = await fetchJson(
-        `/api-gateway/rag/evidence-drafts/${encodeURIComponent(state.draft.draft_id)}/approve`,
-        {
-          method: "POST",
-          body: JSON.stringify({ approved_by: reviewer.trim(), content }),
-        },
-      );
-      const payload = response?.data || response || {};
-      const draft = payload?.draft || state.draft;
-      setState({ loading: false, draft, error: "", success: "Approved and promoted into RAG for future grounding." });
-    } catch (error) {
-      setState((current) => ({ ...current, error: String(error?.message || "Unable to approve evidence document"), success: "" }));
-    }
-  }
-
-  if (!alertId) return null;
-  return (
-    <article className="panel">
-      <div className="section-heading">
-        <div>
-          <span className="discovery-eyebrow">Evidence knowledge lifecycle</span>
-          <h3>Review before future grounding</h3>
-          <p>Evidence creates a non-searchable draft automatically. Only explicit approval promotes it into RAG.</p>
-        </div>
-        <button type="button" className="button-secondary" onClick={loadDraft} disabled={state.loading}>
-          {state.loading ? "Loading..." : "Refresh draft"}
-        </button>
-      </div>
-      {!state.draft && !state.loading ? <p className="subtitle">No evidence draft exists yet for this alert.</p> : null}
-      {state.draft ? (
-        <>
-          <div className="workflow-pill-row">
-            <span className={`workflow-pill ${state.draft.status === "approved" ? "workflow-pill-clear" : "workflow-pill-warn"}`}>
-              {state.draft.status}
-            </span>
-            <span className="workflow-pill">{state.draft.evidence_ids?.length || 0} evidence IDs</span>
-            <span className="workflow-pill">{state.draft.status === "approved" ? "grounding enabled" : "grounding blocked"}</span>
-          </div>
-          <label>
-            Reviewer / approver
-            <input value={reviewer} onChange={(event) => setReviewer(event.target.value)} placeholder="Your name" />
-          </label>
-          <label>
-            Evidence-derived document
-            <textarea rows={16} value={content} onChange={(event) => setContent(event.target.value)} disabled={state.draft.status === "approved"} />
-          </label>
-          <div className="button-row">
-            <button type="button" className="button-secondary" onClick={reviewDraft} disabled={state.draft.status === "approved"}>Save review</button>
-            <button type="button" className="button-primary" onClick={approveDraft} disabled={state.draft.status === "approved"}>Approve for RAG</button>
-          </div>
-        </>
-      ) : null}
-      {state.error ? <p className="error">{state.error}</p> : null}
-      {state.success ? <p className="success">{state.success}</p> : null}
-    </article>
-  );
-}
-
 function IntelligenceConnectionView({
   workflow,
   documents = [],
@@ -4504,7 +4392,7 @@ function IntelligenceConnectionView({
       </header>
       <div className="investigation-story">
         <div className="investigation-story-intro">
-          <span>How KaiOps reached this conclusion</span>
+          <span>How KaiMS reached this conclusion</span>
           <strong>Every conclusion moves through an observable, evidence-backed handoff.</strong>
         </div>
         <div className="investigation-story-track">
@@ -6773,7 +6661,7 @@ function buildPrometheusRulePreview({ projectName, serviceName, environment, req
       `        environment: ${env}`,
       "      annotations:",
       `        summary: ${yamlQuote(line)}`,
-      `        description: ${yamlQuote(`Generated from KaiOps guided setup for ${project}.`)}`,
+      `        description: ${yamlQuote(`Generated from KaiMS guided setup for ${project}.`)}`,
     ].join("\n");
   });
   return [
@@ -7027,7 +6915,6 @@ export {
   groundedIntelligenceDisplay,
   canonicalIncidentAnalysis,
   downloadInvestigationArtifact,
-  EvidenceRagReview,
   IntelligenceConnectionView,
   ContextRetrievalGraph,
   AgentEventsGraph,

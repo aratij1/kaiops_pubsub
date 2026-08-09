@@ -3,7 +3,7 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { ConfidenceExplanation, EnvironmentBadge, EvidenceSource, StatusBadge } from ".";
 
 const meta = {
-  title: "KaiOps/Status and evidence",
+  title: "KaiMS/Status and evidence",
   component: StatusBadge,
   tags: ["autodocs"],
 } satisfies Meta<typeof StatusBadge>;

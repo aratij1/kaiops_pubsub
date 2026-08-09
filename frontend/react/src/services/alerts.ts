@@ -11,7 +11,7 @@ function safeLimit(limit: number, maximum: number): number {
 export async function fetchAlertRows(limit: number, signal?: AbortSignal): Promise<AlertRow[]> {
   const normalizedLimit = safeLimit(limit, 200);
   return getValidated(
-    `/api-gateway/alerts/all?limit=${normalizedLimit}`,
+    `/api-gateway/alerts/all?limit=${normalizedLimit}&compact=true`,
     AlertRowsResponseSchema,
     { signal, timeoutMs: 7_000 },
   );

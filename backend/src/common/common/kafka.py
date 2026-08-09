@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from common.config import Settings
 from common.logging import get_logger
-from common.message_processing import ProcessedMessageCache, extract_message_identity
+from common.message_processing import ProcessedMessageCache, extract_message_identity, processing_cancelled
 from common.resilience import CircuitBreaker, CircuitOpenError, retry_async
 
 logger = get_logger(__name__)
@@ -180,6 +180,10 @@ async def consume_forever(
     try:
         async for record in consumer._consumer:
             payload = record.value if isinstance(record.value, dict) else {}
+            if await processing_cancelled(consumer._settings, payload):
+                logger.warning("cancelled alert removed from kafka processing", extra={"topic": consumer._topic})
+                await consumer._consumer.commit()
+                continue
             identity = extract_message_identity(payload)
             if processed_cache.contains(identity):
                 logger.info("skipping duplicate kafka message", extra={"topic": consumer._topic, "message_identity": identity})

@@ -22,8 +22,8 @@ class Settings(BaseSettings):
 
     service_name: str = Field(default="kaiops-service", alias="SERVICE_NAME")
     environment: str = Field(default="local", alias="ENVIRONMENT")
-    cloud_provider: str = Field(default="local", alias="CLOUD_PROVIDER")
-    deployment_profile: str = Field(default="onprem", alias="DEPLOYMENT_PROFILE")
+    cloud_provider: str = Field(default="cloud-neutral", alias="CLOUD_PROVIDER")
+    deployment_profile: str = Field(default="cloud-neutral", alias="DEPLOYMENT_PROFILE")
     kafka_bootstrap_servers: str = Field(default="localhost:9092", alias="KAFKA_BOOTSTRAP_SERVERS")
     kafka_group_id: str = Field(default="kaiops", alias="KAFKA_GROUP_ID")
     kafka_consumer_max_retries: int = Field(default=3, alias="KAFKA_CONSUMER_MAX_RETRIES")
@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     db_max_overflow: int = Field(default=20, alias="DB_MAX_OVERFLOW")
     db_pool_timeout_seconds: float = Field(default=30.0, alias="DB_POOL_TIMEOUT_SECONDS")
     db_pool_recycle_seconds: int = Field(default=1800, alias="DB_POOL_RECYCLE_SECONDS")
+    alerts_table_metric_interval_seconds: float = Field(
+        default=300.0,
+        alias="ALERTS_TABLE_METRIC_INTERVAL_SECONDS",
+    )
     otlp_endpoint: str | None = Field(default=None, alias="OTEL_EXPORTER_OTLP_ENDPOINT")
     model_router_url: str = Field(default="http://model-router:8000", alias="MODEL_ROUTER_URL")
     context_agent_url: str = Field(default="http://context-agent:8000", alias="CONTEXT_AGENT_URL")
@@ -62,6 +66,7 @@ class Settings(BaseSettings):
     remediation_engine_url: str = Field(default="http://remediation-engine:8000", alias="REMEDIATION_ENGINE_URL")
     monitoring_adapter_url: str = Field(default="http://monitoring-adapter:8000", alias="MONITORING_ADAPTER_URL")
     evaluation_service_url: str = Field(default="http://evaluation-service:8000", alias="EVALUATION_SERVICE_URL")
+    knowledge_development_url: str = Field(default="http://knowledge-development-worker:8000", alias="KNOWLEDGE_DEVELOPMENT_URL")
     api_gateway_url: str = Field(default="http://api-gateway:8000", alias="API_GATEWAY_URL")
     application_onboarding_url: str = Field(default="http://application-onboarding:8000", alias="APPLICATION_ONBOARDING_URL")
     ai_layer_mode: str = Field(default="endpoint", alias="AI_LAYER_MODE")
@@ -157,6 +162,9 @@ class Settings(BaseSettings):
     openai_base_url: str = Field(default="https://api.openai.com/v1", alias="OPENAI_BASE_URL")
     openai_gpt5_model: str = Field(default="gpt-5", alias="OPENAI_GPT5_MODEL")
     openai_gpt4o_model: str = Field(default="gpt-4o", alias="OPENAI_GPT4O_MODEL")
+    reasoning_standard_model: str = Field(default="gpt-5.6-terra", alias="REASONING_STANDARD_MODEL")
+    reasoning_critical_model: str = Field(default="gpt-5.6-sol", alias="REASONING_CRITICAL_MODEL")
+    model_router_reasoning_backend: str = Field(default="openai", alias="MODEL_ROUTER_REASONING_BACKEND")
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     gemini_model: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL")
     gemini_base_url: str = Field(
@@ -177,9 +185,16 @@ class Settings(BaseSettings):
     model_router_prompt_cache_enabled: bool = Field(default=True, alias="MODEL_ROUTER_PROMPT_CACHE_ENABLED")
     model_router_prompt_cache_ttl_seconds: float = Field(default=300.0, alias="MODEL_ROUTER_PROMPT_CACHE_TTL_SECONDS")
     model_router_prompt_cache_max_entries: int = Field(default=512, alias="MODEL_ROUTER_PROMPT_CACHE_MAX_ENTRIES")
-    model_router_critical_provider: str = Field(default="gpt-5", alias="MODEL_ROUTER_CRITICAL_PROVIDER")
-    model_router_rca_provider: str = Field(default="gpt-4o", alias="MODEL_ROUTER_RCA_PROVIDER")
+    model_router_max_prompt_chars: int = Field(default=60000, alias="MODEL_ROUTER_MAX_PROMPT_CHARS")
+    model_router_max_payload_bytes: int = Field(default=750000, alias="MODEL_ROUTER_MAX_PAYLOAD_BYTES")
+    model_router_critical_provider: str = Field(default="reasoning-critical", alias="MODEL_ROUTER_CRITICAL_PROVIDER")
+    model_router_rca_provider: str = Field(default="reasoning-standard", alias="MODEL_ROUTER_RCA_PROVIDER")
     model_router_default_provider: str = Field(default="gpt-4o", alias="MODEL_ROUTER_DEFAULT_PROVIDER")
+    model_router_evaluation_policy_path: str = Field(
+        default="backend/evaluation/model-routing-policy.json",
+        alias="MODEL_ROUTER_EVALUATION_POLICY_PATH",
+    )
+    model_router_evaluation_min_cases: int = Field(default=50, alias="MODEL_ROUTER_EVALUATION_MIN_CASES")
     gateway_request_timeout_seconds: float = Field(default=180.0, alias="GATEWAY_REQUEST_TIMEOUT_SECONDS")
     openai_gpt5_input_cost_per_million: float = Field(default=1.25, alias="OPENAI_GPT5_INPUT_COST_PER_MILLION")
     openai_gpt5_output_cost_per_million: float = Field(default=10.0, alias="OPENAI_GPT5_OUTPUT_COST_PER_MILLION")
@@ -229,7 +244,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def configure_database_url(self) -> "Settings":
-        profile = str(self.deployment_profile or "onprem").strip().lower()
+        profile = str(self.deployment_profile or "cloud-neutral").strip().lower()
         profile_aliases = {
             "azure": "azure-cloud",
             "aws-cloud": "aws",
@@ -238,11 +253,11 @@ class Settings(BaseSettings):
             "cloud": "cloud-neutral",
         }
         profile = profile_aliases.get(profile, profile)
-        if profile not in {"onprem", "local", "azure-cloud", "aws", "gcp", "cloud-neutral"}:
-            self.deployment_profile = "onprem"
+        if profile not in {"onprem", "local", "private-cloud", "azure-cloud", "aws", "gcp", "cloud-neutral"}:
+            self.deployment_profile = "cloud-neutral"
         else:
             self.deployment_profile = profile
-        provider = str(self.cloud_provider or "").strip().lower() or "local"
+        provider = str(self.cloud_provider or "").strip().lower() or "cloud-neutral"
         provider_aliases = {
             "azure-cloud": "azure",
             "aws-cloud": "aws",

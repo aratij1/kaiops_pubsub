@@ -5,7 +5,7 @@ from time import perf_counter
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Index, JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, MetaData, String, Text, Uuid, event, text
+from sqlalchemy import Index, JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, MetaData, Numeric, String, Text, Uuid, event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -208,6 +208,88 @@ class AuditLogRecord(Base, TimestampMixin):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class RunbookVersionRecord(Base):
+    """Durable execution eligibility for one immutable runbook version."""
+
+    __tablename__ = "runbook_versions"
+    runbook_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    issue_signature: Mapped[str] = mapped_column(String(64), index=True)
+    approval_status: Mapped[str] = mapped_column(String(32), index=True, default="draft")
+    owner: Mapped[str] = mapped_column(String(255))
+    risk_level: Mapped[str] = mapped_column(String(32))
+    required_approval: Mapped[str] = mapped_column(String(32))
+    content: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    success_count: Mapped[int] = mapped_column(Integer, default=0)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    approved_by: Mapped[str | None] = mapped_column(String(255))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class IncidentEvidenceRecord(Base):
+    """Canonical, tenant-isolated evidence snapshot used by both processing modes."""
+
+    __tablename__ = "incident_evidence"
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    incident_id: Mapped[str] = mapped_column(String(128), index=True)
+    issue_signature: Mapped[str] = mapped_column(String(64), index=True)
+    service: Mapped[str] = mapped_column(String(255), index=True)
+    environment: Mapped[str] = mapped_column(String(64), index=True)
+    alert_type: Mapped[str] = mapped_column(String(255))
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    reviewed: Mapped[bool] = mapped_column(Boolean, default=False)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class FailurePatternRecord(Base):
+    """Latest deterministic analysis for a recurring issue signature."""
+
+    __tablename__ = "failure_patterns"
+    pattern_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    issue_signature: Mapped[str] = mapped_column(String(64), index=True)
+    service: Mapped[str] = mapped_column(String(255), index=True)
+    environment: Mapped[str] = mapped_column(String(64), index=True)
+    analysis: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    confidence: Mapped[float] = mapped_column(Numeric(5, 4))
+    analyzed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class RunbookOutcomeRecord(Base):
+    """Immutable execution outcome feeding confidence and suspension decisions."""
+
+    __tablename__ = "runbook_outcomes"
+    outcome_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    incident_id: Mapped[str] = mapped_column(String(128), index=True)
+    runbook_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    runbook_version: Mapped[int] = mapped_column(Integer)
+    reviewed: Mapped[bool] = mapped_column(Boolean, default=False)
+    successful: Mapped[bool] = mapped_column(Boolean)
+    validation: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class LearningAuditRecord(Base):
+    """Append-only, hash-verifiable learning and governance event."""
+
+    __tablename__ = "learning_audit_log"
+    sequence_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), unique=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    actor: Mapped[str] = mapped_column(String(255))
+    action: Mapped[str] = mapped_column(String(128), index=True)
+    resource_type: Mapped[str] = mapped_column(String(64), index=True)
+    resource_id: Mapped[str] = mapped_column(String(128), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    payload_sha256: Mapped[str] = mapped_column(String(64))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
 class HumanCorrectionRecord(Base, TimestampMixin):
     """Immutable, tenant-scoped feedback on an automated decision."""
 
@@ -228,6 +310,7 @@ class HumanCorrectionRecord(Base, TimestampMixin):
     actor: Mapped[str] = mapped_column(String(255), index=True)
     actor_role: Mapped[str] = mapped_column(String(64), index=True)
     status: Mapped[str] = mapped_column(String(32), default="recorded", index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
 
 
 class OnboardingStateRecord(Base, TimestampMixin):

@@ -96,6 +96,9 @@ def test_validate_auto_execution_policy_accepts_well_formed_payload() -> None:
             "metadata": {
                 "evidence_ids": ["ev-1"],
                 "reasoning": "Rollback selected from runbook and deployment timeline.",
+                "runbook_id": "rb-checkout-1",
+                "runbook_status": "approved",
+                "runbook_match_score": 0.93,
             },
         },
     }
@@ -120,6 +123,36 @@ def test_validate_auto_execution_policy_rejects_missing_evidence() -> None:
 
     with pytest.raises(module.PolicyViolation):
         module._validate_auto_execution_policy(payload)
+
+
+def test_validate_auto_execution_policy_rejects_new_or_suspended_runbook() -> None:
+    module = load_remediation_app_module()
+    payload = {
+        "decision": {"requires_approval": False, "risk_tier": "low"},
+        "recommendation": {
+            "confidence": 0.96,
+            "metadata": {
+                "evidence_ids": ["ev-1"], "reasoning": "matched evidence",
+                "runbook_id": "rb-1", "runbook_status": "suspended", "runbook_match_score": 0.96,
+            },
+        },
+    }
+    with pytest.raises(module.PolicyViolation, match="approved, active runbook"):
+        module._validate_auto_execution_policy(payload)
+
+
+def test_dry_run_rejects_destructive_plan_even_after_generic_approval() -> None:
+    module = load_remediation_app_module()
+    from common.models import Approval, ApprovalDecision
+    approval = Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="reviewer",
+        metadata={"execution_plan": {"commands": ["rm -rf /"]}},
+    )
+    reasons = module._unsafe_plan_reasons(approval)
+    assert reasons and "filesystem deletion" in reasons[0]
 
 
 def test_build_policy_blocked_action_returns_structured_skip() -> None:

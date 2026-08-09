@@ -1,6 +1,10 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+const apiGatewayTarget = process.env.KAIMS_DEV_API_GATEWAY || "http://localhost:8010";
+const monitoringTarget = process.env.KAIMS_DEV_MONITORING_ADAPTER || "http://localhost:8001";
+const approvalTarget = process.env.KAIMS_DEV_APPROVAL_SERVICE || "http://localhost:8007";
+
 export default defineConfig({
   plugins: [react()],
   build: {
@@ -20,17 +24,17 @@ export default defineConfig({
   server: {
     proxy: {
       "/api-gateway": {
-        target: "http://localhost:8010",
+        target: apiGatewayTarget,
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api-gateway/, ""),
       },
       "/monitoring-adapter": {
-        target: "http://localhost:8001",
+        target: monitoringTarget,
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/monitoring-adapter/, ""),
       },
       "/approval-service": {
-        target: "http://localhost:8007",
+        target: approvalTarget,
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/approval-service/, ""),
       },

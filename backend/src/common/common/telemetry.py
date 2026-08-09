@@ -122,6 +122,8 @@ LLM_LATENCY = Histogram("kaiops_llm_latency_seconds", "Model request latency", [
 LLM_TOKENS = Counter("kaiops_llm_tokens_total", "Model tokens by provider and direction", ["provider", "direction"])
 LLM_COST_USD = Counter("kaiops_llm_cost_usd_total", "Estimated model cost in USD", ["provider"])
 LLM_FALLBACKS = Counter("kaiops_llm_fallback_total", "Model fallback attempts", ["primary", "fallback"])
+LLM_CACHE_REQUESTS = Counter("kaiops_llm_cache_requests_total", "Model prompt-cache requests", ["result"])
+LLM_GUARDRAIL_EVENTS = Counter("kaiops_llm_guardrail_events_total", "Model request guardrail events", ["reason"])
 
 
 def setup_tracing(app, settings: Settings) -> None:

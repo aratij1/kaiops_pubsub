@@ -1,4 +1,4 @@
-import { createContext, useContext, type PropsWithChildren } from "react";
+import { createContext, useContext, useLayoutEffect, useRef, useSyncExternalStore, type PropsWithChildren } from "react";
 import type { FormEvent } from "react";
 
 export interface CopilotRouteRuntime {
@@ -22,13 +22,13 @@ export interface LandingPadRow { file?: string; received_at?: string; modified_a
 export interface SafetyRouteRuntime { summary: SafetySummary; summaryError: string; events: SafetyEventRow[]; landingRows: LandingPadRow[]; landingError: string; refresh: () => void; }
 export interface BusActivityRow { service?: string; consumed?: string; published?: string; provider?: string; status?: string; }
 export interface BusTopologyRow { service?: string; consumes?: string; publishes?: string; }
-export interface KnowledgeRouteRuntime { actual: { rows: BusActivityRow[]; published: string[]; consumed: string[] }; configuredRows: BusTopologyRow[]; routing: { workflow?: string; next_action?: string } | null; primaryTopic: string; refresh: () => void; }
+export interface KnowledgeRouteRuntime { actual: { rows: BusActivityRow[]; published: string[]; consumed: string[] }; configuredRows: BusTopologyRow[]; routing: { workflow?: string; next_action?: string } | null; primaryTopic: string; application: string; refresh: () => void; }
 export interface IncidentRow { id?: string | number; incident_id?: string | number; service?: string; risk_tier?: string; execution_mode?: string; transport_provider?: string; status?: string; }
 export interface IncidentFilters { risk_tier: string; execution_mode: string; transport_provider: string; status: string; service: string; }
-export interface IncidentsRouteRuntime { rows: IncidentRow[]; loading: boolean; error: string; application: string; filters: IncidentFilters; refresh: () => void; updateFilter: (name: keyof IncidentFilters, value: string) => void; open: (row: IncidentRow) => void; }
-export interface AlertStreamRow { id?: string | number; file?: string; source_channel?: string; status?: string; error?: string; name?: string; alert_name?: string; description?: string; annotations?: { description?: string }; received_at?: string; created_at?: string; modified_at?: string; first_seen?: string; starts_at?: string; last_seen?: string; ends_at?: string; updated_at?: string; service?: string; application?: string; project_name?: string; project?: string; severity?: string; occurrence_count?: number; occurrences?: unknown[]; assignee?: string; owner?: string; jira_assignee?: string; deduplication_reason?: string; correlation_reason?: string; suppression_reason?: string; maintenance_window?: string; }
+export interface IncidentsRouteRuntime { rows: IncidentRow[]; loading: boolean; error: string; application: string; scopeFallback: boolean; filters: IncidentFilters; refresh: () => void; updateFilter: (name: keyof IncidentFilters, value: string) => void; open: (row: IncidentRow) => void; }
+export interface AlertStreamRow { id?: string | number; file?: string; source_channel?: string; status?: string; error?: string; name?: string; alert_name?: string; description?: string; labels?: { application?: string; project_name?: string; project?: string }; annotations?: { description?: string }; received_at?: string; created_at?: string; modified_at?: string; first_seen?: string; starts_at?: string; last_seen?: string; ends_at?: string; updated_at?: string; service?: string; application?: string; project_name?: string; project?: string; severity?: string; occurrence_count?: number; occurrences?: unknown[]; assignee?: string; owner?: string; jira_assignee?: string; deduplication_reason?: string; correlation_reason?: string; suppression_reason?: string; maintenance_window?: string; }
 export interface AlertStreamFilters { timeRange: string; severity: string; application: string; environment: string; }
-export interface AlertsRouteRuntime { loading: boolean; error: string; paused: boolean; liveState: string; lastEventAt: string; rows: AlertStreamRow[]; totalRows: number; updatedAt: string; section: string; view: string; savedViews: { id: string; label: string }[]; filters: AlertStreamFilters; filterOptions: { applications: string[]; environments: string[] }; density: string; counts: Record<string, number>; channel: string; query: string; refresh: () => void; togglePaused: () => void; setSection: (value: string) => void; setView: (value: string) => void; applyView: (value: string) => void; updateFilter: (name: keyof AlertStreamFilters, value: string) => void; setDensity: (value: string) => void; setChannel: (value: string) => void; setQuery: (value: string) => void; }
+export interface AlertsRouteRuntime { loading: boolean; error: string; paused: boolean; liveState: string; lastEventAt: string; rows: AlertStreamRow[]; totalRows: number; updatedAt: string; section: string; view: string; savedViews: { id: string; label: string }[]; filters: AlertStreamFilters; filterOptions: { applications: string[]; environments: string[] }; density: string; counts: Record<string, number>; channel: string; query: string; refresh: () => void; open: (row: AlertStreamRow) => void; togglePaused: () => void; setSection: (value: string) => void; setView: (value: string) => void; applyView: (value: string) => void; updateFilter: (name: keyof AlertStreamFilters, value: string) => void; setDensity: (value: string) => void; setChannel: (value: string) => void; setQuery: (value: string) => void; }
 export interface ChartItem { label: string; value: number; displayValue?: string; tone?: string; }
 export interface WorkflowStage { id: string; label: string; status: string; detail?: string; }
 export interface ServiceFlowRow { service: string; consumes: string; publishes: string; agent: string; }
@@ -46,9 +46,83 @@ export interface AdminRouteRuntime { sessionUser: { username?: string; role_name
 export interface SessionRouteRuntime { accessToken: string; }
 export interface DashboardCard { label: string; value: string | number; detail: string; tone: string; tab: string; }
 export interface DashboardProject { name?: string; namespace?: string; metrics_endpoint?: string; status?: string; }
-export interface DashboardRuntime { role: { kind: string; title: string; description: string; period: string; timezone: string; partial: boolean; refreshing: boolean; cards: DashboardCard[] }; allowedTabs: string[]; projects: DashboardProject[]; selectedProject: string; workflow: { cards: { id: string; label: string; status: string; detail: string }[]; nextAction: string }; openSection: (tab: string) => void; refreshProjects: () => void; selectProject: (name: string) => void; }
+export interface DashboardRuntime { role: { kind: string; title: string; description: string; period: string; timezone: string; partial: boolean; refreshing: boolean; cards: DashboardCard[] }; allowedTabs: string[]; projects: DashboardProject[]; observedProjects: string[]; selectedProject: string; workflow: { cards: { id: string; label: string; status: string; detail: string }[]; nextAction: string }; openSection: (tab: string) => void; refreshProjects: () => void; selectProject: (name: string) => void; }
 export interface RouteRuntime { session: SessionRouteRuntime; dashboard: DashboardRuntime; copilot: CopilotRouteRuntime; closed: ClosedRouteRuntime; agentFlow: AgentFlowRouteRuntime; safety: SafetyRouteRuntime; knowledge: KnowledgeRouteRuntime; incidents: IncidentsRouteRuntime; alerts: AlertsRouteRuntime; executive: ExecutiveRouteRuntime; approvals: ApprovalsRouteRuntime; admin: AdminRouteRuntime; }
 
-const RouteRuntimeContext = createContext<RouteRuntime | null>(null);
-export function RouteRuntimeProvider({ value, children }: PropsWithChildren<{ value: RouteRuntime }>) { return <RouteRuntimeContext.Provider value={value}>{children}</RouteRuntimeContext.Provider>; }
-export function useRouteRuntime(): RouteRuntime { const value = useContext(RouteRuntimeContext); if (!value) throw new Error("Route runtime is unavailable outside the authenticated application shell."); return value; }
+type RuntimeListener = () => void;
+type RuntimeStore = {
+  current: RouteRuntime;
+  listeners: Set<RuntimeListener>;
+  subscribe: (listener: RuntimeListener) => () => void;
+  emit: () => void;
+};
+
+function sameRuntimeSlice(previous: unknown, next: unknown): boolean {
+  if (Object.is(previous, next)) return true;
+  if (!previous || !next || typeof previous !== "object" || typeof next !== "object") return false;
+  const left = previous as Record<string, unknown>;
+  const right = next as Record<string, unknown>;
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  for (const key of keys) {
+    if (typeof left[key] === "function" && typeof right[key] === "function") continue;
+    if (!Object.is(left[key], right[key])) return false;
+  }
+  return true;
+}
+
+const RouteRuntimeContext = createContext<RuntimeStore | null>(null);
+
+export function RouteRuntimeProvider({ value, children }: PropsWithChildren<{ value: RouteRuntime }>) {
+  const storeRef = useRef<RuntimeStore | null>(null);
+  const changedRef = useRef(false);
+  if (!storeRef.current) {
+    const listeners = new Set<RuntimeListener>();
+    storeRef.current = {
+      current: value,
+      listeners,
+      subscribe: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
+      emit: () => listeners.forEach((listener) => listener()),
+    };
+  } else {
+    const previous = storeRef.current.current;
+    let reconciled = previous;
+    (Object.keys(value) as Array<keyof RouteRuntime>).forEach((key) => {
+      const nextSlice = value[key];
+      const previousSlice = previous[key];
+      if (sameRuntimeSlice(previousSlice, nextSlice)) {
+        Object.assign(previousSlice as object, nextSlice as object);
+      } else {
+        if (reconciled === previous) reconciled = { ...previous };
+        (reconciled as unknown as Record<string, unknown>)[key] = nextSlice;
+      }
+    });
+    changedRef.current = changedRef.current || reconciled !== previous;
+    storeRef.current.current = reconciled;
+  }
+  // App.jsx still owns substantial legacy state and therefore renders often.
+  // Notify route subscribers only when a public runtime slice actually changed;
+  // waking every route after every parent render caused avoidable CPU usage and
+  // visible table/header flicker during background refreshes.
+  useLayoutEffect(() => {
+    if (!changedRef.current) return;
+    changedRef.current = false;
+    storeRef.current?.emit();
+  });
+  return <RouteRuntimeContext.Provider value={storeRef.current}>{children}</RouteRuntimeContext.Provider>;
+}
+
+function useRuntimeStore(): RuntimeStore {
+  const store = useContext(RouteRuntimeContext);
+  if (!store) throw new Error("Route runtime is unavailable outside the authenticated application shell.");
+  return store;
+}
+
+export function useRouteRuntime(): RouteRuntime {
+  const store = useRuntimeStore();
+  return useSyncExternalStore(store.subscribe, () => store.current, () => store.current);
+}
+
+export function useRouteRuntimeSlice<K extends keyof RouteRuntime>(key: K): RouteRuntime[K] {
+  const store = useRuntimeStore();
+  return useSyncExternalStore(store.subscribe, () => store.current[key], () => store.current[key]);
+}

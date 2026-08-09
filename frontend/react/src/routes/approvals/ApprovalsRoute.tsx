@@ -1,15 +1,20 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 
-import { useRouteRuntime, type ApprovalForm } from "../../app/routeRuntime";
+import { useRouteRuntimeSlice, type ApprovalForm } from "../../app/routeRuntime";
+import { OperationsWorkflowNav } from "../../components/operations/OperationsWorkflowNav";
 
 type ApprovalSection = "queue" | "capacity" | "review" | "history";
 interface CapacityRow { username: string; resource_names: string[]; weekly_hours: number; allocated_hours: number; remaining_hours: number; timezone: string; working_days: number[]; work_start: string; work_end: string; active: boolean; }
 interface AssignmentRow { incident_id: string; assignee: string; service: string; estimated_hours: number; status: string; assignment_reason: string; created_at?: string; }
 
+let capacitySnapshot: { token: string; fetchedAt: number; rows: CapacityRow[]; assignments: AssignmentRow[] } = { token: "", fetchedAt: 0, rows: [], assignments: [] };
+let capacityLoadPromise: Promise<{ rows: CapacityRow[]; assignments: AssignmentRow[] }> | null = null;
+
 const unwrap = (payload: any) => payload?.data?.rows ? payload.data : payload?.data?.data || payload?.data || payload;
 
 export default function ApprovalsRoute() {
-  const { approvals, session } = useRouteRuntime();
+  const approvals = useRouteRuntimeSlice("approvals");
+  const session = useRouteRuntimeSlice("session");
   const [section, setSection] = useState<ApprovalSection>("queue");
   const [capacity, setCapacity] = useState<{ rows: CapacityRow[]; loading: boolean; error: string }>({ rows: [], loading: true, error: "" });
   const [assignments, setAssignments] = useState<AssignmentRow[]>([]);
@@ -17,18 +22,35 @@ export default function ApprovalsRoute() {
   const [capacityForm, setCapacityForm] = useState({ username: "", resource_names: "", weekly_hours: "8", timezone: "Asia/Kolkata", working_days: [0, 1, 2, 3, 4], work_start: "09:00", work_end: "17:00", active: true });
   const authHeaders = useCallback(() => ({ "Content-Type": "application/json", ...(session.accessToken ? { Authorization: `Bearer ${session.accessToken}` } : {}) }), [session.accessToken]);
 
-  const loadCapacity = useCallback(async () => {
-    setCapacity((current) => ({ ...current, loading: true, error: "" }));
+  const loadCapacity = useCallback(async (forceOrEvent: boolean | unknown = false) => {
+    const force = typeof forceOrEvent === "boolean" ? forceOrEvent : false;
+    const token = session.accessToken || "anonymous";
+    if (!force && capacitySnapshot.token === token && Date.now() - capacitySnapshot.fetchedAt < 30_000) {
+      setCapacity({ rows: capacitySnapshot.rows, loading: false, error: "" });
+      setAssignments(capacitySnapshot.assignments);
+      return;
+    }
+    setCapacity((current) => ({ ...current, loading: current.rows.length === 0, error: "" }));
     try {
-      const [capacityResponse, assignmentResponse] = await Promise.all([
-        fetch("/api-gateway/approval/capacity", { headers: authHeaders() }),
-        fetch("/api-gateway/approval/assignments", { headers: authHeaders() }),
-      ]);
-      if (!capacityResponse.ok || !assignmentResponse.ok) throw new Error("Capacity service is unavailable.");
-      const capacityData = unwrap(await capacityResponse.json());
-      const assignmentData = unwrap(await assignmentResponse.json());
-      setCapacity({ rows: Array.isArray(capacityData?.rows) ? capacityData.rows : [], loading: false, error: "" });
-      setAssignments(Array.isArray(assignmentData?.rows) ? assignmentData.rows : []);
+      if (!capacityLoadPromise) {
+        capacityLoadPromise = (async () => {
+          const [capacityResponse, assignmentResponse] = await Promise.all([
+            fetch("/api-gateway/approval/capacity", { headers: authHeaders() }),
+            fetch("/api-gateway/approval/assignments", { headers: authHeaders() }),
+          ]);
+          if (!capacityResponse.ok || !assignmentResponse.ok) throw new Error("Capacity service is unavailable.");
+          const capacityData = unwrap(await capacityResponse.json());
+          const assignmentData = unwrap(await assignmentResponse.json());
+          return {
+            rows: Array.isArray(capacityData?.rows) ? capacityData.rows : [],
+            assignments: Array.isArray(assignmentData?.rows) ? assignmentData.rows : [],
+          };
+        })().finally(() => { capacityLoadPromise = null; });
+      }
+      const result = await capacityLoadPromise;
+      capacitySnapshot = { token, fetchedAt: Date.now(), ...result };
+      setCapacity({ rows: result.rows, loading: false, error: "" });
+      setAssignments(result.assignments);
     } catch (error) {
       setCapacity((current) => ({ ...current, loading: false, error: String((error as Error).message || error) }));
     }
@@ -44,7 +66,7 @@ export default function ApprovalsRoute() {
       const response = await fetch(`/api-gateway/approval/capacity/${encodeURIComponent(capacityForm.username.trim())}`, { method: "PUT", headers: authHeaders(), body: JSON.stringify(payload) });
       if (!response.ok) throw new Error(`Capacity was not saved (${response.status}).`);
       setCapacityStatus("Capacity saved and available for assignment.");
-      await loadCapacity();
+      await loadCapacity(true);
     } catch (error) { setCapacityStatus(String((error as Error).message || error)); }
   }
 
@@ -57,7 +79,7 @@ export default function ApprovalsRoute() {
       if (!response.ok) throw new Error(`Auto-assignment failed (${response.status}).`);
       const result = unwrap(await response.json());
       setCapacityStatus(`${Number(result?.assigned || 0)} ticket(s) assigned. Unmatched tickets remain visible for manual routing.`);
-      await loadCapacity();
+      await loadCapacity(true);
     } catch (error) { setCapacityStatus(String((error as Error).message || error)); }
   }
 
@@ -65,6 +87,7 @@ export default function ApprovalsRoute() {
   const selected = approvals.rows.find((row) => approvals.incidentId(row) === approvals.selectedIncidentId);
 
   return <section className="grid single-col approval-workspace">
+    <OperationsWorkflowNav active="approvals" />
     <article className="panel approval-hero"><div><span className="eyebrow">HUMAN DECISION OPERATIONS</span><h2>Approval Workspace</h2><p>Balance responder capacity, route pending tickets, and make one evidence-backed decision at a time.</p></div><div className="approval-summary"><div><strong>{approvals.rows.length}</strong><span>Pending</span></div><div><strong>{capacity.rows.filter((row) => row.active).length}</strong><span>Available profiles</span></div><div><strong>{assignments.filter((row) => ["assigned", "in_progress"].includes(row.status)).length}</strong><span>Assigned</span></div></div></article>
     <nav className="approval-section-tabs" aria-label="Approval workspace sections">{([['queue','Queue'],['capacity','Capacity & assignment'],['review','Review & decide'],['history','Assignment history']] as const).map(([id,label]) => <button type="button" key={id} className={section === id ? "active" : ""} aria-current={section === id ? "page" : undefined} onClick={() => setSection(id)}>{label}</button>)}</nav>
 

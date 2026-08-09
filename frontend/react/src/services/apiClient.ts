@@ -28,7 +28,8 @@ export async function requestValidated<T>(
   const controller = new AbortController();
   const timeout = globalThis.setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), options.timeoutMs ?? 7_000);
   const abortFromCaller = () => controller.abort(options.signal?.reason);
-  options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+  if (options.signal?.aborted) abortFromCaller();
+  else options.signal?.addEventListener("abort", abortFromCaller, { once: true });
 
   try {
     const requestHeaders = new Headers(options.headers);
@@ -41,6 +42,10 @@ export async function requestValidated<T>(
     });
     if (!response.ok) {
       throw new Error(`Request failed (${response.status}) for ${endpoint.split("?", 1)[0]}`);
+    }
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.toLowerCase().includes("application/json")) {
+      throw new Error(`Expected JSON from ${endpoint.split("?", 1)[0]}`);
     }
     const payload: unknown = await response.json();
     const parsed = schema.safeParse(payload);
