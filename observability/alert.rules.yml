@@ -244,18 +244,36 @@ groups:
           description: "HTTPS probe failed for {{ $labels.instance }} in {{ $labels.environment }}. Synthetic={{ $labels.synthetic }}."
 
       - alert: RabbitMQQueueBacklog
-        # Sized for a 10k-alerts/day workload (~7/min average, bursts of a
-        # few hundred/hour during an incident storm), not a much larger
-        # deployment: 500 ready messages held for 10m is already well beyond
-        # a burst working itself through the pipeline and indicates a
-        # stalled consumer, not just momentary queueing.
-        expr: sum(rabbitmq_queue_messages_ready) > 500
-        for: 10m
+        # A 1,000-alert/minute burst is expected and must not page by itself.
+        # Alert only when more than two full burst-minutes remain queued.
+        expr: sum(rabbitmq_queue_messages_ready) > 2000
+        for: 5m
         labels:
           severity: warning
+          capacity_profile: alerts-1000-per-minute
         annotations:
-          summary: "RabbitMQ queue backlog high"
-          description: "More than 500 messages are waiting across KaiOps RabbitMQ queues."
+          summary: "Alert pipeline backlog is not draining"
+          description: "More than two minutes of peak ingress remains queued for five minutes. Inspect consumer health and oldest-message age."
+
+      - alert: RabbitMQQueueBacklogCritical
+        expr: sum(rabbitmq_queue_messages_ready) > 5000
+        for: 2m
+        labels:
+          severity: critical
+          capacity_profile: alerts-1000-per-minute
+        annotations:
+          summary: "Alert pipeline backlog exceeded the recovery envelope"
+          description: "More than five peak minutes are queued. Pause low-priority ingestion or scale alert-intelligence consumers."
+
+      - alert: RabbitMQOldestMessageDelayed
+        expr: max(rabbitmq_queue_head_message_timestamp) > 0 and (time() - max(rabbitmq_queue_head_message_timestamp)) > 120
+        for: 2m
+        labels:
+          severity: warning
+          capacity_profile: alerts-1000-per-minute
+        annotations:
+          summary: "Alert processing delay exceeds two minutes"
+          description: "At least one queue head has waited longer than the alert-processing SLO."
 
       - alert: RabbitMQBrokerDown
         expr: up{job="kaiops-rabbitmq"} == 0

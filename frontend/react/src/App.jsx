@@ -6,6 +6,9 @@ import { alertRowsQueryOptions, landingPadRowsQueryOptions } from "./services/al
 import { useOperationalEvents } from "./services/operationalEvents";
 import { beginOidcLogin, completeOidcLogin } from "./services/oidcClient";
 import { RouteRuntimeProvider } from "./app/routeRuntime";
+import { projectIdentityFromAlert } from "./domain/projectIdentity";
+import { buildOnboardingSources } from "./domain/onboardingSources";
+import { buildAlertDocumentDraft } from "./domain/alertDocumentDraft";
 import ResolutionPanel from "./routes/incidents/ResolutionPanel";
 import RcaPanel from "./routes/incidents/RcaPanel";
 import CopilotRoute from "./routes/copilot/CopilotRoute";
@@ -31,7 +34,6 @@ import {
   simplifyMonitoringUrl,
   summarizeUploadedDocument,
 } from "./onboardingUtils";
-
 import {
   DEFAULT_ALERT,
   REAL_USE_CASE_SCOPE,
@@ -377,17 +379,53 @@ const AlertStreamTable = memo(function AlertStreamTable({ rows, loading, selecte
  *
  * @param {{ initialTab?: string, currentPath?: string, currentSearch?: string, onActiveTabChange?: (tabId: string) => void, onNavigatePath?: (path: string) => void, routeOutlet?: import("react").ReactNode }} props
  */
+function KaiMSBrand({ compact = false, inverse = false, onActivate = null }) {
+  const content = <>
+    <span className="kaims-brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 48 48" role="img">
+        <path className="kaims-mark-k" d="M14 11v26M15 25l16-14M15 25l17 13" />
+        <path className="kaims-mark-signal" d="M7 31h7l4-7 5 11 4-7h14" />
+      </svg>
+    </span>
+    <span className="kaims-brand-copy">
+      <strong>Kai<span>MS</span></strong>
+      {!compact ? <small>Intelligent managed service</small> : null}
+    </span>
+  </>;
+  return (
+    onActivate
+      ? <button type="button" className={`kaims-brand kaims-brand-home ${compact ? "is-compact" : ""} ${inverse ? "is-inverse" : ""}`} aria-label="Go to KaiMS home" onClick={onActivate}>{content}</button>
+      : <div className={`kaims-brand ${compact ? "is-compact" : ""} ${inverse ? "is-inverse" : ""}`} aria-label="KaiMS intelligent managed service">{content}</div>
+  );
+}
+
+function visibleManagedApplication(row) {
+  const rawName = String(typeof row === "string" ? row : row?.name || row?.application || "").trim();
+  const name = rawName.toLowerCase();
+  if (["kaims", "kaiops", "kaims-core", "kaiops-core"].includes(name)) return typeof row === "string" ? "KaiMS" : { ...row, name: "KaiMS" };
+  if (name === "telemetry") return typeof row === "string" ? "Telemetry" : { ...row, name: "Telemetry" };
+  // Alert-derived strings are not authoritative application registrations and
+  // can contain hundreds of transient service/project identities. Registered
+  // application objects are authoritative and belong in the workspace picker.
+  if (typeof row === "string" || !rawName) return null;
+  // ParaBank is an intentionally onboarded public banking application, not a
+  // generated UX fixture, despite "Demo" being part of its product name.
+  if (name.includes("parabank")) return { ...row, name: rawName };
+  return isTestApplicationRecord(row) ? null : { ...row, name: rawName };
+}
+
 export default function App({ initialTab = "home", currentPath = "/", currentSearch = "", onActiveTabChange, onNavigatePath, routeOutlet = null } = {}) {
   const queryClient = useQueryClient();
   const skipNextActiveTabNavigationRef = useRef(false);
   const defaultMonitorApplications = FIXED_MONITOR_SCOPES;
-  const [applicationToMonitor, setApplicationToMonitor] = useState("KaiOps");
+  const [applicationToMonitor, setApplicationToMonitor] = useState("KaiMS");
   const [monitorApplications, setMonitorApplications] = useState(defaultMonitorApplications);
   const [activeTab, setActiveTab] = useState(() => (VALID_LEGACY_TABS.has(initialTab) ? initialTab : "home"));
   const [isCopilotOpen, setIsCopilotOpen] = useState(false);
   const [uiDensity, setUiDensity] = useState("comfortable");
   const [uiTheme, setUiTheme] = useState("auto");
   const [health, setHealth] = useState({ loading: false, ok: false, message: "Not checked" });
+  const [queueHealth, setQueueHealth] = useState({ loading: true, status: "checking", provider: "rabbitmq", healthy: false, queues: 0, messages: 0, ready: 0, unacknowledged: 0 });
   const [alerts, setAlerts] = useState({ loading: false, rows: [], error: "" });
   const [alertsLimit, setAlertsLimit] = useState(25);
   const [alertSeverityOverrides, setAlertSeverityOverrides] = useState({ loading: false, rows: [], error: "", savingKey: "" });
@@ -479,8 +517,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     connection_url: "",
     connection_type: "application",
     namespace: "",
+    credential_ref: "",
+    credential_store: "hashicorp_vault",
     notes: "",
   });
+  const [evidenceDraftReview, setEvidenceDraftReview] = useState({ loading: false, draft: null, content: "", notes: "", error: "", message: "" });
+  const [executionOutcomeReview, setExecutionOutcomeReview] = useState({ outcome: "successful", notes: "", reusable: true, loading: false, error: "", message: "" });
+  const [showExecutionCredential, setShowExecutionCredential] = useState(false);
   const [remediationExecutionState, setRemediationExecutionState] = useState({ loading: false, result: null, error: "" });
   const [executionPreflightState, setExecutionPreflightState] = useState({ signature: "", checkedAt: "", passed: false });
   const [executionConfirmationText, setExecutionConfirmationText] = useState("");
@@ -509,7 +552,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         void loadLandingPadRecent({ background: true });
       }
       if (["incident.status", "approval.state", "remediation.progress"].includes(event.type) && activeTab === "summary") {
-        void loadIncidentMetadata();
+        void loadIncidentMetadata({ background: true });
       }
     },
   });
@@ -550,7 +593,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     repository_url: "",
     environment: "prod",
     region: "us-east-1",
-    deployment_mode: "on_prem",
+    deployment_mode: "cloud_neutral",
     monitoring_tool: "prometheus",
     monitoring_url: "http://prometheus:9090",
     prometheus_url: "http://prometheus:9090",
@@ -560,9 +603,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     traces_url: "",
     telemetry_url: "",
     ticketing_url: "",
+    email_url: "",
     healthcheck_url: "",
     network_zone: "",
     connection_auth_type: "none",
+    connection_secret_store: "hashicorp_vault",
     connection_secret_ref: "",
     context_strategy: "continuous",
     azure_subscription_id: "",
@@ -731,7 +776,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     };
   }, []);
   const landingPadRecentRequestRef = useRef({ inFlight: false, lastFetchedAt: 0 });
-  const incidentMetadataRequestRef = useRef(false);
+  const incidentMetadataRequestRef = useRef({ inFlight: false, lastFetchedAt: 0 });
+  const queueHealthRequestRef = useRef({ inFlight: false, lastFetchedAt: 0 });
   const closedIncidentsRequestRef = useRef(false);
 
   const formValid = useMemo(() => {
@@ -748,7 +794,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         return;
       }
       setHealth({ loading: false, ok: data?.status === "ok", message: `${data?.service || "api-gateway"} is ${data?.status || "unknown"}` });
-      loadMonitorApplications().catch(() => {});
     } catch (error) {
       if (healthRequestRef.current !== requestId) {
         return;
@@ -756,6 +801,35 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       setHealth({ loading: false, ok: false, message: error.message });
     }
   }
+
+  async function checkQueueHealth(options = {}) {
+    const background = Boolean(options?.background);
+    const requestState = queueHealthRequestRef.current;
+    if (requestState.inFlight) return;
+    if (background && Date.now() - Number(requestState.lastFetchedAt || 0) < 55000) return;
+    queueHealthRequestRef.current = { ...requestState, inFlight: true };
+    if (!background) setQueueHealth((current) => ({ ...current, loading: true }));
+    try {
+      const data = await fetchJson("/api-gateway/operations/queue-health", { timeoutMs: 4000 });
+      queueHealthRequestRef.current.lastFetchedAt = Date.now();
+      setQueueHealth({ loading: false, ...data });
+    } catch (error) {
+      setQueueHealth((current) => ({ ...current, loading: false, status: "unreachable", healthy: false, error: error.message }));
+    } finally {
+      queueHealthRequestRef.current.inFlight = false;
+    }
+  }
+
+  useEffect(() => {
+    if (!String(adminSession.accessToken || "").trim()) return undefined;
+    if (!["home", "rag"].includes(activeTab)) return undefined;
+    const refreshQueueHealth = () => {
+      if (document.visibilityState === "visible") void checkQueueHealth({ background: true });
+    };
+    refreshQueueHealth();
+    const timer = window.setInterval(refreshQueueHealth, 60000);
+    return () => window.clearInterval(timer);
+  }, [adminSession.accessToken, activeTab]);
 
   function unwrap(payload) {
     return payload?.data || payload || {};
@@ -812,7 +886,17 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       if (recentAlertsRequestRef.current.requestId !== requestId) {
         return;
       }
-      setAlerts({ loading: false, rows: balancedRows, error: "" });
+      setAlerts((prev) => {
+        if (
+          background
+          && !prev.loading
+          && !prev.error
+          && JSON.stringify(prev.rows) === JSON.stringify(balancedRows)
+        ) {
+          return prev;
+        }
+        return { loading: false, rows: balancedRows, error: "" };
+      });
     } catch (error) {
       if (background) {
         if (recentAlertsRequestRef.current.requestId !== requestId) {
@@ -827,7 +911,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       }
       try {
         const fallbackRowsRaw = await queryClient.fetchQuery({
-          ...landingPadRowsQueryOptions(Math.min(Math.max(sourceBalancedFetchLimit, 50), 300)),
+          // Share the same landing-pad query key as the live stream. This lets
+          // TanStack coalesce fallback and stream loads instead of cancelling
+          // two equivalent requests with different limits.
+          ...landingPadRowsQueryOptions(100),
           staleTime: 0,
         });
         const fallbackRows = capLatestAlertsPerSource(
@@ -870,7 +957,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     try {
       const payload = await fetchJson("/api-gateway/alerts/severity-overrides");
       const data = unwrap(payload);
-      const rows = Array.isArray(data?.rows) ? data.rows : [];
+      const rows = (Array.isArray(data?.rows) ? data.rows : []).map(visibleManagedApplication).filter(Boolean);
       setAlertSeverityOverrides((prev) => ({ ...prev, loading: false, rows, error: "" }));
     } catch (error) {
       setAlertSeverityOverrides((prev) => ({ ...prev, loading: false, rows: [], error: error.message }));
@@ -954,7 +1041,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     try {
       const payload = await fetchJson("/api-gateway/applications", authenticatedOptions());
       const data = unwrap(payload);
-      const rows = Array.isArray(data?.rows) ? data.rows : [];
+      const rows = (Array.isArray(data?.rows) ? data.rows : []).map(visibleManagedApplication).filter(Boolean);
       setMonitoringApps({ loading: false, rows, error: "" });
       setSelectedMonitoringAppId((current) => {
         const normalizedCurrent = String(current || "").trim();
@@ -1087,7 +1174,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           timeoutMs: 12000,
           maxAttempts: 1,
         }),
-        staleTime: background ? 15000 : 5000,
+        // Background hydration must bypass the query cache. Incident stages
+        // can complete between polls, and returning a 15-second-old partial
+        // payload makes the cockpit appear permanently stuck.
+        staleTime: background ? 0 : 5000,
       });
       setSelectedAlertData((prev) => {
         if (String(prev.alertId || "") !== normalized) {
@@ -1173,13 +1263,19 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
   }
 
-  async function loadIncidentStageCompleteness(incidentId) {
+  async function loadIncidentStageCompleteness(incidentId, options = {}) {
     const normalized = String(incidentId || "").trim();
+    const background = Boolean(options?.background);
     if (!normalized) {
       setSelectedStageCompleteness({ loading: false, data: null, error: "", incidentId: "" });
       return;
     }
-    setSelectedStageCompleteness({ loading: true, data: null, error: "", incidentId: normalized });
+    setSelectedStageCompleteness((prev) => ({
+      loading: background ? prev.loading : true,
+      data: background && String(prev.incidentId || "") === normalized ? prev.data : null,
+      error: "",
+      incidentId: normalized,
+    }));
     try {
       const payload = await fetchJson(`/api-gateway/incidents/${normalized}/stage-completeness`);
       const stageData = payload?.data || payload;
@@ -1210,6 +1306,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const selectedRow = canonicalAlertId ? canonicalRow : row;
     setSelectedAlertSnapshot(selectedRow);
     setSelectedAlertId(String(alertId));
+    // This action owns the complete cockpit URL below. Prevent the legacy tab
+    // synchronization effect from racing it with a navigation to plain `/`,
+    // which would remove workspace=alert and leave the details view hidden.
+    skipNextActiveTabNavigationRef.current = true;
     setActiveTab("home");
     setHomeDetailTab("overview");
     loadAlertDetails(alertId, selectedRow);
@@ -1285,14 +1385,45 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }, [activeTab, selectedAlertData.payload, selectedStageCompleteness.incidentId, selectedStageCompleteness.data, selectedStageCompleteness.loading, selectedStageCompleteness.error]);
 
   useEffect(() => {
+    const incidentId = String(selectedStageCompleteness.incidentId || "").trim();
+    const completion = selectedStageCompleteness.data?.stage_completion;
+    const completed = Number(completion?.completed || 0);
+    const total = Number(completion?.total || 0);
+    if (activeTab !== "home" || !incidentId || selectedStageCompleteness.loading || (total > 0 && completed >= total)) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      loadIncidentStageCompleteness(incidentId, { background: true });
+    }, 10000);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, selectedStageCompleteness.incidentId, selectedStageCompleteness.data, selectedStageCompleteness.loading]);
+
+  useEffect(() => {
     const scopedRows = mergeAlertStreamRows(
       filterAlertsForMonitor(alerts.rows, applicationToMonitor),
       filterRowsForMonitor(closedIncidents.rows, applicationToMonitor),
     );
+    const snapshotAlertId = String(
+      selectedAlertSnapshot?.alert_id
+      || selectedAlertSnapshot?.id
+      || selectedAlertSnapshot?.incident_id
+      || ""
+    );
+    const snapshotInCurrentScope = filterRowsForMonitor(
+      selectedAlertSnapshot ? [selectedAlertSnapshot] : [],
+      applicationToMonitor,
+    ).length > 0;
+    const hasSelectedSnapshot = Boolean(selectedAlertId && snapshotAlertId === String(selectedAlertId) && snapshotInCurrentScope);
     if (activeTab !== "home") {
       return;
     }
     if (!scopedRows.length) {
+      // A landing-pad event is immediately actionable even before it has been
+      // persisted into the canonical alerts collection. Keep the clicked row
+      // available as the cockpit snapshot while asynchronous processing runs.
+      if (hasSelectedSnapshot) {
+        return;
+      }
       if (selectedAlertId) {
         setSelectedAlertId("");
       }
@@ -1320,8 +1451,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       }
       return;
     }
+    if (hasSelectedSnapshot) {
+      return;
+    }
     openAlertDetails(scopedRows[0]);
-  }, [activeTab, alerts.rows, closedIncidents.rows, applicationToMonitor, selectedAlertId, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId]);
+  }, [activeTab, alerts.rows, closedIncidents.rows, applicationToMonitor, selectedAlertId, selectedAlertSnapshot, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId]);
 
   useEffect(() => {
     const needsEvidence = homeDetailTab === "rca" && rcaDetailView === "evidence";
@@ -1342,7 +1476,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
     const previous = selectedAlertAnalysisPollRef.current;
     const attempts = previous.alertId === alertId ? Number(previous.attempts || 0) : 0;
-    if (attempts >= 12) {
+    // Model-backed RCA can legitimately take several minutes when the queue is
+    // draining. Keep the selected incident hydrated for up to ten minutes.
+    if (attempts >= 60) {
       return undefined;
     }
     selectedAlertAnalysisPollRef.current = { alertId, attempts: attempts + 1 };
@@ -1352,14 +1488,26 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     return () => window.clearTimeout(timer);
   }, [activeTab, selectedAlertId, selectedAlertData.payload]);
 
-  async function loadIncidentMetadata() {
-    if (incidentMetadataRequestRef.current) {
+  async function loadIncidentMetadata(options = {}) {
+    const background = Boolean(options && options.background);
+    const requestState = incidentMetadataRequestRef.current;
+    if (requestState.inFlight) {
       return;
     }
-    incidentMetadataRequestRef.current = true;
-    setIncidentMetadata((prev) => ({ ...prev, loading: true, error: "" }));
+    // Coalesce bursts of incident lifecycle notifications instead of flooding
+    // the gateway and repainting the Operations workspace for every event.
+    if (background && Date.now() - Number(requestState.lastFetchedAt || 0) < 15000) {
+      return;
+    }
+    incidentMetadataRequestRef.current = { ...requestState, inFlight: true };
+    setIncidentMetadata((prev) => {
+      const loading = background ? prev.loading : true;
+      return prev.loading === loading && !prev.error ? prev : { ...prev, loading, error: "" };
+    });
     try {
-      const params = new URLSearchParams({ limit: "120" });
+      // List views need projection fields, not the heavier action/evaluation
+      // enrichment that is fetched when an operator opens an incident.
+      const params = new URLSearchParams({ limit: "120", include_enrichment: "false" });
       if (metadataFilters.risk_tier !== "all") {
         params.set("risk_tier", metadataFilters.risk_tier);
       }
@@ -1378,11 +1526,18 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const payload = await fetchJson(`/api-gateway/incidents/metadata?${params.toString()}`);
       const data = unwrap(payload);
       const rows = data?.rows || [];
-      setIncidentMetadata({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
+      const nextRows = Array.isArray(rows) ? rows : [];
+      setIncidentMetadata((prev) => JSON.stringify(prev.rows) === JSON.stringify(nextRows) && !prev.loading && !prev.error
+        ? prev
+        : { loading: false, rows: nextRows, error: "" });
     } catch (error) {
-      setIncidentMetadata({ loading: false, rows: [], error: error.message });
+      setIncidentMetadata((prev) => ({
+        loading: false,
+        rows: Array.isArray(prev.rows) ? prev.rows : [],
+        error: Array.isArray(prev.rows) && prev.rows.length ? "" : error.message,
+      }));
     } finally {
-      incidentMetadataRequestRef.current = false;
+      incidentMetadataRequestRef.current = { inFlight: false, lastFetchedAt: Date.now() };
     }
   }
 
@@ -1503,7 +1658,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       return;
     }
     landingPadRecentRequestRef.current.inFlight = true;
-    setLandingPadRecent((prev) => ({ ...prev, loading: true, error: "" }));
+    // Keep existing cards mounted while the periodic poll runs. New rows are
+    // swapped in atomically when the background request completes.
+    setLandingPadRecent((prev) => {
+      const loading = background ? prev.loading : true;
+      return prev.loading === loading && !prev.error ? prev : { ...prev, loading, error: "" };
+    });
     try {
       // Interactive refreshes only read the live landing-pad window. Historical
       // source coverage is supplied by /alerts/all, so walking the mounted
@@ -1515,8 +1675,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const balancedRows = capLatestAlertsPerSource(
         (Array.isArray(rows) ? rows : []).map((row, index) => mapLandingPadRowToAlertStreamRow(row, index))
       );
-      setLandingPadRecent({ loading: false, rows: balancedRows, error: "" });
-      setIngestionStreamUpdatedAt(new Date().toISOString());
+      const rowsChanged = JSON.stringify(landingPadRecent.rows) !== JSON.stringify(balancedRows);
+      setLandingPadRecent((prev) => !rowsChanged && !prev.loading && !prev.error
+        ? prev
+        : { loading: false, rows: rowsChanged ? balancedRows : prev.rows, error: "" });
+      if (rowsChanged) setIngestionStreamUpdatedAt(new Date().toISOString());
     } catch (error) {
       setLandingPadRecent((prev) => ({ ...prev, loading: false, error: error.message }));
     } finally {
@@ -1537,32 +1700,32 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
   async function loadMonitorApplications() {
     try {
-      const payload = await fetchJson("/api-gateway/applications", authenticatedOptions());
+      const [payload, discoveredPayload] = await Promise.all([
+        fetchJson("/api-gateway/applications", authenticatedOptions()),
+        fetchJson("/api-gateway/alerts/applications?limit=1000", authenticatedOptions()).catch(() => null),
+      ]);
       const data = unwrap(payload);
-      const applicationRows = Array.isArray(data?.rows) ? data.rows : [];
+      const discoveredData = unwrap(discoveredPayload);
+      const applicationRows = (Array.isArray(data?.rows) ? data.rows : []).map(visibleManagedApplication).filter(Boolean);
+      const discoveredRows = (Array.isArray(discoveredData?.rows) ? discoveredData.rows : []).map(visibleManagedApplication).filter(Boolean);
       setMonitoringApps({ loading: false, rows: applicationRows, error: "" });
       const registered = [
         ...applicationRows.map((row) => String(row?.name || row?.application || "").trim()),
-        ...alerts.rows.map((row) => String(
-          row?.application || row?.project_name || row?.project || row?.labels?.application || ""
-        ).trim()),
+        ...discoveredRows.map((row) => String(row?.name || row?.application || "").trim()),
+        ...alerts.rows.map(projectIdentityFromAlert).map(visibleManagedApplication).filter(Boolean),
       ]
         .filter(Boolean);
-      const ordered = uniqueMonitorApplications([
-        ...CORE_MONITOR_PROJECTS.filter((name) => registered.some((item) => item.toLowerCase() === name.toLowerCase())),
-        ...registered,
-      ]);
-      const options = ordered.length ? ordered : defaultMonitorApplications;
+      const options = uniqueMonitorApplications([...defaultMonitorApplications, ...registered.map(visibleManagedApplication).filter(Boolean)]);
       setMonitorApplications(options);
       setApplicationToMonitor((current) => (
         options.some((item) => item.toLowerCase() === String(current || "").toLowerCase())
           ? current
-          : options[0] || "KaiOps"
+          : options[0] || "KaiMS"
       ));
     } catch (_error) {
       setMonitorApplications(defaultMonitorApplications);
       setApplicationToMonitor((current) => (
-        defaultMonitorApplications.includes(current) ? current : "KaiOps"
+        defaultMonitorApplications.includes(current) ? current : "KaiMS"
       ));
     }
   }
@@ -1807,9 +1970,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const created = unwrap(response);
       const newAlertId = String(created?.id || created?.alert_id || "").trim();
       setSelectedAlertRegeneration({
-        loading: Boolean(newAlertId),
+        loading: false,
         message: newAlertId
-          ? `RCA regeneration triggered. Opened refreshed alert ${newAlertId}.`
+          ? `RCA regeneration accepted. Analysis is running in the background for alert ${newAlertId}.`
           : "RCA regeneration triggered. Refreshing latest alert details.",
         error: "",
       });
@@ -1818,23 +1981,32 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       void Promise.all([loadRecentAlerts(), loadLandingPadRecent(), loadGatewayRecent(), loadGatewaySummary()])
         .catch(() => {});
       if (newAlertId) {
+        // This alert was explicitly created by regeneration. Do not let the
+        // historical-incident recovery effect submit it again while its first
+        // analysis is still being persisted.
+        automaticRcaAttemptsRef.current.add(newAlertId);
         setSelectedAlertId(newAlertId);
         // Discovery fans out across logs, tickets, telemetry, code, and RAG.
         // Under normal ingestion load it can exceed the former 18-second
         // window, so keep polling until the persisted recommendation arrives.
-        const analysisState = await waitForAlertAnalysis(newAlertId, { attempts: 40, intervalMs: 3000 });
-        if (analysisState?.payload) {
-          setSelectedAlertData({ loading: false, payload: analysisState.payload, error: "", alertId: newAlertId });
-        } else {
-          await loadAlertDetails(newAlertId);
-        }
-        await loadSelectedAlertDocumentLinks(newAlertId);
-        setSelectedAlertRegeneration({
-          loading: false,
-          message: analysisState?.ready
-            ? `RCA regeneration complete. Opened refreshed alert ${newAlertId}.`
-            : `Alert ${newAlertId} created. Analysis is still warming up; click Reload Alert Details in a few seconds if RCA is pending.`,
-          error: "",
+        void (async () => {
+          const analysisState = await waitForAlertAnalysis(newAlertId, { attempts: 20, intervalMs: 3000 });
+          if (analysisState?.payload) {
+            setSelectedAlertData({ loading: false, payload: analysisState.payload, error: "", alertId: newAlertId });
+          } else {
+            await loadAlertDetails(newAlertId);
+          }
+          await loadSelectedAlertDocumentLinks(newAlertId);
+          setSelectedAlertRegeneration((current) => ({
+            ...current,
+            loading: false,
+            message: analysisState?.ready
+              ? `RCA regeneration complete for alert ${newAlertId}.`
+              : `Alert ${newAlertId} was created. Analysis is still warming up; reload details shortly if RCA is pending.`,
+            error: "",
+          }));
+        })().catch((error) => {
+          setSelectedAlertRegeneration((current) => ({ ...current, loading: false, error: String(error?.message || "Background RCA refresh failed") }));
         });
         return;
       }
@@ -2149,7 +2321,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       repository_url: String(projectPayload.repository_url || "").trim(),
       environment: String(row.environment || projectPayload.environment || curr.environment || "prod").trim(),
       region: String(row.region || projectPayload.region || curr.region || "").trim(),
-      deployment_mode: String(connectivityPayload.deployment_mode || curr.deployment_mode || "on_prem").trim(),
+      deployment_mode: String(connectivityPayload.deployment_mode || curr.deployment_mode || "cloud_neutral").trim(),
       monitoring_tool: monitoring.tool,
       monitoring_url: monitoring.url,
       prometheus_url: monitoring.tool === "prometheus" ? monitoring.url : "",
@@ -2159,6 +2331,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       traces_url: String(connectivityPayload.traces_url || "").trim(),
       telemetry_url: String(connectivityPayload.telemetry_url || "").trim(),
       ticketing_url: String(connectivityPayload.ticketing_url || "").trim(),
+      email_url: String(connectivityPayload.email_url || "").trim(),
       healthcheck_url: String(connectivityPayload.healthcheck_url || "").trim(),
       network_zone: String(connectivityPayload.network_zone || "").trim(),
       connection_auth_type: String(connectivityPayload.monitoring_sources?.[0]?.auth_type || "none").trim(),
@@ -2213,6 +2386,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       traces_url: "",
       telemetry_url: "",
       ticketing_url: "",
+      email_url: "",
       healthcheck_url: "",
       network_zone: "",
       connection_auth_type: "none",
@@ -2379,7 +2553,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     service: "Which service or application is this knowledge for?",
     environment: "Which environment should this apply to?",
     owner_team: "Which team owns this service?",
-    dependencies: "Which upstream/downstream dependencies should KaiOps check during triage?",
+    dependencies: "Which upstream/downstream dependencies should KaiMS check during triage?",
     alert_patterns: "Which alert conditions should create monitoring rules?",
     commands: "Which commands, scripts, or queries are safe for operators to review?",
     rollback_plan: "What rollback or failback plan should be used if remediation fails?",
@@ -2503,7 +2677,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   );
   const knowledgeReviewSummary = useMemo(() => {
     if (!onboardingKnowledgePack) {
-      return "Describe the service, alerts, dependencies, checks, commands, rollback, and owner. KaiOps will extract the details for review.";
+      return "Describe the service, alerts, dependencies, checks, commands, rollback, and owner. KaiMS will extract the details for review.";
     }
     if (knowledgeReviewReady) {
       return "All required details are accepted. Review the table once, then approve Service Knowledge.";
@@ -3063,7 +3237,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         repository_url: String(project?.repository_url || curr.repository_url || "").trim(),
         environment: String(project?.environment || curr.environment || "prod").trim(),
         region: String(project?.region || curr.region || "").trim(),
-        deployment_mode: String(connectivity?.deployment_mode || curr.deployment_mode || "on_prem").trim(),
+        deployment_mode: String(connectivity?.deployment_mode || curr.deployment_mode || "cloud_neutral").trim(),
         monitoring_tool: monitoring.tool,
         monitoring_url: monitoring.url,
         prometheus_url: monitoring.tool === "prometheus" ? monitoring.url : "",
@@ -3073,6 +3247,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         traces_url: String(connectivity?.traces_url || curr.traces_url || "").trim(),
         telemetry_url: String(connectivity?.telemetry_url || curr.telemetry_url || "").trim(),
         ticketing_url: String(connectivity?.ticketing_url || curr.ticketing_url || "").trim(),
+        email_url: String(connectivity?.email_url || curr.email_url || "").trim(),
         healthcheck_url: String(connectivity?.healthcheck_url || curr.healthcheck_url || "").trim(),
         network_zone: String(connectivity?.network_zone || curr.network_zone || "").trim(),
         connection_auth_type: String(connectivity?.monitoring_sources?.[0]?.auth_type || curr.connection_auth_type || "none").trim(),
@@ -3140,13 +3315,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         new_relic_url: selectedMonitoringTool === "new_relic" ? monitoringUrl : "",
         datadog_url: selectedMonitoringTool === "datadog" ? monitoringUrl : "",
       };
-      const monitoringSources = [
-        { provider: selectedMonitoringTool, endpoint_url: monitoringUrl, signal_types: ["metrics", "alerts"], auth_type: onboardingForm.connection_auth_type || "none", secret_ref: onboardingForm.connection_secret_ref || "", enabled: true },
-        { provider: "logs", endpoint_url: onboardingForm.logs_url, signal_types: ["logs"], auth_type: "none", secret_ref: "", enabled: Boolean(onboardingForm.logs_url) },
-        { provider: "traces", endpoint_url: onboardingForm.traces_url, signal_types: ["traces"], auth_type: "none", secret_ref: "", enabled: Boolean(onboardingForm.traces_url) },
-        { provider: "telemetry", endpoint_url: onboardingForm.telemetry_url, signal_types: ["metrics", "logs", "traces"], auth_type: "none", secret_ref: "", enabled: Boolean(onboardingForm.telemetry_url) },
-        { provider: "ticketing", endpoint_url: onboardingForm.ticketing_url, signal_types: ["tickets", "changes"], auth_type: "none", secret_ref: "", enabled: Boolean(onboardingForm.ticketing_url) },
-      ].filter((source) => source.enabled && source.endpoint_url);
+      const monitoringSources = buildOnboardingSources(onboardingForm, selectedMonitoringTool, monitoringUrl);
       const payload = {
         project: {
           name: String(onboardingForm.name || "").trim(),
@@ -3160,13 +3329,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           environment: String(onboardingForm.environment || "prod").trim(),
           region: String(onboardingForm.region || "").trim(),
         },
-        deployment_mode: String(onboardingForm.deployment_mode || "on_prem").trim(),
+        deployment_mode: String(onboardingForm.deployment_mode || "cloud_neutral").trim(),
         ...monitoringUrls,
         monitoring_sources: monitoringSources,
         logs_url: String(onboardingForm.logs_url || "").trim(),
         traces_url: String(onboardingForm.traces_url || "").trim(),
         telemetry_url: String(onboardingForm.telemetry_url || "").trim(),
         ticketing_url: String(onboardingForm.ticketing_url || "").trim(),
+        email_url: String(onboardingForm.email_url || "").trim(),
         healthcheck_url: String(onboardingForm.healthcheck_url || "").trim(),
         network_zone: String(onboardingForm.network_zone || "").trim(),
         context_strategy: String(onboardingForm.context_strategy || "continuous").trim(),
@@ -3291,7 +3461,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       business_owner: "",
       technical_owner: "",
       technology_stack: [],
-      cloud_provider: onboardingForm.deployment_mode === "azure_cloud" ? "azure" : "on_prem",
+      cloud_provider: ({ azure_cloud: "azure", aws_cloud: "aws", gcp_cloud: "gcp", private_cloud: "private-cloud", on_prem: "on-prem" }[onboardingForm.deployment_mode] || "cloud-neutral"),
       region: String(onboardingForm.region || "").trim(),
       monitoring_platforms: MONITORING_TOOL_OPTIONS.includes(selectedMonitoringTool) ? [selectedMonitoringTool] : ["prometheus"],
       notification_platforms: ["slack", "teams", "pagerduty"],
@@ -3366,7 +3536,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const targetPlatforms = MONITORING_TOOL_OPTIONS.includes(selectedTool) ? [selectedTool] : ["prometheus"];
       const discoveryInputs = {
         endpoint_url: simplifyMonitoringUrl(onboardingForm.monitoring_url),
-        deployment_mode: String(onboardingForm.deployment_mode || "on_prem").trim(),
+        deployment_mode: String(onboardingForm.deployment_mode || "cloud_neutral").trim(),
         environment: String(onboardingForm.environment || "prod").trim(),
         generated_from_plain_language: true,
       };
@@ -4164,7 +4334,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           criticality: String(row?.severity || "high").trim().toLowerCase() === "critical" ? "high" : "medium",
           support_team: String(onboardingForm.owner_team || "platform-ops").trim(),
           region: String(onboardingForm.region || "us-east-1").trim(),
-          cloud_provider: onboardingForm.deployment_mode === "azure_cloud" ? "azure" : "on_prem",
+          cloud_provider: ({ azure_cloud: "azure", aws_cloud: "aws", gcp_cloud: "gcp", private_cloud: "private-cloud", on_prem: "on-prem" }[onboardingForm.deployment_mode] || "cloud-neutral"),
           monitoring_platforms: [platform],
           notification_platforms: ["slack", "teams"],
         },
@@ -4350,31 +4520,23 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }
 
 
-  async function refreshAll() {
+  async function refreshAll({ includeAlerts = true } = {}) {
     if (!Boolean(String(adminSession.accessToken || "").trim())) {
       return;
     }
     // Stage loading so login does not blast all heavy endpoints concurrently.
     await Promise.allSettled([
       checkHealth(),
-      loadRecentAlerts(),
-      loadFlows(),
+      checkQueueHealth({ background: true }),
+      includeAlerts ? loadRecentAlerts() : Promise.resolve(),
+      loadMonitorApplications(),
     ]);
     window.setTimeout(() => {
-      Promise.allSettled([
-        loadMonitorApplications(),
-        loadAlertSeverityOverrides(),
-        loadModelProviderStatus(),
-        loadLandingPadRecent(),
-      ]).catch(() => {});
+      if (activeTab === "stream") void loadLandingPadRecent({ background: true });
+      if (activeTab === "summary") void Promise.allSettled([loadGatewaySummary(), loadIncidentMetadata({ background: true })]);
+      if (activeTab === "ai-hub") void loadModelProviderStatus();
+      if (activeTab === "admin" && adminWorkspace === "alerts") void loadAlertSeverityOverrides();
     }, 250);
-
-    window.setTimeout(() => {
-      Promise.allSettled([
-        loadGatewaySummary(),
-        loadIncidentMetadata(),
-      ]).catch(() => {});
-    }, 1500);
   }
 
   async function refreshViewsAfterSubmit() {
@@ -4416,6 +4578,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
   useEffect(() => {
     if (VALID_LEGACY_TABS.has(initialTab) && initialTab !== activeTab) {
+      // The router is authoritative for top-level navigation. Without this
+      // guard, the following effect can publish the previous local tab during
+      // the same commit and bounce the URL back, continuously remounting the
+      // active route (most visible as Live Alerts / Approvals flicker).
+      skipNextActiveTabNavigationRef.current = true;
       setActiveTab(initialTab);
     }
   }, [initialTab]);
@@ -4541,10 +4708,17 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }, [adminSession.accessToken, adminSession?.user?.role_name]);
 
   useEffect(() => {
+    // Application names are non-secret workspace metadata and the selector is
+    // shown before authentication. Load them on mount so registered workspaces
+    // such as ParaBank are available at sign-in, not only after sign-in.
+    loadMonitorApplications();
+  }, []);
+
+  useEffect(() => {
     if (!Boolean(String(adminSession.accessToken || "").trim())) {
       return;
     }
-    refreshAll();
+    refreshAll({ includeAlerts: false });
   }, [adminSession.accessToken]);
 
   useEffect(() => {
@@ -4665,6 +4839,25 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     adminSession.accessToken,
   ]);
 
+  // SSE is the fast path, but the incident list must still converge if a
+  // proxy, browser, or network temporarily interrupts the event stream.
+  useEffect(() => {
+    if (!Boolean(String(adminSession.accessToken || "").trim()) || activeTab !== "summary") {
+      return undefined;
+    }
+    const refreshVisibleIncidents = () => {
+      if (document.visibilityState === "visible") {
+        void loadIncidentMetadata({ background: true });
+      }
+    };
+    const timer = window.setInterval(refreshVisibleIncidents, 20000);
+    document.addEventListener("visibilitychange", refreshVisibleIncidents);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshVisibleIncidents);
+    };
+  }, [adminSession.accessToken, activeTab]);
+
   useEffect(() => {
     if (!Boolean(String(adminSession.accessToken || "").trim())) {
       return;
@@ -4707,11 +4900,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }, [adminSession.accessToken]);
 
   useEffect(() => {
-    const discovered = alerts.rows
-      .map((row) => String(
-        row?.application || row?.project_name || row?.project || row?.labels?.application || ""
-      ).trim())
-      .filter(Boolean);
+    const discovered = alerts.rows.map(projectIdentityFromAlert).map(visibleManagedApplication).filter(Boolean);
     if (!discovered.length) return;
     setMonitorApplications((current) => {
       const merged = uniqueMonitorApplications([...current, ...discovered]);
@@ -4845,7 +5034,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       if (name) rowByName.set(name.toLowerCase(), row);
     });
     alerts.rows.forEach((row) => {
-      const name = String(row?.application || row?.project_name || row?.project || "").trim();
+      const name = projectIdentityFromAlert(row);
       if (name && !rowByName.has(name.toLowerCase())) rowByName.set(name.toLowerCase(), row);
     });
     const groups = { applications: [], tests: [], platform: [] };
@@ -4892,8 +5081,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       || selectedAlertSnapshot?.incident_id
       || ""
     );
-    return snapshotId === selectedAlertId ? selectedAlertSnapshot : null;
-  }, [visibleAlerts, selectedAlertId, selectedAlertSnapshot]);
+    const snapshotInCurrentScope = filterRowsForMonitor(
+      selectedAlertSnapshot ? [selectedAlertSnapshot] : [],
+      applicationToMonitor,
+    ).length > 0;
+    return snapshotId === selectedAlertId && snapshotInCurrentScope ? selectedAlertSnapshot : null;
+  }, [visibleAlerts, selectedAlertId, selectedAlertSnapshot, applicationToMonitor]);
 
   useEffect(() => {
     const alertId = String(selectedAlertId || "").trim();
@@ -5380,6 +5573,34 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     };
   }, [selectedAlertWorkflow, selectedAlertRow, selectedAlertEvaluation, selectedAiTrust.missing.length]);
 
+  useEffect(() => {
+    const alertId = String(selectedAlertId || "").trim();
+    if (!alertId || selectedAlertDocumentLinks.loading || selectedAlertDocumentLinks.rows.length) {
+      if (selectedAlertDocumentLinks.rows.length) setEvidenceDraftReview({ loading: false, draft: null, content: "", notes: "", error: "", message: "" });
+      return;
+    }
+    let cancelled = false;
+    setEvidenceDraftReview((current) => ({ ...current, loading: true, error: "" }));
+    fetchJson(`/api-gateway/rag/evidence-drafts?alert_id=${encodeURIComponent(alertId)}`, authenticatedOptions())
+      .then(async (response) => {
+        if (cancelled) return;
+        let draft = (unwrap(response)?.drafts || [])[0] || null;
+        if (!draft && selectedRcaDecision.rootCause) {
+          const evidenceIds = selectedAiTrust.evidence.map((row) => row.id || row.evidence_id).filter(Boolean);
+          const sourceUris = selectedAiTrust.evidence.map((row) => row.citation || row.uri).filter(Boolean);
+          const content = buildAlertDocumentDraft({ alertId, alert: selectedAlertRow, decision: selectedRcaDecision, workflow: selectedAlertWorkflow, evidence: selectedAiTrust.evidence });
+          const created = await fetchJson("/api-gateway/rag/evidence-drafts", authenticatedOptions({ method: "POST", body: JSON.stringify({ alert_id: alertId, incident_id: selectedIncidentId, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, title: `RCA review: ${selectedAlertRow?.name || "Alert"}`, content, services: [selectedAlertRow?.service].filter(Boolean), evidence_ids: evidenceIds, source_uris: sourceUris }) }));
+          draft = unwrap(created)?.draft || null;
+        }
+        const draftContent = String(draft?.content || "");
+        const alreadyContainsRca = Boolean(selectedRcaDecision.rootCause && draftContent.toLowerCase().includes(String(selectedRcaDecision.rootCause).trim().toLowerCase()));
+        const rcaAppendix = draft && selectedRcaDecision.rootCause && !alreadyContainsRca ? ["", "## Completed RCA", selectedRcaDecision.rootCause, "", "## Impact", selectedRcaDecision.customerImpact, "", "## Recommended response", selectedRcaDecision.action || "No action supplied.", "", `Confidence: ${Math.round(Number(selectedRcaDecision.confidence || 0) * 100)}%`].join("\n") : "";
+        setEvidenceDraftReview({ loading: false, draft, content: draft ? `${draft.content || ""}${rcaAppendix}` : "", notes: "", error: draft ? "" : "RCA must complete before an alert-document draft can be created.", message: draft ? "Draft created automatically. Review, edit, and approve it before publication." : "" });
+      })
+      .catch((error) => { if (!cancelled) setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) })); });
+    return () => { cancelled = true; };
+  }, [selectedAlertId, selectedAlertDocumentLinks.loading, selectedAlertDocumentLinks.rows.length, selectedRcaDecision.rootCause, selectedRcaDecision.customerImpact, selectedRcaDecision.action]);
+
   const selectedExecutionPlan = useMemo(() => {
     const projectionPayload =
       selectedIncidentMetadataRow?.projection_payload && typeof selectedIncidentMetadataRow.projection_payload === "object"
@@ -5450,6 +5671,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       approvalStatus: approval?.status || projectionPayload?.approval_status || "pending",
       commands,
       remediationAction,
+      remediationAnalysis: typeof recommendationMetadata?.remediation_analysis === "object" ? recommendationMetadata.remediation_analysis : {},
     };
   }, [selectedAlertWorkflow, selectedAlertRouting, selectedAlertEventTrace, selectedIncidentMetadataRow, selectedCanonicalIncidentStatus]);
   const selectedExecutionBreakdown = useMemo(() => {
@@ -5476,6 +5698,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         return;
       }
       grouped.commands.push(normalized);
+    });
+    const agentValidation = Array.isArray(selectedExecutionPlan.remediationAnalysis?.validation_queries)
+      ? selectedExecutionPlan.remediationAnalysis.validation_queries
+      : [];
+    agentValidation.forEach((item) => {
+      const query = String(item || "").trim();
+      if (query && !grouped.queries.includes(query)) grouped.queries.push(query);
     });
     const hasPlan = grouped.commands.length > 0 || grouped.scripts.length > 0 || grouped.queries.length > 0;
     return {
@@ -5596,6 +5825,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       connection_url: selectedApplicationConnection.endpoint === "Not configured" ? "" : selectedApplicationConnection.endpoint,
       connection_type: selectedApplicationConnection.connection_type || "application",
       namespace: selectedApplicationConnection.namespace || "",
+      credential_ref: selectedApplicationConnection.credential_ref || "",
+      credential_store: "hashicorp_vault",
       notes: "",
     });
     setRemediationExecutionState({ loading: false, result: null, error: "" });
@@ -5618,6 +5849,19 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
   const dangerousProductionAction = ["prod", "production"].includes(String(selectedApplicationConnection.environment || "").toLowerCase())
     && (["high", "critical"].includes(String(selectedExecutionPlan.riskTier || selectedAlertRow?.severity || "").toLowerCase()) || selectedExecutionBreakdown.hasPlan);
+  const executionPlanLines = [...toPlanLines(remediationPlanEditor.commands), ...toPlanLines(remediationPlanEditor.scripts)]
+    .map((line) => line.trim().toLowerCase())
+    .filter((line) => line && !line.startsWith("#"));
+  const executionIsReadOnly = executionPlanLines.length > 0 && executionPlanLines.every((line) => {
+    if (/^(set\s+-|[a-z_][a-z0-9_]*=|echo\b|printf\b)/.test(line)) return true;
+    if (/--dry-run(?:=|\s+)(?:true|1)\b/.test(line)) return true;
+    if (/^kubectl\s+(?:get|describe|logs|top|auth\s+can-i)\b/.test(line)) return true;
+    if (/^(?:systemctl|service)\s+status\b/.test(line)) return true;
+    if (/^(?:mysql|psql)\b/.test(line) && /\b(?:select|show|describe|explain)\b/.test(line) && !/\b(?:update|insert|delete|alter|drop|truncate|grant|revoke)\b/.test(line)) return true;
+    if (/^curl\b/.test(line) && !/(?:\s-x\s*(?:post|put|patch|delete)\b|\s--request\s+(?:post|put|patch|delete)\b|\s(?:-d|--data(?:-raw|-binary)?)\b)/.test(line)) return true;
+    return false;
+  });
+  const executionRequiresCredential = dangerousProductionAction && !executionIsReadOnly;
   const executionConfirmationPhrase = `EXECUTE ${String(selectedApplicationConnection.service || selectedApplicationConnection.application || "SERVICE").toUpperCase()}`;
   const executionConfirmationValid = !dangerousProductionAction || executionConfirmationText.trim() === executionConfirmationPhrase;
 
@@ -6994,7 +7238,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           endpoint_url: String(remediationPlanEditor.connection_url || "").trim(),
           connection_type: String(remediationPlanEditor.connection_type || selectedApplicationConnection.connection_type || "").trim(),
           source: selectedApplicationConnection.source,
-          credential_ref: selectedApplicationConnection.credential_ref || undefined,
+          credential_ref: String(remediationPlanEditor.credential_ref || selectedApplicationConnection.credential_ref || "").trim() || undefined,
         },
         ui_edited: true,
       },
@@ -7016,6 +7260,46 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     );
     await refreshApprovalDrivenViews(incidentId);
     return response;
+  }
+
+  async function approveEvidenceDraft() {
+    const draft = evidenceDraftReview.draft;
+    if (!draft?.draft_id) return;
+    setEvidenceDraftReview((current) => ({ ...current, loading: true, error: "", message: "" }));
+    try {
+      const reviewedBy = adminSession?.user?.username || "operator";
+      await fetchJson(`/api-gateway/rag/evidence-drafts/${encodeURIComponent(draft.draft_id)}`, authenticatedOptions({ method: "PUT", body: JSON.stringify({ content: evidenceDraftReview.content, reviewed_by: reviewedBy, review_notes: evidenceDraftReview.notes }) }));
+      const response = await fetchJson(`/api-gateway/rag/evidence-drafts/${encodeURIComponent(draft.draft_id)}/approve`, authenticatedOptions({ method: "POST", body: JSON.stringify({ content: evidenceDraftReview.content, approved_by: reviewedBy }) }));
+      setEvidenceDraftReview((current) => ({ ...current, loading: false, draft: { ...draft, status: "approved" }, message: "Reviewed alert knowledge was approved and stored for future RCA grounding." }));
+      await Promise.allSettled([loadRagDocs(), loadSelectedAlertDocumentLinks(selectedAlertId)]);
+    } catch (error) {
+      setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
+    }
+  }
+  async function saveEvidenceDraft() {
+    const draft = evidenceDraftReview.draft; if (!draft?.draft_id) return;
+    setEvidenceDraftReview((current) => ({ ...current, loading: true, error: "", message: "" }));
+    try {
+      const reviewedBy = adminSession?.user?.username || "operator"; const response = await fetchJson(`/api-gateway/rag/evidence-drafts/${encodeURIComponent(draft.draft_id)}`, authenticatedOptions({ method: "PUT", body: JSON.stringify({ content: evidenceDraftReview.content, reviewed_by: reviewedBy, review_notes: evidenceDraftReview.notes }) }));
+      setEvidenceDraftReview((current) => ({ ...current, loading: false, draft: unwrap(response)?.draft || { ...draft, status: "reviewed" }, message: "Draft saved. It remains blocked from reusable knowledge until an authorized user approves it." }));
+    } catch (error) { setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) })); }
+  }
+  async function approveExecutionOutcomeForReuse() {
+    if (!selectedRemediationOutcome) return;
+    setExecutionOutcomeReview((current) => ({ ...current, loading: true, error: "", message: "" }));
+    try {
+      const plan = remediationPlanEditor.scripts || remediationPlanEditor.commands;
+      const reviewer = adminSession?.user?.username || "operator";
+      const content = [`# Validated remediation: ${selectedAlertRow?.name || "incident"}`, "", `Service: ${selectedApplicationConnection.service}`, `Environment: ${selectedApplicationConnection.environment}`, `Outcome: ${executionOutcomeReview.outcome}`, `Reviewed by: ${reviewer}`, "", "## Approved execution plan", plan || "No reusable execution command supplied.", "", "## Validation", ...editedExecutionPlan.queries, "", "## Rollback", executionRollbackPlan || "Not supplied", "", "## Operator review", executionOutcomeReview.notes || "No additional notes."].join("\n");
+      if (executionOutcomeReview.reusable && plan) {
+        await fetchJson("/api-gateway/rag/documents", authenticatedOptions({ method: "POST", body: JSON.stringify({ kind: "remediation", alert_id: selectedAlertId, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, title: `Validated remediation for ${selectedAlertRow?.name || selectedApplicationConnection.service}`, summary: "Operator-reviewed remediation outcome approved for future use.", content, services: [selectedApplicationConnection.service], source_system: "kaims-execution-review", source_ref: `execution-review://${selectedAlertId}`, resolved_by: reviewer, metadata: { approval_status: "approved", execution_outcome: executionOutcomeReview.outcome, reusable: true } }) }));
+      }
+      if (selectedAlertRecommendationId) await fetchJson(`/api-gateway/evaluations/by-recommendation/${encodeURIComponent(selectedAlertRecommendationId)}/feedback`, authenticatedOptions({ method: "POST", body: JSON.stringify({ decision: executionOutcomeReview.outcome === "successful" ? "approve" : "reject", approver: reviewer, comment: executionOutcomeReview.notes || `Execution outcome: ${executionOutcomeReview.outcome}` }) })).catch(() => null);
+      setExecutionOutcomeReview((current) => ({ ...current, loading: false, message: current.reusable && plan ? "Outcome reviewed. The approved script is now reusable knowledge." : "Outcome review recorded without publishing a reusable script." }));
+      await loadRagDocs();
+    } catch (error) {
+      setExecutionOutcomeReview((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
+    }
   }
 
   async function approveIncidentRow(row) {
@@ -7246,17 +7530,53 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
   }
 
-  function runExecutionPreflight() {
+  async function runExecutionPreflight() {
     const passed = blockingPreflightFailures.length === 0;
-    setExecutionPreflightState({
-      signature: executionPlanSignature,
-      checkedAt: new Date().toISOString(),
-      passed,
-    });
-    setRemediationExecutionState((current) => ({
-      ...current,
-      error: passed ? "" : `Preflight blocked: ${blockingPreflightFailures.map((check) => check.label).join(", ")}.`,
-    }));
+    if (!passed) {
+      if (executionRequiresCredential && !remediationPlanEditor.credential_ref) setShowExecutionCredential(true);
+      setExecutionPreflightState({ signature: executionPlanSignature, checkedAt: new Date().toISOString(), passed: false });
+      setRemediationExecutionState((current) => ({ ...current, error: `Dry run blocked: ${blockingPreflightFailures.map((check) => check.label).join(", ")}.` }));
+      return;
+    }
+    setRemediationExecutionState((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const incidentId = String(approvalForm.incident_id || selectedIncidentId || selectedApprovalIncidentId || "").trim();
+      const recommendationId = await resolveRecommendationIdForIncident(incidentId, String(approvalForm.recommendation_id || selectedApprovalRecommendationId || "").trim());
+      const payload = buildRemediationExecutionPayload({ incidentId, recommendationId, action: approvalForm.action, approver: String(approvalForm.approver || adminSession?.user?.username || "operator"), comment: approvalForm.comment || "operator dry run", editedPlan: buildEditedRemediationPlan() });
+      const response = await fetchJson("/api-gateway/remediation/dry-run", authenticatedOptions({ method: "POST", body: JSON.stringify(payload) }));
+      const result = unwrap(response);
+      if (String(result?.status || "").toLowerCase() !== "passed") throw new Error(result?.message || "Dry run was blocked by remediation policy.");
+      setExecutionPreflightState({ signature: executionPlanSignature, checkedAt: new Date().toISOString(), passed: true });
+      setRemediationExecutionState({ loading: false, result: response, error: "" });
+    } catch (error) {
+      setExecutionPreflightState({ signature: executionPlanSignature, checkedAt: new Date().toISOString(), passed: false });
+      const message = String(error?.message || error);
+      const credentialError = message.includes("valid enterprise secret-manager reference");
+      if (credentialError) setShowExecutionCredential(true);
+      setRemediationExecutionState({ loading: false, result: null, error: credentialError ? "Dry run blocked: enter a valid enterprise secret-manager URI in Execution identity, then retry." : `Dry run failed: ${message}` });
+    }
+  }
+
+  async function approveCockpitRemediationPlan() {
+    const incidentId = String(approvalForm.incident_id || selectedIncidentId || selectedApprovalIncidentId || "").trim();
+    const recommendationIdCandidate = String(approvalForm.recommendation_id || selectedApprovalRecommendationId || selectedAlertRecommendationId || "").trim();
+    const approver = String(approvalForm.approver || adminSession?.user?.username || "operator").trim();
+    setApprovalState({ loading: true, result: null, error: "" });
+    try {
+      if (!executionPreflightCurrent) throw new Error("Run a successful dry run for the current plan before approval.");
+      if (!looksLikeUuid(incidentId)) throw new Error("A valid incident is required before this plan can be approved.");
+      if (!editedExecutionPlan.commands.length && !editedExecutionPlan.scripts.length) throw new Error("Review or add an executable script before approval.");
+      if (["high", "critical"].includes(String(selectedExecutionPlan.riskTier || selectedAlertRow?.severity || "").toLowerCase()) && !String(approvalForm.comment || "").trim()) throw new Error("Add an approval reason for this high-risk plan.");
+      const recommendationId = await resolveRecommendationIdForIncident(incidentId, recommendationIdCandidate);
+      const action = approvalForm.action === "modify" ? "modify" : "approve";
+      const response = await executeApprovalAction({ incidentId, recommendationId, action, approver, channel: approvalForm.channel, comment: approvalForm.comment, modifiedAction: action === "modify" ? JSON.stringify(buildEditedRemediationPlan()) : "" });
+      setApprovalForm((current) => ({ ...current, action, incident_id: incidentId, recommendation_id: recommendationId, approver }));
+      applyApprovalResolutionToUi(incidentId, action === "modify" ? "modified" : "approved", approvalForm.comment);
+      setApprovalState({ loading: false, result: response, error: "" });
+      await refreshApprovalDrivenViews(incidentId);
+    } catch (error) {
+      setApprovalState({ loading: false, result: null, error: String(error?.message || error) });
+    }
   }
 
   function confirmAndExecuteRemediationPlan() {
@@ -7370,9 +7690,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       ensureMinimumAlertsBySource(consolidatedRows, allStreamRows)
     );
   }, [landingPadRecent.rows, alerts.rows]);
+  const scopedIngestionStreamRows = useMemo(
+    () => filterAlertsForMonitor(ingestionStreamRows, applicationToMonitor),
+    [ingestionStreamRows, applicationToMonitor],
+  );
   const ingestionStreamCounts = useMemo(() => {
-    const counts = { all: ingestionStreamRows.length, email: 0, log: 0, prometheus: 0, telemetry: 0, ticket: 0, failed: 0 };
-    ingestionStreamRows.forEach((row) => {
+    const counts = { all: scopedIngestionStreamRows.length, email: 0, log: 0, prometheus: 0, telemetry: 0, ticket: 0, failed: 0 };
+    scopedIngestionStreamRows.forEach((row) => {
       const channels = Array.isArray(row?.source_channels) && row.source_channels.length
         ? row.source_channels
         : [String(row?.source_channel || "prometheus")];
@@ -7384,12 +7708,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       }
     });
     return counts;
-  }, [ingestionStreamRows]);
+  }, [scopedIngestionStreamRows]);
   const visibleIngestionStreamRows = useMemo(() => {
     const query = String(ingestionStreamQuery || "").trim().toLowerCase();
     const now = Date.now();
     const timeWindowMs = { "1h": 3600000, "24h": 86400000, "7d": 604800000 }[ingestionStreamFilters.timeRange] || 0;
-    return ingestionStreamRows.filter((row) => {
+    return scopedIngestionStreamRows.filter((row) => {
       const failed = String(row?.status || "").toLowerCase() === "failed" || Boolean(row?.error);
       const status = String(row?.alert_status || row?.status || "").toLowerCase();
       const resolved = ["resolved", "closed", "completed", "inactive"].includes(status);
@@ -7427,12 +7751,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         row.status,
         row.error,
       ].map((value) => String(value || "").toLowerCase()).join(" ").includes(query);
-    });
-  }, [applicationToMonitor, ingestionStreamRows, ingestionStreamChannel, ingestionStreamFilters, ingestionStreamQuery, ingestionStreamSection]);
+    }).slice(0, 50);
+  }, [applicationToMonitor, scopedIngestionStreamRows, ingestionStreamChannel, ingestionStreamFilters, ingestionStreamQuery, ingestionStreamSection]);
   const ingestionFilterOptions = useMemo(() => ({
-    applications: Array.from(new Set(ingestionStreamRows.map((row) => String(row?.application || row?.project_name || row?.project || "").trim()).filter(Boolean))).sort(),
-    environments: Array.from(new Set(ingestionStreamRows.map((row) => String(row?.environment || row?.labels?.environment || "unknown").trim().toLowerCase()).filter(Boolean))).sort(),
-  }), [ingestionStreamRows]);
+    applications: Array.from(new Set(scopedIngestionStreamRows.map((row) => String(row?.application || row?.project_name || row?.project || "").trim()).filter(Boolean))).sort(),
+    environments: Array.from(new Set(scopedIngestionStreamRows.map((row) => String(row?.environment || row?.labels?.environment || "unknown").trim().toLowerCase()).filter(Boolean))).sort(),
+  }), [scopedIngestionStreamRows]);
   const isAuthenticated = Boolean(String(adminSession.accessToken || "").trim());
   const isAdministrator = currentRole === "administrator";
   const canUseApprovalActions = allowedTabs.includes("approval");
@@ -7441,6 +7765,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     || selectedAlertWorkflow?.recommendation?.rollback_plan
     || selectedExecutionPlan.remediationAction?.rollback
     || selectedExecutionPlan.remediationAction?.parameters?.rollback_plan
+    || (Array.isArray(selectedExecutionPlan.remediationAnalysis?.rollback_plan) ? selectedExecutionPlan.remediationAnalysis.rollback_plan.join(" ") : selectedExecutionPlan.remediationAnalysis?.rollback_plan)
     || ""
   ).trim();
   const editedExecutionPlan = buildEditedRemediationPlan();
@@ -7449,17 +7774,18 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     recommendation: approvalForm.recommendation_id || selectedApprovalRecommendationId || "",
     connection: remediationPlanEditor.connection_url,
     namespace: remediationPlanEditor.namespace,
-    credential_ref: selectedApplicationConnection.credential_ref,
+    credential_ref: remediationPlanEditor.credential_ref || selectedApplicationConnection.credential_ref,
     ...editedExecutionPlan,
   });
+  const credentialReferenceValid = !executionRequiresCredential || /^(?:vault:\/\/|arn:aws:secretsmanager:|gcp-secret:\/\/|k8s-secret:\/\/)/.test(String(remediationPlanEditor.credential_ref || "").trim()) || /^https:\/\/[^/]+\.vault\.azure\.net\/secrets\/[^/]+(?:\/[^/]+)?$/i.test(String(remediationPlanEditor.credential_ref || "").trim());
   const executionPreflightChecks = [
     { id: "incident", label: "Incident identity", detail: "A durable incident ID is attached.", passed: looksLikeUuid(String(approvalForm.incident_id || selectedIncidentId || selectedApprovalIncidentId || "")), blocking: true },
-    { id: "approval", label: "Approval state", detail: "The plan is approved or ready for an explicit approval action.", passed: ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) || ["approve", "modify"].includes(approvalForm.action), blocking: true },
+    { id: "approval", label: "Approval state", detail: "An operator has persisted approval for the reviewed script.", passed: ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus), blocking: true },
     { id: "role", label: "Operator permission", detail: "The signed-in role can approve and execute remediation.", passed: canUseApprovalActions, blocking: true },
     { id: "target", label: "Execution target", detail: `${selectedApplicationConnection.service} in ${selectedApplicationConnection.environment}.`, passed: !["", "-"].includes(String(selectedApplicationConnection.service || "").trim()), blocking: true },
     { id: "plan", label: "Executable plan", detail: `${editedExecutionPlan.commands.length} command(s), ${editedExecutionPlan.scripts.length} script(s).`, passed: Boolean(editedExecutionPlan.commands.length || editedExecutionPlan.scripts.length), blocking: true },
     { id: "connection", label: "Connector context", detail: "Endpoint or runtime namespace is supplied.", passed: Boolean(String(remediationPlanEditor.connection_url || remediationPlanEditor.namespace || "").trim()), blocking: false },
-    { id: "credential", label: "Credential reference", detail: selectedApplicationConnection.credential_ref ? "Reusable secret-manager reference is configured." : "Configure a secret-manager reference in application onboarding.", passed: Boolean(selectedApplicationConnection.credential_ref), blocking: dangerousProductionAction },
+    { id: "credential", label: "Credential reference", detail: !executionRequiresCredential ? "Not required for this read-only plan." : credentialReferenceValid ? "A valid enterprise secret-manager URI is attached." : "Use an Azure Key Vault, HashiCorp Vault, AWS Secrets Manager, or Kubernetes Secret URI.", passed: credentialReferenceValid, blocking: executionRequiresCredential },
     { id: "rollback", label: "Rollback coverage", detail: executionRollbackPlan || "No explicit rollback plan is attached.", passed: Boolean(executionRollbackPlan), blocking: false },
     { id: "validation", label: "Recovery validation", detail: editedExecutionPlan.queries.length ? `${editedExecutionPlan.queries.length} post-check(s) supplied.` : "No explicit validation query is attached.", passed: editedExecutionPlan.queries.length > 0, blocking: false },
   ];
@@ -7476,17 +7802,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     { id: "overview", short: "01", label: "Orient", accessibleLabel: "Overview", description: "Identity and lifecycle", complete: Boolean(selectedAlertId) },
     { id: "evidence", short: "02", label: "Evidence", description: `${selectedAlertRagDocuments.length} linked record(s)`, complete: selectedAlertRagDocuments.length > 0 },
     { id: "rca", short: "03", label: "Understand", accessibleLabel: "RCA & Impact", description: "RCA and impact", complete: Boolean(cockpitAnalysis.rootCause && cockpitAnalysis.rootCause !== "-") },
-    { id: "resolution", short: "04", label: "Plan", accessibleLabel: "Resolution", description: "Recommended response", complete: Boolean(cockpitAnalysis.action && cockpitAnalysis.action !== "-") },
-    { id: "approval", short: "05", label: "Decide", accessibleLabel: "Approval", description: selectedExecutionBreakdown.approvalStatus || "pending", complete: cockpitApprovalComplete },
-    { id: "execution", short: "06", label: "Execute", accessibleLabel: "Execution", description: cockpitExecutionStatus || "not started", complete: ["succeeded", "skipped", "failed"].includes(cockpitExecutionStatus) },
-    { id: "audit", short: "07", label: "Validate", accessibleLabel: "Audit Trail", description: selectedCanonicalIncidentStatus === "closed" ? "closed" : "audit and recovery", complete: selectedCanonicalIncidentStatus === "closed" },
+    { id: "execution", short: "04", label: "Resolve", accessibleLabel: "Resolve incident", description: cockpitExecutionStatus || selectedExecutionBreakdown.approvalStatus || "plan, approve, execute", complete: ["succeeded", "skipped", "failed"].includes(cockpitExecutionStatus) },
+    { id: "audit", short: "05", label: "Validate", accessibleLabel: "Audit Trail", description: selectedCanonicalIncidentStatus === "closed" ? "closed" : "audit and recovery", complete: selectedCanonicalIncidentStatus === "closed" },
   ];
   const cockpitRecommendedStage = (() => {
     if (!selectedAlertRagDocuments.length || selectedAlertEvaluation.requiresReview) return "evidence";
     if (!incidentCockpitStages.find((stage) => stage.id === "rca")?.complete) return "rca";
-    if (!incidentCockpitStages.find((stage) => stage.id === "resolution")?.complete) return "resolution";
-    if (!cockpitApprovalComplete) return "approval";
-    if (!cockpitExecutionStatus) return "execution";
+    if (!cockpitAnalysis.action || cockpitAnalysis.action === "-") return "execution";
+    if (!cockpitApprovalComplete || !cockpitExecutionStatus) return "execution";
     return "audit";
   })();
   const cockpitRecommended = incidentCockpitStages.find((stage) => stage.id === cockpitRecommendedStage) || incidentCockpitStages[0];
@@ -8351,8 +8674,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const openAlerts = monitorScopedAlerts.filter((row) => !isApprovalResolvedStatus(row?.status || row?.state));
     const priorityIncidents = monitorScopedIncidentMetadata.filter((row) => ["critical", "high"].includes(String(row?.severity || row?.risk_tier || row?.risk || "").toLowerCase()));
     const failedAutomation = selectedAlertEventsDisplay.filter((row) => [row?.status, row?.detail, row?.message].some((value) => /failed|error/i.test(String(value || "")))).length;
-    const connectorRows = Array.isArray(monitoringApps.rows) ? monitoringApps.rows : [];
+    const connectorRows = (Array.isArray(monitoringApps.rows) ? monitoringApps.rows : []).filter((row) => {
+      const name = String(row?.name || row?.application || "").trim().toLowerCase();
+      return !applicationToMonitor || name === String(applicationToMonitor).trim().toLowerCase();
+    });
     const unhealthyConnectors = connectorRows.filter((row) => /failed|error|unhealthy|disabled/i.test(String(row?.status || ""))).length;
+    const hasScopedAlertSelection = Boolean(selectedAlertRow);
+    const isManagedPlatformScope = ["kaims", "telemetry"].includes(String(applicationToMonitor || "").trim().toLowerCase());
     const shared = {
       period: "Current operational window",
       timezone: "Asia/Kolkata (IST)",
@@ -8378,11 +8706,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       ] };
     }
     if (currentRole === "administrator") {
-      return { ...shared, kind: "Administrator", title: "Platform attention", description: "Connector, queue, agent, workflow, and telemetry health.", cards: [
-        { label: "Connector Health", value: `${Math.max(connectorRows.length - unhealthyConnectors, 0)}/${connectorRows.length || 0}`, detail: "Registered monitoring applications without a failed health status.", tone: unhealthyConnectors ? "attention" : "clear", tab: "admin" },
-        { label: "Queue Health", value: messageBusActual?.provider || "Unknown", detail: "Configured deployment message-bus provider; queue age is unavailable in this UI contract.", tone: messageBusActual?.provider ? "info" : "attention", tab: "rag" },
-        { label: "Agent Health", value: selectedAlertEventsDisplay.length, detail: "Persisted agent or trace events for the selected alert.", tone: selectedAlertEventsDisplay.length ? "clear" : "attention", tab: "trace" },
-        { label: "Workflow Health", value: failedAutomation ? `${failedAutomation} failed` : "Clear", detail: "Selected workflow events containing failed or error state.", tone: failedAutomation ? "attention" : "clear", tab: "trace" },
+      return { ...shared, kind: "Administrator", title: `${selectedMonitorScopeLabel} operations`, description: "Application health and activity, with platform-wide infrastructure clearly identified.", cards: [
+        { label: "Application Connector", value: isManagedPlatformScope && !connectorRows.length ? "Managed" : !connectorRows.length ? "Not configured" : unhealthyConnectors ? "Attention" : "Healthy", detail: isManagedPlatformScope && !connectorRows.length ? `${selectedMonitorScopeLabel} uses KaiMS-managed platform monitoring; no separate onboarding record is required.` : !connectorRows.length ? `${selectedMonitorScopeLabel} has no registered monitoring connector.` : `${connectorRows.length} connector record(s) scoped to ${selectedMonitorScopeLabel}; ${unhealthyConnectors} unhealthy.`, tone: isManagedPlatformScope && !connectorRows.length ? "info" : !connectorRows.length || unhealthyConnectors ? "attention" : "clear", tab: "admin" },
+        { label: "Queue Health", value: queueHealth.loading ? "Checking" : queueHealth.healthy ? "Healthy" : queueHealth.status === "attention" ? "Attention" : "Unavailable", detail: queueHealth.loading ? "Reading live broker telemetry." : `${String(queueHealth.provider || "rabbitmq").toUpperCase()} · ${queueHealth.queues || 0} queues · ${queueHealth.ready || 0} ready · ${queueHealth.unacknowledged || 0} in flight.`, tone: queueHealth.healthy ? "clear" : "attention", tab: "rag" },
+        { label: "Selected Incident Activity", value: hasScopedAlertSelection ? selectedAlertEventsDisplay.length : "No selection", detail: hasScopedAlertSelection ? `Persisted agent or trace events for the selected ${selectedMonitorScopeLabel} incident.` : `Open a ${selectedMonitorScopeLabel} alert to inspect agent activity.`, tone: hasScopedAlertSelection && selectedAlertEventsDisplay.length ? "clear" : "info", tab: "trace" },
+        { label: "Selected Workflow", value: !hasScopedAlertSelection ? "No selection" : failedAutomation ? `${failedAutomation} failed` : "No failures", detail: hasScopedAlertSelection ? "Failure state for the selected in-scope incident workflow." : "Workflow status is shown only after an in-scope alert is selected.", tone: failedAutomation ? "attention" : "info", tab: "trace" },
         { label: "Telemetry", value: gatewayRecent.rows.length, detail: "API gateway telemetry events in the current loaded window.", tone: gatewayRecent.rows.length ? "info" : "attention", tab: "safety" },
       ] };
     }
@@ -8393,7 +8721,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       { label: "Assigned Work", value: "Partial", detail: "Assignment data is not exposed by the current dashboard contract.", tone: "info", tab: "home" },
       { label: "SLA Risks", value: executiveInsights.slaAtRisk, detail: "Open high-risk or manual-mode incidents.", tone: executiveInsights.slaAtRisk ? "attention" : "clear", tab: "home" },
     ] };
-  }, [alerts.error, alerts.loading, approvalState.error, approvalState.loading, currentRole, executiveInsights, gatewayRecent.rows.length, health.ok, incidentMetadata.error, incidentMetadata.loading, messageBusActual, monitorScopedAlerts, monitorScopedIncidentMetadata, monitoringApps.error, monitoringApps.loading, monitoringApps.rows, pendingApprovals.length, selectedAlertEventsDisplay, selectedExecutionBreakdown.commands.length, selectedExecutionBreakdown.scripts.length]);
+  }, [alerts.error, alerts.loading, approvalState.error, approvalState.loading, applicationToMonitor, currentRole, executiveInsights, gatewayRecent.rows.length, health.ok, incidentMetadata.error, incidentMetadata.loading, monitorScopedAlerts, monitorScopedIncidentMetadata, monitoringApps.error, monitoringApps.loading, monitoringApps.rows, pendingApprovals.length, queueHealth, selectedAlertEventsDisplay, selectedAlertRow, selectedExecutionBreakdown.commands.length, selectedExecutionBreakdown.scripts.length, selectedMonitorScopeLabel]);
 
   function downloadFullHtmlReportPack() {
     const now = new Date();
@@ -8557,7 +8885,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>KaiOps Report Pack - ${htmlEscape(selectedMonitorScopeLabel)}</title>
+  <title>KaiMS Report Pack - ${htmlEscape(selectedMonitorScopeLabel)}</title>
   <style>
     :root { color-scheme: light; }
     body { margin: 0; padding: 24px; font-family: "Segoe UI", Tahoma, sans-serif; background: #f5f8fb; color: #10233b; }
@@ -8574,7 +8902,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   </style>
 </head>
 <body>
-  <h1>KaiOps Full HTML Report Pack</h1>
+  <h1>KaiMS Full HTML Report Pack</h1>
   <p class="meta">Application: ${htmlEscape(selectedMonitorScopeLabel)} | Generated: ${htmlEscape(generatedAt)}</p>
   ${sections.join("\n")}
 </body>
@@ -8593,18 +8921,34 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
   if (!isAuthenticated) {
     return (
-      <main className={`app-shell density-${uiDensity}`}>
-        <section className="grid single-col">
-          <article className="panel" style={{ maxWidth: 560, margin: "48px auto" }}>
+      <main className={`app-shell auth-shell density-${uiDensity}`}>
+        <section className="auth-stage">
+          <aside className="auth-brand-story">
+            <KaiMSBrand inverse />
+            <div className="auth-story-copy">
+              <span className="auth-kicker">Intelligent Managed Service</span>
+              <h1>Always-on incident intelligence. Human-controlled outcomes.</h1>
+              <p>KaiMS is an AI-powered Managed Service that connects evidence, operational reasoning, human judgment, and safe automation in one trusted workspace.</p>
+            </div>
+            <div className="auth-proof-grid" aria-label="KaiMS platform capabilities">
+              <span><strong>Evidence-first</strong><small>Every conclusion is traceable</small></span>
+              <span><strong>Human-governed</strong><small>Control stays with operators</small></span>
+              <span><strong>Closed-loop</strong><small>Every outcome improves the next</small></span>
+            </div>
+          </aside>
+          <article className="panel auth-card">
+            <KaiMSBrand compact />
             <div className="panel-head">
               <div>
-                <h2>Login</h2>
-                <p>Sign in to access role-based KaiOps workspaces.</p>
+                <span className="auth-kicker">Secure workspace</span>
+                <h2>Welcome back</h2>
+                <p>Sign in to your secure Managed Service operations workspace.</p>
               </div>
             </div>
+            <label className="auth-application-select">Application workspace<select aria-label="Application workspace" value={applicationToMonitor} onChange={(event) => setApplicationToMonitor(event.target.value)}>{monitorApplications.map((name) => <option key={name} value={name}>{name}</option>)}</select><small>The workspace opens already scoped to this managed application.</small></label>
             {authConfig.mode === "oidc" ? (
               <div className="form">
-                <p>Enterprise single sign-on is required. Your identity-provider role controls KaiOps access.</p>
+                <p>Enterprise single sign-on is required. Your identity-provider role controls KaiMS access.</p>
                 <button className="button-primary" type="button" onClick={oidcLogin} disabled={adminSession.loading || authConfig.loading}>{adminSession.loading ? "Redirecting..." : "Continue with SSO"}</button>
               </div>
             ) : (
@@ -8635,45 +8979,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       <div className="app-layout">
         <aside className="sidebar panel sidebar-panel">
           <div className="sidebar-head">
-            <p className="eyebrow">KaiOps</p>
-            <h2>Operations</h2>
-            <p className="subtitle">Monitor, investigate, and resolve.</p>
-          </div>
-
-          <div className="sidebar-group">
-            <h3>Monitor</h3>
-            <label>
-              Application
-              <select value={applicationToMonitor} onChange={(e) => setApplicationToMonitor(e.target.value)}>
-                {!monitorApplicationGroups.applications.length
-                  && !monitorApplicationGroups.tests.length
-                  && !monitorApplicationGroups.platform.length ? (
-                    <option value={applicationToMonitor} disabled>No applications registered</option>
-                  ) : null}
-                {monitorApplicationGroups.applications.length ? (
-                  <optgroup label="Applications">
-                    {monitorApplicationGroups.applications.map((app) => (
-                      <option key={app} value={app}>{monitorScopeLabel(app)}</option>
-                    ))}
-                  </optgroup>
-                ) : null}
-                {monitorApplicationGroups.tests.length ? (
-                  <optgroup label="Test projects">
-                    {monitorApplicationGroups.tests.map((app) => (
-                      <option key={app} value={app}>{monitorScopeLabel(app)}</option>
-                    ))}
-                  </optgroup>
-                ) : null}
-                {monitorApplicationGroups.platform.length ? (
-                  <optgroup label="KaiOps platform">
-                    {monitorApplicationGroups.platform.map((app) => (
-                      <option key={app} value={app}>{monitorScopeLabel(app)}</option>
-                    ))}
-                  </optgroup>
-                ) : null}
-              </select>
-            </label>
-            <HealthBadge ok={health.ok} label={health.message} />
+            <KaiMSBrand onActivate={() => onNavigatePath?.("/")} />
+            <p className="sidebar-mission">From signal to verified resolution.</p>
           </div>
 
           <details className="sidebar-group sidebar-preferences">
@@ -8724,7 +9031,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           <nav className="sidebar-group" aria-label="Primary navigation">
             <div className="sidebar-sections-wrap">
               <div className="sidebar-navigation-groups">
-                {navigationGroups.map((group) => <div className="sidebar-navigation-group" key={group.id}>
+                {navigationGroups.map((group) => <div className={`sidebar-navigation-group sidebar-navigation-group-${group.id}`} key={group.id}>
                   <h3>{group.label}</h3>
                   <div className="sidebar-sections">
                     {group.items.map((item) => {
@@ -8747,23 +9054,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             </div>
           </nav>
 
-          <div className="sidebar-group compact-tools">
-            <button className="button-secondary" onClick={refreshAll}>Refresh</button>
-            <button className="button-secondary" onClick={checkHealth} disabled={health.loading}>
-              {health.loading ? "Checking..." : "Health"}
-            </button>
-          </div>
         </aside>
 
         <section className="content-area" id="workspace-content" tabIndex={-1}>
           <header className="hero">
-            <p className="eyebrow">{currentBreadcrumb[0]?.label || "KaiOps"}</p>
+            <p className="eyebrow">{currentBreadcrumb[0]?.label || "KaiMS"}</p>
             <h1>{currentNavigationItem.pageTitle}</h1>
             <p className="subtitle">{currentNavigationItem.keywords.join(" · ")}</p>
             {restrictedDestination ? <div className="permission-navigation-notice" role="status">{restrictedDestination} is not available to your current role. Ask an administrator if your responsibilities require access.</div> : null}
-            <nav className="route-breadcrumbs" aria-label="Breadcrumb">
-              <ol>{currentBreadcrumb.map((crumb, index) => <li key={`${crumb.label}-${index}`} aria-current={index === currentBreadcrumb.length - 1 ? "page" : undefined}>{crumb.label}</li>)}</ol>
-            </nav>
             <label className="mobile-navigation">
               <span>Navigate to</span>
               <select value={currentNavigationItem.path} onChange={(event) => {
@@ -8775,10 +9073,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             </label>
             <div className="hero-actions">
               <HealthBadge ok={health.ok} label={health.message} />
-              <span className="subtitle">Monitoring: {selectedMonitorScopeLabel}</span>
-              <span className="subtitle">Signed in: {adminSession?.user?.username || "-"} ({adminSession?.user?.role_name || "-"})</span>
+              <span className="hero-user" title={`Signed in as ${adminSession?.user?.username || "-"}`}>{adminSession?.user?.username || "-"} · {adminSession?.user?.role_name || "-"}</span>
               <button className="button-primary" type="button" onClick={() => setIsCopilotOpen(!isCopilotOpen)}>
-                <Bot size={16} /> {isCopilotOpen ? "Close Copilot" : "Ask Copilot"}
+                <Bot size={16} /> {isCopilotOpen ? "Close KAI" : "Ask KAI"}
               </button>
               <button className="button-secondary" type="button" onClick={adminLogout}>Logout</button>
             </div>
@@ -8791,7 +9088,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             </nav> : null}
           </header>
 
-          <details className="global-operations-bar panel" aria-label="Global operational capabilities" open>
+          <details className="global-operations-bar panel" aria-label="Global operational capabilities">
             <summary className="global-operations-summary"><span>Search &amp; personal work</span><small>Find records, assignments, and notifications</small></summary>
             <div className="global-operations-body">
             <div className="global-operations-tabs" role="tablist" aria-label="Global operations">
@@ -8868,10 +9165,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               role: roleDashboard,
               allowedTabs,
               projects: monitoringApps.rows || [],
+              observedProjects: monitorApplications,
               selectedProject: String(applicationToMonitor || ""),
               workflow: workflowGuide,
               openSection,
-              refreshProjects: loadMonitorApplications,
+              refreshProjects: () => Promise.allSettled([loadMonitorApplications(), loadMonitoringApplications(), checkQueueHealth(), loadIncidentMetadata({ background: true })]),
               selectProject: setApplicationToMonitor,
             },
             copilot: {
@@ -8919,13 +9217,22 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               configuredRows: messageBusTopicRows,
               routing: observedRouting,
               primaryTopic: onboardingForm.azure_service_bus_topic,
-              refresh: () => runWorkflow(selectedFlow),
+              application: applicationToMonitor,
+              refresh: () => Promise.allSettled([
+                loadGatewayRecent(),
+                selectedAlertId
+                  ? loadAlertDetails(selectedAlertId, selectedAlertRow, { background: true })
+                  : loadRecentAlerts({ background: true }),
+              ]),
             },
             incidents: {
-              rows: monitorScopedIncidentMetadata,
+              rows: monitorScopedIncidentMetadata.length || !incidentMetadata.rows.length
+                ? monitorScopedIncidentMetadata
+                : incidentMetadata.rows,
               loading: incidentMetadata.loading,
               error: incidentMetadata.error || "",
               application: applicationToMonitor,
+              scopeFallback: Boolean(applicationToMonitor && incidentMetadata.rows.length && !monitorScopedIncidentMetadata.length),
               filters: metadataFilters,
               refresh: loadIncidentMetadata,
               updateFilter: (name, value) => setMetadataFilters((current) => ({ ...current, [name]: value })),
@@ -8938,7 +9245,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               liveState: liveEvents.state,
               lastEventAt: liveEvents.lastEventAt,
               rows: visibleIngestionStreamRows,
-              totalRows: ingestionStreamRows.length,
+              totalRows: scopedIngestionStreamRows.length,
               updatedAt: ingestionStreamUpdatedAt,
               section: ingestionStreamSection,
               view: ingestionStreamView,
@@ -8949,7 +9256,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               counts: ingestionStreamCounts,
               channel: ingestionStreamChannel,
               query: ingestionStreamQuery,
-              refresh: loadLandingPadRecent,
+              refresh: () => { loadRecentAlerts({ background: true }); loadLandingPadRecent(); },
+              open: openAlertDetails,
               togglePaused: () => setIngestionStreamPaused((current) => !current),
               setSection: setIngestionStreamSection,
               setView: setIngestionStreamView,
@@ -9194,7 +9502,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                 />
               </article>
 
-              {selectedAlertRow ? (
+              {selectedAlertRow && !routeOutlet ? (
                 <article className="panel guided-cockpit-launcher">
                   <header className="guided-cockpit-header">
                     <div>
@@ -9214,7 +9522,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                     <span><small>Grounding</small><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong></span>
                   </div>
                   <section className="guided-cockpit-next" aria-labelledby="guided-next-action">
-                    <div><span className="eyebrow">Recommended next step</span><h3 id="guided-next-action">{cockpitRecommended.label}</h3><p>{cockpitRecommended.description}. KaiOps will keep your selected incident and context in view.</p></div>
+                    <div><span className="eyebrow">Recommended next step</span><h3 id="guided-next-action">{cockpitRecommended.label}</h3><p>{cockpitRecommended.description}. KaiMS will keep your selected incident and context in view.</p></div>
                     <button type="button" className="button-primary" onClick={() => { openAlertDetails(selectedAlertRow); setHomeDetailTab(cockpitRecommendedStage); }}>Continue to {cockpitRecommended.label}</button>
                   </section>
                   <nav className="guided-cockpit-mini-journey" aria-label="Incident progress">
@@ -9443,10 +9751,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                 <article className="panel alert-details-cockpit" ref={alertDetailsRef} tabIndex={-1}>
                   <div className="panel-head incident-sticky-header">
                     <div>
-                      <span className="discovery-eyebrow">Active incident workspace</span>
-                      <h2>Alert Details Cockpit</h2>
+                      <span className="discovery-eyebrow">Guided Incident Cockpit</span>
+                      <h2>Incident Response</h2>
                       <h3>{selectedAlertRow?.service || "Incident"}: {selectedAlertRow?.name || selectedAlertRow?.alert_name || "Alert investigation"}</h3>
-                      <p>Current task: <strong>{incidentCockpitStages.find((stage) => stage.id === homeDetailTab)?.label || "Investigate"}</strong>. Recommended next: <strong>{cockpitRecommended.label}</strong>.</p>
+                      <p>Work one guided path from evidence and RCA through approval, execution, and verified recovery. Current task: <strong>{incidentCockpitStages.find((stage) => stage.id === homeDetailTab)?.label || "Investigate"}</strong>. Recommended next: <strong>{cockpitRecommended.label}</strong>.</p>
                     </div>
                     <div className="incident-record-navigation" aria-label="Incident record navigation">
                       <button type="button" className="button-secondary" disabled={!selectedAlertNavigation.previous} onClick={() => {
@@ -9618,7 +9926,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         type="button"
                         className="button-secondary"
                         onClick={regenerateSelectedAlertAnalysis}
-                        disabled={selectedAlertData.loading || selectedAlertRegeneration.loading}
+                        disabled={!selectedAlertRow || selectedAlertRegeneration.loading}
                         style={{ marginLeft: 8 }}
                       >
                         {selectedAlertRegeneration.loading ? "Regenerating RCA..." : "Regenerate RCA For This Alert"}
@@ -9629,6 +9937,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                   {selectedAlertRegeneration.message ? <p className="subtitle">{selectedAlertRegeneration.message}</p> : null}
 
                   {homeDetailTab === "rca" ? (
+                    <>
+                    {!selectedAlertRagDocuments.length ? <section className="panel knowledge-review-gate"><div className="panel-head"><div><span className="eyebrow">Knowledge completion required</span><h3>Review RCA-derived alert knowledge</h3><p>No approved alert document is linked. KaiMS prepared a draft from discovery evidence and the completed RCA; an operator must approve it before future use.</p></div><span className={`workflow-pill ${evidenceDraftReview.draft?.status === "approved" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft?.status || "draft"}</span></div>{evidenceDraftReview.loading?<p>Loading evidence draft…</p>:null}{evidenceDraftReview.draft?<><label>Knowledge document<textarea rows={12} value={evidenceDraftReview.content} onChange={(e)=>setEvidenceDraftReview((current)=>({...current,content:e.target.value}))}/></label><label>Reviewer notes<textarea rows={3} placeholder="Confirm corrections, exclusions, and why this is safe for future grounding." value={evidenceDraftReview.notes} onChange={(e)=>setEvidenceDraftReview((current)=>({...current,notes:e.target.value}))}/></label><button type="button" className="button-primary" onClick={approveEvidenceDraft} disabled={evidenceDraftReview.loading||evidenceDraftReview.content.trim().length<20||evidenceDraftReview.draft?.status==="approved"}>{evidenceDraftReview.loading?"Approving…":evidenceDraftReview.draft?.status==="approved"?"Approved":"Approve and publish knowledge"}</button></>:null}{evidenceDraftReview.error?<p className="error">{evidenceDraftReview.error}</p>:null}{evidenceDraftReview.message?<p className="status-message">{evidenceDraftReview.message}</p>:null}</section>:null}
                     <RcaPanel
                       rcaDetailView={rcaDetailView}
                       onSetRcaDetailView={setRcaDetailView}
@@ -9648,7 +9958,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                       onDownloadRagDocument={downloadRagDocument}
                       onLoadRagDocumentContent={loadRagDocumentContent}
                       onSubmitAiRecommendationFeedback={submitAiRecommendationFeedback}
-                    />
+                    /></>
                   ) : null}
 
                   {homeDetailTab === "overview" ? (
@@ -9773,6 +10083,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                       ) : null}
 
                       <h3>Persisted Stage Completeness</h3>
+                      <p className="subtitle">A stage is complete only when durable event or relational evidence confirms it. Pending work is never counted as completed.</p>
                       {selectedStageCompleteness.loading ? <p className="subtitle">Loading stage completeness...</p> : null}
                       {selectedStageCompleteness.error ? <p className="error">{selectedStageCompleteness.error}</p> : null}
                       {selectedStageCompleteness.data ? (
@@ -9781,20 +10092,22 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <thead>
                               <tr>
                                 <th>Stage</th>
-                                <th>Persisted</th>
-                                <th>Matched Event Types</th>
+                                <th>Status</th>
+                                <th>Persisted evidence</th>
+                                <th>Required next action</th>
                               </tr>
                             </thead>
                             <tbody>
                               {(selectedStageCompleteness.data?.stages || []).map((row, index) => (
                                 <tr key={`stage-${row.stage || index}`}>
                                   <td>{row.label || row.stage || "-"}</td>
-                                  <td>{row.persisted ? "yes" : "no"}</td>
-                                  <td>{Array.isArray(row.matched_event_types) && row.matched_event_types.length ? row.matched_event_types.join(" | ") : "-"}</td>
+                                  <td><span className={`stage-state stage-state-${row.state || (row.persisted ? "complete" : "waiting")}`}>{row.state === "in_progress" ? "In progress" : row.persisted ? "Complete" : "Waiting"}</span></td>
+                                  <td>{Array.isArray(row.evidence_sources) && row.evidence_sources.length ? row.evidence_sources.join(" · ") : Array.isArray(row.matched_event_types) && row.matched_event_types.length ? row.matched_event_types.join(" · ") : "No durable evidence yet"}</td>
+                                  <td>{row.next_action || (row.persisted ? "Completed." : "Complete the preceding workflow stage.")}</td>
                                 </tr>
                               ))}
                               {!Array.isArray(selectedStageCompleteness.data?.stages) || !selectedStageCompleteness.data.stages.length ? (
-                                <tr><td colSpan={3}>No persisted stage rows found for incident.</td></tr>
+                                <tr><td colSpan={4}>No persisted stage rows found for incident.</td></tr>
                               ) : null}
                             </tbody>
                           </table>
@@ -9802,10 +10115,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                       ) : null}
 
                       {selectedStageCompleteness.data ? (
-                        <p className="subtitle">
+                        <div className="stage-completion-summary">
+                          <progress max={selectedStageCompleteness.data?.stage_completion?.total || 1} value={selectedStageCompleteness.data?.stage_completion?.completed || 0} />
+                          <p className="subtitle">
                           Completion: {selectedStageCompleteness.data?.stage_completion?.completed ?? 0}/{selectedStageCompleteness.data?.stage_completion?.total ?? 0}
                           {" "}({selectedStageCompleteness.data?.stage_completion?.percentage ?? 0}%)
-                        </p>
+                          </p>
+                        </div>
                       ) : null}
                       </details>
                     </>
@@ -9846,7 +10162,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                     </details>
                   ) : null}
 
-                  {homeDetailTab === "approval" ? (
+                  {false && homeDetailTab === "execution" ? (
                     <details className="panel incident-workspace-section workspace-collapsible approval-workspace" open>
                       <summary className="panel-head">
                         <div>
@@ -9977,10 +10293,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                       ) : (
                         <div className="alert-documents-empty">
                           <div>
-                            <strong>No alert documents linked yet.</strong>
+                            <strong>{evidenceDraftReview.draft ? "KaiMS prepared the missing alert document" : "Preparing the missing alert document"}</strong>
                             <p className="subtitle">
-                              Use the same Provide Documents workflow for this alert to review the generated draft, upload content,
-                              and save downloadable documents back to this tab.
+                              RCA, impact, diagnostics, resolution, validation, rollback, and cited evidence are assembled automatically. Review and edit the draft before approval.
                             </p>
                           </div>
                           <div className="alert-documents-kind-row">
@@ -9988,22 +10303,22 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                               <span key={`empty-doc-kind-${kind}`}>{kind}</span>
                             ))}
                           </div>
+                          {evidenceDraftReview.loading && !evidenceDraftReview.draft ? <div className="alert-document-generation-state"><span className="spinner" aria-hidden="true" /><span>Completing the RCA-derived document draft…</span></div> : null}
+                          {canProvideAlertDocuments && evidenceDraftReview.draft ? <div className="alert-document-draft-editor">
+                            <div className="alert-document-draft-heading"><div><span className="eyebrow">Editable draft</span><h4>{evidenceDraftReview.draft.title || "Incident knowledge document"}</h4></div><span className={`workflow-pill ${evidenceDraftReview.draft.status === "reviewed" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft.status || "draft"}</span></div>
+                            <label>Document content<textarea rows={18} value={evidenceDraftReview.content} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, content: event.target.value }))} disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status === "approved"} /></label>
+                            <label>Reviewer notes<textarea rows={3} value={evidenceDraftReview.notes} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, notes: event.target.value }))} placeholder="Record corrections, exclusions, and evidence that still needs confirmation." disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status === "approved"} /></label>
+                            <div className="alert-documents-empty-actions"><button type="button" className="button-secondary" onClick={saveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20}>Save draft</button><button type="button" className="button-primary" onClick={approveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20}>Approve &amp; publish</button><button type="button" className="button-ghost" onClick={() => selectedAlertRow && openDocumentPrompt(selectedAlertRow)}>Add source document</button></div>
+                          </div> : null}
                           <div className="alert-documents-empty-actions">
-                            {canProvideAlertDocuments ? (
-                              <button
-                                type="button"
-                                className="button-primary"
-                                onClick={() => selectedAlertRow && openDocumentPrompt(selectedAlertRow)}
-                                disabled={!selectedAlertRow || selectedAlertActionContext?.alertClosed}
-                              >
-                                Provide Documents
-                              </button>
-                            ) : (
+                            {!canProvideAlertDocuments ? (
                               <button type="button" className="button-secondary" onClick={() => setHomeDetailTab("audit")}>
                                 Escalate To L2/L3
                               </button>
-                            )}
+                            ) : !evidenceDraftReview.draft && !evidenceDraftReview.loading ? <button type="button" className="button-secondary" onClick={() => selectedAlertRow && openDocumentPrompt(selectedAlertRow)}>Add supporting document</button> : null}
                           </div>
+                          {evidenceDraftReview.error ? <p className="error">{evidenceDraftReview.error}</p> : null}
+                          {evidenceDraftReview.message ? <p className="status-message">{evidenceDraftReview.message}</p> : null}
                           {selectedAlertActionContext?.alertClosed ? (
                             <p className="subtitle">This alert is closed, so document creation is disabled.</p>
                           ) : null}
@@ -10181,18 +10496,24 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                     </div>
                   ) : null}
 
-                  {homeDetailTab === "resolution" ? (
-                    <ResolutionPanel
-                      workflow={selectedAlertWorkflow}
-                      alertRow={selectedAlertRow}
-                      confidenceScore={selectedAlertEvaluation.confidenceScore}
-                      executionPlan={selectedExecutionPlan}
-                      onNavigateTab={setHomeDetailTab}
-                    />
-                  ) : null}
-
                   {homeDetailTab === "execution" ? (
                     <>
+                      <nav className="remediation-stage-rail" aria-label="Plan, decide, and execute sequence">
+                        <span className="is-current"><b>1</b> Review plan</span>
+                        <span><b>2</b> Configure access</span>
+                        <span><b>3</b> Dry run</span>
+                        <span><b>4</b> Approve</span>
+                        <span><b>5</b> Execute</span>
+                        <span><b>6</b> Review outcome</span>
+                      </nav>
+                      <ResolutionPanel
+                        workflow={selectedAlertWorkflow}
+                        alertRow={selectedAlertRow}
+                        confidenceScore={selectedAlertEvaluation.confidenceScore}
+                        executionPlan={selectedExecutionPlan}
+                        onNavigateTab={setHomeDetailTab}
+                        embedded
+                      />
                       <section className="panel agentic-action-brief" aria-labelledby="agentic-action-title">
                         <header className="panel-head"><div><span className="eyebrow">CONTEXT-GROUNDED ACTION</span><h3 id="agentic-action-title">Recommended response</h3><p>Prepared from the persisted RCA, impact, incident evidence, runbooks, and configured discovery sources.</p></div><button type="button" className="button-secondary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Refreshing plan…" : "Refresh with agent"}</button></header>
                         <div className="agentic-action-grid">
@@ -10200,15 +10521,32 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <article><span>What to do</span><strong>{selectedExecutionPlan.action === "-" ? selectedRcaDecision.action : selectedExecutionPlan.action}</strong><p>Target: {selectedApplicationConnection.service} · {selectedApplicationConnection.environment}</p></article>
                           <article><span>Safety and recovery</span><strong>{executionRollbackPlan || "Rollback plan must be supplied before execution."}</strong><p>{editedExecutionPlan.queries[0] || "Add a recovery validation check."}</p></article>
                         </div>
-                        <div className="agentic-source-strip"><span>Internal knowledge: {selectedAlertRagDocuments.length ? `${selectedAlertRagDocuments.length} linked source(s)` : "persisted incident context"}</span><span>External knowledge: {selectedRcaDecision.externalKnowledgeStatus}</span><span>Credential: {selectedApplicationConnection.credential_ref ? "reference configured" : "not configured"}</span></div>
-                        {!selectedApplicationConnection.credential_ref ? <div className="credential-reference-callout"><div><strong>Execution credential reference required</strong><span>Store a Vault, Azure Key Vault, AWS Secrets Manager, or Kubernetes Secret reference in application onboarding. KaiOps does not display the secret after setup.</span></div><button type="button" className="button-secondary" onClick={() => openCopilotWorkspace("monitoring")}>Configure credential reference</button></div> : null}
+                        <section className="agent-execution-plan" aria-label="AI resolution agent execution plan">
+                          <header><div><span className="discovery-eyebrow">AI resolution agent</span><h4>Guarded execution plan</h4></div><span className="workflow-pill workflow-pill-active">Dry run first</span></header>
+                          {remediationPlanEditor.scripts || remediationPlanEditor.commands ? <pre><code>{remediationPlanEditor.scripts || remediationPlanEditor.commands}</code></pre> : <div className="agent-plan-missing"><strong>No safe executable artifact was generated.</strong><span>Regenerate RCA after adding runbook or runtime evidence. KaiMS will not invent a production command without grounded context.</span></div>}
+                          <div className="agent-plan-checks"><div><span>Validate</span><strong>{editedExecutionPlan.queries[0] || "Validation query required"}</strong></div><div><span>Rollback</span><strong>{executionRollbackPlan || "Rollback procedure required"}</strong></div></div>
+                        </section>
+                        <section className="execution-preflight-gate" aria-labelledby="dry-run-heading">
+                          <div><span className="discovery-eyebrow">3 · Safety verification</span><h4 id="dry-run-heading">Run a dry run before approval</h4><p>Validate the target, connector, credential reference, policy, and executable plan without applying changes.</p></div>
+                          <div><span className={executionPreflightCurrent ? "credential-ready" : "credential-required"}>{executionPreflightCurrent ? "Dry run passed" : "Required"}</span><button type="button" className="button-secondary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading || (executionRequiresCredential && !credentialReferenceValid)}>{remediationExecutionState.loading ? "Running…" : executionPreflightCurrent ? "Run dry run again" : "Run dry run"}</button></div>
+                        </section>
+                        <section className="execution-approval-panel" aria-labelledby="script-approval-heading">
+                          <div className="execution-credential-heading"><div><span className="discovery-eyebrow">2 · Human decision</span><h4 id="script-approval-heading">Approve the reviewed script</h4><p>Approval applies to the script shown above. Editing it afterward invalidates dry-run readiness.</p></div><span className={["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "credential-ready" : "credential-required"}>{["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Approved" : "Review required"}</span></div>
+                          <div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div>
+                          <label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this script safe and appropriate for this incident?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label>
+                          <div className="incident-section-actions"><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading || ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus)}>{approvalState.loading ? "Recording approval…" : ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Script approved" : "Approve reviewed script"}</button></div>
+                          {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
+                        </section>
+                        <div className="agentic-source-strip"><span>Internal knowledge: {selectedAlertRagDocuments.length ? `${selectedAlertRagDocuments.length} linked source(s)` : "persisted incident context"}</span><span>External knowledge: {selectedRcaDecision.externalKnowledgeStatus}</span><span>Credential: {executionRequiresCredential ? remediationPlanEditor.credential_ref ? "reference configured" : "required" : "not required for read-only plan"}</span></div>
+                        {executionRequiresCredential ? <div className="credential-reference-callout"><div><strong>{remediationPlanEditor.credential_ref ? "Execution identity is ready" : "Credential reference required before dry run"}</strong><span>KaiMS stores only a secret-manager URI; the remediation connector resolves it at execution time.</span></div><span className={remediationPlanEditor.credential_ref ? "credential-ready" : "credential-required"}>{remediationPlanEditor.credential_ref ? "Configured" : "Step 1 of 3"}</span></div> : null}
+                        {executionRequiresCredential ? <section className="execution-credential-panel"><div className="execution-credential-heading"><div><span className="discovery-eyebrow">3 · Execution identity</span><h4>Choose the credential reference</h4><p>This is required before KaiMS can validate the connector and target in a dry run.</p></div><span className={credentialReferenceValid ? "credential-ready" : "credential-required"}>{credentialReferenceValid ? "Valid URI" : "Required"}</span></div><div className="credential-method-grid"><label>Secret manager<select value={remediationPlanEditor.credential_store} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_store: e.target.value, credential_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select></label><label>Secret reference URI<input className={remediationPlanEditor.credential_ref && !credentialReferenceValid ? "input-invalid" : ""} aria-invalid={Boolean(remediationPlanEditor.credential_ref && !credentialReferenceValid)} autoComplete="off" spellCheck="false" value={remediationPlanEditor.credential_ref} placeholder={remediationPlanEditor.credential_store === "hashicorp_vault" ? `vault://kv/data/kaims/${selectedApplicationConnection.service}#token` : remediationPlanEditor.credential_store === "aws_secrets_manager" ? `arn:aws:secretsmanager:REGION:ACCOUNT:secret:kaims/${selectedApplicationConnection.service}` : remediationPlanEditor.credential_store === "kubernetes_secret" ? `k8s-secret://kaims/${selectedApplicationConnection.service}-credentials#token` : `https://VAULT_NAME.vault.azure.net/secrets/${selectedApplicationConnection.service}-token/VERSION`} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_ref: e.target.value }))} /><span className="field-hint">{remediationPlanEditor.credential_ref && !credentialReferenceValid ? "This is not a supported enterprise secret reference. Use the selected manager’s URI format." : "Enter the URI only—never the token, password, or secret value."}</span></label></div></section> : null}
                       </section>
-                      <details className="panel remediation-workspace incident-workspace-section workspace-collapsible">
+                      <details className="panel remediation-workspace incident-workspace-section workspace-collapsible" open>
                         <summary className="panel-head">
                           <div>
                             <span className="workspace-section-number">04</span>
-                            <h3>Advanced guarded execution</h3>
-                            <p>Open only to inspect or edit commands, run preflight, and execute the approved plan.</p>
+                            <h3>Plan editor and guarded execution</h3>
+                            <p>Edit the proposed script and validation checks, then execute only after dry run and approval.</p>
                           </div>
                           <span className="section-toggle-indicator" />
                         </summary>
@@ -10237,12 +10575,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <div className="panel-head">
                               <div>
                                 <span className="eyebrow">Safety gate</span>
-                                <h3 id="execution-readiness-heading">{blockingPreflightFailures.length ? "Not ready to execute" : executionPreflightCurrent ? "Preflight passed" : "Preflight required"}</h3>
+                                <h3 id="execution-readiness-heading">{blockingPreflightFailures.length ? "Complete required setup" : executionPreflightCurrent ? "Dry run passed" : "Dry run required"}</h3>
                               </div>
                               <strong>{executionPreflightChecks.filter((check) => check.passed).length}/{executionPreflightChecks.length}</strong>
                             </div>
-                            <p>{blockingPreflightFailures.length ? `${blockingPreflightFailures.length} blocking issue(s) must be resolved.` : executionPreflightCurrent ? `Checked ${formatIstTimestamp(executionPreflightState.checkedAt)}. No command was sent.` : "Run the safety simulation after every plan or target change."}</p>
-                            <button type="button" className="button-secondary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>Run Preflight</button>
+                            <p>{blockingPreflightFailures.length ? `${blockingPreflightFailures.length} blocking issue(s) must be resolved.` : executionPreflightCurrent ? `Backend validation passed ${formatIstTimestamp(executionPreflightState.checkedAt)}. No command was executed.` : "KaiMS will validate policy, target, approval, identity, and idempotency without executing a command."}</p>
+                            <button type="button" className="button-secondary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running dry run…" : "Run dry run"}</button>
                           </section>
                         </div>
                         <div className="execution-checklist" aria-label="Execution readiness checks">
@@ -10301,6 +10639,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <p>{selectedRemediationOutcome.detail}</p>
                             <dl><dt>Action</dt><dd>{selectedRemediationOutcome.actionType}</dd><dt>Target</dt><dd>{selectedRemediationOutcome.target}</dd></dl>
                             <details className="k-technical-details"><summary>Technical response</summary><pre className="result">{JSON.stringify(unwrap(remediationExecutionState.result) || selectedExecutionPlan.remediationAction, null, 2)}</pre></details>
+                            <section className="execution-outcome-review"><span className="eyebrow">Required human review</span><h4>Was this remediation effective?</h4><div className="outcome-choice" role="group" aria-label="Execution outcome">{[['successful','Successful'],['partial','Partially successful'],['failed','Failed']] .map(([value,label])=><button type="button" key={value} className={executionOutcomeReview.outcome===value?'active':''} onClick={()=>setExecutionOutcomeReview((current)=>({...current,outcome:value}))}>{label}</button>)}</div><label>Operator findings<textarea rows={3} value={executionOutcomeReview.notes} placeholder="What changed, what was validated, and any side effects." onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,notes:e.target.value}))}/></label><label className="checkbox-row"><input type="checkbox" checked={executionOutcomeReview.reusable} onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,reusable:e.target.checked}))}/>Approve this reviewed script for future matching incidents</label><button type="button" className="button-primary" onClick={approveExecutionOutcomeForReuse} disabled={executionOutcomeReview.loading||!executionOutcomeReview.notes.trim()}>{executionOutcomeReview.loading?'Saving review…':'Submit review and learning'}</button>{executionOutcomeReview.error?<p className="error">{executionOutcomeReview.error}</p>:null}{executionOutcomeReview.message?<p className="status-message">{executionOutcomeReview.message}</p>:null}</section>
                           </section>
                         ) : null}
                         <div className="table-wrap remediation-step-table" style={{ marginTop: 8 }}>
@@ -10346,11 +10685,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         </details>
                         <div className="execution-action-bar">
                           <div>
-                            <strong>{executionAllowed ? "Ready for guarded execution" : executionPreflightCurrent ? "Additional confirmation required" : "Run preflight to continue"}</strong>
+                            <strong>{executionAllowed ? "Ready for guarded execution" : executionPreflightCurrent ? "Additional confirmation required" : executionRequiresCredential && !remediationPlanEditor.credential_ref ? "Configure credential first" : "Run dry run to continue"}</strong>
                             <span>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</span>
                           </div>
                           <div className="remediation-execute-row">
-                            <button type="button" className="button-secondary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>Run Preflight</button>
+                            <button type="button" className="button-secondary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running…" : "Run dry run"}</button>
                             <button type="button" className="button-primary" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed} title={blockingPreflightFailures.length ? `Resolve: ${blockingPreflightFailures.map((check) => check.label).join(", ")}` : !executionPreflightCurrent ? "Run preflight after the latest edit" : !executionConfirmationValid ? `Type ${executionConfirmationPhrase}` : "Execute the approved plan"}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button>
                           </div>
                         </div>
@@ -10374,6 +10713,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                 </article>
               )}
             </section>
+          ) : null}
 
           {activeTab === "admin" && isAdministrator && (!routeOutlet || currentSearch.includes("workspace=knowledge")) ? (
             <section className="grid single-col">
@@ -10568,7 +10908,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                       <div className="panel-head">
                         <div>
                           <h3>Setup Wizard</h3>
-                          <p>Start with one plain-English setup prompt. KaiOps auto-completes details, scores the document, asks for missing values, then validates and updates knowledge/rules.</p>
+                          <p>Start with one plain-English setup prompt. KaiMS auto-completes details, scores the document, asks for missing values, then validates and updates knowledge/rules.</p>
                         </div>
                         <button
                           type="button"
@@ -10724,8 +11064,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <div className="filter-grid" style={{ marginTop: 10 }}>
                             <label>Deployment
                               <select value={onboardingForm.deployment_mode} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, deployment_mode: e.target.value }))}>
-                                <option value="on_prem">On-Prem</option>
-                                <option value="azure_cloud">Azure Cloud</option>
+                                <option value="cloud_neutral">Cloud neutral / portable</option>
+                                <option value="on_prem">On-premises</option>
+                                <option value="private_cloud">Private cloud</option>
+                                <option value="aws_cloud">AWS</option>
+                                <option value="azure_cloud">Azure</option>
+                                <option value="gcp_cloud">Google Cloud</option>
                               </select>
                             </label>
                             <label>Assign User (optional)<input placeholder="username" value={onboardingForm.assignment_username} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, assignment_username: e.target.value }))} /></label>
@@ -10788,8 +11132,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           </div>
                           <p className="subtitle" style={{ marginTop: 8 }}>
                             {onboardingForm.onboarding_path === "setup_monitoring"
-                              ? "KaiOps will generate Prometheus rules from the Documents & Rules step."
-                              : "Keep your current monitoring tool and send alert webhooks to KaiOps landing pad."}
+                              ? "KaiMS will generate Prometheus rules from the Documents & Rules step."
+                              : "Keep your current monitoring tool and send alert webhooks to the KaiMS landing pad."}
                           </p>
                           <div className="setup-message-bus-preview">
                             <div className="setup-route-strip" aria-label="Landing pad event route">
@@ -10866,7 +11210,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           </summary>
                           <div className="panel-head">
                             <h3>Landing Pad Details</h3>
-                            <p>Endpoint and payload guidance for alert ingestion into KaiOps workflow. Troubleshooting runbooks for ingested alerts are managed under Alert Knowledge.</p>
+                            <p>Endpoint and payload guidance for alert ingestion into the KaiMS workflow. Troubleshooting runbooks for ingested alerts are managed under Alert Knowledge.</p>
                           </div>
                           <div className="filter-grid">
                             <label>Ingestion Endpoint (UI/Gateway)
@@ -10958,11 +11302,22 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <span className="field-hint">
                               {onboardingForm.onboarding_path === "setup_monitoring"
                                 ? "Required for Prometheus rule setup. In Docker Compose, use http://prometheus:9090."
-                                : "Optional. If provided, KaiOps stores endpoint metadata for your existing monitoring tool."}
+                                : "Optional. If provided, KaiMS stores endpoint metadata for your existing monitoring tool."}
                             </span>
                           </label>
-                          <label>Authentication<select value={onboardingForm.connection_auth_type} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, connection_auth_type: e.target.value }))}><option value="none">None</option><option value="basic">Basic</option><option value="bearer">Bearer token</option><option value="api_key">API key</option><option value="oauth2">OAuth 2</option><option value="managed_identity">Managed identity</option></select></label>
-                          <label>Secret Reference<input placeholder="vault://team/service/monitoring" value={onboardingForm.connection_secret_ref} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, connection_secret_ref: e.target.value }))} /><span className="field-hint">Reference only. Never paste a password or token.</span></label>
+                          <section className="credential-config" aria-labelledby="credential-config-title">
+                            <header>
+                              <div><span className="discovery-eyebrow">Secure connection</span><h4 id="credential-config-title">Authentication &amp; credentials</h4><p>Connect using an identity or a reference to an existing secret. KaiMS never asks for or displays the secret value.</p></div>
+                              <span className={`credential-security-state ${onboardingForm.connection_auth_type === "none" ? "is-neutral" : "is-secure"}`}>{onboardingForm.connection_auth_type === "none" ? "No authentication" : "Reference only"}</span>
+                            </header>
+                            <div className="credential-method-grid">
+                              <label>Authentication method<select value={onboardingForm.connection_auth_type} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, connection_auth_type: e.target.value, connection_secret_ref: e.target.value === "none" || e.target.value === "managed_identity" ? "" : curr.connection_secret_ref }))}><option value="none">No authentication</option><option value="managed_identity">Azure managed identity</option><option value="bearer">Bearer token</option><option value="api_key">API key</option><option value="basic">Username and password</option><option value="oauth2">OAuth 2 client credentials</option></select><span className="field-hint">Choose the method required by the monitoring endpoint.</span></label>
+                              {!['none', 'managed_identity'].includes(onboardingForm.connection_auth_type) ? <label>Secret manager<select value={onboardingForm.connection_secret_store || "azure_key_vault"} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, connection_secret_store: e.target.value, connection_secret_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select><span className="field-hint">The runtime identity must have read access to this reference.</span></label> : null}
+                            </div>
+                            {onboardingForm.connection_auth_type === "managed_identity" ? <div className="credential-managed-identity"><strong>Managed identity selected</strong><span>KaiMS will use the workload identity assigned to the runtime. No stored secret is required.</span></div> : null}
+                            {!['none', 'managed_identity'].includes(onboardingForm.connection_auth_type) ? <label className="credential-reference-field">Secret reference<input spellCheck="false" autoComplete="off" placeholder={onboardingForm.connection_secret_store === "hashicorp_vault" ? "vault://kv/data/observability/prometheus#token" : onboardingForm.connection_secret_store === "aws_secrets_manager" ? "aws-sm://prod/observability/prometheus#api-key" : onboardingForm.connection_secret_store === "kubernetes_secret" ? "k8s-secret://monitoring/prometheus-credentials#token" : "azure-kv://kaims-prod/observability-prometheus/token"} value={onboardingForm.connection_secret_ref} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, connection_secret_ref: e.target.value }))} /><span className="field-hint">Paste the secret URI, not its value. Expected format includes the vault or namespace, secret name, and optional key/version.</span></label> : null}
+                            <footer><span aria-hidden="true">✓</span><p><strong>Secrets stay outside KaiMS.</strong> Only this reference is saved with the application configuration and passed to authorized runtime connectors.</p></footer>
+                          </section>
                           <label>Network Zone<input placeholder="prod-private / vnet name" value={onboardingForm.network_zone} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, network_zone: e.target.value }))} /></label>
                           <label>Health Check URL<input type="url" placeholder="https://service/health" value={onboardingForm.healthcheck_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, healthcheck_url: e.target.value }))} /></label>
                         </div>
@@ -10971,6 +11326,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <label>Trace Source<input type="url" placeholder="https://jaeger.example.com" value={onboardingForm.traces_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, traces_url: e.target.value }))} /><span>Jaeger, Tempo, or tracing gateway</span></label>
                           <label>Telemetry / OTLP<input type="url" placeholder="https://otel-collector:4318" value={onboardingForm.telemetry_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, telemetry_url: e.target.value }))} /><span>OpenTelemetry collector or observability gateway</span></label>
                           <label>Ticketing / Change Source<input type="url" placeholder="https://jira.example.com" value={onboardingForm.ticketing_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, ticketing_url: e.target.value }))} /><span>Incident, change, and historical outcome source</span></label>
+                          <label>Email Alert Source<input placeholder="imaps://mail.example.com/INBOX" value={onboardingForm.email_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, email_url: e.target.value }))} /><span>IMAP/IMAPS mailbox or HTTPS email webhook; credentials remain secret references</span></label>
                         </div>
                         {onboardingForm.onboarding_path !== "setup_monitoring" ? (
                           <p className="subtitle">Alerts from your configured monitoring tool can be ingested into landing pad to trigger the remaining workflow.</p>
@@ -10990,7 +11346,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                       <div className="panel-head">
                         <div>
                           <h3>Guided Setup</h3>
-                          <p>Enter the service details once. KaiOps extracts project, monitoring, alert, remediation, rollback, and validation facts.</p>
+                          <p>Enter the service details once. KaiMS extracts project, monitoring, alert, remediation, rollback, and validation facts.</p>
                         </div>
                         <button type="button" className="button-secondary" onClick={() => setProjectSetupStep("setup")}>Connection Setup</button>
                       </div>
@@ -11007,7 +11363,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <div className="panel-head">
                             <div>
                               <h3>Project & Connection</h3>
-                              <p>Select an existing project or create a new one. Prometheus is used when KaiOps creates monitoring rules.</p>
+                              <p>Select an existing project or create a new one. Prometheus is used when KaiMS creates monitoring rules.</p>
                             </div>
                             <span className={`workflow-pill ${onboardingProjectMode === "new" ? "workflow-pill-active" : "workflow-pill-idle"}`}>
                               {onboardingProjectMode === "new" ? "new project" : "existing project"}
@@ -11140,8 +11496,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           </summary>
                           <div className="panel-head">
                             <div>
-                              <h3>Tell KaiOps What To Set Up</h3>
-                              <p>Paste a short description or runbook notes. KaiOps will complete the setup form and ask only for missing or low-confidence fields.</p>
+                              <h3>Tell KaiMS What To Set Up</h3>
+                              <p>Paste a short description or runbook notes. KaiMS will complete the setup form and ask only for missing or low-confidence fields.</p>
                             </div>
                             <button
                               type="button"
@@ -11175,7 +11531,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                                 value={onboardingForm.service_knowledge_prompt}
                                 onChange={(event) => setOnboardingForm((curr) => ({ ...curr, service_knowledge_prompt: event.target.value }))}
                               />
-                              <span className="field-hint">Use plain English. KaiOps extracts setup fields, creates placeholders for missing values, and prepares rules from this prompt.</span>
+                              <span className="field-hint">Use plain English. KaiMS extracts setup fields, creates placeholders for missing values, and prepares rules from this prompt.</span>
                             </label>
                             <button
                               type="button"
@@ -11328,7 +11684,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <div className="panel-head">
                             <div>
                               <h3>Rule Intent</h3>
-                              <p>Use extracted hints or type plain-English rules. KaiOps previews the Prometheus format before generation.</p>
+                              <p>Use extracted hints or type plain-English rules. KaiMS previews the Prometheus format before generation.</p>
                             </div>
                             <span className={`workflow-pill ${onboardingRulePromptVisible ? "workflow-pill-active" : "workflow-pill-idle"}`}>
                               {onboardingRulePromptVisible ? "ready" : "optional"}
@@ -11418,7 +11774,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         <div><span>Application</span><strong>{onboardingForm.name || "Not supplied"}</strong><small>{onboardingForm.business_service || onboardingForm.description || "Business context not supplied"}</small></div>
                         <div><span>Ownership</span><strong>{onboardingForm.owner_team || "Not supplied"}</strong><small>{onboardingForm.owner_email || "Owner email not supplied"}</small></div>
                         <div><span>Runtime</span><strong>{onboardingForm.environment} · {onboardingForm.region}</strong><small>{onboardingForm.network_zone || onboardingForm.deployment_mode}</small></div>
-                        <div><span>Monitoring</span><strong>{onboardingForm.monitoring_tool}</strong><small>{[onboardingForm.logs_url && "logs", onboardingForm.traces_url && "traces", onboardingForm.telemetry_url && "telemetry", onboardingForm.ticketing_url && "tickets"].filter(Boolean).join(", ") || "primary source only"}</small></div>
+                        <div><span>Monitoring</span><strong>{onboardingForm.monitoring_tool}</strong><small>{[onboardingForm.logs_url && "logs", onboardingForm.traces_url && "traces", onboardingForm.telemetry_url && "telemetry", onboardingForm.ticketing_url && "ITSM/Jira", onboardingForm.email_url && "email"].filter(Boolean).join(", ") || "primary source only"}</small></div>
                         <div><span>Context policy</span><strong>{onboardingForm.context_strategy}</strong><small>{onboardingForm.context_strategy === "continuous" ? "Reuse validated context and learn from outcomes" : "Refresh discovery for each alert"}</small></div>
                         <div><span>Credentials</span><strong>{onboardingForm.connection_auth_type}</strong><small>{onboardingForm.connection_secret_ref || "No secret reference required"}</small></div>
                       </section>
@@ -11940,7 +12296,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <h3>Service Knowledge Status</h3>
                           <button type="button" className="button-secondary" onClick={applyUploadedDocumentsToRuleIntent} disabled={!onboardingDerivedRequirements.length}>Apply To Rules</button>
                         </div>
-                        <p className="subtitle">Use the Service Knowledge upload above. KaiOps extracts and validates the important details in one flow.</p>
+                        <p className="subtitle">Use the Service Knowledge upload above. KaiMS extracts and validates the important details in one flow.</p>
                         <div className="approval-steps" style={{ marginTop: 10 }}>
                           <div className="approval-step">
                             <strong>Extract</strong>
@@ -12284,7 +12640,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               </div>
               <aside className={`global-copilot-drawer ${isCopilotOpen ? "open" : ""}`}>
                 <div className="global-copilot-drawer-header">
-                  <h3>Ask Copilot</h3>
+                  <h3><Bot size={18} /> Ask KAI</h3>
                   <button className="button-secondary" onClick={() => setIsCopilotOpen(false)}>Close</button>
                 </div>
                 <div className="global-copilot-drawer-body">

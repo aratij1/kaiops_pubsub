@@ -1,8 +1,6 @@
-@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap");
-
 :root {
-  --dm-font-heading: "Space Grotesk", "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
-  --dm-font-body: "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
+  --dm-font-heading: "Segoe UI Variable Display", "Segoe UI", Inter, system-ui, sans-serif;
+  --dm-font-body: "Segoe UI Variable Text", "Segoe UI", Inter, system-ui, sans-serif;
   --dm-color-primary-700: #7f1010;
   --dm-color-primary-600: #d32f2f;
   --dm-color-primary-500: #e57373;

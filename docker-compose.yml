@@ -1,6 +1,6 @@
 x-service-env: &service-env
-  CLOUD_PROVIDER: ${CLOUD_PROVIDER:-local}
-  DEPLOYMENT_PROFILE: ${DEPLOYMENT_PROFILE:-onprem}
+  CLOUD_PROVIDER: ${CLOUD_PROVIDER:-cloud-neutral}
+  DEPLOYMENT_PROFILE: ${DEPLOYMENT_PROFILE:-cloud-neutral}
   CONNECTION_CONFIG_PATH: ${CONNECTION_CONFIG_PATH:-backend/config/kaiops-connections.json}
   KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
   REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
@@ -11,6 +11,12 @@ x-service-env: &service-env
   DB_USER: ${COMPOSE_DB_USER:-kaiops}
   DB_PASSWORD: ${COMPOSE_DB_PASSWORD:-kaiops}
   DB_DATABASE: ${COMPOSE_DB_DATABASE:-kaiops}
+  # Most services are low-throughput workflow stages. Keep their idle pools
+  # small; ingestion services override these values below where concurrency is
+  # useful. This prevents dozens of containers from retaining hundreds of
+  # mostly idle MySQL connections.
+  DB_POOL_SIZE: ${SHARED_DB_POOL_SIZE:-4}
+  DB_MAX_OVERFLOW: ${SHARED_DB_MAX_OVERFLOW:-6}
   JWT_SECRET_KEY: ${JWT_SECRET_KEY:-kaiops-local-demo-secret-key-change-me}
   AUTH_MODE: ${AUTH_MODE:-local}
   OIDC_ISSUER: ${OIDC_ISSUER:-}
@@ -106,6 +112,9 @@ x-service-env: &service-env
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
   OPENAI_GPT5_MODEL: ${OPENAI_GPT5_MODEL:-gpt-5}
   OPENAI_GPT4O_MODEL: ${OPENAI_GPT4O_MODEL:-gpt-4o}
+  REASONING_STANDARD_MODEL: ${REASONING_STANDARD_MODEL:-gpt-5.6-terra}
+  REASONING_CRITICAL_MODEL: ${REASONING_CRITICAL_MODEL:-gpt-5.6-sol}
+  MODEL_ROUTER_REASONING_BACKEND: ${MODEL_ROUTER_REASONING_BACKEND:-openai}
   GEMINI_API_KEY: ${GEMINI_API_KEY:-}
   GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
   GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}
@@ -114,9 +123,14 @@ x-service-env: &service-env
   GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
   LOCAL_LLM_ENABLED: ${LOCAL_LLM_ENABLED:-false}
   LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-120}
-  MODEL_ROUTER_CRITICAL_PROVIDER: ${MODEL_ROUTER_CRITICAL_PROVIDER:-gpt-5}
-  MODEL_ROUTER_RCA_PROVIDER: ${MODEL_ROUTER_RCA_PROVIDER:-gpt-4o}
+  MODEL_ROUTER_CRITICAL_PROVIDER: ${MODEL_ROUTER_CRITICAL_PROVIDER:-reasoning-critical}
+  MODEL_ROUTER_RCA_PROVIDER: ${MODEL_ROUTER_RCA_PROVIDER:-reasoning-standard}
   MODEL_ROUTER_DEFAULT_PROVIDER: ${MODEL_ROUTER_DEFAULT_PROVIDER:-gpt-4o}
+  MODEL_ROUTER_EVALUATION_POLICY_PATH: ${MODEL_ROUTER_EVALUATION_POLICY_PATH:-/app/backend/evaluation/model-routing-policy.json}
+  MODEL_ROUTER_EVALUATION_MIN_CASES: ${MODEL_ROUTER_EVALUATION_MIN_CASES:-50}
+  MODEL_ROUTER_MAX_PROMPT_CHARS: ${MODEL_ROUTER_MAX_PROMPT_CHARS:-60000}
+  MODEL_ROUTER_MAX_PAYLOAD_BYTES: ${MODEL_ROUTER_MAX_PAYLOAD_BYTES:-750000}
+  ALERTS_TABLE_METRIC_INTERVAL_SECONDS: ${ALERTS_TABLE_METRIC_INTERVAL_SECONDS:-300}
   # Keep the live alert path deterministic and bounded. Operators can opt in
   # to external enrichment, but local logs/metrics/code remain the default.
   RCA_EXTERNAL_KNOWLEDGE_ENABLED: ${RCA_EXTERNAL_KNOWLEDGE_ENABLED:-false}
@@ -129,15 +143,18 @@ x-service-env: &service-env
   LANDING_PAD_INGEST_CONCURRENCY: ${LANDING_PAD_INGEST_CONCURRENCY:-8}
   ALERTMANAGER_DEDUP_TTL_SECONDS: ${ALERTMANAGER_DEDUP_TTL_SECONDS:-900}
   ALERTMANAGER_DEDUP_MAX_ENTRIES: ${ALERTMANAGER_DEDUP_MAX_ENTRIES:-10000}
-  INCIDENT_PROJECTION_INTERVAL_SECONDS: ${INCIDENT_PROJECTION_INTERVAL_SECONDS:-60}
-  INCIDENT_PROJECTION_BATCH_SIZE: ${INCIDENT_PROJECTION_BATCH_SIZE:-100}
+  INCIDENT_PROJECTION_INTERVAL_SECONDS: ${INCIDENT_PROJECTION_INTERVAL_SECONDS:-5}
+  INCIDENT_PROJECTION_BATCH_SIZE: ${INCIDENT_PROJECTION_BATCH_SIZE:-500}
   KAFKA_ENABLED: ${KAFKA_ENABLED:-false}
   EVENT_BUS_PROVIDER: ${EVENT_BUS_PROVIDER:-rabbitmq}
   MESSAGE_BUS_DYNAMIC_ROUTING: "true"
-  MESSAGE_BUS_STREAM_THRESHOLD: "500"
+  MESSAGE_BUS_STREAM_THRESHOLD: ${MESSAGE_BUS_STREAM_THRESHOLD:-250}
   MESSAGE_BUS_DEFAULT_PROVIDER: ${MESSAGE_BUS_DEFAULT_PROVIDER:-rabbitmq}
   MESSAGE_BUS_WORKER_COUNT: ${MESSAGE_BUS_WORKER_COUNT:-1}
-  TEMPORAL_PILOT_ENABLED: ${TEMPORAL_PILOT_ENABLED:-true}
+  # The Temporal worker is profile-gated. Keep the default incident path on
+  # the always-on message bus unless the temporal-pilot profile is explicitly
+  # enabled; otherwise the orchestrator starts a workflow that no worker runs.
+  TEMPORAL_PILOT_ENABLED: ${TEMPORAL_PILOT_ENABLED:-false}
   TEMPORAL_ADDRESS: ${TEMPORAL_ADDRESS:-temporal:7233}
   TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
   TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-kaiops-incident-pilot}
@@ -205,16 +222,10 @@ services:
     restart: unless-stopped
     # Raised from the image default so per-service DB_POOL_SIZE/DB_MAX_OVERFLOW
     # increases (needed for a 10k-alert burst) don't exhaust connections across
-    # the ~24 services sharing this one instance. The previous default (400)
-    # was tuned per-service but never summed: 21 services depend on mysql,
-    # 3 with a raised pool (monitoring-adapter 20+30, monitoring-ingestion-worker
-    # 10+10, alert-intelligence 20+30 = 120) and 18 at the shared default
-    # (10+20=30 each = 540), for a worst-case ceiling of ~660 pooled
-    # connections before counting mysql-exporter or any manual/admin session.
-    # 900 leaves real headroom over that sum. Verify the effective value for
-    # your environment (SHOW VARIABLES LIKE 'max_connections') and adjust if
-    # you raise any individual service's DB_POOL_SIZE/DB_MAX_OVERFLOW further.
-    command: ["--max-connections=${MYSQL_MAX_CONNECTIONS:-900}"]
+    # Shared services use 4+6 connections while the three ingestion-heavy
+    # services retain their explicit larger pools. 450 leaves headroom without
+    # encouraging the high per-connection memory ceiling of the old 900 value.
+    command: ["--max-connections=${MYSQL_MAX_CONNECTIONS:-450}"]
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-kaiops}
@@ -250,6 +261,9 @@ services:
       start_period: 30s
 
   temporal-ui:
+    # Administrative tooling is opt-in so the normal KaiMS runtime does not
+    # reserve memory for a second workflow UI. Start with --profile admin-tools.
+    profiles: ["admin-tools", "full"]
     image: temporalio/ui:2.34.0
     restart: unless-stopped
     environment:
@@ -319,6 +333,7 @@ services:
       retries: 20
 
   mysql-exporter:
+    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/mysqld-exporter:v0.16.0
     restart: unless-stopped
     # Uses a dedicated low-privilege monitoring user (PROCESS, REPLICATION
@@ -337,6 +352,7 @@ services:
       mysql: { condition: service_healthy }
 
   node-exporter:
+    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/node-exporter:v1.8.1
     restart: unless-stopped
     command:
@@ -351,6 +367,7 @@ services:
     ports: ["9100:9100"]
 
   blackbox-exporter:
+    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/blackbox-exporter:v0.25.0
     restart: unless-stopped
     command:
@@ -370,6 +387,7 @@ services:
       kafka: { condition: service_healthy }
 
   alertmanager:
+    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/alertmanager:v0.27.0
     restart: unless-stopped
     command:
@@ -394,6 +412,7 @@ services:
       - ./fault-lab/runtime:/app/runtime
 
   otel-collector:
+    profiles: ["observability", "monitoring-authoring", "full"]
     image: otel/opentelemetry-collector-contrib:0.117.0
     restart: unless-stopped
     command: ["--config=/etc/otelcol/config.yml"]
@@ -406,6 +425,7 @@ services:
       jaeger: { condition: service_started }
 
   jaeger:
+    profiles: ["observability", "monitoring-authoring", "full"]
     image: jaegertracing/all-in-one:1.62.0
     restart: unless-stopped
     environment:
@@ -414,11 +434,17 @@ services:
       - "16686:16686"
 
   prometheus:
+    profiles: ["observability", "monitoring-authoring", "full"]
     image: prom/prometheus:v2.54.1
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
+      # Bound local-development TSDB growth and memory-mapped index pressure.
+      # Production deployments should override these values from capacity plans.
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-3d}
+      - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-2GB}
+      - --query.max-concurrency=${PROMETHEUS_QUERY_CONCURRENCY:-10}
       - --web.enable-lifecycle
     ports: ["9090:9090"]
     volumes:
@@ -437,6 +463,7 @@ services:
       otel-collector: { condition: service_started }
 
   grafana:
+    profiles: ["observability", "full"]
     image: grafana/grafana:11.2.2
     restart: unless-stopped
     ports: ["3000:3000"]
@@ -456,6 +483,8 @@ services:
   monitoring-adapter:
     image: ${MONITORING_ADAPTER_IMAGE:-kaiops_pubsub-monitoring-adapter:latest}
     build: *service-build
+    # Reap connector/subprocess children and forward stop signals cleanly.
+    init: true
     restart: unless-stopped
     environment:
       <<: *service-env
@@ -483,6 +512,9 @@ services:
 
   monitoring-ingestion-worker:
     image: ${MONITORING_ADAPTER_IMAGE:-kaiops_pubsub-monitoring-adapter:latest}
+    # Reap child processes from connector probes and file watchers so Docker
+    # can stop/recreate this long-running worker cleanly.
+    init: true
     restart: unless-stopped
     environment:
       <<: *service-env
@@ -527,6 +559,7 @@ services:
       mysql: { condition: service_healthy }
 
   discovery-service:
+    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment:
@@ -548,6 +581,7 @@ services:
       mysql: { condition: service_healthy }
 
   metrics-validation-agent:
+    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: metrics-validation-agent }
@@ -560,6 +594,7 @@ services:
       mysql: { condition: service_healthy }
 
   rule-generation-agent:
+    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: rule-generation-agent }
@@ -572,6 +607,7 @@ services:
       mysql: { condition: service_healthy }
 
   prometheus-config-service:
+    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: prometheus-config-service }
@@ -587,6 +623,7 @@ services:
       prometheus: { condition: service_started }
 
   validation-agent:
+    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: validation-agent }
@@ -600,6 +637,7 @@ services:
       prometheus: { condition: service_started }
 
   dashboard-generator:
+    profiles: ["monitoring-authoring", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: dashboard-generator }
@@ -656,7 +694,11 @@ services:
       # raised max-connections above).
       DB_POOL_SIZE: ${ALERT_INTELLIGENCE_DB_POOL_SIZE:-20}
       DB_MAX_OVERFLOW: ${ALERT_INTELLIGENCE_DB_MAX_OVERFLOW:-30}
-      MESSAGE_BUS_WORKER_COUNT: ${ALERT_INTELLIGENCE_WORKER_COUNT:-4}
+      MESSAGE_BUS_WORKER_COUNT: ${ALERT_INTELLIGENCE_WORKER_COUNT:-8}
+      # Cheap normalization/correlation can safely reserve a larger batch.
+      # Context and resolution retain the shared prefetch of two so LLM work
+      # remains bounded even during an alert storm.
+      RABBITMQ_CONSUMER_PREFETCH_COUNT: ${ALERT_INTELLIGENCE_PREFETCH_COUNT:-16}
       # Correlation/qualification already has a deterministic implementation.
       # One remote model call per raw alert created the ingestion backlog and
       # delayed context/RCA for newer alerts.
@@ -786,6 +828,8 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/ai-workbench/src/model-router
     ports: ["8005:8000"]
+    volumes:
+      - ./backend/evaluation:/app/backend/evaluation:ro
     depends_on:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
@@ -832,6 +876,7 @@ services:
       mysql: { condition: service_healthy }
 
   evaluation-service:
+    profiles: ["evaluation", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: evaluation-service }
@@ -844,6 +889,7 @@ services:
       temporal: { condition: service_healthy }
 
   temporal-pilot-worker:
+    profiles: ["temporal-pilot", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: temporal-pilot-worker, TEMPORAL_PILOT_ENABLED: "true", AI_LAYER_REQUEST_TIMEOUT_SECONDS: "300" }
@@ -875,6 +921,19 @@ services:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
+  knowledge-development-worker:
+    build: *service-build
+    restart: unless-stopped
+    environment:
+      <<: *service-env
+      SERVICE_NAME: knowledge-development-worker
+      KNOWLEDGE_DEVELOPMENT_INTERVAL_SECONDS: ${KNOWLEDGE_DEVELOPMENT_INTERVAL_SECONDS:-21600}
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/knowledge-development-worker
+    ports: ["8022:8000"]
+    depends_on:
+      mysql: { condition: service_healthy }
+
   ui:
     build:
       context: .
@@ -885,6 +944,24 @@ services:
       api-gateway: { condition: service_healthy }
       approval-service: { condition: service_started }
       monitoring-adapter: { condition: service_started }
+
+  ui-dev:
+    profiles: ["ui-dev"]
+    image: node:20-alpine
+    working_dir: /app
+    command: ["sh", "-lc", "if [ ! -x node_modules/.bin/vite ]; then npm ci --prefer-offline --no-audit --no-fund; fi; npm run dev"]
+    environment:
+      KAIMS_DEV_API_GATEWAY: http://api-gateway:8000
+      KAIMS_DEV_MONITORING_ADAPTER: http://monitoring-adapter:8000
+      KAIMS_DEV_APPROVAL_SERVICE: http://approval-service:8000
+      CHOKIDAR_USEPOLLING: "true"
+    volumes:
+      - ./frontend/react:/app
+      - ui-dev-node-modules:/app/node_modules
+      - ui-dev-npm-cache:/root/.npm
+    ports: ["8502:8501"]
+    depends_on:
+      api-gateway: { condition: service_healthy }
 
   # --- Online Boutique (GoogleCloudPlatform/microservices-demo) ---
   # No official docker-compose.yml exists upstream (it's Kubernetes/Skaffold-
@@ -897,10 +974,12 @@ services:
   # All service names are ob-prefixed to avoid colliding with this
   # project's own redis/mysql/etc.
   ob-redis-cart:
+    profiles: ["demo-online-boutique"]
     image: redis:alpine
     restart: unless-stopped
 
   ob-currencyservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/currencyservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -908,6 +987,7 @@ services:
       DISABLE_PROFILER: "1"
 
   ob-productcatalogservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/productcatalogservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -915,6 +995,7 @@ services:
       DISABLE_PROFILER: "1"
 
   ob-paymentservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/paymentservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -922,6 +1003,7 @@ services:
       DISABLE_PROFILER: "1"
 
   ob-shippingservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/shippingservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -929,6 +1011,7 @@ services:
       DISABLE_PROFILER: "1"
 
   ob-emailservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/emailservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -936,12 +1019,14 @@ services:
       DISABLE_PROFILER: "1"
 
   ob-adservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/adservice:v0.10.6
     restart: unless-stopped
     environment:
       PORT: "9555"
 
   ob-cartservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/cartservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -950,6 +1035,7 @@ services:
       - ob-redis-cart
 
   ob-recommendationservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/recommendationservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -960,6 +1046,7 @@ services:
       - ob-productcatalogservice
 
   ob-checkoutservice:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/checkoutservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -979,6 +1066,7 @@ services:
       - ob-cartservice
 
   ob-frontend:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/frontend:v0.10.6
     restart: unless-stopped
     ports:
@@ -1006,6 +1094,7 @@ services:
       - ob-adservice
 
   ob-loadgenerator:
+    profiles: ["demo-online-boutique"]
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/loadgenerator:v0.10.6
     restart: unless-stopped
     environment:
@@ -1019,6 +1108,7 @@ services:
   # only genuine metrics source available since Online Boutique has no
   # app-level /metrics endpoint anywhere.
   ob-cadvisor:
+    profiles: ["demo-online-boutique"]
     image: gcr.io/cadvisor/cadvisor:v0.49.1
     restart: unless-stopped
     ports:
@@ -1049,6 +1139,7 @@ services:
   # redis/mysql/rabbitmq because it only exists inside that isolated
   # network, not the default one.
   rs-mongodb:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-mongodb:2.1.0
     restart: unless-stopped
     networks:
@@ -1056,6 +1147,7 @@ services:
         aliases: [mongodb]
 
   rs-redis:
+    profiles: ["demo-robot-shop"]
     image: redis:6.2-alpine
     restart: unless-stopped
     networks:
@@ -1063,6 +1155,7 @@ services:
         aliases: [redis]
 
   rs-rabbitmq:
+    profiles: ["demo-robot-shop"]
     image: rabbitmq:3.8-management-alpine
     restart: unless-stopped
     networks:
@@ -1070,6 +1163,7 @@ services:
         aliases: [rabbitmq]
 
   rs-mysql:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-mysql-db:2.1.0
     restart: unless-stopped
     cap_add:
@@ -1079,6 +1173,7 @@ services:
         aliases: [mysql]
 
   rs-catalogue:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-catalogue:2.1.0
     restart: unless-stopped
     networks:
@@ -1088,6 +1183,7 @@ services:
       - rs-mongodb
 
   rs-user:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-user:2.1.0
     restart: unless-stopped
     networks:
@@ -1098,6 +1194,7 @@ services:
       - rs-redis
 
   rs-cart:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-cart:2.1.0
     restart: unless-stopped
     networks:
@@ -1108,6 +1205,7 @@ services:
       - rs-redis
 
   rs-shipping:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-shipping:2.1.0
     restart: unless-stopped
     networks:
@@ -1117,6 +1215,7 @@ services:
       - rs-mysql
 
   rs-ratings:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-ratings:2.1.0
     restart: unless-stopped
     environment:
@@ -1128,6 +1227,7 @@ services:
       - rs-mysql
 
   rs-payment:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-payment:2.1.0
     restart: unless-stopped
     networks:
@@ -1138,6 +1238,7 @@ services:
       - rs-rabbitmq
 
   rs-dispatch:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-dispatch:2.1.0
     restart: unless-stopped
     networks:
@@ -1147,6 +1248,7 @@ services:
       - rs-rabbitmq
 
   rs-web:
+    profiles: ["demo-robot-shop"]
     image: robotshop/rs-web:2.1.0
     restart: unless-stopped
     ports:
@@ -1164,6 +1266,7 @@ services:
   # from source only) — using the standard public locustio/locust image
   # with a minimal locustfile instead, same effect: continuous real traffic.
   rs-load-gen:
+    profiles: ["demo-robot-shop"]
     image: locustio/locust:2.32.4
     restart: unless-stopped
     volumes:
@@ -1178,6 +1281,7 @@ services:
   # exporters also join "default" so the main project's Prometheus (which
   # is not on robot-shop-net) can scrape them.
   rs-mysqld-exporter:
+    profiles: ["demo-robot-shop"]
     image: prom/mysqld-exporter:v0.19.0
     restart: unless-stopped
     # v0.19.0 dropped DATA_SOURCE_NAME env var support in favor of a
@@ -1194,6 +1298,7 @@ services:
       - rs-mysql
 
   rs-redis-exporter:
+    profiles: ["demo-robot-shop"]
     image: oliver006/redis_exporter:v1.88.0
     restart: unless-stopped
     environment:
@@ -1205,6 +1310,7 @@ services:
       - rs-redis
 
   rs-rabbitmq-exporter:
+    profiles: ["demo-robot-shop"]
     image: kbudde/rabbitmq-exporter:1.0.0
     restart: unless-stopped
     environment:
@@ -1219,6 +1325,7 @@ services:
       - rs-rabbitmq
 
   rs-mongodb-exporter:
+    profiles: ["demo-robot-shop"]
     image: percona/mongodb_exporter:0.51.0
     restart: unless-stopped
     command:
@@ -1249,3 +1356,5 @@ volumes:
   kafka-data:
   rabbitmq-data:
   grafana-data:
+  ui-dev-node-modules:
+  ui-dev-npm-cache:

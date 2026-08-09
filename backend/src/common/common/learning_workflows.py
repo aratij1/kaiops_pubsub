@@ -32,6 +32,7 @@ class LearningStore(Protocol):
     async def replace_patterns(self, patterns: Sequence[FailurePattern]) -> None: ...
     async def list_approved_runbooks(self, *, service: str) -> list[RunbookVersion]: ...
     async def record_connector_cursor(self, connector_id: str, cursor: str | None) -> None: ...
+    async def save_runbook_draft(self, runbook: RunbookVersion) -> None: ...
 
 
 @dataclass(slots=True)
@@ -39,6 +40,7 @@ class Mode02Result:
     collected: int
     patterns: list[FailurePattern]
     draftable_pattern_ids: list[str]
+    runbook_drafts: list[RunbookVersion]
 
 
 class Mode02Worker:
@@ -59,10 +61,37 @@ class Mode02Worker:
             await self.store.record_connector_cursor(connector.connector_id, cursor)
         patterns = self.analyzer.analyze(await self.store.list_evidence())
         await self.store.replace_patterns(patterns)
+        drafts = [self._draft_runbook(pattern) for pattern in patterns if self.analyzer.can_draft(pattern)]
+        save_draft = getattr(self.store, "save_runbook_draft", None)
+        if callable(save_draft):
+            for draft in drafts:
+                await save_draft(draft)
         return Mode02Result(
             collected=collected,
             patterns=patterns,
             draftable_pattern_ids=[p.pattern_id for p in patterns if self.analyzer.can_draft(p)],
+            runbook_drafts=drafts,
+        )
+
+    @staticmethod
+    def _draft_runbook(pattern: FailurePattern) -> RunbookVersion:
+        resolution = pattern.successful_resolutions[0]
+        return RunbookVersion(
+            issue_signature=pattern.issue_signature,
+            service_scope=[pattern.service],
+            prerequisites=["Confirm the current incident evidence matches this failure pattern."],
+            diagnostic_steps=[
+                *([f"Verify symptom: {item}" for item in pattern.common_symptoms] or ["Collect current logs, metrics, and traces."]),
+                "Check recent code, configuration, and dependency changes.",
+            ],
+            remediation_steps=[resolution],
+            validation_steps=["Confirm service health, error-rate recovery, and alert clearance."],
+            rollback_steps=["Revert the remediation and escalate if validation fails."],
+            risk_level="medium",
+            required_approval=ApprovalRequirement.MANDATORY,
+            evidence_references=pattern.evidence_references,
+            version=1,
+            owner="unassigned",
         )
 
 

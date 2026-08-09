@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 from time import perf_counter
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 from common.config import get_settings
 from common.event_publishers import EventPublisher, RabbitMQPublisher, build_agent_event_contract, build_event_envelope
@@ -1129,8 +1130,7 @@ async def ingest_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
     return {"status": "ingested", "document_flag_updated": document_flag_updated, **result}
 
 
-@app.get("/rag/evidence-drafts")
-async def list_evidence_rag_drafts(alert_id: str | None = None, status: str | None = None) -> dict[str, Any]:
+def _list_evidence_rag_drafts_sync(alert_id: str | None, status: str | None) -> list[dict[str, Any]]:
     drafts: list[dict[str, Any]] = []
     for path in sorted(_evidence_draft_dir().glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
         try:
@@ -1144,7 +1144,48 @@ async def list_evidence_rag_drafts(alert_id: str | None = None, status: str | No
         if status and str(payload.get("status") or "").lower() != status.lower():
             continue
         drafts.append(payload)
+    return drafts
+
+
+@app.get("/rag/evidence-drafts")
+async def list_evidence_rag_drafts(alert_id: str | None = None, status: str | None = None) -> dict[str, Any]:
+    # The review directory can live on a high-latency bind mount. Never block
+    # RabbitMQ heartbeats and incident consumers while walking/stat-ing it.
+    drafts = await asyncio.to_thread(_list_evidence_rag_drafts_sync, alert_id, status)
     return {"count": len(drafts), "drafts": drafts}
+
+
+@app.post("/rag/evidence-drafts")
+async def create_evidence_rag_draft_from_rca(request: dict[str, Any]) -> dict[str, Any]:
+    """Create the reviewable alert document when the RCA pipeline has no draft."""
+    alert_id = str(request.get("alert_id") or "").strip()
+    content = str(request.get("content") or "").strip()
+    if not alert_id:
+        raise HTTPException(status_code=422, detail="alert_id is required")
+    if len(content) < 20:
+        raise HTTPException(status_code=422, detail="grounded RCA content is required")
+    draft_id = f"evidence-{alert_id}"
+    path = _draft_path(draft_id)
+    if path.exists():
+        return {"status": "existing", "draft": _read_evidence_draft(draft_id)}
+    now = datetime.now(timezone.utc).isoformat()
+    draft = _write_evidence_draft({
+        "draft_id": draft_id,
+        "status": "draft",
+        "alert_id": alert_id,
+        "incident_id": str(request.get("incident_id") or ""),
+        "alert_type": str(request.get("alert_type") or "Alert"),
+        "severity": str(request.get("severity") or "unknown"),
+        "title": str(request.get("title") or f"RCA review: {request.get('alert_type') or alert_id}"),
+        "content": content,
+        "services": [str(item) for item in request.get("services", []) if str(item).strip()],
+        "evidence_ids": [str(item) for item in request.get("evidence_ids", []) if str(item).strip()],
+        "source_uris": [str(item) for item in request.get("source_uris", []) if str(item).strip()],
+        "created_at": now, "updated_at": now, "reviewed_by": None,
+        "review_notes": None, "approved_by": None, "approved_at": None,
+        "rag_document_path": None,
+    })
+    return {"status": "created", "draft": draft}
 
 
 @app.put("/rag/evidence-drafts/{draft_id}")
@@ -1255,7 +1296,16 @@ async def approve_knowledge_pack(request: KnowledgePackApproveRequest) -> dict[s
     pack["status"] = "approved"
     rag_request = _knowledge_pack_to_rag_request(pack, request.approved_by)
     result = write_rag_document(rag_request)
-    return {"status": "approved", "knowledge_pack": pack, "rag_document": result}
+    runbook_id = str(uuid5(NAMESPACE_URL, rag_request.content))
+    governance = {"runbook_id": runbook_id, "version": 1, "status": "approved"}
+    if settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
+        async with app.state.session_factory() as session:
+            governance = await IncidentRepository(session).approve_runbook_version(
+                runbook_id=runbook_id, version=1, approved_by=request.approved_by,
+                payload={"rag_document": result, "knowledge_pack": pack},
+            )
+            await session.commit()
+    return {"status": "approved", "knowledge_pack": pack, "rag_document": result, "runbook_governance": governance}
 
 
 @app.put("/rag/documents")

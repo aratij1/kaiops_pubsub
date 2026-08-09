@@ -52,7 +52,7 @@
     "DEPLOYMENT_PROFILE": "cloud-neutral",
     "EVENT_BUS_PROVIDER": "rabbitmq",
     "MESSAGE_BUS_DEFAULT_PROVIDER": "rabbitmq",
-    "KAFKA_ENABLED": "true",
+    "KAFKA_ENABLED": "false",
     "AZURE_SERVICE_BUS_ENABLED": "false",
     "AZURE_CONTENT_SAFETY_ENABLED": "false",
     "AZURE_OPENAI_EMBEDDINGS_ENABLED": "false",

@@ -3,7 +3,7 @@ import { Button } from "react-aria-components";
 
 import { ConfirmationDialog, DataTable, MasterDetailLayout, SectionNavigation, StatusBadge } from ".";
 
-const meta = { title: "KaiOps/Interaction patterns" } satisfies Meta;
+const meta = { title: "KaiMS/Interaction patterns" } satisfies Meta;
 export default meta;
 type Story = StoryObj<typeof meta>;
 

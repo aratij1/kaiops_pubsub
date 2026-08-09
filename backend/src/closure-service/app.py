@@ -231,6 +231,17 @@ async def _validate_and_store(action: RemediationAction) -> ResolutionReport:
             repo = IncidentRepository(session)
             await repo.save_report(report)
             await repo.save_knowledge_base(report)
+            runbook_id = str(action.parameters.get("runbook_id") or "").strip()
+            if runbook_id:
+                await repo.record_runbook_execution_outcome(
+                    runbook_id=runbook_id,
+                    version=int(action.parameters.get("runbook_version") or 1),
+                    successful=bool(report.health_restored and report.alerts_cleared),
+                    modified=bool(action.parameters.get("operator_modified")),
+                    actor=str(action.parameters.get("approved_by") or "closure-service"),
+                    tenant_id=action.tenant_id or "default",
+                    metadata=action.parameters,
+                )
             await session.commit()
     return report
 

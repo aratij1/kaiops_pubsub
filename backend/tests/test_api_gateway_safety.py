@@ -14,6 +14,23 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 
 
+class _ConnectOnceProxyClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def request(self, *args, **kwargs):
+        import httpx
+
+        self.calls += 1
+        if self.calls == 1:
+            raise httpx.ConnectError("temporary Docker DNS failure")
+        return httpx.Response(
+            200,
+            json={"decision": "approved"},
+            request=httpx.Request("POST", "http://approval-service:8000/approve"),
+        )
+
+
 def load_api_gateway_app_module():
     existing = sys.modules.get("api_gateway_app")
     if existing is not None:
@@ -26,6 +43,25 @@ def load_api_gateway_app_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.asyncio
+async def test_proxy_retries_post_after_connection_establishment_failure(monkeypatch) -> None:
+    module = load_api_gateway_app_module()
+    client = _ConnectOnceProxyClient()
+    monkeypatch.setattr(module.app.state, "proxy_client", client, raising=False)
+
+    status, payload = await module.proxy(
+        method="POST",
+        path="/approve",
+        target_base="http://approval-service:8000",
+        payload={"incident_id": str(uuid4())},
+        trace_id="approval-retry-test",
+    )
+
+    assert status == 200
+    assert payload == {"decision": "approved"}
+    assert client.calls == 2
 
 
 def test_triage_correction_contract_requires_governed_feedback() -> None:

@@ -94,7 +94,7 @@ def save_onboarding_connectivity(payload: dict[str, Any]) -> dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
     sanitized = {
         "project": payload.get("project", {}),
-        "deployment_mode": payload.get("deployment_mode", "on_prem"),
+        "deployment_mode": payload.get("deployment_mode", "cloud_neutral"),
         "prometheus_url": payload.get("prometheus_url", ""),
         "new_relic_url": payload.get("new_relic_url", ""),
         "datadog_url": payload.get("datadog_url", ""),

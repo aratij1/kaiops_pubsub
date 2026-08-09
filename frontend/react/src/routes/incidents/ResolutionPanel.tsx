@@ -8,13 +8,12 @@ interface ExecutionPlan {
 }
 
 interface ResolutionPanelProps {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- legacy untyped workflow/alertRow shapes from App.jsx
   workflow: any;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   alertRow: any;
   confidenceScore: number;
   executionPlan: ExecutionPlan;
   onNavigateTab: (tab: string) => void;
+  embedded?: boolean;
 }
 
 export default function ResolutionPanel({
@@ -23,6 +22,7 @@ export default function ResolutionPanel({
   confidenceScore,
   executionPlan,
   onNavigateTab,
+  embedded = false,
 }: ResolutionPanelProps) {
   const analysis = useMemo(
     () => canonicalIncidentAnalysis(workflow, alertRow),
@@ -34,8 +34,8 @@ export default function ResolutionPanel({
       <div className="panel-head">
         <div>
           <span className="workspace-section-number">04</span>
-          <h3>Resolution</h3>
-          <p>Review the proposed outcome before approval or guarded execution.</p>
+          <h3>Proposed remediation plan</h3>
+          <p>Confirm the evidence-grounded response, scope, and risk before dry run and approval.</p>
         </div>
       </div>
       <div className="table-wrap">
@@ -51,18 +51,18 @@ export default function ResolutionPanel({
           </tbody>
         </table>
       </div>
-      <div className="incident-section-actions">
+      {!embedded ? <div className="incident-section-actions">
         <button type="button" className="button-secondary" onClick={() => onNavigateTab("rca")}>
           Review RCA
         </button>
         <button
           type="button"
           className="button-primary"
-          onClick={() => onNavigateTab(executionPlan.requiresApproval ? "approval" : "execution")}
+          onClick={() => onNavigateTab("execution")}
         >
-          {executionPlan.requiresApproval ? "Continue to Approval" : "Continue to Execution"}
+          Review script and decide
         </button>
-      </div>
+      </div> : null}
     </section>
   );
 }

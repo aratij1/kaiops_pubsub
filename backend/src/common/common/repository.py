@@ -24,6 +24,7 @@ from common.database import (
     EvaluationRecord,
     GrafanaDashboardRecord,
     IncidentEventRecord,
+    LearningAuditRecord,
     IncidentRecord,
     IncidentProjectionRecord,
     JiraTicketLinkRecord,
@@ -40,6 +41,8 @@ from common.database import (
     MonitoringConnectionAuditRecord,
     OnboardingHistoryRecord,
     RcaReportRecord,
+    RunbookVersionRecord,
+    RunbookOutcomeRecord,
     PrometheusConfigRecord,
     RecordingRuleRecord,
     OnboardingStateRecord,
@@ -1521,36 +1524,43 @@ class IncidentRepository:
                 "stage": "alert_enriched",
                 "label": "Alert Intelligence Agent",
                 "event_types": ["incident.alert.enriched"],
+                "next_action": "Enrich and persist the normalized alert.",
             },
             {
                 "stage": "workflow_selected",
                 "label": "Orchestrator Agent",
                 "event_types": ["incident.workflow.selected"],
+                "next_action": "Select and persist the incident workflow.",
             },
             {
                 "stage": "context_collected",
                 "label": "Context Intelligence Agent",
                 "event_types": ["incident.context.collected"],
+                "next_action": "Collect logs, metrics, traces, tickets, and dependency context.",
             },
             {
                 "stage": "recommendation_generated",
                 "label": "Resolution Intelligence Agent",
                 "event_types": ["incident.recommendation.generated"],
+                "next_action": "Generate and persist an evidence-grounded recommendation.",
             },
             {
                 "stage": "approval_recorded",
                 "label": "Human Approval Layer",
                 "event_types": ["incident.approval.recorded", "incident.approval.requested"],
+                "next_action": "Complete dry run and record an authorized operator decision.",
             },
             {
                 "stage": "remediation_executed",
                 "label": "Remediation Automation Engine",
                 "event_types": ["incident.remediation.executed"],
+                "next_action": "Execute or explicitly skip the approved remediation plan.",
             },
             {
                 "stage": "closure_completed",
                 "label": "Closure & Validation",
                 "event_types": ["incident.closure.completed", "incident.closed"],
+                "next_action": "Validate recovery and close or escalate the incident.",
             },
         ]
 
@@ -1558,22 +1568,47 @@ class IncidentRepository:
         for row in stage_matrix:
             matched = [event_type for event_type in row["event_types"] if event_type in event_types]
             persisted = bool(matched)
+            evidence_sources = [f"event:{event_type}" for event_type in matched]
+            state = "complete" if persisted else "waiting"
 
             # Use persisted relational evidence to avoid under-reporting when some
             # services emit equivalent terminal states under different event names.
             if row["stage"] == "alert_enriched" and not persisted:
                 persisted = len(work_rows) > 0 or len(event_rows) > 0
+                if persisted:
+                    evidence_sources.append("relational:incident_events")
             elif row["stage"] == "context_collected" and not persisted:
-                persisted = any(
+                context_work = [work for work in work_rows if
                     str(work.agent_name or "").strip().lower() in {"context intelligence agent", "context-agent"}
-                    for work in work_rows
+                ]
+                persisted = any(
+                    str(work.status or "").strip().lower() in {"completed", "complete", "succeeded", "success"}
+                    for work in context_work
                 )
+                if persisted:
+                    evidence_sources.append("relational:agent_work_items/context-completed")
+                elif context_work:
+                    state = "in_progress"
+                    evidence_sources.append("relational:agent_work_items/context-started")
             elif row["stage"] == "approval_recorded" and not persisted:
                 persisted = len(approval_rows) > 0
+                if persisted:
+                    evidence_sources.append("relational:approvals")
             elif row["stage"] == "remediation_executed" and not persisted:
-                persisted = len(action_rows) > 0 or "remediating" in event_statuses
+                terminal_actions = [action for action in action_rows if str(action.status or "").strip().lower() in {"succeeded", "failed", "skipped"}]
+                persisted = bool(terminal_actions)
+                if persisted:
+                    evidence_sources.extend(f"relational:actions/{str(action.status or '').strip().lower()}" for action in terminal_actions)
+                elif action_rows or "remediating" in event_statuses:
+                    state = "in_progress"
+                    evidence_sources.append("relational:actions/in-progress")
             elif row["stage"] == "closure_completed" and not persisted:
-                persisted = incident_status in {"closed", "resolved", "failed"}
+                persisted = incident_status in {"closed", "resolved"}
+                if persisted:
+                    evidence_sources.append(f"relational:incidents/status={incident_status}")
+
+            if persisted:
+                state = "complete"
 
             stages.append(
                 {
@@ -1581,6 +1616,9 @@ class IncidentRepository:
                     "label": row["label"],
                     "persisted": persisted,
                     "matched_event_types": matched,
+                    "evidence_sources": sorted(set(evidence_sources)),
+                    "state": state,
+                    "next_action": "Completed." if persisted else row["next_action"],
                 }
             )
 
@@ -1808,6 +1846,116 @@ class IncidentRepository:
                 payload=payload,
             )
         )
+
+    async def get_runbook_governance(
+        self, runbook_id: str, version: int = 1, *, tenant_id: str = "default"
+    ) -> dict[str, Any] | None:
+        result = await self.session.execute(
+            select(RunbookVersionRecord).where(
+                RunbookVersionRecord.tenant_id == tenant_id,
+                RunbookVersionRecord.runbook_id == self._parse_uuid(runbook_id),
+                RunbookVersionRecord.version == int(version),
+            ).limit(1)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return {
+            "runbook_id": str(row.runbook_id), "version": row.version, "status": row.approval_status,
+            "approved_by": row.approved_by, "approved_at": row.approved_at,
+            "success_count": row.success_count, "failure_count": row.failure_count,
+            "suspended_reason": (row.content or {}).get("suspended_reason"), "payload": row.content or {},
+        }
+
+    async def approve_runbook_version(
+        self, *, runbook_id: str, version: int, approved_by: str,
+        tenant_id: str = "default", payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = await self.session.execute(
+            select(RunbookVersionRecord).where(
+                RunbookVersionRecord.tenant_id == tenant_id,
+                RunbookVersionRecord.runbook_id == self._parse_uuid(runbook_id),
+                RunbookVersionRecord.version == int(version),
+            ).limit(1)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            row = RunbookVersionRecord(
+                tenant_id=tenant_id, runbook_id=self._parse_uuid(runbook_id), version=int(version),
+                issue_signature=str((payload or {}).get("issue_signature") or "manual-approval")[:64],
+                owner=str(approved_by), risk_level=str((payload or {}).get("risk_level") or "medium"),
+                required_approval="mandatory", content=payload or {},
+            )
+            self.session.add(row)
+        row.approval_status = "approved"
+        row.approved_by = str(approved_by)
+        row.approved_at = datetime.now(timezone.utc)
+        row.content = payload or row.content or {}
+        await self.session.flush()
+        return {"runbook_id": str(row.runbook_id), "version": row.version, "status": row.approval_status}
+
+    async def record_runbook_execution_outcome(
+        self, *, runbook_id: str, version: int, successful: bool, modified: bool,
+        actor: str, tenant_id: str = "default", metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = await self.session.execute(
+            select(RunbookVersionRecord).where(
+                RunbookVersionRecord.tenant_id == tenant_id,
+                RunbookVersionRecord.runbook_id == self._parse_uuid(runbook_id),
+                RunbookVersionRecord.version == int(version),
+            ).limit(1)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            row = RunbookVersionRecord(
+                tenant_id=tenant_id, runbook_id=self._parse_uuid(runbook_id), version=int(version),
+                issue_signature=str((metadata or {}).get("issue_signature") or "execution")[:64],
+                approval_status=str((metadata or {}).get("runbook_status") or "draft"),
+                owner=str(actor), risk_level=str((metadata or {}).get("risk_level") or "medium"),
+                required_approval="mandatory", content=metadata or {},
+            )
+            self.session.add(row)
+        row.success_count = int(row.success_count or 0) + int(successful)
+        row.failure_count = int(row.failure_count or 0) + int(not successful)
+        if modified or not successful:
+            row.approval_status = "suspended"
+            content = dict(row.content or {})
+            content["suspended_reason"] = f"modified during execution by {actor}" if modified else f"execution failed; recorded by {actor}"
+            row.content = content
+        row.last_validated_at = datetime.now(timezone.utc)
+        outcome_payload = dict(metadata or {})
+        incident_id = str(outcome_payload.get("incident_id") or outcome_payload.get("alert_id") or "unknown")[:128]
+        outcome_key = f"{tenant_id}:{incident_id}:{row.runbook_id}:{row.version}"
+        outcome_id = UUID(hashlib.md5(outcome_key.encode(), usedforsecurity=False).hexdigest())
+        await self.session.merge(RunbookOutcomeRecord(
+            outcome_id=outcome_id,
+            tenant_id=tenant_id,
+            incident_id=incident_id,
+            runbook_id=row.runbook_id,
+            runbook_version=row.version,
+            reviewed=bool(outcome_payload.get("reviewed") or outcome_payload.get("approved_by")),
+            successful=successful,
+            validation=outcome_payload,
+        ))
+        audit_payload = {
+            "successful": successful,
+            "modified": modified,
+            "runbook_version": row.version,
+            "resulting_status": row.approval_status,
+            "incident_id": incident_id,
+        }
+        canonical = json.dumps(audit_payload, sort_keys=True, separators=(",", ":"))
+        self.session.add(LearningAuditRecord(
+            tenant_id=tenant_id,
+            actor=str(actor),
+            action="runbook.execution.recorded",
+            resource_type="runbook",
+            resource_id=str(row.runbook_id),
+            payload=audit_payload,
+            payload_sha256=hashlib.sha256(canonical.encode()).hexdigest(),
+        ))
+        await self.session.flush()
+        return {"runbook_id": str(row.runbook_id), "version": row.version, "status": row.approval_status}
 
     async def save_report(self, report: ResolutionReport, *, tenant_id: str = "default") -> None:
         await self.session.merge(
@@ -3073,6 +3221,7 @@ class IncidentRepository:
         self,
         *,
         limit: int = 100,
+        include_enrichment: bool = True,
         risk_tier: str | None = None,
         execution_mode: str | None = None,
         transport_provider: str | None = None,
@@ -3110,7 +3259,7 @@ class IncidentRepository:
 
         action_by_incident: dict[UUID, ActionRecord] = {}
         incident_ids = [row.incident_id for row in rows]
-        if incident_ids:
+        if include_enrichment and incident_ids:
             action_result = await self.session.execute(
                 select(ActionRecord)
                 .where(ActionRecord.incident_id.in_(incident_ids))
@@ -3120,7 +3269,7 @@ class IncidentRepository:
                 action_by_incident.setdefault(action.incident_id, action)
 
         evaluation_by_incident: dict[UUID, EvaluationRecord] = {}
-        if incident_ids:
+        if include_enrichment and incident_ids:
             evaluation_result = await self.session.execute(
                 select(EvaluationRecord)
                 .where(EvaluationRecord.incident_id.in_(incident_ids))

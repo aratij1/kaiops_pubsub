@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { ConfirmationDialog, LoadingState, SectionNavigation, StatusBadge } from ".";
 
-describe("KaiOps design system", () => {
+describe("KaiMS design system", () => {
   it("exposes meaningful status text while keeping the icon decorative", () => {
     const { container } = render(<StatusBadge tone="critical">Critical</StatusBadge>);
     expect(screen.getByText("Critical")).toBeInTheDocument();

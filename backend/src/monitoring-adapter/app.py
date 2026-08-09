@@ -92,6 +92,8 @@ from monitoring_adapter.onboarding_pipelines import (
     run_existing_rule_pipeline,
     run_new_rule_pipeline,
 )
+from monitoring_adapter.project_inventory import activation_readiness_blockers, collect_alert_applications, record_successful_test_alert
+from monitoring_adapter.onboarding_sources import OnboardingMonitoringSource, normalize_email_endpoint, normalize_http_endpoint
 from monitoring_adapter.existing_monitoring import (
     apply_field_mapping,
     build_webhook_path,
@@ -447,7 +449,7 @@ WORKER_FAILURE_THRESHOLD = max(1, int(os.getenv("WORKER_FAILURE_THRESHOLD", "5")
 _ALLOWED_PROJECT_ENVIRONMENTS = {"dev", "staging", "prod"}
 _ALLOWED_ONBOARDING_PROVIDERS = {"prometheus", "new_relic", "datadog"}
 _ALLOWED_ACTIVE_PROVIDERS = {"prometheus", "new_relic", "datadog", "azure_service_bus"}
-_ALLOWED_DEPLOYMENT_MODES = {"on_prem", "azure_cloud"}
+_ALLOWED_DEPLOYMENT_MODES = {"cloud_neutral", "on_prem", "private_cloud", "azure_cloud", "aws_cloud", "gcp_cloud"}
 ONBOARDING_RULE_EVENTS = "onboarding-rule-events"
 
 
@@ -1091,33 +1093,9 @@ class OnboardingProject(BaseModel):
         return self
 
 
-class OnboardingMonitoringSource(BaseModel):
-    provider: str
-    endpoint_url: str = ""
-    signal_types: list[str] = Field(default_factory=list)
-    auth_type: str = "none"
-    secret_ref: str = ""
-    enabled: bool = True
-
-    @model_validator(mode="after")
-    def _validate_source(self) -> "OnboardingMonitoringSource":
-        self.provider = str(self.provider or "").strip().lower().replace(" ", "_")
-        if not self.provider:
-            raise ValueError("monitoring_sources.provider is required")
-        self.endpoint_url = OnboardingConnectivityPayload._normalize_endpoint(self.endpoint_url, "monitoring_sources.endpoint_url")
-        self.signal_types = list(dict.fromkeys(str(item or "").strip().lower() for item in self.signal_types if str(item or "").strip()))
-        self.auth_type = str(self.auth_type or "none").strip().lower()
-        if self.auth_type not in {"none", "basic", "bearer", "api_key", "oauth2", "managed_identity"}:
-            raise ValueError("monitoring_sources.auth_type is invalid")
-        self.secret_ref = str(self.secret_ref or "").strip()
-        if self.auth_type != "none" and not self.secret_ref:
-            raise ValueError("monitoring_sources.secret_ref is required when authentication is enabled")
-        return self
-
-
 class OnboardingConnectivityPayload(BaseModel):
     project: OnboardingProject
-    deployment_mode: str = "on_prem"
+    deployment_mode: str = "cloud_neutral"
     prometheus_url: str = ""
     new_relic_url: str = ""
     datadog_url: str = ""
@@ -1127,6 +1105,7 @@ class OnboardingConnectivityPayload(BaseModel):
     traces_url: str = ""
     telemetry_url: str = ""
     ticketing_url: str = ""
+    email_url: str = ""
     network_zone: str = ""
     context_strategy: str = "continuous"
     azure_subscription_id: str = ""
@@ -1186,8 +1165,8 @@ class OnboardingConnectivityPayload(BaseModel):
             user_assignments[normalized_user] = list(dict.fromkeys(normalized_projects))
         normalized["user_assignments"] = user_assignments
 
-        deployment_mode = str(normalized.get("deployment_mode", "on_prem")).strip().lower().replace("-", "_")
-        normalized["deployment_mode"] = deployment_mode or "on_prem"
+        deployment_mode = str(normalized.get("deployment_mode", "cloud_neutral")).strip().lower().replace("-", "_")
+        normalized["deployment_mode"] = deployment_mode or "cloud_neutral"
 
         normalized["azure_subscription_id"] = str(normalized.get("azure_subscription_id", "")).strip()
         normalized["azure_resource_group"] = str(normalized.get("azure_resource_group", "")).strip()
@@ -1203,19 +1182,13 @@ class OnboardingConnectivityPayload(BaseModel):
 
     @staticmethod
     def _normalize_endpoint(value: str, field_name: str) -> str:
-        endpoint = str(value or "").strip()
-        if not endpoint:
-            return ""
-        parsed = urlparse(endpoint)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError(f"{field_name} must be a valid http(s) URL")
-        return endpoint
+        return normalize_http_endpoint(value, field_name)
 
     @model_validator(mode="after")
     def _validate_payload(self) -> "OnboardingConnectivityPayload":
-        self.deployment_mode = str(self.deployment_mode or "on_prem").strip().lower().replace("-", "_")
+        self.deployment_mode = str(self.deployment_mode or "cloud_neutral").strip().lower().replace("-", "_")
         if self.deployment_mode not in _ALLOWED_DEPLOYMENT_MODES:
-            raise ValueError("deployment_mode must be one of on_prem, azure_cloud")
+            raise ValueError("deployment_mode must be one of cloud_neutral, on_prem, private_cloud, azure_cloud, aws_cloud, gcp_cloud")
 
         self.prometheus_url = self._normalize_endpoint(self.prometheus_url, "prometheus_url")
         self.new_relic_url = self._normalize_endpoint(self.new_relic_url, "new_relic_url")
@@ -1225,6 +1198,7 @@ class OnboardingConnectivityPayload(BaseModel):
         self.traces_url = self._normalize_endpoint(self.traces_url, "traces_url")
         self.telemetry_url = self._normalize_endpoint(self.telemetry_url, "telemetry_url")
         self.ticketing_url = self._normalize_endpoint(self.ticketing_url, "ticketing_url")
+        self.email_url = normalize_email_endpoint(self.email_url)
         self.network_zone = str(self.network_zone or "").strip()
         self.context_strategy = str(self.context_strategy or "continuous").strip().lower()
         if self.context_strategy not in {"immediate", "continuous"}:
@@ -1256,7 +1230,7 @@ class OnboardingConnectivityPayload(BaseModel):
 
 class OnboardingConnectivitySnapshot(BaseModel):
     project: dict[str, Any] = Field(default_factory=dict)
-    deployment_mode: str = "on_prem"
+    deployment_mode: str = "cloud_neutral"
     prometheus_url: str = ""
     new_relic_url: str = ""
     datadog_url: str = ""
@@ -1266,6 +1240,7 @@ class OnboardingConnectivitySnapshot(BaseModel):
     traces_url: str = ""
     telemetry_url: str = ""
     ticketing_url: str = ""
+    email_url: str = ""
     network_zone: str = ""
     context_strategy: str = "continuous"
     azure_subscription_id: str = ""
@@ -1518,7 +1493,24 @@ async def _landing_pad_file_watcher() -> None:
         try:
             _recover_stale_claims()
             paths = _landing_pad_input_files(LANDING_PAD_FILE_WATCHER_BATCH_SIZE)
-            await asyncio.gather(*(_process_landing_pad_input_file(path) for path in paths), return_exceptions=True)
+            results = await asyncio.gather(
+                *(_process_landing_pad_input_file(path) for path in paths),
+                return_exceptions=True,
+            )
+            failures = [
+                result
+                for result in results
+                if isinstance(result, Exception)
+                or (isinstance(result, dict) and result.get("status") in {"failed", "failed_all_rows"})
+            ]
+            if failures:
+                samples = [
+                    str(result) if isinstance(result, Exception) else str(result.get("error") or result.get("status"))
+                    for result in failures[:3]
+                ]
+                raise RuntimeError(
+                    f"landing-pad batch failed for {len(failures)}/{len(results)} files: {'; '.join(samples)}"
+                )
             _record_worker_success("landing_pad_file_watcher")
         except Exception as exc:
             _record_worker_failure("landing_pad_file_watcher", exc)
@@ -1984,7 +1976,13 @@ def _build_onboarding_rule_seed(connectivity: OnboardingConnectivityPayload, sel
         "business_owner": str(project.owner_team or "").strip(),
         "technical_owner": str(project.owner_team or "").strip(),
         "technology_stack": [],
-        "cloud_provider": "azure" if connectivity.deployment_mode == "azure_cloud" else "on_prem",
+        "cloud_provider": {
+            "azure_cloud": "azure",
+            "aws_cloud": "aws",
+            "gcp_cloud": "gcp",
+            "private_cloud": "private-cloud",
+            "on_prem": "on-prem",
+        }.get(connectivity.deployment_mode, "cloud-neutral"),
         "region": str(project.region or "").strip(),
         "monitoring_platforms": [selected_tool],
         "notification_platforms": ["slack", "teams", "pagerduty"],
@@ -2464,10 +2462,19 @@ async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
     project_name = _normalize_project_name(project)
     provider_statuses = payload.get("provider_statuses", {}) if isinstance(payload.get("provider_statuses"), dict) else {}
     connectivity_payload = {
-        "deployment_mode": str(payload.get("deployment_mode", "on_prem")).strip().lower().replace("-", "_"),
+        "deployment_mode": str(payload.get("deployment_mode", "cloud_neutral")).strip().lower().replace("-", "_"),
         "prometheus_url": str(payload.get("prometheus_url", "")).strip(),
         "new_relic_url": str(payload.get("new_relic_url", "")).strip(),
         "datadog_url": str(payload.get("datadog_url", "")).strip(),
+        "monitoring_sources": payload.get("monitoring_sources", []) if isinstance(payload.get("monitoring_sources"), list) else [],
+        "healthcheck_url": str(payload.get("healthcheck_url", "")).strip(),
+        "logs_url": str(payload.get("logs_url", "")).strip(),
+        "traces_url": str(payload.get("traces_url", "")).strip(),
+        "telemetry_url": str(payload.get("telemetry_url", "")).strip(),
+        "ticketing_url": str(payload.get("ticketing_url", "")).strip(),
+        "email_url": str(payload.get("email_url", "")).strip(),
+        "network_zone": str(payload.get("network_zone", "")).strip(),
+        "context_strategy": str(payload.get("context_strategy", "continuous")).strip(),
         "azure_subscription_id": str(payload.get("azure_subscription_id", "")).strip(),
         "azure_resource_group": str(payload.get("azure_resource_group", "")).strip(),
         "azure_service_bus_namespace": str(payload.get("azure_service_bus_namespace", "")).strip(),
@@ -4524,6 +4531,10 @@ async def test_monitoring_alert(integration_id: str, payload: dict[str, Any] = A
     alert = _build_alert_from_payload(mapped_payload)
     await _publish_ingested_alert(alert)
     await _publish_lifecycle_events(normalized)
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        await record_successful_test_alert(repo, integration_id=integration_id, provider=provider, alert_id=str(alert.id))
+        await session.commit()
     await _persist_monitoring_audit(
         tenant_id=str(integration.get("tenant_id") or "default"),
         actor="api",
@@ -4545,6 +4556,19 @@ async def activate_monitoring_integration(integration_id: str) -> dict[str, Any]
         row = await repo.get_monitoring_integration(integration_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Monitoring integration not found")
+        health_rows = await repo.list_monitoring_connection_health(tenant_id=str(row.get("tenant_id") or "default"))
+        latest_health = next((item for item in health_rows if item.get("integration_id") == integration_id), None)
+        blockers = activation_readiness_blockers(row, latest_health)
+        if blockers:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "activation_readiness_failed",
+                    "message": "Project monitoring remains in DRAFT until all activation checks pass.",
+                    "blockers": blockers,
+                    "next_steps": ["Validate the connector and credentials.", "Send and verify a test alert."],
+                },
+            )
         await repo.save_monitoring_integration(
             integration_id=integration_id,
             tenant_id=str(row.get("tenant_id") or "default"),
@@ -5547,52 +5571,47 @@ async def get_recent_alerts(limit: int = 50, tenant_id: str | None = None) -> di
     return {"rows": rows, "count": len(rows)}
 
 
+def _compact_alert_row(row: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "id", "alert_id", "incident_id", "correlation_id", "trace_id",
+        "fingerprint", "alert_fingerprint", "name", "alert_name", "service",
+        "application", "project", "project_name", "environment", "source",
+        "source_channel", "severity", "status", "alert_status", "description",
+        "created_at", "updated_at", "received_at", "first_seen", "last_seen",
+        "starts_at", "ends_at", "occurrence_count", "assignee", "owner",
+        "ticket_key", "issue_key", "file", "path", "error", "labels", "annotations",
+    }
+    compact = {key: value for key, value in row.items() if key in fields}
+    labels = row.get("labels") if isinstance(row.get("labels"), dict) else {}
+    annotations = row.get("annotations") if isinstance(row.get("annotations"), dict) else {}
+    label_fields = {
+        "alertname", "service", "job", "application", "project", "project_name",
+        "environment", "severity", "fingerprint", "alert_fingerprint",
+        "source_alert_id", "ticket_key", "issue_key", "jira_issue_key",
+    }
+    compact["labels"] = {key: value for key, value in labels.items() if key in label_fields}
+    compact["annotations"] = {
+        key: value for key, value in annotations.items() if key in {"summary", "description"}
+    }
+    return compact
+
+
 @app.get("/alerts/all")
-async def get_all_alerts(limit: int = 500, tenant_id: str | None = None) -> dict[str, Any]:
+async def get_all_alerts(limit: int = 500, tenant_id: str | None = None, compact: bool = False) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 5000))
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
             rows = await repo.list_alerts_source_balanced(limit=safe_limit, tenant_id=tenant_id)
+        if compact:
+            rows = [_compact_alert_row(row) for row in rows]
         return {"rows": rows, "count": len(rows)}
 
     rows = list(RECENT_ALERTS)[:safe_limit]
+    if compact:
+        rows = [_compact_alert_row(row) for row in rows]
     return {"rows": rows, "count": len(rows)}
-
-
-def _alert_application_candidates(row: dict[str, Any]) -> list[str]:
-    labels = row.get("labels", {}) if isinstance(row.get("labels"), dict) else {}
-    candidates = [
-        row.get("application"),
-        row.get("project"),
-        row.get("project_name"),
-        row.get("service"),
-        labels.get("application"),
-        labels.get("project"),
-        labels.get("project_name"),
-        labels.get("deployment"),
-        labels.get("namespace"),
-        labels.get("job"),
-    ]
-    return [str(value or "").strip() for value in candidates if str(value or "").strip()]
-
-
-def _is_displayable_alert_application(value: str) -> bool:
-    normalized = str(value or "").strip()
-    if not normalized:
-        return False
-    if "/" in normalized or ":" in normalized:
-        return False
-    if re.match(r"^(unknown|default|prod|dev|staging|warning|critical|high|info)$", normalized, re.IGNORECASE):
-        return False
-    if re.match(
-        r"^(prometheus|alertmanager|blackbox|node-exporter|mysql|redis|rabbitmq|kafka|zookeeper)$",
-        normalized,
-        re.IGNORECASE,
-    ):
-        return False
-    return True
 
 
 @app.get("/alerts/applications")
@@ -5602,22 +5621,14 @@ async def get_alert_applications(limit: int = 5000) -> dict[str, Any]:
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
-            rows = await repo.list_alerts(limit=safe_limit)
+            # Project discovery only needs the persisted alert payload. Avoid
+            # incident/projection enrichment, which turns this lightweight
+            # inventory endpoint into several large follow-up queries.
+            rows = await repo.list_alerts(limit=safe_limit, include_incident_context=False)
     else:
         rows = list(RECENT_ALERTS)[:safe_limit]
 
-    seen: set[str] = set()
-    applications: list[str] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        for candidate in _alert_application_candidates(row):
-            if not _is_displayable_alert_application(candidate):
-                continue
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            applications.append(candidate)
+    applications = collect_alert_applications(rows)
 
     return {
         "rows": [{"name": name} for name in applications],
@@ -6087,6 +6098,7 @@ async def get_closed_incidents(limit: int = 100) -> dict[str, Any]:
 @app.get("/incidents/metadata")
 async def get_incident_metadata(
     limit: int = 100,
+    include_enrichment: bool = True,
     risk_tier: str | None = None,
     execution_mode: str | None = None,
     transport_provider: str | None = None,
@@ -6100,6 +6112,7 @@ async def get_incident_metadata(
             repo = IncidentRepository(session)
             rows = await repo.list_incident_projections(
                 limit=safe_limit,
+                include_enrichment=include_enrichment,
                 risk_tier=risk_tier,
                 execution_mode=execution_mode,
                 transport_provider=transport_provider,
@@ -6236,7 +6249,7 @@ async def post_onboarding_complete(payload: OnboardingCompletePayload = Body(...
             "target_platforms": [selected_tool],
             "discovery_inputs": {
                 "endpoint_url": endpoint_url,
-                "deployment_mode": str(connectivity.deployment_mode or "on_prem").strip(),
+                "deployment_mode": str(connectivity.deployment_mode or "cloud_neutral").strip(),
                 "environment": str(connectivity.project.environment or "prod").strip(),
                 "region": str(connectivity.project.region or "").strip(),
                 "selected_monitoring_tool": selected_tool,

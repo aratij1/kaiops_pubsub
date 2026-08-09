@@ -3,7 +3,7 @@ import { Button } from "react-aria-components";
 
 import { EmptyState, ErrorState, LoadingState, PageHeader, StaleDataNotice, TechnicalDetails } from ".";
 
-const meta = { title: "KaiOps/Operational states" } satisfies Meta;
+const meta = { title: "KaiMS/Operational states" } satisfies Meta;
 export default meta;
 type Story = StoryObj<typeof meta>;
 

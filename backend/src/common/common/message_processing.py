@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
+from time import monotonic
 from typing import Any
+
+from redis.asyncio import Redis
+
+from common.config import Settings
+
+_cancelled_cache: dict[str, tuple[float, set[str]]] = {}
+_cancellation_clients: dict[str, Redis] = {}
 
 
 def extract_message_identity(payload: dict[str, Any]) -> str | None:
@@ -32,6 +40,34 @@ def extract_message_identity(payload: dict[str, Any]) -> str | None:
         if token:
             return token
     return None
+
+
+def extract_processing_identities(payload: dict[str, Any]) -> list[str]:
+    envelope = payload.get("event_envelope") if isinstance(payload.get("event_envelope"), dict) else {}
+    contract = payload.get("event_contract") if isinstance(payload.get("event_contract"), dict) else {}
+    candidates = [payload.get("alert_id"), payload.get("incident_id"), payload.get("id"), envelope.get("alert_id"), envelope.get("incident_id"), contract.get("alert_id"), contract.get("incident_id"), extract_message_identity(payload)]
+    return list(dict.fromkeys(str(value).strip() for value in candidates if str(value or "").strip()))
+
+
+async def processing_cancelled(settings: Settings, payload: dict[str, Any]) -> bool:
+    identities = extract_processing_identities(payload)
+    if not identities:
+        return False
+    cached_at, cancelled = _cancelled_cache.get(settings.redis_url, (0.0, set()))
+    if monotonic() - cached_at < 2.0:
+        return any(identity in cancelled for identity in identities)
+    client = _cancellation_clients.get(settings.redis_url)
+    if client is None:
+        client = Redis.from_url(settings.redis_url, decode_responses=True, socket_connect_timeout=1, socket_timeout=1)
+        _cancellation_clients[settings.redis_url] = client
+    try:
+        cancelled = {str(value) for value in await client.smembers("kaims:cancelled-processing")}
+        _cancelled_cache[settings.redis_url] = (monotonic(), cancelled)
+        return any(identity in cancelled for identity in identities)
+    except Exception:
+        # Queue processing must fail open if the cancellation control store is
+        # temporarily unavailable; broker durability remains authoritative.
+        return False
 
 
 class ProcessedMessageCache:

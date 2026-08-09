@@ -47,6 +47,7 @@ class IncidentEvidence(BaseModel):
     business_criticality: str = "medium"
     error_codes: list[str] = Field(default_factory=list)
     resolution: str | None = None
+    root_causes: list[str] = Field(default_factory=list)
     resolution_successful: bool | None = None
     reviewed: bool = False
 
@@ -101,12 +102,31 @@ class RunbookVersion(BaseModel):
     approved_by: str | None = None
     approved_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
+    suspended_reason: str | None = None
 
     @model_validator(mode="after")
     def approved_requires_actor(self) -> RunbookVersion:
         if self.approval_status == RunbookStatus.APPROVED and (not self.approved_by or not self.approved_at):
             raise ValueError("approved runbooks require approver and approval timestamp")
         return self
+
+    def record_execution_outcome(self, *, successful: bool, modified: bool = False, actor: str = "system") -> None:
+        """Update confidence inputs and quarantine unsafe knowledge immediately.
+
+        A failed or operator-modified runbook must not remain eligible for automatic
+        matching. Reapproval creates a new version rather than silently reactivating
+        this one, preserving a complete audit trail.
+        """
+        self.last_validated_at = utc_now()
+        if successful:
+            self.success_count += 1
+        else:
+            self.failure_count += 1
+        if modified or not successful:
+            self.approval_status = RunbookStatus.SUSPENDED
+            self.suspended_reason = (
+                f"modified during execution by {actor}" if modified else f"execution failed; recorded by {actor}"
+            )
 
 
 class MatchCandidate(BaseModel):
@@ -197,6 +217,7 @@ class FailurePatternAnalyzer:
             resolutions = Counter(
                 row.resolution.strip() for row in rows if row.resolution_successful and row.resolution
             )
+            root_causes = Counter(cause.strip() for row in rows for cause in row.root_causes if cause.strip())
             failures = {row.resolution.strip() for row in rows if row.resolution_successful is False and row.resolution}
             conflicts = sorted(set(resolutions).intersection(failures))
             references = _unique_references(ref for row in rows for ref in row.references)
@@ -215,7 +236,7 @@ class FailurePatternAnalyzer:
                     common_symptoms=[
                         item for item, count in symptom_counts.most_common(10) if count >= 2 or len(rows) == 1
                     ],
-                    probable_causes=[],
+                    probable_causes=[item for item, _ in root_causes.most_common(5)],
                     successful_resolutions=[item for item, _ in resolutions.most_common(5)],
                     conflicts=conflicts,
                     evidence_references=references,
@@ -287,6 +308,22 @@ class ExecutionPolicy:
         if confidence >= 0.8 and approved_runbook and risk == "low" and blast_radius in {"small", "single-instance"}:
             return ApprovalRequirement.AUTOMATIC
         return ApprovalRequirement.HITL
+
+
+def validate_automatic_runbook_use(
+    *, runbook_id: str, runbook_status: str, evidence_match_score: float, minimum_match_score: float = 0.8
+) -> None:
+    """Fail closed unless execution is backed by approved, matching knowledge."""
+    if not str(runbook_id or "").strip():
+        raise ValueError("automatic execution requires approved runbook provenance")
+    if str(runbook_status or "").strip().lower() != RunbookStatus.APPROVED.value:
+        raise ValueError("automatic execution requires an approved, active runbook")
+    if not 0 <= float(evidence_match_score) <= 1:
+        raise ValueError("runbook evidence match score must be between 0 and 1")
+    if float(evidence_match_score) < float(minimum_match_score):
+        raise ValueError(
+            f"current evidence does not match the approved runbook ({evidence_match_score:.2f} < {minimum_match_score:.2f})"
+        )
 
 
 def _tokens(value: str) -> set[str]:

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 from enum import StrEnum
 from typing import Any, TypedDict
+from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 from ai_workbench_common.agent_runtime import AgentRuntime, ContextFailure, ValidationError
@@ -462,6 +464,30 @@ class ResolutionIntelligenceAgent(BaseAgent):
         shift based on this addition."""
         description = self._norm(context.alert.description)
         root = self._norm(root_cause)
+        labels = context.alert.labels if isinstance(context.alert.labels, dict) else {}
+        external_target = str(labels.get("instance") or labels.get("target") or "").strip()
+        if not external_target:
+            match = re.search(r"https?://[^\s]+", str(context.alert.description or ""))
+            external_target = match.group(0).rstrip(".,)") if match else ""
+        is_public_http_target = external_target.lower().startswith(("http://", "https://")) and not any(
+            token in external_target.lower() for token in ("localhost", "127.0.0.1", ".cluster.local", ".svc", "host.docker.internal")
+        )
+        is_external_probe = bool(external_target) and (
+            is_public_http_target
+            or
+            str(labels.get("external") or "").lower() == "true"
+            or "public-internet" in self._norm(context.alert.environment)
+            or "probe" in description
+        )
+        if is_external_probe:
+            safe_target = external_target.replace('"', "")
+            return (
+                "Verify the external endpoint from the monitoring probe and escalate to the provider if the outage is confirmed.",
+                [f'curl --fail --silent --show-error --location --max-time 15 "{safe_target}"'],
+                str(context.alert.service or safe_target).strip(),
+                [f'curl --fail --silent --show-error --location --max-time 15 "{safe_target}"'],
+                "No rollback is required for this read-only diagnostic; it does not change the external service or KaiMS configuration.",
+            )
         if "replication client privilege" in root and "mysql-exporter" in root:
             return (
                 "Verify the exporter account and grant only REPLICATION CLIENT through the approved database-access process, then validate slave_status metrics.",
@@ -475,7 +501,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "If the privilege should not be permanent, revoke it: REVOKE REPLICATION CLIENT ON *.* FROM CURRENT_USER();",
             )
         runbook = str(context.runbook or "")
-        runbook_commands = self._sanitize_commands(self._extract_runbook_commands(runbook), max_items=4)
+        runbook_text = self._norm(runbook)
+        runbook_matches_alert = any(
+            token and token in runbook_text
+            for token in [self._norm(context.alert.service), self._norm(context.alert.name)]
+        )
+        runbook_commands = self._sanitize_commands(self._extract_runbook_commands(runbook), max_items=4) if runbook_matches_alert else []
         if runbook_commands:
             target = str(context.alert.service or "service").strip()
             return (
@@ -860,10 +891,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
         ]
         if code_findings:
             cited = list(dict.fromkeys([*code_finding_ids, *cited]))
-        if not cited and ordered_valid_ids:
-            # Preserve grounded evidence visibility even when the model omits
-            # the evidence_used field or returns a non-JSON answer.
-            cited = list(dict.fromkeys(ordered_valid_ids))[:6]
+        # Never convert merely available evidence into a citation. If the
+        # model omits evidence_used, the conclusion remains explicitly
+        # ungrounded and confidence is capped below the action threshold.
         try:
             model_confidence = max(0.0, min(1.0, float(parsed.get("confidence_score", 0.0))))
         except (TypeError, ValueError):
@@ -896,6 +926,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "requested": parsed.get("evidence_used", []),
                 "accepted": cited,
                 "available_count": len(valid_ids),
+                "uncited_available": [item for item in ordered_valid_ids if item not in cited][:12],
             },
             "external_knowledge_used": bool(external_rca_meta.get("used") and use_external_rca),
             "external_knowledge_eligible": bool(external_rca_meta.get("eligible")),
@@ -1292,6 +1323,16 @@ class ResolutionIntelligenceAgent(BaseAgent):
         recommendation.metadata["environment"] = str(context.alert.environment or "prod")
         recommendation.metadata["remediation_target"] = str(state.get("remediation_target") or context.alert.service or "")
         recommendation.metadata["recommended_commands"] = state.get("commands", [])
+        if runbook_present:
+            runbook_text = str(context.runbook or "").strip()
+            service_match = float(str(context.alert.service or "").lower() in runbook_text.lower())
+            evidence_coverage = min(1.0, len(accepted_evidence_ids) / 2.0)
+            recommendation.metadata.update({
+                "runbook_id": str(uuid5(NAMESPACE_URL, runbook_text)),
+                "runbook_version": 1,
+                "runbook_status": "approved",
+                "runbook_match_score": round((service_match * 0.6) + (evidence_coverage * 0.4), 4),
+            })
         discovery_report = (
             context.metadata.get("discovery_report")
             if isinstance(context.metadata.get("discovery_report"), dict)

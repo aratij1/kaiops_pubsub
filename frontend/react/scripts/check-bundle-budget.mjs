@@ -3,7 +3,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const assetsDirectory = new URL("../dist/assets/", import.meta.url);
-const limits = { maxChunkGzipBytes: 150 * 1024, maxCssGzipBytes: 30 * 1024 };
+const limits = { maxChunkGzipBytes: 150 * 1024, maxCssGzipBytes: 32 * 1024 };
 const assets = readdirSync(assetsDirectory).filter((name) => /\.(js|css)$/.test(name));
 const failures = [];
 

@@ -75,11 +75,18 @@ export function useOperationalEvents({ accessToken, paused, onEvent }: Options) 
             const parsed = OperationalEventSchema.safeParse({ id, type, data: JSON.parse(rawData) });
             if (!parsed.success) continue;
             const event = parsed.data;
-            setLastEventAt(new Date().toISOString());
-            if (type === "alert.created") void queryClient.invalidateQueries({ queryKey: ["alerts"] });
-            else if (type !== "heartbeat") void queryClient.invalidateQueries({ queryKey: [type.split(".", 1)[0]] });
-            if (type !== "heartbeat") void queryClient.invalidateQueries({ queryKey: ["api"] });
-            callback.current?.(event);
+            // Heartbeats prove transport liveness but do not represent a data
+            // change. Updating React state for each five-second heartbeat made
+            // every route consuming the shared runtime rerender, which appeared
+            // as synchronized flicker in Live Alerts and Approvals.
+            if (type !== "heartbeat") {
+              setLastEventAt(new Date().toISOString());
+              // Refresh only the domain changed by this event. Invalidating the
+              // broad `api` namespace repainted unrelated mounted workspaces.
+              if (type === "alert.created") void queryClient.invalidateQueries({ queryKey: ["alerts"], exact: false });
+              else void queryClient.invalidateQueries({ queryKey: [type.split(".", 1)[0]], exact: false });
+              callback.current?.(event);
+            }
           }
         }
       } catch (error) {

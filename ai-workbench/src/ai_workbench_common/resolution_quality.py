@@ -24,6 +24,29 @@ _DIRECT_SIGNALS = {
     "alert_payload",
 }
 
+_SOURCE_FAMILIES = {
+    "alert": "alerting",
+    "alertmanager": "alerting",
+    "prometheus": "metrics",
+    "metric": "metrics",
+    "metrics": "metrics",
+    "telemetry": "metrics",
+    "log": "logs",
+    "logs": "logs",
+    "opensearch": "logs",
+    "elasticsearch": "logs",
+    "ticket": "tickets",
+    "jira": "tickets",
+    "code": "code",
+    "github": "code",
+    "gitlab": "code",
+}
+
+
+def _source_family(value: Any) -> str:
+    source = str(value or "unknown").strip().lower()
+    return _SOURCE_FAMILIES.get(source, source)
+
 
 def assess_evidence_quality(
     evidence: list[dict[str, Any]],
@@ -33,7 +56,9 @@ def assess_evidence_quality(
 ) -> EvidenceQuality:
     accepted = set(accepted_ids)
     rows = [row for row in evidence if str(row.get("evidence_id") or "") in accepted]
-    sources = {str(row.get("source") or "unknown").strip().lower() for row in rows}
+    # Connector aliases backed by the same underlying signal are one source,
+    # not independent corroboration (for example Prometheus + telemetry).
+    sources = {_source_family(row.get("source")) for row in rows}
     direct = sum(
         1
         for row in rows

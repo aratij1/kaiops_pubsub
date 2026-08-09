@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from contextlib import suppress
 import json
 import logging
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, unquote, urlencode, urlparse
 from uuid import uuid4
 
 import httpx
 import pymysql
+from redis.asyncio import Redis
 from api_gateway import SafetyAnalyzer
 from api_gateway.auth_policy import route_auth_rule
 from api_gateway.copilot import (
@@ -26,9 +28,10 @@ from api_gateway.copilot import (
 from api_gateway.modules.users.models import SystemRole
 from api_gateway.modules.users.permissions import AuthContext, current_auth_context, current_tenant_id, require_roles
 from api_gateway.modules.users.router import router as user_management_router
+from api_gateway.modules.triage.router import router as triage_router
 from api_gateway.modules.users.service import UserService
 from common.config import get_settings
-from common.database import ActionRecord, AlertRecord, ApprovalRecord, AuditLogRecord, HumanCorrectionRecord, IncidentProjectionRecord, MonitoringConnectionHealthRecord
+from common.database import ActionRecord, AlertRecord, ApprovalRecord, AuditLogRecord, IncidentProjectionRecord, MonitoringConnectionHealthRecord
 from common.event_publishers import build_agent_event_contract
 from common.kafka import normalize_payload
 from common.models import GatewayAuditEvent, SafetyDecision
@@ -48,40 +51,6 @@ settings.service_name = "api-gateway"
 analyzer = SafetyAnalyzer()
 AUDIT_EVENTS: deque[GatewayAuditEvent] = deque(maxlen=200)
 logger = logging.getLogger("api-gateway")
-
-
-class TriageCorrectionCreate(BaseModel):
-    """Governed feedback contract for a human correction to automation."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    entity_type: str = Field(default="alert", min_length=1, max_length=64)
-    entity_id: str = Field(min_length=1, max_length=255)
-    correction_type: str = Field(default="severity", min_length=1, max_length=64)
-    original_payload: dict[str, Any] = Field(default_factory=dict)
-    corrected_payload: dict[str, Any]
-    reason: str = Field(min_length=10, max_length=4000)
-
-    @field_validator("entity_type")
-    @classmethod
-    def validate_entity_type(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        if normalized not in {"alert", "ticket", "incident", "rca", "recommendation"}:
-            raise ValueError("unsupported entity_type")
-        return normalized
-
-    @field_validator("correction_type")
-    @classmethod
-    def validate_correction_type(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        if normalized not in {"severity", "priority", "category", "ownership", "rca", "recommendation"}:
-            raise ValueError("unsupported correction_type")
-        return normalized
-
-    @field_validator("entity_id", "reason")
-    @classmethod
-    def strip_required_text(cls, value: str) -> str:
-        return value.strip()
 
 
 def require_object_payload(payload: Any, label: str = "request body") -> dict[str, Any]:
@@ -270,7 +239,18 @@ def _query_alerts_table_row_count() -> float:
             autocommit=True,
         )
         with connection.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) FROM alerts")
+            # This is an operational capacity gauge, not a billing count. An
+            # exact COUNT(*) repeatedly scans a growing InnoDB table and was a
+            # measurable source of database CPU. information_schema provides
+            # the inexpensive estimate appropriate for this metric.
+            cursor.execute(
+                """
+                SELECT COALESCE(TABLE_ROWS, 0)
+                FROM information_schema.TABLES
+                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'alerts'
+                """,
+                (settings.db_database,),
+            )
             row = cursor.fetchone()
             return float((row or [0])[0] or 0)
     except Exception as exc:
@@ -284,6 +264,14 @@ def _query_alerts_table_row_count() -> float:
                 pass
 
 
+async def _sample_alerts_table_row_count() -> None:
+    """Update the gauge off the event loop; Prometheus scrapes stay read-only and fast."""
+    while True:
+        count = await asyncio.to_thread(_query_alerts_table_row_count)
+        ALERTS_TABLE_ROWS.labels(settings.db_database, "alerts").set(count)
+        await asyncio.sleep(max(30.0, settings.alerts_table_metric_interval_seconds))
+
+
 async def startup(app: FastAPI) -> None:
     app.state.proxy_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.gateway_request_timeout_seconds, connect=5.0, pool=5.0),
@@ -295,10 +283,15 @@ async def startup(app: FastAPI) -> None:
     else:
         app.state.user_service = UserService(settings=settings, session_factory=None)
 
-    ALERTS_TABLE_ROWS.labels(settings.db_database, "alerts").set_function(_query_alerts_table_row_count)
+    app.state.alerts_table_metric_task = asyncio.create_task(_sample_alerts_table_row_count())
 
 
 async def shutdown(app: FastAPI) -> None:
+    metric_task = getattr(app.state, "alerts_table_metric_task", None)
+    if metric_task is not None:
+        metric_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await metric_task
     client = getattr(app.state, "proxy_client", None)
     if client is not None:
         await client.aclose()
@@ -306,6 +299,7 @@ async def shutdown(app: FastAPI) -> None:
 
 app = create_app(title="KaiMS API Gateway", settings=settings, startup=startup, shutdown=shutdown)
 app.include_router(user_management_router)
+app.include_router(triage_router)
 
 
 @app.middleware("http")
@@ -425,6 +419,13 @@ async def stream_operational_events(request: Request) -> StreamingResponse:
 
 
 def preview(payload: Any) -> dict[str, Any]:
+    # Collection responses can contain hundreds of nested alert/evidence
+    # payloads. Audit their shape and count without deep-normalizing the entire
+    # response on the request path; canonical details remain in the source DB.
+    if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+        return {"rows_count": len(payload["rows"]), "count": payload.get("count")}
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("rows"), list):
+        return {"rows_count": len(payload["data"]["rows"]), "count": payload["data"].get("count")}
     normalized = normalize_payload(payload)
     if not isinstance(normalized, dict):
         return {"value": str(normalized)[:500]}
@@ -702,7 +703,12 @@ async def proxy(
     else:
         request_timeout = 12.0 if is_fast_read else settings.gateway_request_timeout_seconds
     timeout = httpx.Timeout(request_timeout, connect=5.0, pool=5.0)
-    max_attempts = 2 if normalized_method in {"GET", "HEAD", "OPTIONS"} else 1
+    # A ConnectError/ConnectTimeout occurs while establishing the downstream
+    # connection, before an HTTP response exists. Retrying it once is safe for
+    # state-changing requests too and absorbs brief Docker DNS/service-start
+    # races. Read/pool timeouts and HTTP responses are deliberately not retried
+    # because the downstream may already have applied those requests.
+    max_attempts = 2
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -1051,6 +1057,7 @@ async def get_recent_alerts(
 async def get_all_alerts(
     request: Request,
     limit: int = 500,
+    compact: bool = False,
     x_trace_id: str | None = Header(default=None),
     tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
@@ -1058,7 +1065,7 @@ async def get_all_alerts(
     # token (this endpoint doesn't otherwise require auth, matching
     # api_gateway.auth_policy's read-routes-open convention) and to the
     # authenticated caller's own tenant otherwise — see current_tenant_id.
-    path = f"/alerts/all?{urlencode({'limit': str(limit), 'tenant_id': tenant_id})}"
+    path = f"/alerts/all?{urlencode({'limit': str(limit), 'tenant_id': tenant_id, 'compact': 'true' if compact else 'false'})}"
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -1113,14 +1120,26 @@ async def get_alert_linked_documents(
     trace_id = trace_id_from_header(x_trace_id)
     safe_limit = max(1, min(int(limit), 1000))
     alerts_path = f"/alerts/all?{urlencode({'limit': str(safe_limit)})}"
-    _, alerts_payload = await proxy(
-        method="GET",
-        path=alerts_path,
-        target_base=settings.monitoring_adapter_url,
-        payload={},
-        trace_id=trace_id,
-    )
-    documents_degraded = False
+    alerts_degraded = False
+    try:
+        _, alerts_payload = await proxy(
+            method="GET",
+            path=alerts_path,
+            target_base=settings.monitoring_adapter_url,
+            payload={},
+            trace_id=trace_id,
+            timeout_seconds=2.0,
+        )
+    except httpx.HTTPError as exc:
+        alerts_degraded = True
+        alerts_payload = {"rows": []}
+        logger.warning(
+            "linked_documents_alert_lookup_degraded alert_id=%s trace_id=%s error_type=%s",
+            str(alert_id or "").strip(),
+            trace_id,
+            type(exc).__name__,
+        )
+    documents_degraded = alerts_degraded
     documents_warning = ""
     try:
         _, docs_payload = await proxy(
@@ -1129,7 +1148,9 @@ async def get_alert_linked_documents(
             target_base=settings.context_agent_url,
             payload={},
             trace_id=trace_id,
-            timeout_seconds=8.0,
+            # Evidence enrichment is optional and must never hold the
+            # incident workspace open behind a saturated context service.
+            timeout_seconds=2.0,
         )
     except (httpx.HTTPError, ValueError, TypeError) as exc:
         # Document evidence enriches the RCA view but is not required to show
@@ -1168,7 +1189,15 @@ async def get_alert_linked_documents(
         ),
         None,
     )
-    if selected_alert is None:
+    if selected_alert is None and alerts_degraded:
+        selected_alert = {
+            "id": normalized_id,
+            "alert_id": normalized_id,
+            "name": "Alert details temporarily unavailable",
+            "service": "unknown",
+            "source": "degraded-alert-lookup",
+        }
+    elif selected_alert is None:
         raise HTTPException(status_code=404, detail={"message": "alert not found", "alert_id": normalized_id, "trace_id": trace_id})
 
     canonical = _canonical_alert_contract(selected_alert)
@@ -1244,118 +1273,6 @@ async def delete_alert_severity_override(
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
-
-
-@app.post("/triage/corrections", status_code=201)
-@app.post("/api/v1/triage/corrections", status_code=201, include_in_schema=False)
-async def create_triage_correction(
-    request: Request,
-    payload: TriageCorrectionCreate,
-    auth: AuthContext = Depends(
-        require_roles(
-            SystemRole.ADMINISTRATOR.value,
-            SystemRole.L3_ENGINEER.value,
-            SystemRole.L2_ENGINEER.value,
-        )
-    ),
-) -> dict[str, Any]:
-    session_factory = getattr(request.app.state, "session_factory", None)
-    if not settings.database_enabled or session_factory is None:
-        raise HTTPException(status_code=503, detail="Correction persistence is unavailable")
-
-    correction_id = uuid4()
-    actor = str(auth.username or auth.email or auth.user_id).strip()
-    correction = HumanCorrectionRecord(
-        id=correction_id,
-        tenant_id=auth.tenant_id,
-        entity_type=payload.entity_type,
-        entity_id=payload.entity_id,
-        correction_type=payload.correction_type,
-        original_payload=payload.original_payload,
-        corrected_payload=payload.corrected_payload,
-        reason=payload.reason,
-        actor=actor,
-        actor_role=auth.role,
-        status="recorded",
-    )
-    audit = AuditLogRecord(
-        tenant_id=auth.tenant_id,
-        actor=actor,
-        action="triage.correction.recorded",
-        resource_type=payload.entity_type,
-        resource_id=payload.entity_id,
-        payload={
-            "correction_id": str(correction_id),
-            "correction_type": payload.correction_type,
-            "reason": payload.reason,
-            "actor_role": auth.role,
-        },
-    )
-    async with session_factory() as session:
-        session.add(correction)
-        session.add(audit)
-        await session.commit()
-
-    return {
-        "correction": {
-            "id": str(correction_id),
-            "tenant_id": auth.tenant_id,
-            "entity_type": payload.entity_type,
-            "entity_id": payload.entity_id,
-            "correction_type": payload.correction_type,
-            "original_payload": payload.original_payload,
-            "corrected_payload": payload.corrected_payload,
-            "reason": payload.reason,
-            "actor": actor,
-            "actor_role": auth.role,
-            "status": "recorded",
-        }
-    }
-
-
-@app.get("/triage/corrections")
-@app.get("/api/v1/triage/corrections", include_in_schema=False)
-async def list_triage_corrections(
-    request: Request,
-    entity_id: str = "",
-    correction_type: str = "",
-    limit: int = 50,
-    auth: AuthContext = Depends(current_auth_context),
-) -> dict[str, Any]:
-    session_factory = getattr(request.app.state, "session_factory", None)
-    if not settings.database_enabled or session_factory is None:
-        raise HTTPException(status_code=503, detail="Correction persistence is unavailable")
-
-    safe_limit = max(1, min(int(limit), 200))
-    statement = select(HumanCorrectionRecord).where(HumanCorrectionRecord.tenant_id == auth.tenant_id)
-    if entity_id.strip():
-        statement = statement.where(HumanCorrectionRecord.entity_id == entity_id.strip())
-    if correction_type.strip():
-        statement = statement.where(HumanCorrectionRecord.correction_type == correction_type.strip().lower())
-    async with session_factory() as session:
-        result = await session.execute(statement.order_by(HumanCorrectionRecord.created_at.desc()).limit(safe_limit))
-        rows = result.scalars().all()
-
-    return {
-        "rows": [
-            {
-                "id": str(row.id),
-                "entity_type": row.entity_type,
-                "entity_id": row.entity_id,
-                "correction_type": row.correction_type,
-                "original_payload": row.original_payload or {},
-                "corrected_payload": row.corrected_payload or {},
-                "reason": row.reason,
-                "actor": row.actor,
-                "actor_role": row.actor_role,
-                "status": row.status,
-                "created_at": row.created_at.isoformat() if row.created_at else None,
-            }
-            for row in rows
-        ],
-        "count": len(rows),
-        "tenant_id": auth.tenant_id,
-    }
 
 
 @app.post("/sample/payment-latency")
@@ -1606,6 +1523,7 @@ async def get_closed_incidents(
 async def get_incident_metadata(
     request: Request,
     limit: int = 100,
+    include_enrichment: bool = True,
     risk_tier: str | None = None,
     execution_mode: str | None = None,
     transport_provider: str | None = None,
@@ -1613,7 +1531,10 @@ async def get_incident_metadata(
     service: str | None = None,
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    params: dict[str, str] = {"limit": str(limit)}
+    params: dict[str, str] = {
+        "limit": str(limit),
+        "include_enrichment": "true" if include_enrichment else "false",
+    }
     if risk_tier:
         params["risk_tier"] = str(risk_tier)
     if execution_mode:
@@ -2032,6 +1953,171 @@ async def get_monitoring_health(
     )
 
 
+@app.get("/knowledge-development/status")
+async def knowledge_development_status(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path="/status", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.get("/knowledge-development/configuration")
+async def knowledge_development_configuration(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path="/configuration", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.put("/knowledge-development/configuration")
+async def update_knowledge_development_configuration(request: Request, payload: dict[str, Any] = REQUEST_BODY, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="PUT", path="/configuration", target_base=settings.knowledge_development_url, payload=payload, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.post("/knowledge-development/run")
+async def run_knowledge_development(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="POST", path="/run", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=180)
+
+
+@app.get("/knowledge-development/report")
+async def knowledge_development_report(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path="/report", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30)
+
+
+@app.get("/operations/queue-health")
+async def get_queue_health() -> dict[str, Any]:
+    """Return live RabbitMQ readiness and backlog data for the command center.
+
+    Broker telemetry is intentionally bounded and read-only. A failed management
+    probe returns a useful degraded contract instead of turning dashboard load
+    into an HTTP 500.
+    """
+    broker_url = urlparse(str(settings.rabbitmq_url or ""))
+    if broker_url.scheme not in {"amqp", "amqps"} or not broker_url.hostname:
+        return {"status": "not_configured", "provider": "rabbitmq", "healthy": False, "queues": 0, "messages": 0, "ready": 0, "unacknowledged": 0}
+    scheme = "https" if broker_url.scheme == "amqps" else "http"
+    management_url = f"{scheme}://{broker_url.hostname}:15672/api/queues"
+    username = unquote(broker_url.username or "guest")
+    password = unquote(broker_url.password or "guest")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(2.0)) as client:
+            response = await client.get(management_url, auth=(username, password))
+            response.raise_for_status()
+        rows = response.json()
+        queues = rows if isinstance(rows, list) else []
+        messages = sum(int(row.get("messages") or 0) for row in queues if isinstance(row, dict))
+        ready = sum(int(row.get("messages_ready") or 0) for row in queues if isinstance(row, dict))
+        unacknowledged = sum(int(row.get("messages_unacknowledged") or 0) for row in queues if isinstance(row, dict))
+        idle_consumers = sum(1 for row in queues if isinstance(row, dict) and int(row.get("consumers") or 0) == 0 and int(row.get("messages") or 0) > 0)
+        status = "attention" if unacknowledged > 0 or idle_consumers > 0 else "healthy"
+        return {"status": status, "provider": "rabbitmq", "healthy": status == "healthy", "queues": len(queues), "messages": messages, "ready": ready, "unacknowledged": unacknowledged, "queues_without_consumers": idle_consumers}
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        logger.warning("RabbitMQ management health probe failed: %s", exc)
+        return {"status": "unreachable", "provider": "rabbitmq", "healthy": False, "queues": 0, "messages": 0, "ready": 0, "unacknowledged": 0}
+
+
+def _rabbit_management() -> tuple[str, tuple[str, str]]:
+    broker_url = urlparse(str(settings.rabbitmq_url or ""))
+    if broker_url.scheme not in {"amqp", "amqps"} or not broker_url.hostname:
+        raise HTTPException(status_code=503, detail="RabbitMQ management is not configured")
+    scheme = "https" if broker_url.scheme == "amqps" else "http"
+    return f"{scheme}://{broker_url.hostname}:15672/api", (unquote(broker_url.username or "guest"), unquote(broker_url.password or "guest"))
+
+
+async def _queue_audit(request: Request, action: str, resource_id: str, payload: dict[str, Any]) -> None:
+    auth = getattr(request.state, "auth", None)
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        return
+    async with session_factory() as session:
+        session.add(AuditLogRecord(tenant_id=getattr(auth, "tenant_id", "default"), actor=getattr(auth, "username", "administrator"), action=action, resource_type="processing_queue", resource_id=resource_id, payload=payload))
+        await session.commit()
+
+
+@app.get("/operations/queues")
+async def list_processing_queues(request: Request, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    base, auth = _rabbit_management()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+        response = await client.get(f"{base}/queues", auth=auth)
+        response.raise_for_status()
+    prefix = f"{settings.rabbitmq_queue_prefix}."
+    rows = []
+    for row in response.json() if isinstance(response.json(), list) else []:
+        name = str(row.get("name") or "")
+        if not name.startswith(prefix):
+            continue
+        parts = name.split(".")
+        rows.append({"name": name, "consumer_service": parts[1] if len(parts) > 2 else "unknown", "stage": ".".join(parts[2:]) if len(parts) > 2 else name, "ready": int(row.get("messages_ready") or 0), "in_flight": int(row.get("messages_unacknowledged") or 0), "total": int(row.get("messages") or 0), "consumers": int(row.get("consumers") or 0), "state": row.get("state") or "unknown", "dead_letter": name.endswith(".dlq")})
+    rows.sort(key=lambda item: (-item["total"], item["name"]))
+    return {"provider": "rabbitmq", "queues": rows, "summary": {"queues": len(rows), "ready": sum(row["ready"] for row in rows), "in_flight": sum(row["in_flight"] for row in rows), "dead_letter": sum(row["total"] for row in rows if row["dead_letter"])}}
+
+
+@app.post("/operations/queues/{queue_name}/sample")
+async def sample_processing_queue(queue_name: str, request: Request, count: int = 25, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    if not queue_name.startswith(f"{settings.rabbitmq_queue_prefix}."):
+        raise HTTPException(status_code=403, detail="Queue is outside the KaiMS namespace")
+    base, auth = _rabbit_management()
+    path = f"{base}/queues/%2F/{quote(queue_name, safe='')}/get"
+    body = {"count": max(1, min(count, 100)), "ackmode": "ack_requeue_true", "encoding": "auto", "truncate": 50000}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+        response = await client.post(path, auth=auth, json=body)
+        response.raise_for_status()
+    messages = []
+    for item in response.json() if isinstance(response.json(), list) else []:
+        raw = item.get("payload")
+        try: decoded = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError: decoded = {"raw": str(raw)[:500]}
+        payload = decoded.get("payload") if isinstance(decoded, dict) and isinstance(decoded.get("payload"), dict) else decoded
+        messages.append({"alert_id": str((payload or {}).get("alert_id") or (payload or {}).get("id") or ""), "incident_id": str((payload or {}).get("incident_id") or ""), "name": str((payload or {}).get("name") or (payload or {}).get("alert_name") or "Queued event"), "service": str((payload or {}).get("service") or "unknown"), "severity": str((payload or {}).get("severity") or "unknown"), "redelivered": bool(item.get("redelivered")), "payload_bytes": int(item.get("payload_bytes") or 0)})
+    return {"queue": queue_name, "messages": messages, "sampled": len(messages), "note": "Messages were inspected and requeued; no processing state changed."}
+
+
+@app.post("/operations/queues/cancel-alert")
+async def cancel_queued_alert(request: Request, payload: dict[str, Any] = REQUEST_BODY, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    alert_id = str(payload.get("alert_id") or "").strip()
+    reason = str(payload.get("reason") or "").strip()
+    if not alert_id or len(reason) < 8 or payload.get("confirmation") != f"STOP {alert_id}":
+        raise HTTPException(status_code=422, detail="Alert ID, a meaningful reason, and exact STOP confirmation are required")
+    client = Redis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        await client.sadd("kaims:cancelled-processing", alert_id)
+        await client.hset("kaims:cancelled-processing:metadata", alert_id, json.dumps({"reason": reason, "cancelled_at": datetime.now(timezone.utc).isoformat()}))
+    finally:
+        await client.aclose()
+    await _queue_audit(request, "queue.alert.cancelled", alert_id, {"reason": reason})
+    return {"status": "cancelled", "alert_id": alert_id, "effect": "Queued stages will acknowledge and quarantine matching work. A currently executing handler may finish its current atomic operation."}
+
+
+@app.delete("/operations/queues/{queue_name}/messages")
+async def purge_processing_queue(queue_name: str, request: Request, payload: dict[str, Any] = REQUEST_BODY, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    if not queue_name.startswith(f"{settings.rabbitmq_queue_prefix}."):
+        raise HTTPException(status_code=403, detail="Queue is outside the KaiMS namespace")
+    if payload.get("confirmation") != f"PURGE {queue_name}" or len(str(payload.get("reason") or "").strip()) < 8:
+        raise HTTPException(status_code=422, detail="A meaningful reason and exact queue purge confirmation are required")
+    base, auth = _rabbit_management()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+        response = await client.delete(f"{base}/queues/%2F/{quote(queue_name, safe='')}/contents", auth=auth)
+        response.raise_for_status()
+    await _queue_audit(request, "queue.messages.purged", queue_name, {"reason": payload["reason"]})
+    return {"status": "purged", "queue": queue_name, "effect": "Ready messages were removed. In-flight messages were not interrupted."}
+
+
+@app.delete("/operations/queues/purge-all/ready-messages")
+async def purge_all_processing_queues(request: Request, payload: dict[str, Any] = REQUEST_BODY, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    reason = str(payload.get("reason") or "").strip()
+    if payload.get("confirmation") != "PURGE ALL READY JOBS" or len(reason) < 12:
+        raise HTTPException(status_code=422, detail="A detailed reason and exact PURGE ALL READY JOBS confirmation are required")
+    base, auth = _rabbit_management()
+    prefix = f"{settings.rabbitmq_queue_prefix}."
+    purged: list[str] = []
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        listing = await client.get(f"{base}/queues", auth=auth)
+        listing.raise_for_status()
+        for row in listing.json() if isinstance(listing.json(), list) else []:
+            name = str(row.get("name") or "")
+            if not name.startswith(prefix) or int(row.get("messages_ready") or 0) <= 0:
+                continue
+            response = await client.delete(f"{base}/queues/%2F/{quote(name, safe='')}/contents", auth=auth)
+            response.raise_for_status()
+            purged.append(name)
+    await _queue_audit(request, "queue.all_ready_messages.purged", "all", {"reason": reason, "queues": purged})
+    return {"status": "purged", "queues": purged, "queue_count": len(purged), "effect": "All ready KaiMS messages were removed. In-flight messages were not interrupted."}
+
+
 @app.get("/monitoring/audit")
 async def get_monitoring_audit(
     request: Request,
@@ -2236,6 +2322,22 @@ async def remediation_execute(
     )
 
 
+@app.post("/remediation/dry-run")
+async def remediation_dry_run(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/dry-run",
+        target_base=settings.remediation_engine_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.post("/rag/documents")
 async def ingest_rag_document(
     request: Request,
@@ -2283,6 +2385,22 @@ async def list_evidence_rag_drafts(
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
         params=params,
+    )
+
+
+@app.post("/rag/evidence-drafts")
+async def create_evidence_rag_draft(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/rag/evidence-drafts",
+        target_base=settings.context_agent_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
     )
 
 

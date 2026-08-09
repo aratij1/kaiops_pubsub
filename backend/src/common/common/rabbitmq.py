@@ -11,7 +11,7 @@ from aio_pika import DeliveryMode, ExchangeType, Message, RobustChannel, RobustC
 
 from common.config import Settings
 from common.logging import get_logger
-from common.message_processing import ProcessedMessageCache, extract_message_identity
+from common.message_processing import ProcessedMessageCache, extract_message_identity, processing_cancelled
 from common.resilience import CircuitBreaker, CircuitOpenError
 from common.telemetry import DEAD_LETTER_EVENTS, QUEUE_AGE, QUEUE_DEPTH
 from opentelemetry import propagate, trace
@@ -262,6 +262,10 @@ async def consume_forever(
                         continue
 
                     identity = extract_message_identity(payload)
+                    if await processing_cancelled(consumer._settings, payload):
+                        logger.warning("cancelled alert removed from rabbitmq processing", extra={"topic": consumer._topic, "message_identity": identity})
+                        await message.ack()
+                        continue
                     if processed_cache.contains(identity):
                         logger.info("skipping duplicate rabbitmq message", extra={"topic": consumer._topic, "message_identity": identity})
                         await message.ack()

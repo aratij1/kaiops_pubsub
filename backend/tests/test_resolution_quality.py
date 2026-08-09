@@ -23,6 +23,19 @@ def test_independent_sources_with_direct_signal_support_high_confidence() -> Non
     assert quality.confidence_ceiling == 0.95
 
 
+def test_connector_aliases_do_not_fake_independent_corroboration() -> None:
+    quality = assess_evidence_quality(
+        [
+            {"evidence_id": "a", "source": "prometheus", "diagnostic_signals": ["metric_anomaly"]},
+            {"evidence_id": "b", "source": "telemetry", "diagnostic_signals": ["metric_anomaly"]},
+        ],
+        accepted_ids=["a", "b"],
+    )
+    assert quality.independent_sources == 1
+    assert quality.sufficiency == "partial"
+    assert quality.confidence_ceiling == 0.69
+
+
 def test_remediation_gate_requires_validation_rollback_and_approval() -> None:
     gate = remediation_quality_gate(
         {"commands": ["kubectl delete pod checkout"], "approval_required": True},

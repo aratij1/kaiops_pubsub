@@ -18,6 +18,15 @@ const Login = z.object({ access_token: z.string().min(1), user: User }).passthro
 const AuthenticatedUser = z.union([User, z.object({ user: User }).passthrough()]);
 const Refresh = z.object({ access_token: z.string().min(1) }).passthrough();
 const Health = z.object({ status: z.string().min(1) }).passthrough();
+const QueueHealth = z.object({
+  status: z.string().min(1),
+  provider: z.string().min(1),
+  healthy: z.boolean(),
+  queues: z.number().nonnegative(),
+  messages: z.number().nonnegative(),
+  ready: z.number().nonnegative(),
+  unacknowledged: z.number().nonnegative(),
+}).passthrough();
 const ObjectResponse = z.object({}).passthrough();
 const ObjectOrList = z.union([ObjectResponse, RecordList]);
 const RowsEnvelope = z.union([
@@ -35,6 +44,7 @@ const contracts: readonly Contract[] = [
   { method: "POST", path: /^\/api-gateway\/auth\/refresh$/, schema: Refresh, name: "token-refresh" },
   { path: /^\/api-gateway\/auth\/logout$/, schema: ObjectResponse, name: "logout" },
   { method: "GET", path: /^\/api-gateway\/healthz$/, schema: Health, name: "health" },
+  { method: "GET", path: /^\/api-gateway\/operations\/queue-health$/, schema: QueueHealth, name: "queue-health" },
   { path: /^\/(?:api-gateway|monitoring-adapter)\/alerts(?:\/|$)/, schema: ObjectOrList, name: "alerts" },
   { path: /^\/api-gateway\/landing-pad(?:\/|$)/, schema: RowsEnvelope, name: "landing-pad" },
   { path: /^\/api-gateway\/incidents(?:\/|$)/, schema: ObjectOrList, name: "incidents" },
