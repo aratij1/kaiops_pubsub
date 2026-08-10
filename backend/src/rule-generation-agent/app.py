@@ -188,8 +188,8 @@ def _build_runbook_document_payload(
             "source": "rule-generation-agent",
             "application_id": str(application.id),
             "context_strategy": "similar-historical-tickets-first",
-            "historical_ticket_count": len(similar_tickets),
-            "historical_ticket_paths": [str(ticket.get("path") or "") for ticket in similar_tickets],
+            "historical_ticket_count": str(len(similar_tickets)),
+            "historical_ticket_paths": ",".join(str(ticket.get("path") or "") for ticket in similar_tickets),
         },
     }
 
