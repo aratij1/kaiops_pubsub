@@ -268,6 +268,28 @@ function cleanRecommendationText(value, fallback = "-") {
   if (value == null) {
     return fallback;
   }
+  if (Array.isArray(value)) {
+    const items = value.map((item) => cleanRecommendationText(item, "")).filter(Boolean);
+    return items.length ? Array.from(new Set(items)).join("; ") : fallback;
+  }
+  if (typeof value === "object") {
+    const preferredKeys = [
+      "summary", "description", "observed_impact", "impact_summary", "customer_impact",
+      "service_impact", "dependency_impact", "severity_rationale", "urgency", "name", "service",
+      "root_cause", "cause", "mechanism", "reasoning", "content", "value",
+    ];
+    const preferred = preferredKeys
+      .map((key) => cleanRecommendationText(value[key], ""))
+      .filter(Boolean);
+    if (preferred.length) {
+      return Array.from(new Set(preferred)).join("; ");
+    }
+    const scalarDetails = Object.entries(value)
+      .filter(([, item]) => ["string", "number"].includes(typeof item))
+      .map(([key, item]) => `${key.replaceAll("_", " ")}: ${String(item).trim()}`)
+      .filter((item) => !isPlaceholderRecommendationText(item.split(":").slice(1).join(":").trim()));
+    return scalarDetails.length ? scalarDetails.join("; ") : fallback;
+  }
   const text = String(value).trim();
   if (!text || isPlaceholderRecommendationText(text)) {
     return fallback;
@@ -299,7 +321,7 @@ function cleanRecommendationText(value, fallback = "-") {
       "title",
     ];
     for (const key of keys) {
-      const candidate = String(payload[key] || "").trim();
+      const candidate = cleanRecommendationText(payload[key], "");
       if (candidate && !isPromptFragment(candidate) && !isPlaceholderRecommendationText(candidate)) {
         return candidate;
       }
