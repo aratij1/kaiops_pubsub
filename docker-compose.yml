@@ -942,7 +942,9 @@ services:
     build:
       context: .
       dockerfile: deploy/docker/Dockerfile.ui
-    ports: ["8501:80"]
+    # Public traffic terminates at host Nginx on HTTPS/443. Keep the raw UI
+    # listener loopback-only so it cannot bypass TLS or the reverse proxy.
+    ports: ["127.0.0.1:8501:80"]
     restart: unless-stopped
     depends_on:
       api-gateway: { condition: service_healthy }
