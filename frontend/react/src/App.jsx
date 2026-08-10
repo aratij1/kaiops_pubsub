@@ -5734,6 +5734,18 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       ? selectedAlertWorkflow.recommendation
       : {};
     const metadata = typeof recommendation?.metadata === "object" && recommendation.metadata ? recommendation.metadata : {};
+    const workflowDecision =
+      (typeof selectedAlertWorkflow?.decision === "object" && selectedAlertWorkflow.decision)
+      || (typeof selectedAlertWorkflow?.orchestration_decision === "object" && selectedAlertWorkflow.orchestration_decision)
+      || (typeof metadata?.orchestration_decision === "object" && metadata.orchestration_decision)
+      || selectedAlertRouting
+      || {};
+    const resolvedExecutionPlan = typeof workflowDecision?.execution_plan === "object" && workflowDecision.execution_plan
+      ? workflowDecision.execution_plan
+      : {};
+    const resolvedConnector = typeof resolvedExecutionPlan?.connection?.connector === "object" && resolvedExecutionPlan.connection.connector
+      ? resolvedExecutionPlan.connection.connector
+      : {};
     const service = String(
       selectedAlertRow?.service
       || incident?.service
@@ -5758,6 +5770,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const endpoint = String(
       metadata?.connection_url
       || metadata?.endpoint_url
+      || resolvedConnector?.endpoint
       || workflowContext?.deployment
       || workflowContext?.observability?.metrics_endpoint
       || appRow?.metrics_endpoint
@@ -5777,6 +5790,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const credentialRef = String(
       metadata?.credential_ref
       || metadata?.secret_ref
+      || resolvedConnector?.secret_ref
       || appRow?.secret_ref
       || onboardingForm.connection_secret_ref
       || ""
@@ -5787,14 +5801,22 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       environment: environment || "prod",
       namespace,
       endpoint: endpoint || "Not configured",
-      connection_type: endpoint ? "metrics/application endpoint" : "missing connection details",
-      source: endpoint ? "onboarding/application metadata" : "missing",
+      connection_type: String(resolvedConnector?.type || (endpoint ? "metrics/application endpoint" : "missing connection details")),
+      source: Object.keys(resolvedConnector).length ? "resolved workflow connector" : endpoint ? "onboarding/application metadata" : "missing",
       credential_ref: credentialRef,
+      credential_store: credentialRef.startsWith("arn:aws:secretsmanager:")
+        ? "aws_secrets_manager"
+        : credentialRef.startsWith("k8s-secret://")
+          ? "kubernetes_secret"
+          : credentialRef.startsWith("https://") && credentialRef.includes(".vault.azure.net/secrets/")
+            ? "azure_key_vault"
+            : "hashicorp_vault",
     };
   }, [
     selectedAlertWorkflow,
     selectedAlertRow,
     selectedIncidentMetadataRow,
+    selectedAlertRouting,
     monitoringApps.rows,
     onboardingForm.monitoring_url,
     onboardingForm.prometheus_url,
@@ -5826,7 +5848,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       connection_type: selectedApplicationConnection.connection_type || "application",
       namespace: selectedApplicationConnection.namespace || "",
       credential_ref: selectedApplicationConnection.credential_ref || "",
-      credential_store: "hashicorp_vault",
+      credential_store: selectedApplicationConnection.credential_store || "hashicorp_vault",
       notes: "",
     });
     setRemediationExecutionState({ loading: false, result: null, error: "" });
@@ -5843,6 +5865,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     selectedApplicationConnection.service,
     selectedApplicationConnection.application,
     selectedApplicationConnection.environment,
+    selectedApplicationConnection.credential_ref,
+    selectedApplicationConnection.credential_store,
     onboardingForm.prometheus_url,
     onboardingForm.monitoring_url,
   ]);
