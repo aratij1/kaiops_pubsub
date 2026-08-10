@@ -144,18 +144,22 @@ class LocalScriptExecutionPlugin(BasePlugin):
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
         command = self._resolve_script_command(action)
+        script_path = Path(command[1])
+        script_input = script_path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        runtime_command = ["sh", "-s", "--", *command[2:]]
         env = os.environ.copy()
         env.setdefault("MYSQL_PASSWORD", env.get("DB_PASSWORD", ""))
         timeout_seconds = float(action.parameters.get("timeout_seconds") or 45)
         process = await asyncio.create_subprocess_exec(
-            *command,
+            *runtime_command,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=str(self._repo_root()),
         )
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+            stdout, stderr = await asyncio.wait_for(process.communicate(input=script_input), timeout=timeout_seconds)
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
@@ -173,6 +177,7 @@ class LocalScriptExecutionPlugin(BasePlugin):
             "executed": process.returncode == 0,
             "executor": "local-script",
             "command": command,
+            "runtime_command": runtime_command,
             "returncode": process.returncode,
             "stdout": output,
             "stderr": error,
