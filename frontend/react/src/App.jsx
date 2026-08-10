@@ -525,6 +525,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const [showExecutionCredential, setShowExecutionCredential] = useState(false);
   const [remediationExecutionState, setRemediationExecutionState] = useState({ loading: false, result: null, error: "" });
   const [executionPreflightState, setExecutionPreflightState] = useState({ signature: "", checkedAt: "", passed: false });
+  const [approvedExecutionSignature, setApprovedExecutionSignature] = useState("");
   const [executionConfirmationText, setExecutionConfirmationText] = useState("");
   const [selectedFlow, setSelectedFlow] = useState("payment-latency");
   const [metadataFilters, setMetadataFilters] = useState({
@@ -5857,6 +5858,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     });
     setRemediationExecutionState({ loading: false, result: null, error: "" });
     setExecutionPreflightState({ signature: "", checkedAt: "", passed: false });
+    setApprovedExecutionSignature("");
     setExecutionConfirmationText("");
   }, [
     selectedAlertId,
@@ -7600,6 +7602,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const response = await executeApprovalAction({ incidentId, recommendationId, action, approver, channel: approvalForm.channel, comment: approvalForm.comment, modifiedAction: action === "modify" ? JSON.stringify(buildEditedRemediationPlan()) : "" });
       setApprovalForm((current) => ({ ...current, action, incident_id: incidentId, recommendation_id: recommendationId, approver }));
       applyApprovalResolutionToUi(incidentId, action === "modify" ? "modified" : "approved", approvalForm.comment);
+      setApprovedExecutionSignature(executionPlanSignature);
       setApprovalState({ loading: false, result: response, error: "" });
       await refreshApprovalDrivenViews(incidentId);
     } catch (error) {
@@ -7820,7 +7823,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   ];
   const blockingPreflightFailures = executionPreflightChecks.filter((check) => check.blocking && !check.passed);
   const executionPreflightCurrent = executionPreflightState.signature === executionPlanSignature && executionPreflightState.passed;
-  const cockpitApprovalAccepted = ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus);
+  const cockpitApprovalAccepted = ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) || approvedExecutionSignature === executionPlanSignature;
   const executionAllowed = !remediationExecutionState.loading
     && executionPreflightCurrent
     && cockpitApprovalAccepted
@@ -10624,12 +10627,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         </article>
                         {executionRequiresCredential ? <section className="execution-credential-panel"><div className="execution-credential-heading"><div><span className="discovery-eyebrow">Execution identity</span><h4>Credential reference</h4><p>KaiMS uses the governed connector reference automatically. Change it only when this application has a dedicated secret.</p></div><span className={credentialReferenceValid ? "credential-ready" : "credential-required"}>{credentialReferenceValid ? "Ready" : "Required"}</span></div><div className="credential-method-grid"><label>Secret manager<select value={remediationPlanEditor.credential_store} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_store: e.target.value, credential_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select></label><label>Secret reference URI<input className={remediationPlanEditor.credential_ref && !credentialReferenceValid ? "input-invalid" : ""} aria-invalid={Boolean(remediationPlanEditor.credential_ref && !credentialReferenceValid)} autoComplete="off" spellCheck="false" value={remediationPlanEditor.credential_ref} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_ref: e.target.value }))} /><span className="field-hint">Reference only—never enter a token, password, or secret value.</span></label></div></section> : null}
                         <section className="execution-approval-panel" aria-labelledby="script-approval-heading">
-                          <div className="execution-credential-heading"><div><span className="discovery-eyebrow">Human decision</span><h4 id="script-approval-heading">Approve the current plan</h4><p>Run the dry run after the latest edit, then record the decision.</p></div><span className={["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "credential-ready" : "credential-required"}>{["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Approved" : "Review required"}</span></div>
+                          <div className="execution-credential-heading"><div><span className="discovery-eyebrow">Human decision</span><h4 id="script-approval-heading">Approve the current plan</h4><p>Run the dry run after the latest edit, then record the decision.</p></div><span className={cockpitApprovalAccepted ? "credential-ready" : "credential-required"}>{cockpitApprovalAccepted ? "Approved" : "Review required"}</span></div>
                           <div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div>
                           <label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this plan safe and appropriate?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label>
                           <div className="incident-section-actions">
-                            {!executionPreflightCurrent ? <button type="button" className="button-primary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running dry run…" : "Run dry run"}</button> : <button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading || ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus)}>{approvalState.loading ? "Recording approval…" : ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Plan approved" : "Approve plan"}</button>}
+                            {!executionPreflightCurrent ? <button type="button" className="button-primary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running dry run…" : "Run dry run"}</button> : <button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading || cockpitApprovalAccepted}>{approvalState.loading ? "Recording approval…" : cockpitApprovalAccepted ? "Plan approved" : "Approve plan"}</button>}
                           </div>
+                          {cockpitApprovalAccepted ? <p className="status-message">Approval recorded. Complete the production confirmation and select Execute approved plan.</p> : null}
                           {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
                         </section>
                         <section className="execution-recovery-grid">
