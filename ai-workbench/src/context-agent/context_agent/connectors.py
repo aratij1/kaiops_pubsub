@@ -1580,11 +1580,19 @@ class ContextIntelligenceAgent(BaseAgent):
         vector_matches = by_name["vector-db"]["matches"]
         vector_connector = next((c for c in self.connectors if isinstance(c, VectorDBConnector)), None)
         service_tagged_match = bool(vector_connector and vector_connector.has_service_tagged_match(alert))
+        def explicitly_matches_service(doc: dict[str, Any]) -> bool:
+            if not vector_connector:
+                return False
+            services = doc.get("services", [])
+            if isinstance(services, str):
+                services = [services]
+            return bool(services) and vector_connector._service_matches(doc, alert.service)
+
         runbook = next((doc["content"] for doc in vector_matches if doc["kind"] == "runbook"), "")
-        related = [doc for doc in vector_matches if doc["kind"] == "incident"]
-        deployment_doc = next((doc for doc in vector_matches if doc["kind"] == "deployment"), {})
-        dependency_docs = [doc for doc in vector_matches if doc["kind"] == "dependency"]
-        change_docs = [doc for doc in vector_matches if doc["kind"] == "change"]
+        related = [doc for doc in vector_matches if doc["kind"] == "incident" and explicitly_matches_service(doc)]
+        deployment_doc = next((doc for doc in vector_matches if doc["kind"] == "deployment" and explicitly_matches_service(doc)), {})
+        dependency_docs = [doc for doc in vector_matches if doc["kind"] == "dependency" and explicitly_matches_service(doc)]
+        change_docs = [doc for doc in vector_matches if doc["kind"] == "change" and explicitly_matches_service(doc)]
         deployment = (
             by_name["jenkins"].get("recent_deployments", [{}])[0].get("version")
             or alert.labels.get("deployment")
@@ -1651,6 +1659,12 @@ class ContextIntelligenceAgent(BaseAgent):
                 continue
             source = str(row.get("source") or row.get("kind") or "other").strip().lower()
             bucket = source_aliases.get(source, "other")
+            if bucket in {"tickets", "code"}:
+                searchable = " ".join(str(value) for value in row.values()).lower()
+                service = str(alert.service or "").strip().lower()
+                alert_name = str(alert.name or "").strip().lower()
+                if service and service not in searchable and (not alert_name or alert_name not in searchable):
+                    continue
             evidence_buckets[bucket].append(row)
         evidence_buckets["rag"] = [
             {

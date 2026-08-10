@@ -185,17 +185,32 @@ class LocalScriptExecutionPlugin(BasePlugin):
 
         output = stdout.decode("utf-8", errors="replace").strip()
         error = stderr.decode("utf-8", errors="replace").strip()
+        validation_only = any(
+            marker in output.lower()
+            for marker in (
+                "dry run complete. no remediation mutation was executed",
+                "live remediation is intentionally connector-gated",
+            )
+        )
         action.output = output
         action.error = error if process.returncode else ""
-        action.status = RemediationStatus.SUCCEEDED if process.returncode == 0 else RemediationStatus.FAILED
+        if process.returncode != 0:
+            action.status = RemediationStatus.FAILED
+        elif validation_only:
+            action.status = RemediationStatus.SKIPPED
+            action.error = "Validation completed, but this script did not apply a remediation change. Select a governed live executor to execute the plan."
+        else:
+            action.status = RemediationStatus.SUCCEEDED
         action.parameters["execution_result"] = {
-            "executed": process.returncode == 0,
+            "executed": process.returncode == 0 and not validation_only,
+            "validation_only": validation_only,
             "executor": "local-script",
             "command": command,
             "runtime_command": runtime_command,
             "returncode": process.returncode,
             "stdout": output,
             "stderr": error,
+            "summary": action.error or "Remediation command completed and returned a successful exit status.",
         }
         return action
 
