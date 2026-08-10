@@ -1454,7 +1454,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     if (hasSelectedSnapshot) {
       return;
     }
-    openAlertDetails(scopedRows[0]);
+    // Command Center must not implicitly open the newest row. That row may
+    // still be moving through enrichment/RCA, which made the first cockpit
+    // appear incomplete before the operator selected an alert.
+    if (selectedAlertId) {
+      setSelectedAlertId("");
+      setSelectedAlertSnapshot(null);
+      setSelectedAlertData({ loading: false, payload: null, error: "", alertId: "" });
+    }
   }, [activeTab, alerts.rows, closedIncidents.rows, applicationToMonitor, selectedAlertId, selectedAlertSnapshot, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId]);
 
   useEffect(() => {

@@ -8,8 +8,10 @@ import logging
 import os
 from pathlib import Path
 import re
+import shlex
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlparse
 from uuid import NAMESPACE_URL, uuid5
 
 from common.config import get_settings
@@ -484,35 +486,41 @@ def _metadata_value(metadata: dict[str, str], *keys: str, default: str = "") -> 
     return default
 
 
+def _http_url_or_default(value: str, default: str) -> str:
+    candidate = str(value or "").strip()
+    parsed = urlparse(candidate)
+    return candidate if parsed.scheme in {"http", "https"} and parsed.netloc else default
+
+
 def _single_remediation_script(request: RagDocumentRequest) -> str:
     service = (request.services[0] if request.services else request.alert_type or "kaiops-service").strip()
     environment = _metadata_value(request.metadata, "environment", default="prod")
-    api_gateway_url = _metadata_value(
+    api_gateway_url = _http_url_or_default(_metadata_value(
         request.metadata,
         "api_gateway_url",
         "apiGatewayUrl",
         "gateway_url",
         default="http://api-gateway:8000",
-    )
-    prometheus_url = _metadata_value(
+    ), "http://api-gateway:8000")
+    prometheus_url = _http_url_or_default(_metadata_value(
         request.metadata,
         "prometheus_url",
         "monitoring_url",
         "metrics_endpoint",
         default="http://prometheus:9090",
-    )
+    ), "http://prometheus:9090")
     mysql_host = _metadata_value(request.metadata, "mysql_host", "database_host", default="mysql")
     mysql_database = _metadata_value(request.metadata, "mysql_database", "database_name", default="kaiops")
     mysql_user = _metadata_value(request.metadata, "mysql_user", "database_user", default="kaiops")
     return (
         "bash scripts/remediation/kaiops_alert_health_triage.sh "
-        f"--service {service or 'kaiops-service'} "
-        f"--environment {environment or 'prod'} "
-        f"--api-gateway-url {api_gateway_url} "
-        f"--prometheus-url {prometheus_url} "
-        f"--mysql-host {mysql_host} "
-        f"--mysql-database {mysql_database} "
-        f"--mysql-user {mysql_user} "
+        f"--service {shlex.quote(service or 'kaiops-service')} "
+        f"--environment {shlex.quote(environment or 'prod')} "
+        f"--api-gateway-url {shlex.quote(api_gateway_url)} "
+        f"--prometheus-url {shlex.quote(prometheus_url)} "
+        f"--mysql-host {shlex.quote(mysql_host)} "
+        f"--mysql-database {shlex.quote(mysql_database)} "
+        f"--mysql-user {shlex.quote(mysql_user)} "
         "--dry-run true"
     )
 
