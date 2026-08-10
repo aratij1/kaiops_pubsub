@@ -5784,13 +5784,20 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       || "prod"
     ).trim();
     const namespace = String(metadata?.namespace || appRow?.namespace || environment || "prod").trim();
+    // Older persisted incidents may predate execution-connector metadata. The
+    // governed connector catalog resolves those services through generic-api,
+    // whose production credential reference is the default platform token.
+    // Persist/reference the URI only; no credential value is exposed here.
+    const governedDefaultCredential = ["prod", "production"].includes(environment.toLowerCase())
+      ? "vault://kaiops/prod/default-token"
+      : `vault://kaiops/${environment.toLowerCase() || "local"}/default-token`;
     const credentialRef = String(
       metadata?.credential_ref
       || metadata?.secret_ref
       || resolvedConnector?.secret_ref
       || appRow?.secret_ref
       || onboardingForm.connection_secret_ref
-      || ""
+      || governedDefaultCredential
     ).trim();
     return {
       application: application || "-",
@@ -5799,7 +5806,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       namespace,
       endpoint: endpoint || "Not configured",
       connection_type: String(resolvedConnector?.type || (endpoint ? "metrics/application endpoint" : "missing connection details")),
-      source: Object.keys(resolvedConnector).length ? "resolved workflow connector" : endpoint ? "onboarding/application metadata" : "missing",
+      source: Object.keys(resolvedConnector).length ? "resolved workflow connector" : endpoint ? "onboarding/application metadata + governed default identity" : "governed default connector",
       credential_ref: credentialRef,
       credential_store: credentialRef.startsWith("arn:aws:secretsmanager:")
         ? "aws_secrets_manager"
@@ -10521,7 +10528,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
                   {homeDetailTab === "execution" ? (
                     <>
-                      <section className="panel agentic-action-brief" aria-labelledby="agentic-action-title">
+                      {false ? <section className="panel agentic-action-brief" aria-labelledby="agentic-action-title">
                         <header className="panel-head"><div><span className="eyebrow">CONTEXT-GROUNDED ACTION</span><h3 id="agentic-action-title">Recommended response</h3><p>Prepared from the persisted RCA, impact, incident evidence, runbooks, and configured discovery sources.</p></div><button type="button" className="button-secondary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Refreshing plan…" : "Refresh with agent"}</button></header>
                         <div className="agentic-action-grid">
                           <article><span>Why this action</span><strong>{selectedRcaDecision.rootCause}</strong><p>{selectedRcaDecision.customerImpact}</p></article>
@@ -10537,7 +10544,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         </section>
                         <div className="agentic-source-strip"><span>Internal knowledge: {selectedAlertRagDocuments.length ? `${selectedAlertRagDocuments.length} linked source(s)` : "persisted incident context"}</span><span>External knowledge: {selectedRcaDecision.externalKnowledgeStatus}</span><span>Credential: {executionRequiresCredential ? remediationPlanEditor.credential_ref ? "reference configured" : "required" : "not required for read-only plan"}</span></div>
                         {executionRequiresCredential ? <section className="execution-credential-panel"><div className="execution-credential-heading"><div><span className="discovery-eyebrow">1 · Execution identity</span><h4>Choose the credential reference</h4><p>This is required before KaiMS can validate the connector and target in a dry run.</p></div><span className={credentialReferenceValid ? "credential-ready" : "credential-required"}>{credentialReferenceValid ? "Valid URI" : "Required"}</span></div><div className="credential-method-grid"><label>Secret manager<select value={remediationPlanEditor.credential_store} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_store: e.target.value, credential_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select></label><label>Secret reference URI<input className={remediationPlanEditor.credential_ref && !credentialReferenceValid ? "input-invalid" : ""} aria-invalid={Boolean(remediationPlanEditor.credential_ref && !credentialReferenceValid)} autoComplete="off" spellCheck="false" value={remediationPlanEditor.credential_ref} placeholder={remediationPlanEditor.credential_store === "hashicorp_vault" ? `vault://kv/data/kaims/${selectedApplicationConnection.service}#token` : remediationPlanEditor.credential_store === "aws_secrets_manager" ? `arn:aws:secretsmanager:REGION:ACCOUNT:secret:kaims/${selectedApplicationConnection.service}` : remediationPlanEditor.credential_store === "kubernetes_secret" ? `k8s-secret://kaims/${selectedApplicationConnection.service}-credentials#token` : `https://VAULT_NAME.vault.azure.net/secrets/${selectedApplicationConnection.service}-token/VERSION`} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_ref: e.target.value }))} /><span className="field-hint">{remediationPlanEditor.credential_ref && !credentialReferenceValid ? "This is not a supported enterprise secret reference. Use the selected manager’s URI format." : "Enter the URI only—never the token, password, or secret value."}</span></label></div></section> : null}
-                      </section>
+                      </section> : null}
                       <details className="panel remediation-workspace incident-workspace-section workspace-collapsible" open>
                         <summary className="panel-head">
                           <div>
@@ -10549,11 +10556,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         </summary>
                         <div className={`production-action-banner ${dangerousProductionAction ? "is-production" : "is-nonproduction"}`}>
                           <strong>{dangerousProductionAction ? "Dangerous production action" : "Non-production or lower-risk action"}</strong>
+                          <span>Action: {selectedExecutionPlan.action === "-" ? selectedRcaDecision.action : selectedExecutionPlan.action}</span>
                           <span>Target: {selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · Risk: {selectedExecutionPlan.riskTier || "unknown"}</span>
                           <span>Duplicate execution is guarded by the remediation idempotency contract; repeated clicks are disabled while a request is active.</span>
                         </div>
                         <div className="execution-decision-grid">
-                          <section className="execution-plan-brief" aria-labelledby="execution-plan-heading">
+                          {false ? <section className="execution-plan-brief" aria-labelledby="execution-plan-heading">
                             <div className="panel-head">
                               <div>
                                 <span className="eyebrow">Operator decision</span>
@@ -10567,11 +10575,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                               <dt>Blast radius</dt><dd>{selectedAlertWorkflow?.recommendation?.blast_radius || selectedAlertWorkflow?.recommendation?.impact || "Not supplied"}</dd>
                               <dt>Plan</dt><dd>{editedExecutionPlan.commands.length} command(s), {editedExecutionPlan.scripts.length} script(s), {editedExecutionPlan.queries.length} validation check(s)</dd>
                             </dl>
-                          </section>
+                          </section> : null}
                           <section className={`execution-readiness ${blockingPreflightFailures.length ? "is-blocked" : executionPreflightCurrent ? "is-ready" : "is-pending"}`} aria-labelledby="execution-readiness-heading">
                             <div className="panel-head">
                               <div>
-                                <span className="eyebrow">Safety gate</span>
+                                <span className="eyebrow">Dry run</span>
                                 <h3 id="execution-readiness-heading">{blockingPreflightFailures.length ? "Complete required setup" : executionPreflightCurrent ? "Dry run passed" : "Dry run required"}</h3>
                               </div>
                               <strong>{executionPreflightChecks.filter((check) => check.passed).length}/{executionPreflightChecks.length}</strong>
@@ -10589,11 +10597,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             </article>
                           ))}
                         </div>
-                        <article className="panel remediation-connection-panel">
-                          <div className="panel-head">
-                            <h3>Application Connection Details</h3>
-                            <p>Execution target used for approval, dry-run context, and live executor dispatch.</p>
-                          </div>
+                        <details className="panel remediation-connection-panel">
+                          <summary className="panel-head"><div><h3>Connection details</h3><p>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedApplicationConnection.source}</p></div><span className="section-toggle-indicator" /></summary>
                           <div className="filter-grid">
                             <label>Application<input value={selectedApplicationConnection.application} readOnly /></label>
                             <label>Service<input value={selectedApplicationConnection.service} readOnly /></label>
@@ -10603,7 +10608,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <label>Endpoint URL<input value={remediationPlanEditor.connection_url} placeholder="https://app-or-metrics-endpoint" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, connection_url: e.target.value }))} /></label>
                             <label>Namespace / Runtime<input value={remediationPlanEditor.namespace} placeholder="prod / namespace / resource group" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, namespace: e.target.value }))} /></label>
                           </div>
-                        </article>
+                        </details>
                         <article className="panel remediation-editor-panel">
                           <div className="panel-head">
                             <div><h3>Execution Plan</h3><p>Editing an approved plan invalidates the current preflight check. Review and run preflight again before execution.</p></div>
@@ -10618,6 +10623,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           {dangerousProductionAction ? <label className="typed-execution-confirmation">Type <code>{executionConfirmationPhrase}</code> to enable production execution<input value={executionConfirmationText} autoComplete="off" onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label> : null}
                           {remediationExecutionState.error ? <p className="error">{remediationExecutionState.error}</p> : null}
                         </article>
+                        {executionRequiresCredential ? <section className="execution-credential-panel"><div className="execution-credential-heading"><div><span className="discovery-eyebrow">Execution identity</span><h4>Credential reference</h4><p>KaiMS uses the governed connector reference automatically. Change it only when this application has a dedicated secret.</p></div><span className={credentialReferenceValid ? "credential-ready" : "credential-required"}>{credentialReferenceValid ? "Ready" : "Required"}</span></div><div className="credential-method-grid"><label>Secret manager<select value={remediationPlanEditor.credential_store} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_store: e.target.value, credential_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select></label><label>Secret reference URI<input className={remediationPlanEditor.credential_ref && !credentialReferenceValid ? "input-invalid" : ""} aria-invalid={Boolean(remediationPlanEditor.credential_ref && !credentialReferenceValid)} autoComplete="off" spellCheck="false" value={remediationPlanEditor.credential_ref} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_ref: e.target.value }))} /><span className="field-hint">Reference only—never enter a token, password, or secret value.</span></label></div></section> : null}
+                        <section className="execution-approval-panel" aria-labelledby="script-approval-heading">
+                          <div className="execution-credential-heading"><div><span className="discovery-eyebrow">Human decision</span><h4 id="script-approval-heading">Approve the current plan</h4><p>Run the dry run after the latest edit, then record the decision.</p></div><span className={["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "credential-ready" : "credential-required"}>{["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Approved" : "Review required"}</span></div>
+                          <div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div>
+                          <label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this plan safe and appropriate?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label>
+                          <div className="incident-section-actions"><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading || !executionPreflightCurrent || ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus)}>{approvalState.loading ? "Recording approval…" : ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Plan approved" : !executionPreflightCurrent ? "Run dry run first" : "Approve plan"}</button></div>
+                          {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
+                        </section>
                         <section className="execution-recovery-grid">
                           <article className={`execution-recovery-card ${executionRollbackPlan ? "is-ready" : "is-missing"}`}>
                             <span className="eyebrow">Rollback</span>
@@ -10655,7 +10668,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <span>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</span>
                           </div>
                           <div className="remediation-execute-row">
-                            <button type="button" className="button-secondary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running…" : "Run dry run"}</button>
                             <button type="button" className="button-primary" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed} title={blockingPreflightFailures.length ? `Resolve: ${blockingPreflightFailures.map((check) => check.label).join(", ")}` : !executionPreflightCurrent ? "Run preflight after the latest edit" : !cockpitApprovalAccepted ? "Approve the reviewed script before execution" : !executionConfirmationValid ? `Type ${executionConfirmationPhrase}` : "Execute the approved plan"}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button>
                           </div>
                         </div>
