@@ -31,7 +31,10 @@ x-service-env: &service-env
   L3_USER_PASSWORD: ${L3_USER_PASSWORD:-L3Engineer@123456}
   L2_USER_PASSWORD: ${L2_USER_PASSWORD:-L2Engineer@123456}
   L1_USER_PASSWORD: ${L1_USER_PASSWORD:-L1Operator@123456}
-  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+  # Core compose does not start the profiled collector. Export only when an
+  # operator explicitly supplies a reachable endpoint (or enables the full
+  # observability profile with OTEL_EXPORTER_OTLP_ENDPOINT configured).
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
   CONTEXT_AGENT_URL: http://context-agent:8000
   RESOLUTION_AGENT_URL: http://resolution-agent:8000
   APPROVAL_SERVICE_URL: http://approval-service:8000
