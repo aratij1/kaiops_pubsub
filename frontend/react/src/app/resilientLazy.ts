@@ -9,15 +9,31 @@ export function resilientLazy<T extends ComponentType<any>>(
   importer: () => Promise<{ default: T }>,
 ): LazyExoticComponent<T> {
   return lazy(async () => {
+    const reloadGuardKey = "kaims:chunk-reload-at";
     try {
-      return await importer();
+      const loaded = await importer();
+      window.sessionStorage.removeItem(reloadGuardKey);
+      return loaded;
     } catch (error) {
-      // A full-page reload here used to tear down the authenticated shell and
-      // appeared as a flash (or a return to sign-in) whenever a route chunk was
-      // briefly unavailable. Keep the mounted workspace intact and retry once.
       if (isChunkLoadFailure(error)) {
+        // Retry once for a transient network failure. If the same hashed chunk
+        // is still missing, a deployment replaced it while this page was open;
+        // reload once so index.html can reference the current asset manifest.
         await new Promise((resolve) => window.setTimeout(resolve, 250));
-        return await importer();
+        try {
+          const loaded = await importer();
+          window.sessionStorage.removeItem(reloadGuardKey);
+          return loaded;
+        } catch (retryError) {
+          if (!isChunkLoadFailure(retryError)) throw retryError;
+          const lastReloadAt = Number(window.sessionStorage.getItem(reloadGuardKey) || 0);
+          if (!lastReloadAt || Date.now() - lastReloadAt > 60_000) {
+            window.sessionStorage.setItem(reloadGuardKey, String(Date.now()));
+            window.location.reload();
+            return await new Promise<{ default: T }>(() => undefined);
+          }
+          throw retryError;
+        }
       }
       throw error;
     }
