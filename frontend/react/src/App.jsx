@@ -7820,7 +7820,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const editedExecutionPlan = buildEditedRemediationPlan();
   const effectiveCredentialRef = String(remediationPlanEditor.credential_ref || selectedApplicationConnection.credential_ref || "").trim();
   const executionPlanSignature = JSON.stringify({
-    incident: approvalForm.incident_id || selectedIncidentId || selectedApprovalIncidentId || "",
+    // Incident/recommendation IDs can be hydrated while the dry-run request is
+    // in flight. They identify backend records but do not change the reviewed
+    // plan. Use the stable selected alert so hydration cannot invalidate a
+    // successful dry run and send the operator back to step 1.
+    alert: selectedAlertId || "",
     connection: remediationPlanEditor.connection_url,
     namespace: remediationPlanEditor.namespace,
     credential_ref: effectiveCredentialRef,
