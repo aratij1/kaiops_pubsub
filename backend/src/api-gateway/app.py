@@ -372,7 +372,7 @@ async def stream_operational_events(request: Request) -> StreamingResponse:
         try:
             yield "retry: 2000\n\n"
             while not await request.is_disconnected():
-                emitted = False
+                messages: list[str] = []
                 session_factory = getattr(app.state, "session_factory", None)
                 if settings.database_enabled and session_factory is not None:
                     async with session_factory() as session:
@@ -393,9 +393,8 @@ async def stream_operational_events(request: Request) -> StreamingResponse:
                                 payload = {"entity_id": str(getattr(row, identity.key)), "changed_at": updated_at.isoformat(), "tenant_id": tenant_id}
                                 if state is not None:
                                     payload["state"] = str(getattr(row, state.key))
-                                yield _sse_message(event_id, event_type, payload)
+                                messages.append(_sse_message(event_id, event_type, payload))
                                 SSE_EVENTS.labels(event_type).inc()
-                                emitted = True
                         if role == "Administrator":
                             stmt = select(MonitoringConnectionHealthRecord).where(MonitoringConnectionHealthRecord.updated_at > cursor).order_by(MonitoringConnectionHealthRecord.updated_at.asc()).limit(100)
                             for row in (await session.execute(stmt)).scalars().all():
@@ -403,11 +402,15 @@ async def stream_operational_events(request: Request) -> StreamingResponse:
                                 newest = max(newest, updated_at)
                                 sequence += 1
                                 event_id = f"{int(updated_at.timestamp() * 1000)}-{sequence}"
-                                yield _sse_message(event_id, "connector.health", {"entity_id": str(row.integration_id), "provider": row.provider, "state": row.status, "changed_at": updated_at.isoformat()})
+                                messages.append(_sse_message(event_id, "connector.health", {"entity_id": str(row.integration_id), "provider": row.provider, "state": row.status, "changed_at": updated_at.isoformat()}))
                                 SSE_EVENTS.labels("connector.health").inc()
-                                emitted = True
                         cursor = newest
-                if not emitted:
+                # Never yield while a session/connection is checked out. Slow
+                # or disconnected browsers must not strand pooled DB handles.
+                if messages:
+                    for message in messages:
+                        yield message
+                else:
                     sequence += 1
                     now = datetime.now(timezone.utc)
                     yield _sse_message(f"{int(now.timestamp() * 1000)}-{sequence}", "heartbeat", {"at": now.isoformat(), "queue_health": "polling-fallback"})

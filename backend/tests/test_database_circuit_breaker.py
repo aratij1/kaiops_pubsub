@@ -49,7 +49,7 @@ async def test_open_circuit_rejects_new_checkouts_without_touching_the_database(
 
 
 @pytest.mark.asyncio
-async def test_real_query_failure_counts_toward_opening_the_circuit() -> None:
+async def test_query_failure_does_not_open_database_outage_circuit() -> None:
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
         poolclass=StaticPool,
@@ -63,8 +63,9 @@ async def test_real_query_failure_counts_toward_opening_the_circuit() -> None:
         async with session_factory() as session:
             await session.execute(text("SELECT * FROM this_table_does_not_exist"))
 
-    with pytest.raises(CircuitOpenError):
-        async with session_factory() as session:
-            await session.execute(text("SELECT 1"))
+    # A statement error means the database is reachable. It must not turn
+    # unrelated requests into database_temporarily_unavailable responses.
+    async with session_factory() as session:
+        await session.execute(text("SELECT 1"))
 
     await engine.dispose()
