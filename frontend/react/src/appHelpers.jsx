@@ -1731,6 +1731,8 @@ function remediationOutcomeFromAction(action) {
   const executorError = String(executionResult.stderr || executionResult.error || "").trim();
   const executorOutput = String(executionResult.stdout || "").trim();
   const reason = error || executorError || output || executorOutput || "";
+  const actionType = String(safeAction.action_type || "").trim().toLowerCase();
+  const automaticPolicyBlocked = actionType === "policy-blocked" || /auto(?:matic)? execution blocked/i.test(reason);
 
   if (!status && !reason) {
     return null;
@@ -1739,13 +1741,18 @@ function remediationOutcomeFromAction(action) {
   let title = "Remediation status";
   if (status === "succeeded") {
     title = "Remediation executed successfully";
+  } else if (automaticPolicyBlocked) {
+    title = "Automatic execution deferred for human approval";
   } else if (status === "skipped") {
-    title = "Remediation was approved but not executed";
+    title = "Remediation was not executed";
   } else if (status === "failed") {
     title = "Remediation execution failed";
   }
 
   let detail = reason || `Remediation engine returned status ${status || "unknown"}.`;
+  if (automaticPolicyBlocked) {
+    detail = `${reason || "Automatic execution did not meet the policy threshold."} Complete dry run and human approval, then use Execute approved plan.`;
+  }
   if (/no real .*executor is configured/i.test(detail) || /configure a connector executor/i.test(detail)) {
     detail = `${detail} Add a real remediation connector with executor settings and secret_ref, or edit the plan to use the approved local triage script.`;
   }
@@ -1756,6 +1763,7 @@ function remediationOutcomeFromAction(action) {
     detail,
     actionType: safeAction.action_type || "-",
     target: safeAction.target || "-",
+    automaticPolicyBlocked,
   };
 }
 
