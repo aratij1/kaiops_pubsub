@@ -31,10 +31,9 @@ x-service-env: &service-env
   L3_USER_PASSWORD: ${L3_USER_PASSWORD:-L3Engineer@123456}
   L2_USER_PASSWORD: ${L2_USER_PASSWORD:-L2Engineer@123456}
   L1_USER_PASSWORD: ${L1_USER_PASSWORD:-L1Operator@123456}
-  # Core compose does not start the profiled collector. Export only when an
-  # operator explicitly supplies a reachable endpoint (or enables the full
-  # observability profile with OTEL_EXPORTER_OTLP_ENDPOINT configured).
-  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  # The core stack starts a collector and Jaeger so the default exporter is
+  # always reachable. Override this only when exporting to a managed backend.
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
   CONTEXT_AGENT_URL: http://context-agent:8000
   RESOLUTION_AGENT_URL: http://resolution-agent:8000
   APPROVAL_SERVICE_URL: http://approval-service:8000
@@ -419,7 +418,6 @@ services:
       - ./fault-lab/runtime:/app/runtime
 
   otel-collector:
-    profiles: ["observability", "monitoring-authoring", "full"]
     image: otel/opentelemetry-collector-contrib:0.117.0
     restart: unless-stopped
     command: ["--config=/etc/otelcol/config.yml"]
@@ -432,7 +430,6 @@ services:
       jaeger: { condition: service_started }
 
   jaeger:
-    profiles: ["observability", "monitoring-authoring", "full"]
     image: jaegertracing/all-in-one:1.62.0
     restart: unless-stopped
     environment:
