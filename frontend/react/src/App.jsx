@@ -9,7 +9,6 @@ import { RouteRuntimeProvider } from "./app/routeRuntime";
 import { projectIdentityFromAlert } from "./domain/projectIdentity";
 import { buildOnboardingSources } from "./domain/onboardingSources";
 import { buildAlertDocumentDraft } from "./domain/alertDocumentDraft";
-import ResolutionPanel from "./routes/incidents/ResolutionPanel";
 import RcaPanel from "./routes/incidents/RcaPanel";
 import CopilotRoute from "./routes/copilot/CopilotRoute";
 import { breadcrumbForPath, groupedNavigationForRole, navigationItemForPath, TAB_SHORTCUT_BY_CODE, VALID_LEGACY_TABS } from "./app/navigation";
@@ -5654,11 +5653,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         || "-",
       requiresApproval:
         // Unlike the other fields on this object, this one is consumed as a
-        // boolean (ResolutionPanel: `requiresApproval ? "yes" : "no"` and to
-        // pick the "Continue to Approval"/"Continue to Execution" target) --
-        // the shared "-" unknown-value placeholder would be truthy there and
-        // silently read as "yes, approval required" when it really means
-        // "no routing/decision data available yet".
+        // This value controls approval routing and must remain a real boolean;
+        // the shared "-" placeholder would be truthy and incorrectly require
+        // approval when no routing decision is available yet.
         selectedAlertRouting?.requires_approval
         ?? decision?.requires_approval
         ?? selectedAlertWorkflow?.approval?.required
@@ -10524,22 +10521,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
                   {homeDetailTab === "execution" ? (
                     <>
-                      <nav className="remediation-stage-rail" aria-label="Plan, decide, and execute sequence">
-                        <span className="is-current"><b>1</b> Review plan</span>
-                        <span><b>2</b> Configure access</span>
-                        <span><b>3</b> Dry run</span>
-                        <span><b>4</b> Approve</span>
-                        <span><b>5</b> Execute</span>
-                        <span><b>6</b> Review outcome</span>
-                      </nav>
-                      <ResolutionPanel
-                        workflow={selectedAlertWorkflow}
-                        alertRow={selectedAlertRow}
-                        confidenceScore={selectedAlertEvaluation.confidenceScore}
-                        executionPlan={selectedExecutionPlan}
-                        onNavigateTab={setHomeDetailTab}
-                        embedded
-                      />
                       <section className="panel agentic-action-brief" aria-labelledby="agentic-action-title">
                         <header className="panel-head"><div><span className="eyebrow">CONTEXT-GROUNDED ACTION</span><h3 id="agentic-action-title">Recommended response</h3><p>Prepared from the persisted RCA, impact, incident evidence, runbooks, and configured discovery sources.</p></div><button type="button" className="button-secondary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Refreshing plan…" : "Refresh with agent"}</button></header>
                         <div className="agentic-action-grid">
@@ -10547,26 +10528,15 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <article><span>What to do</span><strong>{selectedExecutionPlan.action === "-" ? selectedRcaDecision.action : selectedExecutionPlan.action}</strong><p>Target: {selectedApplicationConnection.service} · {selectedApplicationConnection.environment}</p></article>
                           <article><span>Safety and recovery</span><strong>{executionRollbackPlan || "Rollback plan must be supplied before execution."}</strong><p>{editedExecutionPlan.queries[0] || "Add a recovery validation check."}</p></article>
                         </div>
-                        <section className="agent-execution-plan" aria-label="AI resolution agent execution plan">
-                          <header><div><span className="discovery-eyebrow">AI resolution agent</span><h4>Guarded execution plan</h4></div><span className="workflow-pill workflow-pill-active">Dry run first</span></header>
-                          {remediationPlanEditor.scripts || remediationPlanEditor.commands ? <pre><code>{remediationPlanEditor.scripts || remediationPlanEditor.commands}</code></pre> : <div className="agent-plan-missing"><strong>No safe executable artifact was generated.</strong><span>Regenerate RCA after adding runbook or runtime evidence. KaiMS will not invent a production command without grounded context.</span></div>}
-                          <div className="agent-plan-checks"><div><span>Validate</span><strong>{editedExecutionPlan.queries[0] || "Validation query required"}</strong></div><div><span>Rollback</span><strong>{executionRollbackPlan || "Rollback procedure required"}</strong></div></div>
-                        </section>
-                        <section className="execution-preflight-gate" aria-labelledby="dry-run-heading">
-                          <div><span className="discovery-eyebrow">3 · Safety verification</span><h4 id="dry-run-heading">Run a dry run before approval</h4><p>Validate the target, connector, credential reference, policy, and executable plan without applying changes.</p></div>
-                          <div><span className={executionPreflightCurrent ? "credential-ready" : "credential-required"}>{executionPreflightCurrent ? "Dry run passed" : "Required"}</span><button type="button" className="button-secondary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading || (executionRequiresCredential && !credentialReferenceValid)}>{remediationExecutionState.loading ? "Running…" : executionPreflightCurrent ? "Run dry run again" : "Run dry run"}</button></div>
-                          {remediationExecutionState.error ? <p className="error" role="alert">{remediationExecutionState.error}</p> : null}
-                        </section>
                         <section className="execution-approval-panel" aria-labelledby="script-approval-heading">
-                          <div className="execution-credential-heading"><div><span className="discovery-eyebrow">2 · Human decision</span><h4 id="script-approval-heading">Approve the reviewed script</h4><p>Approval applies to the script shown above. Editing it afterward invalidates dry-run readiness.</p></div><span className={["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "credential-ready" : "credential-required"}>{["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Approved" : "Review required"}</span></div>
+                          <div className="execution-credential-heading"><div><span className="discovery-eyebrow">3 · Human decision</span><h4 id="script-approval-heading">Approve the reviewed script</h4><p>Approval applies to the plan editor below. Editing it afterward invalidates dry-run readiness.</p></div><span className={["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "credential-ready" : "credential-required"}>{["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Approved" : "Review required"}</span></div>
                           <div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div>
                           <label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this script safe and appropriate for this incident?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label>
                           <div className="incident-section-actions"><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading || ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus)}>{approvalState.loading ? "Recording approval…" : ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Script approved" : "Approve reviewed script"}</button></div>
                           {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
                         </section>
                         <div className="agentic-source-strip"><span>Internal knowledge: {selectedAlertRagDocuments.length ? `${selectedAlertRagDocuments.length} linked source(s)` : "persisted incident context"}</span><span>External knowledge: {selectedRcaDecision.externalKnowledgeStatus}</span><span>Credential: {executionRequiresCredential ? remediationPlanEditor.credential_ref ? "reference configured" : "required" : "not required for read-only plan"}</span></div>
-                        {executionRequiresCredential ? <div className="credential-reference-callout"><div><strong>{remediationPlanEditor.credential_ref ? "Execution identity is ready" : "Credential reference required before dry run"}</strong><span>KaiMS stores only a secret-manager URI; the remediation connector resolves it at execution time.</span></div><span className={remediationPlanEditor.credential_ref ? "credential-ready" : "credential-required"}>{remediationPlanEditor.credential_ref ? "Configured" : "Step 1 of 3"}</span></div> : null}
-                        {executionRequiresCredential ? <section className="execution-credential-panel"><div className="execution-credential-heading"><div><span className="discovery-eyebrow">3 · Execution identity</span><h4>Choose the credential reference</h4><p>This is required before KaiMS can validate the connector and target in a dry run.</p></div><span className={credentialReferenceValid ? "credential-ready" : "credential-required"}>{credentialReferenceValid ? "Valid URI" : "Required"}</span></div><div className="credential-method-grid"><label>Secret manager<select value={remediationPlanEditor.credential_store} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_store: e.target.value, credential_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select></label><label>Secret reference URI<input className={remediationPlanEditor.credential_ref && !credentialReferenceValid ? "input-invalid" : ""} aria-invalid={Boolean(remediationPlanEditor.credential_ref && !credentialReferenceValid)} autoComplete="off" spellCheck="false" value={remediationPlanEditor.credential_ref} placeholder={remediationPlanEditor.credential_store === "hashicorp_vault" ? `vault://kv/data/kaims/${selectedApplicationConnection.service}#token` : remediationPlanEditor.credential_store === "aws_secrets_manager" ? `arn:aws:secretsmanager:REGION:ACCOUNT:secret:kaims/${selectedApplicationConnection.service}` : remediationPlanEditor.credential_store === "kubernetes_secret" ? `k8s-secret://kaims/${selectedApplicationConnection.service}-credentials#token` : `https://VAULT_NAME.vault.azure.net/secrets/${selectedApplicationConnection.service}-token/VERSION`} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_ref: e.target.value }))} /><span className="field-hint">{remediationPlanEditor.credential_ref && !credentialReferenceValid ? "This is not a supported enterprise secret reference. Use the selected manager’s URI format." : "Enter the URI only—never the token, password, or secret value."}</span></label></div></section> : null}
+                        {executionRequiresCredential ? <section className="execution-credential-panel"><div className="execution-credential-heading"><div><span className="discovery-eyebrow">1 · Execution identity</span><h4>Choose the credential reference</h4><p>This is required before KaiMS can validate the connector and target in a dry run.</p></div><span className={credentialReferenceValid ? "credential-ready" : "credential-required"}>{credentialReferenceValid ? "Valid URI" : "Required"}</span></div><div className="credential-method-grid"><label>Secret manager<select value={remediationPlanEditor.credential_store} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_store: e.target.value, credential_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select></label><label>Secret reference URI<input className={remediationPlanEditor.credential_ref && !credentialReferenceValid ? "input-invalid" : ""} aria-invalid={Boolean(remediationPlanEditor.credential_ref && !credentialReferenceValid)} autoComplete="off" spellCheck="false" value={remediationPlanEditor.credential_ref} placeholder={remediationPlanEditor.credential_store === "hashicorp_vault" ? `vault://kv/data/kaims/${selectedApplicationConnection.service}#token` : remediationPlanEditor.credential_store === "aws_secrets_manager" ? `arn:aws:secretsmanager:REGION:ACCOUNT:secret:kaims/${selectedApplicationConnection.service}` : remediationPlanEditor.credential_store === "kubernetes_secret" ? `k8s-secret://kaims/${selectedApplicationConnection.service}-credentials#token` : `https://VAULT_NAME.vault.azure.net/secrets/${selectedApplicationConnection.service}-token/VERSION`} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_ref: e.target.value }))} /><span className="field-hint">{remediationPlanEditor.credential_ref && !credentialReferenceValid ? "This is not a supported enterprise secret reference. Use the selected manager’s URI format." : "Enter the URI only—never the token, password, or secret value."}</span></label></div></section> : null}
                       </section>
                       <details className="panel remediation-workspace incident-workspace-section workspace-collapsible" open>
                         <summary className="panel-head">
@@ -10669,37 +10639,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <section className="execution-outcome-review"><span className="eyebrow">Required human review</span><h4>Was this remediation effective?</h4><div className="outcome-choice" role="group" aria-label="Execution outcome">{[['successful','Successful'],['partial','Partially successful'],['failed','Failed']] .map(([value,label])=><button type="button" key={value} className={executionOutcomeReview.outcome===value?'active':''} onClick={()=>setExecutionOutcomeReview((current)=>({...current,outcome:value}))}>{label}</button>)}</div><label>Operator findings<textarea rows={3} value={executionOutcomeReview.notes} placeholder="What changed, what was validated, and any side effects." onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,notes:e.target.value}))}/></label><label className="checkbox-row"><input type="checkbox" checked={executionOutcomeReview.reusable} onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,reusable:e.target.checked}))}/>Approve this reviewed script for future matching incidents</label><button type="button" className="button-primary" onClick={approveExecutionOutcomeForReuse} disabled={executionOutcomeReview.loading||!executionOutcomeReview.notes.trim()}>{executionOutcomeReview.loading?'Saving review…':'Submit review and learning'}</button>{executionOutcomeReview.error?<p className="error">{executionOutcomeReview.error}</p>:null}{executionOutcomeReview.message?<p className="status-message">{executionOutcomeReview.message}</p>:null}</section>
                           </section>
                         ) : null}
-                        <div className="table-wrap remediation-step-table" style={{ marginTop: 8 }}>
-                          <table>
-                            <thead>
-                              <tr><th>Type</th><th>Step</th><th>Action</th></tr>
-                            </thead>
-                            <tbody>
-                              {editedExecutionPlan.commands.map((step, index) => (
-                                <tr key={`summary-command-${index}`}>
-                                  <td>Command</td>
-                                  <td>{step}</td>
-                                  <td><button type="button" className="button-secondary" onClick={() => copyPlanStep(step)}>Copy</button></td>
-                                </tr>
-                              ))}
-                              {editedExecutionPlan.scripts.map((step, index) => (
-                                <tr key={`summary-script-${index}`}>
-                                  <td>Script</td>
-                                  <td>{step}</td>
-                                  <td><button type="button" className="button-secondary" onClick={() => copyPlanStep(step)}>Copy</button></td>
-                                </tr>
-                              ))}
-                              {editedExecutionPlan.queries.map((step, index) => (
-                                <tr key={`summary-query-${index}`}>
-                                  <td>Query</td>
-                                  <td>{step}</td>
-                                  <td><button type="button" className="button-secondary" onClick={() => copyPlanStep(step)}>Copy</button></td>
-                                </tr>
-                              ))}
-                              {!editedExecutionPlan.commands.length && !editedExecutionPlan.scripts.length && !editedExecutionPlan.queries.length ? <tr><td colSpan={3}>No remediation steps available.</td></tr> : null}
-                            </tbody>
-                          </table>
-                        </div>
                         <details className="k-technical-details execution-technical-details">
                           <summary>Workflow and backend routing details</summary>
                           <div className="workflow-guide-grid remediation-flow-grid">
