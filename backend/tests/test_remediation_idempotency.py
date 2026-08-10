@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from common.database import ActionRecord
 from common.models import Approval, ApprovalDecision
+from common.repository import IncidentRepository
 from sqlalchemy import select
 
 
@@ -62,6 +63,10 @@ async def test_redelivered_approval_message_does_not_re_execute_remediation(sqli
 
     module.engine.execute = counting_execute
 
+    async with sqlite_session_factory() as session:
+        await IncidentRepository(session).save_approval(approval)
+        await session.commit()
+
     first = await module.execute_approval(approval)
     second = await module.execute_approval(approval)
 
@@ -73,3 +78,23 @@ async def test_redelivered_approval_message_does_not_re_execute_remediation(sqli
     async with sqlite_session_factory() as session:
         rows = (await session.execute(select(ActionRecord))).scalars().all()
     assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_rejects_unpersisted_human_approval(sqlite_session_factory) -> None:
+    module = load_remediation_app_module()
+    module.settings.database_enabled = True
+    module.app.state.session_factory = sqlite_session_factory
+    approval = Approval(
+        incident_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        recommendation_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        decision=ApprovalDecision.APPROVED,
+        approver="operator@example.com",
+        comment="unpersisted request body",
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        await module.execute_approval(approval)
+
+    assert getattr(exc_info.value, "status_code", None) == 409
+    assert "persist an approved or modified human decision" in str(getattr(exc_info.value, "detail", ""))

@@ -1,0 +1,25 @@
+services:
+  prometheus:
+    image: quay.io/prometheus/prometheus:v3.13.1
+    container_name: telemetry-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus-config.yaml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=3d
+      - --web.enable-lifecycle
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "19090:9090"
+    volumes:
+      - ./prometheus-kaiops.yaml:/etc/prometheus/prometheus-config.yaml:ro
+      - ./telemetry-alerts.yml:/etc/prometheus/telemetry-alerts.yml:ro
+      - telemetry-prometheus-data:/prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  telemetry-prometheus-data:

@@ -357,6 +357,8 @@ async def execute_approval(approval: Approval) -> RemediationAction:
                 await _require_persisted_approved_runbook(approval)
             except PolicyViolation as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+        else:
+            await _require_persisted_human_approval(approval)
         action = engine.build_action(approval)
         _require_production_credential_reference(approval, action.action_type)
         if not engine.is_action_allowed(action.action_type):
@@ -377,6 +379,24 @@ async def execute_approval(approval: Approval) -> RemediationAction:
 
     await _persist_action(app, action)
     return action
+
+
+async def _require_persisted_human_approval(approval: Approval) -> None:
+    """Prevent callers from turning an unpersisted request body into approval."""
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Durable approval verification is unavailable.")
+    async with session_factory() as session:
+        accepted = await IncidentRepository(session).has_accepted_approval(
+            approval.incident_id,
+            approval.recommendation_id,
+            tenant_id=approval.tenant_id or "default",
+        )
+    if not accepted:
+        raise HTTPException(
+            status_code=409,
+            detail="Execution blocked: persist an approved or modified human decision for this recommendation first.",
+        )
 
 
 async def _require_persisted_approved_runbook(approval: Approval) -> None:

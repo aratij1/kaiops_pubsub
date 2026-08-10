@@ -116,6 +116,7 @@ class ObjectStorageRepository:
 from common.models import (
     Alert,
     Approval,
+    ApprovalDecision,
     ApplicationRegistration,
     GrafanaDashboardResult,
     Incident,
@@ -1733,6 +1734,27 @@ class IncidentRepository:
             )
         )
 
+    async def has_accepted_approval(
+        self,
+        incident_id: Any,
+        recommendation_id: Any,
+        *,
+        tenant_id: str = "default",
+    ) -> bool:
+        incident_uuid = self._parse_uuid(incident_id)
+        recommendation_uuid = self._parse_uuid(recommendation_id)
+        if incident_uuid is None or recommendation_uuid is None:
+            return False
+        result = await self.session.execute(
+            select(ApprovalRecord.id)
+            .where(ApprovalRecord.tenant_id == (str(tenant_id or "default").strip() or "default"))
+            .where(ApprovalRecord.incident_id == incident_uuid)
+            .where(ApprovalRecord.recommendation_id == recommendation_uuid)
+            .where(ApprovalRecord.decision.in_([ApprovalDecision.APPROVED.value, ApprovalDecision.MODIFIED.value]))
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
     async def update_incident_approval_status(
         self,
         incident_id: Any,
@@ -3229,18 +3251,37 @@ class IncidentRepository:
         service: str | None = None,
     ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 1000))
-        stmt = select(IncidentProjectionRecord)
+        # Apply ordering and the limit to narrow scalar columns before loading
+        # projection_payload. On databases that drifted without the updated_at
+        # index, sorting full JSON-bearing rows can exhaust MySQL's sort buffer.
+        latest_stmt = select(
+            IncidentProjectionRecord.incident_id.label("incident_id"),
+            IncidentProjectionRecord.updated_at.label("updated_at"),
+        )
         if risk_tier:
-            stmt = stmt.where(IncidentProjectionRecord.risk_tier == str(risk_tier).strip().lower())
+            latest_stmt = latest_stmt.where(
+                IncidentProjectionRecord.risk_tier == str(risk_tier).strip().lower()
+            )
         if execution_mode:
-            stmt = stmt.where(IncidentProjectionRecord.execution_mode == str(execution_mode).strip().lower())
+            latest_stmt = latest_stmt.where(
+                IncidentProjectionRecord.execution_mode == str(execution_mode).strip().lower()
+            )
         if transport_provider:
-            stmt = stmt.where(IncidentProjectionRecord.transport_provider == str(transport_provider).strip().lower())
+            latest_stmt = latest_stmt.where(
+                IncidentProjectionRecord.transport_provider == str(transport_provider).strip().lower()
+            )
         if status:
-            stmt = stmt.where(IncidentProjectionRecord.status == str(status).strip().lower())
+            latest_stmt = latest_stmt.where(
+                IncidentProjectionRecord.status == str(status).strip().lower()
+            )
         if service:
-            stmt = stmt.where(IncidentProjectionRecord.service == str(service).strip())
-        stmt = stmt.order_by(IncidentProjectionRecord.updated_at.desc()).limit(safe_limit)
+            latest_stmt = latest_stmt.where(IncidentProjectionRecord.service == str(service).strip())
+        latest = latest_stmt.order_by(IncidentProjectionRecord.updated_at.desc()).limit(safe_limit).subquery()
+        stmt = (
+            select(IncidentProjectionRecord)
+            .join(latest, IncidentProjectionRecord.incident_id == latest.c.incident_id)
+            .order_by(latest.c.updated_at.desc())
+        )
         result = await self.session.execute(stmt)
         rows = result.scalars().all()
 
