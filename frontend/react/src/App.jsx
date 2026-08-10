@@ -777,6 +777,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }, []);
   const landingPadRecentRequestRef = useRef({ inFlight: false, lastFetchedAt: 0 });
   const incidentMetadataRequestRef = useRef({ inFlight: false, lastFetchedAt: 0 });
+  const incidentMetadataFiltersRef = useRef(metadataFilters);
   const queueHealthRequestRef = useRef({ inFlight: false, lastFetchedAt: 0 });
   const closedIncidentsRequestRef = useRef(false);
 
@@ -1499,6 +1500,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const background = Boolean(options && options.background);
     const requestState = incidentMetadataRequestRef.current;
     if (requestState.inFlight) {
+      incidentMetadataRequestRef.current = { ...requestState, pending: true };
       return;
     }
     // Coalesce bursts of incident lifecycle notifications instead of flooding
@@ -1515,20 +1517,21 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       // List views need projection fields, not the heavier action/evaluation
       // enrichment that is fetched when an operator opens an incident.
       const params = new URLSearchParams({ limit: "120", include_enrichment: "false" });
-      if (metadataFilters.risk_tier !== "all") {
-        params.set("risk_tier", metadataFilters.risk_tier);
+      const currentFilters = incidentMetadataFiltersRef.current;
+      if (currentFilters.risk_tier !== "all") {
+        params.set("risk_tier", currentFilters.risk_tier);
       }
-      if (metadataFilters.execution_mode !== "all") {
-        params.set("execution_mode", metadataFilters.execution_mode);
+      if (currentFilters.execution_mode !== "all") {
+        params.set("execution_mode", currentFilters.execution_mode);
       }
-      if (metadataFilters.transport_provider !== "all") {
-        params.set("transport_provider", metadataFilters.transport_provider);
+      if (currentFilters.transport_provider !== "all") {
+        params.set("transport_provider", currentFilters.transport_provider);
       }
-      if (metadataFilters.status !== "all") {
-        params.set("status", metadataFilters.status);
+      if (currentFilters.status !== "all") {
+        params.set("status", currentFilters.status);
       }
-      if (String(metadataFilters.service || "").trim()) {
-        params.set("service", String(metadataFilters.service).trim());
+      if (String(currentFilters.service || "").trim()) {
+        params.set("service", String(currentFilters.service).trim());
       }
       const payload = await fetchJson(`/api-gateway/incidents/metadata?${params.toString()}`);
       const data = unwrap(payload);
@@ -1544,7 +1547,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         error: Array.isArray(prev.rows) && prev.rows.length ? "" : error.message,
       }));
     } finally {
-      incidentMetadataRequestRef.current = { inFlight: false, lastFetchedAt: Date.now() };
+      const pending = Boolean(incidentMetadataRequestRef.current.pending);
+      incidentMetadataRequestRef.current = { inFlight: false, pending: false, lastFetchedAt: Date.now() };
+      if (pending) {
+        window.setTimeout(() => loadIncidentMetadata(), 0);
+      }
     }
   }
 
@@ -4720,6 +4727,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     // such as ParaBank are available at sign-in, not only after sign-in.
     loadMonitorApplications();
   }, []);
+
+  useEffect(() => {
+    incidentMetadataFiltersRef.current = metadataFilters;
+  }, [metadataFilters]);
 
   useEffect(() => {
     if (!Boolean(String(adminSession.accessToken || "").trim())) {

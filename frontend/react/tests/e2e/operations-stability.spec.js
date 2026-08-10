@@ -106,6 +106,17 @@ test("Open incident cockpit preserves the selected alert details route", async (
   await expect(page.getByRole("region", { name: "Complete the current step" })).toBeVisible();
 });
 
+test("incident service search converges when changed during initial loading", async ({ page }) => {
+  test.setTimeout(120_000);
+  await signIn(page);
+  await page.getByRole("button", { name: "Operations Workspace", exact: true }).click();
+  await page.getByRole("navigation", { name: "Operations workflow" })
+    .getByRole("button").filter({ hasText: "Incidents" }).click();
+  await expect(page.getByRole("heading", { name: "Operations Center" })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("textbox", { name: "Find service" }).fill("kaiops-core1");
+  await expect(page.getByRole("row", { name: /kaiops-core1/ }).first()).toBeVisible({ timeout: 30_000 });
+});
+
 test("administrator dashboard uses the application workspace selected at sign-in", async ({ page }) => {
   test.setTimeout(120_000);
   await signIn(page);
