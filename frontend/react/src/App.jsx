@@ -10574,7 +10574,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <span>Target: {selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · Risk: {selectedExecutionPlan.riskTier || "unknown"}</span>
                           <span>Duplicate execution is guarded by the remediation idempotency contract; repeated clicks are disabled while a request is active.</span>
                         </div>
-                        <div className="execution-decision-grid">
+                        <details className="execution-safety-details">
+                          <summary>Safety checks <span>{executionPreflightChecks.filter((check) => check.passed).length}/{executionPreflightChecks.length} ready</span></summary>
+                          <div className="execution-decision-grid">
                           {false ? <section className="execution-plan-brief" aria-labelledby="execution-plan-heading">
                             <div className="panel-head">
                               <div>
@@ -10600,8 +10602,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             </div>
                             <p>{blockingPreflightFailures.length ? `${blockingPreflightFailures.length} blocking issue(s) must be resolved.` : executionPreflightCurrent ? `Backend validation passed ${formatIstTimestamp(executionPreflightState.checkedAt)}. No command was executed.` : "KaiMS will validate policy, target, approval, identity, and idempotency without executing a command."}</p>
                           </section>
-                        </div>
-                        <div className="execution-checklist" aria-label="Execution readiness checks">
+                          </div>
+                          <div className="execution-checklist" aria-label="Execution readiness checks">
                           {executionPreflightChecks.map((check) => (
                             <article className={`execution-check ${check.passed ? "is-pass" : check.blocking ? "is-block" : "is-warn"}`} key={check.id}>
                               <span aria-hidden="true">{check.passed ? "✓" : check.blocking ? "×" : "!"}</span>
@@ -10609,7 +10611,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                               <small>{check.passed ? "Ready" : check.blocking ? "Required" : "Recommended"}</small>
                             </article>
                           ))}
-                        </div>
+                          </div>
+                        </details>
                         <details className="panel remediation-connection-panel">
                           <summary className="panel-head"><div><h3>Connection details</h3><p>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedApplicationConnection.source}</p></div><span className="section-toggle-indicator" /></summary>
                           <div className="filter-grid">
@@ -10632,18 +10635,20 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <label>Additional Commands<textarea rows={8} value={remediationPlanEditor.commands} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, commands: e.target.value }))} /></label>
                             <label>Additional Validation Queries<textarea rows={8} value={remediationPlanEditor.queries} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, queries: e.target.value }))} /></label>
                           </div>
-                          {dangerousProductionAction ? <label className="typed-execution-confirmation">Type <code>{executionConfirmationPhrase}</code> to enable production execution<input value={executionConfirmationText} autoComplete="off" onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label> : null}
-                          {remediationExecutionState.error ? <p className="error">{remediationExecutionState.error}</p> : null}
                         </article>
                         {executionRequiresCredential ? <section className="execution-credential-panel"><div className="execution-credential-heading"><div><span className="discovery-eyebrow">Execution identity</span><h4>Credential reference</h4><p>KaiMS uses the governed connector reference automatically. Change it only when this application has a dedicated secret.</p></div><span className={credentialReferenceValid ? "credential-ready" : "credential-required"}>{credentialReferenceValid ? "Ready" : "Required"}</span></div><div className="credential-method-grid"><label>Secret manager<select value={remediationPlanEditor.credential_store} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_store: e.target.value, credential_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select></label><label>Secret reference URI<input className={remediationPlanEditor.credential_ref && !credentialReferenceValid ? "input-invalid" : ""} aria-invalid={Boolean(remediationPlanEditor.credential_ref && !credentialReferenceValid)} autoComplete="off" spellCheck="false" value={remediationPlanEditor.credential_ref} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_ref: e.target.value }))} /><span className="field-hint">Reference only—never enter a token, password, or secret value.</span></label></div></section> : null}
-                        <section className="execution-approval-panel" aria-labelledby="script-approval-heading">
-                          <div className="execution-credential-heading"><div><span className="discovery-eyebrow">Human decision</span><h4 id="script-approval-heading">Approve the current plan</h4><p>Run the dry run after the latest edit, then record the decision.</p></div><span className={cockpitApprovalAccepted ? "credential-ready" : "credential-required"}>{cockpitApprovalAccepted ? "Approved" : "Review required"}</span></div>
-                          <div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div>
-                          <label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this plan safe and appropriate?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label>
-                          <div className="incident-section-actions">
-                            {!executionPreflightCurrent ? <button type="button" className="button-primary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running dry run…" : "Run dry run"}</button> : <button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading || cockpitApprovalAccepted}>{approvalState.loading ? "Recording approval…" : cockpitApprovalAccepted ? "Plan approved" : "Approve plan"}</button>}
+                        <section className="execution-guided-flow" aria-labelledby="guided-execution-heading">
+                          <div className="execution-guided-head"><div><span className="discovery-eyebrow">Guarded execution</span><h3 id="guided-execution-heading">Complete the current step</h3><p>{executionActivationMessage}</p></div><span className={`pill ${executionAllowed ? "pill-success" : "pill-warning"}`}>{executionAllowed ? "Ready" : "In progress"}</span></div>
+                          <ol className="execution-stepper" aria-label="Execution progress">
+                            <li className={executionPreflightCurrent ? "is-complete" : "is-current"}><span>1</span><div><strong>Dry run</strong><small>{executionPreflightCurrent ? "Passed" : "Required"}</small></div></li>
+                            <li className={cockpitApprovalAccepted ? "is-complete" : executionPreflightCurrent ? "is-current" : ""}><span>2</span><div><strong>Approve</strong><small>{cockpitApprovalAccepted ? "Recorded" : "Pending"}</small></div></li>
+                            <li className={executionConfirmationValid ? "is-complete" : cockpitApprovalAccepted ? "is-current" : ""}><span>3</span><div><strong>Confirm</strong><small>{executionConfirmationValid ? "Complete" : "Pending"}</small></div></li>
+                            <li className={executionAllowed ? "is-current" : ""}><span>4</span><div><strong>Execute</strong><small>{executionAllowed ? "Ready" : "Locked"}</small></div></li>
+                          </ol>
+                          <div className="execution-current-step">
+                            {!executionPreflightCurrent ? <><div><strong>Validate without making changes</strong><p>KaiMS checks the target, identity, policy, and executable plan.</p></div><button type="button" className="button-primary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running dry run…" : "Run dry run"}</button></> : !cockpitApprovalAccepted ? <div className="execution-step-form"><div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div><label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this plan safe and appropriate?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading}>{approvalState.loading ? "Recording approval…" : "Approve plan"}</button></div> : dangerousProductionAction && !executionConfirmationValid ? <div className="execution-step-form"><label className="typed-execution-confirmation">Type <code>{executionConfirmationPhrase}</code> to confirm production execution<input value={executionConfirmationText} autoComplete="off" autoFocus onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label></div> : <><div><strong>All safety gates passed</strong><p>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</p></div><button type="button" className="button-primary execution-primary-action" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button></>}
                           </div>
-                          {cockpitApprovalAccepted ? <p className="status-message">Approval recorded. Complete the production confirmation and select Execute approved plan.</p> : null}
+                          {remediationExecutionState.error ? <p className="error">{remediationExecutionState.error}</p> : null}
                           {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
                         </section>
                         <section className="execution-recovery-grid">
@@ -10677,15 +10682,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <div className="table-wrap table-wrap-scroll-x remediation-service-flow"><table><thead><tr><th>Backend Service</th><th>Consumes</th><th>Publishes</th><th>Processing Agent</th></tr></thead><tbody>{SERVICE_TOPIC_FLOW.map((stage) => <tr key={`service-flow-${stage.service}`}><td>{stage.service}</td><td>{stage.consumes}</td><td>{stage.publishes}</td><td>{stage.agent}</td></tr>)}</tbody></table></div>
                           <ExecutionPlanGraph plan={selectedExecutionPlan} />
                         </details>
-                        <div className="execution-action-bar">
-                          <div>
-                            <strong>{executionActivationMessage}</strong>
-                            <span>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</span>
-                          </div>
-                          <div className="remediation-execute-row">
-                            <button type="button" className="button-primary" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed} title={blockingPreflightFailures.length ? `Resolve: ${blockingPreflightFailures.map((check) => check.label).join(", ")}` : !executionPreflightCurrent ? "Run preflight after the latest edit" : !cockpitApprovalAccepted ? "Approve the reviewed script before execution" : !executionConfirmationValid ? `Type ${executionConfirmationPhrase}` : "Execute the approved plan"}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button>
-                          </div>
-                        </div>
                       </details>
                     </>
                   ) : null}
