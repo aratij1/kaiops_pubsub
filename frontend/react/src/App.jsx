@@ -5551,8 +5551,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const analysis = canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow);
     const impact = analysis.impactAnalysis && typeof analysis.impactAnalysis === "object" ? analysis.impactAnalysis : {};
     const impactedServices = Array.isArray(impact.impacted_services)
-      ? impact.impacted_services.map((value) => String(value)).filter(Boolean)
+      ? impact.impacted_services.map((value) => cleanRecommendationText(value, "")).filter(Boolean)
       : [];
+    const evidenceUsed = Array.isArray(impact.evidence_used) ? impact.evidence_used.map((value) => cleanRecommendationText(value, "")).filter(Boolean) : [];
+    const causalDetails = cleanRecommendationText(
+      analysis.rca?.causal_chain || analysis.rca?.mechanism || analysis.rca?.reasoning || analysis.rca?.contributing_factors,
+      "The causal mechanism was not supplied by the current analysis.",
+    );
     const confidence = Number(selectedAlertEvaluation.confidenceScore || analysis.confidence || 0);
     const reviewRequired = Boolean(
       selectedAlertEvaluation.requiresReview
@@ -5566,10 +5571,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       reviewRequired,
       confidenceLabel: confidence >= 0.85 ? "High confidence" : confidence >= 0.7 ? "Moderate confidence" : "Low confidence",
       impactedServices,
-      customerImpact: String(impact.customer_impact || impact.impact_summary || analysis.impact || "Impact not established from current evidence."),
-      serviceImpact: String(impact.service_impact || analysis.impact || "Service impact is not yet quantified."),
-      dependencyImpact: String(impact.dependency_impact || "No dependency impact was supplied."),
-      urgency: String(impact.severity_rationale || impact.urgency || selectedAlertRow?.severity || "Not supplied"),
+      causalDetails,
+      impactEvidence: evidenceUsed,
+      customerImpact: cleanRecommendationText(impact.customer_impact || impact.impact_summary || analysis.impact, "Customer and business impact are not established by the collected evidence."),
+      serviceImpact: cleanRecommendationText(impact.observed_impact || impact.service_impact || analysis.impact, "Observed service impact is not yet quantified."),
+      dependencyImpact: cleanRecommendationText(impact.dependency_impact, "Dependency impact was not established by the collected evidence."),
+      urgency: cleanRecommendationText(impact.severity_rationale || impact.urgency, selectedAlertRow?.severity ? `${selectedAlertRow.severity} alert priority; business urgency requires operator validation.` : "Operational urgency was not established."),
     };
   }, [selectedAlertWorkflow, selectedAlertRow, selectedAlertEvaluation, selectedAiTrust.missing.length]);
 
