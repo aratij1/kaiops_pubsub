@@ -7803,7 +7803,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const effectiveCredentialRef = String(remediationPlanEditor.credential_ref || selectedApplicationConnection.credential_ref || "").trim();
   const executionPlanSignature = JSON.stringify({
     incident: approvalForm.incident_id || selectedIncidentId || selectedApprovalIncidentId || "",
-    recommendation: approvalForm.recommendation_id || selectedApprovalRecommendationId || "",
     connection: remediationPlanEditor.connection_url,
     namespace: remediationPlanEditor.namespace,
     credential_ref: effectiveCredentialRef,
@@ -7829,6 +7828,17 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     && cockpitApprovalAccepted
     && executionConfirmationValid
     && blockingPreflightFailures.length === 0;
+  const executionActivationMessage = executionAllowed
+    ? "Ready for guarded execution"
+    : blockingPreflightFailures.length
+      ? `Complete: ${blockingPreflightFailures.map((check) => check.label).join(", ")}`
+      : !executionPreflightCurrent
+        ? "Run dry run for the current plan"
+        : !cockpitApprovalAccepted
+          ? "Approve the reviewed plan"
+          : !executionConfirmationValid
+            ? `Type ${executionConfirmationPhrase} in the production confirmation field`
+            : "Execution is temporarily unavailable";
   const cockpitApprovalComplete = ["approved", "modified", "rejected"].includes(selectedExecutionBreakdown.approvalStatus);
   const cockpitExecutionStatus = String(selectedExecutionPlan.remediationAction?.status || "").trim().toLowerCase();
   const cockpitAnalysis = canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow);
@@ -10669,7 +10679,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         </details>
                         <div className="execution-action-bar">
                           <div>
-                            <strong>{executionAllowed ? "Ready for guarded execution" : executionPreflightCurrent && !cockpitApprovalAccepted ? "Approve the reviewed script to continue" : executionPreflightCurrent ? "Additional confirmation required" : executionRequiresCredential && !remediationPlanEditor.credential_ref ? "Configure credential first" : "Run dry run to continue"}</strong>
+                            <strong>{executionActivationMessage}</strong>
                             <span>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</span>
                           </div>
                           <div className="remediation-execute-row">
