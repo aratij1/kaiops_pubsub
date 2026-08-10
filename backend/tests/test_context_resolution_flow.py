@@ -276,7 +276,8 @@ async def test_resolution_agent_generates_recommendation() -> None:
 
     recommendation = await ResolutionIntelligenceAgent(model_router=static_router()).resolve(context)
 
-    assert recommendation.root_cause == "Deployment 2.5"
+    assert "deployment payments-api" in recommendation.root_cause
+    assert "confirm the rollout diff" in recommendation.root_cause
     assert 0.5 <= recommendation.confidence < 0.9
     assert "evidence" in recommendation.rationale.lower()
     assert "latency for payments" in recommendation.impact

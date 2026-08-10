@@ -5734,6 +5734,16 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
     return remediationOutcomeFromAction(selectedExecutionPlan.remediationAction);
   }, [remediationExecutionState.result, selectedExecutionPlan.remediationAction]);
+  const selectedExecutionTechnicalResponse = useMemo(() => {
+    const latestResponse = unwrap(remediationExecutionState.result);
+    const candidates = [
+      latestResponse?.parameters?.execution_result,
+      latestResponse,
+      selectedExecutionPlan.remediationAction?.parameters?.execution_result,
+      selectedExecutionPlan.remediationAction,
+    ];
+    return candidates.find((value) => value && typeof value === "object" && Object.keys(value).length > 0) || { message: "No executor details were returned." };
+  }, [remediationExecutionState.result, selectedExecutionPlan.remediationAction]);
 
   const selectedApplicationConnection = useMemo(() => {
     const workflowContext = typeof selectedAlertWorkflow?.context === "object" && selectedAlertWorkflow.context
@@ -10701,7 +10711,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <div className="panel-head"><div><span className="eyebrow">Execution result</span><h3>{selectedRemediationOutcome.title}</h3></div><span className={`pill ${statusPillClass(selectedRemediationOutcome.status)}`}>{selectedRemediationOutcome.status}</span></div>
                             <p>{selectedRemediationOutcome.detail}</p>
                             <dl><dt>Action</dt><dd>{selectedRemediationOutcome.actionType}</dd><dt>Target</dt><dd>{selectedRemediationOutcome.target}</dd></dl>
-                            <details className="k-technical-details"><summary>Technical response</summary><pre className="result">{JSON.stringify(unwrap(remediationExecutionState.result) || selectedExecutionPlan.remediationAction, null, 2)}</pre></details>
+                            <details className="k-technical-details"><summary>Technical response</summary><pre className="result">{JSON.stringify(selectedExecutionTechnicalResponse, null, 2)}</pre></details>
                             {selectedRemediationOutcome.status === "succeeded" ? <section className="execution-outcome-review"><span className="eyebrow">Required human review</span><h4>Was this remediation effective?</h4><div className="outcome-choice" role="group" aria-label="Execution outcome">{[['successful','Successful'],['partial','Partially successful'],['failed','Failed']] .map(([value,label])=><button type="button" key={value} className={executionOutcomeReview.outcome===value?'active':''} onClick={()=>setExecutionOutcomeReview((current)=>({...current,outcome:value}))}>{label}</button>)}</div><label>Operator findings<textarea rows={3} value={executionOutcomeReview.notes} placeholder="What changed, what was validated, and any side effects." onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,notes:e.target.value}))}/></label><label className="checkbox-row"><input type="checkbox" checked={executionOutcomeReview.reusable} onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,reusable:e.target.checked}))}/>Approve this reviewed script for future matching incidents</label><button type="button" className="button-primary" onClick={approveExecutionOutcomeForReuse} disabled={executionOutcomeReview.loading||!executionOutcomeReview.notes.trim()}>{executionOutcomeReview.loading?'Saving review…':'Submit review and learning'}</button>{executionOutcomeReview.error?<p className="error">{executionOutcomeReview.error}</p>:null}{executionOutcomeReview.message?<p className="status-message">{executionOutcomeReview.message}</p>:null}</section> : null}
                           </section>
                         ) : null}
