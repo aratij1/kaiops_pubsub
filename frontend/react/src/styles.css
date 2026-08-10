@@ -5716,6 +5716,32 @@ th {
 .execution-action-bar { position: sticky; z-index: 20; bottom: 10px; display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-top: 14px; padding: 12px 14px; border: 1px solid #9ebbd8; border-radius: 14px; background: color-mix(in srgb, var(--card) 94%, transparent); box-shadow: 0 14px 34px rgba(15, 42, 68, .18); backdrop-filter: blur(12px); }
 .execution-action-bar > div:first-child { display: grid; gap: 2px; }
 .execution-action-bar span { color: var(--muted); font-size: 12px; }
+.execution-safety-details { margin: 10px 0 14px; border: 1px solid var(--line); border-radius: 12px; background: color-mix(in srgb, var(--card) 96%, var(--accent) 4%); }
+.execution-safety-details > summary { display: flex; justify-content: space-between; align-items: center; padding: 11px 14px; cursor: pointer; color: var(--ink); font-weight: 800; }
+.execution-safety-details > summary span { color: var(--muted); font-size: 12px; font-weight: 700; }
+.execution-safety-details[open] > summary { border-bottom: 1px solid var(--line); }
+.execution-safety-details .execution-decision-grid, .execution-safety-details .execution-checklist { margin: 12px; }
+.execution-guided-flow { display: grid; gap: 16px; margin: 16px 0; padding: 20px; border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--line)); border-radius: 18px; background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 6%, var(--card)), var(--card) 52%); box-shadow: 0 14px 34px rgba(15,42,68,.1); }
+.execution-guided-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.execution-guided-head h3, .execution-guided-head p { margin: 3px 0 0; }
+.execution-guided-head p { color: var(--muted); }
+.execution-stepper { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
+.execution-stepper li { display: flex; align-items: center; gap: 9px; min-width: 0; padding: 11px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--muted); }
+.execution-stepper li > span { display: grid; place-items: center; flex: 0 0 28px; width: 28px; height: 28px; border-radius: 50%; background: var(--surface-strong); font-weight: 900; }
+.execution-stepper li > div { display: grid; min-width: 0; }
+.execution-stepper li strong { color: var(--ink); font-size: 13px; }
+.execution-stepper li small { font-size: 11px; }
+.execution-stepper li.is-complete { border-color: color-mix(in srgb, var(--ok) 48%, var(--line)); background: color-mix(in srgb, var(--ok) 7%, var(--card)); }
+.execution-stepper li.is-complete > span { background: var(--ok); color: #fff; }
+.execution-stepper li.is-current { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent); }
+.execution-stepper li.is-current > span { background: var(--accent); color: #fff; }
+.execution-current-step { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 16px; border-radius: 14px; background: color-mix(in srgb, var(--surface) 72%, var(--card)); }
+.execution-current-step p { margin: 4px 0 0; color: var(--muted); }
+.execution-current-step > button { min-width: 170px; }
+.execution-step-form { display: grid; gap: 12px; width: 100%; }
+.execution-step-form > label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 700; }
+.execution-step-form > button { justify-self: end; min-width: 170px; }
+.execution-primary-action { min-height: 44px; }
 
 .remediation-kpi-grid {
   gap: 8px;
@@ -8515,6 +8541,9 @@ tbody tr:hover { background: #f5fafc; }
 .sidebar-navigation-group-administration .sidebar-section { min-height: 42px; }
 .sidebar-panel .compact-tools { flex: 0 0 auto; }
 @media (max-width: 900px) {
+  .execution-stepper { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .execution-current-step { align-items: stretch; flex-direction: column; }
+  .execution-current-step > button, .execution-step-form > button { width: 100%; }
   .sidebar-panel { height: auto; max-height: none; overflow: visible; }
   .sidebar-panel > nav.sidebar-group { overflow: visible; }
 }
