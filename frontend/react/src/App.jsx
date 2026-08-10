@@ -7780,7 +7780,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const credentialReferenceValid = !executionRequiresCredential || /^(?:vault:\/\/|arn:aws:secretsmanager:|gcp-secret:\/\/|k8s-secret:\/\/)/.test(String(remediationPlanEditor.credential_ref || "").trim()) || /^https:\/\/[^/]+\.vault\.azure\.net\/secrets\/[^/]+(?:\/[^/]+)?$/i.test(String(remediationPlanEditor.credential_ref || "").trim());
   const executionPreflightChecks = [
     { id: "incident", label: "Incident identity", detail: "A durable incident ID is attached.", passed: looksLikeUuid(String(approvalForm.incident_id || selectedIncidentId || selectedApprovalIncidentId || "")), blocking: true },
-    { id: "approval", label: "Approval state", detail: "An operator has persisted approval for the reviewed script.", passed: ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus), blocking: true },
+    { id: "approval", label: "Approval state", detail: "Approval is recorded only after this dry run passes.", passed: ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus), blocking: false },
     { id: "role", label: "Operator permission", detail: "The signed-in role can approve and execute remediation.", passed: canUseApprovalActions, blocking: true },
     { id: "target", label: "Execution target", detail: `${selectedApplicationConnection.service} in ${selectedApplicationConnection.environment}.`, passed: !["", "-"].includes(String(selectedApplicationConnection.service || "").trim()), blocking: true },
     { id: "plan", label: "Executable plan", detail: `${editedExecutionPlan.commands.length} command(s), ${editedExecutionPlan.scripts.length} script(s).`, passed: Boolean(editedExecutionPlan.commands.length || editedExecutionPlan.scripts.length), blocking: true },
@@ -7791,8 +7791,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   ];
   const blockingPreflightFailures = executionPreflightChecks.filter((check) => check.blocking && !check.passed);
   const executionPreflightCurrent = executionPreflightState.signature === executionPlanSignature && executionPreflightState.passed;
+  const cockpitApprovalAccepted = ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus);
   const executionAllowed = !remediationExecutionState.loading
     && executionPreflightCurrent
+    && cockpitApprovalAccepted
     && executionConfirmationValid
     && blockingPreflightFailures.length === 0;
   const cockpitApprovalComplete = ["approved", "modified", "rejected"].includes(selectedExecutionBreakdown.approvalStatus);
@@ -10529,6 +10531,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         <section className="execution-preflight-gate" aria-labelledby="dry-run-heading">
                           <div><span className="discovery-eyebrow">3 · Safety verification</span><h4 id="dry-run-heading">Run a dry run before approval</h4><p>Validate the target, connector, credential reference, policy, and executable plan without applying changes.</p></div>
                           <div><span className={executionPreflightCurrent ? "credential-ready" : "credential-required"}>{executionPreflightCurrent ? "Dry run passed" : "Required"}</span><button type="button" className="button-secondary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading || (executionRequiresCredential && !credentialReferenceValid)}>{remediationExecutionState.loading ? "Running…" : executionPreflightCurrent ? "Run dry run again" : "Run dry run"}</button></div>
+                          {remediationExecutionState.error ? <p className="error" role="alert">{remediationExecutionState.error}</p> : null}
                         </section>
                         <section className="execution-approval-panel" aria-labelledby="script-approval-heading">
                           <div className="execution-credential-heading"><div><span className="discovery-eyebrow">2 · Human decision</span><h4 id="script-approval-heading">Approve the reviewed script</h4><p>Approval applies to the script shown above. Editing it afterward invalidates dry-run readiness.</p></div><span className={["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "credential-ready" : "credential-required"}>{["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Approved" : "Review required"}</span></div>
@@ -10685,12 +10688,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         </details>
                         <div className="execution-action-bar">
                           <div>
-                            <strong>{executionAllowed ? "Ready for guarded execution" : executionPreflightCurrent ? "Additional confirmation required" : executionRequiresCredential && !remediationPlanEditor.credential_ref ? "Configure credential first" : "Run dry run to continue"}</strong>
+                            <strong>{executionAllowed ? "Ready for guarded execution" : executionPreflightCurrent && !cockpitApprovalAccepted ? "Approve the reviewed script to continue" : executionPreflightCurrent ? "Additional confirmation required" : executionRequiresCredential && !remediationPlanEditor.credential_ref ? "Configure credential first" : "Run dry run to continue"}</strong>
                             <span>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</span>
                           </div>
                           <div className="remediation-execute-row">
                             <button type="button" className="button-secondary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running…" : "Run dry run"}</button>
-                            <button type="button" className="button-primary" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed} title={blockingPreflightFailures.length ? `Resolve: ${blockingPreflightFailures.map((check) => check.label).join(", ")}` : !executionPreflightCurrent ? "Run preflight after the latest edit" : !executionConfirmationValid ? `Type ${executionConfirmationPhrase}` : "Execute the approved plan"}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button>
+                            <button type="button" className="button-primary" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed} title={blockingPreflightFailures.length ? `Resolve: ${blockingPreflightFailures.map((check) => check.label).join(", ")}` : !executionPreflightCurrent ? "Run preflight after the latest edit" : !cockpitApprovalAccepted ? "Approve the reviewed script before execution" : !executionConfirmationValid ? `Type ${executionConfirmationPhrase}` : "Execute the approved plan"}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button>
                           </div>
                         </div>
                       </details>
