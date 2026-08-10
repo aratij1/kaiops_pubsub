@@ -1483,11 +1483,15 @@ class IncidentRepository:
             return None
 
         events_result = await self.session.execute(
-            select(IncidentEventRecord)
+            select(
+                IncidentEventRecord.event_type,
+                IncidentEventRecord.status,
+                IncidentEventRecord.created_at,
+            )
             .where(IncidentEventRecord.incident_id == incident_uuid)
             .order_by(IncidentEventRecord.created_at.asc())
         )
-        event_rows = events_result.scalars().all()
+        event_rows = events_result.all()
         event_types = {
             str(row.event_type or "").strip().lower()
             for row in event_rows
