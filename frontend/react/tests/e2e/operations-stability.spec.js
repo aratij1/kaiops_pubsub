@@ -101,8 +101,9 @@ test("Open incident cockpit preserves the selected alert details route", async (
   await expect(cockpitTabs.getByRole("tab", { name: "Resolution" })).toHaveCount(0);
   await cockpitTabs.getByRole("tab", { name: "Resolve incident" }).click();
   await expect(page.getByRole("heading", { name: "Decision & Approval" })).toHaveCount(0);
-  await expect(page.getByRole("navigation", { name: "Plan, decide, and execute sequence" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Proposed remediation plan" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Plan editor and guarded execution" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Execution Plan" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Complete the current step" })).toBeVisible();
 });
 
 test("administrator dashboard uses the application workspace selected at sign-in", async ({ page }) => {

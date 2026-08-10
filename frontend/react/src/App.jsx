@@ -1451,7 +1451,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       }
       return;
     }
-    if (hasSelectedSnapshot) {
+    if (hasSelectedSnapshot && !selectedAlertData.error) {
       return;
     }
     // Command Center must not implicitly open the newest row. That row may
@@ -5793,7 +5793,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       metadata?.connection_url
       || metadata?.endpoint_url
       || resolvedConnector?.endpoint
-      || workflowContext?.deployment
       || workflowContext?.observability?.metrics_endpoint
       || appRow?.metrics_endpoint
       || onboardingForm.monitoring_url
@@ -5920,6 +5919,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     return false;
   });
   const executionRequiresCredential = dangerousProductionAction && !executionIsReadOnly;
+  const executionEndpoint = String(remediationPlanEditor.connection_url || "").trim();
+  const executionEndpointValid = !executionEndpoint || /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(executionEndpoint);
+  const liveExecutionPlanAvailable = executionPlanLines.length > 0 && !executionIsReadOnly;
   const executionConfirmationPhrase = `EXECUTE ${String(selectedApplicationConnection.service || selectedApplicationConnection.application || "SERVICE").toUpperCase()}`;
   const executionConfirmationValid = !dangerousProductionAction || executionConfirmationText.trim() === executionConfirmationPhrase;
 
@@ -7854,7 +7856,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     { id: "role", label: "Operator permission", detail: "The signed-in role can approve and execute remediation.", passed: canUseApprovalActions, blocking: true },
     { id: "target", label: "Execution target", detail: `${selectedApplicationConnection.service} in ${selectedApplicationConnection.environment}.`, passed: !["", "-"].includes(String(selectedApplicationConnection.service || "").trim()), blocking: true },
     { id: "plan", label: "Executable plan", detail: `${editedExecutionPlan.commands.length} command(s), ${editedExecutionPlan.scripts.length} script(s).`, passed: Boolean(editedExecutionPlan.commands.length || editedExecutionPlan.scripts.length), blocking: true },
-    { id: "connection", label: "Connector context", detail: "Endpoint or runtime namespace is supplied.", passed: Boolean(String(remediationPlanEditor.connection_url || remediationPlanEditor.namespace || "").trim()), blocking: false },
+    { id: "connection", label: "Connector endpoint", detail: executionEndpointValid ? "Endpoint format is valid." : "Use an http:// or https:// endpoint; deployment names are not URLs.", passed: executionEndpointValid, blocking: Boolean(executionEndpoint) },
     { id: "credential", label: "Credential reference", detail: !executionRequiresCredential ? "Not required for this read-only plan." : credentialReferenceValid ? "A valid enterprise secret-manager URI is attached." : "Use an Azure Key Vault, HashiCorp Vault, AWS Secrets Manager, or Kubernetes Secret URI.", passed: credentialReferenceValid, blocking: executionRequiresCredential },
     { id: "rollback", label: "Rollback coverage", detail: executionRollbackPlan || "No explicit rollback plan is attached.", passed: Boolean(executionRollbackPlan), blocking: false },
     { id: "validation", label: "Recovery validation", detail: editedExecutionPlan.queries.length ? `${editedExecutionPlan.queries.length} post-check(s) supplied.` : "No explicit validation query is attached.", passed: editedExecutionPlan.queries.length > 0, blocking: false },
@@ -7866,6 +7868,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     && executionPreflightCurrent
     && cockpitApprovalAccepted
     && executionConfirmationValid
+    && liveExecutionPlanAvailable
     && blockingPreflightFailures.length === 0;
   const executionActivationMessage = remediationExecutionState.loading
     ? "Execution submitted — waiting for the terminal run status"
@@ -7877,6 +7880,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         ? "Run dry run for the current plan"
         : !cockpitApprovalAccepted
           ? "Approve the reviewed plan"
+          : !liveExecutionPlanAvailable
+            ? "Validation-only plan: attach a governed live executor before execution"
           : !executionConfirmationValid
             ? `Type ${executionConfirmationPhrase} in the production confirmation field`
             : "Execution is temporarily unavailable";
@@ -10664,7 +10669,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <label>Environment<input value={selectedApplicationConnection.environment} readOnly /></label>
                             <label>Source<input value={selectedApplicationConnection.source} readOnly /></label>
                             <label>Connection Type<input value={remediationPlanEditor.connection_type} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, connection_type: e.target.value }))} /></label>
-                            <label>Endpoint URL<input value={remediationPlanEditor.connection_url} placeholder="https://app-or-metrics-endpoint" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, connection_url: e.target.value }))} /></label>
+                            <label>Endpoint URL<input className={executionEndpoint && !executionEndpointValid ? "input-invalid" : ""} aria-invalid={Boolean(executionEndpoint && !executionEndpointValid)} value={remediationPlanEditor.connection_url} placeholder="https://app-or-metrics-endpoint" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, connection_url: e.target.value }))} /><span className="field-hint">{executionEndpoint && !executionEndpointValid ? "Enter an HTTP(S) endpoint, not a deployment or release name." : "Optional connector endpoint used for validation and execution."}</span></label>
                             <label>Namespace / Runtime<input value={remediationPlanEditor.namespace} placeholder="prod / namespace / resource group" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, namespace: e.target.value }))} /></label>
                           </div>
                         </details>
@@ -10679,7 +10684,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <label>Additional Validation Queries<textarea rows={8} value={remediationPlanEditor.queries} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, queries: e.target.value }))} /></label>
                           </div>
                         </article>
-                        {executionRequiresCredential ? <section className="execution-credential-panel"><div className="execution-credential-heading"><div><span className="discovery-eyebrow">Execution identity</span><h4>Credential reference</h4><p>KaiMS uses the governed connector reference automatically. Change it only when this application has a dedicated secret.</p></div><span className={credentialReferenceValid ? "credential-ready" : "credential-required"}>{credentialReferenceValid ? "Ready" : "Required"}</span></div><div className="credential-method-grid"><label>Secret manager<select value={remediationPlanEditor.credential_store} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_store: e.target.value, credential_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select></label><label>Secret reference URI<input className={remediationPlanEditor.credential_ref && !credentialReferenceValid ? "input-invalid" : ""} aria-invalid={Boolean(remediationPlanEditor.credential_ref && !credentialReferenceValid)} autoComplete="off" spellCheck="false" value={remediationPlanEditor.credential_ref} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_ref: e.target.value }))} /><span className="field-hint">Reference only—never enter a token, password, or secret value.</span></label></div></section> : null}
                         <section className="execution-guided-flow" aria-labelledby="guided-execution-heading">
                           <div className="execution-guided-head"><div><span className="discovery-eyebrow">Guarded execution</span><h3 id="guided-execution-heading">Complete the current step</h3><p>{executionActivationMessage}</p></div><span className={`pill ${executionAllowed ? "pill-success" : "pill-warning"}`}>{executionAllowed ? "Ready" : "In progress"}</span></div>
                           <ol className="execution-stepper" aria-label="Execution progress">
