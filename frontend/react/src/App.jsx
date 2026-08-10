@@ -5862,9 +5862,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     setExecutionConfirmationText("");
   }, [
     selectedAlertId,
-    selectedExecutionBreakdown.commands,
-    selectedExecutionBreakdown.scripts,
-    selectedExecutionBreakdown.queries,
+    selectedExecutionBreakdown.commands.join("\n"),
+    selectedExecutionBreakdown.scripts.join("\n"),
+    selectedExecutionBreakdown.queries.join("\n"),
     selectedApplicationConnection.endpoint,
     selectedApplicationConnection.connection_type,
     selectedApplicationConnection.namespace,
