@@ -7229,6 +7229,7 @@ th {
   border-radius: 18px;
   background: radial-gradient(circle at 90% 0%, rgba(71, 190, 229, .34), transparent 34%), linear-gradient(135deg, #102f4b 0%, #18577b 55%, #247662 100%);
   box-shadow: 0 18px 38px rgba(16, 47, 75, .18);
+  scroll-margin-top: 150px;
 }
 
 .incident-workspace-hero h3 {
@@ -7270,6 +7271,14 @@ th {
   font-size: .92rem;
   text-transform: capitalize;
 }
+
+.incident-workspace-kpis span.is-quality-warning {
+  color: #fff0b3;
+  border-color: rgba(255, 206, 84, .62);
+  background: rgba(116, 72, 0, .38);
+}
+
+.incident-workspace-kpis span.is-quality-warning strong { color: #fff7d6; }
 
 .incident-workspace-section {
   position: relative;
@@ -8111,6 +8120,9 @@ th {
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
+
+.incident-overview-table th,
+.incident-overview-table td { padding-top: 10px; padding-bottom: 10px; }
 
 @media (max-width: 850px) {
   .timeline-event-panel {

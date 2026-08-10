@@ -10020,7 +10020,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
                   {homeDetailTab === "overview" ? (
                     <>
-                      <header className="incident-workspace-hero">
+                      <header className="incident-workspace-hero" id="incident-workspace-overview">
                         <div>
                           <span className="discovery-eyebrow">Unified response cockpit</span>
                           <h3>Incident Workspace</h3>
@@ -10030,7 +10030,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <span><strong>{selectedCanonicalIncidentStatus}</strong> lifecycle</span>
                           <span><strong>{selectedAlertTimelineRows.length}</strong> events</span>
                           <span><strong>{selectedAlertRagDocuments.length}</strong> documents</span>
-                          <span><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong> grounded</span>
+                          <span className={Number(selectedAlertEvaluation.groundingScore || 0) < 0.5 ? "is-quality-warning" : ""}><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong>{Number(selectedAlertEvaluation.groundingScore || 0) < 0.5 ? "grounding · review required" : "grounded"}</span>
                         </div>
                       </header>
                       <details className="panel incident-workspace-section workspace-collapsible" open>
