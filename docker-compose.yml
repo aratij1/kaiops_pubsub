@@ -225,7 +225,11 @@ services:
     # Shared services use 4+6 connections while the three ingestion-heavy
     # services retain their explicit larger pools. 450 leaves headroom without
     # encouraging the high per-connection memory ceiling of the old 900 value.
-    command: ["--max-connections=${MYSQL_MAX_CONNECTIONS:-450}"]
+    # 2 MiB is bounded per sorting connection and prevents MySQL error 1038 on
+    # legitimate operational queries while their covering indexes are built.
+    command:
+      - "--max-connections=${MYSQL_MAX_CONNECTIONS:-450}"
+      - "--sort-buffer-size=${MYSQL_SORT_BUFFER_SIZE:-2097152}"
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-kaiops}
