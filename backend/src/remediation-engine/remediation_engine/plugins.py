@@ -7,6 +7,7 @@ import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.models import Approval, RemediationAction, RemediationStatus, utc_now
@@ -140,7 +141,21 @@ class LocalScriptExecutionPlugin(BasePlugin):
         if not resolved_script.exists():
             raise FileNotFoundError(f"approved remediation script not found: {resolved_script}")
 
-        return ["sh", str(resolved_script), *parts[script_index + 1:]]
+        arguments = parts[script_index + 1:]
+        url_defaults = {
+            "--api-gateway-url": os.environ.get("API_GATEWAY_URL", "http://api-gateway:8000"),
+            "--prometheus-url": os.environ.get("PROMETHEUS_URL", "http://prometheus:9090"),
+        }
+        for option, default in url_defaults.items():
+            if option not in arguments:
+                continue
+            value_index = arguments.index(option) + 1
+            value = arguments[value_index] if value_index < len(arguments) else ""
+            parsed = urlparse(value)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                arguments[value_index:value_index + 1] = [default]
+
+        return ["sh", str(resolved_script), *arguments]
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
         command = self._resolve_script_command(action)
