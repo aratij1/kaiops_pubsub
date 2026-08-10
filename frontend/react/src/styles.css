@@ -7203,7 +7203,7 @@ th {
 .guided-cockpit-mini-journey button.is-current { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 60%, var(--line)); box-shadow: inset 0 -3px var(--accent); }
 .guided-cockpit-context { margin: 0 18px 18px; }
 
-.cockpit-stage-navigation { position: sticky; top: 70px; z-index: 14; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; padding: 7px; overflow: visible; background: color-mix(in srgb, var(--card) 94%, transparent); backdrop-filter: blur(12px); }
+.cockpit-stage-navigation { position: sticky; top: 8px; z-index: 40; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; margin-block: 8px 12px; padding: 8px; overflow: visible; border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line)); border-radius: 14px; background: color-mix(in srgb, var(--card) 97%, transparent); box-shadow: 0 10px 28px rgba(15, 42, 66, .16); backdrop-filter: blur(14px); }
 .cockpit-stage-navigation .detail-tab { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 1px 7px; min-width: 0; padding: 8px; text-align: left; white-space: normal; }
 .cockpit-stage-navigation .detail-tab > span { grid-row: 1 / 3; display: grid; width: 24px; height: 24px; place-items: center; border-radius: 50%; background: color-mix(in srgb, var(--line) 55%, transparent); font-size: 10px; }
 .cockpit-stage-navigation .detail-tab strong { min-width: 0; overflow-wrap: anywhere; font-size: 12px; line-height: 1.2; }
@@ -8563,7 +8563,7 @@ tbody tr:hover { background: #f5fafc; }
 .operations-workflow-nav { min-height: 78px; }
 .ingestion-stream-page,.operations-center,.approval-workspace { min-height: 620px; align-content: start; }
 
-.alert-details-cockpit { padding: 0; overflow: clip; }
+.alert-details-cockpit { padding: 0; overflow: visible; }
 .alert-details-cockpit>.incident-sticky-header { padding: 22px 24px 16px; background: linear-gradient(180deg,#fff,#f7fafc); }
 .alert-details-cockpit>.detail-context { margin: 0; padding: 12px 24px; border-block: 1px solid var(--k-border); background: #eef5f8; }
 .alert-details-cockpit>.incident-workspace-nav { margin-inline: 20px; }

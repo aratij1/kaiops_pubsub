@@ -521,7 +521,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     notes: "",
   });
   const [evidenceDraftReview, setEvidenceDraftReview] = useState({ loading: false, draft: null, content: "", notes: "", error: "", message: "" });
-  const [executionOutcomeReview, setExecutionOutcomeReview] = useState({ outcome: "successful", notes: "", reusable: true, loading: false, error: "", message: "" });
+  const [executionOutcomeReview, setExecutionOutcomeReview] = useState({ outcome: "successful", notes: "", reusable: true, loading: false, error: "", message: "", reviewedAlertId: "" });
   const [showExecutionCredential, setShowExecutionCredential] = useState(false);
   const [remediationExecutionState, setRemediationExecutionState] = useState({ loading: false, result: null, error: "" });
   const [executionPreflightState, setExecutionPreflightState] = useState({ signature: "", checkedAt: "", passed: false });
@@ -7343,8 +7343,15 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         await fetchJson("/api-gateway/rag/documents", authenticatedOptions({ method: "POST", body: JSON.stringify({ kind: "remediation", alert_id: selectedAlertId, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, title: `Validated remediation for ${selectedAlertRow?.name || selectedApplicationConnection.service}`, summary: "Operator-reviewed remediation outcome approved for future use.", content, services: [selectedApplicationConnection.service], source_system: "kaims-execution-review", source_ref: `execution-review://${selectedAlertId}`, resolved_by: reviewer, metadata: { approval_status: "approved", execution_outcome: String(executionOutcomeReview.outcome), reusable: "true" } }) }));
       }
       if (selectedAlertRecommendationId) await fetchJson(`/api-gateway/evaluations/by-recommendation/${encodeURIComponent(selectedAlertRecommendationId)}/feedback`, authenticatedOptions({ method: "POST", body: JSON.stringify({ decision: executionOutcomeReview.outcome === "successful" ? "approve" : "reject", approver: reviewer, comment: executionOutcomeReview.notes || `Execution outcome: ${executionOutcomeReview.outcome}` }) })).catch(() => null);
-      setExecutionOutcomeReview((current) => ({ ...current, loading: false, message: current.reusable && plan ? "Outcome reviewed. The approved script is now reusable knowledge." : "Outcome review recorded without publishing a reusable script." }));
-      await loadRagDocs();
+      setExecutionOutcomeReview((current) => ({ ...current, loading: false, reviewedAlertId: String(selectedAlertId || ""), message: current.reusable && plan ? "Outcome reviewed. The approved script is now reusable knowledge." : "Outcome review recorded without publishing a reusable script." }));
+      const incidentId = String(selectedIncidentId || selectedApprovalIncidentId || approvalForm.incident_id || "").trim();
+      await Promise.allSettled([
+        loadRagDocs(),
+        loadSelectedAlertDocumentLinks(selectedAlertId, selectedAlertRow),
+        loadAlertDetails(selectedAlertId, selectedAlertRow, { background: true }),
+        incidentId ? loadIncidentStageCompleteness(incidentId, { background: true }) : Promise.resolve(),
+      ]);
+      setHomeDetailTab("audit");
     } catch (error) {
       setExecutionOutcomeReview((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
     }
@@ -7866,12 +7873,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const cockpitApprovalComplete = ["approved", "modified", "rejected"].includes(selectedExecutionBreakdown.approvalStatus);
   const cockpitExecutionStatus = String(selectedExecutionPlan.remediationAction?.status || "").trim().toLowerCase();
   const cockpitAnalysis = canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow);
+  const executionOutcomeReviewed = String(executionOutcomeReview.reviewedAlertId || "") === String(selectedAlertId || "")
+    || selectedAlertRagDocuments.some((document) => String(document?.source_system || document?.metadata?.source_system || "").toLowerCase() === "kaims-execution-review");
   const incidentCockpitStages = [
     { id: "overview", short: "01", label: "Orient", accessibleLabel: "Overview", description: "Identity and lifecycle", complete: Boolean(selectedAlertId) },
     { id: "evidence", short: "02", label: "Evidence", description: `${selectedAlertRagDocuments.length} linked record(s)`, complete: selectedAlertRagDocuments.length > 0 },
     { id: "rca", short: "03", label: "Understand", accessibleLabel: "RCA & Impact", description: "RCA and impact", complete: Boolean(cockpitAnalysis.rootCause && cockpitAnalysis.rootCause !== "-") },
     { id: "execution", short: "04", label: "Resolve", accessibleLabel: "Resolve incident", description: cockpitExecutionStatus || selectedExecutionBreakdown.approvalStatus || "plan, approve, execute", complete: ["succeeded", "skipped", "failed"].includes(cockpitExecutionStatus) },
-    { id: "audit", short: "05", label: "Validate", accessibleLabel: "Audit Trail", description: selectedCanonicalIncidentStatus === "closed" ? "closed" : "audit and recovery", complete: selectedCanonicalIncidentStatus === "closed" },
+    { id: "audit", short: "05", label: "Validate", accessibleLabel: "Audit Trail", description: selectedCanonicalIncidentStatus === "closed" ? "closed" : executionOutcomeReviewed ? "outcome reviewed" : "audit and recovery", complete: selectedCanonicalIncidentStatus === "closed" || executionOutcomeReviewed },
   ];
   const cockpitRecommendedStage = (() => {
     if (!selectedAlertRagDocuments.length || selectedAlertEvaluation.requiresReview) return "evidence";
