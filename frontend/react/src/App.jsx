@@ -526,6 +526,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const [remediationExecutionState, setRemediationExecutionState] = useState({ loading: false, result: null, error: "" });
   const [executionPreflightState, setExecutionPreflightState] = useState({ signature: "", checkedAt: "", passed: false });
   const [approvedExecutionSignature, setApprovedExecutionSignature] = useState("");
+  const [executionApprovalRequiresRenewal, setExecutionApprovalRequiresRenewal] = useState(false);
   const [executionConfirmationText, setExecutionConfirmationText] = useState("");
   const [selectedFlow, setSelectedFlow] = useState("payment-latency");
   const [metadataFilters, setMetadataFilters] = useState({
@@ -5911,6 +5912,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   useEffect(() => {
     setExecutionPreflightState({ signature: "", checkedAt: "", passed: false });
     setApprovedExecutionSignature("");
+    setExecutionApprovalRequiresRenewal(false);
     setExecutionConfirmationText("");
     setRemediationExecutionState({ loading: false, result: null, error: "" });
   }, [selectedAlertId]);
@@ -7651,6 +7653,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       setApprovalForm((current) => ({ ...current, action, incident_id: incidentId, recommendation_id: recommendationId, approver }));
       applyApprovalResolutionToUi(incidentId, action === "modify" ? "modified" : "approved", approvalForm.comment);
       setApprovedExecutionSignature(executionPlanSignature);
+      setExecutionApprovalRequiresRenewal(false);
       setApprovalState({ loading: false, result: response, error: "" });
       await refreshApprovalDrivenViews(incidentId);
     } catch (error) {
@@ -7664,6 +7667,20 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       return;
     }
     executeApprovedRemediationPlan();
+  }
+
+  function prepareLiveExecutionPlan() {
+    const enableLiveExecution = (value) => String(value || "")
+      .replace(/--dry-run(?:=|\s+)(?:true|1)\b/gi, "--dry-run false");
+    setRemediationPlanEditor((current) => ({
+      ...current,
+      commands: enableLiveExecution(current.commands),
+      scripts: enableLiveExecution(current.scripts),
+    }));
+    setExecutionPreflightState({ signature: "", checkedAt: "", passed: false });
+    setApprovedExecutionSignature("");
+    setExecutionApprovalRequiresRenewal(true);
+    setExecutionConfirmationText("");
   }
 
   function resetSuggestedRemediationPlan() {
@@ -7874,7 +7891,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   ];
   const blockingPreflightFailures = executionPreflightChecks.filter((check) => check.blocking && !check.passed);
   const executionPreflightCurrent = executionPreflightState.signature === executionPlanSignature && executionPreflightState.passed;
-  const cockpitApprovalAccepted = ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) || approvedExecutionSignature === executionPlanSignature;
+  const cockpitApprovalAccepted = (!executionApprovalRequiresRenewal && ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus))
+    || approvedExecutionSignature === executionPlanSignature;
   const executionAllowed = !remediationExecutionState.loading
     && executionPreflightCurrent
     && cockpitApprovalAccepted
@@ -10708,7 +10726,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <li className={remediationExecutionState.loading || executionAllowed ? "is-current" : ""}><span>4</span><div><strong>Execute</strong><small>{remediationExecutionState.loading ? "Running" : executionAllowed ? "Ready" : executionCapabilityBlocked ? "Executor required" : "Locked"}</small></div></li>
                           </ol>
                           <div className="execution-current-step">
-                            {!executionPreflightCurrent ? <><div><strong>Validate without making changes</strong><p>KaiMS checks the target, identity, policy, and executable plan.</p></div><button type="button" className="button-primary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running dry run…" : "Run dry run"}</button></> : !cockpitApprovalAccepted ? <div className="execution-step-form"><div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div><label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this plan safe and appropriate?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading}>{approvalState.loading ? "Recording approval…" : "Approve plan"}</button></div> : dangerousProductionAction && !executionConfirmationValid ? <div className="execution-step-form"><label className="typed-execution-confirmation">Type <code>{executionConfirmationPhrase}</code> to confirm production execution<input value={executionConfirmationText} autoComplete="off" autoFocus onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label></div> : executionCapabilityBlocked ? <div className="execution-step-form"><div><strong>Live execution is not configured</strong><p>The reviewed plan contains validation-only or read-only actions. Add a governed remediation command or script, then run the dry run and approval again.</p></div><button type="button" className="button-secondary" onClick={() => document.querySelector(".remediation-editor-panel textarea")?.focus()}>Review execution plan</button></div> : <><div><strong>All safety gates passed</strong><p>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</p></div><button type="button" className="button-primary execution-primary-action" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button></>}
+                            {!executionPreflightCurrent ? <><div><strong>Validate without making changes</strong><p>KaiMS checks the target, identity, policy, and executable plan.</p></div><button type="button" className="button-primary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running dry run…" : "Run dry run"}</button></> : !cockpitApprovalAccepted ? <div className="execution-step-form"><div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div><label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this plan safe and appropriate?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading}>{approvalState.loading ? "Recording approval…" : "Approve plan"}</button></div> : dangerousProductionAction && !executionConfirmationValid ? <div className="execution-step-form"><label className="typed-execution-confirmation">Type <code>{executionConfirmationPhrase}</code> to confirm production execution<input value={executionConfirmationText} autoComplete="off" autoFocus onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label></div> : executionCapabilityBlocked ? <div className="execution-step-form"><div><strong>Live execution is not configured</strong><p>This approved plan still contains <code>--dry-run true</code>. Preparing live execution changes it to <code>--dry-run false</code> and requires a new dry run, approval, and confirmation.</p></div><button type="button" className="button-primary" onClick={prepareLiveExecutionPlan}>Prepare live execution</button></div> : <><div><strong>All safety gates passed</strong><p>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</p></div><button type="button" className="button-primary execution-primary-action" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button></>}
                           </div>
                           {remediationExecutionState.error ? <p className="error">{remediationExecutionState.error}</p> : null}
                           {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
