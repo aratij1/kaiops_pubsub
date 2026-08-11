@@ -105,6 +105,30 @@ async def test_evidence_draft_requires_review_approval_before_grounding(tmp_path
     assert connector.search("checkout returned HTTP 500", limit=3)[0]["kind"] == "incident"
 
 
+def test_evidence_draft_rejects_unrelated_cross_project_evidence(tmp_path) -> None:
+    module = load_context_app_module()
+    alert = SimpleNamespace(
+        id="11111111-1111-1111-1111-111111111111",
+        name="UptimeRobot monitor down",
+        service="uptimerobot",
+        environment="production",
+        severity=SimpleNamespace(value="critical"),
+        labels={"application": "UptimeRobot", "monitor_id": "monitor-42"},
+    )
+    incident = SimpleNamespace(id="22222222-2222-2222-2222-222222222222")
+    context = SimpleNamespace(metadata={"discovery_report": {
+        "report": {"summary": "Unrelated service failed."},
+        "evidence": [{
+            "evidence_id": "MYSQL-123",
+            "source": "mysql",
+            "snippet": "kaiops remediation engine is unavailable",
+            "uri": "mysql://kaiops/incidents/123",
+        }],
+    }})
+
+    assert module.create_evidence_rag_draft(alert=alert, incident=incident, context=context) is None
+
+
 def test_azure_ai_search_vector_store_builds_hybrid_search_request(monkeypatch) -> None:
     captured = {}
     store = AzureAISearchVectorStore(

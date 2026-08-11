@@ -943,6 +943,7 @@ async def update_application(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
+    _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
@@ -959,6 +960,7 @@ async def delete_application(
     application_id: str,
     request: Request,
     x_trace_id: str | None = Header(default=None),
+    _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
@@ -1101,8 +1103,9 @@ async def get_alert_applications(
     request: Request,
     limit: int = 5000,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    path = f"/alerts/applications?{urlencode({'limit': str(limit)})}"
+    path = f"/alerts/applications?{urlencode({'limit': str(limit), 'tenant_id': tenant_id})}"
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -1950,6 +1953,23 @@ async def get_monitoring_health(
         request=request,
         method="GET",
         path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.delete("/alerts/applications/{project_name}")
+async def delete_observed_alert_application(
+    project_name: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="DELETE",
+        path=f"/alerts/applications/{quote(project_name, safe='')}?{urlencode({'tenant_id': auth.tenant_id})}",
         target_base=settings.monitoring_adapter_url,
         payload={},
         trace_id=trace_id_from_header(x_trace_id),

@@ -351,44 +351,21 @@ function filterAlertsForMonitor(rows, applicationToMonitor) {
   }
   return alertRows.filter((row) => {
     const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
-    const explicitProject = String(
-      row?.project_name
-      || labels?.project_name
-      || row?.project
-      || labels?.project
-      || row?.application
-      || labels?.application
-      || ""
-    ).trim().toLowerCase();
     const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
     const candidates = [
       row?.application,
       row?.project,
       row?.project_name,
-      row?.service,
-      row?.source,
-      row?.name,
-      metadata?.owner_team,
+      metadata?.application,
+      metadata?.project,
+      metadata?.project_name,
       labels?.application,
       labels?.project,
       labels?.project_name,
-      labels?.deployment,
-      labels?.namespace,
-      labels?.service,
-      labels?.job,
-      labels?.instance,
-      labels?.team,
-      labels?.alertname,
     ]
-      .map((value) => String(value || "").trim().toLowerCase())
+      .map((value) => normalizeMonitorToken(value))
       .filter(Boolean);
-    return candidates.some(
-      (value) =>
-        value === target ||
-        value.includes(target) ||
-        target.includes(value) ||
-        hasTokenOverlap(value, target)
-    );
+    return candidates.includes(normalizeMonitorToken(target));
   });
 }
 
@@ -412,33 +389,21 @@ function filterRowsForMonitor(rows, applicationToMonitor) {
   }
   return items.filter((row) => {
     const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
+    const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
     const candidates = [
       row?.application,
       row?.project,
       row?.project_name,
-      row?.service,
-      row?.source,
-      row?.provider_name,
-      row?.owner,
-      row?.owner_team,
+      metadata?.application,
+      metadata?.project,
+      metadata?.project_name,
       labels?.application,
       labels?.project,
       labels?.project_name,
-      labels?.deployment,
-      labels?.namespace,
-      labels?.service,
-      labels?.job,
-      labels?.instance,
     ]
-      .map((value) => String(value || "").trim().toLowerCase())
+      .map((value) => normalizeMonitorToken(value))
       .filter(Boolean);
-    return candidates.some(
-      (value) =>
-        value === target ||
-        value.includes(target) ||
-        target.includes(value) ||
-        hasTokenOverlap(value, target)
-    );
+    return candidates.includes(normalizeMonitorToken(target));
   });
 }
 

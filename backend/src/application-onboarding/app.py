@@ -112,7 +112,17 @@ async def update_application(application_id: str, payload: dict = Body(...)) -> 
     normalized["id"] = application_id
     application = ApplicationRegistration.model_validate(normalized)
     async with _repo() as repo:
+        existing = await repo.get_application(application.id)
+        existing_payload = existing.get("payload") if isinstance(existing, dict) else {}
+        workflow_keys = ("discovery", "metrics_validation", "rules_generation", "prometheus_update", "validation", "dashboard")
+        workflow_payload = {
+            key: existing_payload[key]
+            for key in workflow_keys
+            if isinstance(existing_payload, dict) and key in existing_payload
+        }
         await repo.save_application(application)
+        if workflow_payload:
+            await repo.update_application_status(application.id, status=str(application.status), payload=workflow_payload)
         await _write_audit(repo, application, event_type="application.updated", decision="updated", actor="user", started=started, output={"status": application.status})
         ONBOARDING_SUCCESS.labels(settings.service_name, "update").inc()
         return {"application": application.model_dump(mode="json")}

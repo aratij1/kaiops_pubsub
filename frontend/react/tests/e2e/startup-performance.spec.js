@@ -9,10 +9,14 @@ test("KaiMS starts without runtime errors and reaches an interactive login promp
     if (message.type() === "error") runtimeErrors.push(message.text());
   });
   await page.route("**/api-gateway/auth/config", (route) => route.fulfill(json({ mode: "local", local_development_only: true })));
+  await page.route("**/api-gateway/applications", (route) => route.fulfill(json({ data: { rows: [
+    { id: "app-mono", name: "mono", environment: "prod", status: "registered" },
+  ] } })));
 
   const started = Date.now();
   await page.goto("/", { waitUntil: "domcontentloaded" });
   await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
+  await expect(page.getByLabel("Application workspace")).toContainText("mono");
   expect(Date.now() - started).toBeLessThan(5_000);
   expect(runtimeErrors).toEqual([]);
 });

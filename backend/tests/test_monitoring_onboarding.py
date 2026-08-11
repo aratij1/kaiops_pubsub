@@ -4,6 +4,40 @@ import json
 from common.models import ApplicationRegistration
 from common.monitoring_onboarding import RuleGenerationAgent, write_prometheus_artifacts
 from monitoring_adapter.onboarding_pipelines import capabilities_catalog, run_new_rule_pipeline, NewRuleOnboardingRequest
+from monitoring_adapter.existing_monitoring import get_provider_adapter, normalize_provider_name
+
+
+def test_uptimerobot_native_payload_is_normalized_without_inventing_details() -> None:
+    normalized = get_provider_adapter("uptimerobot").normalize_alert({
+        "monitorID": "42",
+        "monitorFriendlyName": "Public API",
+        "monitorURL": "https://api.example.com/health",
+        "alertType": "1",
+        "alertTypeFriendlyName": "Down",
+        "alertDetails": "HTTP 503",
+        "httpStatusCode": "503",
+        "alertDateTime": "1786400000",
+    })
+
+    assert normalize_provider_name("UptimeRobot") == "uptime_robot"
+    assert normalized["alertName"] == "Public API Down"
+    assert normalized["severity"] == "critical"
+    assert normalized["labels"]["monitor_id"] == "42"
+    assert normalized["environment"] == "unknown"
+
+
+def test_raygun_native_payload_preserves_vendor_provenance() -> None:
+    normalized = get_provider_adapter("raygun").normalize_alert({
+        "event": "error_notification",
+        "eventType": "NewErrorOccurred",
+        "error": {"message": "Checkout failed", "url": "https://app.raygun.com/errors/1", "instance": {"tags": ["env:prod"]}},
+        "application": {"name": "checkout-api", "url": "https://app.raygun.com/apps/1"},
+    })
+
+    assert normalized["application"] == "checkout-api"
+    assert normalized["environment"] == "prod"
+    assert normalized["alertName"] == "Checkout failed"
+    assert normalized["labels"]["event_type"] == "NewErrorOccurred"
 
 
 def make_application() -> ApplicationRegistration:

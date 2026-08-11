@@ -16,3 +16,6 @@ export const NewApplicationSchema = z.object({
   tenant_id: z.string().min(1), name: z.string().min(1), owner_team: z.string().min(1), owner_email: z.string().email().nullable(), environment: z.enum(["dev", "staging", "prod"]), namespace: z.string().min(1), region: z.string().min(1), technology: z.string().min(1), metrics_endpoint: z.string().url(), monitoring_platform: z.string().min(1), labels: z.record(z.string()),
 });
 export type NewApplication = z.infer<typeof NewApplicationSchema>;
+
+export const ApplicationUpdateSchema = NewApplicationSchema.extend({ status: z.string().min(1) });
+export type ApplicationUpdate = z.infer<typeof ApplicationUpdateSchema>;
