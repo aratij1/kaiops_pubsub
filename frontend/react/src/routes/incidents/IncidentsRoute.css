@@ -237,10 +237,122 @@
   padding: 11px 12px;
   border-bottom: 1px solid #e2eaf0;
   vertical-align: middle;
+  /* Keep body copy readable on the white list surface even when a dark
+     root theme sets global td/ink to near-white (#e9edf1). */
+  color: #243b53;
+}
+
+.operations-center .contained-table td strong {
+  color: #1d3348;
+  font-weight: 700;
+}
+
+.operations-center .contained-table .pill.status-open,
+.operations-center .contained-table .pill.status-pending,
+.operations-center .contained-table .pill.status-investigating,
+.operations-center .contained-table .pill.status-awaiting_approval,
+.operations-center .contained-table .pill.status-remediating,
+.operations-center .contained-table .pill.status-validating {
+  background: #edf4ff;
+  border-color: #cad6f6;
+  color: #3346a8;
+}
+
+.operations-center .contained-table .pill.status-failed,
+.operations-center .contained-table .pill.status-blocked {
+  background: #ffecef;
+  border-color: #f7c3ce;
+  color: #9f1239;
+}
+
+.operations-center .contained-table .pill.status-closed,
+.operations-center .contained-table .pill.status-resolved {
+  background: #eafcf1;
+  border-color: #bae7c8;
+  color: #166534;
 }
 
 .operations-center .contained-table tbody tr:hover { background: #f6fafc; }
 .operations-center .contained-table code { color: #304a61; font-size: 11px; }
+
+/* Dark theme: match list surfaces to dark tokens so light cell text stays legible. */
+:root.dm-theme-dark .operations-center .panel.incident-list-panel,
+:root[data-ui-theme="dark"] .operations-center .panel.incident-list-panel {
+  background: #101317;
+  border-color: #2a3038;
+  color: #e9edf1;
+}
+
+:root.dm-theme-dark .operations-center .compact-filter-bar,
+:root[data-ui-theme="dark"] .operations-center .compact-filter-bar {
+  background: #0b0e11;
+  border-color: #2a3038;
+}
+
+:root.dm-theme-dark .operations-center .compact-filter-bar label,
+:root[data-ui-theme="dark"] .operations-center .compact-filter-bar label {
+  color: #a8b0bb;
+}
+
+:root.dm-theme-dark .operations-center .compact-filter-bar input,
+:root.dm-theme-dark .operations-center .compact-filter-bar select,
+:root[data-ui-theme="dark"] .operations-center .compact-filter-bar input,
+:root[data-ui-theme="dark"] .operations-center .compact-filter-bar select {
+  color: #e9edf1;
+  background: #15191e;
+  border-color: #303741;
+}
+
+:root.dm-theme-dark .operations-center .contained-table,
+:root[data-ui-theme="dark"] .operations-center .contained-table {
+  background: #101317;
+  border-color: #2a3038;
+}
+
+:root.dm-theme-dark .operations-center .contained-table th,
+:root[data-ui-theme="dark"] .operations-center .contained-table th {
+  color: #b2bac4;
+  background: #171b20;
+}
+
+:root.dm-theme-dark .operations-center .contained-table td,
+:root.dm-theme-dark .operations-center .contained-table td strong,
+:root[data-ui-theme="dark"] .operations-center .contained-table td,
+:root[data-ui-theme="dark"] .operations-center .contained-table td strong {
+  color: #e9edf1;
+  border-bottom-color: #2a3038;
+}
+
+:root.dm-theme-dark .operations-center .contained-table code,
+:root[data-ui-theme="dark"] .operations-center .contained-table code {
+  color: #c5d0db;
+}
+
+:root.dm-theme-dark .operations-center .contained-table tbody tr:hover,
+:root[data-ui-theme="dark"] .operations-center .contained-table tbody tr:hover {
+  background: #171b20;
+}
+
+:root.dm-theme-dark .operations-center .operations-workflow-nav,
+:root[data-ui-theme="dark"] .operations-center .operations-workflow-nav {
+  background: #101317;
+  border-color: #2a3038;
+}
+
+:root.dm-theme-dark .operations-center .operations-workflow-nav button,
+:root[data-ui-theme="dark"] .operations-center .operations-workflow-nav button {
+  color: #e9edf1;
+}
+
+:root.dm-theme-dark .operations-center .operations-workflow-nav small,
+:root[data-ui-theme="dark"] .operations-center .operations-workflow-nav small {
+  color: #a8b0bb;
+}
+
+:root.dm-theme-dark .operations-center .table-pagination,
+:root[data-ui-theme="dark"] .operations-center .table-pagination {
+  color: #a8b0bb;
+}
 
 .operations-center .table-pagination {
   display: flex;

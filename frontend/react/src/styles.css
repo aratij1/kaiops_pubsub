@@ -8419,6 +8419,13 @@ label>small { color: var(--k-text-muted); font-weight: 450; }
 .button-primary:disabled,.button-secondary:disabled { cursor: not-allowed; opacity: .5; transform: none; }
 
 .table-wrap,.contained-table { border-color: var(--k-border); border-radius: 13px; background: #fff; }
+:root.dm-theme-dark .table-wrap,
+:root.dm-theme-dark .contained-table,
+:root[data-ui-theme="dark"] .table-wrap,
+:root[data-ui-theme="dark"] .contained-table {
+  background: #101317;
+  border-color: #2a3038;
+}
 table { border-collapse: separate; border-spacing: 0; }
 th { height: 40px; padding: 9px 11px; color: #54657a; font-size: .67rem; font-weight: 800; letter-spacing: .035em; text-transform: uppercase; background: #eef4f8; border-color: #d8e3ec; }
 td { padding: 10px 11px; color: #344256; border-color: #e2eaf1; }

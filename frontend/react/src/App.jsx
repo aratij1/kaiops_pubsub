@@ -1,7 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Archive, BookOpen, Bot, Boxes, ChartNoAxesCombined, CircleCheckBig, Database, PlugZap, RadioTower, ScrollText, Settings, ShieldCheck, Siren, Workflow } from "lucide-react";
+import { Archive, BookOpen, Bot, Boxes, ChartNoAxesCombined, ChevronDown, CircleCheckBig, Database, List, LogOut, Monitor, Moon, PanelLeft, PanelLeftClose, PlugZap, RadioTower, Rows2, ScrollText, Settings, ShieldCheck, Siren, Sun, Workflow } from "lucide-react";
 import { alertRowsQueryOptions, landingPadRowsQueryOptions } from "./services/alerts";
 import { useOperationalEvents } from "./services/operationalEvents";
 import { beginOidcLogin, completeOidcLogin } from "./services/oidcClient";
@@ -12,6 +12,8 @@ import { buildAlertDocumentDraft } from "./domain/alertDocumentDraft";
 import ResolutionPanel from "./routes/incidents/ResolutionPanel";
 import RcaPanel from "./routes/incidents/RcaPanel";
 import CopilotRoute from "./routes/copilot/CopilotRoute";
+import { KaiMSBrand } from "./components/brand/KaiMSBrand";
+import { SignIn } from "./components/auth/SignIn";
 import { breadcrumbForPath, groupedNavigationForRole, navigationItemForPath, TAB_SHORTCUT_BY_CODE, VALID_LEGACY_TABS } from "./app/navigation";
 import { allowedLegacyTabsForRole, canAccessDestination } from "./app/permissions";
 import {
@@ -379,26 +381,6 @@ const AlertStreamTable = memo(function AlertStreamTable({ rows, loading, selecte
  *
  * @param {{ initialTab?: string, currentPath?: string, currentSearch?: string, onActiveTabChange?: (tabId: string) => void, onNavigatePath?: (path: string) => void, routeOutlet?: import("react").ReactNode }} props
  */
-function KaiMSBrand({ compact = false, inverse = false, onActivate = null }) {
-  const content = <>
-    <span className="kaims-brand-mark" aria-hidden="true">
-      <svg viewBox="0 0 48 48" role="img">
-        <path className="kaims-mark-k" d="M14 11v26M15 25l16-14M15 25l17 13" />
-        <path className="kaims-mark-signal" d="M7 31h7l4-7 5 11 4-7h14" />
-      </svg>
-    </span>
-    <span className="kaims-brand-copy">
-      <strong>Kai<span>MS</span></strong>
-      {!compact ? <small>Intelligent managed service</small> : null}
-    </span>
-  </>;
-  return (
-    onActivate
-      ? <button type="button" className={`kaims-brand kaims-brand-home ${compact ? "is-compact" : ""} ${inverse ? "is-inverse" : ""}`} aria-label="Go to KaiMS home" onClick={onActivate}>{content}</button>
-      : <div className={`kaims-brand ${compact ? "is-compact" : ""} ${inverse ? "is-inverse" : ""}`} aria-label="KaiMS intelligent managed service">{content}</div>
-  );
-}
-
 function visibleManagedApplication(row) {
   const rawName = String(typeof row === "string" ? row : row?.name || row?.application || "").trim();
   const name = rawName.toLowerCase();
@@ -422,6 +404,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const [monitorApplications, setMonitorApplications] = useState(defaultMonitorApplications);
   const [activeTab, setActiveTab] = useState(() => (VALID_LEGACY_TABS.has(initialTab) ? initialTab : "home"));
   const [isCopilotOpen, setIsCopilotOpen] = useState(false);
+  const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(() => (
+    typeof window === "undefined" ? true : window.matchMedia("(min-width: 901px)").matches
+  ));
+  const userMenuRef = useRef(null);
   const [uiDensity, setUiDensity] = useState("comfortable");
   const [uiTheme, setUiTheme] = useState("auto");
   const [health, setHealth] = useState({ loading: false, ok: false, message: "Not checked" });
@@ -1398,6 +1385,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     return () => window.clearTimeout(timer);
   }, [activeTab, selectedStageCompleteness.incidentId, selectedStageCompleteness.data, selectedStageCompleteness.loading]);
 
+  // #region agent log
+  useEffect(() => {
+    const params = new URLSearchParams(currentSearch);
+    fetch("http://127.0.0.1:7875/ingest/ccf9f1e5-f5b0-448c-9300-44f1d9b7446d", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "136b38" }, body: JSON.stringify({ sessionId: "136b38", runId: "post-fix", hypothesisId: "A", location: "App.jsx:url-params-effect", message: "URL search params observed", data: { currentSearch, workspace: params.get("workspace"), alertIdFromUrl: params.get("alert_id"), selectedAlertId, activeTab, authenticated: Boolean(String(adminSession.accessToken || "").trim()) }, timestamp: Date.now() }) }).catch(() => {});
+  }, [currentSearch, selectedAlertId, activeTab, adminSession.accessToken]);
+  // #endregion
+
   useEffect(() => {
     const scopedRows = mergeAlertStreamRows(
       filterAlertsForMonitor(alerts.rows, applicationToMonitor),
@@ -1421,6 +1415,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       // A landing-pad event is immediately actionable even before it has been
       // persisted into the canonical alerts collection. Keep the clicked row
       // available as the cockpit snapshot while asynchronous processing runs.
+      const urlAlertId = String(new URLSearchParams(currentSearch).get("alert_id") || "").trim();
+      if (urlAlertId && String(selectedAlertId) === urlAlertId) {
+        if (String(selectedAlertData.alertId || "") !== urlAlertId && !selectedAlertData.loading) {
+          loadAlertDetails(urlAlertId);
+        }
+        return;
+      }
       if (hasSelectedSnapshot) {
         return;
       }
@@ -1435,6 +1436,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const selectedExists = scopedRows.some(
       (row) => String(row?.alert_id || row?.id || row?.incident_id || "") === selectedAlertId
     );
+    // #region agent log
+    const urlAlertId = String(new URLSearchParams(currentSearch).get("alert_id") || "").trim();
+    fetch("http://127.0.0.1:7875/ingest/ccf9f1e5-f5b0-448c-9300-44f1d9b7446d", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "136b38" }, body: JSON.stringify({ sessionId: "136b38", runId: "post-fix", hypothesisId: "B", location: "App.jsx:alert-selection-effect", message: "Alert selection effect branch", data: { selectedAlertId, urlAlertId, scopedRowCount: scopedRows.length, firstScopedAlertId: String(scopedRows[0]?.alert_id || scopedRows[0]?.id || ""), selectedExists, hasSelectedSnapshot, willAutoOpenFirst: !selectedExists && !hasSelectedSnapshot && scopedRows.length > 0 && !urlAlertId }, timestamp: Date.now() }) }).catch(() => {});
+    // #endregion
     if (selectedExists) {
       const normalizedSelectedAlertId = String(selectedAlertId || "");
       if (String(selectedAlertData.alertId || "") !== normalizedSelectedAlertId) {
@@ -1454,8 +1459,22 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     if (hasSelectedSnapshot) {
       return;
     }
+    if (urlAlertId) {
+      const urlMatch = scopedRows.find(
+        (row) => String(row?.alert_id || row?.id || row?.incident_id || "") === urlAlertId,
+      );
+      if (urlMatch) {
+        openAlertDetails(urlMatch);
+        return;
+      }
+      if (String(selectedAlertId) !== urlAlertId) {
+        setSelectedAlertId(urlAlertId);
+        loadAlertDetails(urlAlertId);
+      }
+      return;
+    }
     openAlertDetails(scopedRows[0]);
-  }, [activeTab, alerts.rows, closedIncidents.rows, applicationToMonitor, selectedAlertId, selectedAlertSnapshot, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId]);
+  }, [activeTab, alerts.rows, closedIncidents.rows, applicationToMonitor, selectedAlertId, selectedAlertSnapshot, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId, selectedAlertData.loading, currentSearch]);
 
   useEffect(() => {
     const needsEvidence = homeDetailTab === "rca" && rcaDetailView === "evidence";
@@ -4648,14 +4667,54 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     if (!root) {
       return;
     }
-    root.classList.remove("dm-theme-light", "dm-theme-dark");
-    if (uiTheme === "light") {
-      root.classList.add("dm-theme-light");
-    } else if (uiTheme === "dark") {
-      root.classList.add("dm-theme-dark");
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const applyResolvedTheme = () => {
+      root.classList.remove("dm-theme-light", "dm-theme-dark");
+      // Auto must resolve to the same class-driven palette as Light/Dark.
+      // Keeping only data-ui-theme="auto" left Auto on a separate (stale blue) token path.
+      const resolved =
+        uiTheme === "auto" ? (media.matches ? "dark" : "light") : uiTheme;
+      if (resolved === "light") {
+        root.classList.add("dm-theme-light");
+      } else if (resolved === "dark") {
+        root.classList.add("dm-theme-dark");
+      }
+      root.setAttribute("data-ui-theme", uiTheme);
+      // #region agent log
+      const cs = getComputedStyle(root);
+      const bodyCs = getComputedStyle(document.body);
+      fetch('http://127.0.0.1:7875/ingest/ccf9f1e5-f5b0-448c-9300-44f1d9b7446d',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'fe716a'},body:JSON.stringify({sessionId:'fe716a',runId:'theme-post',hypothesisId:'A',location:'App.jsx:theme-effect',message:'Theme applied to documentElement',data:{uiTheme,resolved,hasLightClass:root.classList.contains('dm-theme-light'),hasDarkClass:root.classList.contains('dm-theme-dark'),dataUiTheme:root.getAttribute('data-ui-theme'),prefersDark:media.matches,colorScheme:cs.colorScheme,kColorSurface:cs.getPropertyValue('--k-color-surface').trim(),kColorText:cs.getPropertyValue('--k-color-text').trim(),kSurface:cs.getPropertyValue('--k-surface').trim(),kCanvas:cs.getPropertyValue('--k-canvas').trim(),bg:cs.getPropertyValue('--bg').trim(),card:cs.getPropertyValue('--card').trim(),accent:cs.getPropertyValue('--accent').trim(),ink:cs.getPropertyValue('--ink').trim(),bodyBg:bodyCs.backgroundImage||bodyCs.backgroundColor,bodyColor:bodyCs.color},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+    };
+    applyResolvedTheme();
+    if (uiTheme !== "auto") {
+      return undefined;
     }
-    root.setAttribute("data-ui-theme", uiTheme);
+    media.addEventListener("change", applyResolvedTheme);
+    return () => media.removeEventListener("change", applyResolvedTheme);
   }, [uiTheme]);
+
+  useEffect(() => {
+    if (!isUserMenuOpen) {
+      return undefined;
+    }
+    const onPointerDown = (event) => {
+      if (userMenuRef.current && !userMenuRef.current.contains(event.target)) {
+        setIsUserMenuOpen(false);
+      }
+    };
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setIsUserMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [isUserMenuOpen]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -5490,6 +5549,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       selectedAlertRow?.state,
     ],
   );
+
+  // #region agent log
+  useEffect(() => {
+    if (!selectedAlertId) return;
+    fetch("http://127.0.0.1:7875/ingest/ccf9f1e5-f5b0-448c-9300-44f1d9b7446d", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "136b38" }, body: JSON.stringify({ sessionId: "136b38", runId: "pre-fix", hypothesisId: "D", location: "App.jsx:status-pill-effect", message: "Status pill computed", data: { selectedAlertId, selectedCanonicalIncidentStatus, statusPillClass: statusPillClass(selectedCanonicalIncidentStatus) }, timestamp: Date.now() }) }).catch(() => {});
+  }, [selectedAlertId, selectedCanonicalIncidentStatus]);
+  // #endregion
 
   const selectedAlertRecommendationId = useMemo(() => {
     if (!selectedIncidentId) {
@@ -8921,54 +8987,23 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
   if (!isAuthenticated) {
     return (
-      <main className={`app-shell auth-shell density-${uiDensity}`}>
-        <section className="auth-stage">
-          <aside className="auth-brand-story">
-            <KaiMSBrand inverse />
-            <div className="auth-story-copy">
-              <span className="auth-kicker">Intelligent Managed Service</span>
-              <h1>Always-on incident intelligence. Human-controlled outcomes.</h1>
-              <p>KaiMS is an AI-powered Managed Service that connects evidence, operational reasoning, human judgment, and safe automation in one trusted workspace.</p>
-            </div>
-            <div className="auth-proof-grid" aria-label="KaiMS platform capabilities">
-              <span><strong>Evidence-first</strong><small>Every conclusion is traceable</small></span>
-              <span><strong>Human-governed</strong><small>Control stays with operators</small></span>
-              <span><strong>Closed-loop</strong><small>Every outcome improves the next</small></span>
-            </div>
-          </aside>
-          <article className="panel auth-card">
-            <KaiMSBrand compact />
-            <div className="panel-head">
-              <div>
-                <span className="auth-kicker">Secure workspace</span>
-                <h2>Welcome back</h2>
-                <p>Sign in to your secure Managed Service operations workspace.</p>
-              </div>
-            </div>
-            <label className="auth-application-select">Application workspace<select aria-label="Application workspace" value={applicationToMonitor} onChange={(event) => setApplicationToMonitor(event.target.value)}>{monitorApplications.map((name) => <option key={name} value={name}>{name}</option>)}</select><small>The workspace opens already scoped to this managed application.</small></label>
-            {authConfig.mode === "oidc" ? (
-              <div className="form">
-                <p>Enterprise single sign-on is required. Your identity-provider role controls KaiMS access.</p>
-                <button className="button-primary" type="button" onClick={oidcLogin} disabled={adminSession.loading || authConfig.loading}>{adminSession.loading ? "Redirecting..." : "Continue with SSO"}</button>
-              </div>
-            ) : (
-              <form className="form" onSubmit={adminLogin}>
-                <label>Username<input value={adminAuthForm.username} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, username: e.target.value }))} /></label>
-                <label>Password<input type="password" value={adminAuthForm.password} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, password: e.target.value }))} /></label>
-                <button className="button-primary" type="submit" disabled={adminSession.loading}>{adminSession.loading ? "Signing in..." : "Sign In (local development)"}</button>
-              </form>
-            )}
-            {adminSession.error ? <p className="error">{adminSession.error}</p> : null}
-            {authConfig.error ? <p className="error">{authConfig.error}</p> : null}
-            <p className="subtitle">{authConfig.mode === "local" ? "Local password authentication is for local/demo/test only. " : "Tokens remain in memory and are not written to local storage. "}Role access: Admin = all screens and document provisioning, L3/L2 = investigations plus Provide Documents, L1 = monitoring dashboard and escalation.</p>
-          </article>
-        </section>
-      </main>
+      <SignIn
+        uiDensity={uiDensity}
+        applicationToMonitor={applicationToMonitor}
+        onApplicationChange={setApplicationToMonitor}
+        monitorApplications={monitorApplications}
+        authConfig={authConfig}
+        adminSession={adminSession}
+        adminAuthForm={adminAuthForm}
+        onAdminAuthFormChange={(patch) => setAdminAuthForm((curr) => ({ ...curr, ...patch }))}
+        onLocalLogin={adminLogin}
+        onOidcLogin={oidcLogin}
+      />
     );
   }
 
   return (
-    <main className={`app-shell density-${uiDensity}`}>
+    <main className={`app-shell density-${uiDensity} ${isSidebarOpen ? "is-sidebar-open" : "is-sidebar-collapsed"}`}>
       <a className="skip-link" href="#workspace-content">Skip to workspace content</a>
       {!isBrowserOnline ? (
         <aside className="connectivity-banner" role="alert" aria-live="assertive">
@@ -8977,56 +9012,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         </aside>
       ) : null}
       <div className="app-layout">
-        <aside className="sidebar panel sidebar-panel">
+        <aside id="app-sidebar" className={`sidebar panel sidebar-panel ${isSidebarOpen ? "is-open" : "is-closed"}`} aria-hidden={!isSidebarOpen}>
           <div className="sidebar-head">
             <KaiMSBrand onActivate={() => onNavigatePath?.("/")} />
             <p className="sidebar-mission">From signal to verified resolution.</p>
           </div>
-
-          <details className="sidebar-group sidebar-preferences">
-            <summary>Display preferences</summary>
-            <h3>View Density</h3>
-            <div className="density-switch" role="group" aria-label="Density options">
-              <button
-                type="button"
-                className={`density-option ${uiDensity === "comfortable" ? "active" : ""}`}
-                onClick={() => setUiDensity("comfortable")}
-              >
-                Comfortable
-              </button>
-              <button
-                type="button"
-                className={`density-option ${uiDensity === "compact" ? "active" : ""}`}
-                onClick={() => setUiDensity("compact")}
-              >
-                Compact
-              </button>
-            </div>
-            <h3 style={{ marginTop: 10 }}>Theme</h3>
-            <div className="theme-switch" role="group" aria-label="Theme options">
-              <button
-                type="button"
-                className={`density-option ${uiTheme === "auto" ? "active" : ""}`}
-                onClick={() => setUiTheme("auto")}
-              >
-                Auto
-              </button>
-              <button
-                type="button"
-                className={`density-option ${uiTheme === "light" ? "active" : ""}`}
-                onClick={() => setUiTheme("light")}
-              >
-                Light
-              </button>
-              <button
-                type="button"
-                className={`density-option ${uiTheme === "dark" ? "active" : ""}`}
-                onClick={() => setUiTheme("dark")}
-              >
-                Dark
-              </button>
-            </div>
-          </details>
 
           <nav className="sidebar-group" aria-label="Primary navigation">
             <div className="sidebar-sections-wrap">
@@ -9040,7 +9030,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         key={`sidebar-${item.id}`}
                         type="button"
                         className={`sidebar-section ${currentPath === item.path ? "active" : ""}`}
-                        onClick={() => openNavigationItem(item)}
+                        onClick={() => {
+                          openNavigationItem(item);
+                          if (typeof window !== "undefined" && window.matchMedia("(max-width: 900px)").matches) {
+                            setIsSidebarOpen(false);
+                          }
+                        }}
                         title={item.label}
                         aria-current={currentPath === item.path ? "page" : undefined}
                       >
@@ -9055,12 +9050,135 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           </nav>
 
         </aside>
+        {isSidebarOpen ? (
+          <button
+            type="button"
+            className="sidebar-backdrop"
+            aria-label="Close navigation menu"
+            onClick={() => setIsSidebarOpen(false)}
+          />
+        ) : null}
 
-        <section className="content-area" id="workspace-content" tabIndex={-1}>
-          <header className="hero">
-            <p className="eyebrow">{currentBreadcrumb[0]?.label || "KaiMS"}</p>
-            <h1>{currentNavigationItem.pageTitle}</h1>
-            <p className="subtitle">{currentNavigationItem.keywords.join(" · ")}</p>
+        <div className="workspace-main">
+          <div className="workspace-top-toolbar" aria-label="Workspace toolbar">
+            <div className="workspace-top-toolbar-start">
+              <button
+                type="button"
+                className="sidebar-toggle"
+                aria-controls="app-sidebar"
+                aria-expanded={isSidebarOpen}
+                aria-label={isSidebarOpen ? "Hide navigation menu" : "Show navigation menu"}
+                title={isSidebarOpen ? "Hide menu" : "Show menu"}
+                onClick={() => setIsSidebarOpen((open) => !open)}
+              >
+                {isSidebarOpen ? <PanelLeftClose size={18} aria-hidden="true" /> : <PanelLeft size={18} aria-hidden="true" />}
+              </button>
+              <HealthBadge ok={health.ok} label={health.message} />
+            </div>
+            <div className="workspace-top-toolbar-center" aria-label="Current workspace">
+              <span className="workspace-top-toolbar-eyebrow">{currentBreadcrumb[0]?.label || "KaiMS"}</span>
+              <strong className="workspace-top-toolbar-title">{currentNavigationItem.pageTitle}</strong>
+            </div>
+            <div className="workspace-top-toolbar-end">
+              <button className="button-primary workspace-top-toolbar-ask" type="button" onClick={() => setIsCopilotOpen(!isCopilotOpen)}>
+                <Bot size={16} aria-hidden="true" /> {isCopilotOpen ? "Close KAI" : "Ask KAI"}
+              </button>
+              <div className={`workspace-user-menu ${isUserMenuOpen ? "is-open" : ""}`} ref={userMenuRef}>
+                <button
+                  type="button"
+                  className="workspace-user-menu-trigger"
+                  aria-haspopup="menu"
+                  aria-expanded={isUserMenuOpen}
+                  onClick={() => setIsUserMenuOpen((open) => !open)}
+                >
+                  <span className="workspace-user-menu-avatar" aria-hidden="true">
+                    {String(adminSession?.user?.username || "U").trim().charAt(0).toUpperCase()}
+                  </span>
+                  <span className="workspace-user-menu-copy">
+                    <strong>{adminSession?.user?.username || "-"}</strong>
+                    <small>{adminSession?.user?.role_name || "-"}</small>
+                  </span>
+                  <ChevronDown size={16} aria-hidden="true" />
+                </button>
+                {isUserMenuOpen ? (
+                  <div className="workspace-user-menu-panel" role="menu" aria-label="Account and display settings">
+                    <div className="workspace-user-menu-section">
+                      <p className="workspace-user-menu-label">Density</p>
+                      <div className="workspace-user-menu-options" role="group" aria-label="Density options">
+                        <button
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={uiDensity === "comfortable"}
+                          className={uiDensity === "comfortable" ? "is-active" : ""}
+                          onClick={() => setUiDensity("comfortable")}
+                        >
+                          <Rows2 size={15} aria-hidden="true" /> Comfortable
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={uiDensity === "compact"}
+                          className={uiDensity === "compact" ? "is-active" : ""}
+                          onClick={() => setUiDensity("compact")}
+                        >
+                          <List size={15} aria-hidden="true" /> Compact
+                        </button>
+                      </div>
+                    </div>
+                    <div className="workspace-user-menu-section">
+                      <p className="workspace-user-menu-label">Theme</p>
+                      <div className="workspace-user-menu-options" role="group" aria-label="Theme options">
+                        <button
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={uiTheme === "auto"}
+                          className={uiTheme === "auto" ? "is-active" : ""}
+                          onClick={() => setUiTheme("auto")}
+                        >
+                          <Monitor size={15} aria-hidden="true" /> Auto
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={uiTheme === "light"}
+                          className={uiTheme === "light" ? "is-active" : ""}
+                          onClick={() => setUiTheme("light")}
+                        >
+                          <Sun size={15} aria-hidden="true" /> Light
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={uiTheme === "dark"}
+                          className={uiTheme === "dark" ? "is-active" : ""}
+                          onClick={() => setUiTheme("dark")}
+                        >
+                          <Moon size={15} aria-hidden="true" /> Dark
+                        </button>
+                      </div>
+                    </div>
+                    <div className="workspace-user-menu-footer">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="workspace-user-menu-logout"
+                        onClick={() => {
+                          setIsUserMenuOpen(false);
+                          adminLogout();
+                        }}
+                      >
+                        <LogOut size={15} aria-hidden="true" /> Logout
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
+
+          <section className="content-area" id="workspace-content" tabIndex={-1}>
+          {(restrictedDestination || currentNavigationItem.related?.length) ? (
+          <header className="hero hero-compact">
             {restrictedDestination ? <div className="permission-navigation-notice" role="status">{restrictedDestination} is not available to your current role. Ask an administrator if your responsibilities require access.</div> : null}
             <label className="mobile-navigation">
               <span>Navigate to</span>
@@ -9071,14 +9189,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                 {navigationGroups.map((group) => <optgroup key={group.id} label={group.label}>{group.items.map((item) => <option key={item.id} value={item.path}>{item.label}</option>)}</optgroup>)}
               </select>
             </label>
-            <div className="hero-actions">
-              <HealthBadge ok={health.ok} label={health.message} />
-              <span className="hero-user" title={`Signed in as ${adminSession?.user?.username || "-"}`}>{adminSession?.user?.username || "-"} · {adminSession?.user?.role_name || "-"}</span>
-              <button className="button-primary" type="button" onClick={() => setIsCopilotOpen(!isCopilotOpen)}>
-                <Bot size={16} /> {isCopilotOpen ? "Close KAI" : "Ask KAI"}
-              </button>
-              <button className="button-secondary" type="button" onClick={adminLogout}>Logout</button>
-            </div>
             {currentNavigationItem.related?.length ? <nav className="contextual-navigation" aria-label="Related workflow destinations">
               <span>Continue workflow:</span>
               {currentNavigationItem.related.map((relatedId) => {
@@ -9087,6 +9197,17 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               })}
             </nav> : null}
           </header>
+          ) : (
+          <label className="mobile-navigation mobile-navigation-standalone">
+            <span>Navigate to</span>
+            <select value={currentNavigationItem.path} onChange={(event) => {
+              const item = navigationGroups.flatMap((group) => group.items).find((candidate) => candidate.path === event.target.value);
+              if (item) openNavigationItem(item);
+            }}>
+              {navigationGroups.map((group) => <optgroup key={group.id} label={group.label}>{group.items.map((item) => <option key={item.id} value={item.path}>{item.label}</option>)}</optgroup>)}
+            </select>
+          </label>
+          )}
 
           <details className="global-operations-bar panel" aria-label="Global operational capabilities">
             <summary className="global-operations-summary"><span>Search &amp; personal work</span><small>Find records, assignments, and notifications</small></summary>
@@ -12651,6 +12772,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           </RouteRuntimeProvider>
 
         </section>
+        </div>
       </div>
     </main>
   );

@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouteRuntimeSlice, type IncidentFilters } from "../../app/routeRuntime";
 import "./IncidentsRoute.css";
+// Load after route CSS so modern layout overrides win on this page.
+import "../../styles/modern-layout-overrides.css";
+import "../../custom.css";
 import { OperationsWorkflowNav } from "../../components/operations/OperationsWorkflowNav";
 
 const PAGE_SIZE = 15;
@@ -10,6 +13,21 @@ export default function IncidentsRoute() {
   const pages = Math.max(1, Math.ceil(incidents.rows.length / PAGE_SIZE));
   useEffect(() => setPage((current) => Math.min(current, pages)), [pages]);
   useEffect(() => setPage(1), [incidents.filters.risk_tier, incidents.filters.execution_mode, incidents.filters.status, incidents.filters.service]);
+  // #region agent log
+  useEffect(() => {
+    const root = document.documentElement;
+    const td = document.querySelector(".operations-center .contained-table td:nth-child(2)");
+    const code = document.querySelector(".operations-center .contained-table code");
+    const pill = document.querySelector(".operations-center .contained-table .pill");
+    const table = document.querySelector(".operations-center .contained-table");
+    if (!td || !table) return;
+    const tdCs = getComputedStyle(td);
+    const tableCs = getComputedStyle(table);
+    const codeCs = code ? getComputedStyle(code) : null;
+    const pillCs = pill ? getComputedStyle(pill) : null;
+    fetch("http://127.0.0.1:7875/ingest/ccf9f1e5-f5b0-448c-9300-44f1d9b7446d", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "fe716a" }, body: JSON.stringify({ sessionId: "fe716a", runId: "contrast-post", hypothesisId: "A", location: "IncidentsRoute.tsx:contrast", message: "Incidents table computed contrast", data: { uiTheme: root.getAttribute("data-ui-theme"), hasDarkClass: root.classList.contains("dm-theme-dark"), hasLightClass: root.classList.contains("dm-theme-light"), ink: getComputedStyle(root).getPropertyValue("--ink").trim(), tdColor: tdCs.color, tdBg: tdCs.backgroundColor, tableBg: tableCs.backgroundColor, codeColor: codeCs?.color || null, pillColor: pillCs?.color || null, pillBg: pillCs?.backgroundColor || null }, timestamp: Date.now() }) }).catch(() => {});
+  }, [incidents.rows.length, page]);
+  // #endregion
   const rows = useMemo(() => incidents.rows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE), [incidents.rows, page]);
   const select = (label: string, name: keyof IncidentFilters, options: string[]) => <label>{label}<select value={incidents.filters[name]} onChange={(event) => incidents.updateFilter(name, event.target.value)}>{options.map((option) => <option value={option} key={option}>{option}</option>)}</select></label>;
   const priority = incidents.rows.filter((row) => ["high", "critical"].includes(String(row.risk_tier || "").toLowerCase())).length;

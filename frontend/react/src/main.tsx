@@ -9,6 +9,10 @@ import "./datamatics-dark.css";
 // KaiMS product styles load last so legacy compatibility themes cannot
 // unpredictably override the branded component system.
 import "./styles.css";
+// Final cascade: modern table-first layout overrides win over legacy CSS.
+import "./styles/modern-layout-overrides.css";
+// Project-local tweaks — always last so they override everything above.
+import "./custom.css";
 
 const root = document.getElementById("root");
 
