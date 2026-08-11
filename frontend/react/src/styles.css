@@ -5735,6 +5735,8 @@ th {
 .execution-stepper li.is-complete > span { background: var(--ok); color: #fff; }
 .execution-stepper li.is-current { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent); }
 .execution-stepper li.is-current > span { background: var(--accent); color: #fff; }
+.execution-stepper li.is-failed { border-color: color-mix(in srgb, var(--danger) 58%, var(--line)); background: color-mix(in srgb, var(--danger) 7%, var(--card)); }
+.execution-stepper li.is-failed > span { background: var(--danger); color: #fff; }
 .execution-current-step { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 16px; border-radius: 14px; background: color-mix(in srgb, var(--surface) 72%, var(--card)); }
 .execution-current-step p { margin: 4px 0 0; color: var(--muted); }
 .execution-current-step > button { min-width: 170px; }
@@ -8579,6 +8581,12 @@ tbody tr:hover { background: #f5fafc; }
 .queue-global-danger[open] { display: grid; gap: 12px; }
 .button-danger { border: 1px solid #b42318; border-radius: 10px; background: #b42318; color: #fff; padding: 10px 14px; font-weight: 800; cursor: pointer; }
 .button-danger:disabled { cursor: not-allowed; opacity: .45; }
+.selection-column { width: 44px; text-align: center; }
+.selection-column input { width: 16px; height: 16px; cursor: pointer; }
+.project-bulk-selector { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; padding: 10px; border: 1px solid #d6e1eb; border-radius: 10px; background: #f7fafc; }
+.project-bulk-selector label { display: inline-flex; align-items: center; gap: 7px; padding: 7px 9px; border-radius: 8px; background: #fff; border: 1px solid #d6e1eb; cursor: pointer; }
+.project-bulk-selector input { width: 16px; height: 16px; cursor: pointer; }
+.project-bulk-selector small { color: #667085; }
 .periodic-knowledge-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; background: linear-gradient(135deg, #0b3150, #126f78); color: #fff; }
 .periodic-knowledge-header h3 { color: #fff; margin: 4px 0; }
 .periodic-knowledge-header p { color: #d9f4f5; margin: 0; max-width: 760px; }

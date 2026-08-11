@@ -320,6 +320,7 @@ class HumanCorrectionRecord(Base, TimestampMixin):
 class OnboardingStateRecord(Base, TimestampMixin):
     __tablename__ = "onboarding_state"
 
+    tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True, default="default", index=True)
     project_name: Mapped[str] = mapped_column(String(255), primary_key=True)
     provider_name: Mapped[str] = mapped_column(String(64), primary_key=True)
     owner_team: Mapped[str | None] = mapped_column(String(255))

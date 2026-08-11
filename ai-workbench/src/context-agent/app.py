@@ -916,12 +916,54 @@ def _write_evidence_draft(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+_GENERIC_EVIDENCE_TERMS = {
+    "alert", "application", "critical", "error", "failed", "failure",
+    "high", "incident", "monitor", "monitoring", "prod", "production",
+    "service", "validation", "warning",
+}
+
+
+def _alert_identity_terms(alert: Alert) -> set[str]:
+    raw_labels = getattr(alert, "labels", {})
+    labels = raw_labels if isinstance(raw_labels, dict) else {}
+    values = [
+        alert.service,
+        alert.name,
+        labels.get("application"),
+        labels.get("project"),
+        labels.get("project_name"),
+        labels.get("monitor_id"),
+    ]
+    terms: set[str] = set()
+    for value in values:
+        for token in re.findall(r"[a-z0-9][a-z0-9_.-]{2,}", str(value or "").lower()):
+            if token not in _GENERIC_EVIDENCE_TERMS:
+                terms.add(token)
+    return terms
+
+
+def _evidence_matches_alert(row: dict[str, Any], identity_terms: set[str]) -> bool:
+    if not identity_terms:
+        return False
+    haystack = " ".join(
+        str(row.get(key) or "")
+        for key in ("source", "snippet", "summary", "uri", "path", "title")
+    ).lower()
+    return any(term in haystack for term in identity_terms)
+
+
 def create_evidence_rag_draft(*, alert: Alert, incident: Incident, context: Context) -> dict[str, Any] | None:
     metadata = context.metadata if isinstance(context.metadata, dict) else {}
     discovery = metadata.get("discovery_report") if isinstance(metadata.get("discovery_report"), dict) else {}
     report = discovery.get("report") if isinstance(discovery.get("report"), dict) else {}
     evidence = discovery.get("evidence") if isinstance(discovery.get("evidence"), list) else []
-    grounded = [row for row in evidence if isinstance(row, dict) and str(row.get("evidence_id") or "").strip()]
+    identity_terms = _alert_identity_terms(alert)
+    grounded = [
+        row for row in evidence
+        if isinstance(row, dict)
+        and str(row.get("evidence_id") or "").strip()
+        and _evidence_matches_alert(row, identity_terms)
+    ]
     if not grounded:
         return None
     draft_id = f"evidence-{alert.id}"
@@ -976,6 +1018,12 @@ def create_evidence_rag_draft(*, alert: Alert, incident: Incident, context: Cont
             "approved_by": None,
             "approved_at": None,
             "rag_document_path": None,
+            "evidence_relevance": {
+                "verified": True,
+                "identity_terms": sorted(identity_terms),
+                "relevant_count": len(grounded),
+                "retrieved_count": len(evidence),
+            },
         }
     )
 

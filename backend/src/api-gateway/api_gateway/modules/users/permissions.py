@@ -8,7 +8,6 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from api_gateway.modules.users.service import UserService
 
 security = HTTPBearer(auto_error=True)
-optional_security = HTTPBearer(auto_error=False)
 
 
 @dataclass(slots=True)
@@ -68,24 +67,17 @@ async def current_auth_context(
 
 
 async def current_tenant_id(
-    credentials: HTTPAuthorizationCredentials | None = Depends(optional_security),
-    user_service: UserService = Depends(get_user_service),
+    auth: AuthContext = Depends(current_auth_context),
 ) -> str:
-    """Best-effort tenant scoping for read endpoints that must keep working
-    for callers that don't yet send a bearer token (e.g. the live alert
-    stream poll), while still real-isolating any caller that IS
-    authenticated. An invalid/expired token here degrades to 'default'
+    """Return the tenant from a verified access-token context.
+
+    Missing, invalid, expired, and revoked credentials are rejected by
+    ``current_auth_context`` before this dependency runs.
     rather than a 401, since these endpoints don't otherwise require auth —
     making a request reject on a *garbled* token would be a stricter
     behavior change than today, not just narrower results.
     """
-    if credentials is None:
-        return "default"
-    try:
-        payload = await user_service.decode_access_token(credentials.credentials)
-    except HTTPException:
-        return "default"
-    return str(payload.get("tenant_id") or "default")
+    return auth.tenant_id
 
 
 def require_roles(*allowed_roles: str):

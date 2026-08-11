@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shlex
@@ -8,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
+
+import httpx
 
 from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.models import Approval, RemediationAction, RemediationStatus, utc_now
@@ -63,7 +66,62 @@ class JenkinsRollbackPlugin(BasePlugin):
 
     @circuit_breaker(CircuitBreaker())
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        return await self._not_configured(action, "jenkins")
+        profile = action.parameters.get("connection_profile") if isinstance(action.parameters.get("connection_profile"), dict) else {}
+        endpoint = str(profile.get("endpoint_url") or profile.get("endpoint") or "").rstrip("/")
+        job_name = str(profile.get("job_name") or "").strip("/")
+        secret_ref = str(profile.get("credential_ref") or profile.get("secret_ref") or "").strip()
+        allowed = profile.get("allowed_operations") if isinstance(profile.get("allowed_operations"), list) else []
+        if not endpoint or not job_name or not secret_ref:
+            return await self._not_configured(action, "jenkins")
+        if allowed and action.action_type not in {str(item).strip() for item in allowed}:
+            action.status = RemediationStatus.SKIPPED
+            action.error = f"Connector does not allow operation {action.action_type}"
+            return action
+
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("Jenkins endpoint must be an absolute HTTP(S) URL")
+
+        username = os.getenv("JENKINS_USERNAME", "").strip()
+        token = os.getenv("JENKINS_API_TOKEN", "").strip()
+        if not username or not token:
+            action.status = RemediationStatus.SKIPPED
+            action.error = f"Secret reference {secret_ref} is configured, but the runtime secret provider did not inject JENKINS_USERNAME and JENKINS_API_TOKEN"
+            return action
+
+        job_path = "/job/" + "/job/".join(part for part in job_name.split("/") if part)
+        build_url = f"{endpoint}{job_path}/buildWithParameters"
+        timeout_seconds = max(5.0, min(float(profile.get("timeout_seconds") or 120), 900.0))
+        parameters = {
+            "KAI_OPS_INCIDENT_ID": str(action.incident_id),
+            "KAI_OPS_TARGET": str(action.target),
+            "KAI_OPS_SERVICE": str(action.parameters.get("service") or ""),
+            "KAI_OPS_ENVIRONMENT": str(action.parameters.get("environment") or ""),
+            "KAI_OPS_EXECUTION_PLAN": json.dumps(action.parameters.get("execution_plan") or {}, separators=(",", ":")),
+        }
+        async with httpx.AsyncClient(auth=(username, token), timeout=httpx.Timeout(timeout_seconds, connect=10.0)) as client:
+            headers: dict[str, str] = {}
+            crumb_response = await client.get(f"{endpoint}/crumbIssuer/api/json")
+            if crumb_response.status_code == 200:
+                crumb = crumb_response.json()
+                headers[str(crumb.get("crumbRequestField") or "Jenkins-Crumb")] = str(crumb.get("crumb") or "")
+            response = await client.post(build_url, params=parameters, headers=headers)
+            response.raise_for_status()
+
+        queue_url = str(response.headers.get("location") or "").strip()
+        action.status = RemediationStatus.SUCCEEDED
+        action.output = f"Jenkins build queued for {job_name}"
+        action.parameters["execution_result"] = {
+            "executed": True,
+            "executor": "jenkins",
+            "connector_endpoint": endpoint,
+            "job_name": job_name,
+            "queue_url": queue_url,
+            "secret_ref": secret_ref,
+            "submitted_parameters": {key: value for key, value in parameters.items() if key != "KAI_OPS_EXECUTION_PLAN"},
+            "summary": "Jenkins accepted the governed remediation build request.",
+        }
+        return action
 
 
 class KubernetesRestartPlugin(BasePlugin):

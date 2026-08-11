@@ -723,13 +723,17 @@ class IncidentRepository:
             return
         row.status = "closed"
 
-    async def list_alerts(self, limit: int = 500, include_incident_context: bool = True) -> list[dict[str, Any]]:
+    async def list_alerts(
+        self,
+        limit: int = 500,
+        include_incident_context: bool = True,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 5000))
-        alert_ids_result = await self.session.execute(
-            select(AlertRecord.id)
-            .order_by(AlertRecord.created_at.desc())
-            .limit(safe_limit)
-        )
+        alert_ids_query = select(AlertRecord.id)
+        if tenant_id is not None:
+            alert_ids_query = alert_ids_query.where(AlertRecord.tenant_id == self._require("tenant_id", tenant_id))
+        alert_ids_result = await self.session.execute(alert_ids_query.order_by(AlertRecord.created_at.desc()).limit(safe_limit))
         alert_ids = [row[0] for row in alert_ids_result.all()]
         if not alert_ids:
             return []
@@ -2842,6 +2846,7 @@ class IncidentRepository:
     async def save_onboarding_state(
         self,
         *,
+        tenant_id: str = "default",
         project_name: str,
         provider_name: str,
         project_payload: dict[str, Any],
@@ -2856,6 +2861,7 @@ class IncidentRepository:
     ) -> None:
         await self.session.merge(
             OnboardingStateRecord(
+                tenant_id=self._require("onboarding.tenant_id", tenant_id),
                 project_name=self._require("onboarding.project_name", project_name),
                 provider_name=self._require("onboarding.provider_name", provider_name),
                 owner_team=owner_team,
@@ -2870,9 +2876,10 @@ class IncidentRepository:
             )
         )
 
-    async def list_onboarding_state(self) -> list[dict[str, Any]]:
+    async def list_onboarding_state(self, tenant_id: str = "default") -> list[dict[str, Any]]:
         result = await self.session.execute(
             select(
+                OnboardingStateRecord.tenant_id,
                 OnboardingStateRecord.project_name,
                 OnboardingStateRecord.provider_name,
                 OnboardingStateRecord.owner_team,
@@ -2885,11 +2892,14 @@ class IncidentRepository:
                 OnboardingStateRecord.connectivity_payload,
                 OnboardingStateRecord.updated_at,
                 OnboardingStateRecord.last_tested_at,
-            ).order_by(OnboardingStateRecord.project_name, OnboardingStateRecord.provider_name)
+            )
+            .where(OnboardingStateRecord.tenant_id == self._require("onboarding.tenant_id", tenant_id))
+            .order_by(OnboardingStateRecord.project_name, OnboardingStateRecord.provider_name)
         )
         rows = result.all()
         return [
             {
+                "tenant_id": row.tenant_id,
                 "project_name": row.project_name,
                 "provider_name": row.provider_name,
                 "owner_team": row.owner_team,
