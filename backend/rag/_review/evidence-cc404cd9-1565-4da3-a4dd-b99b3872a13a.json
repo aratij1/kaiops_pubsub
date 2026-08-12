@@ -1,0 +1,67 @@
+{
+  "draft_id": "evidence-cc404cd9-1565-4da3-a4dd-b99b3872a13a",
+  "status": "draft",
+  "alert_id": "cc404cd9-1565-4da3-a4dd-b99b3872a13a",
+  "incident_id": "4328db53-7413-40d8-be0f-6fbce4fb913c",
+  "alert_type": "ClosureServiceUnavailablePostMerge",
+  "severity": "critical",
+  "title": "Evidence review: ClosureServiceUnavailablePostMerge",
+  "content": "## Alert\nClosureServiceUnavailablePostMerge on closure-service (prod)\n\n## Evidence-backed summary\nEvidence was retrieved; model synthesis was unavailable.\n\n## Hypotheses\n- No grounded hypothesis was produced.\n\n## Collected evidence\n- [LOG-b73aa2b061371c1e] log: 2026-08-12T12:10:29.313353604Z INFO: 172.18.0.31:33910 - \"GET /metrics HTTP/1.1\" 200 OK (docker://kaiops_pub-closure-service-1#L1)\n- [TICKET-f3609d0bbbebb0e1] ticket: KAN-1473 closure-service: ClosureServiceUnavailable; type=Bug; status=To Do; priority=Medium; updated=2026-08-12T17:57:01.713+0530; labels=kaiops-candidate-11ee253a1a3a27a5c53b375961ab7cee,kaiops-severity-critical,kaiops_incident_4328db53_7413_40d8_be0f_6fbce4fb913c,managed_by_kaiops; description=AI-discovered incident Service: closure-service Environment: prod Category: dependency Final severity: critical Confidence: 0.8 Initial hypothesis The closure-service signal is likely caused by a dependency condition. Business impact Customers may be unable to complete the affected business journey. Evidence [{\"evidence_id\": \"alert:6e0ee68a-5b11-4196-ae7d-1db0af2f0f05\", \"source\": \"log\", \"uri\": \"al (https://kaiops-test.atlassian.net/browse/KAN-1473)\n- [CODE-5a5d61e9e1caf4b1] code: 1: from __future__ import annotations 2: 3: import asyncio 4: from collections.abc import Awaitable, Callable, Coroutine (code:///workspace/backend/src/closure-service/app.py#L1)\n- [MYSQL-cb470dfddb967b56] mysql: table=incidents {\"id\": \"4328db53741340d8be0f6fbce4fb913c\", \"tenant_id\": \"default\", \"service\": \"closure-service\", \"environment\": \"prod\", \"severity\": \"critical\", \"status\": \"investigating\", \"title\": \"closure-service: ClosureServiceUnavailablePostMerge\", \"ticket_id\": \"KAN-1473\", \"payload\": \"{\\\"id\\\": \\\"4328db53-7413-40d8-be0f-6fbce4fb913c\\\", \\\"title\\\": \\\"closure-service: ClosureServiceUnavailablePostMerge\\\", \\\"status\\\": \\\"investigating\\\", \\\"service\\\": \\\"closure-service\\\", \\\"summary\\\": \\\"closure-service is unreachable, connection refused, related to _build_final_incident_payload function (post-merge code-analysis check).\\\", \\\"metadata (mysql://kaiops/incidents#row=4328db53741340d8be0f6fbce4fb913c)\n- [LOG-cc342401d6a94425] log: 2026-08-12T12:10:44.316533276Z INFO: 172.18.0.31:42518 - \"GET /metrics HTTP/1.1\" 200 OK (docker://kaiops_pub-closure-service-1#L2)\n- [CODE-326266f9013d00da] code: 7: 8: from closure_service import ClosureValidationAgent 9: from common.config import get_settings 10: from common.event_publishers import build_agent_event_contract, build_event_envelope 11: from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever 12: from common.models import Incident, IncidentStatus, RemediationAction, ResolutionReport 13: from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever (code:///workspace/backend/src/closure-service/app.py#L10)\n- [MYSQL-c3305c4d71a83399] mysql: table=incident_projections {\"incident_id\": \"4328db53741340d8be0f6fbce4fb913c\", \"alert_id\": \"cc404cd915654da3a4ddb99b3872a13a\", \"trace_id\": \"aa566e81491f4385a7d2493395dca8c3\", \"recommendation_id\": null, \"flow_id\": null, \"tenant_id\": \"default\", \"service\": \"closure-service\", \"environment\": \"prod\", \"severity\": \"critical\", \"status\": \"investigating\", \"owner\": null, \"risk_tier\": \"high\", \"execution_mode\": \"human-approval\", \"requires_approval\": 1, \"policy_version\": \"policy-v1\", \"policy_reason\": \"severity in mandatory approval set; planner=deterministic severity routing\", \"transport_provider\": \"rabbitmq\", \"latest_event_id\": \"1d58d82914ed4e0294c4cc51 (mysql://kaiops/incident_projections#row=cc404cd915654da3a4ddb99b3872a13a)\n- [LOG-61a34d81a523b862] log: 2026-08-12T12:10:59.306313852Z INFO: 172.18.0.31:53836 - \"GET /metrics HTTP/1.1\" 200 OK (docker://kaiops_pub-closure-service-1#L3)\n- [CODE-9239fd74bd014a1c] code: 97: existing_metadata = incident_payload_map.get(\"metadata\") 98: final_payload = { 99: \"id\": str(action.incident_id), 100: \"service\": service_name, 101: \"environment\": str(incident_payload_map.get(\"environment\") or action.parameters.get(\"environment\") or \"prod\"), 102: \"severity\": str(incident_payload_map.get(\"severity\") or recommendation_map.get(\"severity\") or \"warning\").lower(), 103: \"status\": IncidentStatus.CLOSED.value if report.health_restored else IncidentStatus.FAILED.value, (code:///workspace/backend/src/closure-service/app.py#L100)\n- [MYSQL-a3ada98a6f3ed952] mysql: table=alerts {\"id\": \"eadd224526634e768702192317672705\", \"tenant_id\": \"default\", \"source\": \"jira\", \"name\": \"kaiops-closure-service: ServiceDown\", \"service\": \"jira-tickets\", \"environment\": \"prod\", \"severity\": \"warning\", \"fingerprint\": null, \"correlation_id\": null, \"payload\": \"{\\\"id\\\": \\\"eadd2245-2663-4e76-8702-192317672705\\\", \\\"name\\\": \\\"kaiops-closure-service: ServiceDown\\\", \\\"labels\\\": {\\\"ticket_id\\\": \\\"KAN-1445\\\", \\\"jira_status\\\": \\\"To Do\\\", \\\"alert_status\\\": \\\"firing\\\", \\\"event_origin\\\": \\\"kaiops\\\", \\\"support_tier\\\": \\\"L1\\\", \\\"jira_assignee\\\": \\\"\\\", \\\"jira_issue_id\\\": \\\"12255\\\", \\\"jira_priority\\\": \\\"Medium\\\", \\\"jira_reporte (mysql://kaiops/alerts#row=eadd224526634e768702192317672705)\n- [CODE-a35dbf81291fbfa0] code: settings.service_name = \"closure-service\" (code:///app/backend/src/closure-service/app.py#L21)\n- [CODE-1347a99326cf9b57] code: agent=\"closure-service\", (code:///app/backend/src/closure-service/app.py#L52)\n- [CODE-de9d17d0cf373d42] code: logger = logging.getLogger(\"closure-service.jira-sync\") (code:///app/backend/src/closure-service/app.py#L124)\n- [CODE-a3dbeca178335514] code: logger = logging.getLogger(\"closure-service\") (code:///app/backend/src/closure-service/app.py#L214)\n- [CODE-4706c5a5f93f80bd] code: task = asyncio.create_task(consume_forever(consumer, handle), name=f\"closure-service-{source}-consumer\") (code:///app/backend/src/closure-service/app.py#L311)\n- [CODE-f93e45aa02d66ad4] code: actor=str(action.parameters.get(\"approved_by\") or \"closure-service\"), (code:///app/backend/src/closure-service/app.py#L339)\n- [CODE-6ae802586eb5f1d5] code: \"closure-service\", (code:///app/backend/src/monitoring-adapter/app.py#L1907)",
+  "services": [
+    "closure-service"
+  ],
+  "evidence_ids": [
+    "LOG-b73aa2b061371c1e",
+    "TICKET-f3609d0bbbebb0e1",
+    "CODE-5a5d61e9e1caf4b1",
+    "MYSQL-cb470dfddb967b56",
+    "LOG-cc342401d6a94425",
+    "CODE-326266f9013d00da",
+    "MYSQL-c3305c4d71a83399",
+    "LOG-61a34d81a523b862",
+    "CODE-9239fd74bd014a1c",
+    "MYSQL-a3ada98a6f3ed952",
+    "CODE-a35dbf81291fbfa0",
+    "CODE-1347a99326cf9b57",
+    "CODE-de9d17d0cf373d42",
+    "CODE-a3dbeca178335514",
+    "CODE-4706c5a5f93f80bd",
+    "CODE-f93e45aa02d66ad4",
+    "CODE-6ae802586eb5f1d5"
+  ],
+  "source_uris": [
+    "docker://kaiops_pub-closure-service-1#L1",
+    "https://kaiops-test.atlassian.net/browse/KAN-1473",
+    "code:///workspace/backend/src/closure-service/app.py#L1",
+    "mysql://kaiops/incidents#row=4328db53741340d8be0f6fbce4fb913c",
+    "docker://kaiops_pub-closure-service-1#L2",
+    "code:///workspace/backend/src/closure-service/app.py#L10",
+    "mysql://kaiops/incident_projections#row=cc404cd915654da3a4ddb99b3872a13a",
+    "docker://kaiops_pub-closure-service-1#L3",
+    "code:///workspace/backend/src/closure-service/app.py#L100",
+    "mysql://kaiops/alerts#row=eadd224526634e768702192317672705",
+    "code:///app/backend/src/closure-service/app.py#L21",
+    "code:///app/backend/src/closure-service/app.py#L52",
+    "code:///app/backend/src/closure-service/app.py#L124",
+    "code:///app/backend/src/closure-service/app.py#L214",
+    "code:///app/backend/src/closure-service/app.py#L311",
+    "code:///app/backend/src/closure-service/app.py#L339",
+    "code:///app/backend/src/monitoring-adapter/app.py#L1907"
+  ],
+  "created_at": "2026-08-12T12:30:32.282804+00:00",
+  "updated_at": "2026-08-12T12:30:32.282804+00:00",
+  "reviewed_by": null,
+  "review_notes": null,
+  "approved_by": null,
+  "approved_at": null,
+  "rag_document_path": null,
+  "evidence_relevance": {
+    "verified": true,
+    "identity_terms": [
+      "closure-service",
+      "closureserviceunavailablepostmerge"
+    ],
+    "relevant_count": 17,
+    "retrieved_count": 19
+  }
+}
