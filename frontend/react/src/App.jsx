@@ -8160,6 +8160,21 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }),
     [onboardingSourceDocs.rows],
   );
+  const selectedJenkinsProcess = useMemo(() => {
+    const response = selectedExecutionTechnicalResponse && typeof selectedExecutionTechnicalResponse === "object" ? selectedExecutionTechnicalResponse : {};
+    const submitted = response.submitted_parameters && typeof response.submitted_parameters === "object" ? response.submitted_parameters : {};
+    const executor = String(response.executor || remediationPlanEditor.executor_type || remediationPlanEditor.connection_type || "").toLowerCase();
+    return {
+      configured: executor === "jenkins",
+      jobName: String(response.job_name || remediationPlanEditor.job_name || ""),
+      queueUrl: String(response.queue_url || ""),
+      resolutionId: String(submitted.KAI_OPS_RESOLUTION_ID || response.resolution_id || selectedExecutionPlan.remediationAction?.parameters?.resolution_id || selectedExecutionPlan.remediationAction?.action_type || "Not selected"),
+      applicationId: String(submitted.KAI_OPS_APPLICATION_ID || selectedExecutionPlan.remediationAction?.parameters?.application_id || selectedApplicationConnection.application || "Not recorded"),
+      dryRun: String(submitted.KAI_OPS_DRY_RUN ?? selectedExecutionPlan.remediationAction?.parameters?.dry_run ?? "true") === "true",
+      queued: Boolean(response.queue_url),
+      succeeded: String(selectedRemediationOutcome?.status || "").toLowerCase() === "succeeded",
+    };
+  }, [selectedExecutionTechnicalResponse, selectedRemediationOutcome, selectedExecutionPlan, remediationPlanEditor, selectedApplicationConnection]);
   const onboardingSourceDocCount = onboardingSourceDocRows.length;
   const severityOverrideByKey = useMemo(() => {
     const map = new Map();
@@ -10844,6 +10859,18 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <span>Target: {selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · Risk: {selectedExecutionPlan.riskTier || "unknown"}</span>
                           <span>Duplicate execution is guarded by the remediation idempotency contract; repeated clicks are disabled while a request is active.</span>
                         </div>
+                        <section className={`jenkins-process-panel ${selectedJenkinsProcess.configured ? "is-configured" : "is-pending"}`} aria-labelledby="jenkins-process-heading">
+                          <header><div><span className="eyebrow">Application automation</span><h3 id="jenkins-process-heading">Jenkins Resolution Process</h3><p>Governed execution from resolution selection through recovery validation.</p></div><span className={`pill ${selectedJenkinsProcess.succeeded ? "pill-success" : selectedJenkinsProcess.queued ? "pill-info" : selectedJenkinsProcess.configured ? "pill-warning" : "status-failed"}`}>{selectedJenkinsProcess.succeeded ? "Completed" : selectedJenkinsProcess.queued ? "Queued" : selectedJenkinsProcess.configured ? "Configured" : "Not configured"}</span></header>
+                          <dl className="jenkins-process-summary"><div><dt>Application</dt><dd>{selectedJenkinsProcess.applicationId}</dd></div><div><dt>Jenkins job</dt><dd>{selectedJenkinsProcess.jobName || "Job path required"}</dd></div><div><dt>Resolution</dt><dd>{selectedJenkinsProcess.resolutionId}</dd></div><div><dt>Execution</dt><dd>{selectedJenkinsProcess.dryRun ? "Dry run" : "Live"}</dd></div></dl>
+                          <ol className="jenkins-process-flow" aria-label="Jenkins resolution progress">
+                            <li className="is-complete"><span>1</span><div><strong>Resolution selected</strong><small>{selectedJenkinsProcess.resolutionId}</small></div></li>
+                            <li className={executionPreflightCurrent ? "is-complete" : "is-current"}><span>2</span><div><strong>Safety validation</strong><small>{executionPreflightCurrent ? "Dry run passed" : "Dry run required"}</small></div></li>
+                            <li className={cockpitApprovalAccepted ? "is-complete" : executionPreflightCurrent ? "is-current" : ""}><span>3</span><div><strong>Approval</strong><small>{cockpitApprovalAccepted ? "Recorded" : "Pending"}</small></div></li>
+                            <li className={selectedJenkinsProcess.queued || selectedJenkinsProcess.succeeded ? "is-complete" : cockpitApprovalAccepted ? "is-current" : ""}><span>4</span><div><strong>Jenkins execution</strong><small>{selectedJenkinsProcess.succeeded ? "Completed" : selectedJenkinsProcess.queued ? "Build queued" : "Waiting"}</small></div></li>
+                            <li className={selectedJenkinsProcess.succeeded ? "is-complete" : ""}><span>5</span><div><strong>Validate and close</strong><small>{selectedJenkinsProcess.succeeded ? `${editedExecutionPlan.queries.length} check(s)` : "Waiting for result"}</small></div></li>
+                          </ol>
+                          <footer><div><strong>Rollback</strong><span>{executionRollbackPlan || "Rollback instructions are required before live execution."}</span></div>{selectedJenkinsProcess.queueUrl ? <a className="button-secondary" href={selectedJenkinsProcess.queueUrl} target="_blank" rel="noreferrer">Open Jenkins build</a> : <button type="button" className="button-secondary" onClick={() => document.querySelector(".remediation-connection-panel")?.scrollIntoView({ behavior: "smooth", block: "start" })}>{selectedJenkinsProcess.configured ? "Review Jenkins setup" : "Configure Jenkins"}</button>}</footer>
+                        </section>
                         <details className="execution-safety-details">
                           <summary>Safety checks <span>{executionPreflightChecks.filter((check) => check.passed).length}/{executionPreflightChecks.length} ready</span></summary>
                           <div className="execution-decision-grid">
