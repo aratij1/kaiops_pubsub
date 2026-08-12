@@ -1131,8 +1131,35 @@ class IncidentRepository:
                 "next_step": "Discovery context loaded from onboarding inputs, ticket/log/code evidence, and alert metadata while incident projection is pending.",
             }
 
-        incident_payload = incident_record.payload if isinstance(incident_record.payload, dict) else {}
+        incident_payload = dict(incident_record.payload) if isinstance(incident_record.payload, dict) else {}
         incident_id_str = str(incident_record.id)
+        incident_payload["id"] = incident_id_str
+        incident_payload["status"] = incident_record.status
+        incident_payload["severity"] = incident_record.severity
+        incident_payload["service"] = incident_record.service
+        incident_payload["environment"] = incident_record.environment
+        incident_payload["title"] = incident_record.title
+        ticket_id = incident_record.ticket_id or incident_payload.get("ticket_id") or ""
+        incident_payload["ticket_id"] = ticket_id or None
+        
+        import os
+        jira_base = str(os.environ.get("JIRA_URL") or os.environ.get("JIRA_API_BASE_URL") or "").rstrip("/")
+        jira_link = f"{jira_base}/browse/{ticket_id}" if (ticket_id and jira_base) else None
+        incident_payload["jira_link"] = jira_link
+        # jira_key/jira_url alias the same value under the naming convention
+        # alert-intelligence and the incident list UI already use.
+        incident_payload["jira_key"] = ticket_id or None
+        incident_payload["jira_url"] = jira_link
+
+        status_lower = str(incident_record.status or "").strip().lower()
+        if status_lower in {"closed", "resolved", "done"}:
+            jira_status = "Done"
+        elif status_lower in {"pending", "awaiting_approval"}:
+            jira_status = "Awaiting Approval"
+        else:
+            jira_status = "In Progress"
+        incident_payload["jira_status"] = jira_status
+
 
         recommendation = {}
         audit_stmt = (
@@ -3420,10 +3447,29 @@ class IncidentRepository:
                 projection_payload["remediation_action"] = action.payload or {}
                 projection_payload["remediation_status"] = action_status
 
+            ticket_id = ticket_by_incident.get(row.incident_id) or projection_payload.get("ticket_id")
+
+            import os
+            jira_base = str(os.environ.get("JIRA_URL") or os.environ.get("JIRA_API_BASE_URL") or "").rstrip("/")
+            jira_link = f"{jira_base}/browse/{ticket_id}" if (ticket_id and jira_base) else None
+
+            status_lower = str(projected_status or "").strip().lower()
+            if status_lower in {"closed", "resolved", "done"}:
+                jira_status = "Done"
+            elif status_lower in {"pending", "awaiting_approval"}:
+                jira_status = "Awaiting Approval"
+            else:
+                jira_status = "In Progress"
+
+            projection_payload["ticket_id"] = ticket_id or None
+            projection_payload["jira_link"] = jira_link
+            projection_payload["jira_status"] = jira_status
+            projection_payload["jira_key"] = ticket_id or None
+            projection_payload["jira_url"] = jira_link
+
             response_rows.append(
                 {
                     "incident_id": str(row.incident_id),
-                    "ticket_id": ticket_by_incident.get(row.incident_id),
                     "alert_id": str(row.alert_id) if row.alert_id else None,
                     "trace_id": row.trace_id,
                     "recommendation_id": str(merged_recommendation_id) if merged_recommendation_id else None,
@@ -3444,9 +3490,15 @@ class IncidentRepository:
                     "latest_event_type": row.latest_event_type,
                     "latest_event_at": row.latest_event_at,
                     "updated_at": row.updated_at,
+                    "ticket_id": ticket_id or None,
+                    "jira_link": jira_link,
+                    "jira_status": jira_status,
+                    "jira_key": ticket_id or None,
+                    "jira_url": jira_link,
                     "projection_payload": projection_payload,
                 }
             )
+
         return response_rows
 
     async def list_closed_incidents(self, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -3476,10 +3528,40 @@ class IncidentRepository:
         result = await self.session.execute(stmt)
         rows = result.all()
 
+        incident_ids = [row.incident_id for row in rows]
+        ticket_id_by_incident: dict[UUID, str] = {}
+        if incident_ids:
+            ticket_result = await self.session.execute(
+                select(IncidentRecord.id, IncidentRecord.ticket_id)
+                .where(IncidentRecord.id.in_(incident_ids))
+            )
+            for inc_id, t_id in ticket_result.all():
+                if t_id:
+                    ticket_id_by_incident[inc_id] = t_id
+
         response_rows: list[dict[str, Any]] = []
         for row in rows:
-            projection_payload = row.projection_payload if isinstance(row.projection_payload, dict) else {}
+            projection_payload = dict(row.projection_payload) if isinstance(row.projection_payload, dict) else {}
             event_payload = projection_payload.get("event_payload") if isinstance(projection_payload.get("event_payload"), dict) else {}
+            
+            ticket_id = ticket_id_by_incident.get(row.incident_id) or projection_payload.get("ticket_id")
+            
+            import os
+            jira_base = str(os.environ.get("JIRA_URL") or os.environ.get("JIRA_API_BASE_URL") or "").rstrip("/")
+            jira_link = f"{jira_base}/browse/{ticket_id}" if (ticket_id and jira_base) else None
+            
+            status_lower = str(row.status or "").strip().lower()
+            if status_lower in {"closed", "resolved", "done"}:
+                jira_status = "Done"
+            else:
+                jira_status = "In Progress"
+                
+            projection_payload["ticket_id"] = ticket_id or None
+            projection_payload["jira_link"] = jira_link
+            projection_payload["jira_status"] = jira_status
+            projection_payload["jira_key"] = ticket_id or None
+            projection_payload["jira_url"] = jira_link
+
             response_rows.append(
                 {
                     "incident_id": str(row.incident_id),
@@ -3498,6 +3580,11 @@ class IncidentRepository:
                     "alerts_cleared": bool(event_payload.get("alerts_cleared")) if "alerts_cleared" in event_payload else None,
                     "closed_at": row.latest_event_at or row.updated_at,
                     "updated_at": row.updated_at,
+                    "ticket_id": ticket_id or None,
+                    "jira_link": jira_link,
+                    "jira_status": jira_status,
+                    "jira_key": ticket_id or None,
+                    "jira_url": jira_link,
                     "projection_payload": projection_payload,
                 }
             )

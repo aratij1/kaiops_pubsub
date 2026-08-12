@@ -76,7 +76,9 @@ import {
   alertApplicationCandidate,
   alertRowScore,
   resolveCanonicalAlertRow,
+  resolveCanonicalAlertForRow,
   dedupeAndConsolidateAlertRows,
+  shouldRetainAlertSelection,
   mapClosedIncidentToAlertStreamRow,
   projectHintFromAlertRow,
   ALERT_UUID_PATTERN,
@@ -508,6 +510,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   });
   const [selectedAlertId, setSelectedAlertId] = useState("");
   const [selectedAlertSnapshot, setSelectedAlertSnapshot] = useState(null);
+  // A landing-pad row opened before its canonical DB alert exists yet: keep
+  // the raw row here so the cockpit stays on it while a background effect
+  // retries resolveCanonicalAlertForRow against alerts.rows as it refreshes.
+  const [pendingCanonicalAlert, setPendingCanonicalAlert] = useState(null);
+  const pendingCanonicalAlertRetryRef = useRef({ key: "", attempts: 0 });
   const selectedAlertAnalysisPollRef = useRef({ alertId: "", attempts: 0 });
   const alertStreamRefreshInFlight = useRef(false);
   const landingPadStreamRefreshInFlight = useRef(false);
@@ -1348,42 +1355,34 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }
 
   function openAlertDetails(row, initialTab = "overview") {
-    const projection = row?.projection_payload && typeof row.projection_payload === "object"
-      ? row.projection_payload
-      : {};
-    const eventPayload = projection?.event_payload && typeof projection.event_payload === "object"
-      ? projection.event_payload
-      : {};
-    const suppliedAlertId = String(
-      row?.alert_id
-      || projection?.alert_id
-      || eventPayload?.alert_id
-      || eventPayload?.source_alert_id
-      || ""
-    ).trim();
     // Incident projections already carry the authoritative alert UUID. Do not
     // replace it with a semantically similar landing-pad row whose id is a
     // filename; processed RCA endpoints are keyed by the canonical UUID.
-    const canonicalRow = ALERT_UUID_PATTERN.test(suppliedAlertId)
-      ? row
-      : resolveCanonicalAlertRow(row, alerts.rows);
-    const canonicalAlertId = canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id;
-    const clickedAlertId = suppliedAlertId || row?.id || row?.incident_id;
-    const alertId = canonicalAlertId || clickedAlertId;
+    const resolution = resolveCanonicalAlertForRow(row, alerts.rows);
+    const pending = resolution.status === "pending";
+    // While pending (canonical DB alert not in alerts.rows yet -- landing-pad
+    // ingestion fires before the alert row is persisted/fetched), keep the
+    // row itself as the selection so it stays visible in the cockpit.
+    // loadAlertDetails already has a dedicated non-UUID branch that renders a
+    // local "landing_pad_only" snapshot without an API call, so this never
+    // sends a doomed processed-result lookup. The retry effect below promotes
+    // the selection to the real UUID once alerts.rows catches up.
+    const canonicalRow = pending ? row : resolution.row;
+    const alertId = String(canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id || "").trim();
     if (!alertId) {
       return;
     }
-    const selectedRow = canonicalAlertId ? canonicalRow : row;
-    setSelectedAlertSnapshot(selectedRow);
-    setSelectedAlertId(String(alertId));
+    setPendingCanonicalAlert(pending ? row : null);
+    setSelectedAlertSnapshot(canonicalRow);
+    setSelectedAlertId(alertId);
     // This action owns the complete cockpit URL below. Prevent the legacy tab
     // synchronization effect from racing it with a navigation to plain `/`,
     // which would remove workspace=alert and leave the details view hidden.
     skipNextActiveTabNavigationRef.current = true;
     setActiveTab("home");
     setHomeDetailTab(initialTab);
-    loadAlertDetails(alertId, selectedRow);
-    onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(String(alertId))}`);
+    loadAlertDetails(alertId, canonicalRow);
+    onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(alertId)}`);
     window.setTimeout(() => {
       alertDetailsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
       alertDetailsRef.current?.focus({ preventScroll: true });
@@ -1428,11 +1427,45 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     // Detail URLs are durable application state. Reconstruct the selection on
     // refresh, browser history navigation, and shared links instead of relying
     // on an in-memory summary-row click from the current session.
+    if (ALERT_UUID_PATTERN.test(routeAlertId)) {
+      setSelectedAlertId(routeAlertId);
+      setSelectedAlertSnapshot(null);
+      setHomeDetailTab("overview");
+      void loadAlertDetails(routeAlertId);
+      return;
+    }
+    // A landing-pad filename can end up in the URL from an earlier click that
+    // happened before the canonical DB alert existed (see openAlertDetails /
+    // resolveCanonicalAlertForRow). Route restoration must go through the same
+    // canonicalization -- otherwise every refresh/shared-link re-opens with an
+    // id that can never resolve, permanently stuck on a landing-pad-only
+    // snapshot even after the canonical alert is long since available. Find
+    // the original landing-pad row by filename so matching has its real
+    // fingerprint/name/service identity, not just the bare filename string.
+    const landingPadSourceRow = (Array.isArray(landingPadRecent.rows) ? landingPadRecent.rows : [])
+      .find((row) => String(row?.file || "") === routeAlertId)
+      || { id: routeAlertId, alert_id: routeAlertId, file: routeAlertId };
+    const resolution = resolveCanonicalAlertForRow(landingPadSourceRow, alerts.rows);
+    if (resolution.status === "resolved") {
+      const canonicalRow = resolution.row;
+      const alertId = String(canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id || "").trim();
+      if (alertId) {
+        setSelectedAlertId(alertId);
+        setSelectedAlertSnapshot(canonicalRow);
+        setHomeDetailTab("overview");
+        void loadAlertDetails(alertId, canonicalRow);
+        onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(alertId)}`);
+      }
+      return;
+    }
     setSelectedAlertId(routeAlertId);
     setSelectedAlertSnapshot(null);
     setHomeDetailTab("overview");
     void loadAlertDetails(routeAlertId);
-  }, [adminSession.accessToken, activeTab, currentSearch, selectedAlertId]);
+    if (resolution.status === "pending") {
+      setPendingCanonicalAlert(landingPadSourceRow);
+    }
+  }, [adminSession.accessToken, activeTab, currentSearch, selectedAlertId, alerts.rows, landingPadRecent.rows]);
 
   function openGlobalOperationalItem(item) {
     if (!item?.row) return;
@@ -1563,6 +1596,19 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     if (selectedAlertData.loading && String(selectedAlertData.alertId || "") === String(selectedAlertId || "")) {
       return;
     }
+    // See shouldRetainAlertSelection: list membership in scopedRows is not
+    // authoritative for whether the selected alert still exists (closure and
+    // monitor-scope filtering can both drop it from this summary list without
+    // it having stopped existing) -- only clear the selection when there is no
+    // already-loaded payload to fall back on.
+    if (shouldRetainAlertSelection({
+      selectedAlertId,
+      payload: selectedAlertData.payload,
+      error: selectedAlertData.error,
+      alertId: selectedAlertData.alertId,
+    })) {
+      return;
+    }
     // The incident summary must not implicitly open the newest row. That row may
     // still be moving through enrichment/RCA, which made the first cockpit
     // appear incomplete before the operator selected an alert.
@@ -1572,6 +1618,58 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       setSelectedAlertData({ loading: false, payload: null, error: "", alertId: "" });
     }
   }, [activeTab, alerts.rows, closedIncidents.rows, applicationToMonitor, selectedAlertId, selectedAlertSnapshot, selectedAlertData.loading, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId]);
+
+  useEffect(() => {
+    // A landing-pad row was opened before its canonical DB alert existed in
+    // alerts.rows (see openAlertDetails / resolveCanonicalAlertForRow). Retry
+    // resolution on every alerts.rows refresh; once the canonical UUID-bearing
+    // alert appears, promote the selection to it and load the real processed
+    // result. Bounded so a landing-pad event that never gets persisted (e.g.
+    // discovery classified it as noise) doesn't retry forever.
+    if (activeTab !== "home" || !pendingCanonicalAlert) {
+      return undefined;
+    }
+    const resolution = resolveCanonicalAlertForRow(pendingCanonicalAlert, alerts.rows);
+    if (resolution.status === "resolved") {
+      const canonicalRow = resolution.row;
+      const alertId = String(canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id || "").trim();
+      if (alertId) {
+        setPendingCanonicalAlert(null);
+        setSelectedAlertSnapshot(canonicalRow);
+        setSelectedAlertId(alertId);
+        loadAlertDetails(alertId, canonicalRow);
+        onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(alertId)}`);
+      }
+      return undefined;
+    }
+    if (resolution.status === "unresolved") {
+      // The row itself carries no identity to ever match against -- retrying
+      // cannot help.
+      setPendingCanonicalAlert(null);
+      return undefined;
+    }
+    const previous = pendingCanonicalAlertRetryRef.current;
+    const pendingKey = String(
+      pendingCanonicalAlert?.file
+      || pendingCanonicalAlert?.id
+      || pendingCanonicalAlert?.alert_id
+      || ""
+    );
+    const attempts = previous.key === pendingKey ? Number(previous.attempts || 0) : 0;
+    // loadRecentAlerts throttles background refreshes to at most once per 45s
+    // (see recentAlertsRequestRef), so polling faster than that only re-checks
+    // the same alerts.rows snapshot. Match that cadence; ten attempts (~7.5
+    // minutes) covers slow discovery processing without retrying forever for
+    // an event that never gets persisted (e.g. classified as noise).
+    if (attempts >= 10) {
+      return undefined;
+    }
+    pendingCanonicalAlertRetryRef.current = { key: pendingKey, attempts: attempts + 1 };
+    const timer = window.setTimeout(() => {
+      void loadRecentAlerts({ background: true });
+    }, 45000);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, pendingCanonicalAlert, alerts.rows]);
 
   useEffect(() => {
     const needsEvidence = homeDetailTab === "rca" && rcaDetailView === "evidence";
@@ -10306,6 +10404,35 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                                 </span>
                               </td>
                             </tr>
+                            <tr>
+                               <th>Jira Ticket</th>
+                               <td>
+                                 {(selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id) ? (
+                                   <a 
+                                     href={selectedAlertWorkflow?.incident?.jira_link || selectedAlertWorkflow?.jira_link || `https://kaiops-test.atlassian.net/browse/${selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id}`} 
+                                     target="_blank" 
+                                     rel="noopener noreferrer"
+                                     style={{ color: "#22d3ee", textDecoration: "underline", fontWeight: "bold" }}
+                                   >
+                                     {selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id}
+                                   </a>
+                                 ) : (
+                                   "-"
+                                 )}
+                               </td>
+                             </tr>
+                             <tr>
+                               <th>Jira Status</th>
+                               <td>
+                                 {(selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id) ? (
+                                   <span className={`pill ${(selectedAlertWorkflow?.incident?.jira_status || selectedAlertWorkflow?.jira_status) === "Done" ? "status-success" : "status-warning"}`}>
+                                     {selectedAlertWorkflow?.incident?.jira_status || selectedAlertWorkflow?.jira_status || "In Progress"}
+                                   </span>
+                                 ) : (
+                                   "-"
+                                 )}
+                               </td>
+                             </tr>
                             <tr><th>Closed At</th><td>{formatIstTimestamp(selectedAlertWorkflow?.incident?.closed_at)}</td></tr>
                             <tr><th>Service</th><td>{selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "-"}</td></tr>
                             <tr><th>Analysis Status</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).status}</td></tr>

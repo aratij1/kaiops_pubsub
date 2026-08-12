@@ -11,7 +11,7 @@ export interface CopilotRouteRuntime {
   openIncidentMetadata: () => void;
   refresh: () => void;
 }
-export interface ClosedIncidentRow { incident_id?: string | number; ticket_id?: string; service?: string; severity?: string; status?: string; closed_at?: string; updated_at?: string; }
+export interface ClosedIncidentRow { incident_id?: string | number; ticket_id?: string; jira_link?: string; jira_status?: string; jira_key?: string; jira_url?: string; service?: string; severity?: string; status?: string; closed_at?: string; updated_at?: string; }
 export interface ClosedRouteRuntime { rows: ClosedIncidentRow[]; risk: string; mode: string; riskOptions: string[]; modeOptions: string[]; loading: boolean; error: string; refresh: () => void; setRisk: (value: string) => void; setMode: (value: string) => void; }
 export interface WorkflowEventRow { sequence?: string | number; agent?: string; action?: string; decision?: string; output?: string; communicates_to?: string; }
 export interface GatewayEventRow { id?: string | number; created_at?: string; path?: string; status_code?: string | number; safety?: { decision?: string }; trace_id?: string; }

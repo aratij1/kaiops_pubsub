@@ -94,6 +94,7 @@ def _build_final_incident_payload(
     recommendation_map = recommendation if isinstance(recommendation, dict) else {}
     source_contract_map = source_contract if isinstance(source_contract, dict) else {}
     service_name = _resolve_closure_service_name(action, incident_payload_map)
+    existing_metadata = incident_payload_map.get("metadata")
     final_payload = {
         "id": str(action.incident_id),
         "service": service_name,
@@ -111,9 +112,106 @@ def _build_final_incident_payload(
             or recommendation_map.get("trace_id")
             or ""
         ) or None,
+        # Preserve persistence-critical fields that save_incident() would
+        # otherwise silently reset to Pydantic defaults (metadata -> {},
+        # created_at -> now, tenant_id -> "default"), wiping data set at
+        # incident creation (incident_candidate/correlation_key, Jira,
+        # deduplication, severity_policy, etc.).
+        "metadata": existing_metadata if isinstance(existing_metadata, dict) else {},
+        "created_at": incident_payload_map.get("created_at"),
+        "tenant_id": incident_payload_map.get("tenant_id") or "default",
     }
     final_payload["alert_ids"] = incident_payload_map.get("alert_ids") if isinstance(incident_payload_map.get("alert_ids"), list) else []
+    if final_payload["created_at"] is None:
+        final_payload.pop("created_at")
     return final_payload
+
+
+async def _sync_closure_to_jira(incident_payload: dict[str, Any], report: ResolutionReport) -> None:
+    import os
+    import logging
+    import httpx
+
+    logger = logging.getLogger("closure-service.jira-sync")
+
+    ticket_id = str(incident_payload.get("ticket_id") or "").strip()
+    if not ticket_id:
+        logger.info("No Jira ticket linked to incident %s; skipping closure update", report.incident_id)
+        return
+
+    base_url = str(os.getenv("JIRA_API_BASE_URL", "") or os.getenv("JIRA_URL", "") or "").rstrip("/")
+    email = str(os.getenv("JIRA_API_EMAIL", "") or os.getenv("JIRA_USER_EMAIL", "") or "")
+    token = str(os.getenv("JIRA_API_TOKEN", "") or "")
+
+    if not (base_url and email and token):
+        logger.info("Jira outbound API is not fully configured; skipping closure sync on ticket %s", ticket_id)
+        return
+
+    auth = (email, token)
+    headers = {"Content-Type": "application/json"}
+
+    # 1. Post resolution comment
+    lessons = "\n".join(f"- {lesson}" for lesson in report.lessons_learned) if report.lessons_learned else "- No additional lessons captured."
+    comment_body = (
+        "[kaiops-managed-closure]\n"
+        "h2. Incident Resolved & Closed\n"
+        "This incident has been automated resolved by KaiOps workflow.\n\n"
+        "h3. Resolution Report\n"
+        f"* *Root Cause*: {report.root_cause}\n"
+        f"* *Impact*: {report.impact}\n"
+        f"* *Action Taken*: {report.action_taken}\n"
+        f"* *Health Restored*: {report.health_restored}\n"
+        f"* *Alerts Cleared*: {report.alerts_cleared}\n"
+        f"* *Validation Details*: {report.validation}\n\n"
+        "h3. Lessons Learned\n"
+        f"{lessons}\n"
+    )
+
+    try:
+        async with httpx.AsyncClient(auth=auth, timeout=15.0) as client:
+            # Post Comment
+            comment_resp = await client.post(
+                f"{base_url}/rest/api/2/issue/{ticket_id}/comment",
+                json={"body": comment_body},
+                headers=headers
+            )
+            if comment_resp.status_code >= 400:
+                logger.error("Failed to post resolution comment to Jira ticket %s (%s): %s", ticket_id, comment_resp.status_code, comment_resp.text)
+            else:
+                logger.info("Successfully posted resolution comment to Jira ticket %s", ticket_id)
+
+            # 2. Transition Jira ticket to Resolved / Done
+            trans_resp = await client.get(
+                f"{base_url}/rest/api/2/issue/{ticket_id}/transitions",
+                headers=headers
+            )
+            if trans_resp.status_code >= 400:
+                logger.error("Failed to fetch transitions for Jira ticket %s (%s): %s", ticket_id, trans_resp.status_code, trans_resp.text)
+                return
+
+            transitions = trans_resp.json().get("transitions", [])
+            transition_id = None
+            for t in transitions:
+                name = str(t.get("name") or "").strip().lower()
+                if name in {"done", "resolved", "closed", "resolve", "close", "resolve issue", "close issue"}:
+                    transition_id = t.get("id")
+                    break
+
+            if transition_id:
+                transition_resp = await client.post(
+                    f"{base_url}/rest/api/2/issue/{ticket_id}/transitions",
+                    json={"transition": {"id": transition_id}},
+                    headers=headers
+                )
+                if transition_resp.status_code >= 400:
+                    logger.error("Failed to transition Jira ticket %s to resolved state (%s): %s", ticket_id, transition_resp.status_code, transition_resp.text)
+                else:
+                    logger.info("Successfully transitioned Jira ticket %s to resolved state using transition id %s", ticket_id, transition_id)
+            else:
+                logger.warning("No matching transition found for closing Jira ticket %s (available: %s)", ticket_id, [t.get("name") for t in transitions])
+
+    except Exception as exc:
+        logger.exception("Error updating Jira closure for ticket %s: %s", ticket_id, exc)
 
 
 async def _persist_closure_event(
@@ -123,6 +221,8 @@ async def _persist_closure_event(
     report: ResolutionReport,
     source_payload: dict[str, Any],
 ) -> None:
+    import logging
+    logger = logging.getLogger("closure-service")
     if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
         return
     source_contract = source_payload.get("event_contract", {}) if isinstance(source_payload.get("event_contract"), dict) else {}
@@ -190,6 +290,10 @@ async def _persist_closure_event(
             )
         )
         await session.commit()
+        try:
+            await _sync_closure_to_jira(incident_payload, report)
+        except Exception:
+            logger.exception("Failed to synchronize closure event to Jira ticket")
 
 
 async def startup(app: FastAPI) -> None:
