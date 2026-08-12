@@ -58,3 +58,39 @@ test("detail URL reconstructs the selected alert after a page refresh", async ({
   await expect(page.getByRole("heading", { name: "kaiops-api-gateway: ReloadedAlert" })).toBeVisible();
   await expect(page.getByText("Select an alert in Alert Stream to open the detail tabs workspace.")).toHaveCount(0);
 });
+
+test("incident summary connects source application and Prometheus to KaiOps processing", async ({ page }) => {
+  const alertId = "55555555-5555-4555-8555-555555555555";
+  const incidentId = "66666666-6666-4666-8666-666666666666";
+  await page.route("**/api-gateway/**", async (route) => {
+    const path = new URL(route.request().url()).pathname.replace(/^\/api-gateway/, "");
+    let body = { data: [], rows: [], summary: {}, items: [] };
+    if (path === "/auth/config") body = { mode: "local", local_development_only: true };
+    else if (path === "/auth/login") body = { access_token: "admin-token", refresh_token: "refresh-token", user: { id: 1, username: "admin", role_name: "Administrator" } };
+    else if (path.startsWith("/incidents/metadata")) body = { rows: [{ incident_id: incidentId, alert_id: alertId, title: "httpbin-failure-lab: ExternalApplicationUnavailable", service: "httpbin-failure-lab", environment: "public-internet", status: "awaiting_approval", ticket_id: "KAN-1376", source: "public-internet-blackbox", projection_payload: { context_source: "realtime_collection", event_payload: { labels: { application: "httpbin-failure-lab", project_name: "KaiOps", instance: "https://httpbin.org/status/503", alertname: "ExternalApplicationUnavailable", job: "blackbox", transport: "alertmanager", environment: "public-internet" } } } }] };
+    else if (path.startsWith("/alerts/all")) body = { data: { rows: [{ id: alertId, name: "ExternalApplicationUnavailable", service: "httpbin-failure-lab", source: "public-internet-blackbox", starts_at: "2026-08-11T15:23:20Z", trace_id: "trace-httpbin-503", description: "HTTPS probe failed for https://httpbin.org/status/503 in public-internet.", labels: { application: "httpbin-failure-lab", project_name: "KaiOps", instance: "https://httpbin.org/status/503", alertname: "ExternalApplicationUnavailable", job: "blackbox", transport: "alertmanager", alert_status: "firing", ingestion_channel: "monitoring" }, annotations: { generatorURL: "http://prometheus:9090/graph?g0.expr=probe_success" } }] } };
+    else if (path.startsWith("/landing-pad/recent") || path === "/applications") body = { data: { rows: [] } };
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  });
+
+  await page.goto("/incidents");
+  await page.getByLabel("Username").fill("admin");
+  await page.getByLabel("Password").fill("Admin@123456");
+  await page.getByRole("button", { name: "Sign In" }).click();
+  await expect(page.getByLabel("Application: httpbin-failure-lab")).toBeVisible();
+  await expect(page.getByLabel("Signal: https://httpbin.org/status/503")).toBeVisible();
+  await expect(page.getByLabel("Prometheus: ExternalApplicationUnavailable")).toBeVisible();
+  await expect(page.getByLabel(/Alert landing:/)).toBeVisible();
+  await expect(page.getByLabel("Jira: KAN-1376")).toBeVisible();
+  await page.getByLabel("Application: httpbin-failure-lab").click();
+  await expect(page.getByText("No application log captured for this alert")).toBeVisible();
+  await expect(page.getByText("HTTPS probe failed for https://httpbin.org/status/503 in public-internet.")).toBeVisible();
+  await expect(page.getByText("trace-httpbin-503")).toBeVisible();
+  await page.getByLabel("Prometheus: ExternalApplicationUnavailable").click();
+  await expect(page.getByText(alertId)).toBeVisible();
+  await expect(page.getByText("firing", { exact: true })).toBeVisible();
+  await page.getByLabel("Understand: RCA generated").click();
+  await expect(page.getByRole("heading", { name: "Understand", exact: true })).toBeVisible();
+  await expect(page.locator(".incident-stage-inspector")).toBeInViewport();
+  await expect(page.getByLabel("Understand: RCA generated")).toHaveClass(/is-selected/);
+});
