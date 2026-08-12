@@ -46,6 +46,81 @@ def test_resolution_requires_approval_falls_back_to_metadata() -> None:
     assert module._resolution_requires_approval(payload) is False
 
 
+def test_resolution_requires_approval_auto_completes_when_both_confidences_meet_threshold() -> None:
+    """Arch's auto-completion rule: RCA confidence and resolution confidence
+    both >= threshold (default 0.70) skips manual approval, even overriding a
+    severity-based decision that would otherwise require it."""
+    module = load_remediation_app_module()
+
+    payload = {
+        "decision": {"requires_approval": True},
+        "recommendation": {
+            "id": "22222222-2222-2222-2222-222222222222",
+            "incident_id": "11111111-1111-1111-1111-111111111111",
+            "confidence": 0.80,
+            "metadata": {"rca_analysis": {"confidence_score": 0.85}},
+        },
+    }
+
+    assert module._resolution_requires_approval(payload) is False
+
+
+def test_resolution_requires_approval_keeps_existing_flow_when_resolution_confidence_below_threshold() -> None:
+    module = load_remediation_app_module()
+
+    payload = {
+        "decision": {"requires_approval": True},
+        "recommendation": {
+            "id": "22222222-2222-2222-2222-222222222222",
+            "incident_id": "11111111-1111-1111-1111-111111111111",
+            "confidence": 0.60,
+            "metadata": {"rca_analysis": {"confidence_score": 0.85}},
+        },
+    }
+
+    assert module._resolution_requires_approval(payload) is True
+
+
+def test_resolution_requires_approval_keeps_existing_flow_when_rca_confidence_below_threshold() -> None:
+    module = load_remediation_app_module()
+
+    payload = {
+        "decision": {"requires_approval": False},
+        "recommendation": {
+            "id": "22222222-2222-2222-2222-222222222222",
+            "incident_id": "11111111-1111-1111-1111-111111111111",
+            "confidence": 0.90,
+            "metadata": {"rca_analysis": {"confidence_score": 0.55}},
+        },
+    }
+
+    # Neither confidence clears the threshold as a pair, so this falls through
+    # to the existing decision payload unchanged (still honors decision=False here).
+    assert module._resolution_requires_approval(payload) is False
+
+
+def test_resolution_requires_approval_threshold_is_configurable() -> None:
+    module = load_remediation_app_module()
+    original_threshold = module.settings.rca_resolution_auto_complete_threshold
+    try:
+        module.settings.rca_resolution_auto_complete_threshold = 0.95
+        payload = {
+            "decision": {"requires_approval": True},
+            "recommendation": {
+                "id": "22222222-2222-2222-2222-222222222222",
+                "incident_id": "11111111-1111-1111-1111-111111111111",
+                "confidence": 0.80,
+                "metadata": {"rca_analysis": {"confidence_score": 0.85}},
+            },
+        }
+        # Same 0.80/0.85 confidences that auto-completed against the 0.70
+        # default no longer clear a raised 0.95 threshold, so the existing
+        # (severity-mandated) approval flow applies.
+        assert module._resolution_requires_approval(payload) is True
+    finally:
+        module.settings.rca_resolution_auto_complete_threshold = original_threshold
+
+
 def test_build_auto_approval_includes_policy_metadata() -> None:
     module = load_remediation_app_module()
 

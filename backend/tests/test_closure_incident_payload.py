@@ -1,0 +1,142 @@
+from importlib import util
+from pathlib import Path
+
+from common.models import Incident, RemediationAction, RemediationStatus, ResolutionReport
+
+
+def load_closure_app_module():
+    module_path = Path("backend/src/closure-service/app.py")
+    spec = util.spec_from_file_location("closure_service_app", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Unable to load closure-service app module")
+    module = util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+INCIDENT_ID = "11111111-1111-1111-1111-111111111111"
+
+
+def _existing_incident_payload() -> dict:
+    return {
+        "id": INCIDENT_ID,
+        "service": "robot-shop-payment",
+        "environment": "prod",
+        "severity": "critical",
+        "status": "investigating",
+        "title": "robot-shop-payment: RobotShopServiceDown",
+        "summary": "Prometheus cannot scrape robot-shop-payment for more than 20s.",
+        "owner_team": "platform-ops",
+        "ticket_id": "KAN-9999",
+        "tenant_id": "default",
+        "created_at": "2026-08-12T06:46:15.869698Z",
+        "trace_id": "trace-abc",
+        "alert_ids": ["8ff12ea1-a6bf-4c83-9fff-8da2d92de061"],
+        "metadata": {
+            "jira": {"key": "KAN-9999", "url": "https://kaiops-test.atlassian.net/browse/KAN-9999"},
+            "incident_candidate": {
+                "correlation_key": "2f5c4d0b1a22e52d",
+                "jira_key": "KAN-9999",
+            },
+            "deduplication": {"window_minutes": 60, "occurrence_count": 4},
+            "severity_policy": {"final_severity": "critical", "policy_version": "incident-severity-policy-v1"},
+            "kaiops_incident_id": INCIDENT_ID,
+        },
+    }
+
+
+def _action() -> RemediationAction:
+    return RemediationAction(
+        incident_id=INCIDENT_ID,
+        action_type="rollback_deployment",
+        target="robot-shop-payment",
+        status=RemediationStatus.SUCCEEDED,
+    )
+
+
+def _report(*, health_restored: bool) -> ResolutionReport:
+    return ResolutionReport(
+        incident_id=INCIDENT_ID,
+        root_cause="deployment rollback",
+        impact="payment service unavailable",
+        action_taken="rolled back deployment",
+        alerts_cleared=health_restored,
+        health_restored=health_restored,
+    )
+
+
+def test_build_final_incident_payload_preserves_metadata_created_at_and_tenant() -> None:
+    module = load_closure_app_module()
+    incident_payload = _existing_incident_payload()
+
+    final_payload = module._build_final_incident_payload(
+        action=_action(),
+        report=_report(health_restored=True),
+        incident_payload=incident_payload,
+        recommendation={},
+        source_contract={},
+    )
+
+    assert final_payload["metadata"] == incident_payload["metadata"]
+    assert final_payload["metadata"]["incident_candidate"]["correlation_key"] == "2f5c4d0b1a22e52d"
+    assert final_payload["metadata"]["jira"]["key"] == "KAN-9999"
+    assert final_payload["metadata"]["deduplication"]["occurrence_count"] == 4
+    assert final_payload["metadata"]["severity_policy"]["final_severity"] == "critical"
+    assert final_payload["created_at"] == incident_payload["created_at"]
+    assert final_payload["tenant_id"] == "default"
+    assert final_payload["status"] == "closed"
+
+
+def test_build_final_incident_payload_marks_failed_when_health_not_restored() -> None:
+    module = load_closure_app_module()
+    incident_payload = _existing_incident_payload()
+
+    final_payload = module._build_final_incident_payload(
+        action=_action(),
+        report=_report(health_restored=False),
+        incident_payload=incident_payload,
+        recommendation={},
+        source_contract={},
+    )
+
+    assert final_payload["status"] == "failed"
+    # Metadata must survive a failed closure too, not just a successful one.
+    assert final_payload["metadata"] == incident_payload["metadata"]
+    assert final_payload["created_at"] == incident_payload["created_at"]
+
+
+def test_build_final_incident_payload_defaults_metadata_when_no_prior_incident() -> None:
+    module = load_closure_app_module()
+
+    final_payload = module._build_final_incident_payload(
+        action=_action(),
+        report=_report(health_restored=True),
+        incident_payload=None,
+        recommendation={},
+        source_contract={},
+    )
+
+    assert final_payload["metadata"] == {}
+    assert final_payload["tenant_id"] == "default"
+    assert "created_at" not in final_payload
+
+
+def test_build_final_incident_payload_validates_into_incident_model_without_error() -> None:
+    module = load_closure_app_module()
+    incident_payload = _existing_incident_payload()
+
+    final_payload = module._build_final_incident_payload(
+        action=_action(),
+        report=_report(health_restored=True),
+        incident_payload=incident_payload,
+        recommendation={},
+        source_contract={},
+    )
+
+    incident = Incident.model_validate(final_payload)
+
+    assert incident.metadata == incident_payload["metadata"]
+    assert incident.created_at.isoformat().replace("+00:00", "Z") == incident_payload["created_at"]
+    assert incident.tenant_id == "default"
+    assert incident.status.value == "closed"
+    assert incident.ticket_id == "KAN-9999"

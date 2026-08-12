@@ -873,6 +873,49 @@ function resolveCanonicalAlertRow(row, candidates) {
     })[0];
 }
 
+// A landing-pad ingestion row can be clicked before the same real-world alert
+// has been persisted into the canonical alerts collection (alerts.rows) --
+// the two are populated by separate, non-atomic sources. Opening it with the
+// landing-pad row's own id (a filename, not a UUID) sends a doomed
+// processed-result lookup, since that endpoint is keyed by the canonical
+// alert UUID. This resolves a row to its canonical UUID-bearing counterpart
+// via the same identity-key matching resolveCanonicalAlertRow already uses,
+// and reports "pending" (rather than silently falling back to the raw row)
+// when no canonical match exists yet, so the caller can wait/retry instead of
+// fetching with an id that can never resolve.
+function resolveCanonicalAlertForRow(row, alertRows) {
+  if (!row || typeof row !== "object") {
+    return { status: "unresolved", row: null };
+  }
+  const suppliedAlertId = String(
+    row?.alert_id
+    || row?.projection_payload?.alert_id
+    || row?.projection_payload?.event_payload?.alert_id
+    || row?.projection_payload?.event_payload?.source_alert_id
+    || row?.id
+    || row?.incident_id
+    || ""
+  ).trim();
+  if (ALERT_UUID_PATTERN.test(suppliedAlertId)) {
+    return { status: "resolved", row };
+  }
+  const canonicalRow = resolveCanonicalAlertRow(row, alertRows);
+  const canonicalAlertId = String(canonicalRow?.alert_id || canonicalRow?.id || "").trim();
+  if (canonicalRow && canonicalRow !== row && ALERT_UUID_PATTERN.test(canonicalAlertId)) {
+    return { status: "resolved", row: canonicalRow };
+  }
+  // No UUID-bearing counterpart is available yet in alertRows. Report
+  // "pending" (an operator can wait for it to appear) only when the row
+  // carries real matchable identity (fingerprint, name+service, etc.) via
+  // alertIdentityKeys -- the same signal resolveCanonicalAlertRow just used
+  // above. A bare non-UUID id/incident_id with no other identity (e.g. a
+  // landing-pad filename whose source row could not be found) can never gain
+  // a match through retrying, so it must report "unresolved" rather than
+  // retry forever.
+  const hasIdentity = alertIdentityKeys(row).length > 0;
+  return { status: hasIdentity ? "pending" : "unresolved", row: null };
+}
+
 function dedupeAndConsolidateAlertRows(rows, options = {}) {
   const preferLatestState = Boolean(options.preferLatestState);
   const allowedChannels = new Set(
@@ -1030,6 +1073,21 @@ function mapLandingPadRowToAlertStreamRow(row, index = 0) {
     source_channel: channel,
     _stream_kind: "landing_pad",
   };
+}
+
+// An alert the operator explicitly opened can legitimately fall out of the
+// summary list's scope without having stopped existing: closure moves it from
+// the open-alerts stream to the closed-incidents stream on its own refresh
+// cadence (the two fetches are not atomic), and monitor-scope filtering can
+// exclude a row the summary list wasn't scoped for. A dedicated,
+// already-loaded /processed-result payload for this exact alertId is the
+// authoritative signal that the alert is real -- list membership is not.
+function shouldRetainAlertSelection({ selectedAlertId, payload, error, alertId }) {
+  return Boolean(
+    payload
+    && !error
+    && String(alertId || "") === String(selectedAlertId || "")
+  );
 }
 
 function mergeAlertStreamRows(openRows, recentClosedRows) {
@@ -6888,7 +6946,9 @@ export {
   alertApplicationCandidate,
   alertRowScore,
   resolveCanonicalAlertRow,
+  resolveCanonicalAlertForRow,
   dedupeAndConsolidateAlertRows,
+  shouldRetainAlertSelection,
   mapClosedIncidentToAlertStreamRow,
   projectHintFromAlertRow,
   ALERT_UUID_PATTERN,

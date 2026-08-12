@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+﻿import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Archive, BookOpen, Bot, Boxes, ChartNoAxesCombined, CircleCheckBig, Database, PlugZap, RadioTower, ScrollText, Settings, ShieldCheck, Siren, Workflow } from "lucide-react";
@@ -76,7 +76,9 @@ import {
   alertApplicationCandidate,
   alertRowScore,
   resolveCanonicalAlertRow,
+  resolveCanonicalAlertForRow,
   dedupeAndConsolidateAlertRows,
+  shouldRetainAlertSelection,
   mapClosedIncidentToAlertStreamRow,
   projectHintFromAlertRow,
   ALERT_UUID_PATTERN,
@@ -230,7 +232,7 @@ function uniqueMonitorApplications(names) {
 
 // Memoized so an unrelated App() state change (modal open, admin toggle, the
 // 4s live-stream staleness watchdog tick, ...) doesn't re-run the row-mapping
-// for the whole visible alert list on every render — only when these props
+// for the whole visible alert list on every render â€” only when these props
 // actually change.
 // Estimate only -- rowVirtualizer.measureElement (attached to each <tr> ref
 // below) measures the actual rendered height and self-corrects, so this
@@ -508,6 +510,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   });
   const [selectedAlertId, setSelectedAlertId] = useState("");
   const [selectedAlertSnapshot, setSelectedAlertSnapshot] = useState(null);
+  // A landing-pad row opened before its canonical DB alert exists yet: keep
+  // the raw row here so the cockpit stays on it while a background effect
+  // retries resolveCanonicalAlertForRow against alerts.rows as it refreshes.
+  const [pendingCanonicalAlert, setPendingCanonicalAlert] = useState(null);
+  const pendingCanonicalAlertRetryRef = useRef({ key: "", attempts: 0 });
   const selectedAlertAnalysisPollRef = useRef({ alertId: "", attempts: 0 });
   const alertStreamRefreshInFlight = useRef(false);
   const landingPadStreamRefreshInFlight = useRef(false);
@@ -1348,42 +1355,34 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }
 
   function openAlertDetails(row, initialTab = "overview") {
-    const projection = row?.projection_payload && typeof row.projection_payload === "object"
-      ? row.projection_payload
-      : {};
-    const eventPayload = projection?.event_payload && typeof projection.event_payload === "object"
-      ? projection.event_payload
-      : {};
-    const suppliedAlertId = String(
-      row?.alert_id
-      || projection?.alert_id
-      || eventPayload?.alert_id
-      || eventPayload?.source_alert_id
-      || ""
-    ).trim();
     // Incident projections already carry the authoritative alert UUID. Do not
     // replace it with a semantically similar landing-pad row whose id is a
     // filename; processed RCA endpoints are keyed by the canonical UUID.
-    const canonicalRow = ALERT_UUID_PATTERN.test(suppliedAlertId)
-      ? row
-      : resolveCanonicalAlertRow(row, alerts.rows);
-    const canonicalAlertId = canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id;
-    const clickedAlertId = suppliedAlertId || row?.id || row?.incident_id;
-    const alertId = canonicalAlertId || clickedAlertId;
+    const resolution = resolveCanonicalAlertForRow(row, alerts.rows);
+    const pending = resolution.status === "pending";
+    // While pending (canonical DB alert not in alerts.rows yet -- landing-pad
+    // ingestion fires before the alert row is persisted/fetched), keep the
+    // row itself as the selection so it stays visible in the cockpit.
+    // loadAlertDetails already has a dedicated non-UUID branch that renders a
+    // local "landing_pad_only" snapshot without an API call, so this never
+    // sends a doomed processed-result lookup. The retry effect below promotes
+    // the selection to the real UUID once alerts.rows catches up.
+    const canonicalRow = pending ? row : resolution.row;
+    const alertId = String(canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id || "").trim();
     if (!alertId) {
       return;
     }
-    const selectedRow = canonicalAlertId ? canonicalRow : row;
-    setSelectedAlertSnapshot(selectedRow);
-    setSelectedAlertId(String(alertId));
+    setPendingCanonicalAlert(pending ? row : null);
+    setSelectedAlertSnapshot(canonicalRow);
+    setSelectedAlertId(alertId);
     // This action owns the complete cockpit URL below. Prevent the legacy tab
     // synchronization effect from racing it with a navigation to plain `/`,
     // which would remove workspace=alert and leave the details view hidden.
     skipNextActiveTabNavigationRef.current = true;
     setActiveTab("home");
     setHomeDetailTab(initialTab);
-    loadAlertDetails(alertId, selectedRow);
-    onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(String(alertId))}`);
+    loadAlertDetails(alertId, canonicalRow);
+    onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(alertId)}`);
     window.setTimeout(() => {
       alertDetailsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
       alertDetailsRef.current?.focus({ preventScroll: true });
@@ -1428,11 +1427,45 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     // Detail URLs are durable application state. Reconstruct the selection on
     // refresh, browser history navigation, and shared links instead of relying
     // on an in-memory summary-row click from the current session.
+    if (ALERT_UUID_PATTERN.test(routeAlertId)) {
+      setSelectedAlertId(routeAlertId);
+      setSelectedAlertSnapshot(null);
+      setHomeDetailTab("overview");
+      void loadAlertDetails(routeAlertId);
+      return;
+    }
+    // A landing-pad filename can end up in the URL from an earlier click that
+    // happened before the canonical DB alert existed (see openAlertDetails /
+    // resolveCanonicalAlertForRow). Route restoration must go through the same
+    // canonicalization -- otherwise every refresh/shared-link re-opens with an
+    // id that can never resolve, permanently stuck on a landing-pad-only
+    // snapshot even after the canonical alert is long since available. Find
+    // the original landing-pad row by filename so matching has its real
+    // fingerprint/name/service identity, not just the bare filename string.
+    const landingPadSourceRow = (Array.isArray(landingPadRecent.rows) ? landingPadRecent.rows : [])
+      .find((row) => String(row?.file || "") === routeAlertId)
+      || { id: routeAlertId, alert_id: routeAlertId, file: routeAlertId };
+    const resolution = resolveCanonicalAlertForRow(landingPadSourceRow, alerts.rows);
+    if (resolution.status === "resolved") {
+      const canonicalRow = resolution.row;
+      const alertId = String(canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id || "").trim();
+      if (alertId) {
+        setSelectedAlertId(alertId);
+        setSelectedAlertSnapshot(canonicalRow);
+        setHomeDetailTab("overview");
+        void loadAlertDetails(alertId, canonicalRow);
+        onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(alertId)}`);
+      }
+      return;
+    }
     setSelectedAlertId(routeAlertId);
     setSelectedAlertSnapshot(null);
     setHomeDetailTab("overview");
     void loadAlertDetails(routeAlertId);
-  }, [adminSession.accessToken, activeTab, currentSearch, selectedAlertId]);
+    if (resolution.status === "pending") {
+      setPendingCanonicalAlert(landingPadSourceRow);
+    }
+  }, [adminSession.accessToken, activeTab, currentSearch, selectedAlertId, alerts.rows, landingPadRecent.rows]);
 
   function openGlobalOperationalItem(item) {
     if (!item?.row) return;
@@ -1563,6 +1596,19 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     if (selectedAlertData.loading && String(selectedAlertData.alertId || "") === String(selectedAlertId || "")) {
       return;
     }
+    // See shouldRetainAlertSelection: list membership in scopedRows is not
+    // authoritative for whether the selected alert still exists (closure and
+    // monitor-scope filtering can both drop it from this summary list without
+    // it having stopped existing) -- only clear the selection when there is no
+    // already-loaded payload to fall back on.
+    if (shouldRetainAlertSelection({
+      selectedAlertId,
+      payload: selectedAlertData.payload,
+      error: selectedAlertData.error,
+      alertId: selectedAlertData.alertId,
+    })) {
+      return;
+    }
     // The incident summary must not implicitly open the newest row. That row may
     // still be moving through enrichment/RCA, which made the first cockpit
     // appear incomplete before the operator selected an alert.
@@ -1572,6 +1618,58 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       setSelectedAlertData({ loading: false, payload: null, error: "", alertId: "" });
     }
   }, [activeTab, alerts.rows, closedIncidents.rows, applicationToMonitor, selectedAlertId, selectedAlertSnapshot, selectedAlertData.loading, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId]);
+
+  useEffect(() => {
+    // A landing-pad row was opened before its canonical DB alert existed in
+    // alerts.rows (see openAlertDetails / resolveCanonicalAlertForRow). Retry
+    // resolution on every alerts.rows refresh; once the canonical UUID-bearing
+    // alert appears, promote the selection to it and load the real processed
+    // result. Bounded so a landing-pad event that never gets persisted (e.g.
+    // discovery classified it as noise) doesn't retry forever.
+    if (activeTab !== "home" || !pendingCanonicalAlert) {
+      return undefined;
+    }
+    const resolution = resolveCanonicalAlertForRow(pendingCanonicalAlert, alerts.rows);
+    if (resolution.status === "resolved") {
+      const canonicalRow = resolution.row;
+      const alertId = String(canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id || "").trim();
+      if (alertId) {
+        setPendingCanonicalAlert(null);
+        setSelectedAlertSnapshot(canonicalRow);
+        setSelectedAlertId(alertId);
+        loadAlertDetails(alertId, canonicalRow);
+        onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(alertId)}`);
+      }
+      return undefined;
+    }
+    if (resolution.status === "unresolved") {
+      // The row itself carries no identity to ever match against -- retrying
+      // cannot help.
+      setPendingCanonicalAlert(null);
+      return undefined;
+    }
+    const previous = pendingCanonicalAlertRetryRef.current;
+    const pendingKey = String(
+      pendingCanonicalAlert?.file
+      || pendingCanonicalAlert?.id
+      || pendingCanonicalAlert?.alert_id
+      || ""
+    );
+    const attempts = previous.key === pendingKey ? Number(previous.attempts || 0) : 0;
+    // loadRecentAlerts throttles background refreshes to at most once per 45s
+    // (see recentAlertsRequestRef), so polling faster than that only re-checks
+    // the same alerts.rows snapshot. Match that cadence; ten attempts (~7.5
+    // minutes) covers slow discovery processing without retrying forever for
+    // an event that never gets persisted (e.g. classified as noise).
+    if (attempts >= 10) {
+      return undefined;
+    }
+    pendingCanonicalAlertRetryRef.current = { key: pendingKey, attempts: attempts + 1 };
+    const timer = window.setTimeout(() => {
+      void loadRecentAlerts({ background: true });
+    }, 45000);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, pendingCanonicalAlert, alerts.rows]);
 
   useEffect(() => {
     const needsEvidence = homeDetailTab === "rca" && rcaDetailView === "evidence";
@@ -2770,7 +2868,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const backendFact = validatedSnapshot === correction ? knowledgePackRevalidation.facts?.[key] : null;
       next[key] = backendFact
         ? {
-          // Keep backendFact.value as-is (what the backend actually detected —
+          // Keep backendFact.value as-is (what the backend actually detected â€”
           // may legitimately be empty if the correction didn't match anything).
           // The edit textarea itself reads straight from knowledgePackCorrections,
           // so it still shows exactly what the user typed regardless of this.
@@ -2895,7 +2993,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     if (promptRow.derived_requirements.length) {
       // Replace (not merge) with the current prompt's derived requirements.
       // The previous version folded in whatever was already sitting in
-      // rule_onboarding_plain_language — which, after a prior Auto-Complete
+      // rule_onboarding_plain_language â€” which, after a prior Auto-Complete
       // run, was itself already the merged result of an even earlier run.
       // That let stale requirement lines from long-past prompts accumulate
       // indefinitely across re-runs in the same session, silently bleeding
@@ -2968,7 +3066,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
     const basePayload = buildKnowledgePackPayload(onboardingSourceDocs.rows);
     // service/environment/owner_team are matched by the backend from these
-    // top-level request fields FIRST, before it ever looks at document text —
+    // top-level request fields FIRST, before it ever looks at document text â€”
     // so a correction to one of these three has to override the field here,
     // not just get folded into the corrections document (which would be
     // silently ignored otherwise).
@@ -6259,7 +6357,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const stages = Array.isArray(discoveryMcp.retrieval_stages) ? discoveryMcp.retrieval_stages : [];
       stages.forEach((stage, index) => {
         syntheticRows.push({
-          stage: `Discovery Agent · ${String(stage.stage || "stage").replaceAll("_", " ")}`,
+          stage: `Discovery Agent Â· ${String(stage.stage || "stage").replaceAll("_", " ")}`,
           sequence: 80 + index,
           agent: "Discovery Agent",
           service: "context-agent",
@@ -6267,7 +6365,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           publishes: stage.stage === "discovery_completed" ? "context-events" : "discovery-evidence",
           timestamp: selectedAlertWorkflow?.context?.created_at || incidentCreatedAt || ingestAt,
           elapsed: elapsedSeconds(ingestAt, selectedAlertWorkflow?.context?.created_at || incidentCreatedAt || ingestAt),
-          detail: `${stage.status || "unknown"}${Number.isFinite(Number(stage.result_count)) ? ` · ${stage.result_count} result(s)` : ""}`,
+          detail: `${stage.status || "unknown"}${Number.isFinite(Number(stage.result_count)) ? ` Â· ${stage.result_count} result(s)` : ""}`,
           tables: "-",
           inputValueText: stringifyTimelineValue({ protocol: discoveryMcp.protocol, server: discoveryMcp.server }),
           outputValueText: stringifyTimelineValue(stage),
@@ -6975,14 +7073,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const assignedIncidents = monitorScopedIncidentMetadata.filter((row) => [row?.owner, row?.assignee, row?.assigned_engineer, row?.assigned_to].some((value) => String(value || "").trim().toLowerCase() === username));
     const failedActions = monitorScopedIncidentMetadata.filter((row) => ["failed", "rollback_failed", "remediation_failed"].includes(String(row?.status || row?.remediation_status || "").toLowerCase()));
     const myWork = [
-      ...assignedIncidents.map((row) => ({ kind: "Assigned incident", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} · ${row?.status || "-"}`, row })),
-      ...pendingApprovals.map((row) => ({ kind: "Approval", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} · ${row?.risk_tier || row?.severity || "unknown"} risk`, row })),
-      ...failedActions.map((row) => ({ kind: "Failed action", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} · ${row?.status || "failed"}`, row })),
+      ...assignedIncidents.map((row) => ({ kind: "Assigned incident", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} Â· ${row?.status || "-"}`, row })),
+      ...pendingApprovals.map((row) => ({ kind: "Approval", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} Â· ${row?.risk_tier || row?.severity || "unknown"} risk`, row })),
+      ...failedActions.map((row) => ({ kind: "Failed action", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} Â· ${row?.status || "failed"}`, row })),
     ];
     const notifications = [
       ...pendingApprovals.map((row) => ({ kind: "Approval reminder", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} requires review`, row })),
-      ...monitorScopedAlerts.filter((row) => ["critical", "high"].includes(String(row?.severity || "").toLowerCase())).slice(0, 8).map((row) => ({ kind: "Alert", label: row?.name || row?.id || "Alert", meta: `${row?.severity || "-"} · ${row?.service || "-"}`, row })),
-      ...(closedIncidents.rows || []).slice(0, 5).map((row) => ({ kind: String(row?.status || "").toLowerCase().includes("reopen") ? "Reopened" : "Resolved", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} · ${row?.status || "closed"}`, row })),
+      ...monitorScopedAlerts.filter((row) => ["critical", "high"].includes(String(row?.severity || "").toLowerCase())).slice(0, 8).map((row) => ({ kind: "Alert", label: row?.name || row?.id || "Alert", meta: `${row?.severity || "-"} Â· ${row?.service || "-"}`, row })),
+      ...(closedIncidents.rows || []).slice(0, 5).map((row) => ({ kind: String(row?.status || "").toLowerCase().includes("reopen") ? "Reopened" : "Resolved", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} Â· ${row?.status || "closed"}`, row })),
     ];
     return { results: results.slice(0, 12), myWork, notifications };
   }, [adminSession?.user?.username, closedIncidents.rows, globalOperationsQuery, monitorScopedAlerts, monitorScopedIncidentMetadata, monitoringApps.rows, pendingApprovals]);
@@ -8106,7 +8204,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     && executionConfirmationValid
     && !liveExecutionPlanAvailable;
   const executionActivationMessage = remediationExecutionState.loading
-    ? "Execution submitted — waiting for the terminal run status"
+    ? "Execution submitted â€” waiting for the terminal run status"
     : executionAllowed
       ? "Ready for guarded execution"
     : blockingPreflightFailures.length
@@ -9050,7 +9148,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     if (currentRole === "administrator") {
       return { ...shared, kind: "Administrator", title: `${selectedMonitorScopeLabel} operations`, description: "Application health and activity, with platform-wide infrastructure clearly identified.", cards: [
         { label: "Application Connector", value: isManagedPlatformScope && !connectorRows.length ? "Managed" : !connectorRows.length ? "Not configured" : unhealthyConnectors ? "Attention" : "Healthy", detail: isManagedPlatformScope && !connectorRows.length ? `${selectedMonitorScopeLabel} uses KaiMS-managed platform monitoring; no separate onboarding record is required.` : !connectorRows.length ? `${selectedMonitorScopeLabel} has no registered monitoring connector.` : `${connectorRows.length} connector record(s) scoped to ${selectedMonitorScopeLabel}; ${unhealthyConnectors} unhealthy.`, tone: isManagedPlatformScope && !connectorRows.length ? "info" : !connectorRows.length || unhealthyConnectors ? "attention" : "clear", tab: "admin" },
-        { label: "Queue Health", value: queueHealth.loading ? "Checking" : queueHealth.healthy ? "Healthy" : queueHealth.status === "attention" ? "Attention" : "Unavailable", detail: queueHealth.loading ? "Reading live broker telemetry." : `${String(queueHealth.provider || "rabbitmq").toUpperCase()} · ${queueHealth.queues || 0} queues · ${queueHealth.ready || 0} ready · ${queueHealth.unacknowledged || 0} in flight.`, tone: queueHealth.healthy ? "clear" : "attention", tab: "rag" },
+        { label: "Queue Health", value: queueHealth.loading ? "Checking" : queueHealth.healthy ? "Healthy" : queueHealth.status === "attention" ? "Attention" : "Unavailable", detail: queueHealth.loading ? "Reading live broker telemetry." : `${String(queueHealth.provider || "rabbitmq").toUpperCase()} Â· ${queueHealth.queues || 0} queues Â· ${queueHealth.ready || 0} ready Â· ${queueHealth.unacknowledged || 0} in flight.`, tone: queueHealth.healthy ? "clear" : "attention", tab: "rag" },
         { label: "Selected Incident Activity", value: hasScopedAlertSelection ? selectedAlertEventsDisplay.length : "No selection", detail: hasScopedAlertSelection ? `Persisted agent or trace events for the selected ${selectedMonitorScopeLabel} incident.` : `Open a ${selectedMonitorScopeLabel} alert to inspect agent activity.`, tone: hasScopedAlertSelection && selectedAlertEventsDisplay.length ? "clear" : "info", tab: "trace" },
         { label: "Selected Workflow", value: !hasScopedAlertSelection ? "No selection" : failedAutomation ? `${failedAutomation} failed` : "No failures", detail: hasScopedAlertSelection ? "Failure state for the selected in-scope incident workflow." : "Workflow status is shown only after an in-scope alert is selected.", tone: failedAutomation ? "attention" : "info", tab: "trace" },
         { label: "Telemetry", value: gatewayRecent.rows.length, detail: "API gateway telemetry events in the current loaded window.", tone: gatewayRecent.rows.length ? "info" : "attention", tab: "safety" },
@@ -9402,7 +9500,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           <header className="hero">
             <p className="eyebrow">{currentBreadcrumb[0]?.label || "KaiMS"}</p>
             <h1>{currentNavigationItem.pageTitle}</h1>
-            <p className="subtitle">{currentNavigationItem.keywords.join(" · ")}</p>
+            <p className="subtitle">{currentNavigationItem.keywords.join(" Â· ")}</p>
             {restrictedDestination ? <div className="permission-navigation-notice" role="status">{restrictedDestination} is not available to your current role. Ask an administrator if your responsibilities require access.</div> : null}
             <label className="mobile-navigation">
               <span>Navigate to</span>
@@ -9415,7 +9513,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             </label>
             <div className="hero-actions">
               <HealthBadge ok={health.ok} label={health.message} />
-              <span className="hero-user" title={`Signed in as ${adminSession?.user?.username || "-"}`}>{adminSession?.user?.username || "-"} · {adminSession?.user?.role_name || "-"}</span>
+              <span className="hero-user" title={`Signed in as ${adminSession?.user?.username || "-"}`}>{adminSession?.user?.username || "-"} Â· {adminSession?.user?.role_name || "-"}</span>
               <button className="button-primary" type="button" onClick={() => setIsCopilotOpen(!isCopilotOpen)}>
                 <Bot size={16} /> {isCopilotOpen ? "Close KAI" : "Ask KAI"}
               </button>
@@ -9769,7 +9867,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                       <option value={50}>50</option>
                       <option value={100}>100</option>
                       {/* Fetch is hard-capped at 200 (sourceBalancedFetchLimit
-                          in loadRecentAlerts) regardless of this selection —
+                          in loadRecentAlerts) regardless of this selection â€”
                           don't offer a value the backend call can't honor. */}
                       <option value={200}>200</option>
                     </select>
@@ -9865,7 +9963,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                     <button type="button" className="button-primary" onClick={() => { openAlertDetails(selectedAlertRow); setHomeDetailTab(cockpitRecommendedStage); }}>Continue to {cockpitRecommended.label}</button>
                   </section>
                   <nav className="guided-cockpit-mini-journey" aria-label="Incident progress">
-                    {incidentCockpitStages.map((stage) => <button key={`launcher-${stage.id}`} type="button" className={stage.complete ? "is-complete" : stage.id === cockpitRecommendedStage ? "is-current" : ""} onClick={() => { openAlertDetails(selectedAlertRow); setHomeDetailTab(stage.id); }}><span>{stage.complete ? "✓" : stage.short}</span><strong>{stage.label}</strong></button>)}
+                    {incidentCockpitStages.map((stage) => <button key={`launcher-${stage.id}`} type="button" className={stage.complete ? "is-complete" : stage.id === cockpitRecommendedStage ? "is-current" : ""} onClick={() => { openAlertDetails(selectedAlertRow); setHomeDetailTab(stage.id); }}><span>{stage.complete ? "âœ“" : stage.short}</span><strong>{stage.label}</strong></button>)}
                   </nav>
                   <details className="k-technical-details guided-cockpit-context">
                     <summary>Rule context and severity controls</summary>
@@ -10217,7 +10315,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         aria-selected={homeDetailTab === stage.id}
                         aria-label={stage.accessibleLabel || stage.label}
                       >
-                        <span>{stage.complete ? "✓" : stage.short}</span>
+                        <span>{stage.complete ? "âœ“" : stage.short}</span>
                         <strong>{stage.label}</strong>
                         <small>{stage.description}</small>
                       </button>
@@ -10267,7 +10365,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
                   {homeDetailTab === "rca" ? (
                     <>
-                    {false && !selectedAlertRagDocuments.length ? <section className="panel knowledge-review-gate"><div className="panel-head"><div><span className="eyebrow">Knowledge completion required</span><h3>Review RCA-derived alert knowledge</h3><p>No approved alert document is linked. KaiMS prepared a draft from discovery evidence and the completed RCA; an operator must approve it before future use.</p></div><span className={`workflow-pill ${evidenceDraftReview.draft?.status === "approved" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft?.status || "draft"}</span></div>{evidenceDraftReview.loading?<p>Loading evidence draft…</p>:null}{evidenceDraftReview.draft?<><label>Knowledge document<textarea rows={12} value={evidenceDraftReview.content} onChange={(e)=>setEvidenceDraftReview((current)=>({...current,content:e.target.value}))}/></label><label>Reviewer notes<textarea rows={3} placeholder="Confirm corrections, exclusions, and why this is safe for future grounding." value={evidenceDraftReview.notes} onChange={(e)=>setEvidenceDraftReview((current)=>({...current,notes:e.target.value}))}/></label><button type="button" className="button-primary" onClick={approveEvidenceDraft} disabled={evidenceDraftReview.loading||evidenceDraftReview.content.trim().length<20||evidenceDraftReview.draft?.status==="approved"}>{evidenceDraftReview.loading?"Approving…":evidenceDraftReview.draft?.status==="approved"?"Approved":"Approve and publish knowledge"}</button></>:null}{evidenceDraftReview.error?<p className="error">{evidenceDraftReview.error}</p>:null}{evidenceDraftReview.message?<p className="status-message">{evidenceDraftReview.message}</p>:null}</section>:null}
+                    {false && !selectedAlertRagDocuments.length ? <section className="panel knowledge-review-gate"><div className="panel-head"><div><span className="eyebrow">Knowledge completion required</span><h3>Review RCA-derived alert knowledge</h3><p>No approved alert document is linked. KaiMS prepared a draft from discovery evidence and the completed RCA; an operator must approve it before future use.</p></div><span className={`workflow-pill ${evidenceDraftReview.draft?.status === "approved" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft?.status || "draft"}</span></div>{evidenceDraftReview.loading?<p>Loading evidence draftâ€¦</p>:null}{evidenceDraftReview.draft?<><label>Knowledge document<textarea rows={12} value={evidenceDraftReview.content} onChange={(e)=>setEvidenceDraftReview((current)=>({...current,content:e.target.value}))}/></label><label>Reviewer notes<textarea rows={3} placeholder="Confirm corrections, exclusions, and why this is safe for future grounding." value={evidenceDraftReview.notes} onChange={(e)=>setEvidenceDraftReview((current)=>({...current,notes:e.target.value}))}/></label><button type="button" className="button-primary" onClick={approveEvidenceDraft} disabled={evidenceDraftReview.loading||evidenceDraftReview.content.trim().length<20||evidenceDraftReview.draft?.status==="approved"}>{evidenceDraftReview.loading?"Approvingâ€¦":evidenceDraftReview.draft?.status==="approved"?"Approved":"Approve and publish knowledge"}</button></>:null}{evidenceDraftReview.error?<p className="error">{evidenceDraftReview.error}</p>:null}{evidenceDraftReview.message?<p className="status-message">{evidenceDraftReview.message}</p>:null}</section>:null}
                     <RcaPanel
                       rcaDetailView={rcaDetailView}
                       onSetRcaDetailView={setRcaDetailView}
@@ -10302,7 +10400,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <span><strong>{selectedCanonicalIncidentStatus}</strong> lifecycle</span>
                           <span><strong>{selectedAlertTimelineRows.length}</strong> events</span>
                           <span><strong>{selectedAlertRagDocuments.length}</strong> documents</span>
-                          <span className={Number(selectedAlertEvaluation.groundingScore || 0) < 0.5 ? "is-quality-warning" : ""}><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong>{Number(selectedAlertEvaluation.groundingScore || 0) < 0.5 ? "grounding · review required" : "grounded"}</span>
+                          <span className={Number(selectedAlertEvaluation.groundingScore || 0) < 0.5 ? "is-quality-warning" : ""}><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong>{Number(selectedAlertEvaluation.groundingScore || 0) < 0.5 ? "grounding Â· review required" : "grounded"}</span>
                         </div>
                       </header>
                       <details className="panel incident-workspace-section workspace-collapsible" open>
@@ -10328,6 +10426,35 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                                 </span>
                               </td>
                             </tr>
+                            <tr>
+                               <th>Jira Ticket</th>
+                               <td>
+                                 {(selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id) ? (
+                                   <a
+                                     href={selectedAlertWorkflow?.incident?.jira_link || selectedAlertWorkflow?.jira_link || `https://kaiops-test.atlassian.net/browse/${selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id}`}
+                                     target="_blank"
+                                     rel="noopener noreferrer"
+                                     style={{ color: "#22d3ee", textDecoration: "underline", fontWeight: "bold" }}
+                                   >
+                                     {selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id}
+                                   </a>
+                                 ) : (
+                                   "-"
+                                 )}
+                               </td>
+                             </tr>
+                             <tr>
+                               <th>Jira Status</th>
+                               <td>
+                                 {(selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id) ? (
+                                   <span className={`pill ${(selectedAlertWorkflow?.incident?.jira_status || selectedAlertWorkflow?.jira_status) === "Done" ? "status-success" : "status-warning"}`}>
+                                     {selectedAlertWorkflow?.incident?.jira_status || selectedAlertWorkflow?.jira_status || "In Progress"}
+                                   </span>
+                                 ) : (
+                                   "-"
+                                 )}
+                               </td>
+                             </tr>
                             <tr><th>Closed At</th><td>{formatIstTimestamp(selectedAlertWorkflow?.incident?.closed_at)}</td></tr>
                             <tr><th>Service</th><td>{selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "-"}</td></tr>
                             <tr><th>Analysis Status</th><td>{canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).status}</td></tr>
@@ -10431,7 +10558,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                                 <tr key={`stage-${row.stage || index}`}>
                                   <td>{row.label || row.stage || "-"}</td>
                                   <td><span className={`stage-state stage-state-${row.state || (row.persisted ? "complete" : "waiting")}`}>{row.state === "in_progress" ? "In progress" : row.persisted ? "Complete" : "Waiting"}</span></td>
-                                  <td>{Array.isArray(row.evidence_sources) && row.evidence_sources.length ? row.evidence_sources.join(" · ") : Array.isArray(row.matched_event_types) && row.matched_event_types.length ? row.matched_event_types.join(" · ") : "No durable evidence yet"}</td>
+                                  <td>{Array.isArray(row.evidence_sources) && row.evidence_sources.length ? row.evidence_sources.join(" Â· ") : Array.isArray(row.matched_event_types) && row.matched_event_types.length ? row.matched_event_types.join(" Â· ") : "No durable evidence yet"}</td>
                                   <td>{row.next_action || (row.persisted ? "Completed." : "Complete the preceding workflow stage.")}</td>
                                 </tr>
                               ))}
@@ -10632,7 +10759,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                               <span key={`empty-doc-kind-${kind}`}>{kind === "jira" ? "Jira ticket" : kind}</span>
                             ))}
                           </div>
-                          {evidenceDraftReview.loading && !evidenceDraftReview.draft ? <div className="alert-document-generation-state"><span className="spinner" aria-hidden="true" /><span>Completing the RCA-derived document draft…</span></div> : null}
+                          {evidenceDraftReview.loading && !evidenceDraftReview.draft ? <div className="alert-document-generation-state"><span className="spinner" aria-hidden="true" /><span>Completing the RCA-derived document draftâ€¦</span></div> : null}
                           {canProvideAlertDocuments && evidenceDraftReview.draft ? <div className="alert-document-draft-editor">
                             <div className="alert-document-draft-heading"><div><span className="eyebrow">Editable draft</span><h4>{evidenceDraftReview.draft.title || "Incident knowledge document"}</h4></div><span className={`workflow-pill ${evidenceDraftReview.draft.status === "reviewed" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft.status || "draft"}</span></div>
                             <div className="report-view-switch" role="tablist" aria-label="Incident report detail"><button type="button" role="tab" aria-selected={incidentReportView === "simple"} className={incidentReportView === "simple" ? "active" : ""} onClick={() => setIncidentReportView("simple")}>Simple</button><button type="button" role="tab" aria-selected={incidentReportView === "detailed"} className={incidentReportView === "detailed" ? "active" : ""} onClick={() => setIncidentReportView("detailed")}>Detailed</button></div>
@@ -10828,21 +10955,21 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                   {homeDetailTab === "execution" ? (
                     <>
                       {false ? <section className="panel agentic-action-brief" aria-labelledby="agentic-action-title">
-                        <header className="panel-head"><div><span className="eyebrow">CONTEXT-GROUNDED ACTION</span><h3 id="agentic-action-title">Recommended response</h3><p>Prepared from the persisted RCA, impact, incident evidence, runbooks, and configured discovery sources.</p></div><button type="button" className="button-secondary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Refreshing plan…" : "Refresh with agent"}</button></header>
+                        <header className="panel-head"><div><span className="eyebrow">CONTEXT-GROUNDED ACTION</span><h3 id="agentic-action-title">Recommended response</h3><p>Prepared from the persisted RCA, impact, incident evidence, runbooks, and configured discovery sources.</p></div><button type="button" className="button-secondary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Refreshing planâ€¦" : "Refresh with agent"}</button></header>
                         <div className="agentic-action-grid">
                           <article><span>Why this action</span><strong>{selectedRcaDecision.rootCause}</strong><p>{selectedRcaDecision.customerImpact}</p></article>
-                          <article><span>What to do</span><strong>{selectedExecutionPlan.action === "-" ? selectedRcaDecision.action : selectedExecutionPlan.action}</strong><p>Target: {selectedApplicationConnection.service} · {selectedApplicationConnection.environment}</p></article>
+                          <article><span>What to do</span><strong>{selectedExecutionPlan.action === "-" ? selectedRcaDecision.action : selectedExecutionPlan.action}</strong><p>Target: {selectedApplicationConnection.service} Â· {selectedApplicationConnection.environment}</p></article>
                           <article><span>Safety and recovery</span><strong>{executionRollbackPlan || "Rollback plan must be supplied before execution."}</strong><p>{editedExecutionPlan.queries[0] || "Add a recovery validation check."}</p></article>
                         </div>
                         <section className="execution-approval-panel" aria-labelledby="script-approval-heading">
-                          <div className="execution-credential-heading"><div><span className="discovery-eyebrow">3 · Human decision</span><h4 id="script-approval-heading">Approve the reviewed script</h4><p>Approval applies to the plan editor below. Editing it afterward invalidates dry-run readiness.</p></div><span className={["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "credential-ready" : "credential-required"}>{["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Approved" : "Review required"}</span></div>
+                          <div className="execution-credential-heading"><div><span className="discovery-eyebrow">3 Â· Human decision</span><h4 id="script-approval-heading">Approve the reviewed script</h4><p>Approval applies to the plan editor below. Editing it afterward invalidates dry-run readiness.</p></div><span className={["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "credential-ready" : "credential-required"}>{["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Approved" : "Review required"}</span></div>
                           <div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div>
                           <label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this script safe and appropriate for this incident?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label>
-                          <div className="incident-section-actions"><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading || ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus)}>{approvalState.loading ? "Recording approval…" : ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Script approved" : "Approve reviewed script"}</button></div>
+                          <div className="incident-section-actions"><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading || ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus)}>{approvalState.loading ? "Recording approvalâ€¦" : ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Script approved" : "Approve reviewed script"}</button></div>
                           {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
                         </section>
                         <div className="agentic-source-strip"><span>Source authenticity: {selectedAlertAuthenticity}</span><span>Relevant evidence: {selectedRelevantRcaEvidence.length}</span><span>Internal knowledge: {selectedAlertRagDocuments.length ? `${selectedAlertRagDocuments.length} linked source(s)` : "persisted incident context"}</span><span>External knowledge: {selectedRcaDecision.externalKnowledgeStatus}</span><span>Credential: {executionRequiresCredential ? remediationPlanEditor.credential_ref ? "reference configured" : "required" : "not required for read-only plan"}</span></div>
-                        {executionRequiresCredential ? <section className="execution-credential-panel"><div className="execution-credential-heading"><div><span className="discovery-eyebrow">1 · Execution identity</span><h4>Choose the credential reference</h4><p>This is required before KaiMS can validate the connector and target in a dry run.</p></div><span className={credentialReferenceValid ? "credential-ready" : "credential-required"}>{credentialReferenceValid ? "Valid URI" : "Required"}</span></div><div className="credential-method-grid"><label>Secret manager<select value={remediationPlanEditor.credential_store} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_store: e.target.value, credential_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select></label><label>Secret reference URI<input className={remediationPlanEditor.credential_ref && !credentialReferenceValid ? "input-invalid" : ""} aria-invalid={Boolean(remediationPlanEditor.credential_ref && !credentialReferenceValid)} autoComplete="off" spellCheck="false" value={remediationPlanEditor.credential_ref} placeholder={remediationPlanEditor.credential_store === "hashicorp_vault" ? `vault://kv/data/kaims/${selectedApplicationConnection.service}#token` : remediationPlanEditor.credential_store === "aws_secrets_manager" ? `arn:aws:secretsmanager:REGION:ACCOUNT:secret:kaims/${selectedApplicationConnection.service}` : remediationPlanEditor.credential_store === "kubernetes_secret" ? `k8s-secret://kaims/${selectedApplicationConnection.service}-credentials#token` : `https://VAULT_NAME.vault.azure.net/secrets/${selectedApplicationConnection.service}-token/VERSION`} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_ref: e.target.value }))} /><span className="field-hint">{remediationPlanEditor.credential_ref && !credentialReferenceValid ? "This is not a supported enterprise secret reference. Use the selected manager’s URI format." : "Enter the URI only—never the token, password, or secret value."}</span></label></div></section> : null}
+                        {executionRequiresCredential ? <section className="execution-credential-panel"><div className="execution-credential-heading"><div><span className="discovery-eyebrow">1 Â· Execution identity</span><h4>Choose the credential reference</h4><p>This is required before KaiMS can validate the connector and target in a dry run.</p></div><span className={credentialReferenceValid ? "credential-ready" : "credential-required"}>{credentialReferenceValid ? "Valid URI" : "Required"}</span></div><div className="credential-method-grid"><label>Secret manager<select value={remediationPlanEditor.credential_store} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_store: e.target.value, credential_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select></label><label>Secret reference URI<input className={remediationPlanEditor.credential_ref && !credentialReferenceValid ? "input-invalid" : ""} aria-invalid={Boolean(remediationPlanEditor.credential_ref && !credentialReferenceValid)} autoComplete="off" spellCheck="false" value={remediationPlanEditor.credential_ref} placeholder={remediationPlanEditor.credential_store === "hashicorp_vault" ? `vault://kv/data/kaims/${selectedApplicationConnection.service}#token` : remediationPlanEditor.credential_store === "aws_secrets_manager" ? `arn:aws:secretsmanager:REGION:ACCOUNT:secret:kaims/${selectedApplicationConnection.service}` : remediationPlanEditor.credential_store === "kubernetes_secret" ? `k8s-secret://kaims/${selectedApplicationConnection.service}-credentials#token` : `https://VAULT_NAME.vault.azure.net/secrets/${selectedApplicationConnection.service}-token/VERSION`} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_ref: e.target.value }))} /><span className="field-hint">{remediationPlanEditor.credential_ref && !credentialReferenceValid ? "This is not a supported enterprise secret reference. Use the selected managerâ€™s URI format." : "Enter the URI onlyâ€”never the token, password, or secret value."}</span></label></div></section> : null}
                       </section> : null}
                       <details className="panel remediation-workspace incident-workspace-section workspace-collapsible" open>
                         <summary className="panel-head">
@@ -10856,7 +10983,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         <div className={`production-action-banner ${dangerousProductionAction ? "is-production" : "is-nonproduction"}`}>
                           <strong>{dangerousProductionAction ? "Dangerous production action" : "Non-production or lower-risk action"}</strong>
                           <span>Action: {selectedExecutionPlan.action === "-" ? selectedRcaDecision.action : selectedExecutionPlan.action}</span>
-                          <span>Target: {selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · Risk: {selectedExecutionPlan.riskTier || "unknown"}</span>
+                          <span>Target: {selectedApplicationConnection.service} Â· {selectedApplicationConnection.environment} Â· Risk: {selectedExecutionPlan.riskTier || "unknown"}</span>
                           <span>Duplicate execution is guarded by the remediation idempotency contract; repeated clicks are disabled while a request is active.</span>
                         </div>
                         <section className={`jenkins-process-panel ${selectedJenkinsProcess.configured ? "is-configured" : "is-pending"}`} aria-labelledby="jenkins-process-heading">
@@ -10884,7 +11011,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             </div>
                             <dl>
                               <dt>Action</dt><dd>{selectedExecutionPlan.action || "No recommended action supplied"}</dd>
-                              <dt>Target</dt><dd>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment}</dd>
+                              <dt>Target</dt><dd>{selectedApplicationConnection.service} Â· {selectedApplicationConnection.environment}</dd>
                               <dt>Blast radius</dt><dd>{selectedAlertWorkflow?.recommendation?.blast_radius || selectedAlertWorkflow?.recommendation?.impact || "Not supplied"}</dd>
                               <dt>Plan</dt><dd>{editedExecutionPlan.commands.length} command(s), {editedExecutionPlan.scripts.length} script(s), {editedExecutionPlan.queries.length} validation check(s)</dd>
                             </dl>
@@ -10903,7 +11030,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <div className="execution-checklist" aria-label="Execution readiness checks">
                           {executionPreflightChecks.map((check) => (
                             <article className={`execution-check ${check.passed ? "is-pass" : check.blocking ? "is-block" : "is-warn"}`} key={check.id}>
-                              <span aria-hidden="true">{check.passed ? "✓" : check.blocking ? "×" : "!"}</span>
+                              <span aria-hidden="true">{check.passed ? "âœ“" : check.blocking ? "Ã—" : "!"}</span>
                               <div><strong>{check.label}</strong><p>{check.detail}</p></div>
                               <small>{check.passed ? "Ready" : check.blocking ? "Required" : "Recommended"}</small>
                             </article>
@@ -10911,7 +11038,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           </div>
                         </details>
                         <details className="panel remediation-connection-panel">
-                          <summary className="panel-head"><div><h3>Connection details</h3><p>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedApplicationConnection.source}</p></div><span className="section-toggle-indicator" /></summary>
+                          <summary className="panel-head"><div><h3>Connection details</h3><p>{selectedApplicationConnection.service} Â· {selectedApplicationConnection.environment} Â· {selectedApplicationConnection.source}</p></div><span className="section-toggle-indicator" /></summary>
                           <div className="filter-grid">
                             <label>Application<input value={selectedApplicationConnection.application} readOnly /></label>
                             <label>Service<input value={selectedApplicationConnection.service} readOnly /></label>
@@ -10945,7 +11072,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           </ol>
                           <div className="execution-current-step">
                             {!executionIsReadOnly && !jenkinsExecutorSelected ? <div className="execution-step-form"><div><strong>Executor required</strong><p>KaiMS detected a live action without a governed connector. Build the required Jenkins process, complete its endpoint and secret reference, then run dry run.</p></div><button type="button" className="button-primary" onClick={buildRequiredExecutor}>Build required process</button></div> : null}
-                            {!executionPreflightCurrent ? <><div><strong>Validate without making changes</strong><p>KaiMS checks the target, identity, policy, and executable plan.</p></div><button type="button" className="button-primary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running dry run…" : "Run dry run"}</button></> : !cockpitApprovalAccepted ? <div className="execution-step-form"><div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div><label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this plan safe and appropriate?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading}>{approvalState.loading ? "Recording approval…" : "Approve plan"}</button></div> : dangerousProductionAction && !executionConfirmationValid ? <div className="execution-step-form"><label className="typed-execution-confirmation">Type <code>{executionConfirmationPhrase}</code> to confirm production execution<input value={executionConfirmationText} autoComplete="off" autoFocus onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label></div> : executionCapabilityBlocked ? <div className="execution-step-form"><div><strong>Live execution is not configured</strong><p>This approved plan still contains <code>--dry-run true</code>. Preparing live execution changes it to <code>--dry-run false</code> and requires a new dry run, approval, and confirmation.</p></div><button type="button" className="button-primary" onClick={prepareLiveExecutionPlan}>Prepare live execution</button></div> : <><div><strong>All safety gates passed</strong><p>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</p></div><button type="button" className="button-primary execution-primary-action" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button></>}
+                            {!executionPreflightCurrent ? <><div><strong>Validate without making changes</strong><p>KaiMS checks the target, identity, policy, and executable plan.</p></div><button type="button" className="button-primary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running dry runâ€¦" : "Run dry run"}</button></> : !cockpitApprovalAccepted ? <div className="execution-step-form"><div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div><label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this plan safe and appropriate?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading}>{approvalState.loading ? "Recording approvalâ€¦" : "Approve plan"}</button></div> : dangerousProductionAction && !executionConfirmationValid ? <div className="execution-step-form"><label className="typed-execution-confirmation">Type <code>{executionConfirmationPhrase}</code> to confirm production execution<input value={executionConfirmationText} autoComplete="off" autoFocus onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label></div> : executionCapabilityBlocked ? <div className="execution-step-form"><div><strong>Live execution is not configured</strong><p>This approved plan still contains <code>--dry-run true</code>. Preparing live execution changes it to <code>--dry-run false</code> and requires a new dry run, approval, and confirmation.</p></div><button type="button" className="button-primary" onClick={prepareLiveExecutionPlan}>Prepare live execution</button></div> : <><div><strong>All safety gates passed</strong><p>{selectedApplicationConnection.service} Â· {selectedApplicationConnection.environment} Â· {selectedExecutionPlan.riskTier || "unknown risk"}</p></div><button type="button" className="button-primary execution-primary-action" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed}>{remediationExecutionState.loading ? "Executingâ€¦" : "Execute approved plan"}</button></>}
                           </div>
                           {remediationExecutionState.error ? <p className="error">{remediationExecutionState.error}</p> : null}
                           {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
@@ -10968,7 +11095,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <p>{selectedRemediationOutcome.detail}</p>
                             <dl><dt>Action</dt><dd>{selectedRemediationOutcome.actionType}</dd><dt>Target</dt><dd>{selectedRemediationOutcome.target}</dd></dl>
                             <details className="k-technical-details"><summary>Technical response</summary><pre className="result">{JSON.stringify(selectedExecutionTechnicalResponse, null, 2)}</pre></details>
-                            {selectedRemediationOutcome.status === "succeeded" ? <section className="execution-outcome-review"><span className="eyebrow">Required human review</span><h4>Was this remediation effective?</h4><div className="outcome-choice" role="group" aria-label="Execution outcome">{[['successful','Successful'],['partial','Partially successful'],['failed','Failed']] .map(([value,label])=><button type="button" key={value} className={executionOutcomeReview.outcome===value?'active':''} onClick={()=>setExecutionOutcomeReview((current)=>({...current,outcome:value}))}>{label}</button>)}</div><label>Operator findings<textarea rows={3} value={executionOutcomeReview.notes} placeholder="What changed, what was validated, and any side effects." onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,notes:e.target.value}))}/></label><label className="checkbox-row"><input type="checkbox" checked={executionOutcomeReview.reusable} onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,reusable:e.target.checked}))}/>Approve this reviewed script for future matching incidents</label><button type="button" className="button-primary" onClick={approveExecutionOutcomeForReuse} disabled={executionOutcomeReview.loading||!executionOutcomeReview.notes.trim()}>{executionOutcomeReview.loading?'Saving review…':'Submit review and learning'}</button>{executionOutcomeReview.error?<p className="error">{executionOutcomeReview.error}</p>:null}{executionOutcomeReview.message?<p className="status-message">{executionOutcomeReview.message}</p>:null}</section> : null}
+                            {selectedRemediationOutcome.status === "succeeded" ? <section className="execution-outcome-review"><span className="eyebrow">Required human review</span><h4>Was this remediation effective?</h4><div className="outcome-choice" role="group" aria-label="Execution outcome">{[['successful','Successful'],['partial','Partially successful'],['failed','Failed']] .map(([value,label])=><button type="button" key={value} className={executionOutcomeReview.outcome===value?'active':''} onClick={()=>setExecutionOutcomeReview((current)=>({...current,outcome:value}))}>{label}</button>)}</div><label>Operator findings<textarea rows={3} value={executionOutcomeReview.notes} placeholder="What changed, what was validated, and any side effects." onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,notes:e.target.value}))}/></label><label className="checkbox-row"><input type="checkbox" checked={executionOutcomeReview.reusable} onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,reusable:e.target.checked}))}/>Approve this reviewed script for future matching incidents</label><button type="button" className="button-primary" onClick={approveExecutionOutcomeForReuse} disabled={executionOutcomeReview.loading||!executionOutcomeReview.notes.trim()}>{executionOutcomeReview.loading?'Saving reviewâ€¦':'Submit review and learning'}</button>{executionOutcomeReview.error?<p className="error">{executionOutcomeReview.error}</p>:null}{executionOutcomeReview.message?<p className="status-message">{executionOutcomeReview.message}</p>:null}</section> : null}
                           </section>
                         ) : null}
                         <details className="k-technical-details execution-technical-details">
@@ -11207,7 +11334,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <header><span>01</span><div><small>Immediate</small><h3>Real-time Response</h3></div></header>
                           <ol><li><strong>Process the alert</strong><span>Start as soon as an alert reaches the landing pad.</span></li><li><strong>Reuse known context</strong><span>Apply the latest validated knowledge before discovering missing evidence.</span></li><li><strong>Control the action</strong><span>Review, approve, remediate, validate, and close with a full audit trail.</span></li></ol>
                         </article>
-                        <div className="operating-mode-loop" aria-label="AI learning feedback loop"><span>AI</span><strong>Context in</strong><i>↔</i><strong>Outcome back</strong></div>
+                        <div className="operating-mode-loop" aria-label="AI learning feedback loop"><span>AI</span><strong>Context in</strong><i>â†”</i><strong>Outcome back</strong></div>
                         <article className="operating-mode-card is-continuous">
                           <header><span>02</span><div><small>Continuous</small><h3>Proactive & Knowledge</h3></div></header>
                           <ol><li><strong>Monitor all alert sources</strong><span>Aggregate new alert families and schedule recurring analysis.</span></li><li><strong>Curate understanding</strong><span>Persist context, RCA, impact, dependencies, and resolution guidance.</span></li><li><strong>Learn from outcomes</strong><span>Feed validated incident results back into the repository for future response.</span></li></ol>
@@ -11627,7 +11754,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             </div>
                             {onboardingForm.connection_auth_type === "managed_identity" ? <div className="credential-managed-identity"><strong>Managed identity selected</strong><span>KaiMS will use the workload identity assigned to the runtime. No stored secret is required.</span></div> : null}
                             {!['none', 'managed_identity'].includes(onboardingForm.connection_auth_type) ? <label className="credential-reference-field">Secret reference<input spellCheck="false" autoComplete="off" placeholder={onboardingForm.connection_secret_store === "hashicorp_vault" ? "vault://kv/data/observability/prometheus#token" : onboardingForm.connection_secret_store === "aws_secrets_manager" ? "aws-sm://prod/observability/prometheus#api-key" : onboardingForm.connection_secret_store === "kubernetes_secret" ? "k8s-secret://monitoring/prometheus-credentials#token" : "azure-kv://kaims-prod/observability-prometheus/token"} value={onboardingForm.connection_secret_ref} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, connection_secret_ref: e.target.value }))} /><span className="field-hint">Paste the secret URI, not its value. Expected format includes the vault or namespace, secret name, and optional key/version.</span></label> : null}
-                            <footer><span aria-hidden="true">✓</span><p><strong>Secrets stay outside KaiMS.</strong> Only this reference is saved with the application configuration and passed to authorized runtime connectors.</p></footer>
+                            <footer><span aria-hidden="true">âœ“</span><p><strong>Secrets stay outside KaiMS.</strong> Only this reference is saved with the application configuration and passed to authorized runtime connectors.</p></footer>
                           </section>
                           <label>Network Zone<input placeholder="prod-private / vnet name" value={onboardingForm.network_zone} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, network_zone: e.target.value }))} /></label>
                           <label>Health Check URL<input type="url" placeholder="https://service/health" value={onboardingForm.healthcheck_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, healthcheck_url: e.target.value }))} /></label>
@@ -12084,7 +12211,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                       <section className="onboarding-activation-summary" aria-label="Application configuration review">
                         <div><span>Application</span><strong>{onboardingForm.name || "Not supplied"}</strong><small>{onboardingForm.business_service || onboardingForm.description || "Business context not supplied"}</small></div>
                         <div><span>Ownership</span><strong>{onboardingForm.owner_team || "Not supplied"}</strong><small>{onboardingForm.owner_email || "Owner email not supplied"}</small></div>
-                        <div><span>Runtime</span><strong>{onboardingForm.environment} · {onboardingForm.region}</strong><small>{onboardingForm.network_zone || onboardingForm.deployment_mode}</small></div>
+                        <div><span>Runtime</span><strong>{onboardingForm.environment} Â· {onboardingForm.region}</strong><small>{onboardingForm.network_zone || onboardingForm.deployment_mode}</small></div>
                         <div><span>Monitoring</span><strong>{onboardingForm.monitoring_tool}</strong><small>{[onboardingForm.logs_url && "logs", onboardingForm.traces_url && "traces", onboardingForm.telemetry_url && "telemetry", onboardingForm.ticketing_url && "ITSM/Jira", onboardingForm.email_url && "email"].filter(Boolean).join(", ") || "primary source only"}</small></div>
                         <div><span>Context policy</span><strong>{onboardingForm.context_strategy}</strong><small>{onboardingForm.context_strategy === "realtime" ? "Collect fresh context for every alert" : onboardingForm.context_strategy === "historical" ? "Use periodic historical snapshots only" : "Reuse complete context; refresh only when needed"}</small></div>
                         <div><span>Credentials</span><strong>{onboardingForm.connection_auth_type}</strong><small>{onboardingForm.connection_secret_ref || "No secret reference required"}</small></div>

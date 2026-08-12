@@ -514,7 +514,33 @@ async def _persist_action(app: FastAPI, action: RemediationAction) -> None:
         await session.commit()
 
 
+def _rca_and_resolution_confidence(payload: dict[str, Any]) -> tuple[float | None, float | None]:
+    recommendation = payload.get("recommendation", {}) if isinstance(payload.get("recommendation"), dict) else {}
+    metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
+    rca_analysis = metadata.get("rca_analysis", {}) if isinstance(metadata.get("rca_analysis"), dict) else {}
+    try:
+        rca_confidence = float(rca_analysis.get("confidence_score"))
+    except (TypeError, ValueError):
+        rca_confidence = None
+    try:
+        resolution_confidence = float(recommendation.get("confidence"))
+    except (TypeError, ValueError):
+        resolution_confidence = None
+    return rca_confidence, resolution_confidence
+
+
 def _resolution_requires_approval(payload: dict[str, Any]) -> bool:
+    # Arch's auto-completion rule: when both the RCA confidence and the
+    # resolution confidence meet the configured threshold, the alert flow
+    # continues without manual approval, regardless of the severity-based
+    # decision below. Below threshold on either value (or either is missing),
+    # the existing approval flow is unchanged.
+    rca_confidence, resolution_confidence = _rca_and_resolution_confidence(payload)
+    if rca_confidence is not None and resolution_confidence is not None:
+        threshold = settings.rca_resolution_auto_complete_threshold
+        if rca_confidence >= threshold and resolution_confidence >= threshold:
+            return False
+
     decision = payload.get("decision", {}) if isinstance(payload.get("decision"), dict) else {}
     if "requires_approval" in decision:
         return bool(decision.get("requires_approval"))

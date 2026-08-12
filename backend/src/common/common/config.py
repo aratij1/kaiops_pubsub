@@ -154,6 +154,13 @@ class Settings(BaseSettings):
     confidence_auto_execute_threshold: float = Field(default=0.9, alias="CONFIDENCE_AUTO_EXECUTE_THRESHOLD")
     confidence_guided_execute_threshold: float = Field(default=0.75, alias="CONFIDENCE_GUIDED_EXECUTE_THRESHOLD")
     auto_execute_min_confidence: float = Field(default=0.8, alias="AUTO_EXECUTE_MIN_CONFIDENCE")
+    # Arch's auto-completion rule: when both the RCA confidence and the
+    # resolution (remediation recommendation) confidence meet this threshold,
+    # the alert flow continues without waiting on manual approval. Below
+    # threshold on either value, the existing approval flow is unchanged.
+    rca_resolution_auto_complete_threshold: float = Field(
+        default=0.70, alias="RCA_RESOLUTION_AUTO_COMPLETE_THRESHOLD"
+    )
     orchestration_approval_severities: str = Field(
         default="high,critical",
         alias="ORCHESTRATION_APPROVAL_SEVERITIES",
