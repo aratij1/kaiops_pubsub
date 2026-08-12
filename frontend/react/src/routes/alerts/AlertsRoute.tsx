@@ -6,7 +6,7 @@ import { OperationsWorkflowNav } from "../../components/operations/OperationsWor
 
 const channels = [
   ["all", "ALL", "All arrivals"], ["prometheus", "PR", "Prometheus"],
-  ["telemetry", "OT", "Telemetry"], ["email", "EM", "Email"],
+  ["email", "EM", "Email"],
   ["log", "LG", "Logs / OpenSearch"], ["ticket", "TK", "Tickets / Jira"],
   ["failed", "!", "Failed intake"],
 ] as const;
@@ -145,7 +145,12 @@ function metricTrace(row: AlertStreamRow | null) {
 
 export default function AlertsRoute() {
   const alerts = useRouteRuntimeSlice("alerts");
+  useEffect(() => {
+    if (alerts.channel === "telemetry") alerts.setChannel("all");
+  }, [alerts.channel, alerts.setChannel]);
   const [dedupWindow, setDedupWindow] = useState(60);
+  const [liveView, setLiveView] = useState<"stream" | "flow">(() => window.localStorage.getItem("kaiops.live-alert-view") === "flow" ? "flow" : "stream");
+  useEffect(() => window.localStorage.setItem("kaiops.live-alert-view", liveView), [liveView]);
   const [dedupSaving, setDedupSaving] = useState(false);
   const [dedupMessage, setDedupMessage] = useState("");
   const prometheusRows = alerts.rows.filter((row) => normalizedChannel(row) === "prometheus");
@@ -247,7 +252,13 @@ export default function AlertsRoute() {
 
     <div className="ingestion-channel-grid" aria-label="Alert source counts">{channels.map(([channel, icon, label]) => <button type="button" key={channel} className={`ingestion-channel-card channel-${channel} ${alerts.channel === channel ? "is-active" : ""}`} onClick={() => alerts.setChannel(channel)} aria-pressed={alerts.channel === channel}><span>{icon}</span><div><strong>{alerts.counts[channel] || 0}</strong><small>{label}</small></div></button>)}</div>
 
-    {trace ? <article className="panel metric-alert-trace">
+    <div className="live-alert-view-switch" role="group" aria-label="Live alert presentation">
+      <span>Display</span>
+      <button type="button" className={liveView === "stream" ? "is-active" : ""} aria-pressed={liveView === "stream"} onClick={() => setLiveView("stream")}><RadioTower size={16} /><span><strong>Live stream</strong><small>Latest alert arrivals</small></span></button>
+      <button type="button" className={liveView === "flow" ? "is-active" : ""} aria-pressed={liveView === "flow"} onClick={() => setLiveView("flow")}><GitMerge size={16} /><span><strong>Flow view</strong><small>Metric through incident</small></span></button>
+    </div>
+
+    {liveView === "flow" && trace ? <article className="panel metric-alert-trace">
       <div className="panel-head"><div><span className="discovery-eyebrow">Prometheus execution</span><h3>Metric-to-Alert Trace</h3><p>{trace.alertName} · {trace.target}</p></div><span className={`pill ${statusPillClass(trace.status)}`}>{trace.status.toUpperCase()}</span></div>
       <div className="metric-trace-flow" aria-label="Prometheus metric to alert flow">{flowStages.map(([id, label, Icon], index) => <button key={id} type="button" className={`${traceStage === id ? "is-selected" : ""} ${id === "alert" ? "is-alert" : ""}`} onClick={() => setTraceStage(id)} aria-pressed={traceStage === id}><span className="metric-trace-sequence">{String(index + 1).padStart(2, "0")}</span><i><Icon size={19} /></i><strong>{label}</strong><small>{id === "target" ? trace.job : id === "scrape" ? "/metrics polled" : id === "parse" ? `${trace.metric} = ${trace.value}` : id === "store" ? "Time series" : id === "rule" ? "Condition matched" : trace.alertName}</small></button>)}</div>
       <div className="metric-trace-details">
@@ -271,7 +282,7 @@ export default function AlertsRoute() {
       </div>
     </article> : null}
 
-    <article className="panel ingestion-stream-panel">
+    {liveView === "stream" ? <article className="panel ingestion-stream-panel">
       <div className="ingestion-stream-toolbar"><div><span className="discovery-eyebrow">Landing-pad events</span><h3>{alerts.channel === "all" ? "All source activity" : alerts.channel === "failed" ? "Failed ingestion activity" : `${sourceChannelLabel(alerts.channel)} activity`}</h3></div><label><span>Search alerts</span><input value={alerts.query} onChange={(event) => alerts.setQuery(event.target.value)} placeholder="Alert, service, project, or source" /></label></div>
       {alerts.error ? <p className="error">Live data could not be refreshed. Existing results are preserved. {alerts.error}</p> : null}
       <div className="ingestion-stream-list" aria-live="off">{alerts.rows.map((row) => {
@@ -280,6 +291,6 @@ export default function AlertsRoute() {
         const failed = String(row.status || "").toLowerCase() === "failed" || Boolean(row.error);
         return <article className={`ingestion-event channel-${channel} ${failed ? "is-failed" : ""}`} key={alertRowKey(row)}><div className="ingestion-event-marker"><span>{channelIcon(channel)}</span><i aria-hidden="true" /></div><div className="ingestion-event-main"><header><div><strong>{display.title}</strong><span className={`source-badge source-${channel}`}>{sourceChannelLabel(channel)}</span><span className={`pill ${failed ? "status-failed" : statusPillClass(row.status || "processed")}`}>{display.status}</span></div><time>{display.lastSeen}</time></header><p>{display.summary}</p><footer><span><b>Service</b>{display.service}</span><span><b>Project</b>{display.project}</span><span><b>Severity</b>{display.severity}</span><span title={row.file}><b>File</b>{display.file}</span><span><b>First seen</b>{display.firstSeen}</span><span><b>Last seen</b>{display.lastSeen}</span><span><b>Occurrences</b>{display.occurrences}</span><span><b>Owner</b>{display.owner}</span></footer>{channel === "prometheus" ? <button type="button" className="button-secondary ingestion-open-action" onClick={() => { setTraceAlert(row); setTraceStage("target"); document.querySelector(".metric-alert-trace")?.scrollIntoView({ behavior: "smooth", block: "start" }); }}>Trace metric flow</button> : null}{!failed ? <button type="button" className="button-secondary ingestion-open-action" onClick={() => alerts.open(row)}>Open incident cockpit</button> : null}{row.error ? <small className="ingestion-event-error">{compactText(richText(row.error), 240)}</small> : null}</div></article>;
       })}{!alerts.rows.length && !alerts.loading ? <div className="ingestion-stream-empty"><strong>No alerts match this view</strong><p>Change the filters or verify the selected connector is delivering events.</p></div> : null}</div>
-    </article>
+    </article> : null}
   </section>;
 }
