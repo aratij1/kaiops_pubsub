@@ -94,9 +94,14 @@ class JenkinsRollbackPlugin(BasePlugin):
         timeout_seconds = max(5.0, min(float(profile.get("timeout_seconds") or 120), 900.0))
         parameters = {
             "KAI_OPS_INCIDENT_ID": str(action.incident_id),
+            "KAI_OPS_APPROVAL_ID": str(action.approval_id or ""),
+            "KAI_OPS_APPLICATION_ID": str(action.parameters.get("application_id") or ""),
             "KAI_OPS_TARGET": str(action.target),
             "KAI_OPS_SERVICE": str(action.parameters.get("service") or ""),
             "KAI_OPS_ENVIRONMENT": str(action.parameters.get("environment") or ""),
+            "KAI_OPS_NAMESPACE": str(action.parameters.get("namespace") or "default"),
+            "KAI_OPS_RESOLUTION_ID": str(action.parameters.get("resolution_id") or action.action_type),
+            "KAI_OPS_DRY_RUN": str(bool(action.parameters.get("dry_run", False))).lower(),
             "KAI_OPS_EXECUTION_PLAN": json.dumps(action.parameters.get("execution_plan") or {}, separators=(",", ":")),
         }
         async with httpx.AsyncClient(auth=(username, token), timeout=httpx.Timeout(timeout_seconds, connect=10.0)) as client:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import httpx
 from common.models import Approval, ApprovalDecision, RemediationStatus
 from remediation_engine.plugins import JenkinsRollbackPlugin, RemediationEngine
 
@@ -119,3 +120,36 @@ async def test_jenkins_rollback_requires_runtime_secret_injection(monkeypatch: p
 
     assert result.status == RemediationStatus.SKIPPED
     assert "runtime secret provider" in str(result.error)
+
+
+@pytest.mark.asyncio
+async def test_jenkins_submits_application_resolution_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    submitted: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/crumbIssuer/api/json"):
+            return httpx.Response(404)
+        submitted.update(dict(request.url.params))
+        return httpx.Response(201, headers={"location": "https://jenkins.example/queue/item/7"})
+
+    monkeypatch.setenv("JENKINS_USERNAME", "kaiops")
+    monkeypatch.setenv("JENKINS_API_TOKEN", "secret")
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: async_client(transport=httpx.MockTransport(handler), **kwargs))
+    action = RemediationEngine().build_action(Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="sre-user",
+        comment="restart pod",
+        metadata={"connection_profile": {"executor_type": "jenkins", "endpoint_url": "https://jenkins.example", "job_name": "kaiops/remediation/payments", "credential_ref": "vault://jenkins"}},
+    ))
+    action.parameters.update({"application_id": "payments", "namespace": "prod-payments", "resolution_id": "restart-workload", "dry_run": True})
+
+    result = await JenkinsRollbackPlugin().execute(action)
+
+    assert result.status == RemediationStatus.SUCCEEDED
+    assert submitted["KAI_OPS_APPLICATION_ID"] == "payments"
+    assert submitted["KAI_OPS_NAMESPACE"] == "prod-payments"
+    assert submitted["KAI_OPS_RESOLUTION_ID"] == "restart-workload"
+    assert submitted["KAI_OPS_DRY_RUN"] == "true"

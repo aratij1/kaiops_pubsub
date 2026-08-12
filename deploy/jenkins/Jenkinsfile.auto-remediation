@@ -3,6 +3,7 @@ import groovy.json.JsonSlurperClassic
 def approvedCommand(String command) {
     def value = (command ?: '').trim()
     def patterns = [
+        ~/^kubectl\s+(get|describe|logs)\b.*/,
         ~/^kubectl\s+(rollout\s+(restart|undo|status)|scale)\b.*/,
         ~/^ansible-playbook\s+playbooks\/[A-Za-z0-9_.\/-]+\.ya?ml\b.*/,
         ~/^redis-cli\s+-h\s+[A-Za-z0-9_.-]+\s+-n\s+\d+\s+FLUSHDB$/,
@@ -23,9 +24,14 @@ pipeline {
 
     parameters {
         string(name: 'KAI_OPS_INCIDENT_ID', trim: true)
+        string(name: 'KAI_OPS_APPROVAL_ID', trim: true)
+        string(name: 'KAI_OPS_APPLICATION_ID', trim: true)
         string(name: 'KAI_OPS_TARGET', trim: true)
         string(name: 'KAI_OPS_SERVICE', trim: true)
         string(name: 'KAI_OPS_ENVIRONMENT', defaultValue: 'prod', trim: true)
+        string(name: 'KAI_OPS_NAMESPACE', defaultValue: 'default', trim: true)
+        string(name: 'KAI_OPS_RESOLUTION_ID', defaultValue: 'investigate-first', trim: true)
+        booleanParam(name: 'KAI_OPS_DRY_RUN', defaultValue: true)
         text(name: 'KAI_OPS_EXECUTION_PLAN', defaultValue: '{"commands":[],"scripts":[],"queries":[]}')
     }
 
@@ -38,14 +44,18 @@ pipeline {
                     }
                     def plan = new JsonSlurperClassic().parseText(params.KAI_OPS_EXECUTION_PLAN)
                     def commands = plan.commands instanceof List ? plan.commands : []
-                    if (!commands) {
+                    def mutating = params.KAI_OPS_RESOLUTION_ID != 'investigate-first'
+                    if (mutating && !params.KAI_OPS_APPROVAL_ID?.trim()) {
+                        error('A KaiOps approval id is required for mutating resolution steps')
+                    }
+                    if (!commands && mutating) {
                         error('The approved KaiOps execution plan contains no commands')
                     }
                     def rejected = commands.findAll { !approvedCommand(it as String) }
                     if (rejected) {
                         error("Commands outside the Jenkins remediation allowlist: ${rejected.join(', ')}")
                     }
-                    currentBuild.description = "KaiOps ${params.KAI_OPS_INCIDENT_ID} | ${params.KAI_OPS_TARGET}"
+                    currentBuild.description = "${params.KAI_OPS_RESOLUTION_ID} | ${params.KAI_OPS_INCIDENT_ID} | ${params.KAI_OPS_TARGET}"
                     env.KAI_OPS_COMMANDS_JSON = groovy.json.JsonOutput.toJson(commands)
                 }
             }
@@ -56,7 +66,9 @@ pipeline {
                 script {
                     def commands = new JsonSlurperClassic().parseText(env.KAI_OPS_COMMANDS_JSON)
                     commands.each { command ->
-                        if (isUnix()) {
+                        if (params.KAI_OPS_DRY_RUN) {
+                            echo "DRY RUN: ${command}"
+                        } else if (isUnix()) {
                             sh(label: 'KaiOps remediation', script: command as String)
                         } else {
                             bat(label: 'KaiOps remediation', script: command as String)
@@ -71,7 +83,8 @@ pipeline {
                 script {
                     def plan = new JsonSlurperClassic().parseText(params.KAI_OPS_EXECUTION_PLAN)
                     def checks = plan.queries instanceof List ? plan.queries : []
-                    writeFile file: "kaiops-remediation-${params.KAI_OPS_INCIDENT_ID}.log", text: "Incident: ${params.KAI_OPS_INCIDENT_ID}\nTarget: ${params.KAI_OPS_TARGET}\nExecution: successful\nValidation checks for KaiOps closure service:\n${checks.join('\n')}\n"
+                    def rollback = plan.rollback instanceof List ? plan.rollback : []
+                    writeFile file: "kaiops-remediation-${params.KAI_OPS_INCIDENT_ID}.log", text: "Application: ${params.KAI_OPS_APPLICATION_ID}\nIncident: ${params.KAI_OPS_INCIDENT_ID}\nApproval: ${params.KAI_OPS_APPROVAL_ID}\nResolution: ${params.KAI_OPS_RESOLUTION_ID}\nTarget: ${params.KAI_OPS_TARGET}\nNamespace: ${params.KAI_OPS_NAMESPACE}\nDry run: ${params.KAI_OPS_DRY_RUN}\nExecution: successful\nValidation checks for KaiOps closure service:\n${checks.join('\n')}\nRollback contract:\n${rollback.join('\n')}\n"
                 }
             }
         }
