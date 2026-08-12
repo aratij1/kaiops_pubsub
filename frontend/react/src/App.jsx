@@ -5251,8 +5251,15 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }, [visibleAlerts, dashboardAlertFocus, dashboardAlertQueryDebounced, dashboardAlertSource]);
 
   const monitorScopedIncidentMetadata = useMemo(() => {
-    return filterRowsForMonitor(incidentMetadata.rows, applicationToMonitor);
-  }, [incidentMetadata.rows, applicationToMonitor]);
+    const scoped = filterRowsForMonitor(incidentMetadata.rows, applicationToMonitor);
+    return scoped.map((incidentRow) => {
+      const projection = incidentRow?.projection_payload && typeof incidentRow.projection_payload === "object" ? incidentRow.projection_payload : {};
+      const eventPayload = projection?.event_payload && typeof projection.event_payload === "object" ? projection.event_payload : {};
+      const alertId = String(incidentRow?.alert_id || projection?.alert_id || eventPayload?.alert_id || "").trim();
+      const alertRow = alerts.rows.find((row) => String(row?.alert_id || row?.id || "").trim() === alertId);
+      return alertRow ? { ...incidentRow, source_alert: alertRow } : incidentRow;
+    });
+  }, [incidentMetadata.rows, alerts.rows, applicationToMonitor]);
 
   const selectedMonitorScopeLabel = useMemo(
     () => monitorScopeLabel(applicationToMonitor),
