@@ -514,7 +514,7 @@ def _persist_alert_to_landing_pad(
         target_dir = _date_partition_dir(base_dir, now)
         target_dir.mkdir(parents=True, exist_ok=True)
         # Preserve the title in the payload while bounding the filesystem path.
-        alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))[:160] or "alert"
+        alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))[:50] or "alert"
         labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
         fingerprint = str(labels.get("alert_fingerprint") or "no-fingerprint").strip() or "no-fingerprint"
         safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:24]
@@ -5005,7 +5005,13 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
         event_mode = str(merged_labels.get("event_mode") or merged_labels.get("test_mode") or "real").strip().lower()
         alert_name = str(merged_labels.get("alertname") or "prometheus-alert")
         synthetic = event_mode in {"synthetic", "test", "validation", "simulation"} or "ingestion validation" in alert_name.lower()
-        native_alertmanager_origin = origin_system in {"prometheus", "prometheus-alertmanager", "alertmanager", "grafana"}
+        # This handler is the dedicated Alertmanager webhook receiver, so every
+        # request genuinely arrives via Alertmanager regardless of the
+        # display-oriented "source" label an individual alert rule sets (e.g.
+        # "robot-shop", "online-boutique") for categorization in the UI.
+        # Authenticity must not be derived from that label, or every rule that
+        # sets a descriptive source gets wrongly quarantined as unverified.
+        native_alertmanager_origin = True
         authenticity = "synthetic" if synthetic else "internal-observed" if native_alertmanager_origin else "unverified"
         delivery_key = _alertmanager_delivery_key(item, merged_labels, status)
 

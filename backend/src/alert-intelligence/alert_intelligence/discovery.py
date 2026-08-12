@@ -48,7 +48,11 @@ def _impact(alert: Alert) -> tuple[str, str, str, str]:
 
 
 def _fallback_actionability(alert: Alert) -> tuple[bool, str]:
-    text = f"{alert.name} {alert.description}".lower()
+    # The alert's own annotations (e.g. an Alertmanager rule's "summary") often
+    # carry the clearest actionability signal even when "description" doesn't
+    # repeat it verbatim, so both must be checked, not description alone.
+    annotation_text = " ".join(str(value) for value in alert.annotations.values())
+    text = f"{alert.name} {alert.description} {annotation_text}".lower()
     noise = (
         "cleaning up inactive",
         "cleanup completed",
@@ -63,6 +67,7 @@ def _fallback_actionability(alert: Alert) -> tuple[bool, str]:
         token in text
         for token in (
             "unavailable",
+            "unreachable",
             "outage",
             "connection refused",
             "fatal",
@@ -72,6 +77,7 @@ def _fallback_actionability(alert: Alert) -> tuple[bool, str]:
             "timeout",
             "deadline exceeded",
             "error scraping",
+            "cannot scrape",
             "failed",
         )
     )
