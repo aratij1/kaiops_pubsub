@@ -46,6 +46,8 @@ class AlertIntelligenceAgent(BaseAgent):
     embedding_model: HashingEmbeddingModel = field(default_factory=HashingEmbeddingModel)
     correlation_threshold: float | None = None
     retention_minutes: int | None = None
+    deduplication_enabled: bool | None = None
+    deduplication_window_minutes: int | None = None
     alert_history_repository: AlertHistoryRepository = field(default_factory=InMemoryAlertHistoryRepository)
     name: str = "alert-intelligence-agent"
     # Bounded FIFO cache: an unbounded dict here grows for the life of the
@@ -59,22 +61,63 @@ class AlertIntelligenceAgent(BaseAgent):
         if self.correlation_threshold is None:
             self.correlation_threshold = float(getattr(settings, "alert_correlation_threshold", 0.72))
         if self.retention_minutes is None:
-            self.retention_minutes = int(getattr(settings, "alert_retention_minutes", 30))
+            self.retention_minutes = int(getattr(settings, "alert_retention_minutes", 60))
+        if self.deduplication_enabled is None:
+            self.deduplication_enabled = bool(getattr(settings, "alert_deduplication_enabled", True))
+        if self.deduplication_window_minutes is None:
+            self.deduplication_window_minutes = int(
+                getattr(settings, "alert_deduplication_window_minutes", self.retention_minutes or 60)
+            )
+        self.deduplication_window_minutes = max(1, min(int(self.deduplication_window_minutes), 1440))
+        self.retention_minutes = max(int(self.retention_minutes or 0), self.deduplication_window_minutes)
 
     async def deduplicate_alerts(self, alert: Alert, candidates: Sequence[Alert] | None = None) -> Alert:
         fingerprint = self._fingerprint(alert)
         alert.fingerprint = fingerprint
-        cutoff = utc_now() - timedelta(minutes=int(self.retention_minutes or 30))
+        alert.metadata["deduplication"] = {
+            "enabled": bool(self.deduplication_enabled),
+            "window_minutes": int(self.deduplication_window_minutes or 60),
+            "fingerprint": fingerprint,
+            "similarity_threshold": float(self.correlation_threshold or 0.72),
+        }
+        if not self.deduplication_enabled:
+            alert.deduplicated_count = 1
+            alert.metadata["deduplication"].update({"matched": False, "disposition": "new_incident"})
+            return alert
+        cutoff = utc_now() - timedelta(minutes=int(self.deduplication_window_minutes or 60))
         if candidates is None:
             candidates = await self.alert_history_repository.list_recent_alerts(
                 environment=alert.environment, tenant_id=alert.tenant_id
             )
-        matches = [
-            item
-            for item in candidates
-            if item.fingerprint == fingerprint and item.starts_at >= cutoff and item.ends_at is None
-        ]
+        matches: list[Alert] = []
+        match_details: list[dict[str, Any]] = []
+        for item in candidates:
+            if item.starts_at < cutoff or item.ends_at is not None:
+                continue
+            exact = item.fingerprint == fingerprint
+            similarity, evidence = self._correlation_score(alert, item)
+            if not exact and similarity < float(self.correlation_threshold or 0.72):
+                continue
+            matches.append(item)
+            match_details.append(
+                {
+                    "alert_id": str(item.id),
+                    "match_type": "exact" if exact else "similar",
+                    "similarity_score": round(similarity, 4),
+                    "evidence": evidence,
+                }
+            )
         alert.deduplicated_count = len(matches) + 1
+        alert.metadata["deduplication"].update(
+            {
+                "matched": bool(matches),
+                "matched_alert_ids": [str(item.id) for item in matches[:20]],
+                "matches": match_details[:20],
+                "match_type": match_details[0]["match_type"] if match_details else None,
+                "similarity_score": match_details[0]["similarity_score"] if match_details else 0.0,
+                "disposition": "duplicate" if matches else "new_incident",
+            }
+        )
         return alert
 
     async def correlate_alerts(self, alert: Alert, candidates: Sequence[Alert] | None = None) -> Alert:

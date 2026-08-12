@@ -51,6 +51,7 @@ def _build_closure_event_payload(
         correlation_id=correlation_id,
         agent="closure-service",
         payload={
+            "ticket_id": report.ticket_id,
             "action_taken": report.action_taken,
             "health_restored": report.health_restored,
             "alerts_cleared": report.alerts_cleared,
@@ -59,6 +60,7 @@ def _build_closure_event_payload(
         metadata={
             "root_cause": report.root_cause,
             "impact": report.impact,
+            "ticket_id": report.ticket_id,
         },
         confidence=1.0 if report.health_restored else 0.7,
         reasoning="closure validation derived from remediation outcome and health checks",
@@ -131,6 +133,7 @@ async def _persist_closure_event(
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
         incident_payload = await repo.get_incident(str(action.incident_id)) or {}
+        report.ticket_id = str(incident_payload.get("ticket_id") or "").strip() or None
         final_incident_payload = _build_final_incident_payload(
             action=action,
             report=report,
@@ -229,6 +232,8 @@ async def _validate_and_store(action: RemediationAction) -> ResolutionReport:
     if settings.database_enabled:
         async with app.state.session_factory() as session:
             repo = IncidentRepository(session)
+            incident_payload = await repo.get_incident(str(action.incident_id)) or {}
+            report.ticket_id = str(incident_payload.get("ticket_id") or "").strip() or None
             await repo.save_report(report)
             await repo.save_knowledge_base(report)
             runbook_id = str(action.parameters.get("runbook_id") or "").strip()

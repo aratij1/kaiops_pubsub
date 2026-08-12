@@ -12,6 +12,25 @@ async def test_remediation_engine_registers_tool_specs() -> None:
     assert "rollback_deployment" in engine.tool_registry.tools
     assert "restart_pod" in engine.tool_registry.tools
     assert "api_execution" in engine.tool_registry.tools
+    assert "jenkins" in engine.tool_registry.tools
+
+
+@pytest.mark.asyncio
+async def test_selected_jenkins_executor_routes_non_rollback_actions_to_jenkins() -> None:
+    engine = RemediationEngine()
+    approval = Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="sre-user",
+        comment="restart pod",
+        metadata={"connection_profile": {"executor_type": "jenkins"}},
+    )
+
+    result = await engine.execute(engine.build_action(approval))
+
+    assert result.status == RemediationStatus.SKIPPED
+    assert result.parameters["execution_result"]["executor"] == "jenkins"
 
 
 @pytest.mark.asyncio

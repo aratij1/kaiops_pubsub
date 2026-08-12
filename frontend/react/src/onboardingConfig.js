@@ -1,6 +1,6 @@
 export const MONITORING_TOOL_OPTIONS = ["prometheus", "new_relic", "datadog"];
 
-export const ALERT_DOC_KIND_OPTIONS = ["incident", "runbook", "deployment", "change", "dependency", "remediation"];
+export const ALERT_DOC_KIND_OPTIONS = ["incident", "jira", "runbook", "deployment", "change", "dependency", "remediation"];
 
 export const ONBOARDING_SOURCE_DOC_EXTENSIONS = new Set(["txt", "md", "markdown", "json", "csv", "log", "yaml", "yml"]);
 

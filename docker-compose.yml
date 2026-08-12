@@ -337,6 +337,7 @@ services:
       interval: 5s
       timeout: 10s
       retries: 20
+      start_period: 30s
 
   mysql-exporter:
     profiles: ["observability", "monitoring-authoring", "full"]
@@ -675,12 +676,12 @@ services:
       test:
         [
           "CMD-SHELL",
-          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)\"",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=8)\"",
         ]
       interval: 5s
-      timeout: 3s
-      retries: 20
-      start_period: 10s
+      timeout: 10s
+      retries: 40
+      start_period: 60s
     depends_on:
       monitoring-adapter: { condition: service_started }
       application-onboarding: { condition: service_started }
@@ -707,6 +708,8 @@ services:
       # One remote model call per raw alert created the ingestion backlog and
       # delayed context/RCA for newer alerts.
       DISCOVERY_LLM_ENABLED: ${DISCOVERY_LLM_ENABLED:-false}
+      ALERT_DEDUPLICATION_ENABLED: ${ALERT_DEDUPLICATION_ENABLED:-true}
+      ALERT_DEDUPLICATION_WINDOW_MINUTES: ${ALERT_DEDUPLICATION_WINDOW_MINUTES:-60}
       # MESSAGE_BUS_WORKER_COUNT (shared default above) spins up N competing
       # consumer tasks in this one process/event loop - raising it adds I/O
       # concurrency (more DB round-trips/publishes in flight) but NOT CPU
@@ -742,10 +745,11 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: context-agent
-      # Continuous knowledge mode is the production default. Set a per-event
-      # decision.context_strategy=immediate when fresh discovery is mandatory.
-      CONTEXT_STRATEGY: ${CONTEXT_STRATEGY:-continuous}
+      # Auto reuses complete cached context. Per event, realtime forces fresh
+      # discovery and historical uses periodic snapshots without live calls.
+      CONTEXT_STRATEGY: ${CONTEXT_STRATEGY:-auto}
       CONTEXT_KNOWLEDGE_TTL_SECONDS: ${CONTEXT_KNOWLEDGE_TTL_SECONDS:-604800}
+      CONTEXT_HISTORICAL_MAX_AGE_SECONDS: ${CONTEXT_HISTORICAL_MAX_AGE_SECONDS:-2592000}
       MESSAGE_BUS_WORKER_COUNT: ${CONTEXT_AGENT_WORKER_COUNT:-2}
       DISCOVERY_MCP_URL: http://discovery-mcp:8000/mcp
       DISCOVERY_MCP_TIMEOUT_SECONDS: ${DISCOVERY_MCP_TIMEOUT_SECONDS:-15}
@@ -942,9 +946,9 @@ services:
     build:
       context: .
       dockerfile: deploy/docker/Dockerfile.ui
-    # Public traffic terminates at host Nginx on HTTPS/443. Keep the raw UI
-    # listener loopback-only so it cannot bypass TLS or the reverse proxy.
-    ports: ["127.0.0.1:8501:80"]
+    # Docker Desktop's IPv6 localhost forwarder can accept connections without
+    # forwarding them. Bind IPv4 explicitly so Windows falls back from ::1.
+    ports: ["${UI_BIND_ADDRESS:-127.0.0.1}:8501:80"]
     restart: unless-stopped
     depends_on:
       api-gateway: { condition: service_healthy }

@@ -40,8 +40,12 @@ export default function KnowledgeRoute() {
   };
   const runNow = async () => {
     setDevelopment((current) => ({ ...current, running: true, error: "" }));
-    try { await request("/run", { method: "POST" }); await loadDevelopment(); setDevelopment((current) => ({ ...current, running: false })); }
-    catch (error: any) { setDevelopment((current) => ({ ...current, running: false, error: error.message })); }
+    try {
+      const result = await request("/run", { method: "POST" });
+      if (result?.status === "failed") throw new Error(result.error || "Analysis failed");
+      await loadDevelopment();
+      setDevelopment((current) => ({ ...current, running: false }));
+    } catch (error: any) { setDevelopment((current) => ({ ...current, running: false, error: error.message })); }
   };
   useEffect(() => {
     if (view !== "development") return undefined;

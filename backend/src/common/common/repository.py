@@ -864,7 +864,42 @@ class IncidentRepository:
         output = [row for row in selected if row.id in reserved_ids]
         output.extend(row for row in selected if row.id not in reserved_ids)
         output = sorted(output[:safe_limit], key=lambda row: row.created_at, reverse=True)
-        return [dict(row.payload) if isinstance(row.payload, dict) else {} for row in output]
+        alert_ids = {str(row.id) for row in output}
+        incident_by_alert: dict[str, dict[str, Any]] = {}
+        incident_query = (
+            select(IncidentRecord)
+            .options(load_only(IncidentRecord.id, IncidentRecord.ticket_id, IncidentRecord.payload))
+            .order_by(IncidentRecord.created_at.desc())
+            .limit(max(150, safe_limit * 3))
+        )
+        if tenant_id is not None:
+            incident_query = incident_query.where(IncidentRecord.tenant_id == tenant_id)
+        incident_result = await self.session.execute(incident_query)
+        for incident in incident_result.scalars().all():
+            incident_payload = incident.payload if isinstance(incident.payload, dict) else {}
+            linked_alert_ids = incident_payload.get("alert_ids", [])
+            if not isinstance(linked_alert_ids, list):
+                continue
+            for linked_alert_id in linked_alert_ids:
+                alert_id = str(linked_alert_id)
+                if alert_id in alert_ids and alert_id not in incident_by_alert:
+                    incident_by_alert[alert_id] = {
+                        "incident_id": str(incident.id),
+                        "ticket_id": str(incident.ticket_id or "").strip() or None,
+                    }
+
+        rows: list[dict[str, Any]] = []
+        for record in output:
+            payload = dict(record.payload) if isinstance(record.payload, dict) else {}
+            payload.update({key: value for key, value in incident_by_alert.get(str(record.id), {}).items() if value})
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            deduplication = metadata.get("deduplication") if isinstance(metadata.get("deduplication"), dict) else {}
+            payload["incident_disposition"] = str(
+                deduplication.get("disposition")
+                or ("duplicate" if int(payload.get("deduplicated_count") or 1) > 1 else "new_incident")
+            )
+            rows.append(payload)
+        return rows
 
     async def update_projection_document_flag(self, alert_id: str, available: bool) -> bool:
         """Set incident_projections.document_available for the incident linked to alert_id.
@@ -1683,6 +1718,15 @@ class IncidentRepository:
 
     async def find_open_jira_by_correlation_key(self, correlation_key: str) -> str | None:
         """Resolve a previously qualified Jira incident for a correlated signal."""
+        incident = await self.find_open_incident_by_correlation_key(correlation_key)
+        if not incident:
+            return None
+        metadata = incident.get("metadata") if isinstance(incident.get("metadata"), dict) else {}
+        candidate = metadata.get("incident_candidate") if isinstance(metadata.get("incident_candidate"), dict) else {}
+        return str(incident.get("ticket_id") or candidate.get("jira_key") or "").strip() or None
+
+    async def find_open_incident_by_correlation_key(self, correlation_key: str) -> dict[str, Any] | None:
+        """Resolve the canonical open incident that owns a correlated alert group."""
         normalized = str(correlation_key or "").strip()
         if not normalized:
             return None
@@ -1701,7 +1745,7 @@ class IncidentRepository:
                 else {}
             )
             if str(candidate.get("correlation_key") or "").strip() == normalized:
-                return str(record.ticket_id or candidate.get("jira_key") or "").strip() or None
+                return payload
         return None
 
     async def get_latest_recommendation_for_incident(self, incident_id: Any) -> dict[str, Any] | None:
@@ -3299,6 +3343,20 @@ class IncidentRepository:
         result = await self.session.execute(stmt)
         rows = result.scalars().all()
 
+        ticket_by_incident: dict[UUID, str] = {}
+        projection_incident_ids = [row.incident_id for row in rows]
+        if projection_incident_ids:
+            ticket_result = await self.session.execute(
+                select(IncidentRecord.id, IncidentRecord.ticket_id).where(
+                    IncidentRecord.id.in_(projection_incident_ids)
+                )
+            )
+            ticket_by_incident = {
+                incident_id: str(ticket_id).strip()
+                for incident_id, ticket_id in ticket_result.all()
+                if str(ticket_id or "").strip()
+            }
+
         pending_by_incident: dict[UUID, PendingWorkflowRecord] = {}
         missing_context_incidents = [
             row.incident_id
@@ -3365,6 +3423,7 @@ class IncidentRepository:
             response_rows.append(
                 {
                     "incident_id": str(row.incident_id),
+                    "ticket_id": ticket_by_incident.get(row.incident_id),
                     "alert_id": str(row.alert_id) if row.alert_id else None,
                     "trace_id": row.trace_id,
                     "recommendation_id": str(merged_recommendation_id) if merged_recommendation_id else None,

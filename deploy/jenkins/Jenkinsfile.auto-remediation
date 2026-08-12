@@ -1,0 +1,85 @@
+import groovy.json.JsonSlurperClassic
+
+def approvedCommand(String command) {
+    def value = (command ?: '').trim()
+    def patterns = [
+        ~/^kubectl\s+(rollout\s+(restart|undo|status)|scale)\b.*/,
+        ~/^ansible-playbook\s+playbooks\/[A-Za-z0-9_.\/-]+\.ya?ml\b.*/,
+        ~/^redis-cli\s+-h\s+[A-Za-z0-9_.-]+\s+-n\s+\d+\s+FLUSHDB$/,
+        ~/^terraform\s+(init|apply)\b.*/,
+        ~/^mysql\s+-e\s+"CALL mysql\.rds_failover\(\);"$/
+    ]
+    return patterns.any { value ==~ it }
+}
+
+pipeline {
+    agent any
+
+    options {
+        disableConcurrentBuilds()
+        timeout(time: 15, unit: 'MINUTES')
+        timestamps()
+    }
+
+    parameters {
+        string(name: 'KAI_OPS_INCIDENT_ID', trim: true)
+        string(name: 'KAI_OPS_TARGET', trim: true)
+        string(name: 'KAI_OPS_SERVICE', trim: true)
+        string(name: 'KAI_OPS_ENVIRONMENT', defaultValue: 'prod', trim: true)
+        text(name: 'KAI_OPS_EXECUTION_PLAN', defaultValue: '{"commands":[],"scripts":[],"queries":[]}')
+    }
+
+    stages {
+        stage('Validate governed request') {
+            steps {
+                script {
+                    if (!params.KAI_OPS_INCIDENT_ID?.trim() || !params.KAI_OPS_TARGET?.trim()) {
+                        error('KaiOps incident id and remediation target are required')
+                    }
+                    def plan = new JsonSlurperClassic().parseText(params.KAI_OPS_EXECUTION_PLAN)
+                    def commands = plan.commands instanceof List ? plan.commands : []
+                    if (!commands) {
+                        error('The approved KaiOps execution plan contains no commands')
+                    }
+                    def rejected = commands.findAll { !approvedCommand(it as String) }
+                    if (rejected) {
+                        error("Commands outside the Jenkins remediation allowlist: ${rejected.join(', ')}")
+                    }
+                    currentBuild.description = "KaiOps ${params.KAI_OPS_INCIDENT_ID} | ${params.KAI_OPS_TARGET}"
+                    env.KAI_OPS_COMMANDS_JSON = groovy.json.JsonOutput.toJson(commands)
+                }
+            }
+        }
+
+        stage('Execute approved resolution') {
+            steps {
+                script {
+                    def commands = new JsonSlurperClassic().parseText(env.KAI_OPS_COMMANDS_JSON)
+                    commands.each { command ->
+                        if (isUnix()) {
+                            sh(label: 'KaiOps remediation', script: command as String)
+                        } else {
+                            bat(label: 'KaiOps remediation', script: command as String)
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Record validation contract') {
+            steps {
+                script {
+                    def plan = new JsonSlurperClassic().parseText(params.KAI_OPS_EXECUTION_PLAN)
+                    def checks = plan.queries instanceof List ? plan.queries : []
+                    writeFile file: "kaiops-remediation-${params.KAI_OPS_INCIDENT_ID}.log", text: "Incident: ${params.KAI_OPS_INCIDENT_ID}\nTarget: ${params.KAI_OPS_TARGET}\nExecution: successful\nValidation checks for KaiOps closure service:\n${checks.join('\n')}\n"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: '**/kaiops-remediation-*.log', allowEmptyArchive: true
+        }
+    }
+}

@@ -8,7 +8,7 @@ import { beginOidcLogin, completeOidcLogin } from "./services/oidcClient";
 import { RouteRuntimeProvider } from "./app/routeRuntime";
 import { projectIdentityFromAlert } from "./domain/projectIdentity";
 import { buildOnboardingSources } from "./domain/onboardingSources";
-import { buildAlertDocumentDraft } from "./domain/alertDocumentDraft";
+import { buildAlertDocumentDraft as buildRcaEvidenceDocumentDraft } from "./domain/alertDocumentDraft";
 import RcaPanel from "./routes/incidents/RcaPanel";
 import CopilotRoute from "./routes/copilot/CopilotRoute";
 import { breadcrumbForPath, groupedNavigationForRole, navigationItemForPath, TAB_SHORTCUT_BY_CODE, VALID_LEGACY_TABS } from "./app/navigation";
@@ -413,6 +413,39 @@ function visibleManagedApplication(row) {
   return isTestApplicationRecord(row) ? null : { ...row, name: rawName };
 }
 
+function simpleIncidentReport(content) {
+  const text = String(content || "").replace(/\r/g, "").trim();
+  if (!text) return "No report content is available.";
+  const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+  const field = (label) => {
+    const line = lines.find((item) => item.toLowerCase().startsWith(`${label.toLowerCase()}:`));
+    return line ? line.slice(line.indexOf(":") + 1).trim() : "";
+  };
+  const section = (names) => {
+    const headings = names.map((name) => name.toLowerCase());
+    const start = lines.findIndex((line) => headings.some((name) => line.replace(/^#+\s*/, "").toLowerCase().includes(name)));
+    if (start < 0) return "";
+    const values = [];
+    for (let index = start + 1; index < lines.length; index += 1) {
+      if (/^#+\s+/.test(lines[index])) break;
+      values.push(lines[index].replace(/^[-*]\s*/, ""));
+      if (values.join(" ").length >= 280) break;
+    }
+    return values.join(" ").slice(0, 320);
+  };
+  const title = lines.find((line) => /^#\s+/.test(line))?.replace(/^#+\s*/, "") || "Incident report";
+  const rows = [
+    ["Incident", field("Incident ID") || field("Incident reference")],
+    ["Jira", field("Jira ticket")],
+    ["Service", field("Service")],
+    ["Severity", field("Severity")],
+    ["Root cause", section(["root cause"]) || field("Root cause") || field("Probable root cause")],
+    ["Impact", section(["technical and business impact", "impact"]) || field("Impact")],
+    ["Recommended action", section(["resolution procedure", "recommended response"]) || field("Recommended action") || field("Immediate action")],
+  ].filter(([, value]) => value);
+  return [`# ${title}`, ...rows.map(([label, value]) => `${label}: ${value}`)].join("\n\n");
+}
+
 export default function App({ initialTab = "home", currentPath = "/", currentSearch = "", onActiveTabChange, onNavigatePath, routeOutlet = null } = {}) {
   const queryClient = useQueryClient();
   const skipNextActiveTabNavigationRef = useRef(false);
@@ -523,6 +556,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     notes: "",
   });
   const [evidenceDraftReview, setEvidenceDraftReview] = useState({ loading: false, draft: null, content: "", notes: "", error: "", message: "" });
+  const [incidentReportView, setIncidentReportView] = useState("simple");
   const [executionOutcomeReview, setExecutionOutcomeReview] = useState({ outcome: "successful", notes: "", reusable: true, loading: false, error: "", message: "", reviewedAlertId: "" });
   const [showExecutionCredential, setShowExecutionCredential] = useState(false);
   const [remediationExecutionState, setRemediationExecutionState] = useState({ loading: false, result: null, error: "" });
@@ -612,7 +646,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     connection_auth_type: "none",
     connection_secret_store: "hashicorp_vault",
     connection_secret_ref: "",
-    context_strategy: "continuous",
+    context_strategy: "auto",
     azure_subscription_id: "",
     azure_resource_group: "",
     azure_service_bus_namespace: "",
@@ -1163,7 +1197,21 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       return;
     }
     const immediatePayload = fallbackRow && typeof fallbackRow === "object"
-      ? { data: { alert: fallbackRow, incident: null, context: { metadata: { processing_state: "loading" } }, timeline: [] } }
+      ? {
+          data: {
+            alert: fallbackRow,
+            incident: fallbackRow.incident_id || fallbackRow.projection_payload
+              ? {
+                  id: fallbackRow.incident_id || fallbackRow.id || "",
+                  status: fallbackRow.status || fallbackRow.state || "",
+                  service: fallbackRow.service || "",
+                  environment: fallbackRow.environment || "",
+                }
+              : null,
+            context: { metadata: { processing_state: "loading" } },
+            timeline: [],
+          },
+        }
       : null;
     setSelectedAlertData((prev) => ({
       loading: background ? prev.loading : true,
@@ -1299,10 +1347,28 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
   }
 
-  function openAlertDetails(row) {
-    const canonicalRow = resolveCanonicalAlertRow(row, alerts.rows);
+  function openAlertDetails(row, initialTab = "overview") {
+    const projection = row?.projection_payload && typeof row.projection_payload === "object"
+      ? row.projection_payload
+      : {};
+    const eventPayload = projection?.event_payload && typeof projection.event_payload === "object"
+      ? projection.event_payload
+      : {};
+    const suppliedAlertId = String(
+      row?.alert_id
+      || projection?.alert_id
+      || eventPayload?.alert_id
+      || eventPayload?.source_alert_id
+      || ""
+    ).trim();
+    // Incident projections already carry the authoritative alert UUID. Do not
+    // replace it with a semantically similar landing-pad row whose id is a
+    // filename; processed RCA endpoints are keyed by the canonical UUID.
+    const canonicalRow = ALERT_UUID_PATTERN.test(suppliedAlertId)
+      ? row
+      : resolveCanonicalAlertRow(row, alerts.rows);
     const canonicalAlertId = canonicalRow?.alert_id || canonicalRow?.id || canonicalRow?.incident_id;
-    const clickedAlertId = row?.alert_id || row?.id || row?.incident_id;
+    const clickedAlertId = suppliedAlertId || row?.id || row?.incident_id;
     const alertId = canonicalAlertId || clickedAlertId;
     if (!alertId) {
       return;
@@ -1315,7 +1381,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     // which would remove workspace=alert and leave the details view hidden.
     skipNextActiveTabNavigationRef.current = true;
     setActiveTab("home");
-    setHomeDetailTab("overview");
+    setHomeDetailTab(initialTab);
     loadAlertDetails(alertId, selectedRow);
     onNavigatePath?.(`/?workspace=alert&alert_id=${encodeURIComponent(String(alertId))}`);
     window.setTimeout(() => {
@@ -1324,19 +1390,32 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }, 100);
   }
 
-  function openAlertDetailsFromIncident(row) {
+  function openAlertDetailsFromIncident(row, initialTab = "overview") {
     const incidentId = String(row?.incident_id || row?.id || "").trim();
     if (!incidentId) {
       return;
     }
     setApprovalState({ loading: false, result: null, error: "" });
+    const projection = row?.projection_payload && typeof row.projection_payload === "object"
+      ? row.projection_payload
+      : {};
+    const eventPayload = projection?.event_payload && typeof projection.event_payload === "object"
+      ? projection.event_payload
+      : {};
+    const projectedAlertId = String(
+      row?.alert_id
+      || projection?.alert_id
+      || eventPayload?.alert_id
+      || eventPayload?.source_alert_id
+      || ""
+    ).trim();
     const scopedAlerts = visibleAlerts;
     const matchedAlert = scopedAlerts.find((alertRow) => {
       const alertId = String(alertRow?.alert_id || alertRow?.id || alertRow?.incident_id || "").trim();
       const sourceIncident = String(alertRow?.incident_id || "").trim();
-      return alertId === incidentId || sourceIncident === incidentId;
+      return alertId === projectedAlertId || alertId === incidentId || sourceIncident === incidentId;
     });
-    openAlertDetails(matchedAlert || row);
+    openAlertDetails(matchedAlert || { ...row, alert_id: projectedAlertId || row?.alert_id }, initialTab);
   }
 
   function openGlobalOperationalItem(item) {
@@ -1455,10 +1534,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       }
       return;
     }
-    if (hasSelectedSnapshot && !selectedAlertData.error) {
+    if (hasSelectedSnapshot && (!selectedAlertData.error || selectedAlertData.loading)) {
       return;
     }
-    // Command Center must not implicitly open the newest row. That row may
+    if (selectedAlertData.loading && String(selectedAlertData.alertId || "") === String(selectedAlertId || "")) {
+      return;
+    }
+    // The incident summary must not implicitly open the newest row. That row may
     // still be moving through enrichment/RCA, which made the first cockpit
     // appear incomplete before the operator selected an alert.
     if (selectedAlertId) {
@@ -2364,7 +2446,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       network_zone: String(connectivityPayload.network_zone || "").trim(),
       connection_auth_type: String(connectivityPayload.monitoring_sources?.[0]?.auth_type || "none").trim(),
       connection_secret_ref: String(connectivityPayload.monitoring_sources?.[0]?.secret_ref || "").trim(),
-      context_strategy: String(connectivityPayload.context_strategy || "continuous").trim(),
+      context_strategy: String(connectivityPayload.context_strategy || "auto").trim(),
       azure_subscription_id: String(connectivityPayload.azure_subscription_id || curr.azure_subscription_id || "").trim(),
       azure_resource_group: String(connectivityPayload.azure_resource_group || curr.azure_resource_group || "").trim(),
       azure_service_bus_namespace: String(connectivityPayload.azure_service_bus_namespace || curr.azure_service_bus_namespace || "").trim(),
@@ -2419,7 +2501,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       network_zone: "",
       connection_auth_type: "none",
       connection_secret_ref: "",
-      context_strategy: "continuous",
+      context_strategy: "auto",
       assignment_username: "",
       assignment_project: "",
       onboarding_path: "setup_monitoring",
@@ -3280,7 +3362,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         network_zone: String(connectivity?.network_zone || curr.network_zone || "").trim(),
         connection_auth_type: String(connectivity?.monitoring_sources?.[0]?.auth_type || curr.connection_auth_type || "none").trim(),
         connection_secret_ref: String(connectivity?.monitoring_sources?.[0]?.secret_ref || curr.connection_secret_ref || "").trim(),
-        context_strategy: String(connectivity?.context_strategy || curr.context_strategy || "continuous").trim(),
+        context_strategy: ({ continuous: "auto", immediate: "realtime" }[String(connectivity?.context_strategy || "").trim()] || String(connectivity?.context_strategy || curr.context_strategy || "auto").trim()),
         azure_subscription_id: String(connectivity?.azure_subscription_id || curr.azure_subscription_id || "").trim(),
         azure_resource_group: String(connectivity?.azure_resource_group || curr.azure_resource_group || "").trim(),
         azure_service_bus_namespace: String(connectivity?.azure_service_bus_namespace || curr.azure_service_bus_namespace || "").trim(),
@@ -3367,7 +3449,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         email_url: String(onboardingForm.email_url || "").trim(),
         healthcheck_url: String(onboardingForm.healthcheck_url || "").trim(),
         network_zone: String(onboardingForm.network_zone || "").trim(),
-        context_strategy: String(onboardingForm.context_strategy || "continuous").trim(),
+        context_strategy: String(onboardingForm.context_strategy || "auto").trim(),
         azure_subscription_id: String(onboardingForm.azure_subscription_id || "").trim(),
         azure_resource_group: String(onboardingForm.azure_resource_group || "").trim(),
         azure_service_bus_namespace: String(onboardingForm.azure_service_bus_namespace || "").trim(),
@@ -4651,9 +4733,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         // The URL is authoritative for the top-level destination. Keep reading
         // the remaining legacy preferences until their owning features move to
         // typed route state.
-        if (prefs.metadataFilters && typeof prefs.metadataFilters === "object") {
-          setMetadataFilters((current) => ({ ...current, ...prefs.metadataFilters }));
-        }
         if (prefs.closedFilters && typeof prefs.closedFilters === "object") {
           setClosedFilters((current) => ({ ...current, ...prefs.closedFilters }));
         }
@@ -4695,14 +4774,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       uiTheme,
       selectedFlow,
       activeTab,
-      metadataFilters,
       closedFilters,
       ingestionStreamFilters,
       ingestionStreamView,
       ingestionStreamSection,
     };
     window.localStorage.setItem(PREFERENCE_STORAGE_KEY, JSON.stringify(payload));
-  }, [applicationToMonitor, uiDensity, uiTheme, selectedFlow, activeTab, metadataFilters, closedFilters, ingestionStreamFilters, ingestionStreamView, ingestionStreamSection]);
+  }, [applicationToMonitor, uiDensity, uiTheme, selectedFlow, activeTab, closedFilters, ingestionStreamFilters, ingestionStreamView, ingestionStreamSection]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -5104,9 +5182,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const matchedRow = visibleAlerts.find(
       (row) => String(row?.alert_id || row?.id || row?.incident_id || "") === selectedAlertId
     );
-    if (matchedRow) {
-      return matchedRow;
-    }
     const snapshotId = String(
       selectedAlertSnapshot?.alert_id
       || selectedAlertSnapshot?.id
@@ -5117,8 +5192,27 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       selectedAlertSnapshot ? [selectedAlertSnapshot] : [],
       applicationToMonitor,
     ).length > 0;
-    return snapshotId === selectedAlertId && snapshotInCurrentScope ? selectedAlertSnapshot : null;
-  }, [visibleAlerts, selectedAlertId, selectedAlertSnapshot, applicationToMonitor]);
+    const snapshotRow = snapshotId === selectedAlertId && snapshotInCurrentScope ? selectedAlertSnapshot : null;
+    const baseRow = matchedRow || snapshotRow;
+    if (!baseRow) return null;
+
+    const payload = selectedAlertData?.payload?.data || selectedAlertData?.payload || {};
+    const processedAlert = payload?.alert && typeof payload.alert === "object" ? payload.alert : {};
+    const processedIncident = payload?.incident && typeof payload.incident === "object" ? payload.incident : {};
+    const processedAlertId = String(processedAlert.alert_id || processedAlert.id || selectedAlertId || "").trim();
+    // Summary projections make the cockpit available immediately. Once the
+    // processed result arrives, overlay its canonical fields so both views
+    // describe the same record without losing the alert/incident relationship.
+    return {
+      ...baseRow,
+      ...processedIncident,
+      ...processedAlert,
+      id: processedAlertId || baseRow.id,
+      alert_id: processedAlertId || baseRow.alert_id,
+      incident_id: processedIncident.id || processedIncident.incident_id || baseRow.incident_id,
+      projection_payload: baseRow.projection_payload,
+    };
+  }, [visibleAlerts, selectedAlertId, selectedAlertSnapshot, selectedAlertData.payload, applicationToMonitor]);
 
   useEffect(() => {
     const alertId = String(selectedAlertId || "").trim();
@@ -5490,8 +5584,21 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   ]);
 
   const selectedIncidentId = useMemo(() => {
-    return String(selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "").trim();
-  }, [selectedAlertWorkflow]);
+    const projection = selectedAlertRow?.projection_payload && typeof selectedAlertRow.projection_payload === "object"
+      ? selectedAlertRow.projection_payload
+      : {};
+    const eventPayload = projection?.event_payload && typeof projection.event_payload === "object"
+      ? projection.event_payload
+      : {};
+    return String(
+      selectedAlertWorkflow?.incident?.id
+      || selectedAlertWorkflow?.incident_id
+      || selectedAlertRow?.incident_id
+      || projection?.incident_id
+      || eventPayload?.incident_id
+      || ""
+    ).trim();
+  }, [selectedAlertWorkflow, selectedAlertRow]);
 
   const selectedIncidentMetadataRow = useMemo(() => {
     if (!selectedIncidentId) {
@@ -5563,10 +5670,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       return {
         id: String(doc?.evidence_id || doc?.document_id || doc?.path || `evidence-${index + 1}`),
         source: String(doc?.source || doc?.kind || doc?.document_kind || "knowledge document"),
+        title: String(doc?.title || ""),
+        summary: String(doc?.summary || doc?.snippet || doc?.description || ""),
         timestamp,
         age: ageMs === null ? "unknown" : ageMs < 3600000 ? `${Math.max(1, Math.round(ageMs / 60000))}m` : ageMs < 86400000 ? `${Math.round(ageMs / 3600000)}h` : `${Math.round(ageMs / 86400000)}d`,
         freshness: !parsed ? "Freshness unknown" : ageMs <= 3600000 ? "Fresh" : ageMs <= 86400000 ? "Recent" : "Stale",
         citation: String(doc?.uri || doc?.url || doc?.citation || doc?.path || ""),
+        uri: String(doc?.uri || doc?.url || ""),
+        path: String(doc?.path || ""),
         cached,
       };
     }).filter((row, index, rows) => rows.findIndex((candidate) => candidate.id === row.id) === index);
@@ -5613,17 +5724,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }, [selectedAlertWorkflow, selectedAlertRow, selectedAlertEvaluation, selectedAiTrust.missing.length]);
 
   const selectedRelevantRcaEvidence = useMemo(() => {
-    const generic = new Set(["alert", "application", "critical", "error", "failed", "failure", "high", "incident", "monitor", "monitoring", "prod", "production", "service", "validation", "warning"]);
-    const labels = selectedAlertRow?.labels && typeof selectedAlertRow.labels === "object" ? selectedAlertRow.labels : {};
-    const identityTerms = [selectedAlertRow?.service, selectedAlertRow?.name, selectedAlertRow?.alert_name, labels.application, labels.project, labels.project_name, labels.monitor_id]
-      .flatMap((value) => String(value || "").toLowerCase().match(/[a-z0-9][a-z0-9_.-]{2,}/g) || [])
-      .filter((term) => !generic.has(term));
-    if (!identityTerms.length) return [];
-    return selectedAiTrust.evidence.filter((row) => {
-      const haystack = [row?.source, row?.snippet, row?.summary, row?.citation, row?.uri, row?.path, row?.title].map((value) => String(value || "").toLowerCase()).join(" ");
-      return identityTerms.some((term) => haystack.includes(term));
-    });
-  }, [selectedAiTrust.evidence, selectedAlertRow]);
+    // These sources already come from the selected alert's linked-document
+    // endpoint and its persisted discovery report. Re-matching them by free
+    // text can discard valid evidence after normalization (for example, an
+    // evidence ID and citation with no service name in the display string).
+    return selectedAiTrust.evidence;
+  }, [selectedAiTrust.evidence]);
   const selectedAlertAuthenticity = String(
     selectedAlertRow?.labels?.event_authenticity
     || selectedAlertRow?.event_authenticity
@@ -5645,7 +5751,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         if (!draft && selectedRcaDecision.rootCause && !selectedRcaDecision.reviewRequired && selectedRelevantRcaEvidence.length) {
           const evidenceIds = selectedRelevantRcaEvidence.map((row) => row.id || row.evidence_id).filter(Boolean);
           const sourceUris = selectedRelevantRcaEvidence.map((row) => row.citation || row.uri).filter(Boolean);
-          const content = buildAlertDocumentDraft({ alertId, alert: selectedAlertRow, decision: selectedRcaDecision, workflow: selectedAlertWorkflow, evidence: selectedRelevantRcaEvidence });
+          const content = buildRcaEvidenceDocumentDraft({ alertId, alert: selectedAlertRow, decision: selectedRcaDecision, workflow: selectedAlertWorkflow, evidence: selectedRelevantRcaEvidence });
           const created = await fetchJson("/api-gateway/rag/evidence-drafts", authenticatedOptions({ method: "POST", body: JSON.stringify({ alert_id: alertId, incident_id: selectedIncidentId, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, title: `RCA review: ${selectedAlertRow?.name || "Alert"}`, content, services: [selectedAlertRow?.service].filter(Boolean), evidence_ids: evidenceIds, source_uris: sourceUris }) }));
           draft = unwrap(created)?.draft || null;
         }
@@ -7348,7 +7454,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           executor_type: String(remediationPlanEditor.executor_type || "").trim(),
           job_name: String(remediationPlanEditor.job_name || "").trim(),
           timeout_seconds: 120,
-          allowed_operations: ["rollback_deployment"],
+          allowed_operations: ["rollback_deployment", "restart_pod", "scale_deployment", "restart_service", "clear_cache", "failover_database", "terraform_rollback"],
           source: selectedApplicationConnection.source,
           credential_ref: String(remediationPlanEditor.credential_ref || selectedApplicationConnection.credential_ref || "").trim() || undefined,
         },
@@ -9419,7 +9525,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               filters: metadataFilters,
               refresh: loadIncidentMetadata,
               updateFilter: (name, value) => setMetadataFilters((current) => ({ ...current, [name]: value })),
-              open: openAlertDetailsFromIncident,
+              open: (row, stage = "overview") => openAlertDetailsFromIncident(row, stage),
             },
             alerts: {
               loading: landingPadRecent.loading,
@@ -10044,16 +10150,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           >
                             Review Decision
                           </button>
-                          {canUseApprovalActions ? (
-                            <button
-                              type="button"
-                              className="button-secondary"
-                              onClick={() => selectApprovalIncident(matchedApproval)}
-                              disabled={approvalState.loading}
-                            >
-                              Load Decision Form
-                            </button>
-                          ) : null}
                           </div>
                         ) : null}
                       </article>
@@ -10483,14 +10579,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           </div>
                           <div className="alert-documents-kind-row">
                             {ALERT_DOC_KIND_OPTIONS.map((kind) => (
-                              <span key={`empty-doc-kind-${kind}`}>{kind}</span>
+                              <span key={`empty-doc-kind-${kind}`}>{kind === "jira" ? "Jira ticket" : kind}</span>
                             ))}
                           </div>
                           {evidenceDraftReview.loading && !evidenceDraftReview.draft ? <div className="alert-document-generation-state"><span className="spinner" aria-hidden="true" /><span>Completing the RCA-derived document draft…</span></div> : null}
                           {canProvideAlertDocuments && evidenceDraftReview.draft ? <div className="alert-document-draft-editor">
                             <div className="alert-document-draft-heading"><div><span className="eyebrow">Editable draft</span><h4>{evidenceDraftReview.draft.title || "Incident knowledge document"}</h4></div><span className={`workflow-pill ${evidenceDraftReview.draft.status === "reviewed" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft.status || "draft"}</span></div>
-                            <label>Document content<textarea rows={18} value={evidenceDraftReview.content} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, content: event.target.value }))} disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status === "approved"} /></label>
-                            <label>Reviewer notes<textarea rows={3} value={evidenceDraftReview.notes} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, notes: event.target.value }))} placeholder="Record corrections, exclusions, and evidence that still needs confirmation." disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status === "approved"} /></label>
+                            <div className="report-view-switch" role="tablist" aria-label="Incident report detail"><button type="button" role="tab" aria-selected={incidentReportView === "simple"} className={incidentReportView === "simple" ? "active" : ""} onClick={() => setIncidentReportView("simple")}>Simple</button><button type="button" role="tab" aria-selected={incidentReportView === "detailed"} className={incidentReportView === "detailed" ? "active" : ""} onClick={() => setIncidentReportView("detailed")}>Detailed</button></div>
+                            {incidentReportView === "simple" ? <pre className="simple-incident-report">{simpleIncidentReport(evidenceDraftReview.content)}</pre> : <><label>Document content<textarea rows={18} value={evidenceDraftReview.content} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, content: event.target.value }))} disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status === "approved"} /></label><label>Reviewer notes<textarea rows={3} value={evidenceDraftReview.notes} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, notes: event.target.value }))} placeholder="Record corrections, exclusions, and evidence that still needs confirmation." disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status === "approved"} /></label></>}
                             <div className="alert-documents-empty-actions"><button type="button" className="button-secondary" onClick={saveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20}>Save draft</button><button type="button" className="button-primary" onClick={approveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20}>Approve &amp; publish</button><button type="button" className="button-ghost" onClick={() => selectedAlertRow && openDocumentPrompt(selectedAlertRow)}>Add source document</button></div>
                           </div> : null}
                           <div className="alert-documents-empty-actions">
@@ -10837,6 +10933,29 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                     </section>
                   ) : null}
                 </article>
+              ) : selectedAlertId ? (
+                <article className="panel alert-details-cockpit" ref={alertDetailsRef} tabIndex={-1} aria-busy={selectedAlertData.loading}>
+                  <div className="panel-head incident-sticky-header">
+                    <div>
+                      <span className="discovery-eyebrow">Guided Incident Cockpit</span>
+                      <h2>Alert Details Cockpit</h2>
+                      <p>{selectedAlertData.error ? "The alert details could not be loaded." : "Loading the selected alert and incident context..."}</p>
+                    </div>
+                    <span className={`pill ${selectedAlertData.error ? "pill-danger" : "pill-info"}`}>
+                      {selectedAlertData.error ? "Load failed" : "Loading"}
+                    </span>
+                  </div>
+                  {selectedAlertData.error ? (
+                    <div>
+                      <p className="error" role="alert">{selectedAlertData.error}</p>
+                      <button type="button" className="button-primary" onClick={() => loadAlertDetails(selectedAlertId)} disabled={selectedAlertData.loading}>
+                        {selectedAlertData.loading ? "Retrying..." : "Retry loading details"}
+                      </button>
+                    </div>
+                  ) : (
+                    <p className="subtitle" role="status">Retrieving processing history, Jira ticket, context, and RCA evidence.</p>
+                  )}
+                </article>
               ) : (
                 <article className="panel">
                   <p className="subtitle">Select an alert in Alert Stream to open the detail tabs workspace.</p>
@@ -11032,7 +11151,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <ol><li><strong>Monitor all alert sources</strong><span>Aggregate new alert families and schedule recurring analysis.</span></li><li><strong>Curate understanding</strong><span>Persist context, RCA, impact, dependencies, and resolution guidance.</span></li><li><strong>Learn from outcomes</strong><span>Feed validated incident results back into the repository for future response.</span></li></ol>
                         </article>
                       </div>
-                      <div className="operating-mode-policy"><div><strong>New application context policy</strong><span>Continuous avoids repeating full discovery when a matching issue returns.</span></div><select aria-label="Default context strategy" value={onboardingForm.context_strategy} onChange={(event) => setOnboardingForm((current) => ({ ...current, context_strategy: event.target.value }))}><option value="continuous">Continuous (recommended)</option><option value="immediate">Immediate refresh every time</option></select></div>
+                      <div className="operating-mode-policy"><div><strong>New application context policy</strong><span>Choose when KaiMS may reuse periodic context and when it must query live systems.</span></div><select aria-label="Default context strategy" value={onboardingForm.context_strategy} onChange={(event) => setOnboardingForm((current) => ({ ...current, context_strategy: event.target.value }))}><option value="auto">Auto: reuse complete context</option><option value="historical">Historical snapshots only</option><option value="realtime">Real-time collection</option></select></div>
                     </section>
                     <article className="panel project-stepper-panel">
                       <div className="panel-head">
@@ -11905,7 +12024,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         <div><span>Ownership</span><strong>{onboardingForm.owner_team || "Not supplied"}</strong><small>{onboardingForm.owner_email || "Owner email not supplied"}</small></div>
                         <div><span>Runtime</span><strong>{onboardingForm.environment} · {onboardingForm.region}</strong><small>{onboardingForm.network_zone || onboardingForm.deployment_mode}</small></div>
                         <div><span>Monitoring</span><strong>{onboardingForm.monitoring_tool}</strong><small>{[onboardingForm.logs_url && "logs", onboardingForm.traces_url && "traces", onboardingForm.telemetry_url && "telemetry", onboardingForm.ticketing_url && "ITSM/Jira", onboardingForm.email_url && "email"].filter(Boolean).join(", ") || "primary source only"}</small></div>
-                        <div><span>Context policy</span><strong>{onboardingForm.context_strategy}</strong><small>{onboardingForm.context_strategy === "continuous" ? "Reuse validated context and learn from outcomes" : "Refresh discovery for each alert"}</small></div>
+                        <div><span>Context policy</span><strong>{onboardingForm.context_strategy}</strong><small>{onboardingForm.context_strategy === "realtime" ? "Collect fresh context for every alert" : onboardingForm.context_strategy === "historical" ? "Use periodic historical snapshots only" : "Reuse complete context; refresh only when needed"}</small></div>
                         <div><span>Credentials</span><strong>{onboardingForm.connection_auth_type}</strong><small>{onboardingForm.connection_secret_ref || "No secret reference required"}</small></div>
                       </section>
                       <div className="filter-grid onboarding-review-checklist" style={{ marginBottom: 8 }}>

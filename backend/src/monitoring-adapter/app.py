@@ -1107,7 +1107,7 @@ class OnboardingConnectivityPayload(BaseModel):
     ticketing_url: str = ""
     email_url: str = ""
     network_zone: str = ""
-    context_strategy: str = "continuous"
+    context_strategy: str = "auto"
     azure_subscription_id: str = ""
     azure_resource_group: str = ""
     azure_service_bus_namespace: str = ""
@@ -1200,9 +1200,10 @@ class OnboardingConnectivityPayload(BaseModel):
         self.ticketing_url = self._normalize_endpoint(self.ticketing_url, "ticketing_url")
         self.email_url = normalize_email_endpoint(self.email_url)
         self.network_zone = str(self.network_zone or "").strip()
-        self.context_strategy = str(self.context_strategy or "continuous").strip().lower()
-        if self.context_strategy not in {"immediate", "continuous"}:
-            raise ValueError("context_strategy must be one of immediate, continuous")
+        self.context_strategy = str(self.context_strategy or "auto").strip().lower()
+        self.context_strategy = {"continuous": "auto", "immediate": "realtime"}.get(self.context_strategy, self.context_strategy)
+        if self.context_strategy not in {"auto", "realtime", "historical"}:
+            raise ValueError("context_strategy must be one of auto, realtime, historical")
         self.azure_subscription_id = str(self.azure_subscription_id or "").strip()
         self.azure_resource_group = str(self.azure_resource_group or "").strip()
         self.azure_service_bus_namespace = str(self.azure_service_bus_namespace or "").strip()
@@ -1242,7 +1243,7 @@ class OnboardingConnectivitySnapshot(BaseModel):
     ticketing_url: str = ""
     email_url: str = ""
     network_zone: str = ""
-    context_strategy: str = "continuous"
+    context_strategy: str = "auto"
     azure_subscription_id: str = ""
     azure_resource_group: str = ""
     azure_service_bus_namespace: str = ""
@@ -2474,7 +2475,7 @@ async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
         "ticketing_url": str(payload.get("ticketing_url", "")).strip(),
         "email_url": str(payload.get("email_url", "")).strip(),
         "network_zone": str(payload.get("network_zone", "")).strip(),
-        "context_strategy": str(payload.get("context_strategy", "continuous")).strip(),
+        "context_strategy": str(payload.get("context_strategy", "auto")).strip(),
         "azure_subscription_id": str(payload.get("azure_subscription_id", "")).strip(),
         "azure_resource_group": str(payload.get("azure_resource_group", "")).strip(),
         "azure_service_bus_namespace": str(payload.get("azure_service_bus_namespace", "")).strip(),
@@ -5676,9 +5677,10 @@ def _compact_alert_row(row: dict[str, Any]) -> dict[str, Any]:
         "fingerprint", "alert_fingerprint", "name", "alert_name", "service",
         "application", "project", "project_name", "environment", "source",
         "source_channel", "severity", "status", "alert_status", "description",
+        "origin_system", "ingestion_channel", "deduplicated_count", "incident_disposition",
         "created_at", "updated_at", "received_at", "first_seen", "last_seen",
         "starts_at", "ends_at", "occurrence_count", "assignee", "owner",
-        "ticket_key", "issue_key", "file", "path", "error", "labels", "annotations",
+        "ticket_id", "jira_key", "jira_url", "ticket_key", "issue_key", "file", "path", "error", "labels", "annotations",
     }
     compact = {key: value for key, value in row.items() if key in fields}
     labels = row.get("labels") if isinstance(row.get("labels"), dict) else {}
@@ -5686,7 +5688,7 @@ def _compact_alert_row(row: dict[str, Any]) -> dict[str, Any]:
     label_fields = {
         "alertname", "service", "job", "application", "project", "project_name",
         "environment", "severity", "fingerprint", "alert_fingerprint",
-        "source_alert_id", "ticket_key", "issue_key", "jira_issue_key",
+        "source_alert_id", "ticket_id", "ticket_key", "issue_key", "jira_issue_key",
     }
     compact["labels"] = {key: value for key, value in labels.items() if key in label_fields}
     compact["annotations"] = {
