@@ -28,7 +28,7 @@ from api_gateway.copilot import (
 from api_gateway.modules.users.models import SystemRole
 from api_gateway.modules.users.permissions import AuthContext, current_auth_context, current_tenant_id, require_roles
 from api_gateway.modules.users.router import router as user_management_router
-from api_gateway.modules.triage.router import router as triage_router
+from api_gateway.modules.triage.router import TriageCorrectionCreate, router as triage_router
 from api_gateway.modules.users.service import UserService
 from common.config import get_settings
 from common.database import ActionRecord, AlertRecord, ApprovalRecord, AuditLogRecord, IncidentProjectionRecord, MonitoringConnectionHealthRecord

@@ -14,8 +14,49 @@ class StaticProvider(ModelProvider):
     async def generate(self, prompt: str, payload: dict) -> ModelResponse:
         self._ensure_available()
         self.breaker.record_success()
+        import json
+        
+        # Build cited evidence list from payload
+        evidence_ids = []
+        summary = "incident"
+        deployment = "payments-api"
+        
+        if isinstance(payload, dict):
+            summary = payload.get("summary", payload.get("service", "incident"))
+            alert_info = payload.get("alert", {})
+            if isinstance(alert_info, dict):
+                labels = alert_info.get("labels", {})
+                if isinstance(labels, dict) and labels.get("deployment"):
+                    deployment = str(labels["deployment"])
+            
+            disc_evidence = payload.get("discovery_evidence", [])
+            if isinstance(disc_evidence, list):
+                for item in disc_evidence:
+                    if isinstance(item, dict) and item.get("evidence_id"):
+                        evidence_ids.append(str(item["evidence_id"]))
+            
+            # Fallback/default if none found
+            if not evidence_ids and payload.get("alert", {}).get("labels", {}).get("source_event_id"):
+                source_id = payload["alert"]["labels"]["source_event_id"]
+                evidence_ids.append(f"alert:{source_id}")
+
+        content_obj = {
+            "root_cause": f"The alert reports degradation after deployment {deployment}; confirm the rollout diff and timing before treating it as causal.",
+            "confidence_score": 0.85,
+            "evidence_used": evidence_ids,
+            "alternative_causes": [],
+            "grounding_notes": "Grounding based on Deployment context.",
+            "impact_summary": f"Service impact for {summary}",
+            "customer_impact": "Payment latency",
+            "remediation_target": "payments",
+            "recommended_action": "Rollback deployment",
+            "commands": ["kubectl rollout undo deployment/payments-service -n prod"],
+            "validation_queries": [],
+            "rollback_plan": ""
+        }
+        
         return ModelResponse(
-            content=f"{self.name}:{prompt}:{payload.get('summary', payload.get('service', 'incident'))}",
+            content=json.dumps(content_obj),
             usage=build_usage(
                 provider=self.name,
                 model=f"{self.name}-model",
