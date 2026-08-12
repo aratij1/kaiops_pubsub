@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Bell, BrainCircuit, Check, CircleSlash2, ClipboardCheck, Copy, ExternalLink, FileCheck2, Filter, GitMerge, RefreshCw, ScanSearch, ShieldCheck, TicketCheck, Wrench } from "lucide-react";
+import { Activity, Bell, BrainCircuit, Check, CircleSlash2, ClipboardCheck, Copy, ExternalLink, FileCheck2, Filter, Gauge, GitMerge, RefreshCw, ScanSearch, Server, ShieldCheck, TicketCheck, Wrench } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
 import { useRouteRuntimeSlice, type IncidentFilters, type IncidentRow } from "../../app/routeRuntime";
 import "./IncidentsRoute.css";
@@ -7,7 +7,10 @@ import "./IncidentsRoute.css";
 const PAGE_SIZE = 10;
 
 const stageOrder = [
-  { id: "ingest", cockpit: "overview", label: "Ingest", detail: "Source received" },
+  { id: "application", cockpit: "overview", label: "Application", detail: "Original source" },
+  { id: "signal", cockpit: "overview", label: "Signal", detail: "Failure observed" },
+  { id: "prometheus", cockpit: "overview", label: "Prometheus", detail: "Rule fired" },
+  { id: "ingest", cockpit: "overview", label: "Alert landing", detail: "KaiOps received" },
   { id: "normalize", cockpit: "overview", label: "Normalize", detail: "Canonical alert" },
   { id: "deduplicate", cockpit: "overview", label: "Deduplicate", detail: "Occurrence decision" },
   { id: "jira", cockpit: "overview", label: "Jira", detail: "Ticket created" },
@@ -23,6 +26,9 @@ type StageState = "complete" | "current" | "reused" | "stopped" | "failed";
 type LifecycleStage = (typeof stageOrder)[number] & { state: StageState; caption: string };
 
 const stageIcons = {
+  application: Server,
+  signal: Gauge,
+  prometheus: Activity,
   ingest: Bell,
   normalize: Filter,
   deduplicate: GitMerge,
@@ -42,6 +48,7 @@ function normalizedStatus(row: IncidentRow) {
 function lifecycleFor(row: IncidentRow): LifecycleStage[] {
   const status = normalizedStatus(row);
   const event = projectionEvent(row);
+  const labels = projectionLabels(row);
   const mode = String(row.execution_mode || event.execution_mode || "human-approval").toLowerCase();
   const decision = String(row.approval_status || event.approval_status || "").toLowerCase();
   const jiraReady = Boolean(row.ticket_id || row.jira_key);
@@ -59,39 +66,48 @@ function lifecycleFor(row: IncidentRow): LifecycleStage[] {
   const validated = ["resolved", "closed"].includes(status);
   const contextStarted = contextReady || latestEvent.includes("context") || understood;
   const complete = (id: string, caption: string): LifecycleStage => ({ ...stageOrder.find((stage) => stage.id === id)!, state: "complete", caption });
+  const application = value(labels.application, labels.project_name, event.application, row.service);
+  const target = value(labels.instance, event.instance, event.target);
+  const alertName = value(labels.alertname, event.alert_name, event.name);
+  const source = value(row.source, row.origin_system, labels.origin_system, labels.source);
+  const prometheusObserved = /prometheus|blackbox|alertmanager/i.test([source, labels.job, labels.transport, event.ingestion_channel].join(" "));
+  const stage = (id: string) => stageOrder.find((item) => item.id === id)!;
   const stages: LifecycleStage[] = [
-    complete("ingest", value(row.source, row.origin_system, "Received")),
+    ...(application !== "Not recorded" ? [complete("application", application)] : []),
+    ...(target !== "Not recorded" ? [complete("signal", target)] : []),
+    ...(prometheusObserved ? [complete("prometheus", alertName !== "Not recorded" ? alertName : "Alert rule fired")] : []),
+    complete("ingest", value(event.received_at, row.created_at, "Received")),
     complete("normalize", value(row.service, "Canonical alert")),
     complete("deduplicate", duplicate ? "Duplicate linked" : Number(row.deduplicated_count || 1) > 1 ? `${row.deduplicated_count} occurrences merged` : "Unique signal"),
-    { ...stageOrder[3], state: jiraReady ? "complete" : "current", caption: jiraReady ? String(row.ticket_id || row.jira_key) : "Creating ticket" },
+    { ...stage("jira"), state: jiraReady ? "complete" : "current", caption: jiraReady ? String(row.ticket_id || row.jira_key) : "Creating ticket" },
   ];
   if (noise) {
-    stages.push({ ...stageOrder[4], state: "stopped", caption: "Noise / no action" });
+    stages.push({ ...stage("decision"), state: "stopped", caption: "Noise / no action" });
     return stages;
   }
   if (duplicate) {
-    stages.push({ ...stageOrder[4], state: "stopped", caption: "Linked to canonical incident" });
+    stages.push({ ...stage("decision"), state: "stopped", caption: "Linked to canonical incident" });
     return stages;
   }
   stages.push(complete("decision", "Incident created"));
   if (contextStarted) {
     stages.push({
-      ...stageOrder[5],
+      ...stage("context"),
       state: contextReady ? (contextState.source.includes("cache") || contextState.source === "ticket_payload" ? "reused" : "complete") : "current",
       caption: contextReady ? contextState.label : "Collecting evidence",
     });
   }
   if (contextReady || understood) {
-    stages.push({ ...stageOrder[6], state: understood ? "complete" : "current", caption: understood ? "RCA generated" : "Generating RCA" });
+    stages.push({ ...stage("understand"), state: understood ? "complete" : "current", caption: understood ? "RCA generated" : "Generating RCA" });
   }
   if (approvalStarted) {
-    stages.push({ ...stageOrder[7], state: approvalComplete ? "complete" : "current", caption: approvalComplete ? "Decision recorded" : "Awaiting decision" });
+    stages.push({ ...stage("approval"), state: approvalComplete ? "complete" : "current", caption: approvalComplete ? "Decision recorded" : "Awaiting decision" });
   }
   if (resolved || status === "failed") {
-    stages.push({ ...stageOrder[8], state: status === "failed" ? "failed" : "complete", caption: status === "failed" ? "Action required" : "Remediation started" });
+    stages.push({ ...stage("resolve"), state: status === "failed" ? "failed" : "complete", caption: status === "failed" ? "Action required" : "Remediation started" });
   }
   if (["validating", "resolved", "closed"].includes(status)) {
-    stages.push({ ...stageOrder[9], state: validated ? "complete" : "current", caption: validated ? "Verified and closed" : "Verifying recovery" });
+    stages.push({ ...stage("validate"), state: validated ? "complete" : "current", caption: validated ? "Verified and closed" : "Verifying recovery" });
   }
   return stages;
 }
@@ -100,6 +116,32 @@ function projectionEvent(row: IncidentRow) {
   const projection = row.projection_payload && typeof row.projection_payload === "object" ? row.projection_payload : {};
   const event = projection.event_payload && typeof projection.event_payload === "object" ? projection.event_payload as Record<string, unknown> : {};
   return event;
+}
+
+function projectionLabels(row: IncidentRow) {
+  const projection = row.projection_payload && typeof row.projection_payload === "object" ? row.projection_payload : {};
+  const event = projectionEvent(row);
+  const candidates = [row.source_alert?.labels, event.labels, projection.labels, event.alert_labels, projection.alert_labels];
+  return (candidates.find((candidate) => candidate && typeof candidate === "object") || {}) as Record<string, unknown>;
+}
+
+function sourceEvidence(row: IncidentRow) {
+  const alert = row.source_alert && typeof row.source_alert === "object" ? row.source_alert : {};
+  const annotations = alert.annotations && typeof alert.annotations === "object" ? alert.annotations : {};
+  const metadata = alert.metadata && typeof alert.metadata === "object" ? alert.metadata : {};
+  const log = [metadata.application_log, metadata.log_line, alert.log, alert.message]
+    .map((candidate) => String(candidate || "").trim())
+    .find(Boolean) || "";
+  return {
+    alert,
+    annotations,
+    metadata,
+    log,
+    observation: value(alert.description, annotations.description, annotations.summary),
+    timestamp: value(alert.starts_at, alert.created_at, annotations.startsAt, row.created_at),
+    uri: value(annotations.generatorURL, metadata.source_uri, metadata.uri),
+    trace: value(alert.trace_id, row.trace_id),
+  };
 }
 
 function incidentNoise(row: IncidentRow) {
@@ -197,10 +239,15 @@ export default function IncidentsRoute() {
         const lifecycle = lifecycleFor(row);
         const selectedStage = inspector?.incidentId === incidentId ? inspector.stage : "";
         const event = projectionEvent(row);
+        const labels = projectionLabels(row);
         const context = contextPresentation(row);
+        const evidence = sourceEvidence(row);
         const disposition = incidentNoise(row);
         const details: Record<string, Array<[string, string]>> = {
-          ingest: [["Source", value(row.source, row.origin_system, event.source)], ["Channel", value(row.ingestion_channel, event.ingestion_channel)], ["Received", value(row.created_at, event.created_at)], ["Alert ID", value(row.alert_id)]],
+          application: [["Application", value(labels.application, labels.project_name, event.application, row.service)], ["Service", value(labels.service, row.service)], ["Environment", value(labels.environment, row.environment)], ["Captured application log", evidence.log || "No application log captured for this alert"], ["Observed evidence", evidence.observation], ["Observed at", evidence.timestamp], ["Trace ID", evidence.trace]],
+          signal: [["Observed target / operation", value(labels.instance, labels.operation, event.instance, event.target)], ["Metric", value(event.metric, labels.__name__, labels.job === "blackbox" ? "probe_success" : labels.category)], ["Actual observation", evidence.observation], ["Evidence URI", evidence.uri], ["Fingerprint", value(evidence.alert.fingerprint, labels.alert_fingerprint, row.fingerprint)]],
+          prometheus: [["Alert rule", value(labels.alertname, evidence.alert.name, event.alert_name, event.name)], ["Prometheus job", value(labels.job, labels.service)], ["Rule result", value(labels.alert_status, "firing")], ["Generator / query", evidence.uri], ["Transport", value(labels.transport, event.transport, "Alertmanager")], ["Produced alert ID", value(row.alert_id)]],
+          ingest: [["Source", value(evidence.alert.source, row.source, row.origin_system, event.source)], ["Channel", value(labels.ingestion_channel, row.ingestion_channel, event.ingestion_channel)], ["Received", value(evidence.alert.created_at, row.created_at, event.created_at)], ["Alert ID", value(row.alert_id)], ["Status", value(labels.alert_status, evidence.alert.status)], ["Trace ID", evidence.trace]],
           normalize: [["Service", value(row.service, event.service)], ["Environment", value(row.environment, event.environment)], ["Severity", value(row.severity, event.severity)], ["Canonical alert", value(row.alert_id)]],
           deduplicate: [["Outcome", Number(row.deduplicated_count || 0) > 1 ? "Duplicate occurrence merged" : "Unique incident signal"], ["Occurrences", value(row.deduplicated_count || 1)], ["Fingerprint", value(row.fingerprint, event.fingerprint)], ["Correlation", value(row.correlation_id, event.correlation_id, row.deduplication_reason)]],
           jira: [["Ticket", jiraKey], ["Status", value(row.jira_status, jiraKey === "Pending" ? "Creation pending" : "Created")], ["Priority", value(row.jira_priority, row.risk_tier, row.severity)], ["Assignee", value(row.jira_assignee)]],
@@ -217,12 +264,13 @@ export default function IncidentsRoute() {
             <div className="incident-summary-meta"><span>{row.service || "Unknown service"}</span><span>{row.environment || "Environment not set"}</span><code>{incidentId}</code>{row.jira_url ? <a href={row.jira_url} target="_blank" rel="noreferrer">{jiraKey}<ExternalLink size={12} /></a> : <strong>{jiraKey}</strong>}</div>
           </div>
           <div className="incident-flow-wrap">
-            <div className="incident-flow-caption"><span>Executed path</span><strong>{lifecycle.length} stages</strong></div>
+            <div className="incident-flow-caption"><span>Source-to-resolution trace</span><strong>{lifecycle.length} evidenced stages</strong></div>
           <div className="incident-lifecycle" style={{ gridTemplateColumns: `repeat(${lifecycle.length}, minmax(112px, 1fr))` }} aria-label={`Lifecycle for ${incidentTitle(row)}`}>
             {lifecycle.map((stage, stageIndex) => {
               const selectable = !["pending", "stopped"].includes(stage.state);
               const StageIcon = stageIcons[stage.id as keyof typeof stageIcons] || FileCheck2;
-              return <button key={stage.id} type="button" className={`is-${stage.state} ${selectedStage === stage.id ? "is-selected" : ""}`} disabled={!selectable} title={stage.state === "stopped" ? disposition.reason : stage.caption} onClick={() => selectable && setInspector((current) => current?.incidentId === incidentId && current.stage === stage.id ? null : { incidentId, stage: stage.id })} aria-expanded={selectedStage === stage.id} aria-label={`${stage.label}: ${stage.caption}`}>
+              const domain = ["application", "signal", "prometheus"].includes(stage.id) ? "source-domain" : "kaiops-domain";
+              return <button key={stage.id} type="button" className={`is-${stage.state} ${domain} ${selectedStage === stage.id ? "is-selected" : ""}`} disabled={!selectable} title={stage.state === "stopped" ? disposition.reason : stage.caption} onClick={() => selectable && setInspector((current) => current?.incidentId === incidentId && current.stage === stage.id ? null : { incidentId, stage: stage.id })} aria-expanded={selectedStage === stage.id} aria-label={`${stage.label}: ${stage.caption}`}>
                 <span className="incident-stage-node"><StageIcon size={17} strokeWidth={2} />{["complete", "reused"].includes(stage.state) ? <i><Check size={9} strokeWidth={3} /></i> : null}</span><span className="incident-stage-copy"><strong>{stage.label}</strong><small>{stage.caption}</small></span><b className="incident-stage-sequence">{String(stageIndex + 1).padStart(2, "0")}</b>
               </button>;
             })}

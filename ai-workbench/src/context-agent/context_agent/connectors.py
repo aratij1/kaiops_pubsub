@@ -150,7 +150,13 @@ class LocalEvidenceConnector(BaseConnector):
                     lowered = line.lower()
                     score = sum(1 for term in terms if term in lowered)
                     if score:
-                        snippet = line.strip()[:500]
+                        match_text = line.strip()[:500]
+                        context_start = max(1, line_number - 3)
+                        context_end = min(len(lines), line_number + 3)
+                        snippet = "\n".join(
+                            f"{source_line:>5} | {lines[source_line - 1]}"
+                            for source_line in range(context_start, context_end + 1)
+                        )[:4000]
                         path_str = str(path)
                         matches.append(
                             (
@@ -160,10 +166,14 @@ class LocalEvidenceConnector(BaseConnector):
                                     "source": kind,
                                     "path": path_str,
                                     "line": line_number,
+                                    "context_start_line": context_start,
+                                    "context_end_line": context_end,
+                                    "language": path.suffix.lower().lstrip("."),
                                     "uri": f"{kind}://{path.as_posix()}#L{line_number}",
                                     "snippet": snippet,
+                                    "matched_line": match_text,
                                     "matched_terms": [term for term in terms if term in lowered],
-                                    "evidence_id": self._evidence_id(kind, path_str, line_number, snippet),
+                                    "evidence_id": self._evidence_id(kind, path_str, line_number, match_text),
                                 },
                             )
                         )

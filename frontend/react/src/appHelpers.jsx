@@ -410,7 +410,10 @@ function filterRowsForMonitor(rows, applicationToMonitor) {
 }
 
 function inferMonitorScope(row) {
-  const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
+  const projection = typeof row?.projection_payload === "object" && row?.projection_payload ? row.projection_payload : {};
+  const event = typeof projection?.event_payload === "object" && projection?.event_payload ? projection.event_payload : {};
+  const labels = [row?.labels, projection?.labels, event?.labels, projection?.alert_labels, event?.alert_labels]
+    .find((candidate) => candidate && typeof candidate === "object") || {};
   const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
   const explicitProject = String(
     row?.project_name
@@ -3794,15 +3797,32 @@ function DiscoveryFlowView({ workflow, timelineRows = [], selectedAlert = null, 
                 ))}
               </div>
               <div className="discovery-evidence-list">
-                {evidence.map((row, index) => (
-                  <details key={`evidence-${row.evidence_id || index}`}>
+                {evidence.map((row, index) => {
+                  const evidenceId = row.evidence_id || `EVIDENCE-${index + 1}`;
+                  const citedHypotheses = hypotheses.filter((item) => Array.isArray(item.supporting_evidence) && item.supporting_evidence.includes(evidenceId));
+                  const citedByRca = Array.isArray(rcaAnalysis.evidence_used) && rcaAnalysis.evidence_used.includes(evidenceId);
+                  const citedByImpact = Array.isArray(impactAnalysis.evidence_used) && impactAnalysis.evidence_used.includes(evidenceId);
+                  const contributions = [
+                    ...citedHypotheses.map((item) => `Supports hypothesis: ${item.cause || "candidate cause"}`),
+                    citedByRca ? "Cited in the derived root-cause conclusion" : "",
+                    citedByImpact ? "Cited in the impact assessment" : "",
+                  ].filter(Boolean);
+                  const sourceType = String(row.source || "source").toLowerCase();
+                  return <details key={`evidence-${evidenceId}`}>
                     <summary><strong>{row.evidence_id || `EVIDENCE-${index + 1}`}</strong> · {row.source || "source"}</summary>
                     <small>{row.uri || row.path || "No source URI"}</small>
-                    <pre className="result">{row.snippet || "No evidence snippet returned."}</pre>
-                    {Array.isArray(row.matched_terms) && row.matched_terms.length ? <small>Matched: {row.matched_terms.join(", ")}</small> : null}
+                    <div className="evidence-purpose" data-cited={contributions.length ? "true" : "false"}>
+                      <strong>{contributions.length ? "Used in reasoning" : "Retrieved context only"}</strong>
+                      <span>{contributions.length
+                        ? contributions.join(". ")
+                        : `${sourceType === "code" ? "This source match identifies relevant implementation context" : "This observation provides runtime context"}, but it was not cited as proof of the conclusion.`}</span>
+                    </div>
+                    {sourceType === "code" ? <small className="evidence-code-label">Source code · lines {row.context_start_line || row.line || "?"}-{row.context_end_line || row.line || "?"}</small> : null}
+                    <pre className={`result evidence-content is-${sourceType}`}>{row.snippet || "No evidence content returned."}</pre>
+                    {Array.isArray(row.matched_terms) && row.matched_terms.length ? <small>Why retrieved: matched {row.matched_terms.join(", ")}</small> : null}
                     {row.sha256 ? <small>Content hash: {row.sha256}</small> : null}
-                  </details>
-                ))}
+                  </details>;
+                })}
                 {!evidence.length ? <p className="subtitle">No cited evidence was returned for this run.</p> : null}
               </div>
             </article>
