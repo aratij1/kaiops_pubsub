@@ -32,3 +32,29 @@ test("incident detail preserves nested alert identity while details load", async
   await expect(page.locator(".detail-context")).toContainText("Severity: HIGH");
   await expect(page.locator(".detail-context")).toContainText("Status: investigating");
 });
+
+test("detail URL reconstructs the selected alert after a page refresh", async ({ page }) => {
+  const alertId = "33333333-3333-4333-8333-333333333333";
+  const incidentId = "44444444-4444-4444-8444-444444444444";
+  await page.route("**/api-gateway/**", async (route) => {
+    const path = new URL(route.request().url()).pathname.replace(/^\/api-gateway/, "");
+    let body = { data: [], rows: [], summary: {}, items: [] };
+    if (path === "/auth/config") body = { mode: "local", local_development_only: true };
+    else if (path === "/auth/login") body = { access_token: "admin-token", refresh_token: "refresh-token", user: { id: 1, username: "admin", role_name: "Administrator" } };
+    else if (path === "/healthz") body = { status: "ok" };
+    else if (path.startsWith(`/alerts/${alertId}/processed-result`)) body = { data: { alert: { id: alertId, name: "ReloadedAlert", service: "kaiops-api-gateway", severity: "critical" }, incident: { id: incidentId, status: "investigating", service: "kaiops-api-gateway" }, context: { metadata: {} }, timeline: [] } };
+    else if (path.startsWith("/alerts/all") || path.startsWith("/landing-pad/recent") || path.startsWith("/incidents/metadata") || path === "/applications") body = { data: { rows: [] }, rows: [] };
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  });
+
+  await page.goto(`/?workspace=alert&alert_id=${alertId}`);
+  await page.getByLabel("Username").fill("admin");
+  await page.getByLabel("Password").fill("Admin@123456");
+  await page.getByRole("button", { name: "Sign In" }).click();
+  await expect(page.getByRole("heading", { name: "kaiops-api-gateway: ReloadedAlert" })).toBeVisible();
+  await page.reload();
+  await page.getByLabel("Password").fill("Admin@123456");
+  await page.getByRole("button", { name: "Sign In" }).click();
+  await expect(page.getByRole("heading", { name: "kaiops-api-gateway: ReloadedAlert" })).toBeVisible();
+  await expect(page.getByText("Select an alert in Alert Stream to open the detail tabs workspace.")).toHaveCount(0);
+});

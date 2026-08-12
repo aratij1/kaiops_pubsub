@@ -1418,6 +1418,22 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     openAlertDetails(matchedAlert || { ...row, alert_id: projectedAlertId || row?.alert_id }, initialTab);
   }
 
+  useEffect(() => {
+    if (!adminSession.accessToken || activeTab !== "home") return;
+    const params = new URLSearchParams(currentSearch || "");
+    if (params.get("workspace") !== "alert") return;
+    const routeAlertId = String(params.get("alert_id") || "").trim();
+    if (!routeAlertId || routeAlertId === String(selectedAlertId || "")) return;
+
+    // Detail URLs are durable application state. Reconstruct the selection on
+    // refresh, browser history navigation, and shared links instead of relying
+    // on an in-memory summary-row click from the current session.
+    setSelectedAlertId(routeAlertId);
+    setSelectedAlertSnapshot(null);
+    setHomeDetailTab("overview");
+    void loadAlertDetails(routeAlertId);
+  }, [adminSession.accessToken, activeTab, currentSearch, selectedAlertId]);
+
   function openGlobalOperationalItem(item) {
     if (!item?.row) return;
     if (["Alert", "Ticket"].includes(item.kind)) {
@@ -1507,6 +1523,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       if (hasSelectedSnapshot) {
         return;
       }
+      if (
+        selectedAlertId
+        && String(selectedAlertData.alertId || "") === String(selectedAlertId)
+        && (selectedAlertData.loading || selectedAlertData.payload || selectedAlertData.error)
+      ) {
+        return;
+      }
       if (selectedAlertId) {
         setSelectedAlertId("");
       }
@@ -1548,7 +1571,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       setSelectedAlertSnapshot(null);
       setSelectedAlertData({ loading: false, payload: null, error: "", alertId: "" });
     }
-  }, [activeTab, alerts.rows, closedIncidents.rows, applicationToMonitor, selectedAlertId, selectedAlertSnapshot, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId]);
+  }, [activeTab, alerts.rows, closedIncidents.rows, applicationToMonitor, selectedAlertId, selectedAlertSnapshot, selectedAlertData.loading, selectedAlertData.payload, selectedAlertData.error, selectedAlertData.alertId]);
 
   useEffect(() => {
     const needsEvidence = homeDetailTab === "rca" && rcaDetailView === "evidence";
@@ -5193,13 +5216,18 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       applicationToMonitor,
     ).length > 0;
     const snapshotRow = snapshotId === selectedAlertId && snapshotInCurrentScope ? selectedAlertSnapshot : null;
-    const baseRow = matchedRow || snapshotRow;
-    if (!baseRow) return null;
-
     const payload = selectedAlertData?.payload?.data || selectedAlertData?.payload || {};
     const processedAlert = payload?.alert && typeof payload.alert === "object" ? payload.alert : {};
     const processedIncident = payload?.incident && typeof payload.incident === "object" ? payload.incident : {};
     const processedAlertId = String(processedAlert.alert_id || processedAlert.id || selectedAlertId || "").trim();
+    const processedMatchesSelection = Boolean(
+      processedAlertId
+      && processedAlertId === String(selectedAlertId || "")
+      && Object.keys(processedAlert).length
+    );
+    const baseRow = matchedRow || snapshotRow || (processedMatchesSelection ? processedAlert : null);
+    if (!baseRow) return null;
+
     // Summary projections make the cockpit available immediately. Once the
     // processed result arrives, overlay its canonical fields so both views
     // describe the same record without losing the alert/incident relationship.
