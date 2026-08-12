@@ -294,7 +294,8 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 pytest
-docker compose up --build
+# Docker Desktop-safe startup: pauses demo workloads and serializes builds.
+powershell -ExecutionPolicy Bypass -File scripts/start-kaims.ps1 -Profile lean -Build
 ```
 
 Real LLM calls are made through the model router. Set an API key in your

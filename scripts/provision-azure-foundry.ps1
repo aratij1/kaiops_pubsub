@@ -272,7 +272,7 @@ Invoke-Step -Name "Generate environment output file" -Action {
         "AZURE_CONTENT_SAFETY_API_KEY=$($contentSafetyKeys.key1)",
         "AZURE_MONITOR_CONNECTION_STRING=$($appInsights.connectionString)",
         "KAFKA_ENABLED=false",
-        "EVENT_BUS_PROVIDER=azure-servicebus"
+        "EVENT_BUS_PROVIDER=azure-service-bus"
     )
 
     Set-Content -Path $OutputEnvFile -Value ($lines -join [Environment]::NewLine) -Encoding utf8

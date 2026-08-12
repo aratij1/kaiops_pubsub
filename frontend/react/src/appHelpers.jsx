@@ -343,13 +343,14 @@ function filterAlertsForMonitor(rows, applicationToMonitor) {
   if (target === TEST_USE_CASE_SCOPE) {
     return alertRows.filter((row) => isGeneratedOrTestAlert(row));
   }
+  const productionRows = alertRows.filter((row) => !isGeneratedOrTestAlert(row));
   if (target === "telemetry") {
-    return alertRows.filter((row) => inferMonitorScope(row) === "telemetry");
+    return productionRows.filter((row) => inferMonitorScope(row) === "telemetry");
   }
   if (isKaiopsCoreSelection(target)) {
-    return alertRows.filter((row) => inferMonitorScope(row) === "kaiops");
+    return productionRows.filter((row) => inferMonitorScope(row) === "kaiops");
   }
-  return alertRows.filter((row) => {
+  return productionRows.filter((row) => {
     const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
     const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
     const candidates = [
@@ -381,13 +382,14 @@ function filterRowsForMonitor(rows, applicationToMonitor) {
   if (target === TEST_USE_CASE_SCOPE) {
     return items.filter((row) => isGeneratedOrTestAlert(row));
   }
+  const productionRows = items.filter((row) => !isGeneratedOrTestAlert(row));
   if (target === "telemetry") {
-    return items.filter((row) => inferMonitorScope(row) === "telemetry");
+    return productionRows.filter((row) => inferMonitorScope(row) === "telemetry");
   }
   if (isKaiopsCoreSelection(target)) {
-    return items.filter((row) => inferMonitorScope(row) === "kaiops");
+    return productionRows.filter((row) => inferMonitorScope(row) === "kaiops");
   }
-  return items.filter((row) => {
+  return productionRows.filter((row) => {
     const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
     const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
     const candidates = [
@@ -2573,6 +2575,29 @@ function buildAlertDocumentDrafts(alertRow, workflowPayload) {
         incident?.id ? `Incident reference: ${String(incident.id)}.` : "",
         "Escalation path: L1 -> L2 -> L3 with timeline checkpoints at 5m, 15m, and 30m.",
       ].filter(Boolean).join("\n\n"),
+      services: service,
+      severity,
+      alert_type: alertName,
+      alert_id: alertId,
+      root_cause: rootCause,
+      impact,
+      recommended_action: suggestedAction,
+    },
+    jira: {
+      kind: "jira",
+      title: `${alertName} Jira Incident Ticket`.slice(0, 160),
+      summary: `${severity.toUpperCase()} incident for ${service}: ${alertName}.`,
+      content: [
+        `Incident: ${alertName}`,
+        `Alert ID: ${alertId || "Pending"}`,
+        `Incident ID: ${String(incident?.id || workflow?.incident_id || "Pending")}`,
+        `Jira ticket: ${String(alertRow?.ticket_id || alertRow?.jira_key || alertRow?.labels?.ticket_id || incident?.ticket_id || "Pending")}`,
+        `Service: ${service}`,
+        `Severity: ${severity.toUpperCase()}`,
+        `Root cause: ${commonRoot}`,
+        `Impact: ${impact || "Impact requires operator confirmation."}`,
+        `Recommended action: ${suggestedAction || "Investigate logs, metrics, dependencies, and recent changes."}`,
+      ].join("\n\n"),
       services: service,
       severity,
       alert_type: alertName,

@@ -1325,6 +1325,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
         recommendation.metadata["environment"] = str(context.alert.environment or "prod")
         recommendation.metadata["remediation_target"] = str(state.get("remediation_target") or context.alert.service or "")
         recommendation.metadata["recommended_commands"] = state.get("commands", [])
+        code_review = state.get("gathered_context", {}).get("code_review", {})
+        recommendation.metadata["code_review"] = code_review if isinstance(code_review, dict) else {}
+        recommendation.metadata["proposed_code_changes"] = (
+            code_review.get("proposed_changes", []) if isinstance(code_review, dict) else []
+        )
         if runbook_present:
             runbook_text = str(context.runbook or "").strip()
             service_match = float(str(context.alert.service or "").lower() in runbook_text.lower())

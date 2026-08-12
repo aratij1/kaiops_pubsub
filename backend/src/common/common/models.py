@@ -400,6 +400,7 @@ class RemediationAction(BaseEvent):
 
 class ResolutionReport(BaseEvent):
     incident_id: UUID
+    ticket_id: str | None = None
     recommendation_id: UUID | None = None
     remediation_action_id: UUID | None = None
     root_cause: str

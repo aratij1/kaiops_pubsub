@@ -47,8 +47,36 @@ MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
 
 
 def _context_strategy(override: str | None = None) -> str:
-    strategy = str(override or getattr(settings, "context_strategy", "continuous") or "continuous").strip().lower()
-    return strategy if strategy in {"immediate", "continuous"} else "continuous"
+    strategy = str(override or getattr(settings, "context_strategy", "auto") or "auto").strip().lower()
+    aliases = {"continuous": "auto", "immediate": "realtime"}
+    strategy = aliases.get(strategy, strategy)
+    return strategy if strategy in {"auto", "realtime", "historical"} else "auto"
+
+
+def _context_completeness(context: Context) -> tuple[bool, list[str]]:
+    metadata = context.metadata if isinstance(context.metadata, dict) else {}
+    discovery = metadata.get("discovery_report") if isinstance(metadata.get("discovery_report"), dict) else {}
+    evidence = discovery.get("evidence") if isinstance(discovery.get("evidence"), list) else []
+    available = {
+        "discovery_evidence": bool(evidence or metadata.get("discovery_evidence")),
+        "service_inventory": bool(context.cmdb or context.deployment),
+        "observability": bool(context.observability),
+        "dependencies": bool(context.dependency_services),
+        "runbook_or_changes": bool(context.runbook or context.recent_changes),
+    }
+    missing = [name for name, present in available.items() if not present]
+    explicitly_complete = metadata.get("context_complete") is True
+    return explicitly_complete or sum(available.values()) >= 3, missing
+
+
+def _has_code_evidence(context: Context) -> bool:
+    metadata = context.metadata if isinstance(context.metadata, dict) else {}
+    discovery = metadata.get("discovery_report") if isinstance(metadata.get("discovery_report"), dict) else {}
+    evidence = discovery.get("evidence") if isinstance(discovery.get("evidence"), list) else []
+    return any(
+        isinstance(row, dict) and str(row.get("source") or "").strip().lower() == "code"
+        for row in evidence
+    )
 
 
 def _context_identity(alert: Alert) -> tuple[str, str, str, str]:
@@ -80,6 +108,7 @@ async def _collect_context_with_strategy(
     alert: Alert,
     incident: Incident,
     strategy_override: str | None = None,
+    supplied_context: dict[str, Any] | None = None,
 ) -> Context:
     started = perf_counter()
     strategy = _context_strategy(strategy_override)
@@ -87,8 +116,32 @@ async def _collect_context_with_strategy(
     session_factory = getattr(app.state, "session_factory", None)
     database_available = bool(settings.database_enabled and session_factory is not None)
 
-    if strategy == "continuous" and database_available:
-        ttl_seconds = max(60, int(getattr(settings, "context_knowledge_ttl_seconds", 604800) or 604800))
+    if isinstance(supplied_context, dict):
+        try:
+            provided = Context.model_validate(supplied_context).model_copy(
+                update={"incident_id": incident.id, "alert": alert}
+            )
+        except Exception:
+            logger.warning("supplied context is invalid; evaluating cache policy instead")
+        else:
+            complete, missing = _context_completeness(provided)
+            if complete and strategy != "realtime":
+                provided.metadata = {
+                    **(provided.metadata if isinstance(provided.metadata, dict) else {}),
+                    "context_strategy": strategy,
+                    "context_source": "ticket_payload",
+                    "context_reused": True,
+                    "context_complete": True,
+                    "context_missing_sections": missing,
+                    "realtime_collection_performed": False,
+                }
+                CONTEXT_STRATEGY_REQUESTS.labels(strategy, "complete_payload").inc()
+                return provided
+
+    if strategy in {"auto", "historical"} and database_available:
+        configured_ttl = int(getattr(settings, "context_knowledge_ttl_seconds", 604800) or 604800)
+        historical_ttl = int(os.getenv("CONTEXT_HISTORICAL_MAX_AGE_SECONDS", "2592000") or 2592000)
+        ttl_seconds = max(60, historical_ttl if strategy == "historical" else configured_ttl)
         try:
             async with session_factory() as session:
                 repo = IncidentRepository(session)
@@ -109,32 +162,58 @@ async def _collect_context_with_strategy(
                         CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "invalid").inc()
                         logger.exception("invalid cached context knowledge id=%s; refreshing", cached.get("id"))
                     else:
-                        reuse_count = int(cached.get("reuse_count", 1) or 1)
-                        context.metadata = {
-                            **(context.metadata if isinstance(context.metadata, dict) else {}),
-                            "context_strategy": "continuous",
-                            "context_reused": True,
-                            "context_knowledge_id": cached.get("id"),
-                            "context_source_alert_id": cached.get("source_alert_id"),
-                            "context_source_incident_id": cached.get("source_incident_id"),
-                            "context_collected_at": cached.get("collected_at"),
-                            "context_reuse_count": reuse_count,
-                            "context_signature": signature,
-                            "prior_resolution": cached.get("resolution_payload", {}),
-                        }
-                        await session.commit()
-                        CONTEXT_KNOWLEDGE_REUSE_COUNT.observe(reuse_count)
-                        CONTEXT_STRATEGY_REQUESTS.labels("continuous", "cache_hit").inc()
-                        CONTEXT_STRATEGY_DURATION.labels("continuous", "reused").observe(
-                            max(0.0, perf_counter() - started)
-                        )
-                        return context
+                        complete, missing = _context_completeness(context)
+                        if strategy == "auto" and (not complete or not _has_code_evidence(context)):
+                            CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "incomplete").inc()
+                            continue_with_refresh = True
+                        else:
+                            continue_with_refresh = False
+                        if continue_with_refresh:
+                            logger.info("cached context lacks required evidence coverage for signature=%s; refreshing", signature)
+                        else:
+                            reuse_count = int(cached.get("reuse_count", 1) or 1)
+                            context.metadata = {
+                                **(context.metadata if isinstance(context.metadata, dict) else {}),
+                                "context_strategy": strategy,
+                                "context_source": "periodic_cache" if strategy == "historical" else "cache",
+                                "context_reused": True,
+                                "context_complete": complete,
+                                "context_missing_sections": missing,
+                                "realtime_collection_performed": False,
+                                "context_knowledge_id": cached.get("id"),
+                                "context_source_alert_id": cached.get("source_alert_id"),
+                                "context_source_incident_id": cached.get("source_incident_id"),
+                                "context_collected_at": cached.get("collected_at"),
+                                "context_reuse_count": reuse_count,
+                                "context_signature": signature,
+                                "prior_resolution": cached.get("resolution_payload", {}),
+                            }
+                            await session.commit()
+                            CONTEXT_KNOWLEDGE_REUSE_COUNT.observe(reuse_count)
+                            CONTEXT_STRATEGY_REQUESTS.labels(strategy, "cache_hit").inc()
+                            CONTEXT_STRATEGY_DURATION.labels(strategy, "reused").observe(
+                                max(0.0, perf_counter() - started)
+                            )
+                            return context
         except Exception:
             CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "error").inc()
             logger.exception("context knowledge lookup failed; continuing with fresh discovery")
 
-    if strategy == "continuous" and not database_available:
+    if strategy in {"auto", "historical"} and not database_available:
         CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "unavailable").inc()
+
+    if strategy == "historical":
+        context = Context(incident_id=incident.id, alert=alert)
+        context.metadata = {
+            "context_strategy": "historical",
+            "context_source": "historical_cache_miss",
+            "context_reused": False,
+            "context_complete": False,
+            "context_missing_sections": ["historical_context"],
+            "realtime_collection_performed": False,
+        }
+        CONTEXT_STRATEGY_REQUESTS.labels("historical", "cache_miss").inc()
+        return context
 
     try:
         context = await agent.collect_with_runtime(alert, incident)
@@ -146,6 +225,10 @@ async def _collect_context_with_strategy(
         **(context.metadata if isinstance(context.metadata, dict) else {}),
         "context_strategy": strategy,
         "context_reused": False,
+        "context_source": "realtime_collection",
+        "context_complete": _context_completeness(context)[0],
+        "context_missing_sections": _context_completeness(context)[1],
+        "realtime_collection_performed": True,
         "context_signature": signature,
         "context_collected_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -169,7 +252,7 @@ async def _collect_context_with_strategy(
         except Exception:
             CONTEXT_KNOWLEDGE_OPERATIONS.labels("store", "error").inc()
             logger.exception("context knowledge persistence failed; returning freshly collected context")
-    outcome = "fresh" if strategy == "immediate" else "cache_miss"
+    outcome = "fresh" if strategy == "realtime" else "cache_miss"
     CONTEXT_STRATEGY_REQUESTS.labels(strategy, outcome).inc()
     CONTEXT_STRATEGY_DURATION.labels(strategy, "fresh_discovery").observe(max(0.0, perf_counter() - started))
     return context
@@ -392,7 +475,9 @@ async def startup(app: FastAPI) -> None:
         alert = Alert.model_validate(payload["alert"])
         incident = Incident.model_validate(payload["incident"])
         decision = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
-        context = await _collect_context_with_strategy(app, alert, incident, decision.get("context_strategy"))
+        context = await _collect_context_with_strategy(
+            app, alert, incident, decision.get("context_strategy"), payload.get("context")
+        )
         try:
             create_evidence_rag_draft(alert=alert, incident=incident, context=context)
         except Exception:
@@ -1144,7 +1229,9 @@ def read_flow_catalog(connector: VectorDBConnector) -> list[dict[str, Any]]:
 async def collect(payload: dict, publish_events: bool = True) -> Context:
     alert = Alert.model_validate(payload["alert"])
     incident = Incident.model_validate(payload["incident"])
-    context = await _collect_context_with_strategy(app, alert, incident, payload.get("context_strategy"))
+    context = await _collect_context_with_strategy(
+        app, alert, incident, payload.get("context_strategy"), payload.get("context")
+    )
     if publish_events:
         await app.state.producer.publish(
             CONTEXT_EVENTS,
@@ -1162,13 +1249,14 @@ async def collect(payload: dict, publish_events: bool = True) -> Context:
 async def context_strategy_status() -> dict[str, Any]:
     return {
         "default": _context_strategy(),
-        "supported": ["immediate", "continuous"],
-        "continuous": {
+        "supported": ["auto", "realtime", "historical"],
+        "auto": {
             "cache_aside": True,
             "ttl_seconds": max(60, int(getattr(settings, "context_knowledge_ttl_seconds", 604800) or 604800)),
             "match_scope": ["tenant", "service", "environment", "alert-family"],
         },
-        "immediate": {"always_refresh": True},
+        "realtime": {"always_refresh": True},
+        "historical": {"always_refresh": False, "cache_miss_collects_realtime": False},
     }
 
 
@@ -1187,6 +1275,20 @@ async def ingest_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
 
 
 def _list_evidence_rag_drafts_sync(alert_id: str | None, status: str | None) -> list[dict[str, Any]]:
+    if alert_id:
+        path = _draft_path(f"evidence-{alert_id}")
+        if not path.exists():
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if not isinstance(payload, dict) or str(payload.get("alert_id") or "") != alert_id:
+            return []
+        if status and str(payload.get("status") or "").lower() != status.lower():
+            return []
+        return [payload]
+
     drafts: list[dict[str, Any]] = []
     for path in sorted(_evidence_draft_dir().glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
         try:
@@ -1194,8 +1296,6 @@ def _list_evidence_rag_drafts_sync(alert_id: str | None, status: str | None) -> 
         except (OSError, ValueError):
             continue
         if not isinstance(payload, dict):
-            continue
-        if alert_id and str(payload.get("alert_id") or "") != alert_id:
             continue
         if status and str(payload.get("status") or "").lower() != status.lower():
             continue

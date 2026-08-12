@@ -2632,6 +2632,10 @@ th {
 .alert-document-draft-heading h4 { margin: 3px 0 0; }
 .alert-document-draft-editor label { display: grid; gap: 6px; color: #38516a; font-size: 12px; font-weight: 800; }
 .alert-document-draft-editor textarea { width: 100%; resize: vertical; font-family: inherit; line-height: 1.55; }
+.report-view-switch { display: inline-flex; width: fit-content; gap: 3px; padding: 3px; border: 1px solid #b9d2eb; border-radius: 8px; background: #eef5fb; }
+.report-view-switch button { min-width: 92px; border: 0; border-radius: 6px; padding: 7px 12px; color: #38516a; background: transparent; font-weight: 800; cursor: pointer; }
+.report-view-switch button.active { color: #fff; background: #11647a; }
+.simple-incident-report { margin: 0; padding: 16px; min-height: 220px; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid #c9dcea; border-radius: 8px; background: #f7fbfe; color: #18344c; font: 500 14px/1.6 inherit; }
 
 .onboarding-review-checklist {
   border: 1px solid #d9e6f5;
@@ -8168,6 +8172,9 @@ th {
 .hero > .subtitle { margin: 0; text-transform: capitalize; }
 .hero-actions { margin-top: 10px; }
 .ingestion-open-action { justify-self: start; margin-top: 8px; }
+.alert-incident-indicator{display:inline-grid;width:28px;height:28px;padding:0;place-items:center;border:1px solid #b9d7c8;border-radius:50%;color:#176744;background:#effaf4;cursor:pointer}
+.alert-incident-indicator:hover,.alert-incident-indicator:focus-visible{border-color:#25815b;background:#ddf5e7}
+.alert-incident-indicator.is-duplicate{color:#8a5a12;border-color:#e5c98f;background:#fff8e8}
 
 /* Final Operations motion policy. These rules intentionally live after the
    legacy reveal animations so background data cannot replay page motion. */
@@ -8649,3 +8656,4 @@ tbody tr:hover { background: #f5fafc; }
   .hero { grid-template-columns: 1fr; }
   .hero-actions { grid-column: 1; grid-row: auto; margin-top: 9px; }
 }
+.portfolio-select-column{width:44px;min-width:44px;text-align:center}.portfolio-select-column input{width:16px;height:16px;margin:0;vertical-align:middle;accent-color:var(--accent,#087ca7)}

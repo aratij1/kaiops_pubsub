@@ -2,6 +2,7 @@ from alert_intelligence import AlertIntelligenceAgent
 from common.models import Alert, AlertSeverity
 from common.repository_interfaces import InMemoryAlertHistoryRepository
 import pytest
+from datetime import timedelta
 
 
 def make_alert(description: str = "payment latency above threshold") -> Alert:
@@ -23,6 +24,8 @@ async def test_alert_intelligence_deduplicates_and_classifies() -> None:
 
     assert first.severity == AlertSeverity.CRITICAL
     assert second.deduplicated_count == 2
+    assert first.metadata["deduplication"]["disposition"] == "new_incident"
+    assert second.metadata["deduplication"]["disposition"] == "duplicate"
     assert second.correlation_id == first.correlation_id
     assert first_incident.owner_team == "payments-sre"
 
@@ -136,3 +139,64 @@ def test_embedding_cache_is_bounded() -> None:
     assert len(agent._embedding_cache) == 3
     assert "alert-text-1" not in agent._embedding_cache
     assert "alert-text-4" in agent._embedding_cache
+
+
+@pytest.mark.asyncio
+async def test_alert_deduplication_can_be_disabled() -> None:
+    repository = InMemoryAlertHistoryRepository()
+    agent = AlertIntelligenceAgent(alert_history_repository=repository, deduplication_enabled=False)
+    original = make_alert()
+    await repository.record_alert(original)
+
+    duplicate = make_alert()
+    enriched = await agent.deduplicate_alerts(duplicate, [original])
+
+    assert enriched.deduplicated_count == 1
+    assert enriched.metadata["deduplication"]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_similar_alert_within_configured_hour_is_duplicate() -> None:
+    repository = InMemoryAlertHistoryRepository()
+    agent = AlertIntelligenceAgent(
+        alert_history_repository=repository,
+        deduplication_window_minutes=60,
+        correlation_threshold=0.2,
+    )
+    original = make_alert("checkout payment latency high")
+    original.fingerprint = agent._fingerprint(original)
+    await repository.record_alert(original)
+    similar = Alert(
+        source="prometheus",
+        name="CheckoutLatencyDegraded",
+        service="payments",
+        severity=AlertSeverity.WARNING,
+        description="payment response latency degraded in checkout",
+        labels={"deployment": "payments-api", "team": "payments-sre"},
+        starts_at=original.starts_at + timedelta(minutes=59),
+    )
+
+    enriched = await agent.deduplicate_alerts(similar, [original])
+
+    assert enriched.metadata["deduplication"]["disposition"] == "duplicate"
+    assert enriched.metadata["deduplication"]["match_type"] == "similar"
+
+
+@pytest.mark.asyncio
+async def test_similar_alert_outside_configured_hour_is_new() -> None:
+    agent = AlertIntelligenceAgent(deduplication_window_minutes=60, correlation_threshold=0.2)
+    original = make_alert("checkout payment latency high")
+    original.fingerprint = agent._fingerprint(original)
+    original.starts_at = original.starts_at - timedelta(minutes=61)
+    similar = Alert(
+        source="prometheus",
+        name="CheckoutLatencyDegraded",
+        service="payments",
+        severity=AlertSeverity.WARNING,
+        description="payment response latency degraded in checkout",
+        labels={"deployment": "payments-api", "team": "payments-sre"},
+    )
+
+    enriched = await agent.deduplicate_alerts(similar, [original])
+
+    assert enriched.metadata["deduplication"]["disposition"] == "new_incident"

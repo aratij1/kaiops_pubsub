@@ -277,6 +277,7 @@ class LocalScriptExecutionPlugin(BasePlugin):
 class RemediationEngine(BaseAgent):
     plugins: dict[str, RemediationPlugin] = field(
         default_factory=lambda: {
+            "jenkins": JenkinsRollbackPlugin(),
             "rollback_deployment": JenkinsRollbackPlugin(),
             "restart_pod": KubernetesRestartPlugin(),
             "scale_deployment": KubernetesRestartPlugin(),
@@ -599,7 +600,11 @@ class RemediationEngine(BaseAgent):
         }
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        action_type = action.action_type if action.action_type in self.tool_registry.tools else "api_execution"
+        profile = action.parameters.get("connection_profile")
+        profile = profile if isinstance(profile, dict) else {}
+        executor_type = str(profile.get("executor_type") or profile.get("connection_type") or "").strip().lower()
+        action_type = "jenkins" if executor_type == "jenkins" else action.action_type
+        action_type = action_type if action_type in self.tool_registry.tools else "api_execution"
         try:
             payload = await self.tool_registry.execute(
                 action_type,

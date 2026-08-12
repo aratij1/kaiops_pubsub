@@ -61,6 +61,24 @@ def test_code_search_uses_service_path_as_relevance_signal(tmp_path: Path, monke
     assert "otel-collector" in result["evidence"][0]["uri"]
 
 
+def test_code_search_prioritizes_kaiops_service_alias_directory(tmp_path: Path, monkeypatch) -> None:
+    backend_root = tmp_path / "backend" / "src"
+    service_root = backend_root / "context-agent"
+    service_root.mkdir(parents=True)
+    (service_root / "app.py").write_text("def collect_context():\n    return 'context'\n", encoding="utf-8")
+    projects = tmp_path / "projects.json"
+    projects.write_text(
+        '{"projects":{"kaiops":{"aliases":["kaiops-platform"],"code_roots":["%s"]}}}'
+        % backend_root.as_posix(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DISCOVERY_MCP_PROJECTS_FILE", str(projects))
+
+    roots = module._code_roots({"project": "kaiops-platform", "service": "kaiops-context-agent"})
+
+    assert roots[0] == service_root
+
+
 def test_code_search_discards_volatile_alert_tokens() -> None:
     terms = module._code_search_terms(
         {

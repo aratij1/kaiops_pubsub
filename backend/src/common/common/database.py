@@ -871,6 +871,23 @@ async def create_schema(engine: AsyncEngine) -> None:
                     if int(has_index or 0) == 0:
                         await connection.execute(text(f"CREATE INDEX {index_name} ON {table_name} ({columns})"))
 
+                has_onboarding_tenant = await connection.scalar(
+                    text(
+                        "SELECT COUNT(*) FROM information_schema.columns "
+                        "WHERE table_schema = DATABASE() "
+                        "AND table_name = 'onboarding_state' AND column_name = 'tenant_id'"
+                    )
+                )
+                if int(has_onboarding_tenant or 0) == 0:
+                    await connection.execute(
+                        text(
+                            "ALTER TABLE onboarding_state "
+                            "ADD COLUMN tenant_id VARCHAR(128) NOT NULL DEFAULT 'default' FIRST, "
+                            "DROP PRIMARY KEY, "
+                            "ADD PRIMARY KEY (tenant_id, project_name, provider_name)"
+                        )
+                    )
+
                 has_agent_table = await connection.scalar(
                     text(
                         """
