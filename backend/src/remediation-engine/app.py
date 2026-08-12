@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import hashlib
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
@@ -352,11 +353,18 @@ async def execute_approval(approval: Approval) -> RemediationAction:
             output="human rejected remediation",
         )
     else:
+        if _plan_is_validation_only(approval):
+            raise HTTPException(
+                status_code=409,
+                detail="Execution blocked: the approved plan is validation-only (--dry-run true). Attach a governed live executor before executing.",
+            )
         if approval.metadata.get("auto_approved"):
             try:
                 await _require_persisted_approved_runbook(approval)
             except PolicyViolation as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+        else:
+            await _require_persisted_human_approval(approval)
         action = engine.build_action(approval)
         _require_production_credential_reference(approval, action.action_type)
         if not engine.is_action_allowed(action.action_type):
@@ -377,6 +385,24 @@ async def execute_approval(approval: Approval) -> RemediationAction:
 
     await _persist_action(app, action)
     return action
+
+
+async def _require_persisted_human_approval(approval: Approval) -> None:
+    """Prevent callers from turning an unpersisted request body into approval."""
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Durable approval verification is unavailable.")
+    async with session_factory() as session:
+        accepted = await IncidentRepository(session).has_accepted_approval(
+            approval.incident_id,
+            approval.recommendation_id,
+            tenant_id=approval.tenant_id or "default",
+        )
+    if not accepted:
+        raise HTTPException(
+            status_code=409,
+            detail="Execution blocked: persist an approved or modified human decision for this recommendation first.",
+        )
 
 
 async def _require_persisted_approved_runbook(approval: Approval) -> None:
@@ -433,6 +459,18 @@ def _unsafe_plan_reasons(approval: Approval) -> list[str]:
         "infrastructure destruction": ("terraform destroy", "kubectl delete namespace"),
     }
     return [f"Dry run blocked: {label} requires a separately reviewed, policy-authorized plan." for label, tokens in markers.items() if any(token in text for token in tokens)]
+
+
+def _plan_is_validation_only(approval: Approval) -> bool:
+    """Return true when every executable entry explicitly requests dry-run mode."""
+    plan = approval.metadata.get("execution_plan") if isinstance(approval.metadata.get("execution_plan"), dict) else {}
+    executable: list[str] = []
+    for key in ("commands", "scripts"):
+        item = plan.get(key, [])
+        executable.extend(str(value).strip() for value in (item if isinstance(item, list) else [item]) if str(value).strip())
+    if not executable:
+        return False
+    return all(re.search(r"--dry-run(?:=|\s+)(?:true|1)\b", value, flags=re.IGNORECASE) for value in executable)
 
 
 def _require_production_credential_reference(approval: Approval, action_type: str) -> None:

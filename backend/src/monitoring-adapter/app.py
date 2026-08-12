@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from uuid import UUID
 
 from common.config import get_settings
@@ -1107,7 +1107,7 @@ class OnboardingConnectivityPayload(BaseModel):
     ticketing_url: str = ""
     email_url: str = ""
     network_zone: str = ""
-    context_strategy: str = "continuous"
+    context_strategy: str = "auto"
     azure_subscription_id: str = ""
     azure_resource_group: str = ""
     azure_service_bus_namespace: str = ""
@@ -1200,9 +1200,10 @@ class OnboardingConnectivityPayload(BaseModel):
         self.ticketing_url = self._normalize_endpoint(self.ticketing_url, "ticketing_url")
         self.email_url = normalize_email_endpoint(self.email_url)
         self.network_zone = str(self.network_zone or "").strip()
-        self.context_strategy = str(self.context_strategy or "continuous").strip().lower()
-        if self.context_strategy not in {"immediate", "continuous"}:
-            raise ValueError("context_strategy must be one of immediate, continuous")
+        self.context_strategy = str(self.context_strategy or "auto").strip().lower()
+        self.context_strategy = {"continuous": "auto", "immediate": "realtime"}.get(self.context_strategy, self.context_strategy)
+        if self.context_strategy not in {"auto", "realtime", "historical"}:
+            raise ValueError("context_strategy must be one of auto, realtime, historical")
         self.azure_subscription_id = str(self.azure_subscription_id or "").strip()
         self.azure_resource_group = str(self.azure_resource_group or "").strip()
         self.azure_service_bus_namespace = str(self.azure_service_bus_namespace or "").strip()
@@ -1242,7 +1243,7 @@ class OnboardingConnectivitySnapshot(BaseModel):
     ticketing_url: str = ""
     email_url: str = ""
     network_zone: str = ""
-    context_strategy: str = "continuous"
+    context_strategy: str = "auto"
     azure_subscription_id: str = ""
     azure_resource_group: str = ""
     azure_service_bus_namespace: str = ""
@@ -2474,7 +2475,7 @@ async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
         "ticketing_url": str(payload.get("ticketing_url", "")).strip(),
         "email_url": str(payload.get("email_url", "")).strip(),
         "network_zone": str(payload.get("network_zone", "")).strip(),
-        "context_strategy": str(payload.get("context_strategy", "continuous")).strip(),
+        "context_strategy": str(payload.get("context_strategy", "auto")).strip(),
         "azure_subscription_id": str(payload.get("azure_subscription_id", "")).strip(),
         "azure_resource_group": str(payload.get("azure_resource_group", "")).strip(),
         "azure_service_bus_namespace": str(payload.get("azure_service_bus_namespace", "")).strip(),
@@ -4454,7 +4455,8 @@ async def register_monitoring_webhook(integration_id: str, payload: dict[str, An
         provider = normalize_provider_name(str(row.get("provider") or ""))
         adapter = get_provider_adapter(provider)
         webhook_path = str(row.get("webhook_path") or build_webhook_path(provider))
-        webhook_url = f"{public_base_url}{webhook_path}"
+        separator = "&" if "?" in webhook_path else "?"
+        webhook_url = f"{public_base_url}{webhook_path}{separator}integration_id={quote(integration_id, safe='')}"
         registration = adapter.register_webhook(row.get("config_payload", {}), webhook_url)
         await repo.save_monitoring_webhook_endpoint(
             endpoint_id=str(uuid.uuid4()),
@@ -4638,10 +4640,11 @@ async def _ingest_provider_alert(
     x_trace_id: str | None,
     x_signature: str | None,
     x_webhook_token: str | None,
+    integration_id_hint: str | None = None,
 ) -> dict[str, Any]:
     provider = normalize_provider_name(provider_hint)
     tenant_id = str(payload.get("tenant_id") or "default")
-    integration_id = str(payload.get("integration_id") or "").strip() or None
+    integration_id = str(integration_id_hint or payload.get("integration_id") or "").strip() or None
 
     session_factory = _db_required()
     mappings: list[dict[str, Any]] = []
@@ -4661,10 +4664,28 @@ async def _ingest_provider_alert(
     auth_valid = True if not expected_token else (str(x_webhook_token or "") == expected_token)
     body_as_string = json.dumps(payload, sort_keys=True)
     signature_valid = verify_hmac_signature(hmac_secret, body_as_string, x_signature)
+    verification_configured = bool(expected_token or hmac_secret)
+    event_mode = str(payload.get("event_mode") or payload.get("eventMode") or "real").strip().lower()
+    synthetic = event_mode in {"synthetic", "test", "validation", "simulation"}
+    authenticity = (
+        "synthetic"
+        if synthetic
+        else "verified"
+        if integration is not None and verification_configured and auth_valid and signature_valid
+        else "unverified"
+    )
 
     adapter = get_provider_adapter(provider)
     normalized = adapter.normalize_alert(payload, None)
     normalized = apply_field_mapping(normalized, mappings)
+    normalized_labels = normalized.get("labels") if isinstance(normalized.get("labels"), dict) else {}
+    normalized["labels"] = {
+        **normalized_labels,
+        "event_authenticity": authenticity,
+        "event_mode": event_mode,
+        "provider": provider,
+        "integration_id": integration_id or "",
+    }
 
     mapped_payload = {
         "source": provider,
@@ -4673,11 +4694,10 @@ async def _ingest_provider_alert(
         "environment": str(normalized.get("environment") or "prod"),
         "severity": str(normalized.get("severity") or "warning"),
         "description": str((normalized.get("annotations") or {}).get("summary") or normalized.get("alertName") or f"{provider}-alert"),
-        "labels": normalized.get("labels", {}),
+        "labels": normalized["labels"],
         "annotations": normalized.get("annotations", {}),
     }
     alert = _build_alert_from_payload(mapped_payload, trace_id=x_trace_id)
-    await _publish_ingested_alert(alert)
     received_id, normalized_id = await _persist_received_and_normalized(
         tenant_id=tenant_id,
         provider=provider,
@@ -4687,6 +4707,35 @@ async def _ingest_provider_alert(
         signature_valid=signature_valid,
         auth_valid=auth_valid,
     )
+    if authenticity != "verified":
+        reason = (
+            "Synthetic/test payloads are retained for validation but never promoted as real incidents."
+            if synthetic
+            else "A registered integration with a valid webhook token or HMAC signature is required."
+        )
+        await _persist_monitoring_audit(
+            tenant_id=tenant_id,
+            actor="landing-pad",
+            action="webhook.quarantine",
+            provider=provider,
+            outcome="quarantined",
+            message=reason,
+            payload={"received_alert_id": received_id, "normalized_alert_id": normalized_id, "authenticity": authenticity},
+            integration_id=integration_id,
+        )
+        return {
+            "provider": provider,
+            "integration_id": integration_id,
+            "received_alert_id": received_id,
+            "normalized_alert_id": normalized_id,
+            "signature_valid": signature_valid,
+            "auth_valid": auth_valid,
+            "authenticity": authenticity,
+            "status": "quarantined",
+            "reason": reason,
+        }
+
+    await _publish_ingested_alert(alert)
     await _publish_lifecycle_events(normalized, trace_id=x_trace_id)
     await _persist_monitoring_audit(
         tenant_id=tenant_id,
@@ -4712,84 +4761,117 @@ async def _ingest_provider_alert(
         "normalized_alert_id": normalized_id,
         "signature_valid": signature_valid,
         "auth_valid": auth_valid,
+        "authenticity": authenticity,
         "status": "accepted",
     }
 
 
 @app.post("/api/v1/alerts/prometheus")
-async def ingest_prometheus_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_prometheus_alert(payload: dict[str, Any] = ALERT_BODY, integration_id: str | None = None, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint="prometheus",
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
 @app.post("/api/v1/alerts/datadog")
-async def ingest_datadog_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_datadog_alert(payload: dict[str, Any] = ALERT_BODY, integration_id: str | None = None, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint="datadog",
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
 @app.post("/api/v1/alerts/newrelic")
-async def ingest_newrelic_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_newrelic_alert(payload: dict[str, Any] = ALERT_BODY, integration_id: str | None = None, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint="new_relic",
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
 @app.post("/api/v1/alerts/dynatrace")
-async def ingest_dynatrace_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_dynatrace_alert(payload: dict[str, Any] = ALERT_BODY, integration_id: str | None = None, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint="dynatrace",
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
 @app.post("/api/v1/alerts/azure-monitor")
-async def ingest_azure_monitor_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_azure_monitor_alert(payload: dict[str, Any] = ALERT_BODY, integration_id: str | None = None, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint="azure_monitor",
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
 @app.post("/api/v1/alerts/splunk")
-async def ingest_splunk_alert(payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_splunk_alert(payload: dict[str, Any] = ALERT_BODY, integration_id: str | None = None, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint="splunk",
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
 @app.post("/api/v1/alerts/generic")
-async def ingest_generic_provider_alert(provider: str = "prometheus", payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def ingest_generic_provider_alert(provider: str = "prometheus", integration_id: str | None = None, payload: dict[str, Any] = ALERT_BODY, x_trace_id: str | None = Header(default=None), x_signature: str | None = Header(default=None), x_webhook_token: str | None = Header(default=None)) -> dict[str, Any]:
     return await _ingest_provider_alert(
         provider_hint=provider,
         payload=payload,
         x_trace_id=x_trace_id,
         x_signature=x_signature,
         x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
+    )
+
+
+@app.post("/api/v1/alerts/{provider}")
+async def ingest_registered_provider_alert(
+    provider: str,
+    payload: dict[str, Any] = ALERT_BODY,
+    integration_id: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    x_signature: str | None = Header(default=None),
+    x_webhook_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Receive a registered provider's native payload.
+
+    The integration id is embedded in the generated webhook URL. Payloads are
+    promoted to the incident pipeline only when the integration's token/HMAC
+    check succeeds; everything else is retained as quarantined evidence.
+    """
+    return await _ingest_provider_alert(
+        provider_hint=provider,
+        payload=payload,
+        x_trace_id=x_trace_id,
+        x_signature=x_signature,
+        x_webhook_token=x_webhook_token,
+        integration_id_hint=integration_id,
     )
 
 
@@ -4920,6 +5002,11 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
             or merged_labels.get("source")
             or "prometheus"
         ).strip().lower() or "prometheus"
+        event_mode = str(merged_labels.get("event_mode") or merged_labels.get("test_mode") or "real").strip().lower()
+        alert_name = str(merged_labels.get("alertname") or "prometheus-alert")
+        synthetic = event_mode in {"synthetic", "test", "validation", "simulation"} or "ingestion validation" in alert_name.lower()
+        native_alertmanager_origin = origin_system in {"prometheus", "prometheus-alertmanager", "alertmanager", "grafana"}
+        authenticity = "synthetic" if synthetic else "internal-observed" if native_alertmanager_origin else "unverified"
         delivery_key = _alertmanager_delivery_key(item, merged_labels, status)
 
         if not _claim_alertmanager_delivery(delivery_key):
@@ -4935,7 +5022,7 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
 
         mapped_payload = {
             "source": origin_system,
-            "name": str(merged_labels.get("alertname") or "prometheus-alert"),
+            "name": alert_name,
             "service": str(merged_labels.get("service") or merged_labels.get("job") or merged_labels.get("instance") or "kaiops-platform"),
             "environment": str(merged_labels.get("environment") or merged_labels.get("env") or "prod"),
             "severity": str(merged_labels.get("severity") or "warning").lower(),
@@ -4947,6 +5034,8 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 "transport": "alertmanager",
                 "alert_status": status,
                 "alert_fingerprint": str(item.get("fingerprint") or ""),
+                "event_mode": event_mode,
+                "event_authenticity": authenticity,
             },
             "annotations": {
                 **merged_annotations,
@@ -4955,6 +5044,17 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 "generatorURL": str(item.get("generatorURL") or ""),
             },
         }
+        if authenticity in {"synthetic", "unverified"}:
+            landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item, status="processed")
+            skipped_rows.append({
+                "status": "quarantined",
+                "alertname": mapped_payload["name"],
+                "service": mapped_payload["service"],
+                "authenticity": authenticity,
+                "landing_pad_file": landing_pad_file,
+                "reason": "Synthetic validation is not a real incident." if synthetic else f"{origin_system} must use its registered provider webhook endpoint.",
+            })
+            continue
         if status != "firing":
             # Resolved/inactive notifications are operationally important: they
             # close the lifecycle in the intake stream even though they must not
@@ -5577,9 +5677,10 @@ def _compact_alert_row(row: dict[str, Any]) -> dict[str, Any]:
         "fingerprint", "alert_fingerprint", "name", "alert_name", "service",
         "application", "project", "project_name", "environment", "source",
         "source_channel", "severity", "status", "alert_status", "description",
+        "origin_system", "ingestion_channel", "deduplicated_count", "incident_disposition",
         "created_at", "updated_at", "received_at", "first_seen", "last_seen",
         "starts_at", "ends_at", "occurrence_count", "assignee", "owner",
-        "ticket_key", "issue_key", "file", "path", "error", "labels", "annotations",
+        "ticket_id", "jira_key", "jira_url", "ticket_key", "issue_key", "file", "path", "error", "labels", "annotations",
     }
     compact = {key: value for key, value in row.items() if key in fields}
     labels = row.get("labels") if isinstance(row.get("labels"), dict) else {}
@@ -5587,7 +5688,7 @@ def _compact_alert_row(row: dict[str, Any]) -> dict[str, Any]:
     label_fields = {
         "alertname", "service", "job", "application", "project", "project_name",
         "environment", "severity", "fingerprint", "alert_fingerprint",
-        "source_alert_id", "ticket_key", "issue_key", "jira_issue_key",
+        "source_alert_id", "ticket_id", "ticket_key", "issue_key", "jira_issue_key",
     }
     compact["labels"] = {key: value for key, value in labels.items() if key in label_fields}
     compact["annotations"] = {
@@ -5615,7 +5716,7 @@ async def get_all_alerts(limit: int = 500, tenant_id: str | None = None, compact
 
 
 @app.get("/alerts/applications")
-async def get_alert_applications(limit: int = 5000) -> dict[str, Any]:
+async def get_alert_applications(limit: int = 5000, tenant_id: str = "default") -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 10000))
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
@@ -5624,16 +5725,57 @@ async def get_alert_applications(limit: int = 5000) -> dict[str, Any]:
             # Project discovery only needs the persisted alert payload. Avoid
             # incident/projection enrichment, which turns this lightweight
             # inventory endpoint into several large follow-up queries.
-            rows = await repo.list_alerts(limit=safe_limit, include_incident_context=False)
+            rows = await repo.list_alerts(limit=safe_limit, include_incident_context=False, tenant_id=tenant_id)
     else:
         rows = list(RECENT_ALERTS)[:safe_limit]
 
     applications = collect_alert_applications(rows)
+    suppressed: set[str] = set()
+    if settings.database_enabled and session_factory is not None:
+        async with session_factory() as session:
+            repo = IncidentRepository(session)
+            state_rows = await repo.list_onboarding_state(tenant_id=tenant_id)
+        suppression_providers = {
+            "observed_project_suppression",
+            f"observed_project_suppression:{tenant_id.strip().lower()}",
+        }
+        suppressed = {
+            str(row.get("project_name") or "").strip().lower()
+            for row in state_rows
+            if str(row.get("provider_name") or "").strip().lower()
+            in suppression_providers
+        }
+    applications = [name for name in applications if name.strip().lower() not in suppressed]
 
     return {
         "rows": [{"name": name} for name in applications],
         "count": len(applications),
         "scanned_alerts": len(rows),
+    }
+
+
+@app.delete("/alerts/applications/{project_name}")
+async def suppress_observed_alert_application(project_name: str, tenant_id: str = "default") -> dict[str, Any]:
+    normalized = str(project_name or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=422, detail="project name is required")
+    session_factory = _db_required()
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_onboarding_state(
+            tenant_id=tenant_id,
+            project_name=normalized,
+            provider_name="observed_project_suppression",
+            project_payload={"name": normalized, "tenant_id": tenant_id, "inventory_visibility": "suppressed"},
+            connectivity_payload={"source": "alert_observation", "historical_alerts_preserved": True},
+            test_status="suppressed",
+            test_message="Removed from Project Management observed inventory by an administrator",
+        )
+        await session.commit()
+    return {
+        "name": normalized,
+        "status": "removed_from_inventory",
+        "historical_alerts_preserved": True,
     }
 
 

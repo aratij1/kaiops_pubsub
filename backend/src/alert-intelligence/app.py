@@ -5,9 +5,7 @@ import json
 import logging
 import os
 import re
-from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine
-from time import monotonic
 from typing import Any
 
 from alert_intelligence import AlertIntelligenceAgent
@@ -25,6 +23,7 @@ from common.telemetry import EVENTS_PROCESSED
 from common.topics import ENRICHED_ALERTS, JIRA_INVESTIGATIONS, RAW_ALERTS
 from fastapi import FastAPI
 import httpx
+from pydantic import BaseModel, Field
 
 settings = get_settings()
 settings.service_name = "alert-intelligence"
@@ -37,11 +36,9 @@ DISCOVERY_WARNING_MIN_CONFIDENCE = max(
     DISCOVERY_MIN_CONFIDENCE,
     min(1.0, float(os.getenv("DISCOVERY_WARNING_MIN_CONFIDENCE", "0.80") or 0.80)),
 )
-JIRA_MAX_NEW_ISSUES_PER_HOUR = max(1, int(os.getenv("JIRA_MAX_NEW_ISSUES_PER_HOUR", "10") or 10))
 MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
     os.getenv("MESSAGE_BUS_DUAL_CONSUME_ENABLED", "false")
 ).strip().lower() in {"1", "true", "yes", "on"}
-_JIRA_CREATION_TIMES: deque[float] = deque()
 logger = logging.getLogger("alert-intelligence")
 
 ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any, Any, None]]
@@ -144,20 +141,13 @@ async def _sync_candidate_to_jira(incident: Any) -> str | None:
         return None
     qualified, qualification_reason = _qualify_candidate_for_jira(candidate)
     incident.metadata["jira_qualification"] = {
-        "qualified": qualified,
-        "reason": qualification_reason,
-        "policy_version": "jira-qualification-v2",
+        "qualified": True,
+        "discovery_qualified": qualified,
+        "reason": "mandatory ticket after alert deduplication",
+        "discovery_reason": qualification_reason,
+        "policy_version": "jira-for-every-deduplicated-alert-v1",
     }
     jira_key = str(getattr(incident, "ticket_id", "") or candidate.get("jira_key") or "")
-    # Human/external Jira incidents are already golden records and may be
-    # enriched even when the new evidence alone is below creation threshold.
-    if not jira_key and not qualified:
-        logger.info(
-            "incident_pipeline stage=jira_qualification outcome=suppressed incident=%s reason=%s",
-            incident.id,
-            qualification_reason,
-        )
-        return None
     base_url = str(os.getenv("JIRA_API_BASE_URL", "") or "").rstrip("/")
     email = str(os.getenv("JIRA_API_EMAIL", "") or "")
     token = str(os.getenv("JIRA_API_TOKEN", "") or "")
@@ -181,21 +171,6 @@ async def _sync_candidate_to_jira(incident: Any) -> str | None:
             if issues and isinstance(issues[0], dict):
                 jira_key = str(issues[0].get("key") or "")
             else:
-                current = monotonic()
-                while _JIRA_CREATION_TIMES and current - _JIRA_CREATION_TIMES[0] >= 3600:
-                    _JIRA_CREATION_TIMES.popleft()
-                if len(_JIRA_CREATION_TIMES) >= JIRA_MAX_NEW_ISSUES_PER_HOUR:
-                    incident.metadata["jira_qualification"] = {
-                        "qualified": False,
-                        "reason": "post-Discovery hourly Jira creation limit reached",
-                        "policy_version": "jira-qualification-v2",
-                    }
-                    logger.info(
-                        "incident_pipeline stage=jira outcome=rate_limited incident=%s",
-                        incident.id,
-                    )
-                    return None
-                _JIRA_CREATION_TIMES.append(current)
                 severity = str(candidate.get("final_severity") or "warning").lower()
                 description = (
                     "h2. AI-discovered incident\n"
@@ -233,7 +208,9 @@ async def _sync_candidate_to_jira(incident: Any) -> str | None:
                     raise RuntimeError("Jira create response did not include an issue key")
         incident.ticket_id = jira_key
         candidate["jira_key"] = jira_key
+        candidate["jira_url"] = f"{base_url}/browse/{jira_key}"
         incident.metadata["incident_candidate"] = candidate
+        incident.metadata["jira"] = {"key": jira_key, "url": candidate["jira_url"]}
     property_key = f"kaiops-candidate-{idempotency_key[:32]}"
     property_url = f"{base_url}/rest/api/2/issue/{jira_key}/properties/{property_key}"
     async with httpx.AsyncClient(auth=(email, token), timeout=15.0) as client:
@@ -310,6 +287,66 @@ async def _reuse_correlated_jira(incident: Any) -> str | None:
     return jira_key
 
 
+async def _merge_duplicate_into_canonical(alert: Alert, incident: Any) -> Any | None:
+    deduplication = alert.metadata.get("deduplication") if isinstance(alert.metadata, dict) else {}
+    if not isinstance(deduplication, dict) or deduplication.get("disposition") != "duplicate":
+        return None
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        return None
+    candidate = incident.metadata.get("incident_candidate") if isinstance(incident.metadata, dict) else {}
+    correlation_key = str(candidate.get("correlation_key") or alert.correlation_id or "").strip()
+    async with app.state.session_factory() as session:
+        repo = IncidentRepository(session)
+        payload = await repo.find_open_incident_by_correlation_key(correlation_key)
+        if not payload:
+            return None
+        canonical = type(incident).model_validate(payload)
+        if alert.id not in canonical.alert_ids:
+            canonical.alert_ids.append(alert.id)
+        canonical_metadata = canonical.metadata if isinstance(canonical.metadata, dict) else {}
+        canonical_metadata["deduplication"] = {
+            "occurrence_count": len(canonical.alert_ids),
+            "latest_duplicate_alert_id": str(alert.id),
+            "window_minutes": deduplication.get("window_minutes"),
+        }
+        canonical.metadata = canonical_metadata
+        deduplication.update(
+            {
+                "canonical_incident_id": str(canonical.id),
+                "canonical_jira_key": str(canonical.ticket_id or ""),
+                "processing_stopped": True,
+                "reason": "Duplicate occurrence linked to canonical incident",
+            }
+        )
+        alert.labels["kaiops_incident_id"] = str(canonical.id)
+        if canonical.ticket_id:
+            alert.labels["ticket_id"] = str(canonical.ticket_id)
+            alert.labels["jira_issue_key"] = str(canonical.ticket_id)
+        await repo.save_alert(alert)
+        await repo.save_incident(canonical)
+        await session.commit()
+    logger.info(
+        "incident_pipeline stage=deduplicate outcome=linked_duplicate alert=%s canonical_incident=%s issue=%s",
+        alert.id,
+        canonical.id,
+        canonical.ticket_id,
+    )
+    return canonical
+
+
+def _connect_jira_context(alert: Alert, incident: Any) -> None:
+    """Keep the external work item attached to every downstream code path."""
+    jira_key = str(getattr(incident, "ticket_id", "") or "").strip()
+    if not jira_key:
+        return
+    candidate = incident.metadata.get("incident_candidate", {}) if isinstance(incident.metadata, dict) else {}
+    jira_url = str(candidate.get("jira_url") or "").strip() if isinstance(candidate, dict) else ""
+    alert.labels["ticket_id"] = jira_key
+    alert.labels["jira_issue_key"] = jira_key
+    alert.metadata["jira"] = {"key": jira_key, "url": jira_url}
+    alert.metadata["ticket_id"] = jira_key
+
+
 def _build_alert_enriched_envelope(alert: Alert, incident: Any) -> dict[str, Any]:
     severity = str(getattr(alert.severity, "value", alert.severity) or "warning").strip().lower() or "warning"
     return build_event_envelope(
@@ -362,6 +399,28 @@ def _build_alert_enriched_envelope(alert: Alert, incident: Any) -> dict[str, Any
         },
     )
 
+
+def _noise_classification(alert: Alert, incident: Any) -> tuple[bool, str]:
+    candidate = incident.metadata.get("incident_candidate", {}) if isinstance(incident.metadata, dict) else {}
+    noise = bool(
+        candidate.get("noise")
+        or candidate.get("false_positive")
+        or candidate.get("actionable") is False
+    )
+    rationale = candidate.get("audit_metadata", {}).get("rationale") if isinstance(candidate.get("audit_metadata"), dict) else None
+    reason = str(
+        rationale
+        or candidate.get("actionability_reason")
+        or candidate.get("description")
+        or "Classified as non-actionable monitoring noise."
+    ).strip()
+    if noise:
+        deduplication = alert.metadata.setdefault("deduplication", {})
+        if isinstance(deduplication, dict):
+            deduplication.update({"disposition": "noise", "processing_stopped": True, "reason": reason})
+        alert.metadata["noise"] = {"classified": True, "processing_stopped": True, "reason": reason}
+    return noise, reason
+
 async def startup(app: FastAPI) -> None:
     if settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
         agent.alert_history_repository = SqlAlertHistoryRepository(
@@ -410,12 +469,27 @@ async def startup(app: FastAPI) -> None:
         alert_input = Alert.model_validate(raw_alert_payload)
         llm_discovery = await _llm_discovery(alert_input)
         alert, incident = await agent.process(alert_input, llm_discovery)
+        noise, noise_reason = _noise_classification(alert, incident)
+        if noise:
+            if settings.database_enabled:
+                async with app.state.session_factory() as session:
+                    repo = IncidentRepository(session)
+                    await repo.save_alert(alert)
+                    await session.commit()
+            logger.info("alert_pipeline outcome=noise alert=%s reason=%s", alert.id, noise_reason)
+            EVENTS_PROCESSED.labels(settings.service_name, RAW_ALERTS, "noise").inc()
+            return
+        canonical = await _merge_duplicate_into_canonical(alert, incident)
+        if canonical is not None:
+            EVENTS_PROCESSED.labels(settings.service_name, RAW_ALERTS, "duplicate").inc()
+            return
         jira_key: str | None = None
         try:
             await _reuse_correlated_jira(incident)
             jira_key = await _sync_candidate_to_jira(incident)
         except Exception:
             logger.exception("failed to synchronize incident candidate to Jira incident=%s", incident.id)
+        _connect_jira_context(alert, incident)
         if settings.database_enabled:
             async with app.state.session_factory() as session:
                 repo = IncidentRepository(session)
@@ -453,15 +527,59 @@ async def shutdown(_: FastAPI) -> None:
 app = create_app(title="KaiMS Alert Intelligence", settings=settings, startup=startup, shutdown=shutdown)
 
 
+class DeduplicationConfigUpdate(BaseModel):
+    enabled: bool | None = None
+    window_minutes: int | None = Field(default=None, ge=1, le=1440)
+
+
+@app.get("/deduplication/config")
+async def get_deduplication_config() -> dict[str, Any]:
+    return {
+        "enabled": bool(agent.deduplication_enabled),
+        "window_minutes": int(agent.deduplication_window_minutes or 60),
+        "similarity_threshold": float(agent.correlation_threshold or 0.72),
+        "algorithm": "exact-or-weighted-similarity-v1",
+    }
+
+
+@app.put("/deduplication/config")
+async def update_deduplication_config(update: DeduplicationConfigUpdate) -> dict[str, Any]:
+    if update.enabled is not None:
+        agent.deduplication_enabled = update.enabled
+    if update.window_minutes is not None:
+        agent.deduplication_window_minutes = update.window_minutes
+        agent.retention_minutes = max(int(agent.retention_minutes or 0), update.window_minutes)
+    return await get_deduplication_config()
+
+
 @app.post("/process")
 async def process(alert: Alert) -> dict:
     enriched, incident = await agent.process(alert, await _llm_discovery(alert))
+    noise, noise_reason = _noise_classification(enriched, incident)
+    if noise:
+        if settings.database_enabled:
+            async with app.state.session_factory() as session:
+                repo = IncidentRepository(session)
+                await repo.save_alert(enriched)
+                await session.commit()
+        return {"alert": enriched, "incident": None, "disposition": "noise", "processing_stopped": True, "reason": noise_reason, "jira_qualified": False}
+    canonical = await _merge_duplicate_into_canonical(enriched, incident)
+    if canonical is not None:
+        return {
+            "alert": enriched,
+            "incident": canonical,
+            "disposition": "duplicate",
+            "processing_stopped": True,
+            "reason": "Duplicate occurrence linked to canonical incident",
+            "jira_qualified": bool(canonical.ticket_id),
+        }
     jira_key: str | None = None
     try:
         await _reuse_correlated_jira(incident)
         jira_key = await _sync_candidate_to_jira(incident)
     except Exception:
         logger.exception("failed to synchronize incident candidate to Jira incident=%s", incident.id)
+    _connect_jira_context(enriched, incident)
     if settings.database_enabled:
         async with app.state.session_factory() as session:
             repo = IncidentRepository(session)

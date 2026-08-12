@@ -8,6 +8,8 @@ param(
     [switch]$SkipBuild,
     [switch]$SkipHealthCheck,
     [switch]$StopExisting,
+    [switch]$PreserveRemoteEnv,
+    [string[]]$Services = @(),
     [switch]$NoStrictHostKeyChecking,
     [switch]$DryRun
 )
@@ -110,10 +112,23 @@ function New-SourceArchive {
 
     $excludeArgs = @(
         "--exclude=.git",
+        "--exclude=.env",
+        "--exclude=.env.*",
+        "--exclude=config/env/*.generated",
         "--exclude=.venv",
         "--exclude=.tmp",
         "--exclude=.tmp/**",
         "--exclude=logs",
+        "--exclude=backend/runtime",
+        "--exclude=backend/runtime/**",
+        "--exclude=backend/ingested_alerts",
+        "--exclude=backend/ingested_alerts/**",
+        "--exclude=backend/rag/_review",
+        "--exclude=backend/rag/_review/**",
+        "--exclude=backend/rag/changes",
+        "--exclude=backend/rag/changes/**",
+        "--exclude=frontend/react/test-results",
+        "--exclude=frontend/react/playwright-report",
         "--exclude=__pycache__",
         "--exclude=.pytest_cache",
         "--exclude=node_modules",
@@ -146,7 +161,7 @@ if (-not (Test-Path $ComposePath)) {
     throw "Missing docker-compose.yml at $ComposePath"
 }
 
-if (-not (Test-Path $EnvPath) -and -not $DryRun) {
+if (-not $PreserveRemoteEnv -and -not (Test-Path $EnvPath) -and -not $DryRun) {
     throw "Missing env file at $EnvPath"
 }
 
@@ -183,11 +198,14 @@ foreach ($target in $Targets) {
         }
         else {
             Invoke-Scp -LocalPath $sourceArchive -Target $target -RemotePath "$RemoteDir/source.tar.gz"
-            Invoke-Ssh -Target $target -Command "cd $RemoteDir && tar -xzf source.tar.gz && rm -f source.tar.gz"
+            Invoke-Ssh -Target $target -Command "cd $RemoteDir && tar --no-same-owner --no-same-permissions -xzf source.tar.gz && rm -f source.tar.gz"
         }
         Invoke-Scp -LocalPath $ComposePath -Target $target -RemotePath "$RemoteDir/docker-compose.yml"
-        if (Test-Path $EnvPath) {
+        if (-not $PreserveRemoteEnv -and (Test-Path $EnvPath)) {
             Invoke-Scp -LocalPath $EnvPath -Target $target -RemotePath "$RemoteDir/.env"
+        }
+        elseif ($PreserveRemoteEnv) {
+            Invoke-Ssh -Target $target -Command "test -s $RemoteDir/.env || (echo 'Missing preserved .env on target' >&2; exit 1)"
         }
         elseif ($DryRun) {
             Write-Host "DRY RUN: scp <env-file> ${SshUser}@${target}:$RemoteDir/.env"
@@ -197,13 +215,11 @@ foreach ($target in $Targets) {
     if ($ForceAzureFlags) {
         Invoke-Step -Name "Force Azure runtime flags on $target" -Action {
             $commands = @(
-                "cd $RemoteDir && (grep -q '^AZURE_SERVICE_BUS_ENABLED=' .env && sed -i 's/^AZURE_SERVICE_BUS_ENABLED=.*/AZURE_SERVICE_BUS_ENABLED=true/' .env || echo 'AZURE_SERVICE_BUS_ENABLED=true' >> .env)",
                 "cd $RemoteDir && (grep -q '^AZURE_CONTENT_SAFETY_ENABLED=' .env && sed -i 's/^AZURE_CONTENT_SAFETY_ENABLED=.*/AZURE_CONTENT_SAFETY_ENABLED=true/' .env || echo 'AZURE_CONTENT_SAFETY_ENABLED=true' >> .env)",
                 "cd $RemoteDir && (grep -q '^AZURE_OPENAI_EMBEDDINGS_ENABLED=' .env && sed -i 's/^AZURE_OPENAI_EMBEDDINGS_ENABLED=.*/AZURE_OPENAI_EMBEDDINGS_ENABLED=true/' .env || echo 'AZURE_OPENAI_EMBEDDINGS_ENABLED=true' >> .env)",
                 "cd $RemoteDir && (grep -q '^AZURE_AI_EVALUATION_ENABLED=' .env && sed -i 's/^AZURE_AI_EVALUATION_ENABLED=.*/AZURE_AI_EVALUATION_ENABLED=true/' .env || echo 'AZURE_AI_EVALUATION_ENABLED=true' >> .env)",
                 "cd $RemoteDir && (grep -q '^OBSERVABILITY_AZURE_MONITOR_ENABLED=' .env && sed -i 's/^OBSERVABILITY_AZURE_MONITOR_ENABLED=.*/OBSERVABILITY_AZURE_MONITOR_ENABLED=true/' .env || echo 'OBSERVABILITY_AZURE_MONITOR_ENABLED=true' >> .env)",
-                "cd $RemoteDir && (grep -q '^KAFKA_ENABLED=' .env && sed -i 's/^KAFKA_ENABLED=.*/KAFKA_ENABLED=false/' .env || echo 'KAFKA_ENABLED=false' >> .env)",
-                "cd $RemoteDir && (grep -q '^EVENT_BUS_PROVIDER=' .env && sed -i 's/^EVENT_BUS_PROVIDER=.*/EVENT_BUS_PROVIDER=azure-servicebus/' .env || echo 'EVENT_BUS_PROVIDER=azure-servicebus' >> .env)"
+                "cd $RemoteDir && (grep -q '^UI_BIND_ADDRESS=' .env && sed -i 's/^UI_BIND_ADDRESS=.*/UI_BIND_ADDRESS=0.0.0.0/' .env || echo 'UI_BIND_ADDRESS=0.0.0.0' >> .env)"
             )
             foreach ($command in $commands) {
                 Invoke-Ssh -Target $target -Command $command
@@ -212,9 +228,15 @@ foreach ($target in $Targets) {
     }
 
     Invoke-Step -Name "Start containers on $target" -Action {
-        $upCmd = if ($SkipBuild) { "cd $RemoteDir && docker compose --env-file .env up -d" } else { "cd $RemoteDir && docker compose --env-file .env up -d --build" }
+        $serviceArgs = if ($Services.Count) { " " + ($Services -join " ") } else { "" }
+        $buildCmd = "cd $RemoteDir && COMPOSE_PARALLEL_LIMIT=1 COMPOSE_BAKE=false docker compose --env-file .env build$serviceArgs"
+        $upCmd = "cd $RemoteDir && COMPOSE_PARALLEL_LIMIT=1 docker compose --env-file .env up -d --no-build$serviceArgs"
         if ($StopExisting) {
             Invoke-Ssh -Target $target -Command "cd $RemoteDir && docker compose --env-file .env down || true"
+        }
+        Invoke-Ssh -Target $target -Command "cd $RemoteDir && docker compose --profile demo-online-boutique --profile demo-robot-shop stop ob-loadgenerator ob-frontend ob-checkoutservice ob-recommendationservice ob-cartservice ob-adservice ob-emailservice ob-paymentservice ob-shippingservice ob-productcatalogservice ob-currencyservice ob-redis-cart rs-load-gen rs-web rs-user rs-shipping rs-ratings rs-payment rs-dispatch rs-cart rs-catalogue rs-mysql rs-mongodb rs-redis rs-rabbitmq 2>/dev/null || true"
+        if (-not $SkipBuild) {
+            Invoke-Ssh -Target $target -Command $buildCmd
         }
         Invoke-Ssh -Target $target -Command $upCmd
     }

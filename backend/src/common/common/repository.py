@@ -116,6 +116,7 @@ class ObjectStorageRepository:
 from common.models import (
     Alert,
     Approval,
+    ApprovalDecision,
     ApplicationRegistration,
     GrafanaDashboardResult,
     Incident,
@@ -722,13 +723,17 @@ class IncidentRepository:
             return
         row.status = "closed"
 
-    async def list_alerts(self, limit: int = 500, include_incident_context: bool = True) -> list[dict[str, Any]]:
+    async def list_alerts(
+        self,
+        limit: int = 500,
+        include_incident_context: bool = True,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 5000))
-        alert_ids_result = await self.session.execute(
-            select(AlertRecord.id)
-            .order_by(AlertRecord.created_at.desc())
-            .limit(safe_limit)
-        )
+        alert_ids_query = select(AlertRecord.id)
+        if tenant_id is not None:
+            alert_ids_query = alert_ids_query.where(AlertRecord.tenant_id == self._require("tenant_id", tenant_id))
+        alert_ids_result = await self.session.execute(alert_ids_query.order_by(AlertRecord.created_at.desc()).limit(safe_limit))
         alert_ids = [row[0] for row in alert_ids_result.all()]
         if not alert_ids:
             return []
@@ -859,7 +864,42 @@ class IncidentRepository:
         output = [row for row in selected if row.id in reserved_ids]
         output.extend(row for row in selected if row.id not in reserved_ids)
         output = sorted(output[:safe_limit], key=lambda row: row.created_at, reverse=True)
-        return [dict(row.payload) if isinstance(row.payload, dict) else {} for row in output]
+        alert_ids = {str(row.id) for row in output}
+        incident_by_alert: dict[str, dict[str, Any]] = {}
+        incident_query = (
+            select(IncidentRecord)
+            .options(load_only(IncidentRecord.id, IncidentRecord.ticket_id, IncidentRecord.payload))
+            .order_by(IncidentRecord.created_at.desc())
+            .limit(max(150, safe_limit * 3))
+        )
+        if tenant_id is not None:
+            incident_query = incident_query.where(IncidentRecord.tenant_id == tenant_id)
+        incident_result = await self.session.execute(incident_query)
+        for incident in incident_result.scalars().all():
+            incident_payload = incident.payload if isinstance(incident.payload, dict) else {}
+            linked_alert_ids = incident_payload.get("alert_ids", [])
+            if not isinstance(linked_alert_ids, list):
+                continue
+            for linked_alert_id in linked_alert_ids:
+                alert_id = str(linked_alert_id)
+                if alert_id in alert_ids and alert_id not in incident_by_alert:
+                    incident_by_alert[alert_id] = {
+                        "incident_id": str(incident.id),
+                        "ticket_id": str(incident.ticket_id or "").strip() or None,
+                    }
+
+        rows: list[dict[str, Any]] = []
+        for record in output:
+            payload = dict(record.payload) if isinstance(record.payload, dict) else {}
+            payload.update({key: value for key, value in incident_by_alert.get(str(record.id), {}).items() if value})
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            deduplication = metadata.get("deduplication") if isinstance(metadata.get("deduplication"), dict) else {}
+            payload["incident_disposition"] = str(
+                deduplication.get("disposition")
+                or ("duplicate" if int(payload.get("deduplicated_count") or 1) > 1 else "new_incident")
+            )
+            rows.append(payload)
+        return rows
 
     async def update_projection_document_flag(self, alert_id: str, available: bool) -> bool:
         """Set incident_projections.document_available for the incident linked to alert_id.
@@ -1482,11 +1522,15 @@ class IncidentRepository:
             return None
 
         events_result = await self.session.execute(
-            select(IncidentEventRecord)
+            select(
+                IncidentEventRecord.event_type,
+                IncidentEventRecord.status,
+                IncidentEventRecord.created_at,
+            )
             .where(IncidentEventRecord.incident_id == incident_uuid)
             .order_by(IncidentEventRecord.created_at.asc())
         )
-        event_rows = events_result.scalars().all()
+        event_rows = events_result.all()
         event_types = {
             str(row.event_type or "").strip().lower()
             for row in event_rows
@@ -1674,6 +1718,15 @@ class IncidentRepository:
 
     async def find_open_jira_by_correlation_key(self, correlation_key: str) -> str | None:
         """Resolve a previously qualified Jira incident for a correlated signal."""
+        incident = await self.find_open_incident_by_correlation_key(correlation_key)
+        if not incident:
+            return None
+        metadata = incident.get("metadata") if isinstance(incident.get("metadata"), dict) else {}
+        candidate = metadata.get("incident_candidate") if isinstance(metadata.get("incident_candidate"), dict) else {}
+        return str(incident.get("ticket_id") or candidate.get("jira_key") or "").strip() or None
+
+    async def find_open_incident_by_correlation_key(self, correlation_key: str) -> dict[str, Any] | None:
+        """Resolve the canonical open incident that owns a correlated alert group."""
         normalized = str(correlation_key or "").strip()
         if not normalized:
             return None
@@ -1692,7 +1745,7 @@ class IncidentRepository:
                 else {}
             )
             if str(candidate.get("correlation_key") or "").strip() == normalized:
-                return str(record.ticket_id or candidate.get("jira_key") or "").strip() or None
+                return payload
         return None
 
     async def get_latest_recommendation_for_incident(self, incident_id: Any) -> dict[str, Any] | None:
@@ -1732,6 +1785,27 @@ class IncidentRepository:
                 payload=approval.model_dump(mode="json"),
             )
         )
+
+    async def has_accepted_approval(
+        self,
+        incident_id: Any,
+        recommendation_id: Any,
+        *,
+        tenant_id: str = "default",
+    ) -> bool:
+        incident_uuid = self._parse_uuid(incident_id)
+        recommendation_uuid = self._parse_uuid(recommendation_id)
+        if incident_uuid is None or recommendation_uuid is None:
+            return False
+        result = await self.session.execute(
+            select(ApprovalRecord.id)
+            .where(ApprovalRecord.tenant_id == (str(tenant_id or "default").strip() or "default"))
+            .where(ApprovalRecord.incident_id == incident_uuid)
+            .where(ApprovalRecord.recommendation_id == recommendation_uuid)
+            .where(ApprovalRecord.decision.in_([ApprovalDecision.APPROVED.value, ApprovalDecision.MODIFIED.value]))
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def update_incident_approval_status(
         self,
@@ -2816,6 +2890,7 @@ class IncidentRepository:
     async def save_onboarding_state(
         self,
         *,
+        tenant_id: str = "default",
         project_name: str,
         provider_name: str,
         project_payload: dict[str, Any],
@@ -2830,6 +2905,7 @@ class IncidentRepository:
     ) -> None:
         await self.session.merge(
             OnboardingStateRecord(
+                tenant_id=self._require("onboarding.tenant_id", tenant_id),
                 project_name=self._require("onboarding.project_name", project_name),
                 provider_name=self._require("onboarding.provider_name", provider_name),
                 owner_team=owner_team,
@@ -2844,9 +2920,10 @@ class IncidentRepository:
             )
         )
 
-    async def list_onboarding_state(self) -> list[dict[str, Any]]:
+    async def list_onboarding_state(self, tenant_id: str = "default") -> list[dict[str, Any]]:
         result = await self.session.execute(
             select(
+                OnboardingStateRecord.tenant_id,
                 OnboardingStateRecord.project_name,
                 OnboardingStateRecord.provider_name,
                 OnboardingStateRecord.owner_team,
@@ -2859,11 +2936,14 @@ class IncidentRepository:
                 OnboardingStateRecord.connectivity_payload,
                 OnboardingStateRecord.updated_at,
                 OnboardingStateRecord.last_tested_at,
-            ).order_by(OnboardingStateRecord.project_name, OnboardingStateRecord.provider_name)
+            )
+            .where(OnboardingStateRecord.tenant_id == self._require("onboarding.tenant_id", tenant_id))
+            .order_by(OnboardingStateRecord.project_name, OnboardingStateRecord.provider_name)
         )
         rows = result.all()
         return [
             {
+                "tenant_id": row.tenant_id,
                 "project_name": row.project_name,
                 "provider_name": row.provider_name,
                 "owner_team": row.owner_team,
@@ -3229,20 +3309,53 @@ class IncidentRepository:
         service: str | None = None,
     ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 1000))
-        stmt = select(IncidentProjectionRecord)
+        # Apply ordering and the limit to narrow scalar columns before loading
+        # projection_payload. On databases that drifted without the updated_at
+        # index, sorting full JSON-bearing rows can exhaust MySQL's sort buffer.
+        latest_stmt = select(
+            IncidentProjectionRecord.incident_id.label("incident_id"),
+            IncidentProjectionRecord.updated_at.label("updated_at"),
+        )
         if risk_tier:
-            stmt = stmt.where(IncidentProjectionRecord.risk_tier == str(risk_tier).strip().lower())
+            latest_stmt = latest_stmt.where(
+                IncidentProjectionRecord.risk_tier == str(risk_tier).strip().lower()
+            )
         if execution_mode:
-            stmt = stmt.where(IncidentProjectionRecord.execution_mode == str(execution_mode).strip().lower())
+            latest_stmt = latest_stmt.where(
+                IncidentProjectionRecord.execution_mode == str(execution_mode).strip().lower()
+            )
         if transport_provider:
-            stmt = stmt.where(IncidentProjectionRecord.transport_provider == str(transport_provider).strip().lower())
+            latest_stmt = latest_stmt.where(
+                IncidentProjectionRecord.transport_provider == str(transport_provider).strip().lower()
+            )
         if status:
-            stmt = stmt.where(IncidentProjectionRecord.status == str(status).strip().lower())
+            latest_stmt = latest_stmt.where(
+                IncidentProjectionRecord.status == str(status).strip().lower()
+            )
         if service:
-            stmt = stmt.where(IncidentProjectionRecord.service == str(service).strip())
-        stmt = stmt.order_by(IncidentProjectionRecord.updated_at.desc()).limit(safe_limit)
+            latest_stmt = latest_stmt.where(IncidentProjectionRecord.service == str(service).strip())
+        latest = latest_stmt.order_by(IncidentProjectionRecord.updated_at.desc()).limit(safe_limit).subquery()
+        stmt = (
+            select(IncidentProjectionRecord)
+            .join(latest, IncidentProjectionRecord.incident_id == latest.c.incident_id)
+            .order_by(latest.c.updated_at.desc())
+        )
         result = await self.session.execute(stmt)
         rows = result.scalars().all()
+
+        ticket_by_incident: dict[UUID, str] = {}
+        projection_incident_ids = [row.incident_id for row in rows]
+        if projection_incident_ids:
+            ticket_result = await self.session.execute(
+                select(IncidentRecord.id, IncidentRecord.ticket_id).where(
+                    IncidentRecord.id.in_(projection_incident_ids)
+                )
+            )
+            ticket_by_incident = {
+                incident_id: str(ticket_id).strip()
+                for incident_id, ticket_id in ticket_result.all()
+                if str(ticket_id or "").strip()
+            }
 
         pending_by_incident: dict[UUID, PendingWorkflowRecord] = {}
         missing_context_incidents = [
@@ -3310,6 +3423,7 @@ class IncidentRepository:
             response_rows.append(
                 {
                     "incident_id": str(row.incident_id),
+                    "ticket_id": ticket_by_incident.get(row.incident_id),
                     "alert_id": str(row.alert_id) if row.alert_id else None,
                     "trace_id": row.trace_id,
                     "recommendation_id": str(merged_recommendation_id) if merged_recommendation_id else None,

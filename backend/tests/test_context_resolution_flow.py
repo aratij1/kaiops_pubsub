@@ -162,6 +162,8 @@ def test_code_review_keeps_only_evidence_linked_unified_diff_patches() -> None:
     assert len(review["findings"]) == 1
     assert review["findings"][0]["source_uri"] == "code://app/settings.py#L30"
     assert review["findings"][0]["patch"].startswith("--- a/app/settings.py")
+    assert review["proposed_changes"][0]["ready_to_apply"] is True
+    assert review["proposed_changes"][0]["source_uri"] == "code://app/settings.py#L30"
 
 
 def test_code_review_does_not_claim_findings_without_code_evidence() -> None:
@@ -172,6 +174,7 @@ def test_code_review_does_not_claim_findings_without_code_evidence() -> None:
 
     assert review["status"] == "not_performed"
     assert review["findings"] == []
+    assert review["proposed_changes"] == []
     assert review["insufficient_context"] is True
 
 
@@ -276,7 +279,8 @@ async def test_resolution_agent_generates_recommendation() -> None:
 
     recommendation = await ResolutionIntelligenceAgent(model_router=static_router()).resolve(context)
 
-    assert recommendation.root_cause == "Deployment 2.5"
+    assert "deployment payments-api" in recommendation.root_cause
+    assert "confirm the rollout diff" in recommendation.root_cause
     assert 0.5 <= recommendation.confidence < 0.9
     assert "evidence" in recommendation.rationale.lower()
     assert "latency for payments" in recommendation.impact

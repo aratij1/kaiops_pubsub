@@ -26,6 +26,27 @@ logger = get_logger(__name__)
 _PUBLISH_TIMEOUT_SECONDS = 10.0
 
 
+def _is_transient_handler_error(error: str) -> bool:
+    normalized = str(error or "").strip().lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "can't connect to mysql server",
+            "connection refused",
+            "connection reset",
+            "connection timed out",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "server has gone away",
+            "lost connection to mysql",
+            "circuit breaker open",
+            "tool circuit open",
+            "timeout",
+            "timed out",
+        )
+    )
+
+
 def normalize_payload(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
@@ -309,7 +330,11 @@ async def consume_forever(
                         continue
 
                     logger.error(
-                        "failed to process rabbitmq message",
+                        "failed to process rabbitmq message: topic=%s identity=%s attempts=%s error=%s",
+                        consumer._topic,
+                        identity,
+                        attempts,
+                        last_error,
                         extra={
                             "topic": consumer._topic,
                             "attempts": attempts,
@@ -318,6 +343,16 @@ async def consume_forever(
                             "message_identity": identity,
                         },
                     )
+                    if _is_transient_handler_error(last_error):
+                        logger.warning(
+                            "requeueing rabbitmq message after transient dependency failure: topic=%s identity=%s error=%s",
+                            consumer._topic,
+                            identity,
+                            last_error,
+                        )
+                        await asyncio.sleep(min(5.0, max(1.0, float(attempts))))
+                        await message.nack(requeue=True)
+                        continue
                     if consumer._exchange is not None and consumer._dlq_routing_key:
                         try:
                             envelope = {

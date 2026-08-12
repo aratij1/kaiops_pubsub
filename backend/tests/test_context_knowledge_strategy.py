@@ -63,12 +63,12 @@ def make_incident(alert: Alert) -> Incident:
 
 
 @pytest.mark.asyncio
-async def test_continuous_mode_collects_once_then_reuses_durable_context(sqlite_session_factory) -> None:
+async def test_auto_mode_collects_once_then_reuses_complete_durable_context(sqlite_session_factory) -> None:
     module = load_context_app_module()
     collector = CountingContextAgent()
     module.agent = collector
     module.settings.database_enabled = True
-    module.settings.context_strategy = "continuous"
+    module.settings.context_strategy = "auto"
     module.settings.context_knowledge_ttl_seconds = 3600
     module.app.state.session_factory = sqlite_session_factory
 
@@ -96,12 +96,12 @@ async def test_continuous_mode_collects_once_then_reuses_durable_context(sqlite_
 
 
 @pytest.mark.asyncio
-async def test_immediate_mode_always_refreshes_but_still_updates_knowledge(sqlite_session_factory) -> None:
+async def test_realtime_mode_always_refreshes_but_still_updates_knowledge(sqlite_session_factory) -> None:
     module = load_context_app_module()
     collector = CountingContextAgent()
     module.agent = collector
     module.settings.database_enabled = True
-    module.settings.context_strategy = "continuous"
+    module.settings.context_strategy = "auto"
     module.app.state.session_factory = sqlite_session_factory
 
     for _ in range(2):
@@ -110,17 +110,38 @@ async def test_immediate_mode_always_refreshes_but_still_updates_knowledge(sqlit
             module.app,
             alert,
             make_incident(alert),
-            "immediate",
+            "realtime",
         )
-        assert context.metadata["context_strategy"] == "immediate"
+        assert context.metadata["context_strategy"] == "realtime"
         assert context.metadata["context_reused"] is False
+        assert context.metadata["realtime_collection_performed"] is True
 
     assert collector.calls == 2
 
 
-def test_continuous_is_the_default_strategy() -> None:
+@pytest.mark.asyncio
+async def test_historical_cache_miss_never_runs_live_collection(sqlite_session_factory) -> None:
     module = load_context_app_module()
-    module.settings.context_strategy = "continuous"
-    assert module._context_strategy() == "continuous"
-    assert module._context_strategy("immediate") == "immediate"
-    assert module._context_strategy("unsupported") == "continuous"
+    collector = CountingContextAgent()
+    module.agent = collector
+    module.settings.database_enabled = True
+    module.app.state.session_factory = sqlite_session_factory
+    alert = make_alert()
+
+    context = await module._collect_context_with_strategy(
+        module.app, alert, make_incident(alert), "historical"
+    )
+
+    assert collector.calls == 0
+    assert context.metadata["context_source"] == "historical_cache_miss"
+    assert context.metadata["realtime_collection_performed"] is False
+
+
+def test_auto_is_the_default_strategy_and_legacy_names_are_supported() -> None:
+    module = load_context_app_module()
+    module.settings.context_strategy = "auto"
+    assert module._context_strategy() == "auto"
+    assert module._context_strategy("continuous") == "auto"
+    assert module._context_strategy("immediate") == "realtime"
+    assert module._context_strategy("historical") == "historical"
+    assert module._context_strategy("unsupported") == "auto"

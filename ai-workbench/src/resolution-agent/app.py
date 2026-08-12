@@ -17,6 +17,8 @@ from common.telemetry import CONTEXT_KNOWLEDGE_OPERATIONS, EVENTS_PROCESSED
 from common.topics import CONTEXT_EVENTS, RESOLUTION_EVENTS
 from fastapi import FastAPI
 from resolution_agent import ResolutionIntelligenceAgent
+from resolution_agent.catalog import prepare_resolution_plan, relevant_resolutions
+from pydantic import BaseModel
 
 settings = get_settings()
 settings.service_name = "resolution-agent"
@@ -237,6 +239,34 @@ async def shutdown(_: FastAPI) -> None:
 
 
 app = create_app(title="KaiMS Resolution Intelligence Agent", settings=settings, startup=startup, shutdown=shutdown)
+
+
+class ResolutionCatalogRequest(BaseModel):
+    issue: str
+    service: str = "unknown"
+    recommended_action: str = ""
+
+
+class ResolutionSelectionRequest(BaseModel):
+    option_id: str
+    issue: str
+    service: str = "unknown"
+    incident_id: str = ""
+
+
+@app.post("/resolution-catalog/relevant")
+async def resolution_catalog(request: ResolutionCatalogRequest) -> dict[str, Any]:
+    return {"rows": relevant_resolutions(issue=request.issue, service=request.service, recommended_action=request.recommended_action)}
+
+
+@app.post("/resolution-catalog/select")
+async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, Any]:
+    try:
+        plan = prepare_resolution_plan(option_id=request.option_id, issue=request.issue, service=request.service)
+    except ValueError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"incident_id": request.incident_id, "selected": plan}
 
 
 @app.post("/resolve", response_model=Recommendation)

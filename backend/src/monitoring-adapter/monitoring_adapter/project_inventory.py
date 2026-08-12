@@ -20,6 +20,11 @@ def is_displayable_alert_application(value: str) -> bool:
     normalized = str(value or "").strip()
     if not normalized or "/" in normalized or ":" in normalized:
         return False
+    token = normalized.casefold()
+    if any(marker in token for marker in ("smoke-test", "ux-test", "ux test", "e2e-", "-e2e", "onboarding-test")):
+        return False
+    if re.match(r"^(test\d*|demo(?:-|$))", normalized, re.IGNORECASE):
+        return False
     if re.match(r"^(unknown|default|prod|dev|staging|warning|critical|high|info)$", normalized, re.IGNORECASE):
         return False
     return not re.match(

@@ -97,11 +97,19 @@ def _code_roots(arguments: dict[str, Any]) -> list[Path]:
             "email-inbox": "monitoring-adapter",
             "common.rabbitmq": "common",
         }.get(service.lower(), service)
+        service_aliases = [service]
+        if service.lower().startswith("kaiops-"):
+            service_aliases.append(service[7:])
         catalog_root = str(project.get("service_catalog_root") or "").strip()
         if service and catalog_root:
             service_root = Path(catalog_root) / service
             if service_root.is_dir():
                 roots.insert(0, service_root)
+        for root in list(roots):
+            for alias in service_aliases:
+                candidate = root / alias
+                if candidate.is_dir():
+                    roots.insert(0, candidate)
         return list(dict.fromkeys(roots))
     return _roots(
         "DISCOVERY_MCP_CODE_ROOTS",

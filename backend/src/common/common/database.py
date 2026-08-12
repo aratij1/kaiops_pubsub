@@ -62,7 +62,10 @@ class ObjectStorageRecord(Base, TimestampMixin):
 
 class AlertRecord(Base, TimestampMixin):
     __tablename__ = "alerts"
-    __table_args__ = (Index("idx_alerts_created_at", "created_at"),)
+    __table_args__ = (
+        Index("idx_alerts_created_at", "created_at"),
+        Index("idx_alerts_tenant_updated", "tenant_id", "updated_at"),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
@@ -132,6 +135,7 @@ class ApprovalAssignmentRecord(Base, TimestampMixin):
 
 class ActionRecord(Base, TimestampMixin):
     __tablename__ = "actions"
+    __table_args__ = (Index("idx_actions_tenant_updated", "tenant_id", "updated_at"),)
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
@@ -316,6 +320,7 @@ class HumanCorrectionRecord(Base, TimestampMixin):
 class OnboardingStateRecord(Base, TimestampMixin):
     __tablename__ = "onboarding_state"
 
+    tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True, default="default", index=True)
     project_name: Mapped[str] = mapped_column(String(255), primary_key=True)
     provider_name: Mapped[str] = mapped_column(String(64), primary_key=True)
     owner_team: Mapped[str | None] = mapped_column(String(255))
@@ -538,6 +543,7 @@ class IncidentEventRecord(Base):
 
 class IncidentProjectionRecord(Base, TimestampMixin):
     __tablename__ = "incident_projections"
+    __table_args__ = (Index("idx_incident_projections_tenant_updated", "tenant_id", "updated_at"),)
 
     incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     alert_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
@@ -662,6 +668,7 @@ class MonitoringAlertMappingRecord(Base, TimestampMixin):
 
 class MonitoringConnectionHealthRecord(Base, TimestampMixin):
     __tablename__ = "monitoring_connection_health"
+    __table_args__ = (Index("idx_monitoring_health_updated", "updated_at"),)
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     integration_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
@@ -764,7 +771,9 @@ def install_db_circuit_breaker(engine: AsyncEngine, breaker: CircuitBreaker) -> 
     """Fail fast on new DB work while the database is down, instead of every
     one of ~21 services independently waiting out its own pool/connect
     timeout on every request. `checkout` gates new connection use before a
-    query is attempted; `handle_error` counts real DB failures. No explicit
+    query is attempted; `handle_error` counts only connection failures. Query
+    errors (bad SQL, constraint errors, or MySQL resource limits) must not
+    masquerade as a database outage and block unrelated requests. No explicit
     success signal is wired up: CircuitBreaker.allow() already self-heals
     after `recovery_seconds` and only reopens if the next attempt(s) fail
     again, so a healthy database naturally keeps the breaker closed.
@@ -778,7 +787,8 @@ def install_db_circuit_breaker(engine: AsyncEngine, breaker: CircuitBreaker) -> 
 
     @event.listens_for(sync_engine, "handle_error")
     def _on_handle_error(exception_context) -> None:
-        breaker.record_failure()
+        if exception_context.is_disconnect:
+            breaker.record_failure()
 
 
 def create_engine(settings: Settings) -> AsyncEngine:
@@ -837,6 +847,44 @@ async def create_schema(engine: AsyncEngine) -> None:
                     await connection.execute(
                         text(
                             "CREATE INDEX idx_audit_logs_resource_action_created ON audit_logs (resource_type, action, created_at)"
+                        )
+                    )
+
+                # create_all() does not add indexes to existing tables. These
+                # indexes keep the live event cursor queries off MySQL's
+                # filesort path, which otherwise sorts full JSON-bearing rows.
+                live_event_indexes = (
+                    ("alerts", "idx_alerts_tenant_updated", "tenant_id, updated_at"),
+                    ("actions", "idx_actions_tenant_updated", "tenant_id, updated_at"),
+                    ("incident_projections", "idx_incident_projections_tenant_updated", "tenant_id, updated_at"),
+                    ("monitoring_connection_health", "idx_monitoring_health_updated", "updated_at"),
+                )
+                for table_name, index_name, columns in live_event_indexes:
+                    has_index = await connection.scalar(
+                        text(
+                            "SELECT COUNT(*) FROM information_schema.statistics "
+                            "WHERE table_schema = DATABASE() "
+                            "AND table_name = :table_name AND index_name = :index_name"
+                        ),
+                        {"table_name": table_name, "index_name": index_name},
+                    )
+                    if int(has_index or 0) == 0:
+                        await connection.execute(text(f"CREATE INDEX {index_name} ON {table_name} ({columns})"))
+
+                has_onboarding_tenant = await connection.scalar(
+                    text(
+                        "SELECT COUNT(*) FROM information_schema.columns "
+                        "WHERE table_schema = DATABASE() "
+                        "AND table_name = 'onboarding_state' AND column_name = 'tenant_id'"
+                    )
+                )
+                if int(has_onboarding_tenant or 0) == 0:
+                    await connection.execute(
+                        text(
+                            "ALTER TABLE onboarding_state "
+                            "ADD COLUMN tenant_id VARCHAR(128) NOT NULL DEFAULT 'default' FIRST, "
+                            "DROP PRIMARY KEY, "
+                            "ADD PRIMARY KEY (tenant_id, project_name, provider_name)"
                         )
                     )
 

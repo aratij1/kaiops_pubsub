@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlparse
+
+import httpx
 
 from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.models import Approval, RemediationAction, RemediationStatus, utc_now
@@ -62,7 +66,62 @@ class JenkinsRollbackPlugin(BasePlugin):
 
     @circuit_breaker(CircuitBreaker())
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        return await self._not_configured(action, "jenkins")
+        profile = action.parameters.get("connection_profile") if isinstance(action.parameters.get("connection_profile"), dict) else {}
+        endpoint = str(profile.get("endpoint_url") or profile.get("endpoint") or "").rstrip("/")
+        job_name = str(profile.get("job_name") or "").strip("/")
+        secret_ref = str(profile.get("credential_ref") or profile.get("secret_ref") or "").strip()
+        allowed = profile.get("allowed_operations") if isinstance(profile.get("allowed_operations"), list) else []
+        if not endpoint or not job_name or not secret_ref:
+            return await self._not_configured(action, "jenkins")
+        if allowed and action.action_type not in {str(item).strip() for item in allowed}:
+            action.status = RemediationStatus.SKIPPED
+            action.error = f"Connector does not allow operation {action.action_type}"
+            return action
+
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("Jenkins endpoint must be an absolute HTTP(S) URL")
+
+        username = os.getenv("JENKINS_USERNAME", "").strip()
+        token = os.getenv("JENKINS_API_TOKEN", "").strip()
+        if not username or not token:
+            action.status = RemediationStatus.SKIPPED
+            action.error = f"Secret reference {secret_ref} is configured, but the runtime secret provider did not inject JENKINS_USERNAME and JENKINS_API_TOKEN"
+            return action
+
+        job_path = "/job/" + "/job/".join(part for part in job_name.split("/") if part)
+        build_url = f"{endpoint}{job_path}/buildWithParameters"
+        timeout_seconds = max(5.0, min(float(profile.get("timeout_seconds") or 120), 900.0))
+        parameters = {
+            "KAI_OPS_INCIDENT_ID": str(action.incident_id),
+            "KAI_OPS_TARGET": str(action.target),
+            "KAI_OPS_SERVICE": str(action.parameters.get("service") or ""),
+            "KAI_OPS_ENVIRONMENT": str(action.parameters.get("environment") or ""),
+            "KAI_OPS_EXECUTION_PLAN": json.dumps(action.parameters.get("execution_plan") or {}, separators=(",", ":")),
+        }
+        async with httpx.AsyncClient(auth=(username, token), timeout=httpx.Timeout(timeout_seconds, connect=10.0)) as client:
+            headers: dict[str, str] = {}
+            crumb_response = await client.get(f"{endpoint}/crumbIssuer/api/json")
+            if crumb_response.status_code == 200:
+                crumb = crumb_response.json()
+                headers[str(crumb.get("crumbRequestField") or "Jenkins-Crumb")] = str(crumb.get("crumb") or "")
+            response = await client.post(build_url, params=parameters, headers=headers)
+            response.raise_for_status()
+
+        queue_url = str(response.headers.get("location") or "").strip()
+        action.status = RemediationStatus.SUCCEEDED
+        action.output = f"Jenkins build queued for {job_name}"
+        action.parameters["execution_result"] = {
+            "executed": True,
+            "executor": "jenkins",
+            "connector_endpoint": endpoint,
+            "job_name": job_name,
+            "queue_url": queue_url,
+            "secret_ref": secret_ref,
+            "submitted_parameters": {key: value for key, value in parameters.items() if key != "KAI_OPS_EXECUTION_PLAN"},
+            "summary": "Jenkins accepted the governed remediation build request.",
+        }
+        return action
 
 
 class KubernetesRestartPlugin(BasePlugin):
@@ -140,22 +199,40 @@ class LocalScriptExecutionPlugin(BasePlugin):
         if not resolved_script.exists():
             raise FileNotFoundError(f"approved remediation script not found: {resolved_script}")
 
-        return ["sh", str(resolved_script), *parts[script_index + 1:]]
+        arguments = parts[script_index + 1:]
+        url_defaults = {
+            "--api-gateway-url": os.environ.get("API_GATEWAY_URL", "http://api-gateway:8000"),
+            "--prometheus-url": os.environ.get("PROMETHEUS_URL", "http://prometheus:9090"),
+        }
+        for option, default in url_defaults.items():
+            if option not in arguments:
+                continue
+            value_index = arguments.index(option) + 1
+            value = arguments[value_index] if value_index < len(arguments) else ""
+            parsed = urlparse(value)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                arguments[value_index:value_index + 1] = [default]
+
+        return ["sh", str(resolved_script), *arguments]
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
         command = self._resolve_script_command(action)
+        script_path = Path(command[1])
+        script_input = script_path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        runtime_command = ["sh", "-s", "--", *command[2:]]
         env = os.environ.copy()
         env.setdefault("MYSQL_PASSWORD", env.get("DB_PASSWORD", ""))
         timeout_seconds = float(action.parameters.get("timeout_seconds") or 45)
         process = await asyncio.create_subprocess_exec(
-            *command,
+            *runtime_command,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=str(self._repo_root()),
         )
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+            stdout, stderr = await asyncio.wait_for(process.communicate(input=script_input), timeout=timeout_seconds)
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
@@ -166,16 +243,32 @@ class LocalScriptExecutionPlugin(BasePlugin):
 
         output = stdout.decode("utf-8", errors="replace").strip()
         error = stderr.decode("utf-8", errors="replace").strip()
+        validation_only = any(
+            marker in output.lower()
+            for marker in (
+                "dry run complete. no remediation mutation was executed",
+                "live remediation is intentionally connector-gated",
+            )
+        )
         action.output = output
         action.error = error if process.returncode else ""
-        action.status = RemediationStatus.SUCCEEDED if process.returncode == 0 else RemediationStatus.FAILED
+        if process.returncode != 0:
+            action.status = RemediationStatus.FAILED
+        elif validation_only:
+            action.status = RemediationStatus.SKIPPED
+            action.error = "Validation completed, but this script did not apply a remediation change. Select a governed live executor to execute the plan."
+        else:
+            action.status = RemediationStatus.SUCCEEDED
         action.parameters["execution_result"] = {
-            "executed": process.returncode == 0,
+            "executed": process.returncode == 0 and not validation_only,
+            "validation_only": validation_only,
             "executor": "local-script",
             "command": command,
+            "runtime_command": runtime_command,
             "returncode": process.returncode,
             "stdout": output,
             "stderr": error,
+            "summary": action.error or "Remediation command completed and returned a successful exit status.",
         }
         return action
 
@@ -184,6 +277,7 @@ class LocalScriptExecutionPlugin(BasePlugin):
 class RemediationEngine(BaseAgent):
     plugins: dict[str, RemediationPlugin] = field(
         default_factory=lambda: {
+            "jenkins": JenkinsRollbackPlugin(),
             "rollback_deployment": JenkinsRollbackPlugin(),
             "restart_pod": KubernetesRestartPlugin(),
             "scale_deployment": KubernetesRestartPlugin(),
@@ -506,7 +600,11 @@ class RemediationEngine(BaseAgent):
         }
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        action_type = action.action_type if action.action_type in self.tool_registry.tools else "api_execution"
+        profile = action.parameters.get("connection_profile")
+        profile = profile if isinstance(profile, dict) else {}
+        executor_type = str(profile.get("executor_type") or profile.get("connection_type") or "").strip().lower()
+        action_type = "jenkins" if executor_type == "jenkins" else action.action_type
+        action_type = action_type if action_type in self.tool_registry.tools else "api_execution"
         try:
             payload = await self.tool_registry.execute(
                 action_type,

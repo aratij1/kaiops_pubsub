@@ -73,6 +73,8 @@ services:
     container_name: telemetry-opamp-server
   prometheus:
     container_name: telemetry-prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports: !override
       - "19090:9090"
     volumes: !override

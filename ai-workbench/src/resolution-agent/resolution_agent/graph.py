@@ -439,16 +439,18 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "The MySQL account used by mysql-exporter lacks the REPLICATION CLIENT privilege required by "
                 "the slave_status collector, so MySQL rejects that scrape with error 1227."
             )
-        deployment = str(context.deployment or "").strip()
+        # A retrieved deployment/change is context, not proof of causality. Only
+        # promote a deployment when the alert itself explicitly identifies it.
+        deployment = str(
+            context.alert.labels.get("deployment")
+            or context.alert.labels.get("release")
+            or context.alert.labels.get("version")
+            or ""
+        ).strip()
         if deployment and any(
             keyword in normalized_description for keyword in ["deploy", "release", "rollout", "version"]
         ):
-            return deployment
-
-        for change in context.recent_changes[:5]:
-            message = self._norm(change.get("message") or change.get("title"))
-            if any(keyword in message for keyword in ["deploy", "release", "rollback", "config", "schema"]):
-                return str(change.get("message") or change.get("title") or model_root_cause).strip()
+            return f"The alert reports degradation after deployment {deployment}; confirm the rollout diff and timing before treating it as causal."
 
         return str(model_root_cause or f"Likely degradation in {context.alert.service}").strip()
 
@@ -1323,6 +1325,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
         recommendation.metadata["environment"] = str(context.alert.environment or "prod")
         recommendation.metadata["remediation_target"] = str(state.get("remediation_target") or context.alert.service or "")
         recommendation.metadata["recommended_commands"] = state.get("commands", [])
+        code_review = state.get("gathered_context", {}).get("code_review", {})
+        recommendation.metadata["code_review"] = code_review if isinstance(code_review, dict) else {}
+        recommendation.metadata["proposed_code_changes"] = (
+            code_review.get("proposed_changes", []) if isinstance(code_review, dict) else []
+        )
         if runbook_present:
             runbook_text = str(context.runbook or "").strip()
             service_match = float(str(context.alert.service or "").lower() in runbook_text.lower())

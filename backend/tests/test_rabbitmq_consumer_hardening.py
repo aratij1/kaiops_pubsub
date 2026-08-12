@@ -13,7 +13,14 @@ import json
 import pytest
 
 from common.config import Settings
-from common.rabbitmq import RabbitMQConsumer, consume_forever
+from common.rabbitmq import RabbitMQConsumer, _is_transient_handler_error, consume_forever
+
+
+def test_transient_dependency_errors_are_requeueable() -> None:
+    assert _is_transient_handler_error("Can't connect to MySQL server on 'mysql'")
+    assert _is_transient_handler_error("Temporary failure in name resolution")
+    assert _is_transient_handler_error("request timed out")
+    assert not _is_transient_handler_error("context field is required")
 
 
 class _FakeQueue:

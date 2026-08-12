@@ -101,8 +101,20 @@ test("Open incident cockpit preserves the selected alert details route", async (
   await expect(cockpitTabs.getByRole("tab", { name: "Resolution" })).toHaveCount(0);
   await cockpitTabs.getByRole("tab", { name: "Resolve incident" }).click();
   await expect(page.getByRole("heading", { name: "Decision & Approval" })).toHaveCount(0);
-  await expect(page.getByRole("navigation", { name: "Plan, decide, and execute sequence" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Proposed remediation plan" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Plan editor and guarded execution" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Execution Plan" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Complete the current step" })).toBeVisible();
+});
+
+test("incident service search converges when changed during initial loading", async ({ page }) => {
+  test.setTimeout(120_000);
+  await signIn(page);
+  await page.getByRole("button", { name: "Operations Workspace", exact: true }).click();
+  await page.getByRole("navigation", { name: "Operations workflow" })
+    .getByRole("button").filter({ hasText: "Incidents" }).click();
+  await expect(page.getByRole("heading", { name: "Operations Center" })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("textbox", { name: "Find service" }).fill("kaiops-core1");
+  await expect(page.getByRole("row", { name: /kaiops-core1/ }).first()).toBeVisible({ timeout: 30_000 });
 });
 
 test("administrator dashboard uses the application workspace selected at sign-in", async ({ page }) => {

@@ -275,6 +275,19 @@ class DiscoveryMCPConnector(BaseConnector):
                     "patch_limitations": str(finding.get("patch_limitations") or "").strip()[:600],
                 }
             )
+        proposed_changes = [
+            {
+                "title": finding["title"],
+                "explanation": finding["explanation"],
+                "evidence_id": finding["evidence_id"],
+                "source_uri": finding["source_uri"],
+                "patch": finding["patch"],
+                "limitations": finding["patch_limitations"],
+                "ready_to_apply": bool(finding["patch"]),
+            }
+            for finding in validated
+            if finding["patch"] or finding["explanation"]
+        ]
         return {
             "status": "completed" if code_evidence else "not_performed",
             "summary": (
@@ -290,6 +303,7 @@ class DiscoveryMCPConnector(BaseConnector):
                 else "No source-code evidence was retrieved, so no code review or patch was produced."
             ),
             "findings": validated,
+            "proposed_changes": proposed_changes,
             "reviewed_evidence_ids": list(code_evidence),
             "reviewed_sources": reviewed_sources,
             "insufficient_context": bool(candidate.get("insufficient_context")) or not bool(code_evidence),
@@ -516,6 +530,7 @@ class DiscoveryMCPConnector(BaseConnector):
         ):
             report = self._fallback_report(evidence, stages)
         report["code_review"] = self._validated_code_review(report, evidence)
+        report["proposed_code_changes"] = report["code_review"]["proposed_changes"]
         hypotheses = report.get("hypotheses") if isinstance(report.get("hypotheses"), list) else []
         confidence_values: list[float] = []
         for item in hypotheses:
@@ -1580,11 +1595,19 @@ class ContextIntelligenceAgent(BaseAgent):
         vector_matches = by_name["vector-db"]["matches"]
         vector_connector = next((c for c in self.connectors if isinstance(c, VectorDBConnector)), None)
         service_tagged_match = bool(vector_connector and vector_connector.has_service_tagged_match(alert))
+        def explicitly_matches_service(doc: dict[str, Any]) -> bool:
+            if not vector_connector:
+                return False
+            services = doc.get("services", [])
+            if isinstance(services, str):
+                services = [services]
+            return bool(services) and vector_connector._service_matches(doc, alert.service)
+
         runbook = next((doc["content"] for doc in vector_matches if doc["kind"] == "runbook"), "")
-        related = [doc for doc in vector_matches if doc["kind"] == "incident"]
-        deployment_doc = next((doc for doc in vector_matches if doc["kind"] == "deployment"), {})
-        dependency_docs = [doc for doc in vector_matches if doc["kind"] == "dependency"]
-        change_docs = [doc for doc in vector_matches if doc["kind"] == "change"]
+        related = [doc for doc in vector_matches if doc["kind"] == "incident" and explicitly_matches_service(doc)]
+        deployment_doc = next((doc for doc in vector_matches if doc["kind"] == "deployment" and explicitly_matches_service(doc)), {})
+        dependency_docs = [doc for doc in vector_matches if doc["kind"] == "dependency" and explicitly_matches_service(doc)]
+        change_docs = [doc for doc in vector_matches if doc["kind"] == "change" and explicitly_matches_service(doc)]
         deployment = (
             by_name["jenkins"].get("recent_deployments", [{}])[0].get("version")
             or alert.labels.get("deployment")
@@ -1651,6 +1674,13 @@ class ContextIntelligenceAgent(BaseAgent):
                 continue
             source = str(row.get("source") or row.get("kind") or "other").strip().lower()
             bucket = source_aliases.get(source, "other")
+            if bucket in {"tickets", "code"}:
+                searchable = " ".join(str(value) for value in row.values()).lower()
+                service = str(alert.service or "").strip().lower()
+                alert_name = str(alert.name or "").strip().lower()
+                service_aliases = {service, service.removeprefix("kaiops-")} - {""}
+                if service_aliases and not any(alias in searchable for alias in service_aliases) and (not alert_name or alert_name not in searchable):
+                    continue
             evidence_buckets[bucket].append(row)
         evidence_buckets["rag"] = [
             {
@@ -1795,6 +1825,8 @@ class ContextIntelligenceAgent(BaseAgent):
             ],
         )
         report["insufficient_evidence"] = bool(report.get("insufficient_evidence", False)) and not bool(local_evidence)
+        report["code_review"] = DiscoveryMCPConnector._validated_code_review(report, list(merged_by_id.values()))
+        report["proposed_code_changes"] = report["code_review"]["proposed_changes"]
         report_payload["protocol"] = str(report_payload.get("protocol") or ("local-evidence" if local_evidence else "mcp-jsonrpc-2.0"))
         report_payload["query_terms"] = report_payload.get("query_terms") or local_result.get("query_terms") or []
         report_payload["report"] = report

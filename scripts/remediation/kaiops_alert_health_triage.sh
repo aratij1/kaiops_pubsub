@@ -43,12 +43,18 @@ curl -fsS "${PROMETHEUS_URL%/}/api/v1/alerts" >/tmp/kaiops-prometheus-alerts.jso
 
 if command -v mysql >/dev/null 2>&1; then
   if [ -n "${MYSQL_PASSWORD:-}" ]; then
-    MYSQL_PWD="$MYSQL_PASSWORD" mysql \
+    MYSQL_ERROR_FILE="${TMPDIR:-/tmp}/kaiops-mysql-error.$$"
+    if ! MYSQL_PWD="$MYSQL_PASSWORD" mysql \
       -h "$MYSQL_HOST" \
       -P "$MYSQL_PORT" \
       -u "$MYSQL_USER" \
       "$MYSQL_DATABASE" \
-      -e "SELECT COUNT(*) AS alert_rows FROM ${ALERTS_TABLE};"
+      -e "SELECT COUNT(*) AS alert_rows FROM ${ALERTS_TABLE};" 2>"$MYSQL_ERROR_FILE"; then
+      cat "$MYSQL_ERROR_FILE" >&2
+      rm -f "$MYSQL_ERROR_FILE"
+      exit 1
+    fi
+    rm -f "$MYSQL_ERROR_FILE"
   else
     echo "MYSQL_PASSWORD is not set; skipping MySQL row-count validation."
   fi

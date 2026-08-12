@@ -155,6 +155,34 @@ def test_dry_run_rejects_destructive_plan_even_after_generic_approval() -> None:
     assert reasons and "filesystem deletion" in reasons[0]
 
 
+def test_validation_only_plan_is_detected_before_live_execution() -> None:
+    module = load_remediation_app_module()
+    from common.models import Approval, ApprovalDecision
+    approval = Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="reviewer",
+        metadata={"execution_plan": {"scripts": ["sh scripts/remediation/check.sh --dry-run true"]}},
+    )
+
+    assert module._plan_is_validation_only(approval) is True
+
+
+def test_live_plan_is_not_misclassified_as_validation_only() -> None:
+    module = load_remediation_app_module()
+    from common.models import Approval, ApprovalDecision
+    approval = Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="reviewer",
+        metadata={"execution_plan": {"scripts": ["sh scripts/remediation/restart.sh --dry-run false"]}},
+    )
+
+    assert module._plan_is_validation_only(approval) is False
+
+
 def test_build_policy_blocked_action_returns_structured_skip() -> None:
     module = load_remediation_app_module()
 

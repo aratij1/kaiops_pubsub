@@ -268,6 +268,28 @@ function cleanRecommendationText(value, fallback = "-") {
   if (value == null) {
     return fallback;
   }
+  if (Array.isArray(value)) {
+    const items = value.map((item) => cleanRecommendationText(item, "")).filter(Boolean);
+    return items.length ? Array.from(new Set(items)).join("; ") : fallback;
+  }
+  if (typeof value === "object") {
+    const preferredKeys = [
+      "summary", "description", "observed_impact", "impact_summary", "customer_impact",
+      "service_impact", "dependency_impact", "severity_rationale", "urgency", "name", "service",
+      "root_cause", "cause", "mechanism", "reasoning", "content", "value",
+    ];
+    const preferred = preferredKeys
+      .map((key) => cleanRecommendationText(value[key], ""))
+      .filter(Boolean);
+    if (preferred.length) {
+      return Array.from(new Set(preferred)).join("; ");
+    }
+    const scalarDetails = Object.entries(value)
+      .filter(([, item]) => ["string", "number"].includes(typeof item))
+      .map(([key, item]) => `${key.replaceAll("_", " ")}: ${String(item).trim()}`)
+      .filter((item) => !isPlaceholderRecommendationText(item.split(":").slice(1).join(":").trim()));
+    return scalarDetails.length ? scalarDetails.join("; ") : fallback;
+  }
   const text = String(value).trim();
   if (!text || isPlaceholderRecommendationText(text)) {
     return fallback;
@@ -299,7 +321,7 @@ function cleanRecommendationText(value, fallback = "-") {
       "title",
     ];
     for (const key of keys) {
-      const candidate = String(payload[key] || "").trim();
+      const candidate = cleanRecommendationText(payload[key], "");
       if (candidate && !isPromptFragment(candidate) && !isPlaceholderRecommendationText(candidate)) {
         return candidate;
       }
@@ -321,52 +343,30 @@ function filterAlertsForMonitor(rows, applicationToMonitor) {
   if (target === TEST_USE_CASE_SCOPE) {
     return alertRows.filter((row) => isGeneratedOrTestAlert(row));
   }
+  const productionRows = alertRows.filter((row) => !isGeneratedOrTestAlert(row));
   if (target === "telemetry") {
-    return alertRows.filter((row) => inferMonitorScope(row) === "telemetry");
+    return productionRows.filter((row) => inferMonitorScope(row) === "telemetry");
   }
   if (isKaiopsCoreSelection(target)) {
-    return alertRows.filter((row) => inferMonitorScope(row) === "kaiops");
+    return productionRows.filter((row) => inferMonitorScope(row) === "kaiops");
   }
-  return alertRows.filter((row) => {
+  return productionRows.filter((row) => {
     const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
-    const explicitProject = String(
-      row?.project_name
-      || labels?.project_name
-      || row?.project
-      || labels?.project
-      || row?.application
-      || labels?.application
-      || ""
-    ).trim().toLowerCase();
     const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
     const candidates = [
       row?.application,
       row?.project,
       row?.project_name,
-      row?.service,
-      row?.source,
-      row?.name,
-      metadata?.owner_team,
+      metadata?.application,
+      metadata?.project,
+      metadata?.project_name,
       labels?.application,
       labels?.project,
       labels?.project_name,
-      labels?.deployment,
-      labels?.namespace,
-      labels?.service,
-      labels?.job,
-      labels?.instance,
-      labels?.team,
-      labels?.alertname,
     ]
-      .map((value) => String(value || "").trim().toLowerCase())
+      .map((value) => normalizeMonitorToken(value))
       .filter(Boolean);
-    return candidates.some(
-      (value) =>
-        value === target ||
-        value.includes(target) ||
-        target.includes(value) ||
-        hasTokenOverlap(value, target)
-    );
+    return candidates.includes(normalizeMonitorToken(target));
   });
 }
 
@@ -382,41 +382,30 @@ function filterRowsForMonitor(rows, applicationToMonitor) {
   if (target === TEST_USE_CASE_SCOPE) {
     return items.filter((row) => isGeneratedOrTestAlert(row));
   }
+  const productionRows = items.filter((row) => !isGeneratedOrTestAlert(row));
   if (target === "telemetry") {
-    return items.filter((row) => inferMonitorScope(row) === "telemetry");
+    return productionRows.filter((row) => inferMonitorScope(row) === "telemetry");
   }
   if (isKaiopsCoreSelection(target)) {
-    return items.filter((row) => inferMonitorScope(row) === "kaiops");
+    return productionRows.filter((row) => inferMonitorScope(row) === "kaiops");
   }
-  return items.filter((row) => {
+  return productionRows.filter((row) => {
     const labels = typeof row?.labels === "object" && row?.labels ? row.labels : {};
+    const metadata = typeof row?.metadata === "object" && row?.metadata ? row.metadata : {};
     const candidates = [
       row?.application,
       row?.project,
       row?.project_name,
-      row?.service,
-      row?.source,
-      row?.provider_name,
-      row?.owner,
-      row?.owner_team,
+      metadata?.application,
+      metadata?.project,
+      metadata?.project_name,
       labels?.application,
       labels?.project,
       labels?.project_name,
-      labels?.deployment,
-      labels?.namespace,
-      labels?.service,
-      labels?.job,
-      labels?.instance,
     ]
-      .map((value) => String(value || "").trim().toLowerCase())
+      .map((value) => normalizeMonitorToken(value))
       .filter(Boolean);
-    return candidates.some(
-      (value) =>
-        value === target ||
-        value.includes(target) ||
-        target.includes(value) ||
-        hasTokenOverlap(value, target)
-    );
+    return candidates.includes(normalizeMonitorToken(target));
   });
 }
 
@@ -1731,6 +1720,8 @@ function remediationOutcomeFromAction(action) {
   const executorError = String(executionResult.stderr || executionResult.error || "").trim();
   const executorOutput = String(executionResult.stdout || "").trim();
   const reason = error || executorError || output || executorOutput || "";
+  const actionType = String(safeAction.action_type || "").trim().toLowerCase();
+  const automaticPolicyBlocked = actionType === "policy-blocked" || /auto(?:matic)? execution blocked/i.test(reason);
 
   if (!status && !reason) {
     return null;
@@ -1739,13 +1730,18 @@ function remediationOutcomeFromAction(action) {
   let title = "Remediation status";
   if (status === "succeeded") {
     title = "Remediation executed successfully";
+  } else if (automaticPolicyBlocked) {
+    title = "Automatic execution deferred for human approval";
   } else if (status === "skipped") {
-    title = "Remediation was approved but not executed";
+    title = "Remediation was not executed";
   } else if (status === "failed") {
     title = "Remediation execution failed";
   }
 
   let detail = reason || `Remediation engine returned status ${status || "unknown"}.`;
+  if (automaticPolicyBlocked) {
+    detail = `${reason || "Automatic execution did not meet the policy threshold."} Complete dry run and human approval, then use Execute approved plan.`;
+  }
   if (/no real .*executor is configured/i.test(detail) || /configure a connector executor/i.test(detail)) {
     detail = `${detail} Add a real remediation connector with executor settings and secret_ref, or edit the plan to use the approved local triage script.`;
   }
@@ -1756,6 +1752,7 @@ function remediationOutcomeFromAction(action) {
     detail,
     actionType: safeAction.action_type || "-",
     target: safeAction.target || "-",
+    automaticPolicyBlocked,
   };
 }
 
@@ -2578,6 +2575,29 @@ function buildAlertDocumentDrafts(alertRow, workflowPayload) {
         incident?.id ? `Incident reference: ${String(incident.id)}.` : "",
         "Escalation path: L1 -> L2 -> L3 with timeline checkpoints at 5m, 15m, and 30m.",
       ].filter(Boolean).join("\n\n"),
+      services: service,
+      severity,
+      alert_type: alertName,
+      alert_id: alertId,
+      root_cause: rootCause,
+      impact,
+      recommended_action: suggestedAction,
+    },
+    jira: {
+      kind: "jira",
+      title: `${alertName} Jira Incident Ticket`.slice(0, 160),
+      summary: `${severity.toUpperCase()} incident for ${service}: ${alertName}.`,
+      content: [
+        `Incident: ${alertName}`,
+        `Alert ID: ${alertId || "Pending"}`,
+        `Incident ID: ${String(incident?.id || workflow?.incident_id || "Pending")}`,
+        `Jira ticket: ${String(alertRow?.ticket_id || alertRow?.jira_key || alertRow?.labels?.ticket_id || incident?.ticket_id || "Pending")}`,
+        `Service: ${service}`,
+        `Severity: ${severity.toUpperCase()}`,
+        `Root cause: ${commonRoot}`,
+        `Impact: ${impact || "Impact requires operator confirmation."}`,
+        `Recommended action: ${suggestedAction || "Investigate logs, metrics, dependencies, and recent changes."}`,
+      ].join("\n\n"),
       services: service,
       severity,
       alert_type: alertName,

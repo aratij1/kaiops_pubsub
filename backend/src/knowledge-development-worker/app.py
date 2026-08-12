@@ -206,7 +206,10 @@ app = create_app(title="KaiMS Knowledge Development Worker", settings=settings, 
 @app.post("/run")
 async def run_now() -> dict:
     global last_result
-    last_result = await analyze_history(app)
+    try:
+        last_result = await analyze_history(app)
+    except Exception as exc:
+        last_result = {"status": "failed", "error": str(exc)[:500]}
     return last_result
 
 

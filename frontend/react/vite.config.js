@@ -10,13 +10,29 @@ export default defineConfig({
   build: {
     rollupOptions: {
       output: {
+        // Keep every React-dependent transitive package with its UI family.
+        // Misplacing scheduler/react-remove-scroll in a generic chunk creates
+        // mutual ESM imports and prevents React from mounting in production.
         manualChunks(id) {
           if (!id.includes("node_modules")) return undefined;
-          if (id.includes("react-dom") || id.includes("react-router") || /node_modules[\\/]react[\\/]/.test(id)) return "vendor-react";
-          if (id.includes("@tanstack")) return "vendor-tanstack";
+          if (id.includes("@tanstack") || id.includes("use-sync-external-store")) return "vendor-tanstack";
           if (id.includes("lucide-react")) return "vendor-icons";
-          if (id.includes("react-aria")) return "vendor-accessibility";
-          return "vendor-shared";
+          if (
+            id.includes("react-aria")
+            || id.includes("@react-aria")
+            || id.includes("@react-stately")
+            || id.includes("@react-types")
+            || id.includes("@internationalized")
+            || id.includes("react-remove-scroll")
+            || id.includes("react-style-singleton")
+          ) return "vendor-accessibility";
+          if (
+            id.includes("react-dom")
+            || id.includes("react-router")
+            || id.includes("scheduler")
+            || /node_modules[\\/]react[\\/]/.test(id)
+          ) return "vendor-react";
+          return "vendor-react";
         },
       },
     },

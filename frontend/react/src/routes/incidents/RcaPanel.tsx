@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import {
   canonicalIncidentAnalysis,
   formatQualityPercent,
@@ -8,6 +9,7 @@ import {
   IntelligenceConnectionView,
   DiscoveryFlowView,
   ContextRetrievalGraph,
+  fetchJson,
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore - appHelpers.jsx is untyped legacy JS, no .d.ts yet.
 } from "../../appHelpers.jsx";
@@ -57,6 +59,48 @@ export default function RcaPanel({
   onLoadRagDocumentContent,
   onSubmitAiRecommendationFeedback,
 }: RcaPanelProps) {
+  const [resolutionOptions, setResolutionOptions] = useState<any[]>([]);
+  const [selectedResolution, setSelectedResolution] = useState<any>(null);
+  const [resolutionStatus, setResolutionStatus] = useState("");
+  const recommendationMetadata = selectedAlertWorkflow?.recommendation?.metadata || {};
+  const discoveryAnalysis = recommendationMetadata?.discovery_report?.report
+    || selectedAlertWorkflow?.context?.metadata?.discovery_report?.report
+    || {};
+  const proposedCodeChanges = Array.isArray(recommendationMetadata?.proposed_code_changes)
+    ? recommendationMetadata.proposed_code_changes
+    : Array.isArray(discoveryAnalysis?.proposed_code_changes)
+      ? discoveryAnalysis.proposed_code_changes
+      : [];
+  const resolutionService = selectedAlertRow?.service || selectedAlertRow?.application || "unknown";
+  useEffect(() => {
+    let active = true;
+    setSelectedResolution(null);
+    setResolutionStatus("");
+    fetchJson("/resolution-agent/resolution-catalog/relevant", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ issue: selectedRcaDecision.rootCause, service: resolutionService, recommended_action: selectedRcaDecision.action }),
+      timeoutMs: 10000,
+    }).then((result: any) => { if (active) setResolutionOptions(Array.isArray(result?.rows) ? result.rows : []); })
+      .catch(() => { if (active) setResolutionStatus("Resolution options are temporarily unavailable."); });
+    return () => { active = false; };
+  }, [selectedAlertId, selectedRcaDecision.rootCause, selectedRcaDecision.action, resolutionService]);
+
+  async function chooseResolution(option: any) {
+    setResolutionStatus("Preparing the selected resolution...");
+    try {
+      const result: any = await fetchJson("/resolution-agent/resolution-catalog/select", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ option_id: option.id, issue: selectedRcaDecision.rootCause, service: resolutionService, incident_id: selectedAlertId || "" }),
+        timeoutMs: 10000,
+      });
+      setSelectedResolution(result?.selected || option);
+      setResolutionStatus("Resolution plan prepared by the remediation agent for operator review.");
+    } catch (error: any) {
+      setResolutionStatus(error?.message || "The resolution plan could not be prepared.");
+    }
+  }
   return (
     <section className="combined-analysis-page">
       <header className="combined-analysis-hero">
@@ -88,12 +132,19 @@ export default function RcaPanel({
         </header>
         {selectedRcaDecision.reviewRequired ? <div className="rca-review-banner" role="status"><strong>Human review required</strong><span>{selectedAiTrust.missing.length ? `${selectedAiTrust.missing.length} evidence gap(s) remain.` : "Confidence or grounding is below the auto-action threshold."}</span></div> : <div className="rca-ready-banner" role="status"><strong>Evidence is sufficiently grounded</strong><span>Confirm the target and safeguards before execution.</span></div>}
         <div className="rca-decision-grid">
-          <article className="rca-decision-card rca-cause-card"><span>Probable root cause</span><h4>{selectedRcaDecision.rootCause}</h4><p>{selectedRcaDecision.status === "hypothesis" ? "This is a hypothesis, not a confirmed cause." : selectedRcaDecision.status === "insufficient-evidence" ? "More evidence is required before assigning a cause." : "Supported by the currently linked evidence."}</p></article>
-          <article className="rca-decision-card rca-impact-card"><span>Business and customer impact</span><h4>{selectedRcaDecision.customerImpact}</h4><dl><div><dt>Service</dt><dd>{selectedRcaDecision.serviceImpact}</dd></div><div><dt>Dependencies</dt><dd>{selectedRcaDecision.dependencyImpact}</dd></div><div><dt>Urgency</dt><dd>{selectedRcaDecision.urgency}</dd></div>{selectedRcaDecision.impactedServices.length ? <div><dt>Affected services</dt><dd>{selectedRcaDecision.impactedServices.join(", ")}</dd></div> : null}</dl></article>
+          <article className="rca-decision-card rca-cause-card"><span>Evidence-backed root cause</span><h4>{selectedRcaDecision.rootCause}</h4><dl><div><dt>Causal mechanism</dt><dd>{selectedRcaDecision.causalDetails}</dd></div><div><dt>Assessment</dt><dd>{selectedRcaDecision.status === "hypothesis" ? "Hypothesis—not yet confirmed." : selectedRcaDecision.status === "insufficient-evidence" ? "Insufficient evidence to assign a cause." : "Grounded in the currently linked evidence."}</dd></div><div><dt>Evidence basis</dt><dd>{selectedRcaDecision.rca?.evidence_used?.length ? selectedRcaDecision.rca.evidence_used.join(", ") : "No RCA evidence identifiers were supplied; human validation is required."}</dd></div></dl></article>
+          <article className="rca-decision-card rca-impact-card"><span>Observed impact and business risk</span><h4>{selectedRcaDecision.customerImpact}</h4><dl><div><dt>Observed service impact</dt><dd>{selectedRcaDecision.serviceImpact}</dd></div><div><dt>Dependency impact</dt><dd>{selectedRcaDecision.dependencyImpact}</dd></div><div><dt>Operational priority</dt><dd>{selectedRcaDecision.urgency}</dd></div>{selectedRcaDecision.impactedServices.length ? <div><dt>Affected services</dt><dd>{selectedRcaDecision.impactedServices.join(", ")}</dd></div> : null}<div><dt>Impact evidence</dt><dd>{selectedRcaDecision.impactEvidence.length ? selectedRcaDecision.impactEvidence.join(", ") : "No impact evidence identifiers were supplied; customer impact must not be assumed."}</dd></div></dl></article>
           <article className="rca-decision-card rca-action-card"><span>Recommended response</span><h4>{selectedRcaDecision.action}</h4><div className="rca-decision-actions">{selectedAiTrust.missing.length ? <button type="button" className="button-primary" onClick={() => onSetRcaDetailView("evidence")}>Collect missing evidence</button> : <button type="button" className="button-primary" onClick={() => onSetHomeDetailTab("execution")}>{selectedRcaDecision.reviewRequired ? "Review plan and decide" : "Continue to remediation"}</button>}<button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("evidence")}>Inspect evidence</button></div></article>
         </div>
+        <section className="resolution-catalog" aria-labelledby="resolution-catalog-title">
+          <header><div><span className="discovery-eyebrow">Resolution dictionary</span><h4 id="resolution-catalog-title">Choose the most relevant response</h4></div><span>{resolutionOptions.length} matched options</span></header>
+          <div className="resolution-option-grid">{resolutionOptions.map((option) => <button key={option.id} type="button" className={selectedResolution?.id === option.id ? "selected" : ""} onClick={() => chooseResolution(option)}><span><strong>{option.title}</strong><small>{option.risk} risk</small></span><p>{option.applicability}</p>{option.match_reasons?.length ? <em>Matched: {option.match_reasons.join(", ")}</em> : <em>Diagnostic fallback</em>}</button>)}</div>
+          {resolutionStatus ? <p className="resolution-status" role="status">{resolutionStatus}</p> : null}
+          {selectedResolution ? <div className="resolution-plan"><div><strong>Prerequisites</strong><ol>{selectedResolution.prerequisites.map((step: string) => <li key={step}>{step}</li>)}</ol></div><div><strong>Agent-prepared steps</strong><ol>{selectedResolution.plan.map((step: any) => <li key={`${step.phase}-${step.instruction}`}><span>{step.phase}</span>{step.instruction}</li>)}</ol></div><div><strong>Rollback</strong><ol>{selectedResolution.rollback.map((step: string) => <li key={step}>{step}</li>)}</ol></div><button type="button" className="button-primary" onClick={() => onSetHomeDetailTab("execution")}>Review safeguards and execute</button></div> : null}
+        </section>
         <div className="rca-quality-strip" aria-label="RCA quality indicators"><span><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong> grounding</span><span><strong>{formatQualityPercent(selectedAlertEvaluation.citationCoverage)}</strong> citations</span><span><strong>{selectedAiTrust.evidence.length}</strong> evidence records</span><span><strong>{selectedAiTrust.missing.length}</strong> evidence gaps</span></div>
         <section className="rca-reasoning-chain" aria-label="RCA reasoning chain"><article><span>1 · Observed fact</span><p>{selectedAiTrust.evidence.length ? `${selectedAiTrust.evidence.length} linked record(s) were collected from the incident context.` : "No linked evidence records are available."}</p></article><i aria-hidden="true">→</i><article><span>2 · AI inference</span><p>{selectedRcaDecision.rootCause}</p></article><i aria-hidden="true">→</i><article><span>3 · Operator action</span><p>{selectedRcaDecision.action}</p></article></section>
+        {proposedCodeChanges.length ? <section className="rca-code-changes" aria-labelledby="rca-code-changes-title"><header><span className="discovery-eyebrow">Code context</span><h4 id="rca-code-changes-title">Proposed source changes</h4></header>{proposedCodeChanges.map((change: any, index: number) => <article key={`${change.evidence_id || "change"}-${index}`}><div><strong>{change.title || "Proposed change"}</strong><code>{change.source_uri || "Source path unavailable"}</code></div><p>{change.explanation || change.limitations || "Review the cited source evidence before applying this change."}</p>{change.patch ? <pre className="result">{change.patch}</pre> : <p className="status-message">Patch withheld: {change.limitations || "more surrounding source context is required."}</p>}</article>)}</section> : null}
         <footer className="rca-analysis-meta"><span>Analysis status: <strong>{selectedRcaDecision.status.replaceAll("-", " ")}</strong></span><span>Last evidence: <strong>{selectedAiTrust.evidence[0]?.timestamp ? formatUtcTimestamp(selectedAiTrust.evidence[0].timestamp) : "timestamp not supplied"}</strong></span><span>Version: <strong>current persisted analysis</strong></span></footer>
       </section> : null}
       {rcaDetailView === "technical" ? <div className="combined-analysis-source-rail">

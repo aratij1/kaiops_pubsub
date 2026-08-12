@@ -7,7 +7,7 @@ describe("authoritative navigation", () => {
   it("has unique canonical paths and destination identifiers", () => {
     expect(new Set(NAVIGATION_ITEMS.map((item) => item.path)).size).toBe(NAVIGATION_ITEMS.length);
     expect(new Set(NAVIGATION_ITEMS.map((item) => item.id)).size).toBe(NAVIGATION_ITEMS.length);
-    expect(NAVIGATION_GROUPS.map((group) => group.label)).toEqual(["Operations", "Intelligence", "Governance", "Platform"]);
+    expect(NAVIGATION_GROUPS.map((group) => group.label)).toEqual(["Operations", "Intelligence", "Governance", "Platform", "Administration"]);
   });
 
   it("maps every route through its legacy compatibility tab", () => {
