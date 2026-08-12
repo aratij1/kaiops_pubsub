@@ -1,0 +1,37 @@
+{
+  "draft_id": "evidence-36213e06-cd0c-4da8-ba86-31de7f079076",
+  "status": "draft",
+  "alert_id": "36213e06-cd0c-4da8-ba86-31de7f079076",
+  "incident_id": "00e8aeb4-6b13-434c-bb87-2686d8d7ddde",
+  "alert_type": "GenericChannel42Test",
+  "severity": "critical",
+  "title": "Evidence review: GenericChannel42Test",
+  "content": "## Alert\nGenericChannel42Test on payment-gateway (prod)\n\n## Evidence-backed summary\nEvidence was retrieved; model synthesis was unavailable.\n\n## Hypotheses\n- No grounded hypothesis was produced.\n\n## Collected evidence\n- [MYSQL-56088911bed433e5] mysql: table=incidents {\"id\": \"5bd30b107a6c49fa80dbe0c2a379f631\", \"tenant_id\": \"default\", \"service\": \"payment-gateway\", \"environment\": \"prod\", \"severity\": \"critical\", \"status\": \"investigating\", \"title\": \"payment-gateway: PaymentGatewayTimeout\", \"ticket_id\": \"KAN-1472\", \"payload\": \"{\\\"id\\\": \\\"5bd30b10-7a6c-49fa-80db-e0c2a379f631\\\", \\\"title\\\": \\\"payment-gateway: PaymentGatewayTimeout\\\", \\\"status\\\": \\\"investigating\\\", \\\"service\\\": \\\"payment-gateway\\\", \\\"summary\\\": \\\"Payment gateway connection timeout observed in application logs (multi-channel-ingestion audit test).\\\", \\\"metadata\\\": {\\\"jira\\\": {\\\"key\\\": \\\"KAN-1472\\\", \\\"url\\\": \\\"https://ka (mysql://kaiops/incidents#row=5bd30b107a6c49fa80dbe0c2a379f631)\n- [MYSQL-5f1c8f1b2ae7ae19] mysql: table=incident_projections {\"incident_id\": \"5bd30b107a6c49fa80dbe0c2a379f631\", \"alert_id\": \"0b2886aeb79b4c8c9c1c240163569ea6\", \"trace_id\": \"45b74ba90dc94fa0beedcebd687329cc\", \"recommendation_id\": \"ccc26f4d1dbd4f148f398fdec512bc82\", \"flow_id\": null, \"tenant_id\": \"default\", \"service\": \"payment-gateway\", \"environment\": \"prod\", \"severity\": \"critical\", \"status\": \"awaiting_approval\", \"owner\": null, \"risk_tier\": \"high\", \"execution_mode\": \"human-approval\", \"requires_approval\": 1, \"policy_version\": \"policy-v1\", \"policy_reason\": \"severity in mandatory approval set; planner=deterministic severity routing\", \"transport_provider\": \"rabbitmq\", \"latest_ev (mysql://kaiops/incident_projections#row=0b2886aeb79b4c8c9c1c240163569ea6)",
+  "services": [
+    "payment-gateway"
+  ],
+  "evidence_ids": [
+    "MYSQL-56088911bed433e5",
+    "MYSQL-5f1c8f1b2ae7ae19"
+  ],
+  "source_uris": [
+    "mysql://kaiops/incidents#row=5bd30b107a6c49fa80dbe0c2a379f631",
+    "mysql://kaiops/incident_projections#row=0b2886aeb79b4c8c9c1c240163569ea6"
+  ],
+  "created_at": "2026-08-12T13:13:05.478818+00:00",
+  "updated_at": "2026-08-12T13:13:05.478818+00:00",
+  "reviewed_by": null,
+  "review_notes": null,
+  "approved_by": null,
+  "approved_at": null,
+  "rag_document_path": null,
+  "evidence_relevance": {
+    "verified": true,
+    "identity_terms": [
+      "genericchannel42test",
+      "payment-gateway"
+    ],
+    "relevant_count": 2,
+    "retrieved_count": 12
+  }
+}

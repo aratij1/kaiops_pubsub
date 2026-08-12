@@ -1,0 +1,61 @@
+{
+  "draft_id": "evidence-c45be835-3112-41cc-bb7e-c228d71c0f16",
+  "status": "draft",
+  "alert_id": "c45be835-3112-41cc-bb7e-c228d71c0f16",
+  "incident_id": "711764fb-3e0f-4772-8fb1-db6d63560419",
+  "alert_type": "RemediationEngineUnreachable1786538325",
+  "severity": "critical",
+  "title": "Evidence review: RemediationEngineUnreachable1786538325",
+  "content": "## Alert\nRemediationEngineUnreachable1786538325 on remediation-engine (prod)\n\n## Evidence-backed summary\nEvidence was retrieved; model synthesis was unavailable.\n\n## Hypotheses\n- No grounded hypothesis was produced.\n\n## Collected evidence\n- [TICKET-0896517e85c2c125] ticket: KAN-1477 remediation-engine: RemediationEngineUnreachable1786538325; type=Bug; status=To Do; priority=Medium; updated=2026-08-12T18:05:45.185+0530; labels=kaiops-candidate-267a26d69398c773cba12421aa126e7f,kaiops-severity-critical,kaiops_incident_711764fb_3e0f_4772_8fb1_db6d63560419,managed_by_kaiops; description=AI-discovered incident Service: remediation-engine Environment: prod Category: dependency Final severity: critical Confidence: 0.8 Initial hypothesis The remediation-engine signal is likely caused by a dependency condition. Business impact No confirmed customer impact is available from the current evidence. Evidence [{\"evidence_id\": \"alert:c45be835-3112-41cc-bb7e-c228d71c0f16\", \"sour (https://kaiops-test.atlassian.net/browse/KAN-1477)\n- [CODE-6b1b2c42594ac453] code: 63: resolution_agent_url: str = Field(default=\"http://resolution-agent:8000\", alias=\"RESOLUTION_AGENT_URL\") 64: approval_service_url: str = Field(default=\"http://approval-service:8000\", alias=\"APPROVAL_SERVICE_URL\") 65: orchestrator_url: str = Field(default=\"http://orchestrator:8000\", alias=\"ORCHESTRATOR_URL\") 66: remediation_engine_url: str = Field(default=\"http://remediation-engine:8000\", alias=\"REMEDIATION_ENGINE_URL\") 67: monitoring_adapter_url: str = Field(default=\"http://monitoring-adapter:8000\", alias=\"MONITORING_ADAPTER_URL\") 68: evaluation_service_url: str = Field(default=\"http://evaluation-service:8000\", alias=\"EVALUATION_SERVICE_URL\") 69: knowledge_development_url: str = Field(def (code:///workspace/backend/src/common/common/config.py#L66)\n- [MYSQL-d149ce01785c2f00] mysql: table=incidents {\"id\": \"711764fb3e0f47728fb1db6d63560419\", \"tenant_id\": \"default\", \"service\": \"remediation-engine\", \"environment\": \"prod\", \"severity\": \"critical\", \"status\": \"investigating\", \"title\": \"remediation-engine: RemediationEngineUnreachable1786538325\", \"ticket_id\": \"KAN-1477\", \"payload\": \"{\\\"id\\\": \\\"711764fb-3e0f-4772-8fb1-db6d63560419\\\", \\\"title\\\": \\\"remediation-engine: RemediationEngineUnreachable1786538325\\\", \\\"status\\\": \\\"investigating\\\", \\\"service\\\": \\\"remediation-engine\\\", \\\"summary\\\": \\\"remediation-engine is unreachable, connection refused, related to _resolution_requires_approval function (cache-bypass code-analy (mysql://kaiops/incidents#row=711764fb3e0f47728fb1db6d63560419)\n- [CODE-01d7ac5703104036] code: 1914: async def find_action_by_idempotency_key(self, idempotency_key: str) -> RemediationAction | None: 1915: \"\"\"Look up a previously-persisted action by its deterministic idempotency key. 1916: 1917: Used by remediation-engine to detect a redelivered approval/resolution 1918: message and skip re-running a remediation plugin that already executed. 1919: \"\"\" 1920: if not idempotency_key: (code:///workspace/backend/src/common/common/repository.py#L1917)\n- [MYSQL-69a31762fc29801e] mysql: table=incident_projections {\"incident_id\": \"711764fb3e0f47728fb1db6d63560419\", \"alert_id\": \"c45be835311241ccbb7ec228d71c0f16\", \"trace_id\": \"eea2ee5488cb40df8ed9d9dcc8da9cf4\", \"recommendation_id\": null, \"flow_id\": null, \"tenant_id\": \"default\", \"service\": \"remediation-engine\", \"environment\": \"prod\", \"severity\": \"critical\", \"status\": \"investigating\", \"owner\": null, \"risk_tier\": \"high\", \"execution_mode\": \"human-approval\", \"requires_approval\": 1, \"policy_version\": \"policy-v1\", \"policy_reason\": \"severity in mandatory approval set; planner=deterministic severity routing\", \"transport_provider\": \"rabbitmq\", \"latest_event_id\": \"bde0323687a446a68f760 (mysql://kaiops/incident_projections#row=c45be835311241ccbb7ec228d71c0f16)\n- [CODE-027c1436530b3c69] code: 1927: return None 1928: return RemediationAction.model_validate(record.payload) 1929: 1930: async def save_action_audit(self, action: RemediationAction, actor: str = \"remediation-engine\") -> None: 1931: payload = action.model_dump(mode=\"json\") 1932: policy_version = str(action.parameters.get(\"policy_version\", \"\")).strip() 1933: policy_reason = str(action.parameters.get(\"policy_reason\", \"\")).strip() (code:///workspace/backend/src/common/common/repository.py#L1930)\n- [CODE-aa19c012e3590f12] code: 1903 |         \"model-router\",\n 1904 |         \"orchestrator\",\n 1905 |         \"resolution-agent\",\n 1906 |         \"remediation-engine\",\n 1907 |         \"closure-service\",\n 1908 |         \"approval-service\",\n 1909 |     ): (code:///app/backend/src/monitoring-adapter/app.py#L1906)\n- [CODE-314945835ae567a4] code: 22 | from remediation_engine import RemediationEngine\n   23 | \n   24 | settings = get_settings()\n   25 | settings.service_name = \"remediation-engine\"\n   26 | engine = RemediationEngine()\n   27 | tasks: list[asyncio.Task] = []\n   28 | (code:///app/backend/src/remediation-engine/app.py#L25)\n- [CODE-57753eaddec75669] code: 129 |         incident_id=incident_id,\n  130 |         trace_id=trace_id,\n  131 |         correlation_id=correlation_id,\n  132 |         agent=\"remediation-engine\",\n  133 |         payload={\n  134 |             \"action_type\": action.action_type,\n  135 |             \"status\": action.status.value, (code:///app/backend/src/remediation-engine/app.py#L132)\n- [CODE-96f0598b0bc253f6] code: 322 |         EVENTS_PROCESSED.labels(settings.service_name, RESOLUTION_EVENTS, \"ok\").inc()\n  323 | \n  324 |     for source, approval_consumer, consume_forever in approval_consumers:\n  325 |         task = asyncio.create_task(consume_forever(approval_consumer, handle_approval), name=f\"remediation-engine-{source}-consumer\")\n  326 |         tasks.append(task)\n  327 | \n  328 |     for source, resolution_consumer, consume_forever in resolution_consumers: (code:///app/backend/src/remediation-engine/app.py#L325)\n- [CODE-c70c08d30a16b54f] code: 328 |     for source, resolution_consumer, consume_forever in resolution_consumers:\n  329 |         task = asyncio.create_task(\n  330 |             consume_forever(resolution_consumer, handle_resolution),\n  331 |             name=f\"remediation-engine-{source}-resolution-consumer\",\n  332 |         )\n  333 |         tasks.append(task)\n  334 | (code:///app/backend/src/remediation-engine/app.py#L331)\n- [CODE-ff733a84b021f7e9] code: 1914 |     async def find_action_by_idempotency_key(self, idempotency_key: str) -> RemediationAction | None:\n 1915 |         \"\"\"Look up a previously-persisted action by its deterministic idempotency key.\n 1916 | \n 1917 |         Used by remediation-engine to detect a redelivered approval/resolution\n 1918 |         message and skip re-running a remediation plugin that already executed.\n 1919 |         \"\"\"\n 1920 |         if not idempotency_key: (code:///app/backend/src/common/common/repository.py#L1917)\n- [CODE-d5c8e35c37d4b4a5] code: 1927 |             return None\n 1928 |         return RemediationAction.model_validate(record.payload)\n 1929 | \n 1930 |     async def save_action_audit(self, action: RemediationAction, actor: str = \"remediation-engine\") -> None:\n 1931 |         payload = action.model_dump(mode=\"json\")\n 1932 |         policy_version = str(action.parameters.get(\"policy_version\", \"\")).strip()\n 1933 |         policy_reason = str(action.parameters.get(\"policy_reason\", \"\")).strip() (code:///app/backend/src/common/common/repository.py#L1930)\n- [CODE-6f711c75e1e2b64b] code: 63 |     resolution_agent_url: str = Field(default=\"http://resolution-agent:8000\", alias=\"RESOLUTION_AGENT_URL\")\n   64 |     approval_service_url: str = Field(default=\"http://approval-service:8000\", alias=\"APPROVAL_SERVICE_URL\")\n   65 |     orchestrator_url: str = Field(default=\"http://orchestrator:8000\", alias=\"ORCHESTRATOR_URL\")\n   66 |     remediation_engine_url: str = Field(default=\"http://remediation-engine:8000\", alias=\"REMEDIATION_ENGINE_URL\")\n   67 |     monitoring_adapter_url: str = Field(default=\"http://monitoring-adapter:8000\", alias=\"MONITORING_ADAPTER_URL\")\n   68 |     evaluation_service_url: str = Field(default=\"http://evaluation-service:8000\", alias=\"EVALUATION_SERVICE_URL\")\n   69 |     knowledge_development_url: str = Field(default=\"http://knowledge-development-worker:8000\", alias=\"KNOWLEDGE_DEVELOPMENT_URL\") (code:///app/backend/src/common/common/config.py#L66)",
+  "services": [
+    "remediation-engine"
+  ],
+  "evidence_ids": [
+    "TICKET-0896517e85c2c125",
+    "CODE-6b1b2c42594ac453",
+    "MYSQL-d149ce01785c2f00",
+    "CODE-01d7ac5703104036",
+    "MYSQL-69a31762fc29801e",
+    "CODE-027c1436530b3c69",
+    "CODE-aa19c012e3590f12",
+    "CODE-314945835ae567a4",
+    "CODE-57753eaddec75669",
+    "CODE-96f0598b0bc253f6",
+    "CODE-c70c08d30a16b54f",
+    "CODE-ff733a84b021f7e9",
+    "CODE-d5c8e35c37d4b4a5",
+    "CODE-6f711c75e1e2b64b"
+  ],
+  "source_uris": [
+    "https://kaiops-test.atlassian.net/browse/KAN-1477",
+    "code:///workspace/backend/src/common/common/config.py#L66",
+    "mysql://kaiops/incidents#row=711764fb3e0f47728fb1db6d63560419",
+    "code:///workspace/backend/src/common/common/repository.py#L1917",
+    "mysql://kaiops/incident_projections#row=c45be835311241ccbb7ec228d71c0f16",
+    "code:///workspace/backend/src/common/common/repository.py#L1930",
+    "code:///app/backend/src/monitoring-adapter/app.py#L1906",
+    "code:///app/backend/src/remediation-engine/app.py#L25",
+    "code:///app/backend/src/remediation-engine/app.py#L132",
+    "code:///app/backend/src/remediation-engine/app.py#L325",
+    "code:///app/backend/src/remediation-engine/app.py#L331",
+    "code:///app/backend/src/common/common/repository.py#L1917",
+    "code:///app/backend/src/common/common/repository.py#L1930",
+    "code:///app/backend/src/common/common/config.py#L66"
+  ],
+  "created_at": "2026-08-12T12:39:15.977307+00:00",
+  "updated_at": "2026-08-12T12:39:15.977307+00:00",
+  "reviewed_by": null,
+  "review_notes": null,
+  "approved_by": null,
+  "approved_at": null,
+  "rag_document_path": null,
+  "evidence_relevance": {
+    "verified": true,
+    "identity_terms": [
+      "remediation-engine",
+      "remediationengineunreachable1786538325"
+    ],
+    "relevant_count": 14,
+    "retrieved_count": 20
+  }
+}
