@@ -1,0 +1,269 @@
+/**
+ * Modern table-first layout overrides.
+ * Loaded last (after styles.css and route CSS) so these rules win the cascade
+ * without editing the legacy stylesheet.
+ */
+
+/* -------------------------------------------------------------------------- */
+/* Shell: tighter chrome, more room for the work surface                      */
+/* -------------------------------------------------------------------------- */
+
+.app-shell {
+  max-width: 1680px;
+  padding: 8px 10px 16px;
+}
+
+.app-layout {
+  grid-template-columns: 212px minmax(0, 1fr);
+  gap: 10px;
+}
+
+.workspace-main-content {
+  gap: 8px;
+}
+
+.global-operations-bar {
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: 10px;
+}
+
+.global-operations-summary small {
+  display: none;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Operations workspace: compact sticky toolbar + table-first                 */
+/* -------------------------------------------------------------------------- */
+
+.operations-center {
+  gap: 8px !important;
+  max-width: none;
+  align-content: start;
+}
+
+/* Workflow steps → compact segmented control (one line) */
+.operations-workflow-nav,
+.operations-center .operations-workflow-nav {
+  display: flex !important;
+  grid-template-columns: none !important;
+  align-items: stretch;
+  gap: 4px;
+  min-height: 0 !important;
+  padding: 4px;
+  border: 1px solid var(--k-border, var(--line, #d7e2ec));
+  border-radius: 10px;
+  background: var(--k-surface, var(--card, #fff));
+  box-shadow: none;
+}
+
+.operations-workflow-nav button,
+.operations-center .operations-workflow-nav button {
+  display: inline-flex !important;
+  grid-template-columns: none !important;
+  grid-template-rows: none !important;
+  flex: 1 1 0;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px !important;
+  padding: 8px 12px !important;
+  border-radius: 8px;
+}
+
+.operations-workflow-nav button > span,
+.operations-center .operations-workflow-nav button > span {
+  grid-row: auto !important;
+  width: 24px;
+  height: 24px;
+  font-size: 0.65rem;
+  border-radius: 6px;
+}
+
+.operations-workflow-nav button strong,
+.operations-center .operations-workflow-nav button strong {
+  font-size: 0.8rem;
+}
+
+/* Hide step descriptions to reclaim vertical space */
+.operations-workflow-nav button small,
+.operations-center .operations-workflow-nav button small {
+  display: none !important;
+}
+
+/* Hero / Operations Center summary → slim KPI strip */
+.operations-page-hero,
+.operations-center .panel.operations-summary,
+.operations-center .operations-summary,
+.approval-workspace .approval-hero {
+  display: flex !important;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 0 !important;
+  padding: 10px 14px !important;
+  border-radius: 10px !important;
+  box-shadow: none !important;
+}
+
+.operations-center .operations-summary > div:first-child {
+  min-width: 0;
+}
+
+.operations-center .operations-summary .discovery-eyebrow {
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+}
+
+.operations-center .operations-summary h2,
+.operations-page-hero h2,
+.approval-workspace .approval-hero h2 {
+  margin: 0 !important;
+  font-size: 1rem !important;
+  line-height: 1.25;
+}
+
+/* Hide long marketing copy under the title */
+.operations-center .operations-summary p,
+.operations-page-hero p,
+.approval-workspace .approval-hero p {
+  display: none !important;
+}
+
+.operations-center .operations-kpis {
+  display: flex !important;
+  flex-wrap: wrap;
+  grid-template-columns: none !important;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.operations-center .operations-kpis span {
+  display: inline-flex !important;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 0.65rem;
+  letter-spacing: 0.04em;
+}
+
+.operations-center .operations-kpis strong {
+  font-size: 0.95rem !important;
+}
+
+/* Filter bar + table panel: flat, tight, table-first */
+.operations-center .panel.incident-list-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px !important;
+  border-radius: 12px !important;
+  box-shadow: none !important;
+}
+
+.operations-center .compact-filter-bar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--k-border, var(--line, #d7e2ec));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--k-surface, #fff) 92%, var(--k-canvas, #edf3f7));
+}
+
+.operations-center .compact-filter-bar label {
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.operations-center .compact-filter-bar input,
+.operations-center .compact-filter-bar select,
+.operations-center .compact-filter-bar .button-secondary {
+  min-height: 34px;
+  border-radius: 8px;
+}
+
+.operations-center .contained-table {
+  max-height: calc(100vh - 280px);
+  overflow: auto;
+  border: 1px solid var(--k-border, var(--line, #d7e2ec));
+  border-radius: 10px;
+}
+
+.operations-center .contained-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.operations-center .table-pagination {
+  margin-top: 0;
+  padding-top: 4px;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Dark theme: keep strip + filters on the same surface language              */
+/* -------------------------------------------------------------------------- */
+
+:root.dm-theme-dark .operations-workflow-nav,
+:root[data-ui-theme="dark"] .operations-workflow-nav,
+:root.dm-theme-dark .operations-center .operations-workflow-nav,
+:root[data-ui-theme="dark"] .operations-center .operations-workflow-nav {
+  border-color: #2a3038;
+  background: #14181d;
+}
+
+:root.dm-theme-dark .operations-center .compact-filter-bar,
+:root[data-ui-theme="dark"] .operations-center .compact-filter-bar {
+  border-color: #2a3038;
+  background: #14181d;
+}
+
+:root.dm-theme-dark .operations-center .panel.incident-list-panel,
+:root[data-ui-theme="dark"] .operations-center .panel.incident-list-panel {
+  background: #101317;
+  border-color: #2a3038;
+}
+
+:root.dm-theme-dark .operations-center .contained-table,
+:root[data-ui-theme="dark"] .operations-center .contained-table {
+  border-color: #2a3038;
+  background: #101317;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Responsive                                                                 */
+/* -------------------------------------------------------------------------- */
+
+@media (max-width: 900px) {
+  .app-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .operations-workflow-nav,
+  .operations-center .operations-workflow-nav {
+    flex-direction: column;
+  }
+
+  .operations-center .panel.operations-summary,
+  .operations-center .operations-summary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .operations-center .operations-kpis {
+    width: 100%;
+  }
+
+  .operations-center .contained-table {
+    max-height: none;
+  }
+}
+
+@media (max-width: 700px) {
+  .operations-center .compact-filter-bar {
+    grid-template-columns: 1fr;
+  }
+}

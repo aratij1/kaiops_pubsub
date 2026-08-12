@@ -67,11 +67,14 @@ export function LegacyApplicationShell() {
   );
 
   const handleNavigatePath = useCallback((path: string) => {
-    if (path !== location.pathname) {
-      scrollPositions.current.set(location.pathname, window.scrollY);
-      navigate(path);
+    const normalized = path.startsWith("/") ? path : `/${path}`;
+    const current = `${location.pathname}${location.search}`;
+    if (normalized === current) {
+      return;
     }
-  }, [location.pathname, navigate]);
+    scrollPositions.current.set(location.pathname, window.scrollY);
+    navigate(normalized);
+  }, [location.pathname, location.search, navigate]);
 
   return (
     <>
