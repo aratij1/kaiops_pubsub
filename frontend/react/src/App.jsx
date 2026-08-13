@@ -7,6 +7,7 @@ import { useOperationalEvents } from "./services/operationalEvents";
 import { beginOidcLogin, completeOidcLogin } from "./services/oidcClient";
 import { RouteRuntimeProvider } from "./app/routeRuntime";
 import { projectIdentityFromAlert } from "./domain/projectIdentity";
+import { effectiveIncidentStatus } from "./domain/incidentStatus";
 import { buildOnboardingSources } from "./domain/onboardingSources";
 import { buildAlertDocumentDraft as buildRcaEvidenceDocumentDraft } from "./domain/alertDocumentDraft";
 import RcaPanel from "./routes/incidents/RcaPanel";
@@ -14,6 +15,10 @@ import "./routes/incidents/ExecutionWorkspace.css";
 import CopilotRoute from "./routes/copilot/CopilotRoute";
 import { breadcrumbForPath, groupedNavigationForRole, navigationItemForPath, TAB_SHORTCUT_BY_CODE, VALID_LEGACY_TABS } from "./app/navigation";
 import { allowedLegacyTabsForRole, canAccessDestination } from "./app/permissions";
+
+const LOCAL_JENKINS_ENDPOINT = "http://jenkins:8080";
+const LOCAL_JENKINS_JOB = "kaiops-auto-remediation";
+const LOCAL_JENKINS_CREDENTIAL_REF = "vault://kaiops/local/jenkins#api-token";
 import {
   ALERT_DOC_KIND_OPTIONS,
   DOCUMENT_PROVIDER_ROLES,
@@ -449,6 +454,16 @@ function simpleIncidentReport(content) {
   return [`# ${title}`, ...rows.map(([label, value]) => `${label}: ${value}`)].join("\n\n");
 }
 
+function incidentDraftHasSubstantiveContent(content) {
+  const body = String(content || "")
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => line.replace(/^\s*#+\s*/, "").trim())
+    .filter((line) => line && !/^incident (report|record)$/i.test(line))
+    .join(" ");
+  return body.length >= 40;
+}
+
 export default function App({ initialTab = "home", currentPath = "/", currentSearch = "", onActiveTabChange, onNavigatePath, routeOutlet = null } = {}) {
   const queryClient = useQueryClient();
   const skipNextActiveTabNavigationRef = useRef(false);
@@ -539,7 +554,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     incidentId: "",
   });
   const [homeDetailTab, setHomeDetailTab] = useState("overview");
-  const [rcaDetailView, setRcaDetailView] = useState("summary");
+  const [rcaDetailView, setRcaDetailView] = useState("simple");
   const [diagnosticsDetailTab, setDiagnosticsDetailTab] = useState("pipeline");
   const [approvalForm, setApprovalForm] = useState({
     action: "approve",
@@ -594,7 +609,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         void loadRecentAlerts({ background: true });
       }
       if (event.type === "alert.created" && activeTab === "stream" && !ingestionStreamPaused) {
-        void loadLandingPadRecent({ background: true });
+        // The server event is the freshness signal; never let the periodic
+        // polling throttle suppress this event-driven refresh.
+        void loadLandingPadRecent({ background: true, force: true });
       }
       if (["incident.status", "approval.state", "remediation.progress"].includes(event.type) && activeTab === "summary") {
         void loadIncidentMetadata({ background: true });
@@ -1826,6 +1843,28 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     await Promise.all(tasks);
   }
 
+  async function pollIncidentTerminalStatus(incidentId, attempts = 12) {
+    const normalizedIncidentId = String(incidentId || "").trim();
+    if (!normalizedIncidentId) return;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, attempt === 0 ? 800 : 1200));
+      try {
+        const payload = await fetchJson(`/api-gateway/incidents/${encodeURIComponent(normalizedIncidentId)}/stage-completeness`);
+        const data = unwrap(payload) || {};
+        const status = String(data.status || "").trim().toLowerCase();
+        if (["closed", "resolved", "failed"].includes(status)) {
+          applyApprovalResolutionToUi(normalizedIncidentId, status);
+          await refreshApprovalDrivenViews(normalizedIncidentId);
+          return;
+        }
+      } catch {
+        // A transient projection read must not stop later terminal refreshes.
+      }
+    }
+    await refreshApprovalDrivenViews(normalizedIncidentId);
+  }
+
   function refreshApprovalDrivenViewsSoon(incidentId = "") {
     window.setTimeout(() => {
       refreshApprovalDrivenViews(incidentId);
@@ -1872,10 +1911,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
   async function loadLandingPadRecent(options = {}) {
     const background = Boolean(options && options.background);
+    const force = Boolean(options && options.force);
     if (landingPadRecentRequestRef.current.inFlight) {
       return;
     }
-    if (background && Date.now() - landingPadRecentRequestRef.current.lastFetchedAt < 45000) {
+    if (background && !force && Date.now() - landingPadRecentRequestRef.current.lastFetchedAt < 12000) {
       return;
     }
     landingPadRecentRequestRef.current.inFlight = true;
@@ -1891,7 +1931,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       // archive here adds tens of seconds without improving the visible stream.
       const rows = await queryClient.fetchQuery({
         ...landingPadRowsQueryOptions(100),
-        staleTime: background ? 45000 : 0,
+        staleTime: force ? 0 : background ? 12000 : 0,
       });
       const balancedRows = capLatestAlertsPerSource(
         (Array.isArray(rows) ? rows : []).map((row, index) => mapLandingPadRowToAlertStreamRow(row, index))
@@ -5011,7 +5051,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       }
     };
     refreshLandingPadStream();
-    const timer = window.setInterval(refreshLandingPadStream, 60000);
+    // Event delivery is primary; this bounded 15-second poll covers dropped
+    // events and keeps the visible Live Stream honest.
+    const timer = window.setInterval(refreshLandingPadStream, 15000);
     return () => window.clearInterval(timer);
   }, [adminSession.accessToken, activeTab, ingestionStreamPaused]);
 
@@ -5748,17 +5790,30 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }, [selectedIncidentId, monitorScopedIncidentMetadata, incidentMetadata.rows]);
 
   const selectedCanonicalIncidentStatus = useMemo(
-    () => canonicalIncidentStatus(
-      selectedStageCompleteness.data?.status,
-      selectedIncidentMetadataRow?.status,
-      selectedAlertWorkflow?.incident?.status,
-      selectedAlertRow?.status,
-      selectedAlertRow?.state,
+    () => effectiveIncidentStatus(
+      canonicalIncidentStatus(
+        selectedStageCompleteness.data?.status,
+        selectedIncidentMetadataRow?.status,
+        selectedAlertWorkflow?.incident?.status,
+        selectedAlertRow?.status,
+        selectedAlertRow?.state,
+      ),
+      selectedIncidentMetadataRow?.approval_status
+        || selectedIncidentMetadataRow?.projection_payload?.approval_status
+        || (selectedIncidentMetadataRow?.latest_event_type === "incident.approval.recorded"
+          ? selectedIncidentMetadataRow?.projection_payload?.event_payload?.decision
+          : "")
+        || selectedAlertWorkflow?.approval?.status,
     ),
     [
       selectedStageCompleteness.data?.status,
       selectedIncidentMetadataRow?.status,
       selectedAlertWorkflow?.incident?.status,
+      selectedAlertWorkflow?.approval?.status,
+      selectedIncidentMetadataRow?.approval_status,
+      selectedIncidentMetadataRow?.projection_payload?.approval_status,
+      selectedIncidentMetadataRow?.projection_payload?.event_payload?.decision,
+      selectedIncidentMetadataRow?.latest_event_type,
       selectedAlertRow?.status,
       selectedAlertRow?.state,
     ],
@@ -5890,10 +5945,20 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           draft = unwrap(created)?.draft || null;
         }
         const draftContent = String(draft?.content || "");
-        const alreadyContainsRca = Boolean(selectedRcaDecision.rootCause && draftContent.toLowerCase().includes(String(selectedRcaDecision.rootCause).trim().toLowerCase()));
+        const canonicalContent = buildRcaEvidenceDocumentDraft({
+          alertId,
+          alert: selectedAlertRow,
+          decision: selectedRcaDecision,
+          workflow: selectedAlertWorkflow,
+          evidence: selectedRelevantRcaEvidence,
+        });
+        const resolvedDraftContent = incidentDraftHasSubstantiveContent(draftContent)
+          ? draftContent
+          : canonicalContent;
+        const alreadyContainsRca = Boolean(selectedRcaDecision.rootCause && resolvedDraftContent.toLowerCase().includes(String(selectedRcaDecision.rootCause).trim().toLowerCase()));
         const rcaAppendix = draft && selectedRcaDecision.rootCause && !selectedRcaDecision.reviewRequired && selectedRelevantRcaEvidence.length && !alreadyContainsRca ? ["", "## Completed RCA", selectedRcaDecision.rootCause, "", "## Impact", selectedRcaDecision.customerImpact, "", "## Recommended response", selectedRcaDecision.action || "No action supplied.", "", `Confidence: ${Math.round(Number(selectedRcaDecision.confidence || 0) * 100)}%`].join("\n") : "";
         const insufficientMessage = selectedRelevantRcaEvidence.length ? "RCA requires additional verification before a document can be created." : "Relevant project evidence is missing. KaiMS will not generate or publish an RCA until real source evidence arrives.";
-        setEvidenceDraftReview({ loading: false, draft, content: draft ? `${draft.content || ""}${rcaAppendix}` : "", notes: "", error: draft ? "" : insufficientMessage, message: draft ? "Draft created automatically. Review, edit, and approve it before publication." : "" });
+        setEvidenceDraftReview({ loading: false, draft, content: draft ? `${resolvedDraftContent}${rcaAppendix}` : "", notes: "", error: draft ? "" : insufficientMessage, message: draft ? "Draft created automatically. Review, edit, and approve it before publication." : "" });
       })
       .catch((error) => { if (!cancelled) setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) })); });
     return () => { cancelled = true; };
@@ -5964,7 +6029,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       riskTier: selectedAlertRouting?.risk_tier || decision?.risk_tier || "-",
       provider: selectedAlertRouting?.message_bus_provider || decision?.message_bus_provider || "-",
       incidentStatus: selectedCanonicalIncidentStatus,
-      approvalStatus: approval?.status || projectionPayload?.approval_status || "pending",
+      approvalStatus:
+        approval?.status
+        || projectionPayload?.approval_status
+        || (selectedIncidentMetadataRow?.latest_event_type === "incident.approval.recorded"
+          ? projectionPayload?.event_payload?.decision
+          : "")
+        || "pending",
       commands,
       remediationAction,
       remediationAnalysis: typeof recommendationMetadata?.remediation_analysis === "object" ? recommendationMetadata.remediation_analysis : {},
@@ -6028,6 +6099,24 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     ];
     return candidates.find((value) => value && typeof value === "object" && Object.keys(value).length > 0) || { message: "No executor details were returned." };
   }, [remediationExecutionState.result, selectedExecutionPlan.remediationAction]);
+
+  const persistedExecutionStatus = String(selectedExecutionPlan.remediationAction?.status || "").trim().toLowerCase();
+  useEffect(() => {
+    if (!remediationExecutionState.loading || !remediationExecutionState.result) return;
+    if (!["succeeded", "failed", "skipped", "completed", "closed", "resolved"].includes(persistedExecutionStatus)) return;
+    setRemediationExecutionState((current) => ({ ...current, loading: false }));
+  }, [persistedExecutionStatus, remediationExecutionState.loading, remediationExecutionState.result]);
+
+  useEffect(() => {
+    if (!remediationExecutionState.loading || !remediationExecutionState.result || !selectedAlertId) return undefined;
+    // Execution is asynchronous. Keep the selected workflow hydrated until the
+    // remediation action reaches a terminal state so Act and Validate advance
+    // without requiring an operator to reload the page.
+    const timer = window.setTimeout(() => {
+      void loadAlertDetails(selectedAlertId, selectedAlertRow, { background: true });
+    }, 3000);
+    return () => window.clearTimeout(timer);
+  }, [remediationExecutionState.loading, remediationExecutionState.result, persistedExecutionStatus, selectedAlertId, selectedAlertData.payload]);
 
   const selectedApplicationConnection = useMemo(() => {
     const workflowContext = typeof selectedAlertWorkflow?.context === "object" && selectedAlertWorkflow.context
@@ -6156,12 +6245,16 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       commands: suggestedScript ? "" : selectedExecutionBreakdown.commands.join("\n"),
       scripts: redactOperationalSecrets(suggestedScript),
       queries: suggestedScript ? "" : selectedExecutionBreakdown.queries.join("\n"),
-      connection_url: selectedApplicationConnection.endpoint === "Not configured" ? "" : selectedApplicationConnection.endpoint,
-      connection_type: selectedApplicationConnection.connection_type || "application",
-      executor_type: "",
-      job_name: "",
+      connection_url: selectedExecutionBreakdown.hasPlan
+        ? LOCAL_JENKINS_ENDPOINT
+        : selectedApplicationConnection.endpoint === "Not configured" ? "" : selectedApplicationConnection.endpoint,
+      connection_type: selectedExecutionBreakdown.hasPlan ? "jenkins" : selectedApplicationConnection.connection_type || "application",
+      executor_type: selectedExecutionBreakdown.hasPlan ? "jenkins" : "",
+      job_name: selectedExecutionBreakdown.hasPlan ? LOCAL_JENKINS_JOB : "",
       namespace: selectedApplicationConnection.namespace || "",
-      credential_ref: selectedApplicationConnection.credential_ref || "",
+      credential_ref: selectedExecutionBreakdown.hasPlan
+        ? selectedApplicationConnection.credential_ref || LOCAL_JENKINS_CREDENTIAL_REF
+        : selectedApplicationConnection.credential_ref || "",
       credential_store: selectedApplicationConnection.credential_store || "hashicorp_vault",
       notes: "",
     });
@@ -6171,6 +6264,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     selectedExecutionBreakdown.commands.join("\n"),
     selectedExecutionBreakdown.scripts.join("\n"),
     selectedExecutionBreakdown.queries.join("\n"),
+    selectedExecutionBreakdown.hasPlan,
     selectedApplicationConnection.endpoint,
     selectedApplicationConnection.connection_type,
     selectedApplicationConnection.namespace,
@@ -7575,6 +7669,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           ...editedPlan.queries.map((item) => `query: ${item}`),
         ],
         execution_plan: editedPlan,
+        execution_confirmation_required: true,
         service: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : undefined,
         environment: selectedApplicationConnection.environment,
         remediation_target: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : selectedApplicationConnection.application,
@@ -7603,14 +7698,18 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       body: JSON.stringify(payload),
     }));
     const action = unwrap(response);
-    setRemediationExecutionState({ loading: false, result: response, error: "" });
     const status = String(action?.status || "").toLowerCase();
+    const terminal = ["succeeded", "failed", "skipped", "completed", "closed", "resolved"].includes(status);
+    // Submission acknowledgement is not an execution result. Keep the gate
+    // locked until a terminal action status is observed from the backend.
+    setRemediationExecutionState({ loading: !terminal, result: response, error: "" });
     applyApprovalResolutionToUi(
       incidentId,
       status === "succeeded" ? "validating" : status === "failed" || status === "skipped" ? "failed" : "remediating",
       comment
     );
     await refreshApprovalDrivenViews(incidentId);
+    void pollIncidentTerminalStatus(incidentId);
     return response;
   }
 
@@ -7862,23 +7961,28 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         throw new Error("Approve or modify the remediation first, then execute the approved plan.");
       }
 
-      if (!["approved", "modified"].includes(approvalStatus) && (approvalForm.action === "approve" || approvalForm.action === "modify")) {
-        const approvalResponse = await executeApprovalAction({
-          incidentId,
-          recommendationId,
-          action: approvalForm.action,
-          approver,
-          channel: approvalForm.channel,
-          comment: approvalForm.comment,
-          modifiedAction: approvalForm.modified_action,
-        });
-        setApprovalState({ loading: false, result: approvalResponse, error: "" });
-      }
+      // Incident-level workflow state can refer to an older recommendation.
+      // Re-record the reviewed decision for the exact recommendation that is
+      // about to execute so the durable backend gate cannot observe a stale
+      // incident/recommendation pair.
+      const approvalAction = approvalForm.action === "modify" ? "modify" : "approve";
+      const approvalResponse = await executeApprovalAction({
+        incidentId,
+        recommendationId,
+        action: approvalAction,
+        approver,
+        channel: approvalForm.channel,
+        comment: approvalForm.comment,
+        modifiedAction: approvalAction === "modify"
+          ? approvalForm.modified_action || JSON.stringify(editedPlan)
+          : "",
+      });
+      setApprovalState({ loading: false, result: approvalResponse, error: "" });
 
       const payload = buildRemediationExecutionPayload({
         incidentId,
         recommendationId,
-        action: approvalForm.action,
+        action: approvalAction,
         approver,
         comment: String(approvalForm.comment || remediationPlanEditor.notes || "approved remediation execution").trim(),
         editedPlan,
@@ -7969,9 +8073,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       ...current,
       executor_type: "jenkins",
       connection_type: "jenkins",
-      connection_url: current.connection_type === "jenkins" ? current.connection_url : "",
-      job_name: current.job_name || `${service}/rollback`,
+      connection_url: current.connection_type === "jenkins" && current.connection_url ? current.connection_url : LOCAL_JENKINS_ENDPOINT,
+      job_name: current.job_name || LOCAL_JENKINS_JOB,
       namespace: current.namespace || environment,
+      credential_ref: current.credential_ref || LOCAL_JENKINS_CREDENTIAL_REF,
+      credential_store: current.credential_store || "hashicorp_vault",
       queries: current.queries || `max_over_time(up{job='${service}'}[5m])`,
     }));
     setShowExecutionCredential(true);
@@ -8084,13 +8190,28 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       ensureMinimumAlertsBySource(consolidatedRows, allStreamRows)
     );
   }, [landingPadRecent.rows, alerts.rows]);
-  const scopedIngestionStreamRows = useMemo(
-    () => filterAlertsForMonitor(ingestionStreamRows, applicationToMonitor),
-    [ingestionStreamRows, applicationToMonitor],
-  );
+  // Live Alerts is the cross-application intake console. The sidebar monitor
+  // selection must not silently remove arrivals from other connected sources
+  // (notably Fault Lab); operators can opt into application scoping with the
+  // explicit Application filter below.
+  const scopedIngestionStreamRows = ingestionStreamRows;
   const ingestionStreamCounts = useMemo(() => {
-    const counts = { all: scopedIngestionStreamRows.length, email: 0, log: 0, prometheus: 0, telemetry: 0, ticket: 0, failed: 0 };
-    scopedIngestionStreamRows.forEach((row) => {
+    // Source cards describe the currently selected lifecycle section. Counting
+    // resolved rows while the Active tab hides them produces a contradictory
+    // "3 arrivals / 0 results" view.
+    const sectionRows = scopedIngestionStreamRows.filter((row) => {
+      const failed = String(row?.status || "").toLowerCase() === "failed" || Boolean(row?.error);
+      const status = String(row?.alert_status || row?.status || "").toLowerCase();
+      const resolved = ["resolved", "closed", "completed", "inactive"].includes(status);
+      const timestamp = alertTimeMs(row);
+      if (ingestionStreamSection === "active") return !failed && !resolved;
+      if (ingestionStreamSection === "resolved") return resolved;
+      if (ingestionStreamSection === "failed") return failed;
+      if (ingestionStreamSection === "historical") return Boolean(timestamp && Date.now() - timestamp >= 86400000);
+      return true;
+    });
+    const counts = { all: sectionRows.length, email: 0, log: 0, prometheus: 0, telemetry: 0, ticket: 0, failed: 0 };
+    sectionRows.forEach((row) => {
       const channels = Array.isArray(row?.source_channels) && row.source_channels.length
         ? row.source_channels
         : [String(row?.source_channel || "prometheus")];
@@ -8102,7 +8223,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       }
     });
     return counts;
-  }, [scopedIngestionStreamRows]);
+  }, [scopedIngestionStreamRows, ingestionStreamSection]);
   const visibleIngestionStreamRows = useMemo(() => {
     const query = String(ingestionStreamQuery || "").trim().toLowerCase();
     const now = Date.now();
@@ -8191,8 +8312,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     { id: "validation", label: "Recovery validation", detail: editedExecutionPlan.queries.length ? `${editedExecutionPlan.queries.length} post-check(s) supplied.` : "No explicit validation query is attached.", passed: editedExecutionPlan.queries.length > 0, blocking: false },
   ];
   const blockingPreflightFailures = executionPreflightChecks.filter((check) => check.blocking && !check.passed);
-  const executionPreflightCurrent = executionPreflightState.signature === executionPlanSignature && executionPreflightState.passed;
-  const cockpitApprovalAccepted = (!executionApprovalRequiresRenewal && ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus))
+  const executionAwaitingTerminalResult = remediationExecutionState.loading && Boolean(remediationExecutionState.result);
+  const executionSetupBlocked = !executionAwaitingTerminalResult && blockingPreflightFailures.length > 0;
+  const executionPreflightCurrent = executionAwaitingTerminalResult || (executionPreflightState.signature === executionPlanSignature && executionPreflightState.passed);
+  const cockpitApprovalAccepted = executionAwaitingTerminalResult || (!executionApprovalRequiresRenewal && ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus))
     || approvedExecutionSignature === executionPlanSignature;
   const executionAllowed = !remediationExecutionState.loading
     && executionPreflightCurrent
@@ -8200,7 +8323,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     && executionConfirmationValid
     && liveExecutionPlanAvailable
     && blockingPreflightFailures.length === 0;
-  const executionCapabilityBlocked = executionPreflightCurrent
+  const executionCapabilityBlocked = !executionAwaitingTerminalResult
+    && executionPreflightCurrent
     && cockpitApprovalAccepted
     && executionConfirmationValid
     && !liveExecutionPlanAvailable;
@@ -8220,7 +8344,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             ? `Type ${executionConfirmationPhrase} in the production confirmation field`
             : "Execution is temporarily unavailable";
   const cockpitApprovalComplete = ["approved", "modified", "rejected"].includes(selectedExecutionBreakdown.approvalStatus);
-  const cockpitExecutionStatus = String(selectedExecutionPlan.remediationAction?.status || "").trim().toLowerCase();
+  const recordedExecutionStatus = String(selectedExecutionPlan.remediationAction?.status || "").trim().toLowerCase();
+  const terminalIncidentStatus = String(selectedExecutionBreakdown.incidentStatus || "").trim().toLowerCase();
+  const cockpitExecutionStatus = ["closed", "resolved"].includes(terminalIncidentStatus)
+    ? "succeeded"
+    : terminalIncidentStatus === "failed"
+      ? "failed"
+      : recordedExecutionStatus;
   const cockpitAnalysis = canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow);
   const executionOutcomeReviewed = String(executionOutcomeReview.reviewedAlertId || "") === String(selectedAlertId || "")
     || selectedAlertRagDocuments.some((document) => String(document?.source_system || document?.metadata?.source_system || "").toLowerCase() === "kaims-execution-review");
@@ -8263,13 +8393,16 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const response = selectedExecutionTechnicalResponse && typeof selectedExecutionTechnicalResponse === "object" ? selectedExecutionTechnicalResponse : {};
     const submitted = response.submitted_parameters && typeof response.submitted_parameters === "object" ? response.submitted_parameters : {};
     const executor = String(response.executor || remediationPlanEditor.executor_type || remediationPlanEditor.connection_type || "").toLowerCase();
+    const resolutionId = String(submitted.KAI_OPS_RESOLUTION_ID || response.resolution_id || selectedExecutionPlan.remediationAction?.parameters?.resolution_id || selectedExecutionPlan.remediationAction?.action_type || "").trim();
+    const submittedDryRun = submitted.KAI_OPS_DRY_RUN ?? response.dry_run ?? selectedExecutionPlan.remediationAction?.parameters?.dry_run;
     return {
       configured: executor === "jenkins",
       jobName: String(response.job_name || remediationPlanEditor.job_name || ""),
       queueUrl: String(response.queue_url || ""),
-      resolutionId: String(submitted.KAI_OPS_RESOLUTION_ID || response.resolution_id || selectedExecutionPlan.remediationAction?.parameters?.resolution_id || selectedExecutionPlan.remediationAction?.action_type || "Not selected"),
+      resolutionId: resolutionId || "Not selected",
+      hasResolution: Boolean(resolutionId),
       applicationId: String(submitted.KAI_OPS_APPLICATION_ID || selectedExecutionPlan.remediationAction?.parameters?.application_id || selectedApplicationConnection.application || "Not recorded"),
-      dryRun: String(submitted.KAI_OPS_DRY_RUN ?? selectedExecutionPlan.remediationAction?.parameters?.dry_run ?? "true") === "true",
+      executionMode: submittedDryRun == null ? "Not run" : String(submittedDryRun).toLowerCase() === "true" ? "Dry run" : "Live",
       queued: Boolean(response.queue_url),
       succeeded: String(selectedRemediationOutcome?.status || "").toLowerCase() === "succeeded",
     };
@@ -10987,18 +11120,18 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <span>Target: {selectedApplicationConnection.service} Â· {selectedApplicationConnection.environment} Â· Risk: {selectedExecutionPlan.riskTier || "unknown"}</span>
                           <span>Duplicate execution is guarded by the remediation idempotency contract; repeated clicks are disabled while a request is active.</span>
                         </div>
-                        <section className={`jenkins-process-panel ${selectedJenkinsProcess.configured ? "is-configured" : "is-pending"}`} aria-labelledby="jenkins-process-heading">
+                        {jenkinsExecutorSelected ? <section className={`jenkins-process-panel ${selectedJenkinsProcess.configured ? "is-configured" : "is-pending"}`} aria-labelledby="jenkins-process-heading">
                           <header><div><span className="eyebrow">Application automation</span><h3 id="jenkins-process-heading">Jenkins Resolution Process</h3><p>Governed execution from resolution selection through recovery validation.</p></div><span className={`pill ${selectedJenkinsProcess.succeeded ? "pill-success" : selectedJenkinsProcess.queued ? "pill-info" : selectedJenkinsProcess.configured ? "pill-warning" : "status-failed"}`}>{selectedJenkinsProcess.succeeded ? "Completed" : selectedJenkinsProcess.queued ? "Queued" : selectedJenkinsProcess.configured ? "Configured" : "Not configured"}</span></header>
-                          <dl className="jenkins-process-summary"><div><dt>Application</dt><dd>{selectedJenkinsProcess.applicationId}</dd></div><div><dt>Jenkins job</dt><dd>{selectedJenkinsProcess.jobName || "Job path required"}</dd></div><div><dt>Resolution</dt><dd>{selectedJenkinsProcess.resolutionId}</dd></div><div><dt>Execution</dt><dd>{selectedJenkinsProcess.dryRun ? "Dry run" : "Live"}</dd></div></dl>
+                          <dl className="jenkins-process-summary"><div><dt>Application</dt><dd>{selectedJenkinsProcess.applicationId}</dd></div><div><dt>Jenkins job</dt><dd>{selectedJenkinsProcess.jobName || "Job path required"}</dd></div><div><dt>Resolution</dt><dd>{selectedJenkinsProcess.resolutionId}</dd></div><div><dt>Execution</dt><dd>{selectedJenkinsProcess.executionMode}</dd></div></dl>
                           <ol className="jenkins-process-flow" aria-label="Jenkins resolution progress">
-                            <li className="is-complete"><span>1</span><div><strong>Resolution selected</strong><small>{selectedJenkinsProcess.resolutionId}</small></div></li>
+                            <li className={selectedJenkinsProcess.hasResolution ? "is-complete" : "is-current"}><span>1</span><div><strong>Resolution selected</strong><small>{selectedJenkinsProcess.resolutionId}</small></div></li>
                             <li className={executionPreflightCurrent ? "is-complete" : "is-current"}><span>2</span><div><strong>Safety validation</strong><small>{executionPreflightCurrent ? "Dry run passed" : "Dry run required"}</small></div></li>
                             <li className={cockpitApprovalAccepted ? "is-complete" : executionPreflightCurrent ? "is-current" : ""}><span>3</span><div><strong>Approval</strong><small>{cockpitApprovalAccepted ? "Recorded" : "Pending"}</small></div></li>
                             <li className={selectedJenkinsProcess.queued || selectedJenkinsProcess.succeeded ? "is-complete" : cockpitApprovalAccepted ? "is-current" : ""}><span>4</span><div><strong>Jenkins execution</strong><small>{selectedJenkinsProcess.succeeded ? "Completed" : selectedJenkinsProcess.queued ? "Build queued" : "Waiting"}</small></div></li>
                             <li className={selectedJenkinsProcess.succeeded ? "is-complete" : ""}><span>5</span><div><strong>Validate and close</strong><small>{selectedJenkinsProcess.succeeded ? `${editedExecutionPlan.queries.length} check(s)` : "Waiting for result"}</small></div></li>
                           </ol>
                           <footer><div><strong>Rollback</strong><span>{executionRollbackPlan || "Rollback instructions are required before live execution."}</span></div>{selectedJenkinsProcess.queueUrl ? <a className="button-secondary" href={selectedJenkinsProcess.queueUrl} target="_blank" rel="noreferrer">Open Jenkins build</a> : <button type="button" className="button-secondary" onClick={() => document.querySelector(".remediation-connection-panel")?.scrollIntoView({ behavior: "smooth", block: "start" })}>{selectedJenkinsProcess.configured ? "Review Jenkins setup" : "Configure Jenkins"}</button>}</footer>
-                        </section>
+                        </section> : null}
                         <details className="execution-safety-details">
                           <summary>Safety checks <span>{executionPreflightChecks.filter((check) => check.passed).length}/{executionPreflightChecks.length} ready</span></summary>
                           <div className="execution-decision-grid">
@@ -11064,16 +11197,15 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           </div>
                         </article>
                         <section className="execution-guided-flow" aria-labelledby="guided-execution-heading">
-                          <div className="execution-guided-head"><div><span className="discovery-eyebrow">Guarded execution</span><h3 id="guided-execution-heading">Complete the current step</h3><p>{executionActivationMessage}</p></div><span className={`pill ${executionAllowed ? "pill-success" : "pill-warning"}`}>{executionAllowed ? "Ready" : executionCapabilityBlocked ? "Blocked" : "In progress"}</span></div>
+                          <div className="execution-guided-head"><div><span className="discovery-eyebrow">Guarded execution</span><h3 id="guided-execution-heading">Complete the current step</h3><p>{executionActivationMessage}</p></div><span className={`pill ${executionAllowed ? "pill-success" : "pill-warning"}`}>{executionAllowed ? "Ready" : executionSetupBlocked || executionCapabilityBlocked ? "Blocked" : "In progress"}</span></div>
                           <ol className="execution-stepper" aria-label="Execution progress">
-                            <li className={executionPreflightCurrent ? "is-complete" : "is-current"}><span>1</span><div><strong>Dry run</strong><small>{executionPreflightCurrent ? "Passed" : "Required"}</small></div></li>
+                            <li className={executionPreflightCurrent || executionAwaitingTerminalResult ? "is-complete" : "is-current"}><span>1</span><div><strong>Dry run</strong><small>{executionPreflightCurrent || executionAwaitingTerminalResult ? "Passed" : executionSetupBlocked ? "Blocked by setup" : "Required"}</small></div></li>
                             <li className={cockpitApprovalAccepted ? "is-complete" : executionPreflightCurrent ? "is-current" : ""}><span>2</span><div><strong>Approve</strong><small>{cockpitApprovalAccepted ? "Recorded" : "Pending"}</small></div></li>
                             <li className={executionConfirmationValid ? "is-complete" : cockpitApprovalAccepted ? "is-current" : ""}><span>3</span><div><strong>Confirm</strong><small>{executionConfirmationValid ? "Complete" : "Pending"}</small></div></li>
                             <li className={remediationExecutionState.loading || executionAllowed ? "is-current" : ""}><span>4</span><div><strong>Execute</strong><small>{remediationExecutionState.loading ? "Running" : executionAllowed ? "Ready" : executionCapabilityBlocked ? "Executor required" : "Locked"}</small></div></li>
                           </ol>
                           <div className="execution-current-step">
-                            {!executionIsReadOnly && !jenkinsExecutorSelected ? <div className="execution-step-form"><div><strong>Executor required</strong><p>KaiMS detected a live action without a governed connector. Build the required Jenkins process, complete its endpoint and secret reference, then run dry run.</p></div><button type="button" className="button-primary" onClick={buildRequiredExecutor}>Build required process</button></div> : null}
-                            {!executionPreflightCurrent ? <><div><strong>Validate without making changes</strong><p>KaiMS checks the target, identity, policy, and executable plan.</p></div><button type="button" className="button-primary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running dry runâ€¦" : "Run dry run"}</button></> : !cockpitApprovalAccepted ? <div className="execution-step-form"><div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div><label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this plan safe and appropriate?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading}>{approvalState.loading ? "Recording approvalâ€¦" : "Approve plan"}</button></div> : dangerousProductionAction && !executionConfirmationValid ? <div className="execution-step-form"><label className="typed-execution-confirmation">Type <code>{executionConfirmationPhrase}</code> to confirm production execution<input value={executionConfirmationText} autoComplete="off" autoFocus onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label></div> : executionCapabilityBlocked ? <div className="execution-step-form"><div><strong>Live execution is not configured</strong><p>This approved plan still contains <code>--dry-run true</code>. Preparing live execution changes it to <code>--dry-run false</code> and requires a new dry run, approval, and confirmation.</p></div><button type="button" className="button-primary" onClick={prepareLiveExecutionPlan}>Prepare live execution</button></div> : <><div><strong>All safety gates passed</strong><p>{selectedApplicationConnection.service} Â· {selectedApplicationConnection.environment} Â· {selectedExecutionPlan.riskTier || "unknown risk"}</p></div><button type="button" className="button-primary execution-primary-action" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed}>{remediationExecutionState.loading ? "Executingâ€¦" : "Execute approved plan"}</button></>}
+                            {executionSetupBlocked ? <div className="execution-step-form"><div><strong>Complete required setup before dry run</strong><p>{blockingPreflightFailures.map((check) => check.label).join(", ")}</p></div>{!executionIsReadOnly && !jenkinsExecutorSelected ? <button type="button" className="button-primary" onClick={buildRequiredExecutor}>Build required process</button> : null}</div> : !executionPreflightCurrent ? <><div><strong>Validate without making changes</strong><p>KaiMS checks the target, identity, policy, and executable plan.</p></div><button type="button" className="button-primary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running dry runâ€¦" : "Run dry run"}</button></> : !cockpitApprovalAccepted ? <div className="execution-step-form"><div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div><label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this plan safe and appropriate?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading}>{approvalState.loading ? "Recording approvalâ€¦" : "Approve plan"}</button></div> : dangerousProductionAction && !executionConfirmationValid ? <div className="execution-step-form"><label className="typed-execution-confirmation">Type <code>{executionConfirmationPhrase}</code> to confirm production execution<input value={executionConfirmationText} autoComplete="off" autoFocus onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label></div> : executionCapabilityBlocked ? <div className="execution-step-form"><div><strong>Live execution is not configured</strong><p>This approved plan still contains <code>--dry-run true</code>. Preparing live execution changes it to <code>--dry-run false</code> and requires a new dry run, approval, and confirmation.</p></div><button type="button" className="button-primary" onClick={prepareLiveExecutionPlan}>Prepare live execution</button></div> : <><div><strong>All safety gates passed</strong><p>{selectedApplicationConnection.service} Â· {selectedApplicationConnection.environment} Â· {selectedExecutionPlan.riskTier || "unknown risk"}</p></div><button type="button" className="button-primary execution-primary-action" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed}>{remediationExecutionState.loading ? "Executingâ€¦" : "Execute approved plan"}</button></>}
                           </div>
                           {remediationExecutionState.error ? <p className="error">{remediationExecutionState.error}</p> : null}
                           {approvalState.error ? <p className="error">{approvalState.error}</p> : null}

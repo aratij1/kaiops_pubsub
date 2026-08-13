@@ -34,6 +34,55 @@ async def test_selected_jenkins_executor_routes_non_rollback_actions_to_jenkins(
     assert result.parameters["execution_result"]["executor"] == "jenkins"
 
 
+def test_default_jenkins_profile_is_applied_to_alerts_without_connector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REMEDIATION_DEFAULT_EXECUTOR", "jenkins")
+    monkeypatch.setenv("REMEDIATION_JENKINS_URL", "http://jenkins:8080")
+    monkeypatch.setenv("REMEDIATION_JENKINS_JOB", "kaiops-auto-remediation")
+    monkeypatch.setenv("REMEDIATION_JENKINS_CREDENTIAL_REF", "vault://kaiops/local/jenkins#api-token")
+
+    action = RemediationEngine().build_action(
+        Approval(
+            incident_id="11111111-1111-1111-1111-111111111111",
+            recommendation_id="22222222-2222-2222-2222-222222222222",
+            decision=ApprovalDecision.APPROVED,
+            approver="sre-user",
+            comment="restart pod",
+        )
+    )
+
+    assert action.parameters["connection_profile"]["executor_type"] == "jenkins"
+    assert action.parameters["connection_profile"]["endpoint_url"] == "http://jenkins:8080"
+    assert action.parameters["connection_profile"]["job_name"] == "kaiops-auto-remediation"
+    assert action.parameters["connection_profile"]["credential_ref"].startswith("vault://")
+
+
+def test_jenkins_script_only_plan_receives_governed_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REMEDIATION_DEFAULT_EXECUTOR", "jenkins")
+    action = RemediationEngine().build_action(
+        Approval(
+            incident_id="11111111-1111-1111-1111-111111111111",
+            recommendation_id="22222222-2222-2222-2222-222222222222",
+            decision=ApprovalDecision.APPROVED,
+            approver="sre-user",
+            comment="rollback deployment",
+            metadata={
+                "service": "api-gateway",
+                "environment": "prod",
+                "execution_plan": {
+                    "commands": [],
+                    "scripts": ["scripts/remediation/rollback_deployment.ps1 -Service api-gateway -Namespace prod"],
+                    "queries": [],
+                },
+            },
+        )
+    )
+
+    assert action.parameters["execution_plan"]["commands"]
+    assert action.parameters["execution_plan"]["commands"][0].startswith("kubectl rollout undo")
+
+
 @pytest.mark.asyncio
 async def test_remediation_engine_executes_via_tool_registry() -> None:
     engine = RemediationEngine()
@@ -129,6 +178,10 @@ async def test_jenkins_submits_application_resolution_contract(monkeypatch: pyte
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/crumbIssuer/api/json"):
             return httpx.Response(404)
+        if request.url.path == "/queue/item/7/api/json":
+            return httpx.Response(200, json={"cancelled": False, "executable": {"url": "https://jenkins.example/job/payments/7/"}})
+        if request.url.path == "/job/payments/7/api/json":
+            return httpx.Response(200, json={"building": False, "result": "SUCCESS"})
         submitted.update(dict(request.url.params))
         return httpx.Response(201, headers={"location": "https://jenkins.example/queue/item/7"})
 
@@ -153,3 +206,4 @@ async def test_jenkins_submits_application_resolution_contract(monkeypatch: pyte
     assert submitted["KAI_OPS_NAMESPACE"] == "prod-payments"
     assert submitted["KAI_OPS_RESOLUTION_ID"] == "restart-workload"
     assert submitted["KAI_OPS_DRY_RUN"] == "true"
+    assert result.parameters["execution_result"]["build_result"] == "SUCCESS"

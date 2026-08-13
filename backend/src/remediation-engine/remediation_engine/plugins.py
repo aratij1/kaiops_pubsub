@@ -112,19 +112,63 @@ class JenkinsRollbackPlugin(BasePlugin):
                 headers[str(crumb.get("crumbRequestField") or "Jenkins-Crumb")] = str(crumb.get("crumb") or "")
             response = await client.post(build_url, params=parameters, headers=headers)
             response.raise_for_status()
+            queue_url = str(response.headers.get("location") or "").strip()
+            if not queue_url:
+                action.status = RemediationStatus.FAILED
+                action.error = "Jenkins accepted the request without returning a queue URL"
+                return action
 
-        queue_url = str(response.headers.get("location") or "").strip()
-        action.status = RemediationStatus.SUCCEEDED
-        action.output = f"Jenkins build queued for {job_name}"
+            poll_interval = max(0.25, min(float(os.getenv("REMEDIATION_JENKINS_POLL_SECONDS", "1")), 10.0))
+            deadline = asyncio.get_running_loop().time() + timeout_seconds
+            resolved_build_url = ""
+            while asyncio.get_running_loop().time() < deadline:
+                queue_response = await client.get(f"{queue_url.rstrip('/')}/api/json")
+                queue_response.raise_for_status()
+                queue_payload = queue_response.json()
+                if bool(queue_payload.get("cancelled")):
+                    action.status = RemediationStatus.FAILED
+                    action.error = "Jenkins cancelled the queued remediation build"
+                    break
+                executable = queue_payload.get("executable") if isinstance(queue_payload.get("executable"), dict) else {}
+                resolved_build_url = str(executable.get("url") or "").strip()
+                if resolved_build_url:
+                    break
+                await asyncio.sleep(poll_interval)
+
+            build_result = ""
+            while resolved_build_url and asyncio.get_running_loop().time() < deadline:
+                build_response = await client.get(f"{resolved_build_url.rstrip('/')}/api/json")
+                build_response.raise_for_status()
+                build_payload = build_response.json()
+                if not bool(build_payload.get("building")):
+                    build_result = str(build_payload.get("result") or "UNKNOWN").strip().upper()
+                    break
+                await asyncio.sleep(poll_interval)
+
+        if not action.error and not resolved_build_url:
+            action.status = RemediationStatus.FAILED
+            action.error = f"Jenkins queue did not start a build within {timeout_seconds:g}s"
+        elif not action.error and not build_result:
+            action.status = RemediationStatus.FAILED
+            action.error = f"Jenkins build did not finish within {timeout_seconds:g}s"
+        elif not action.error and build_result == "SUCCESS":
+            action.status = RemediationStatus.SUCCEEDED
+            action.output = f"Jenkins build completed successfully for {job_name}"
+        elif not action.error:
+            action.status = RemediationStatus.FAILED
+            action.error = f"Jenkins build finished with result {build_result}"
+            action.output = f"Jenkins remediation failed for {job_name}"
         action.parameters["execution_result"] = {
-            "executed": True,
+            "executed": action.status == RemediationStatus.SUCCEEDED,
             "executor": "jenkins",
             "connector_endpoint": endpoint,
             "job_name": job_name,
             "queue_url": queue_url,
+            "build_url": resolved_build_url,
+            "build_result": build_result or None,
             "secret_ref": secret_ref,
             "submitted_parameters": {key: value for key, value in parameters.items() if key != "KAI_OPS_EXECUTION_PLAN"},
-            "summary": "Jenkins accepted the governed remediation build request.",
+            "summary": action.error or action.output,
         }
         return action
 
@@ -447,10 +491,28 @@ class RemediationEngine(BaseAgent):
             recommended_action=recommended_action,
             recommended_commands=command_list,
         )
+        connection_profile = approval.metadata.get("connection_profile") if isinstance(approval.metadata.get("connection_profile"), dict) else {}
+        requested_executor = str(
+            connection_profile.get("executor_type")
+            or connection_profile.get("connection_type")
+            or os.getenv("REMEDIATION_DEFAULT_EXECUTOR", "")
+        ).strip().lower()
+        use_generated_commands = not plan_commands and requested_executor == "jenkins"
+        governed_generated_commands = [
+            str(item).strip()
+            for item in generated_execution_plan.get("commands", [])
+            if str(item).strip()
+            and not str(item).strip().lower().startswith("scripts/")
+            and not str(item).strip().lower().endswith((".ps1", ".sh"))
+        ]
         execution_plan = {
             "commands": [
                 str(item).strip()
-                for item in (plan_commands if has_approved_execution_plan else generated_execution_plan.get("commands", []))
+                for item in (
+                    governed_generated_commands
+                    if use_generated_commands
+                    else plan_commands if has_approved_execution_plan else generated_execution_plan.get("commands", [])
+                )
                 if str(item).strip()
             ],
             "scripts": [
@@ -464,7 +526,30 @@ class RemediationEngine(BaseAgent):
                 if str(item).strip()
             ],
         }
-        connection_profile = approval.metadata.get("connection_profile") if isinstance(approval.metadata.get("connection_profile"), dict) else {}
+        supplied_profile = connection_profile
+        default_executor = os.getenv("REMEDIATION_DEFAULT_EXECUTOR", "").strip().lower()
+        if default_executor == "jenkins":
+            default_profile: dict[str, Any] = {
+                "application": str(approval.metadata.get("application") or "KaiMS"),
+                "service": service or "unknown",
+                "environment": environment or "local",
+                "namespace": str(approval.metadata.get("namespace") or environment or "default"),
+                "endpoint_url": os.getenv("REMEDIATION_JENKINS_URL", "http://jenkins:8080").strip(),
+                "connection_type": "jenkins",
+                "executor_type": "jenkins",
+                "job_name": os.getenv("REMEDIATION_JENKINS_JOB", "kaiops-auto-remediation").strip(),
+                "timeout_seconds": 120,
+                "credential_ref": os.getenv(
+                    "REMEDIATION_JENKINS_CREDENTIAL_REF",
+                    "vault://kaiops/local/jenkins#api-token",
+                ).strip(),
+            }
+            connection_profile = {
+                **default_profile,
+                **{key: value for key, value in supplied_profile.items() if value not in (None, "")},
+            }
+        else:
+            connection_profile = supplied_profile
 
         return RemediationAction(
             incident_id=approval.incident_id,
