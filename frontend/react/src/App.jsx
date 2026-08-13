@@ -10,6 +10,7 @@ import { projectIdentityFromAlert } from "./domain/projectIdentity";
 import { buildOnboardingSources } from "./domain/onboardingSources";
 import { buildAlertDocumentDraft as buildRcaEvidenceDocumentDraft } from "./domain/alertDocumentDraft";
 import RcaPanel from "./routes/incidents/RcaPanel";
+import "./routes/incidents/ExecutionWorkspace.css";
 import CopilotRoute from "./routes/copilot/CopilotRoute";
 import { breadcrumbForPath, groupedNavigationForRole, navigationItemForPath, TAB_SHORTCUT_BY_CODE, VALID_LEGACY_TABS } from "./app/navigation";
 import { allowedLegacyTabsForRole, canAccessDestination } from "./app/permissions";
@@ -11056,10 +11057,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <div><h3>Execution Plan</h3><p>Editing an approved plan invalidates the current preflight check. Review and run preflight again before execution.</p></div>
                             <button type="button" className="button-secondary" onClick={resetSuggestedRemediationPlan} disabled={remediationExecutionState.loading}>Restore suggested plan</button>
                           </div>
-                          <div className="remediation-editor-grid">
-                            <label>Single Remediation Script<textarea rows={8} value={remediationPlanEditor.scripts} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, scripts: e.target.value }))} /></label>
-                            <label>Additional Commands<textarea rows={8} value={remediationPlanEditor.commands} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, commands: e.target.value }))} /></label>
-                            <label>Additional Validation Queries<textarea rows={8} value={remediationPlanEditor.queries} onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, queries: e.target.value }))} /></label>
+                          <div className="remediation-editor-grid compact-plan-editor">
+                            <label><span>Remediation script</span><small>{editedExecutionPlan.scripts.length} step(s)</small><textarea rows={4} value={remediationPlanEditor.scripts} placeholder="No remediation script supplied" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, scripts: e.target.value }))} /></label>
+                            <label><span>Additional commands</span><small>{editedExecutionPlan.commands.length} command(s)</small><textarea rows={4} value={remediationPlanEditor.commands} placeholder="No additional commands" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, commands: e.target.value }))} /></label>
+                            <label><span>Validation queries</span><small>{editedExecutionPlan.queries.length} check(s)</small><textarea rows={4} value={remediationPlanEditor.queries} placeholder="No validation queries supplied" onChange={(e) => setRemediationPlanEditor((curr) => ({ ...curr, queries: e.target.value }))} /></label>
                           </div>
                         </article>
                         <section className="execution-guided-flow" aria-labelledby="guided-execution-heading">

@@ -910,13 +910,32 @@ services:
   remediation-engine:
     build: *service-build
     restart: unless-stopped
-    environment: { <<: *service-env, SERVICE_NAME: remediation-engine }
+    environment:
+      <<: *service-env
+      SERVICE_NAME: remediation-engine
+      JENKINS_USERNAME: ${JENKINS_USERNAME:-kaiops}
+      JENKINS_API_TOKEN: ${JENKINS_API_TOKEN:-kaiops-local-token}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/remediation-engine
     ports: ["8008:8000"]
     depends_on:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
+
+  jenkins:
+    profiles: ["jenkins"]
+    build:
+      context: ./deploy/jenkins
+      dockerfile: Dockerfile.local
+    restart: unless-stopped
+    environment:
+      JENKINS_BOOTSTRAP_USERNAME: ${JENKINS_USERNAME:-kaiops}
+      JENKINS_BOOTSTRAP_PASSWORD: ${JENKINS_API_TOKEN:-kaiops-local-token}
+      JAVA_OPTS: -Djenkins.install.runSetupWizard=false
+    ports: ["8082:8080"]
+    volumes:
+      - jenkins-data:/var/jenkins_home
+      - ./deploy/jenkins:/opt/kaiops:ro
 
   closure-service:
     build: *service-build
@@ -1368,3 +1387,4 @@ volumes:
   grafana-data:
   ui-dev-node-modules:
   ui-dev-npm-cache:
+  jenkins-data:

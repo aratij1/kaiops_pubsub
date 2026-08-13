@@ -19,11 +19,13 @@ describe("internal API contract registry", () => {
       unacknowledged: 0,
     })).toMatchObject({ status: "healthy", healthy: true, queues: 4 });
     expect(parseInternalApiResponse("/api-gateway/incidents/metadata?limit=10", "GET", { rows: [] })).toMatchObject({ rows: [] });
+    expect(parseInternalApiResponse("/api-gateway/evaluations/by-recommendation/1f11cbe9-274a-490a-ae4c-aebb3d70e58a/feedback", "POST", { updated: true })).toEqual({ updated: true });
     expect(() => parseInternalApiResponse("/api-gateway/unregistered", "GET", {})).toThrow(ApiValidationError);
   });
 
   it("rejects malformed authentication and streaming payloads", () => {
     expect(() => parseInternalApiResponse("/api-gateway/auth/login", "POST", { access_token: "" })).toThrow(ApiValidationError);
+    expect(() => parseInternalApiResponse("/api-gateway/evaluations/by-recommendation/1f11cbe9-274a-490a-ae4c-aebb3d70e58a/feedback", "POST", { updated: "yes" })).toThrow(ApiValidationError);
     expect(OperationalEventSchema.safeParse({ id: "", type: "alert.created", data: {} }).success).toBe(false);
   });
 
