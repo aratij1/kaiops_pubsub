@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Activity, BookOpen, CheckCircle2, Clock3, Code2, Database, FileSearch, GitCommit, Network, Search, ShieldAlert, Sparkles } from "lucide-react";
 import {
   canonicalIncidentAnalysis,
   formatQualityPercent,
@@ -15,6 +16,7 @@ import {
 } from "../../appHelpers.jsx";
 import EvidenceDraftReview from "./EvidenceDraftReview";
 import "./RcaPanel.css";
+import "./EvidenceReview.css";
 
 type RcaDetailView = "summary" | "evidence" | "technical";
 
@@ -72,6 +74,17 @@ export default function RcaPanel({
       ? discoveryAnalysis.proposed_code_changes
       : [];
   const resolutionService = selectedAlertRow?.service || selectedAlertRow?.application || "unknown";
+  const evidenceSources = [
+    { id: "metrics", label: "Metrics", icon: Activity, match: /prometheus|metric/i },
+    { id: "logs", label: "Logs", icon: FileSearch, match: /log|opensearch|elastic/i },
+    { id: "traces", label: "Traces", icon: Network, match: /trace|jaeger|span/i },
+    { id: "changes", label: "Changes", icon: GitCommit, match: /deploy|change|commit|git/i },
+    { id: "code", label: "Source code", icon: Code2, match: /code|source/i },
+    { id: "knowledge", label: "Knowledge", icon: BookOpen, match: /rag|runbook|ticket|jira|document/i },
+  ].map((source) => {
+    const matches = selectedAiTrust.evidence.filter((row: any) => source.match.test(`${row.source || ""} ${row.citation || ""}`));
+    return { ...source, count: matches.length, fresh: matches.filter((row: any) => !row.cached).length };
+  });
   useEffect(() => {
     let active = true;
     setSelectedResolution(null);
@@ -103,11 +116,11 @@ export default function RcaPanel({
   }
   return (
     <section className="combined-analysis-page">
-      <header className="combined-analysis-hero">
+      <header className="combined-analysis-hero understand-workspace-hero">
         <div>
-          <span className="discovery-eyebrow">Investigation overview</span>
-          <h3>Discovery + Context</h3>
-          <p>See what KaiMS found, what it means, and what to do next.</p>
+          <span className="discovery-eyebrow">Incident intelligence</span>
+          <h3>Understand Workspace</h3>
+          <p>Evidence, causal analysis, impact, and the safest next action in one operational view.</p>
         </div>
         <div className="combined-analysis-kpis">
           <span><strong>{selectedAlertTimelineRows.length}</strong> timeline stages</span>
@@ -116,6 +129,10 @@ export default function RcaPanel({
           <span><strong>{Array.isArray(selectedAlertRow?.source_channels) ? selectedAlertRow.source_channels.map(sourceChannelLabel).join(" + ") : sourceChannelLabel(normalizeAlertChannel(selectedAlertRow))}</strong> sources</span>
         </div>
       </header>
+      <section className="understand-source-matrix" aria-label="External knowledge and evidence coverage">
+        <header><div><Search size={17} /><span><strong>Evidence coverage</strong><small>Live operational data and external knowledge used for this analysis</small></span></div><b>{evidenceSources.filter((source) => source.count).length}/{evidenceSources.length} connected</b></header>
+        <div>{evidenceSources.map(({ id, label, icon: Icon, count, fresh }) => <button type="button" key={id} className={count ? "has-evidence" : "is-missing"} onClick={() => onSetRcaDetailView(count ? "evidence" : "technical")}><i><Icon size={17} /></i><span><strong>{label}</strong><small>{count ? `${count} record${count === 1 ? "" : "s"} · ${fresh} fresh` : "No evidence returned"}</small></span>{count ? <CheckCircle2 size={15} /> : <ShieldAlert size={15} />}</button>)}</div>
+      </section>
       <nav className="rca-view-tabs" aria-label="RCA views">
         {[['summary', 'Summary'], ['evidence', `Evidence (${selectedAiTrust.evidence.length})`], ['technical', 'Technical analysis']].map(([id, label]) => <button key={id} type="button" className={rcaDetailView === id ? "active" : ""} aria-current={rcaDetailView === id ? "page" : undefined} onClick={() => onSetRcaDetailView(id as RcaDetailView)}>{label}</button>)}
       </nav>
@@ -131,11 +148,15 @@ export default function RcaPanel({
           </div>
         </header>
         {selectedRcaDecision.reviewRequired ? <div className="rca-review-banner" role="status"><strong>Human review required</strong><span>{selectedAiTrust.missing.length ? `${selectedAiTrust.missing.length} evidence gap(s) remain.` : "Confidence or grounding is below the auto-action threshold."}</span></div> : <div className="rca-ready-banner" role="status"><strong>Evidence is sufficiently grounded</strong><span>Confirm the target and safeguards before execution.</span></div>}
-        <div className="rca-decision-grid">
+        <div className="understand-decision-layout"><div className="rca-decision-grid">
           <article className="rca-decision-card rca-cause-card"><span>Evidence-backed root cause</span><h4>{selectedRcaDecision.rootCause}</h4><dl><div><dt>Causal mechanism</dt><dd>{selectedRcaDecision.causalDetails}</dd></div><div><dt>Assessment</dt><dd>{selectedRcaDecision.status === "hypothesis" ? "Hypothesis—not yet confirmed." : selectedRcaDecision.status === "insufficient-evidence" ? "Insufficient evidence to assign a cause." : "Grounded in the currently linked evidence."}</dd></div><div><dt>Evidence basis</dt><dd>{selectedRcaDecision.rca?.evidence_used?.length ? selectedRcaDecision.rca.evidence_used.join(", ") : "No RCA evidence identifiers were supplied; human validation is required."}</dd></div></dl></article>
           <article className="rca-decision-card rca-impact-card"><span>Observed impact and business risk</span><h4>{selectedRcaDecision.customerImpact}</h4><dl><div><dt>Observed service impact</dt><dd>{selectedRcaDecision.serviceImpact}</dd></div><div><dt>Dependency impact</dt><dd>{selectedRcaDecision.dependencyImpact}</dd></div><div><dt>Operational priority</dt><dd>{selectedRcaDecision.urgency}</dd></div>{selectedRcaDecision.impactedServices.length ? <div><dt>Affected services</dt><dd>{selectedRcaDecision.impactedServices.join(", ")}</dd></div> : null}<div><dt>Impact evidence</dt><dd>{selectedRcaDecision.impactEvidence.length ? selectedRcaDecision.impactEvidence.join(", ") : "No impact evidence identifiers were supplied; customer impact must not be assumed."}</dd></div></dl></article>
-          <article className="rca-decision-card rca-action-card"><span>Recommended response</span><h4>{selectedRcaDecision.action}</h4><div className="rca-decision-actions">{selectedAiTrust.missing.length ? <button type="button" className="button-primary" onClick={() => onSetRcaDetailView("evidence")}>Collect missing evidence</button> : <button type="button" className="button-primary" onClick={() => onSetHomeDetailTab("execution")}>{selectedRcaDecision.reviewRequired ? "Review plan and decide" : "Continue to remediation"}</button>}<button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("evidence")}>Inspect evidence</button></div></article>
-        </div>
+        </div><aside className="understand-action-rail">
+          <div className="understand-confidence-ring" style={{ "--confidence": `${Math.round(selectedRcaDecision.confidence * 100)}%` } as React.CSSProperties}><span><strong>{formatQualityPercent(selectedRcaDecision.confidence)}</strong><small>confidence</small></span></div>
+          <div><span className="discovery-eyebrow">Recommended response</span><h4>{selectedRcaDecision.action}</h4><p>{selectedRcaDecision.reviewRequired ? "Operator confirmation is required before execution." : "Evidence meets the current action threshold."}</p></div>
+          <dl><div><dt>Grounding</dt><dd>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</dd></div><div><dt>Citations</dt><dd>{formatQualityPercent(selectedAlertEvaluation.citationCoverage)}</dd></div><div><dt>Evidence gaps</dt><dd>{selectedAiTrust.missing.length}</dd></div></dl>
+          <div className="rca-decision-actions">{selectedAiTrust.missing.length ? <button type="button" className="button-primary" onClick={() => onSetRcaDetailView("evidence")}>Collect evidence</button> : <button type="button" className="button-primary" onClick={() => onSetHomeDetailTab("execution")}>{selectedRcaDecision.reviewRequired ? "Review plan" : "Continue"}</button>}<button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("evidence")}>Inspect evidence</button></div>
+        </aside></div>
         <section className="resolution-catalog" aria-labelledby="resolution-catalog-title">
           <header><div><span className="discovery-eyebrow">Resolution dictionary</span><h4 id="resolution-catalog-title">Choose the most relevant response</h4></div><span>{resolutionOptions.length} matched options</span></header>
           <div className="resolution-option-grid">{resolutionOptions.map((option) => <button key={option.id} type="button" className={selectedResolution?.id === option.id ? "selected" : ""} onClick={() => chooseResolution(option)}><span><strong>{option.title}</strong><small>{option.risk} risk</small></span><p>{option.applicability}</p>{option.match_reasons?.length ? <em>Matched: {option.match_reasons.join(", ")}</em> : <em>Diagnostic fallback</em>}</button>)}</div>
@@ -156,33 +177,27 @@ export default function RcaPanel({
         <span className="source-badge source-ticket">Jira / tickets</span>
         <span className="source-badge">Source code</span>
       </div> : null}
-      {rcaDetailView === "evidence" ? <section className="ai-trust-panel" aria-labelledby="ai-trust-title">
-        <header>
-          <div><span className="discovery-eyebrow">Evidence transparency</span><h4 id="ai-trust-title">Why KaiMS reached this recommendation</h4></div>
-          <span className={`workflow-pill workflow-pill-${qualityToneFromScore(selectedAlertEvaluation.confidenceScore) === "success" ? "active" : "idle"}`}>{formatQualityPercent(selectedAlertEvaluation.confidenceScore)} confidence</span>
+      {rcaDetailView === "evidence" ? <section className="ai-trust-panel evidence-review" aria-labelledby="ai-trust-title">
+        <header className="evidence-review-header">
+          <div><span className="discovery-eyebrow">Evidence review</span><h4 id="ai-trust-title">Why KaiMS reached this recommendation</h4><p>Separate direct observations from inferred conclusions before approving remediation.</p></div>
+          <div className={`evidence-confidence is-${qualityToneFromScore(selectedAlertEvaluation.confidenceScore)}`}><Sparkles size={17} /><span><strong>{formatQualityPercent(selectedAlertEvaluation.confidenceScore)}</strong><small>analysis confidence</small></span></div>
         </header>
-        <div className="ai-trust-classification ai-trust-classification-compact" aria-label="AI trust classifications">
-          <span><strong>Direct observation</strong>{selectedAiTrust.evidence.length} linked record(s)</span>
-          <span><strong>AI inference</strong>{selectedAiTrust.analysis.root_cause || canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).rootCause}</span>
-          <span><strong>Cached context</strong>{selectedAiTrust.evidence.filter((row: any) => row.cached).length} record(s)</span>
-          <span><strong>Fresh discovery</strong>{selectedAiTrust.evidence.filter((row: any) => !row.cached).length} record(s)</span>
-          <span><strong>Conflicting evidence</strong>{selectedAiTrust.conflicting.length ? selectedAiTrust.conflicting.join(", ") : "None declared by the analysis"}</span>
-          <span><strong>Missing evidence</strong>{selectedAiTrust.missing.length ? selectedAiTrust.missing.join(", ") : "None declared by the analysis"}</span>
-        </div>
+        <div className="evidence-health-strip" aria-label="Evidence health"><span><i><Database size={16} /></i><strong>{selectedAiTrust.evidence.length}</strong><small>linked records</small></span><span><i><Activity size={16} /></i><strong>{selectedAiTrust.evidence.filter((row: any) => !row.cached).length}</strong><small>fresh observations</small></span><span><i><Clock3 size={16} /></i><strong>{selectedAiTrust.evidence.filter((row: any) => row.cached).length}</strong><small>cached context</small></span><span className={selectedAiTrust.conflicting.length ? "has-risk" : "is-clear"}><i><ShieldAlert size={16} /></i><strong>{selectedAiTrust.conflicting.length}</strong><small>conflicts</small></span><span className={selectedAiTrust.missing.length ? "has-risk" : "is-clear"}><i><Search size={16} /></i><strong>{selectedAiTrust.missing.length}</strong><small>evidence gaps</small></span></div>
+        <section className="evidence-inference-brief"><div><span>AI inference</span><strong>{selectedAiTrust.analysis.root_cause || canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).rootCause}</strong></div><button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("summary")}>Compare decision</button></section>
         {selectedAiTrust.evidence.some((row: any) => row.cached && row.freshness === "Stale") ? <p className="ai-trust-warning" role="status">Cached context may predate the current deployment. Validate the target before acting.</p> : null}
-        <div className="ai-trust-summary-grid ai-trust-summary-compact">
+        <details className="evidence-model-details"><summary>Analysis diagnostics and model details</summary><div className="ai-trust-summary-grid ai-trust-summary-compact">
           <div><strong>Confidence reasons</strong><ul>{selectedAiTrust.confidenceReasons.map((reason: string) => <li key={reason}>{reason}</li>)}</ul></div>
           <div><strong>Model / provider</strong><p>{selectedAiTrust.providerRow ? `${selectedAiTrust.providerRow.model} / ${selectedAiTrust.providerRow.provider}` : "Not supplied by the workflow contract"}</p></div>
           <div><strong>Fallback model</strong><p>{selectedAiTrust.fallbackUsed ? "Used; review required" : "No fallback usage reported"}</p></div>
           <div><strong>Recommendation attempts</strong><p>{selectedAlertRegeneration.message || "One persisted attempt is available; comparison history was not supplied."}</p></div>
-        </div>
-        <details className="evidence-ledger">
+        </div></details>
+        <details className="evidence-ledger evidence-ledger-modern" open>
           <summary><div><strong>Evidence ledger</strong><span>{selectedAiTrust.evidence.length} linked records · expand for citations and freshness</span></div><span>View records</span></summary>
           <div className="table-wrap ai-evidence-table contained-table">
             <table>
               <thead><tr><th>Source</th><th>Observed</th><th>Freshness</th><th>Citation</th><th>Context</th></tr></thead>
               <tbody>{selectedAiTrust.evidence.length ? selectedAiTrust.evidence.map((row: any) => (
-                <tr key={row.id}><td><span className="source-badge">{row.source}</span></td><td>{row.timestamp ? formatUtcTimestamp(row.timestamp) : "Timestamp unavailable"}<small className="table-secondary">{row.age}</small></td><td>{row.freshness}</td><td className="evidence-citation"><code title={row.citation || "Not supplied"}>{row.citation || "Not supplied"}</code></td><td>{row.cached ? "Cached context" : "Fresh discovery"}</td></tr>
+                <tr key={row.id}><td><span className="source-badge">{row.source}</span></td><td>{row.timestamp ? formatUtcTimestamp(row.timestamp) : "Timestamp unavailable"}<small className="table-secondary">{row.age}</small></td><td><span className={`evidence-freshness ${row.cached ? "is-cached" : "is-fresh"}`}>{row.cached ? "Cached" : "Fresh"}</span><small className="table-secondary">{row.freshness}</small></td><td className="evidence-citation"><code title={row.citation || "Not supplied"}>{row.citation || "Not supplied"}</code></td><td>{row.cached ? "Historical context" : "Live discovery"}</td></tr>
               )) : <tr><td colSpan={5}>No linked evidence records. Treat the recommendation as ungrounded and require human review.</td></tr>}</tbody>
             </table>
           </div>

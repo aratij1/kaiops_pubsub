@@ -63,9 +63,11 @@ function lifecycleFor(row: IncidentRow): LifecycleStage[] {
   const understood = ["awaiting_approval", "approved", "remediating", "validating", "resolved", "closed", "failed"].includes(status);
   const approvalStarted = mode.includes("human") && (["awaiting_approval", "approved", "remediating", "validating", "resolved", "closed"].includes(status) || Boolean(decision));
   const approvalComplete = ["approved", "modified", "rejected"].includes(decision) || ["approved", "remediating", "validating", "resolved", "closed"].includes(status);
-  const resolved = ["remediating", "validating", "resolved", "closed"].includes(status);
   const validated = ["resolved", "closed"].includes(status);
-  const contextStarted = contextReady || latestEvent.includes("context") || understood;
+  const hasContextEvidence = Boolean(
+    projection.context_metadata || projection.context || event.context_metadata || event.context
+    || event.context_source || projection.context_source || latestEvent.includes("context"),
+  );
   const complete = (id: string, caption: string): LifecycleStage => ({ ...stageOrder.find((stage) => stage.id === id)!, state: "complete", caption });
   const application = value(labels.application, labels.project_name, event.application, row.service);
   const target = value(labels.instance, event.instance, event.target);
@@ -77,10 +79,10 @@ function lifecycleFor(row: IncidentRow): LifecycleStage[] {
     ...(application !== "Not recorded" ? [complete("application", application)] : []),
     ...(target !== "Not recorded" ? [complete("signal", target)] : []),
     ...(prometheusObserved ? [complete("prometheus", alertName !== "Not recorded" ? alertName : "Alert rule fired")] : []),
-    complete("ingest", value(event.received_at, row.created_at, "Received")),
-    complete("normalize", value(row.service, "Canonical alert")),
-    complete("deduplicate", duplicate ? "Duplicate linked" : Number(row.deduplicated_count || 1) > 1 ? `${row.deduplicated_count} occurrences merged` : "Unique signal"),
-    { ...stage("jira"), state: jiraReady ? "complete" : "current", caption: jiraReady ? String(row.ticket_id || row.jira_key) : "Creating ticket" },
+    ...(row.alert_id ? [complete("ingest", value(event.received_at, row.created_at, "Alert received"))] : []),
+    ...(/normaliz/.test(latestEvent) || Boolean(event.normalized_alert || projection.normalized_alert) ? [complete("normalize", value(row.service, "Canonical alert"))] : []),
+    ...(duplicate || Number(row.deduplicated_count || 1) > 1 || Boolean(event.deduplication || projection.deduplication) ? [complete("deduplicate", duplicate ? "Duplicate linked" : Number(row.deduplicated_count || 1) > 1 ? `${row.deduplicated_count} occurrences merged` : "Unique signal")] : []),
+    ...(jiraReady ? [complete("jira", String(row.ticket_id || row.jira_key))] : []),
   ];
   if (noise) {
     stages.push({ ...stage("decision"), state: "stopped", caption: "Noise / no action" });
@@ -91,23 +93,25 @@ function lifecycleFor(row: IncidentRow): LifecycleStage[] {
     return stages;
   }
   stages.push(complete("decision", "Incident created"));
-  if (contextStarted) {
+  if (hasContextEvidence) {
     stages.push({
       ...stage("context"),
       state: contextReady ? (contextState.source.includes("cache") || contextState.source === "ticket_payload" ? "reused" : "complete") : "current",
       caption: contextReady ? contextState.label : "Collecting evidence",
     });
   }
-  if (contextReady || understood) {
+  if (row.recommendation_id || event.recommendation_id || latestEvent.includes("recommendation") || understood) {
     stages.push({ ...stage("understand"), state: understood ? "complete" : "current", caption: understood ? "RCA generated" : "Generating RCA" });
   }
   if (approvalStarted) {
     stages.push({ ...stage("approval"), state: approvalComplete ? "complete" : "current", caption: approvalComplete ? "Decision recorded" : "Awaiting decision" });
   }
-  if (resolved || status === "failed") {
+  const hasRemediation = Boolean(projection.remediation_action || projection.remediation_status || event.remediation_action || latestEvent.includes("remediation"));
+  const hasValidation = Boolean(projection.closure_report || projection.validation || event.closure_report || latestEvent.includes("closure") || latestEvent.includes("validation"));
+  if (hasRemediation) {
     stages.push({ ...stage("resolve"), state: status === "failed" ? "failed" : "complete", caption: status === "failed" ? "Action required" : "Remediation started" });
   }
-  if (["validating", "resolved", "closed"].includes(status)) {
+  if (hasValidation) {
     stages.push({ ...stage("validate"), state: validated ? "complete" : "current", caption: validated ? "Verified and closed" : "Verifying recovery" });
   }
   return stages;
@@ -165,10 +169,14 @@ function contextPresentation(row: IncidentRow) {
   const source = String(nested?.context_source || event.context_source || projection.context_source || "").toLowerCase();
   const strategy = String(nested?.context_strategy || event.context_strategy || projection.context_strategy || "auto").toLowerCase();
   const realtime = nested?.realtime_collection_performed ?? event.realtime_collection_performed ?? projection.realtime_collection_performed;
+  const status = normalizedStatus(row);
+  const downstreamComplete = ["awaiting_approval", "approved", "remediating", "validating", "resolved", "closed", "failed"].includes(status)
+    || Boolean(row.recommendation_id || event.recommendation_id || projection.recommendation_id);
   if (source === "ticket_payload") return { label: "Available in ticket", source, strategy, realtime: false };
   if (["cache", "periodic_cache"].includes(source)) return { label: source === "periodic_cache" ? "Historical snapshot reused" : "Cached context reused", source, strategy, realtime: false };
   if (source === "historical_cache_miss") return { label: "Historical context unavailable", source, strategy, realtime: false };
   if (source === "realtime_collection" || realtime === true) return { label: "Realtime context collected", source: source || "realtime_collection", strategy, realtime: true };
+  if (downstreamComplete) return { label: "Context available", source: "provenance_not_recorded", strategy, realtime: null };
   return { label: "Context pending", source: source || "not_recorded", strategy, realtime: false };
 }
 
@@ -282,7 +290,7 @@ export default function IncidentsRoute() {
           deduplicate: [["Outcome", Number(row.deduplicated_count || 0) > 1 ? "Duplicate occurrence merged" : "Unique incident signal"], ["Occurrences", value(row.deduplicated_count || 1)], ["Fingerprint", value(row.fingerprint, event.fingerprint)], ["Correlation", value(row.correlation_id, event.correlation_id, row.deduplication_reason)]],
           jira: [["Ticket", jiraKey], ["Status", value(row.jira_status, jiraKey === "Pending" ? "Creation pending" : "Created")], ["Priority", value(row.jira_priority, row.risk_tier, row.severity)], ["Assignee", value(row.jira_assignee)]],
           decision: [["Outcome", disposition.noise ? "Noise / no action" : "Incident created"], ["Reason", disposition.noise ? disposition.reason : "Actionable signal accepted for investigation"], ["Incident", incidentId], ["Jira", jiraKey]],
-          context: [["Status", context.label], ["Strategy", context.strategy], ["Source", context.source], ["Realtime collection", context.realtime ? "Performed" : "Not required"]],
+          context: [["Status", context.label], ["Strategy", context.strategy], ["Source", context.source === "provenance_not_recorded" ? "Provenance not recorded" : context.source], ["Realtime collection", context.realtime === true ? "Performed" : context.realtime === false ? "Not required" : "Not recorded"]],
           understand: [["Status", lifecycle.some((stage) => stage.id === "understand" && stage.state === "complete") ? "RCA generated" : "Waiting for context"], ["Risk", value(row.risk_tier)], ["Recommendation", value(event.recommendation_id, row.recommendation_id)], ["Incident status", value(row.status)]],
           approval: [["Decision", value(row.approval_status, event.approval_status, String(row.execution_mode || event.execution_mode || "").includes("human") ? "Pending review" : "Not required")], ["Approver", value(row.approved_by, event.approved_by, event.approver)], ["Execution mode", value(row.execution_mode, event.execution_mode)], ["Comment", value(row.approval_comment, event.approval_comment, event.comment)]],
           resolve: [["Status", value(row.status)], ["Execution mode", value(row.execution_mode)], ["Recommendation", value(event.recommendation_id)], ["Service", value(row.service)]],

@@ -27,6 +27,7 @@ const QueueHealth = z.object({
   ready: z.number().nonnegative(),
   unacknowledged: z.number().nonnegative(),
 }).passthrough();
+const EvaluationFeedback = z.object({ updated: z.boolean() }).passthrough();
 const ObjectResponse = z.object({}).passthrough();
 const ObjectOrList = z.union([ObjectResponse, RecordList]);
 const RowsEnvelope = z.union([
@@ -45,6 +46,7 @@ const contracts: readonly Contract[] = [
   { path: /^\/api-gateway\/auth\/logout$/, schema: ObjectResponse, name: "logout" },
   { method: "GET", path: /^\/api-gateway\/healthz$/, schema: Health, name: "health" },
   { method: "GET", path: /^\/api-gateway\/operations\/queue-health$/, schema: QueueHealth, name: "queue-health" },
+  { method: "POST", path: /^\/api-gateway\/evaluations\/by-recommendation\/[0-9a-f-]+\/feedback$/i, schema: EvaluationFeedback, name: "evaluation-feedback" },
   { path: /^\/(?:api-gateway|monitoring-adapter)\/alerts(?:\/|$)/, schema: ObjectOrList, name: "alerts" },
   { path: /^\/api-gateway\/landing-pad(?:\/|$)/, schema: RowsEnvelope, name: "landing-pad" },
   { path: /^\/api-gateway\/incidents(?:\/|$)/, schema: ObjectOrList, name: "incidents" },
