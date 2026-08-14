@@ -71,7 +71,8 @@ x-service-env: &service-env
   OPENSEARCH_LOG_DOCKER_API_URL: ${OPENSEARCH_LOG_DOCKER_API_URL:-http://docker-socket-proxy:2375}
   OPENSEARCH_LOG_POLL_INTERVAL_SECONDS: ${OPENSEARCH_LOG_POLL_INTERVAL_SECONDS:-30}
   OPENSEARCH_LOG_LOOKBACK_SECONDS: ${OPENSEARCH_LOG_LOOKBACK_SECONDS:-300}
-  OPENSEARCH_LOG_BATCH_SIZE: ${OPENSEARCH_LOG_BATCH_SIZE:-100}
+  # Hard-capped at 15 by monitoring-adapter; 10 is the safe default.
+  OPENSEARCH_LOG_BATCH_SIZE: ${OPENSEARCH_LOG_BATCH_SIZE:-10}
   OPENSEARCH_LOG_TIMEOUT_SECONDS: ${OPENSEARCH_LOG_TIMEOUT_SECONDS:-10}
   OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING: ${OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING:-true}
   OPENSEARCH_LOG_JIRA_ROUTING_ENABLED: ${OPENSEARCH_LOG_JIRA_ROUTING_ENABLED:-false}
@@ -100,7 +101,8 @@ x-service-env: &service-env
   EMAIL_IMAP_SEARCH_CRITERIA: ${EMAIL_IMAP_SEARCH_CRITERIA:-UNSEEN}
   EMAIL_IMAP_MARK_SEEN: ${EMAIL_IMAP_MARK_SEEN:-true}
   EMAIL_POLL_INTERVAL_SECONDS: ${EMAIL_POLL_INTERVAL_SECONDS:-60}
-  EMAIL_POLL_BATCH_SIZE: ${EMAIL_POLL_BATCH_SIZE:-25}
+  # Hard-capped at 15 by monitoring-adapter; 10 is the safe default.
+  EMAIL_POLL_BATCH_SIZE: ${EMAIL_POLL_BATCH_SIZE:-10}
   EMAIL_DEFAULT_SERVICE: ${EMAIL_DEFAULT_SERVICE:-email-inbox}
   EMAIL_ALERT_SUBJECT_REGEX: ${EMAIL_ALERT_SUBJECT_REGEX:-(?i)\b(alert|incident|critical|warning|error|failure|failed|down|sev[1-5]|p[1-5])\b}
   EVALUATION_SERVICE_URL: http://evaluation-service:8000
@@ -326,18 +328,25 @@ services:
   rabbitmq:
     image: rabbitmq:3.13-management
     restart: unless-stopped
+    mem_limit: 1g
+    mem_reservation: 384m
+    cpus: 2.0
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 2:2 +SDcpu 1 +SDio 1"
     ports: ["5672:5672", "15672:15672"]
     volumes:
-      - rabbitmq-data:/var/lib/rabbitmq
+      # The previous volume is intentionally retained for offline recovery.
+      # A clean broker store avoids boot-locking the platform when persisted
+      # Erlang/RabbitMQ node state is left inconsistent after a VM crash.
+      - rabbitmq-data-recovery:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 5s
-      timeout: 10s
-      retries: 20
-      start_period: 30s
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q check_port_connectivity"]
+      interval: 15s
+      timeout: 15s
+      retries: 12
+      start_period: 45s
 
   mysql-exporter:
     profiles: ["observability", "monitoring-authoring", "full"]
@@ -421,6 +430,9 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.117.0
     restart: unless-stopped
+    mem_limit: 384m
+    mem_reservation: 192m
+    cpus: 1.0
     command: ["--config=/etc/otelcol/config.yml"]
     volumes:
       - ./observability/otel-collector.yml:/etc/otelcol/config.yml:ro
@@ -429,6 +441,11 @@ services:
       - "4318:4318"
     depends_on:
       jaeger: { condition: service_started }
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
 
   jaeger:
     image: jaegertracing/all-in-one:1.62.0
@@ -498,6 +515,9 @@ services:
       LANDING_PAD_FILE_WATCHER_ENABLED: "false"
       INCIDENT_PROJECTION_WORKER_ENABLED: "false"
       LOG_INGESTION_ENABLED: "false"
+      EMAIL_INGESTION_ENABLED: "false"
+      OPENSEARCH_LOG_INGESTION_ENABLED: "false"
+      JIRA_POLLING_ENABLED: "false"
       # This service is on the ingestion hot path for a 10k-alert burst; give
       # it a larger DB pool than the shared default (paired with mysql's
       # raised max-connections above).
@@ -910,13 +930,37 @@ services:
   remediation-engine:
     build: *service-build
     restart: unless-stopped
-    environment: { <<: *service-env, SERVICE_NAME: remediation-engine }
+    environment:
+      <<: *service-env
+      SERVICE_NAME: remediation-engine
+      RCA_RESOLUTION_AUTO_COMPLETE_THRESHOLD: ${RCA_RESOLUTION_AUTO_COMPLETE_THRESHOLD:-0.70}
+      JENKINS_USERNAME: ${JENKINS_USERNAME:-kaiops}
+      JENKINS_API_TOKEN: ${JENKINS_API_TOKEN:-kaiops-local-token}
+      REMEDIATION_DEFAULT_EXECUTOR: ${REMEDIATION_DEFAULT_EXECUTOR:-jenkins}
+      REMEDIATION_JENKINS_URL: ${REMEDIATION_JENKINS_URL:-http://jenkins:8080}
+      REMEDIATION_JENKINS_JOB: ${REMEDIATION_JENKINS_JOB:-kaiops-auto-remediation}
+      REMEDIATION_JENKINS_CREDENTIAL_REF: ${REMEDIATION_JENKINS_CREDENTIAL_REF:-vault://kaiops/local/jenkins#api-token}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/remediation-engine
     ports: ["8008:8000"]
     depends_on:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
+      jenkins: { condition: service_started }
+
+  jenkins:
+    build:
+      context: ./deploy/jenkins
+      dockerfile: Dockerfile.local
+    restart: unless-stopped
+    environment:
+      JENKINS_BOOTSTRAP_USERNAME: ${JENKINS_USERNAME:-kaiops}
+      JENKINS_BOOTSTRAP_PASSWORD: ${JENKINS_API_TOKEN:-kaiops-local-token}
+      JAVA_OPTS: -Djenkins.install.runSetupWizard=false
+    ports: ["8082:8080"]
+    volumes:
+      - jenkins-data:/var/jenkins_home
+      - ./deploy/jenkins:/opt/kaiops:ro
 
   closure-service:
     build: *service-build
@@ -1365,6 +1409,8 @@ volumes:
   zookeeper-log:
   kafka-data:
   rabbitmq-data:
+  rabbitmq-data-recovery:
   grafana-data:
   ui-dev-node-modules:
   ui-dev-npm-cache:
+  jenkins-data:

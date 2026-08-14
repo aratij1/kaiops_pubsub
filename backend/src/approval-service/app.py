@@ -319,6 +319,7 @@ async def _approval_from_request(
         channel=request.channel,
         comment=request.comment,
         modified_action=modified_action,
+        metadata={"execution_confirmation_required": True},
     )
 
 
@@ -462,7 +463,7 @@ async def _store_and_publish(approval: Approval) -> None:
             recommendation_id = str(approval.recommendation_id)
             status = "awaiting_approval"
             if approval.decision == ApprovalDecision.APPROVED or approval.decision == ApprovalDecision.MODIFIED:
-                status = "remediating"
+                status = "approved"
             elif approval.decision == ApprovalDecision.REJECTED:
                 status = "failed"
             await repo.update_incident_approval_status(
