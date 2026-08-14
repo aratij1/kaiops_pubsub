@@ -18,7 +18,8 @@ from common.topics import CONTEXT_EVENTS, RESOLUTION_EVENTS
 from fastapi import FastAPI
 from resolution_agent import ResolutionIntelligenceAgent
 from resolution_agent.catalog import prepare_resolution_plan, relevant_resolutions
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from uuid import UUID, uuid4
 
 settings = get_settings()
 settings.service_name = "resolution-agent"
@@ -252,6 +253,86 @@ class ResolutionSelectionRequest(BaseModel):
     issue: str
     service: str = "unknown"
     incident_id: str = ""
+
+
+class ExecutionFailureRequest(BaseModel):
+    incident_id: UUID
+    action_id: UUID
+    action_type: str
+    target: str
+    service: str = "unknown"
+    environment: str = "prod"
+    error: str
+    execution_result: dict[str, Any] = Field(default_factory=dict)
+    previous_recommendation: dict[str, Any] = Field(default_factory=dict)
+    attempt: int = Field(default=1, ge=1)
+
+
+@app.post("/reconsider-execution")
+async def reconsider_execution(request: ExecutionFailureRequest) -> dict[str, Any]:
+    """Produce a new recommendation after a failed executor attempt.
+
+    The response always requires a fresh human approval; it never retries a
+    mutating operation directly from failure feedback.
+    """
+    previous = request.previous_recommendation
+    previous_metadata = previous.get("metadata", {}) if isinstance(previous.get("metadata"), dict) else {}
+    failure = request.error.strip()
+    platform = os.getenv("REMEDIATION_EXECUTION_PLATFORM", "kubernetes").strip().lower()
+    if platform in {"docker", "docker-compose", "compose"}:
+        project = os.getenv("REMEDIATION_COMPOSE_PROJECT", "kaiops_azure").strip()
+        safe_service = "".join(ch for ch in request.service if ch.isalnum() or ch in "_.-") or "unknown"
+        safe_project = "".join(ch for ch in project if ch.isalnum() or ch in "_.-") or "kaiops_azure"
+        container = f"{safe_project}-{safe_service}-1"
+        commands = [
+            f"curl --fail --silent --show-error -X POST http://docker-socket-proxy:2375/containers/{container}/restart?t=30",
+            f"curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 2 http://{safe_service}:8000/healthz",
+        ]
+        rationale = f"The previous executor attempt failed ({failure}). Re-plan against the configured Docker Compose runtime."
+    else:
+        namespace = str(previous_metadata.get("namespace") or "default")
+        commands = [
+            f"kubectl rollout undo deployment/{request.target} -n {namespace}",
+            f"kubectl rollout status deployment/{request.target} -n {namespace} --timeout=180s",
+        ]
+        rationale = f"The previous executor attempt failed ({failure}). Verify Jenkins tooling and cluster credentials before approving this revised Kubernetes plan."
+    recommendation_id = uuid4()
+    recommendation = {
+        "id": str(recommendation_id),
+        "incident_id": str(request.incident_id),
+        "root_cause": f"Execution of {request.action_type} failed: {failure}",
+        "confidence": 0.8,
+        "impact": "Incident remains unresolved until a corrected execution plan succeeds and recovery is validated.",
+        "recommended_action": f"Reconsider and retry {request.action_type} with the corrected executor plan",
+        "severity": str(previous.get("severity") or "warning"),
+        "rationale": rationale,
+        "commands": commands,
+        "risk": "high",
+        "metadata": {
+            **previous_metadata,
+            "execution_plan": {"commands": commands, "scripts": [], "queries": [f"http://{safe_service}:8000/healthz"]},
+            "execution_reconsideration_attempt": request.attempt,
+            "failed_action_id": str(request.action_id),
+            "failure_feedback": failure,
+            "auto_approved": False,
+        },
+    }
+    return {
+        "recommendation": recommendation,
+        "incident": {
+            "id": str(request.incident_id),
+            "service": request.service,
+            "environment": request.environment,
+            "severity": recommendation["severity"],
+        },
+        "decision": {
+            "flow_id": str(request.incident_id),
+            "requires_approval": True,
+            "execution_mode": "human_approval",
+            "risk_tier": "high",
+            "policy_reason": "A failed execution must be re-planned and approved before retry.",
+        },
+    }
 
 
 @app.post("/resolution-catalog/relevant")

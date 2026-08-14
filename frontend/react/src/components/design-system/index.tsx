@@ -111,7 +111,8 @@ export function ErrorState({ title = "Unable to load data", description, retry }
 
 export function StaleDataNotice({ updatedAt, refresh }: { updatedAt: Date | string; refresh?: () => void }) {
   const timestamp = updatedAt instanceof Date ? updatedAt : new Date(updatedAt);
-  return <div className="k-stale-notice" role="status"><Clock3 size={16} aria-hidden="true" /><span>Showing cached data from <time dateTime={timestamp.toISOString()}>{timestamp.toLocaleString()}</time>.</span>{refresh ? <Button className="k-button is-link" onPress={refresh}>Refresh</Button> : null}</div>;
+  const display = `${timestamp.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST`;
+  return <div className="k-stale-notice" role="status"><Clock3 size={16} aria-hidden="true" /><span>Showing cached data from <time dateTime={timestamp.toISOString()}>{display}</time>.</span>{refresh ? <Button className="k-button is-link" onPress={refresh}>Refresh</Button> : null}</div>;
 }
 
 export function TechnicalDetails({ summary = "Technical details", children }: { summary?: string; children: ReactNode }) {
@@ -119,7 +120,8 @@ export function TechnicalDetails({ summary = "Technical details", children }: { 
 }
 
 export function EvidenceSource({ source, timestamp, freshness, children }: { source: string; timestamp?: string; freshness?: "cached" | "fresh" | "stale"; children?: ReactNode }) {
-  return <article className="k-evidence-source"><div><strong>{source}</strong>{freshness ? <StatusBadge tone={freshness === "fresh" ? "success" : freshness === "cached" ? "info" : "warning"}>{freshness}</StatusBadge> : null}</div>{timestamp ? <time dateTime={timestamp}>{new Date(timestamp).toLocaleString()}</time> : null}{children}</article>;
+  const display = timestamp ? `${new Date(timestamp).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST` : "";
+  return <article className="k-evidence-source"><div><strong>{source}</strong>{freshness ? <StatusBadge tone={freshness === "fresh" ? "success" : freshness === "cached" ? "info" : "warning"}>{freshness}</StatusBadge> : null}</div>{timestamp ? <time dateTime={timestamp}>{display}</time> : null}{children}</article>;
 }
 
 export function ConfidenceExplanation({ score, reasons = [] }: { score: number; reasons?: readonly string[] }) {

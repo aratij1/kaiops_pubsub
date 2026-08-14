@@ -1,4 +1,35 @@
 groups:
+  - name: online-boutique-payment-health
+    rules:
+      - alert: OnlineBoutiquePaymentServiceDown
+        expr: probe_success{job="online-boutique-payment",instance="ob-paymentservice:50051"} == 0
+        for: 15s
+        labels:
+          severity: critical
+          project_name: Online Boutique
+          application: Online Boutique
+          service: ob-paymentservice
+          environment: demo
+          source_system: prometheus
+        annotations:
+          summary: "Online Boutique payment service is down"
+          description: "ob-paymentservice:50051 has been unreachable for more than 15 seconds. The alert resolves automatically when the TCP endpoint recovers."
+
+  - name: kaiops-fault-lab
+    rules:
+      - alert: KaiOpsApplicationFaultDetected
+        expr: kaiops_fault_ratio{job="kaiops-fault-lab"} > 1
+        for: 15s
+        labels:
+          source: kaiops-fault-lab
+          severity: "{{ $labels.severity }}"
+          project_name: fault-lab
+          application: fault-lab
+          environment: test
+        annotations:
+          summary: "{{ $labels.alert_name }} on {{ $labels.service }}"
+          description: "Scenario {{ $labels.scenario_id }} breached its threshold. Example context ticket: {{ $labels.ticket_example }}."
+
   - name: kaiops-service-health
     rules:
       - alert: KaiOpsServiceDown
@@ -513,6 +544,7 @@ groups:
         labels:
           severity: critical
           component: context-knowledge
+          source_system: telemetry
         annotations:
           summary: "Context discovery is failing"
           description: "{{ $value }} context discovery failures occurred in the last five minutes."
@@ -523,6 +555,7 @@ groups:
         labels:
           severity: warning
           component: context-knowledge
+          source_system: telemetry
         annotations:
           summary: "Context knowledge repository operations are failing"
           description: "Lookup, persistence, validation, or RCA attachment errors were observed in the last ten minutes. Fresh discovery remains the fallback path."
@@ -533,6 +566,7 @@ groups:
         labels:
           severity: warning
           component: context-knowledge
+          source_system: telemetry
         annotations:
           summary: "Continuous context cache hit ratio is low"
           description: "Cache hit ratio has remained below 20% with sufficient traffic. Check alert signatures, TTL, and knowledge persistence."
@@ -543,6 +577,7 @@ groups:
         labels:
           severity: warning
           component: context-knowledge
+          source_system: telemetry
         annotations:
           summary: "Reused context retrieval is slow"
           description: "p95 reused-context latency is {{ $value }} seconds, above the 2 second objective."
@@ -553,6 +588,7 @@ groups:
         labels:
           severity: warning
           component: context-discovery
+          source_system: telemetry
         annotations:
           summary: "Fresh context discovery is slow"
           description: "p95 fresh-discovery latency is {{ $value }} seconds, above the 60 second objective."
@@ -563,6 +599,7 @@ groups:
         labels:
           severity: warning
           component: context-knowledge
+          source_system: telemetry
         annotations:
           summary: "RCA could not be attached to context knowledge"
           description: "Resolution completed but its context knowledge record was not found."
@@ -572,7 +609,7 @@ groups:
       - alert: KaiOpsSSEDisconnected
         expr: sum(kaiops_sse_connections) == 0
         for: 15m
-        labels: {severity: warning, component: sse}
+        labels: {severity: warning, component: sse, source_system: telemetry}
         annotations:
           summary: "No KaiOps live-update clients are connected"
           description: "No authenticated SSE connection has been observed for 15 minutes; clients may be using polling fallback."
@@ -580,7 +617,7 @@ groups:
       - alert: KaiOpsDeadLettersIncreasing
         expr: sum(increase(kaiops_dead_letter_events_total[10m])) > 0
         for: 2m
-        labels: {severity: critical, component: message-bus}
+        labels: {severity: critical, component: message-bus, source_system: telemetry}
         annotations:
           summary: "KaiOps events are entering dead-letter queues"
           description: "{{ $value }} events entered a dead-letter path in the last ten minutes."
@@ -588,7 +625,7 @@ groups:
       - alert: KaiOpsWorkflowFailures
         expr: sum(increase(kaiops_workflow_failures_total[10m])) > 0
         for: 2m
-        labels: {severity: critical, component: workflow}
+        labels: {severity: critical, component: workflow, source_system: telemetry}
         annotations:
           summary: "KaiOps durable workflow activity failures detected"
           description: "{{ $value }} workflow activity failures occurred in the last ten minutes."
@@ -596,7 +633,7 @@ groups:
       - alert: KaiOpsMySQLP95LatencyHigh
         expr: histogram_quantile(0.95, sum(rate(kaiops_mysql_query_latency_seconds_bucket[5m])) by (le)) > 1
         for: 10m
-        labels: {severity: warning, component: mysql}
+        labels: {severity: warning, component: mysql, source_system: telemetry}
         annotations:
           summary: "KaiOps MySQL p95 query latency is high"
           description: "MySQL p95 query latency has exceeded one second for ten minutes."
@@ -604,7 +641,7 @@ groups:
       - alert: KaiOpsModelFallbackRateHigh
         expr: sum(rate(kaiops_llm_fallback_total[10m])) > 0.1
         for: 10m
-        labels: {severity: warning, component: model-router}
+        labels: {severity: warning, component: model-router, source_system: telemetry}
         annotations:
           summary: "KaiOps model fallback rate is elevated"
           description: "Model fallbacks exceed 0.1 per second; inspect provider health and quota."

@@ -23,6 +23,18 @@ services:
 .\scripts\start-kaims.ps1
 ```
 
+The launcher starts an explicit 21-service runtime, builds one image at a time,
+checks Docker Desktop capacity, and waits for the UI health endpoint. Do not use
+an unscoped `docker compose up -d --build` on an 8 GB Docker Desktop instance;
+that can start optional observability, authoring, demo, and compatibility
+services together and exhaust the daemon.
+
+Rebuild only the UI with bounded Docker pressure:
+
+```powershell
+.\scripts\rebuild-ui.ps1 -Validate
+```
+
 Observability, monitoring-rule authoring, evaluation, and full compatibility are
 available as opt-in profiles. See
 [`docs/operations/deployment-profiles.md`](docs/operations/deployment-profiles.md).

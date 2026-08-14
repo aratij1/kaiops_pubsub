@@ -82,3 +82,53 @@ class KaiOpsIncidentPilotWorkflow:
         )
         self._stage("completed", remediation=remediation)
         return dict(self._state)
+
+
+@workflow.defn(name="KaiOpsRemediationWorkflow")
+class KaiOpsRemediationWorkflow:
+    """Durable owner of one approved remediation execution."""
+
+    def __init__(self) -> None:
+        self._state: dict[str, Any] = {"stage": "created", "history": ["created"]}
+
+    def _stage(self, value: str, **fields: Any) -> None:
+        self._state = {**self._state, **fields, "stage": value, "history": [*self._state["history"], value]}
+
+    @workflow.query
+    def status(self) -> dict[str, Any]:
+        return dict(self._state)
+
+    @workflow.run
+    async def run(self, approval: dict[str, Any]) -> dict[str, Any]:
+        self._stage(
+            "executing",
+            incident_id=str(approval.get("incident_id") or ""),
+            recommendation_id=str(approval.get("recommendation_id") or ""),
+        )
+        action = await workflow.execute_activity(
+            "execute_remediation_action",
+            approval,
+            start_to_close_timeout=timedelta(minutes=16),
+            heartbeat_timeout=timedelta(minutes=2),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=5),
+                backoff_coefficient=2.0,
+                maximum_interval=timedelta(seconds=30),
+                maximum_attempts=3,
+            ),
+        )
+        status = str(action.get("status") or "failed").lower()
+        self._stage("succeeded" if status == "succeeded" else "failed", action=action)
+        return action
+
+
+@workflow.defn(name="KaiOpsRemediationPreflightWorkflow")
+class KaiOpsRemediationPreflightWorkflow:
+    @workflow.run
+    async def run(self, approval: dict[str, Any]) -> dict[str, Any]:
+        return await workflow.execute_activity(
+            "preflight_remediation_action",
+            approval,
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )

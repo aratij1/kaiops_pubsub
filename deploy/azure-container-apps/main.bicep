@@ -10,8 +10,12 @@ param oidcIssuer string
 param oidcAudience string
 param oidcClientId string
 param otlpEndpoint string
+@description('Reachable Temporal frontend host:port, typically a managed Temporal endpoint.')
+param temporalAddress string
 param mysqlDatabase string = 'kaiops'
 param revisionSuffix string = utcNow('yyyyMMddHHmm')
+@description('Purpose-built, allowlisted remediation runner image used by the manual Container Apps Job.')
+param remediationJobImage string
 
 @secure()
 param mysqlDatabaseUrlSecretUri string
@@ -19,6 +23,8 @@ param mysqlDatabaseUrlSecretUri string
 param serviceBusConnectionSecretUri string
 @secure()
 param azureBlobConnectionSecretUri string
+@secure()
+param remediationInternalTokenSecretUri string
 
 @description('Existing KaiOps-compatible processes. Domain is metadata; it does not merge runtimes.')
 param apps array
@@ -114,6 +120,7 @@ resource containerApps 'Microsoft.App/containerApps@2024-03-01' = [for app in ap
         { name: 'database-url', keyVaultUrl: mysqlDatabaseUrlSecretUri, identity: identity.id }
         { name: 'servicebus-connection', keyVaultUrl: serviceBusConnectionSecretUri, identity: identity.id }
         { name: 'blob-connection', keyVaultUrl: azureBlobConnectionSecretUri, identity: identity.id }
+        { name: 'remediation-internal-token', keyVaultUrl: remediationInternalTokenSecretUri, identity: identity.id }
       ]
     }
     template: {
@@ -141,6 +148,7 @@ resource containerApps 'Microsoft.App/containerApps@2024-03-01' = [for app in ap
           { name: 'OBJECT_STORAGE_PROVIDER', value: 'azure-blob' }
           { name: 'AZURE_BLOB_CONNECTION_STRING', secretRef: 'blob-connection' }
           { name: 'OTEL_EXPORTER_OTLP_ENDPOINT', value: otlpEndpoint }
+          { name: 'TEMPORAL_ADDRESS', value: temporalAddress }
           { name: 'CONTEXT_AGENT_URL', value: 'https://${namePrefix}-context-agent.${environment.properties.defaultDomain}' }
           { name: 'RESOLUTION_AGENT_URL', value: 'https://${namePrefix}-resolution-agent.${environment.properties.defaultDomain}' }
           { name: 'APPROVAL_SERVICE_URL', value: 'https://${namePrefix}-approval-service.${environment.properties.defaultDomain}' }
@@ -149,7 +157,20 @@ resource containerApps 'Microsoft.App/containerApps@2024-03-01' = [for app in ap
           { name: 'MONITORING_ADAPTER_URL', value: 'https://${namePrefix}-monitoring-adapter.${environment.properties.defaultDomain}' }
           { name: 'MODEL_ROUTER_URL', value: 'https://${namePrefix}-model-router.${environment.properties.defaultDomain}' }
           { name: 'APPLICATION_ONBOARDING_URL', value: 'https://${namePrefix}-application-onboarding.${environment.properties.defaultDomain}' }
-        ], app.name == 'ui' ? [
+        ], app.name == 'remediation-engine' ? [
+          { name: 'REMEDIATION_TEMPORAL_ENABLED', value: 'true' }
+          { name: 'REMEDIATION_TEMPORAL_TASK_QUEUE', value: 'kaiops-remediation' }
+          { name: 'REMEDIATION_INTERNAL_TOKEN', secretRef: 'remediation-internal-token' }
+          { name: 'REMEDIATION_DEFAULT_EXECUTOR', value: 'azure_container_apps_job' }
+          { name: 'REMEDIATION_ACA_JOB_NAME', value: '${namePrefix}-remediation' }
+          { name: 'AZURE_SUBSCRIPTION_ID', value: subscription().subscriptionId }
+          { name: 'AZURE_RESOURCE_GROUP', value: resourceGroup().name }
+        ] : app.name == 'temporal-workflow-worker' ? [
+          { name: 'REMEDIATION_TEMPORAL_ENABLED', value: 'true' }
+          { name: 'REMEDIATION_TEMPORAL_TASK_QUEUE', value: 'kaiops-remediation' }
+          { name: 'REMEDIATION_INTERNAL_TOKEN', secretRef: 'remediation-internal-token' }
+          { name: 'AI_LAYER_REQUEST_TIMEOUT_SECONDS', value: '1000' }
+        ] : app.name == 'ui' ? [
           { name: 'API_GATEWAY_HOST', value: '${namePrefix}-api-gateway.${environment.properties.defaultDomain}' }
           { name: 'MONITORING_ADAPTER_HOST', value: '${namePrefix}-monitoring-adapter.${environment.properties.defaultDomain}' }
           { name: 'APPROVAL_SERVICE_HOST', value: '${namePrefix}-approval-service.${environment.properties.defaultDomain}' }
@@ -179,18 +200,65 @@ resource containerApps 'Microsoft.App/containerApps@2024-03-01' = [for app in ap
             }
             auth: [{ secretRef: 'servicebus-connection', triggerParameter: 'connection' }]
           }
-        }] : [{
+        }] : app.ingress ? [{
           name: 'http-concurrency'
           http: { metadata: { concurrentRequests: '50' } }
-        }]
+        }] : []
       }
     }
   }
   dependsOn: [keyVaultSecretsRole, registryPullRole]
 }]
 
+resource remediationJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: '${namePrefix}-remediation'
+  location: location
+  tags: union(tags, { domain: 'integration-remediation' })
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: { '${identity.id}': {} }
+  }
+  properties: {
+    environmentId: environment.id
+    configuration: {
+      triggerType: 'Manual'
+      replicaTimeout: 1800
+      replicaRetryLimit: 1
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [{ server: containerRegistryServer, identity: identity.id }]
+    }
+    template: {
+      containers: [{
+        name: 'remediation'
+        image: remediationJobImage
+        env: [
+          { name: 'ENVIRONMENT', value: 'production' }
+          { name: 'CLOUD_PROVIDER', value: 'azure' }
+          { name: 'KAI_OPS_EXECUTION_PLAN', value: '{"commands":[],"scripts":[],"queries":[],"rollback":[]}' }
+        ]
+        resources: { cpu: json('1.0'), memory: '2Gi' }
+      }]
+    }
+  }
+  dependsOn: [registryPullRole]
+}
+
+resource remediationJobOperator 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(remediationJob.id, identity.id, 'Container Apps Jobs Operator')
+  scope: remediationJob
+  properties: {
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b9a307c4-5aa3-4b52-ba60-2b17c136cd7b')
+  }
+}
+
 output managedEnvironmentId string = environment.id
 output managedIdentityPrincipalId string = identity.properties.principalId
+output remediationJobName string = remediationJob.name
 output applications array = [for (definition, index) in apps: {
   name: containerApps[index].name
   fqdn: definition.ingress ? containerApps[index].properties.configuration.ingress.fqdn : null

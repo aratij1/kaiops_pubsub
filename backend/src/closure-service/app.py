@@ -9,7 +9,7 @@ from closure_service import ClosureValidationAgent
 from common.config import get_settings
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
-from common.models import Incident, IncidentStatus, RemediationAction, ResolutionReport
+from common.models import Incident, IncidentStatus, RemediationAction, RemediationStatus, ResolutionReport
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app
@@ -312,6 +312,12 @@ async def startup(app: FastAPI) -> None:
 
     async def handle(payload: dict) -> None:
         action = RemediationAction.model_validate(_extract_remediation_action_payload(payload))
+        # A failed/skipped executor attempt is not proof that recovery failed.
+        # Remediation Engine owns failure reconsideration; closure only starts
+        # after a successful terminal execution and its validation contract.
+        if action.status != RemediationStatus.SUCCEEDED:
+            EVENTS_PROCESSED.labels(settings.service_name, REMEDIATION_EVENTS, "awaiting-remediation").inc()
+            return
         report = await _validate_and_store(action)
         await _persist_closure_event(app=app, action=action, report=report, source_payload=payload)
         payload_out = _build_closure_event_payload(action=action, report=report, source_payload=payload)
@@ -359,4 +365,6 @@ async def _validate_and_store(action: RemediationAction) -> ResolutionReport:
 async def validate(action: RemediationAction) -> ResolutionReport:
     report = await _validate_and_store(action)
     await _persist_closure_event(app=app, action=action, report=report, source_payload={})
+    payload_out = _build_closure_event_payload(action=action, report=report, source_payload={})
+    await app.state.producer.publish(CLOSURE_EVENTS, payload_out, key=str(action.incident_id))
     return report

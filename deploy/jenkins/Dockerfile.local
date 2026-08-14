@@ -1,5 +1,5 @@
 FROM jenkins/jenkins:lts-jdk17
 
-RUN jenkins-plugin-cli --plugins workflow-aggregator
+RUN jenkins-plugin-cli --plugins workflow-aggregator pipeline-utility-steps
 
 COPY init.groovy.d/ /usr/share/jenkins/ref/init.groovy.d/

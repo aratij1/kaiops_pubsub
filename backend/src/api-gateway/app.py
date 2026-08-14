@@ -1078,6 +1078,9 @@ async def get_all_alerts(
         target_base=settings.monitoring_adapter_url,
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
+        # Source-balanced alert reads include incident context and can exceed
+        # the generic 12-second fast-read budget during active ingestion.
+        timeout_seconds=45.0,
     )
 
 
@@ -2342,6 +2345,7 @@ async def remediation_execute(
         target_base=settings.remediation_engine_url,
         payload=payload,
         trace_id=trace_id_from_header(x_trace_id),
+        timeout_seconds=1000.0,
     )
 
 

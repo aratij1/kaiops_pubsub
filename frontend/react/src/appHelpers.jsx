@@ -3525,6 +3525,25 @@ function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
   const laneText = (row) => [row?.status, row?.stage, row?.detail, row?.agent, row?.service, row?.consumes, row?.publishes]
     .map((item) => String(item || "").toLowerCase())
     .join(" ");
+  const laneIdForRow = (row) => {
+    const order = Number(row?.flowOrder);
+    if (Number.isFinite(order) && order > 0) {
+      if (order >= 170) return "validate";
+      if (order >= 150) return "act";
+      if (order >= 130) return "decide";
+      if (order >= 100) return "diagnose";
+      if (order >= 50) return "discover";
+      return "detect";
+    }
+    const stage = String(row?.stage || "").toLowerCase();
+    if (["validat", "closure", "recovery", "closed", "resolved"].some((token) => stage.includes(token))) return "validate";
+    if (["remedi", "execut", "command", "action"].some((token) => stage.includes(token))) return "act";
+    if (["approval", "decision", "policy", "risk"].some((token) => stage.includes(token))) return "decide";
+    if (["resolution", "root cause", "rca", "impact", "diagnos"].some((token) => stage.includes(token))) return "diagnose";
+    if (["discover", "ticket", "log", "trace", "code", "context", "evidence"].some((token) => stage.includes(token))) return "discover";
+    if (["landing", "ingest", "alert", "monitor", "detect"].some((token) => stage.includes(token))) return "detect";
+    return "";
+  };
   const laneRows = lanes.map((lane) => {
     // A row is claimed by at most one lane: the first (in detect -> validate order) whose
     // keywords match. Previously every lane re-tested every row independently, so a single
@@ -3533,8 +3552,9 @@ function UnifiedIncidentTimeline({ workflow, rows, documents = [] }) {
       if (assigned.has(index)) {
         return false;
       }
+      const authoritativeLane = laneIdForRow(row);
       const text = laneText(row);
-      const hit = lane.match.some((token) => text.includes(token));
+      const hit = authoritativeLane ? authoritativeLane === lane.id : lane.match.some((token) => text.includes(token));
       if (hit) assigned.add(index);
       return hit;
     });
