@@ -72,6 +72,37 @@ function displayAlert(row: AlertStreamRow) {
   };
 }
 
+const SENSITIVE_SOURCE_KEYS = /authorization|cookie|credential|password|secret|token|api[_-]?key/i;
+
+function redactedSourceValue(value: unknown, depth = 0): unknown {
+  if (depth > 8) return "[maximum depth reached]";
+  if (Array.isArray(value)) return value.map((item) => redactedSourceValue(item, depth + 1));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+      key,
+      SENSITIVE_SOURCE_KEYS.test(key) ? "[redacted]" : redactedSourceValue(item, depth + 1),
+    ]));
+  }
+  return value;
+}
+
+function sourceEvidence(row: AlertStreamRow) {
+  const record = row as AlertStreamRow & Record<string, any>;
+  const payload = record.source_payload || record.original_payload || record.raw_payload || record.event_payload || record.payload || record;
+  return {
+    origin: String(record.origin_system || record.provider || record.source || record.source_channel || "Not recorded"),
+    channel: sourceChannelLabel(normalizedChannel(row)),
+    location: String(record.object_uri || record.source_uri || record.url || record.path || record.file || "Not recorded"),
+    sourceId: String(record.source_event_id || record.event_id || record.alert_id || record.id || "Not recorded"),
+    received: formatIstTimestamp(record.received_at || record.created_at || record.modified_at),
+    observed: formatIstTimestamp(record.starts_at || record.first_seen || record.timestamp || record.created_at),
+    message: richText(record.message || record.description || record.summary || record.annotations?.description || record.error) || "No source message supplied",
+    labels: record.labels && typeof record.labels === "object" ? record.labels : {},
+    annotations: record.annotations && typeof record.annotations === "object" ? record.annotations : {},
+    payload: redactedSourceValue(payload),
+  };
+}
+
 const flowStages = [
   ["target", "Target", RadioTower], ["scrape", "Scrape /metrics", Activity], ["parse", "Parse metrics", Braces],
   ["store", "Store series", Database], ["rule", "Evaluate rule", FileCode2], ["alert", "Create alert", BellRing],
@@ -218,6 +249,7 @@ export default function AlertsRoute() {
   const [traceWorkflow, setTraceWorkflow] = useState<{ loading: boolean; data: any; error: string; alertId: string; state: "idle" | "loading" | "ready" | "pending" | "error" }>({ loading: false, data: null, error: "", alertId: "", state: "idle" });
   const [rowWorkflows, setRowWorkflows] = useState<Record<string, any>>({});
   const [priorityFilter, setPriorityFilter] = useState<"all" | AlertPriority>("all");
+  const [expandedSourceKey, setExpandedSourceKey] = useState("");
   const prioritizedRows = useMemo(() => alerts.rows
     .map((row, index) => ({ row, index, priority: classifyAlert(row, rowWorkflows[alertRowKey(row)]) }))
     .filter(({ priority }) => priorityFilter === "all" || priority.kind === priorityFilter)
@@ -409,7 +441,10 @@ export default function AlertsRoute() {
         const display = displayAlert(row);
         const channel = display.channel;
         const failed = String(row.status || "").toLowerCase() === "failed" || Boolean(row.error);
-        return <article className={`ingestion-event channel-${channel} priority-${priority.kind} ${failed ? "is-failed" : ""}`} key={alertRowKey(row)}><div className="ingestion-event-marker"><span>{channelIcon(channel)}</span><i aria-hidden="true" /></div><div className="ingestion-event-main"><header><div><span className={`alert-priority-badge is-${priority.kind}`} title={priority.reason}>{priority.label}</span><strong>{display.title}</strong><span className={`source-badge source-${channel}`}>{sourceChannelLabel(channel)}</span></div><time>{display.lastSeen}</time></header><p>{display.summary}</p><div className="alert-priority-reason">{priority.reason}</div><footer><span><b>Service</b>{display.service}</span><span><b>Severity</b>{display.severity}</span><span><b>Occurrences</b>{display.occurrences}</span><span><b>Owner</b>{display.owner}</span></footer>{priority.kind === "action" || priority.kind === "watch" ? <button type="button" className="button-secondary ingestion-open-action" onClick={() => alerts.open(row)}>{priority.kind === "action" ? "Open incident" : "Review alert"}</button> : <button type="button" className="button-secondary ingestion-open-action" onClick={() => alerts.open(row)}>View audit details</button>}{row.error ? <small className="ingestion-event-error">{compactText(richText(row.error), 240)}</small> : null}</div></article>;
+        const rowKey = alertRowKey(row);
+        const source = sourceEvidence(row);
+        const sourceExpanded = expandedSourceKey === rowKey;
+        return <article className={`ingestion-event channel-${channel} priority-${priority.kind} ${failed ? "is-failed" : ""}`} key={rowKey}><div className="ingestion-event-marker"><span>{channelIcon(channel)}</span><i aria-hidden="true" /></div><div className="ingestion-event-main"><header><div><span className={`alert-priority-badge is-${priority.kind}`} title={priority.reason}>{priority.label}</span><strong>{display.title}</strong><span className={`source-badge source-${channel}`}>{sourceChannelLabel(channel)}</span></div><time>{display.lastSeen}</time></header><p>{display.summary}</p><div className="alert-priority-reason">{priority.reason}</div><footer><span><b>Service</b>{display.service}</span><span><b>Severity</b>{display.severity}</span><span><b>Occurrences</b>{display.occurrences}</span><span><b>Owner</b>{display.owner}</span></footer><div className="ingestion-event-actions"><button type="button" className="button-secondary" aria-expanded={sourceExpanded} aria-controls={`source-${rowKey}`} onClick={() => setExpandedSourceKey(sourceExpanded ? "" : rowKey)}><Braces size={15} />{sourceExpanded ? "Hide source details" : "Show source details"}</button><button type="button" className="button-secondary" onClick={() => alerts.open(row)}>{priority.kind === "action" ? "Open incident" : priority.kind === "watch" ? "Review alert" : "View audit details"}</button></div>{sourceExpanded ? <section id={`source-${rowKey}`} className="alert-source-evidence"><header><div><small>Original source evidence</small><strong>{source.origin}</strong></div><span className={`source-badge source-${channel}`}>{source.channel}</span></header><dl><div><dt>Source event ID</dt><dd><code>{source.sourceId}</code></dd></div><div><dt>Source location</dt><dd>{source.location}</dd></div><div><dt>Observed at</dt><dd>{source.observed}</dd></div><div><dt>Received at</dt><dd>{source.received}</dd></div><div className="source-message"><dt>Source message</dt><dd>{source.message}</dd></div></dl><div className="alert-source-structured"><details open><summary>Labels ({Object.keys(source.labels).length})</summary><pre>{JSON.stringify(source.labels, null, 2)}</pre></details><details open><summary>Annotations ({Object.keys(source.annotations).length})</summary><pre>{JSON.stringify(source.annotations, null, 2)}</pre></details><details><summary>Raw source payload (sensitive values redacted)</summary><pre>{JSON.stringify(source.payload, null, 2)}</pre></details></div></section> : null}{row.error ? <small className="ingestion-event-error">{compactText(richText(row.error), 240)}</small> : null}</div></article>;
       })}{!alerts.rows.length && !alerts.loading ? <div className="ingestion-stream-empty"><strong>No alerts match this view</strong><p>Change the filters or verify the selected connector is delivering events.</p></div> : null}</div>
     </article> : null}
   </section>;

@@ -508,7 +508,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const [ingestionStreamPaused, setIngestionStreamPaused] = useState(false);
   const [ingestionStreamUpdatedAt, setIngestionStreamUpdatedAt] = useState("");
   const [ingestionStreamView, setIngestionStreamView] = useState("");
-  const [ingestionStreamFilters, setIngestionStreamFilters] = useState({ timeRange: "all", severity: "all", application: "all", environment: "all" });
+  const [ingestionStreamFilters, setIngestionStreamFilters] = useState({ timeRange: "all", severity: "all", application: "selected", environment: "all" });
   const [ragDocs, setRagDocs] = useState({ loading: false, rows: [], error: "" });
   const [guidanceQuery, setGuidanceQuery] = useState("");
   const [guidanceState, setGuidanceState] = useState({ loading: false, rows: [], error: "" });
@@ -4899,7 +4899,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           setClosedFilters((current) => ({ ...current, ...prefs.closedFilters }));
         }
         if (prefs.ingestionStreamFilters && typeof prefs.ingestionStreamFilters === "object") {
-          setIngestionStreamFilters((current) => ({ ...current, ...prefs.ingestionStreamFilters }));
+          // Version 2 changes Live Stream from a global-by-default feed to the
+          // selected project. Migrate older saved defaults once; operators can
+          // still explicitly select "All applications" afterward.
+          const savedFilters = prefs.liveStreamScopeVersion === 2
+            ? prefs.ingestionStreamFilters
+            : { ...prefs.ingestionStreamFilters, application: "selected" };
+          setIngestionStreamFilters((current) => ({ ...current, ...savedFilters }));
         }
         if (typeof prefs.ingestionStreamView === "string") setIngestionStreamView(prefs.ingestionStreamView);
         if (typeof prefs.ingestionStreamSection === "string") setIngestionStreamSection(prefs.ingestionStreamSection);
@@ -4940,6 +4946,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       ingestionStreamFilters,
       ingestionStreamView,
       ingestionStreamSection,
+      liveStreamScopeVersion: 2,
     };
     window.localStorage.setItem(PREFERENCE_STORAGE_KEY, JSON.stringify(payload));
   }, [applicationToMonitor, uiDensity, uiTheme, selectedFlow, activeTab, closedFilters, ingestionStreamFilters, ingestionStreamView, ingestionStreamSection]);
@@ -8264,7 +8271,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       if (timeWindowMs && (!timestamp || now - timestamp > timeWindowMs)) return false;
       if (ingestionStreamFilters.severity !== "all" && String(row?.severity || "").toLowerCase() !== ingestionStreamFilters.severity) return false;
       const rowApplication = String(row?.application || row?.project_name || row?.project || "").toLowerCase();
-      if (ingestionStreamFilters.application === "selected" && rowApplication !== String(applicationToMonitor || "").toLowerCase()) return false;
+      if (ingestionStreamFilters.application === "selected" && !filterAlertsForMonitor([row], applicationToMonitor).length) return false;
       if (ingestionStreamFilters.application === "assigned" && !String(row?.assignee || row?.owner || row?.jira_assignee || "").trim()) return false;
       if (!["all", "selected", "assigned"].includes(ingestionStreamFilters.application) && rowApplication !== ingestionStreamFilters.application.toLowerCase()) return false;
       if (ingestionStreamFilters.environment !== "all" && String(row?.environment || row?.labels?.environment || "unknown").toLowerCase() !== ingestionStreamFilters.environment) return false;
