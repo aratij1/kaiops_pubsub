@@ -3547,6 +3547,77 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
   }
 
+  async function checkOnboardingConnectivity() {
+    setOnboardingState((curr) => ({ ...curr, loading: true, error: "", success: "" }));
+    try {
+      const selectedMonitoringTool = String(onboardingForm.monitoring_tool || "prometheus").trim().toLowerCase();
+      const monitoringUrl = simplifyMonitoringUrl(onboardingForm.monitoring_url || "");
+      const username = String(onboardingForm.assignment_username || "").trim();
+      const assignmentProject = String(onboardingForm.name || "").trim();
+      const userAssignments = username && assignmentProject ? { [username]: [assignmentProject] } : {};
+      const monitoringUrls = {
+        prometheus_url: selectedMonitoringTool === "prometheus" ? monitoringUrl : "",
+        new_relic_url: selectedMonitoringTool === "new_relic" ? monitoringUrl : "",
+        datadog_url: selectedMonitoringTool === "datadog" ? monitoringUrl : "",
+      };
+      const monitoringSources = buildOnboardingSources(onboardingForm, selectedMonitoringTool, monitoringUrl);
+      const payload = {
+        project: {
+          name: String(onboardingForm.name || "").trim(),
+          owner_team: String(onboardingForm.owner_team || "").trim(),
+          description: String(onboardingForm.description || "").trim(),
+          business_service: String(onboardingForm.business_service || "").trim(),
+          owner_email: String(onboardingForm.owner_email || "").trim(),
+          criticality: String(onboardingForm.criticality || "medium").trim(),
+          cost_center: String(onboardingForm.cost_center || "").trim(),
+          repository_url: String(onboardingForm.repository_url || "").trim(),
+          environment: String(onboardingForm.environment || "prod").trim(),
+          region: String(onboardingForm.region || "").trim(),
+        },
+        deployment_mode: String(onboardingForm.deployment_mode || "cloud_neutral").trim(),
+        ...monitoringUrls,
+        monitoring_sources: monitoringSources,
+        logs_url: String(onboardingForm.logs_url || "").trim(),
+        traces_url: String(onboardingForm.traces_url || "").trim(),
+        telemetry_url: String(onboardingForm.telemetry_url || "").trim(),
+        ticketing_url: String(onboardingForm.ticketing_url || "").trim(),
+        email_url: String(onboardingForm.email_url || "").trim(),
+        healthcheck_url: String(onboardingForm.healthcheck_url || "").trim(),
+        network_zone: String(onboardingForm.network_zone || "").trim(),
+        context_strategy: String(onboardingForm.context_strategy || "auto").trim(),
+        azure_subscription_id: String(onboardingForm.azure_subscription_id || "").trim(),
+        azure_resource_group: String(onboardingForm.azure_resource_group || "").trim(),
+        azure_service_bus_namespace: String(onboardingForm.azure_service_bus_namespace || "").trim(),
+        azure_service_bus_topic: String(onboardingForm.azure_service_bus_topic || "").trim(),
+        azure_service_bus_subscription: String(onboardingForm.azure_service_bus_subscription || "").trim(),
+        azure_content_safety_enabled: Boolean(onboardingForm.azure_content_safety_enabled),
+        azure_content_safety_endpoint: String(onboardingForm.azure_content_safety_endpoint || "").trim(),
+        user_assignments: userAssignments,
+        active_provider: selectedMonitoringTool,
+      };
+
+      const response = await fetchJson("/api-gateway/onboarding/connectivity", authenticatedOptions({
+        method: "POST",
+        body: JSON.stringify(payload),
+      }));
+      const unwrapped = unwrap(response);
+      const connectivity = unwrapped?.connectivity || unwrapped?.data?.connectivity || {};
+      setOnboardingState((curr) => ({
+        ...curr,
+        loading: false,
+        connectivity,
+        success: "Connectivity checked and updated successfully!",
+      }));
+    } catch (error) {
+      setOnboardingState((curr) => ({
+        ...curr,
+        loading: false,
+        error: "Connectivity check failed: " + error.message,
+        success: "",
+      }));
+    }
+  }
+
   async function saveOnboardingConnectivity(event) {
     event.preventDefault();
     const pendingApprovalDocs = Array.isArray(onboardingGeneratedDocs) ? onboardingGeneratedDocs : [];
@@ -11893,19 +11964,115 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <label>Health Check URL<input type="url" placeholder="https://service/health" value={onboardingForm.healthcheck_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, healthcheck_url: e.target.value }))} /></label>
                         </div>
                         <div className="onboarding-source-grid">
-                          <label>Logs Source<input type="url" placeholder="https://opensearch.example.com" value={onboardingForm.logs_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, logs_url: e.target.value }))} /><span>OpenSearch, Loki, Splunk, or compatible endpoint</span></label>
+                          <label>
+                            Logs Source
+                            <input type="url" placeholder="https://opensearch.example.com" value={onboardingForm.logs_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, logs_url: e.target.value }))} />
+                            <span>OpenSearch, Loki, Splunk, or compatible endpoint</span>
+                            {onboardingState.connectivity?.provider_statuses?.logs ? (
+                              onboardingState.connectivity.provider_statuses.logs.ok ? (
+                                <div style={{
+                                  marginTop: '8px',
+                                  padding: '8px 12px',
+                                  borderRadius: '6px',
+                                  background: 'rgba(16, 185, 129, 0.1)',
+                                  border: '1px solid rgba(16, 185, 129, 0.3)',
+                                  color: '#10b981',
+                                  fontSize: '0.8rem',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '6px',
+                                  whiteSpace: 'normal',
+                                  wordBreak: 'break-word'
+                                }}>
+                                  <span style={{ fontSize: '1rem', fontWeight: 'bold' }}>✓</span>
+                                  <span><strong>Connected:</strong> {onboardingState.connectivity.provider_statuses.logs.message}</span>
+                                </div>
+                              ) : (
+                                <div style={{
+                                  marginTop: '8px',
+                                  padding: '8px 12px',
+                                  borderRadius: '6px',
+                                  background: 'rgba(239, 68, 68, 0.1)',
+                                  border: '1px solid rgba(239, 68, 68, 0.3)',
+                                  color: '#ef4444',
+                                  fontSize: '0.8rem',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '6px',
+                                  whiteSpace: 'normal',
+                                  wordBreak: 'break-word'
+                                }}>
+                                  <span style={{ fontSize: '1rem', fontWeight: 'bold' }}>⚠</span>
+                                  <span><strong>Failed:</strong> {onboardingState.connectivity.provider_statuses.logs.message}</span>
+                                </div>
+                              )
+                            ) : null}
+                          </label>
                           <label>Trace Source<input type="url" placeholder="https://jaeger.example.com" value={onboardingForm.traces_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, traces_url: e.target.value }))} /><span>Jaeger, Tempo, or tracing gateway</span></label>
                           <label>Telemetry / OTLP<input type="url" placeholder="https://otel-collector:4318" value={onboardingForm.telemetry_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, telemetry_url: e.target.value }))} /><span>OpenTelemetry collector or observability gateway</span></label>
                           <label>Ticketing / Change Source<input type="url" placeholder="https://jira.example.com" value={onboardingForm.ticketing_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, ticketing_url: e.target.value }))} /><span>Incident, change, and historical outcome source</span></label>
-                          <label>Email Alert Source<input placeholder="imaps://mail.example.com/INBOX" value={onboardingForm.email_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, email_url: e.target.value }))} /><span>IMAP/IMAPS mailbox or HTTPS email webhook; credentials remain secret references</span></label>
+                          <label>
+                            Email Alert Source
+                            <input placeholder="imaps://mail.example.com/INBOX" value={onboardingForm.email_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, email_url: e.target.value }))} />
+                            <span>IMAP/IMAPS mailbox or HTTPS email webhook; credentials remain secret references</span>
+                            {onboardingState.connectivity?.provider_statuses?.email ? (
+                              onboardingState.connectivity.provider_statuses.email.ok ? (
+                                <div style={{
+                                  marginTop: '8px',
+                                  padding: '8px 12px',
+                                  borderRadius: '6px',
+                                  background: 'rgba(16, 185, 129, 0.1)',
+                                  border: '1px solid rgba(16, 185, 129, 0.3)',
+                                  color: '#10b981',
+                                  fontSize: '0.8rem',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '6px',
+                                  whiteSpace: 'normal',
+                                  wordBreak: 'break-word'
+                                }}>
+                                  <span style={{ fontSize: '1rem', fontWeight: 'bold' }}>✓</span>
+                                  <span><strong>Connected:</strong> {onboardingState.connectivity.provider_statuses.email.message}</span>
+                                </div>
+                              ) : (
+                                <div style={{
+                                  marginTop: '8px',
+                                  padding: '8px 12px',
+                                  borderRadius: '6px',
+                                  background: 'rgba(239, 68, 68, 0.1)',
+                                  border: '1px solid rgba(239, 68, 68, 0.3)',
+                                  color: '#ef4444',
+                                  fontSize: '0.8rem',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '6px',
+                                  whiteSpace: 'normal',
+                                  wordBreak: 'break-word'
+                                }}>
+                                  <span style={{ fontSize: '1rem', fontWeight: 'bold' }}>⚠</span>
+                                  <span><strong>Failed:</strong> {onboardingState.connectivity.provider_statuses.email.message}</span>
+                                </div>
+                              )
+                            ) : null}
+                          </label>
                         </div>
                         {onboardingForm.onboarding_path !== "setup_monitoring" ? (
                           <p className="subtitle">Alerts from your configured monitoring tool can be ingested into landing pad to trigger the remaining workflow.</p>
                         ) : null}
                         </details>
-                        <button className="button-primary" type="submit" disabled={onboardingState.loading || onboardingValidationErrors.length > 0 || onboardingHasPendingDocumentApproval}>
-                          {onboardingState.loading ? "Saving..." : onboardingProjectMode === "new" ? "Create Monitoring Setup" : "Save Monitoring Setup"}
-                        </button>
+                        <div style={{ display: "flex", gap: "12px", marginTop: "16px" }}>
+                          <button className="button-primary" type="submit" disabled={onboardingState.loading || onboardingValidationErrors.length > 0 || onboardingHasPendingDocumentApproval}>
+                            {onboardingState.loading ? "Saving..." : onboardingProjectMode === "new" ? "Create Monitoring Setup" : "Save Monitoring Setup"}
+                          </button>
+                          <button
+                            className="button-secondary"
+                            type="button"
+                            disabled={onboardingState.loading}
+                            onClick={checkOnboardingConnectivity}
+                          >
+                            Test Connection
+                          </button>
+                        </div>
                       </form>
                       {onboardingState.error ? <p className="error">{onboardingState.error}</p> : null}
                       {onboardingState.success ? <p className="subtitle">{onboardingState.success}</p> : null}

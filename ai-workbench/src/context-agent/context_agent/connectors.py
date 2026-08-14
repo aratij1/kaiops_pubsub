@@ -71,7 +71,16 @@ class GitHubConnector(BaseConnector):
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
-        return {"recent_commits": [{"sha": "abc1234", "message": "Tune payment timeout"}]}
+        # No VCS access is configured for this environment (no .git checkout
+        # and no GitHub API credentials reach this connector), so there is no
+        # real commit history to report. Returning a fixed, unrelated commit
+        # here would present fabricated evidence as if it were real deployment
+        # history -- report an explicit unavailable state instead.
+        return {
+            "recent_commits": [],
+            "recent_commits_unavailable": True,
+            "recent_commits_reason": "Source control access is not configured for this environment.",
+        }
 
 
 class CMDBConnector(BaseConnector):
@@ -1188,6 +1197,15 @@ class VectorDBConnector(BaseConnector):
             # block; skip them instead of ending metadata mode early.
             if in_metadata and not stripped:
                 continue
+            # The frontmatter delimiter line ("---") has no colon and isn't a
+            # heading, so it was previously falling into the "else" branch
+            # below and ending metadata mode on line 1 -- before any real
+            # frontmatter key (including "service:") was ever read. Every
+            # document using this "---\n...\n---\n" convention silently lost
+            # its services tag, which _service_matches treats as "matches
+            # every alert".
+            if in_metadata and stripped == "---":
+                continue
             if in_metadata and stripped.startswith("#"):
                 in_metadata = False
                 body_lines.append(line)
@@ -1201,7 +1219,14 @@ class VectorDBConnector(BaseConnector):
 
         title = str(metadata.get("title") or file_path.stem.replace("-", " "))
         content = "\n".join(body_lines).strip()
-        services = metadata.get("services", [])
+        # Frontmatter conventions across the runbook corpus are inconsistent:
+        # some documents use the plural "services:" list, others use a single
+        # "service:" field (e.g. runbooks/mysql-alerts-table-rows-high-runbook.md
+        # has "service: mysql"). Only "services" was ever read here, so every
+        # singular-"service" document silently fell through to services=[] --
+        # which _service_matches treats as "matches every alert" -- letting an
+        # unrelated service's runbook surface as evidence for any alert.
+        services = metadata.get("services", metadata.get("service", []))
         if isinstance(services, str):
             services = [item.strip() for item in services.split(",") if item.strip()]
         elif not isinstance(services, list):
@@ -1231,7 +1256,9 @@ class VectorDBConnector(BaseConnector):
             return metadata
 
         title = str(metadata.get("title") or path.stem.replace("-", " "))
-        services = metadata.get("services", [])
+        # See the matching comment in _load_full_document: fall back to the
+        # singular "service:" frontmatter key when "services:" isn't present.
+        services = metadata.get("services", metadata.get("service", []))
         if isinstance(services, str):
             services = [item.strip() for item in services.split(",") if item.strip()]
         elif not isinstance(services, list):
@@ -1613,7 +1640,22 @@ class ContextIntelligenceAgent(BaseAgent):
                 services = [services]
             return bool(services) and vector_connector._service_matches(doc, alert.service)
 
-        runbook = next((doc["content"] for doc in vector_matches if doc["kind"] == "runbook"), "")
+        # Every other document kind below is filtered by explicitly_matches_service,
+        # but the runbook lookup previously took the first "runbook"-kind vector
+        # match unconditionally -- a runbook tagged for an unrelated service
+        # (e.g. a MySQL runbook surfacing as "evidence" for an approval-service
+        # alert) would be shown as if it applied. Use the same service check
+        # the vector connector already exposes, but via _service_matches (not
+        # explicitly_matches_service) so a genuinely untagged/general runbook
+        # -- which has no services field to check -- still matches, as before.
+        runbook = next(
+            (
+                doc["content"]
+                for doc in vector_matches
+                if doc["kind"] == "runbook" and (not vector_connector or vector_connector._service_matches(doc, alert.service))
+            ),
+            "",
+        )
         related = [doc for doc in vector_matches if doc["kind"] == "incident" and explicitly_matches_service(doc)]
         deployment_doc = next((doc for doc in vector_matches if doc["kind"] == "deployment" and explicitly_matches_service(doc)), {})
         dependency_docs = [doc for doc in vector_matches if doc["kind"] == "dependency" and explicitly_matches_service(doc)]

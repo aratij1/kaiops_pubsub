@@ -39,6 +39,24 @@ _SENSITIVE_KEYS = {
 }
 
 
+def _sanitize_url_credentials(val: str) -> str:
+    if not isinstance(val, str) or "://" not in val:
+        return val
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(val)
+        if parsed.password:
+            netloc = parsed.hostname or ""
+            if parsed.username:
+                netloc = f"{parsed.username}@{netloc}"
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            return parsed._replace(netloc=netloc).geturl()
+    except Exception:
+        pass
+    return val
+
+
 def _mask_sensitive_fields(value: Any) -> Any:
     if isinstance(value, dict):
         masked: dict[str, Any] = {}
@@ -51,6 +69,8 @@ def _mask_sensitive_fields(value: Any) -> Any:
         return masked
     if isinstance(value, list):
         return [_mask_sensitive_fields(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_url_credentials(value)
     return value
 
 
