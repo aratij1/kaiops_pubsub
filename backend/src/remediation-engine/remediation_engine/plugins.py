@@ -8,7 +8,7 @@ import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -64,6 +64,16 @@ class JenkinsRollbackPlugin(BasePlugin):
     def __init__(self) -> None:
         super().__init__("rollback_deployment")
 
+    @staticmethod
+    def _connector_url(endpoint: str, advertised_url: str) -> str:
+        """Keep Jenkins-advertised paths but use the configured connector origin."""
+        candidate = str(advertised_url or "").strip()
+        if not candidate:
+            return ""
+        parsed = urlparse(candidate)
+        path = parsed.path if parsed.scheme and parsed.netloc else candidate
+        return urljoin(f"{endpoint.rstrip('/')}/", path.lstrip("/"))
+
     @circuit_breaker(CircuitBreaker())
     async def execute(self, action: RemediationAction) -> RemediationAction:
         profile = action.parameters.get("connection_profile") if isinstance(action.parameters.get("connection_profile"), dict) else {}
@@ -112,7 +122,7 @@ class JenkinsRollbackPlugin(BasePlugin):
                 headers[str(crumb.get("crumbRequestField") or "Jenkins-Crumb")] = str(crumb.get("crumb") or "")
             response = await client.post(build_url, params=parameters, headers=headers)
             response.raise_for_status()
-            queue_url = str(response.headers.get("location") or "").strip()
+            queue_url = urljoin(f"{endpoint}/", str(response.headers.get("location") or "").strip())
             if not queue_url:
                 action.status = RemediationStatus.FAILED
                 action.error = "Jenkins accepted the request without returning a queue URL"
@@ -130,8 +140,12 @@ class JenkinsRollbackPlugin(BasePlugin):
                     action.error = "Jenkins cancelled the queued remediation build"
                     break
                 executable = queue_payload.get("executable") if isinstance(queue_payload.get("executable"), dict) else {}
-                resolved_build_url = str(executable.get("url") or "").strip()
-                if resolved_build_url:
+                executable_url = str(executable.get("url") or "").strip()
+                # urljoin(base, "") returns the base URL, which previously
+                # made a queued build look resolved and caused us to poll the
+                # Jenkins controller forever instead of the queue item.
+                if executable_url:
+                    resolved_build_url = self._connector_url(endpoint, executable_url)
                     break
                 await asyncio.sleep(poll_interval)
 
@@ -140,8 +154,13 @@ class JenkinsRollbackPlugin(BasePlugin):
                 build_response = await client.get(f"{resolved_build_url.rstrip('/')}/api/json")
                 build_response.raise_for_status()
                 build_payload = build_response.json()
-                if not bool(build_payload.get("building")):
-                    build_result = str(build_payload.get("result") or "UNKNOWN").strip().upper()
+                terminal_result = str(build_payload.get("result") or "").strip().upper()
+                building = bool(build_payload.get("building"))
+                # Jenkins may briefly expose a stale result while a retried or
+                # resumed Pipeline still reports building=true. Require both
+                # signals to agree before finalizing the durable action.
+                if terminal_result and not building:
+                    build_result = terminal_result
                     break
                 await asyncio.sleep(poll_interval)
 
@@ -168,6 +187,85 @@ class JenkinsRollbackPlugin(BasePlugin):
             "build_result": build_result or None,
             "secret_ref": secret_ref,
             "submitted_parameters": {key: value for key, value in parameters.items() if key != "KAI_OPS_EXECUTION_PLAN"},
+            "summary": action.error or action.output,
+        }
+        return action
+
+
+class AzureContainerAppsJobPlugin(BasePlugin):
+    def __init__(self) -> None:
+        super().__init__("azure_container_apps_job")
+
+    async def execute(self, action: RemediationAction) -> RemediationAction:
+        profile = action.parameters.get("connection_profile") if isinstance(action.parameters.get("connection_profile"), dict) else {}
+        subscription = str(profile.get("subscription_id") or os.getenv("AZURE_SUBSCRIPTION_ID", "")).strip()
+        resource_group = str(profile.get("resource_group") or os.getenv("AZURE_RESOURCE_GROUP", "")).strip()
+        job_name = str(profile.get("job_name") or os.getenv("REMEDIATION_ACA_JOB_NAME", "")).strip()
+        identity_endpoint = os.getenv("IDENTITY_ENDPOINT", "").strip()
+        identity_header = os.getenv("IDENTITY_HEADER", "").strip()
+        if not all((subscription, resource_group, job_name, identity_endpoint, identity_header)):
+            return await self._not_configured(action, "azure-container-apps-job")
+
+        timeout_seconds = max(30.0, min(float(profile.get("timeout_seconds") or 900), 1800.0))
+        api_version = "2024-03-01"
+        resource = (
+            f"https://management.azure.com/subscriptions/{subscription}/resourceGroups/{resource_group}"
+            f"/providers/Microsoft.App/jobs/{job_name}"
+        )
+        token_url = f"{identity_endpoint}?resource=https%3A%2F%2Fmanagement.azure.com%2F&api-version=2019-08-01"
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds, connect=10.0)) as client:
+            token_response = await client.get(token_url, headers={"X-IDENTITY-HEADER": identity_header})
+            token_response.raise_for_status()
+            access_token = str(token_response.json().get("access_token") or "")
+            if not access_token:
+                raise RuntimeError("Managed identity endpoint returned no Azure access token")
+            headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+            env = [
+                {"name": "KAI_OPS_INCIDENT_ID", "value": str(action.incident_id)},
+                {"name": "KAI_OPS_APPROVAL_ID", "value": str(action.approval_id or "")},
+                {"name": "KAI_OPS_ACTION_TYPE", "value": action.action_type},
+                {"name": "KAI_OPS_TARGET", "value": str(action.target)},
+                {"name": "KAI_OPS_EXECUTION_PLAN", "value": json.dumps(action.parameters.get("execution_plan") or {}, separators=(",", ":"))},
+            ]
+            start_response = await client.post(
+                f"{resource}/start?api-version={api_version}",
+                headers=headers,
+                json={"containers": [{"name": "remediation", "env": env}]},
+            )
+            start_response.raise_for_status()
+            start_payload = start_response.json() if start_response.content else {}
+            execution_name = str(start_payload.get("name") or start_payload.get("id", "").rstrip("/").split("/")[-1]).strip()
+            if not execution_name:
+                raise RuntimeError("Azure Container Apps Jobs accepted the request without an execution name")
+
+            deadline = asyncio.get_running_loop().time() + timeout_seconds
+            terminal_status = ""
+            while asyncio.get_running_loop().time() < deadline:
+                execution_response = await client.get(
+                    f"{resource}/executions/{execution_name}?api-version={api_version}", headers=headers
+                )
+                execution_response.raise_for_status()
+                properties = execution_response.json().get("properties", {})
+                status = str(properties.get("status") or "").strip()
+                if status.lower() in {"succeeded", "failed", "stopped", "degraded"}:
+                    terminal_status = status
+                    break
+                await asyncio.sleep(max(1.0, min(float(os.getenv("REMEDIATION_ACA_POLL_SECONDS", "5")), 30.0)))
+
+        succeeded = terminal_status.lower() == "succeeded"
+        action.status = RemediationStatus.SUCCEEDED if succeeded else RemediationStatus.FAILED
+        action.output = f"Azure Container Apps Job execution {execution_name} succeeded" if succeeded else ""
+        action.error = None if succeeded else (
+            f"Azure Container Apps Job execution {execution_name} finished with status {terminal_status}"
+            if terminal_status else f"Azure Container Apps Job execution {execution_name} timed out after {timeout_seconds:g}s"
+        )
+        action.parameters["execution_result"] = {
+            "executed": succeeded,
+            "executor": "azure_container_apps_job",
+            "job_name": job_name,
+            "execution_id": execution_name,
+            "execution_status": terminal_status or "TIMED_OUT",
+            "resource_id": resource,
             "summary": action.error or action.output,
         }
         return action
@@ -327,6 +425,7 @@ class RemediationEngine(BaseAgent):
     plugins: dict[str, RemediationPlugin] = field(
         default_factory=lambda: {
             "jenkins": JenkinsRollbackPlugin(),
+            "azure_container_apps_job": AzureContainerAppsJobPlugin(),
             "rollback_deployment": JenkinsRollbackPlugin(),
             "restart_pod": KubernetesRestartPlugin(),
             "scale_deployment": KubernetesRestartPlugin(),
@@ -361,7 +460,11 @@ class RemediationEngine(BaseAgent):
                 ToolSpec(
                     name=action_type,
                     handler=handler,
-                    timeout_seconds=12.0,
+                    # Jenkins is a run-to-completion connector. Its own bounded
+                    # queue/build deadline is authoritative; a shorter wrapper
+                    # timeout would cancel polling and manufacture a failure
+                    # while the external build continues running.
+                    timeout_seconds=1830.0 if action_type == "azure_container_apps_job" else 930.0 if action_type in {"jenkins", "rollback_deployment"} else 60.0,
                     permissions={"automation-agent"},
                 )
             )
@@ -481,6 +584,7 @@ class RemediationEngine(BaseAgent):
         target = str(next((value for value in target_candidates if value), approval.incident_id)).strip()
         service = str(approval.metadata.get("service") or approval.metadata.get("incident_service") or inferred_target or "").strip()
         environment = str(approval.metadata.get("environment") or "").strip()
+        namespace = str(approval.metadata.get("namespace") or "default").strip()
         if self._looks_like_uuid(target) and service:
             target = service
         generated_execution_plan = self._build_execution_plan(
@@ -488,6 +592,7 @@ class RemediationEngine(BaseAgent):
             target=target,
             service=service,
             environment=environment,
+            namespace=namespace,
             recommended_action=recommended_action,
             recommended_commands=command_list,
         )
@@ -497,7 +602,17 @@ class RemediationEngine(BaseAgent):
             or connection_profile.get("connection_type")
             or os.getenv("REMEDIATION_DEFAULT_EXECUTOR", "")
         ).strip().lower()
-        use_generated_commands = not plan_commands and requested_executor == "jenkins"
+        configured_default_executor = os.getenv("REMEDIATION_DEFAULT_EXECUTOR", "").strip().lower()
+        if configured_default_executor == "azure_container_apps_job" and (
+            not requested_executor or str(connection_profile.get("endpoint_url") or "").rstrip("/") == "http://jenkins:8080"
+        ):
+            requested_executor = "azure_container_apps_job"
+        execution_platform = os.getenv("REMEDIATION_EXECUTION_PLATFORM", "kubernetes").strip().lower()
+        stale_platform_plan = (
+            execution_platform in {"docker", "docker-compose", "compose"}
+            and any(str(item).strip().lower().startswith("kubectl ") for item in plan_commands)
+        )
+        use_generated_commands = requested_executor == "jenkins" and (not plan_commands or stale_platform_plan)
         governed_generated_commands = [
             str(item).strip()
             for item in generated_execution_plan.get("commands", [])
@@ -522,18 +637,46 @@ class RemediationEngine(BaseAgent):
             ],
             "queries": [
                 str(item).strip()
-                for item in (plan_queries if has_approved_execution_plan else generated_execution_plan.get("queries", []))
+                for item in (
+                    generated_execution_plan.get("queries", [])
+                    if use_generated_commands and not plan_queries
+                    else plan_queries if has_approved_execution_plan else generated_execution_plan.get("queries", [])
+                )
                 if str(item).strip()
+            ],
+            "rollback": [
+                str(item).strip()
+                for item in (
+                    approval.metadata.get("rollback_plan", [])
+                    if isinstance(approval.metadata.get("rollback_plan"), list)
+                    else [approval.metadata.get("rollback_plan")]
+                )
+                if str(item or "").strip()
             ],
         }
         supplied_profile = connection_profile
         default_executor = os.getenv("REMEDIATION_DEFAULT_EXECUTOR", "").strip().lower()
-        if default_executor == "jenkins":
+        if default_executor == "azure_container_apps_job" and (
+            not requested_executor
+            or str(supplied_profile.get("endpoint_url") or "").rstrip("/") == "http://jenkins:8080"
+        ):
+            connection_profile = {
+                **supplied_profile,
+                "connection_type": "azure_container_apps_job",
+                "executor_type": "azure_container_apps_job",
+                "identity_type": "managed_identity",
+                "subscription_id": os.getenv("AZURE_SUBSCRIPTION_ID", "").strip(),
+                "resource_group": os.getenv("AZURE_RESOURCE_GROUP", "").strip(),
+                "job_name": os.getenv("REMEDIATION_ACA_JOB_NAME", "").strip(),
+                "timeout_seconds": 900,
+            }
+            requested_executor = "azure_container_apps_job"
+        elif default_executor == "jenkins":
             default_profile: dict[str, Any] = {
                 "application": str(approval.metadata.get("application") or "KaiMS"),
                 "service": service or "unknown",
                 "environment": environment or "local",
-                "namespace": str(approval.metadata.get("namespace") or environment or "default"),
+                "namespace": namespace,
                 "endpoint_url": os.getenv("REMEDIATION_JENKINS_URL", "http://jenkins:8080").strip(),
                 "connection_type": "jenkins",
                 "executor_type": "jenkins",
@@ -584,11 +727,28 @@ class RemediationEngine(BaseAgent):
         target: str,
         service: str,
         environment: str,
+        namespace: str,
         recommended_action: str,
         recommended_commands: list[str],
     ) -> dict[str, list[str]]:
-        namespace = environment or "prod"
+        namespace = namespace or "default"
         resolved_target = target or service or "unknown-target"
+        execution_platform = os.getenv("REMEDIATION_EXECUTION_PLATFORM", "kubernetes").strip().lower()
+        if execution_platform in {"docker", "docker-compose", "compose"}:
+            safe_service = re.sub(r"[^a-zA-Z0-9_.-]", "", service or resolved_target)
+            compose_project = re.sub(
+                r"[^a-zA-Z0-9_.-]", "",
+                os.getenv("REMEDIATION_COMPOSE_PROJECT", "kaiops_azure"),
+            )
+            container = f"{compose_project}-{safe_service}-1"
+            return {
+                "commands": [
+                    f"curl --fail --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 -X POST http://docker-socket-proxy:2375/containers/{container}/restart?t=30",
+                    f"curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 2 http://{safe_service}:8000/healthz",
+                ],
+                "scripts": [],
+                "queries": [f"http://{safe_service}:8000/healthz"],
+            }
 
         if action_type == "restart_pod":
             commands = [
@@ -693,7 +853,7 @@ class RemediationEngine(BaseAgent):
         profile = action.parameters.get("connection_profile")
         profile = profile if isinstance(profile, dict) else {}
         executor_type = str(profile.get("executor_type") or profile.get("connection_type") or "").strip().lower()
-        action_type = "jenkins" if executor_type == "jenkins" else action.action_type
+        action_type = executor_type if executor_type in {"jenkins", "azure_container_apps_job"} else action.action_type
         action_type = action_type if action_type in self.tool_registry.tools else "api_execution"
         try:
             payload = await self.tool_registry.execute(

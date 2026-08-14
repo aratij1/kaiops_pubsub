@@ -13,7 +13,10 @@ export async function fetchAlertRows(limit: number, signal?: AbortSignal): Promi
   return getValidated(
     `/api-gateway/alerts/all?limit=${normalizedLimit}&compact=true`,
     AlertRowsResponseSchema,
-    { signal, timeoutMs: 7_000 },
+    // A cold source-balanced query can take several seconds once the alert
+    // history is large. Keep interactive refresh tolerant of that first read;
+    // subsequent reads are normally served in roughly one second.
+    { signal, timeoutMs: 15_000 },
   );
 }
 
@@ -22,7 +25,7 @@ export async function fetchLandingPadRows(limit: number, signal?: AbortSignal): 
   return getValidated(
     `/api-gateway/landing-pad/recent?limit=${normalizedLimit}`,
     AlertRowsResponseSchema,
-    { signal, timeoutMs: 6_000 },
+    { signal, timeoutMs: 15_000 },
   );
 }
 

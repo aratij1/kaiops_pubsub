@@ -9,10 +9,12 @@ receivers:
 processors:
   memory_limiter:
     check_interval: 1s
-    limit_mib: 384
+    limit_mib: 256
+    spike_limit_mib: 64
   batch:
-    timeout: 2s
-    send_batch_size: 1024
+    timeout: 5s
+    send_batch_size: 2048
+    send_batch_max_size: 4096
   attributes/redact:
     actions:
       - key: http.request.header.authorization
@@ -23,14 +25,22 @@ processors:
         action: delete
 
 exporters:
+  nop: {}
   otlp/jaeger:
     endpoint: jaeger:4317
     tls:
       insecure: true
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      queue_size: 512
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_interval: 15s
+      max_elapsed_time: 60s
   prometheus:
     endpoint: 0.0.0.0:8889
-  debug:
-    verbosity: basic
 
 service:
   telemetry:
@@ -48,4 +58,6 @@ service:
     logs:
       receivers: [otlp]
       processors: [memory_limiter, attributes/redact, batch]
-      exporters: [debug]
+      # Accept and bound logs without emitting every batch to Docker stdout.
+      # Log alert ingestion is handled by the dedicated OpenSearch connector.
+      exporters: [nop]

@@ -1,5 +1,5 @@
 import { useRouteRuntime } from "../../app/routeRuntime";
-const formatTime = (value?: string) => value ? new Date(value).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) : "-";
+const formatTime = (value?: string) => value ? `${new Date(value).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST` : "-";
 
 export default function AgentFlowRoute() {
   const { agentFlow } = useRouteRuntime();

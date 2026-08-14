@@ -36,6 +36,8 @@ x-service-env: &service-env
   OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
   CONTEXT_AGENT_URL: http://context-agent:8000
   RESOLUTION_AGENT_URL: http://resolution-agent:8000
+  REMEDIATION_EXECUTION_PLATFORM: ${REMEDIATION_EXECUTION_PLATFORM:-docker-compose}
+  REMEDIATION_COMPOSE_PROJECT: ${REMEDIATION_COMPOSE_PROJECT:-kaiops_azure}
   APPROVAL_SERVICE_URL: http://approval-service:8000
   ORCHESTRATOR_URL: http://orchestrator:8000
   MODEL_ROUTER_URL: http://model-router:8000
@@ -838,13 +840,14 @@ services:
   # Exposes a *read-only, containers-only* view of the Docker API over TCP so discovery-mcp
   # never touches /var/run/docker.sock directly. A raw socket mount (even with ":ro" on the
   # bind mount) grants the full Docker API -- create/exec/mount -- which is host-root
-  # equivalent; this proxy only allows GET requests against /containers*.
+  # equivalent. The proxy restricts access to /containers*; POST is enabled so
+  # the governed Jenkins allowlist can restart an explicitly named container.
   docker-socket-proxy:
     image: tecnativa/docker-socket-proxy:0.2.0
     restart: unless-stopped
     environment:
       CONTAINERS: 1
-      POST: 0
+      POST: 1
       LOG_LEVEL: warning
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -917,10 +920,16 @@ services:
       temporal: { condition: service_healthy }
 
   temporal-pilot-worker:
-    profiles: ["temporal-pilot", "full"]
     build: *service-build
     restart: unless-stopped
-    environment: { <<: *service-env, SERVICE_NAME: temporal-pilot-worker, TEMPORAL_PILOT_ENABLED: "true", AI_LAYER_REQUEST_TIMEOUT_SECONDS: "300" }
+    environment:
+      <<: *service-env
+      SERVICE_NAME: temporal-workflow-worker
+      TEMPORAL_PILOT_ENABLED: "true"
+      REMEDIATION_TEMPORAL_ENABLED: "true"
+      REMEDIATION_TEMPORAL_TASK_QUEUE: kaiops-remediation
+      REMEDIATION_INTERNAL_TOKEN: ${REMEDIATION_INTERNAL_TOKEN:-kaiops-local-temporal-remediation}
+      AI_LAYER_REQUEST_TIMEOUT_SECONDS: "1000"
     command: ["python", "-m", "temporal_pilot.worker"]
     working_dir: /app
     depends_on:
@@ -933,6 +942,9 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: remediation-engine
+      REMEDIATION_TEMPORAL_ENABLED: "true"
+      REMEDIATION_TEMPORAL_TASK_QUEUE: kaiops-remediation
+      REMEDIATION_INTERNAL_TOKEN: ${REMEDIATION_INTERNAL_TOKEN:-kaiops-local-temporal-remediation}
       RCA_RESOLUTION_AUTO_COMPLETE_THRESHOLD: ${RCA_RESOLUTION_AUTO_COMPLETE_THRESHOLD:-0.70}
       JENKINS_USERNAME: ${JENKINS_USERNAME:-kaiops}
       JENKINS_API_TOKEN: ${JENKINS_API_TOKEN:-kaiops-local-token}
@@ -940,6 +952,8 @@ services:
       REMEDIATION_JENKINS_URL: ${REMEDIATION_JENKINS_URL:-http://jenkins:8080}
       REMEDIATION_JENKINS_JOB: ${REMEDIATION_JENKINS_JOB:-kaiops-auto-remediation}
       REMEDIATION_JENKINS_CREDENTIAL_REF: ${REMEDIATION_JENKINS_CREDENTIAL_REF:-vault://kaiops/local/jenkins#api-token}
+      REMEDIATION_EXECUTION_PLATFORM: ${REMEDIATION_EXECUTION_PLATFORM:-docker-compose}
+      REMEDIATION_COMPOSE_PROJECT: ${REMEDIATION_COMPOSE_PROJECT:-kaiops_azure}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/remediation-engine
     ports: ["8008:8000"]
@@ -947,6 +961,7 @@ services:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       jenkins: { condition: service_started }
+      temporal: { condition: service_healthy }
 
   jenkins:
     build:
@@ -957,10 +972,13 @@ services:
       JENKINS_BOOTSTRAP_USERNAME: ${JENKINS_USERNAME:-kaiops}
       JENKINS_BOOTSTRAP_PASSWORD: ${JENKINS_API_TOKEN:-kaiops-local-token}
       JAVA_OPTS: -Djenkins.install.runSetupWizard=false
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
     ports: ["8082:8080"]
     volumes:
       - jenkins-data:/var/jenkins_home
       - ./deploy/jenkins:/opt/kaiops:ro
+    depends_on:
+      docker-socket-proxy: { condition: service_started }
 
   closure-service:
     build: *service-build
