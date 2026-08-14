@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import re
 import hashlib
+import os
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 from uuid import UUID
+
+import httpx
 
 from ai_workbench_common.agent_runtime import PolicyViolation
 from common.config import get_settings
@@ -18,7 +21,7 @@ from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
 from common.topics import APPROVAL_EVENTS, REMEDIATION_EVENTS, RESOLUTION_EVENTS
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from remediation_engine import RemediationEngine
 
 settings = get_settings()
@@ -46,6 +49,17 @@ def _looks_like_uuid(token: str | None) -> bool:
     except (TypeError, ValueError):
         return False
     return True
+
+
+def _execution_plan_fingerprint(action: RemediationAction) -> str:
+    plan = action.parameters.get("execution_plan")
+    plan = plan if isinstance(plan, dict) else {}
+    normalized = {
+        key: [str(item).strip() for item in plan.get(key, []) if str(item).strip()]
+        for key in ("commands", "scripts", "queries")
+        if isinstance(plan.get(key, []), list)
+    }
+    return hashlib.sha256(repr(normalized).encode("utf-8")).hexdigest()
 
 
 def _extract_resolution_context(source_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -252,6 +266,14 @@ async def _persist_remediation_event(
 
 
 async def startup(app: FastAPI) -> None:
+    app.state.temporal_client = None
+    if settings.remediation_temporal_enabled:
+        from temporalio.client import Client
+
+        app.state.temporal_client = await Client.connect(
+            settings.temporal_address,
+            namespace=settings.temporal_namespace,
+        )
     workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
     approval_consumers: list[tuple[str, Any, ConsumeRunner]] = []
     resolution_consumers: list[tuple[str, Any, ConsumeRunner]] = []
@@ -284,6 +306,7 @@ async def startup(app: FastAPI) -> None:
             EVENTS_PROCESSED.labels(settings.service_name, APPROVAL_EVENTS, "awaiting-confirmation").inc()
             return
         action = await _execute_approval(approval)
+        await _request_failure_reconsideration(action=action, source_payload=payload)
         await _persist_remediation_event(app=app, action=action, source_payload=payload, source=APPROVAL_EVENTS)
         payload_out = _build_remediation_event_payload(action=action, source_payload=payload, source=APPROVAL_EVENTS)
         await app.state.producer.publish(REMEDIATION_EVENTS, payload_out, key=str(action.incident_id))
@@ -323,6 +346,7 @@ async def startup(app: FastAPI) -> None:
             EVENTS_PROCESSED.labels(settings.service_name, RESOLUTION_EVENTS, "runbook-blocked").inc()
             return
         action = await _execute_approval(approval)
+        await _request_failure_reconsideration(action=action, source_payload=payload)
         await _persist_remediation_event(app=app, action=action, source_payload=payload, source=RESOLUTION_EVENTS)
         payload_out = _build_remediation_event_payload(action=action, source_payload=payload, source=RESOLUTION_EVENTS)
         await app.state.producer.publish(REMEDIATION_EVENTS, payload_out, key=str(action.incident_id))
@@ -398,7 +422,21 @@ async def _execute_approval(approval: Approval) -> RemediationAction:
                         and str(existing_execution.get("executor") or "").lower() == "jenkins"
                         and not existing_execution.get("build_result")
                     )
-                    if retryable_connector_skip or retryable_legacy_queue_ack:
+                    corrected_failed_plan = (
+                        existing.status == RemediationStatus.FAILED
+                        and _execution_plan_fingerprint(existing) != _execution_plan_fingerprint(action)
+                    )
+                    retryable_indeterminate_jenkins = (
+                        existing.status == RemediationStatus.FAILED
+                        and str(existing_execution.get("executor") or "").lower() == "jenkins"
+                        and str(existing_execution.get("build_result") or "").upper() in {"", "UNKNOWN"}
+                    )
+                    if (
+                        retryable_connector_skip
+                        or retryable_legacy_queue_ack
+                        or corrected_failed_plan
+                        or retryable_indeterminate_jenkins
+                    ):
                         # Preserve the durable row/idempotency identity while
                         # replacing the historical configuration skip with the
                         # newly configured Jenkins attempt.
@@ -418,10 +456,9 @@ async def _execute_approval(approval: Approval) -> RemediationAction:
     return action
 
 
-@app.post("/execute", response_model=RemediationAction)
-async def execute_approval(approval: Approval) -> RemediationAction:
-    action = await _execute_approval(approval)
+async def _finalize_api_execution(approval: Approval, action: RemediationAction) -> RemediationAction:
     source_payload = {"approval": approval.model_dump(mode="json")}
+    await _request_failure_reconsideration(action=action, source_payload=source_payload)
     await _persist_remediation_event(
         app=app,
         action=action,
@@ -436,6 +473,81 @@ async def execute_approval(approval: Approval) -> RemediationAction:
     await app.state.producer.publish(REMEDIATION_EVENTS, payload_out, key=str(action.incident_id))
     EVENTS_PROCESSED.labels(settings.service_name, "api-execute", "ok").inc()
     return action
+
+
+@app.post("/execute-direct", response_model=RemediationAction, include_in_schema=False)
+async def execute_approval_direct(approval: Approval, x_kaiops_internal_token: str = Header(default="")) -> RemediationAction:
+    """Temporal activity target. Idempotency makes activity retries safe."""
+    expected = settings.remediation_internal_token
+    if not expected or x_kaiops_internal_token != expected:
+        raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
+    return await _finalize_api_execution(approval, await _execute_approval(approval))
+
+
+@app.post("/execute", response_model=RemediationAction, status_code=202)
+async def execute_approval(approval: Approval) -> RemediationAction:
+    if not settings.remediation_temporal_enabled:
+        return await _finalize_api_execution(approval, await _execute_approval(approval))
+
+    client = getattr(app.state, "temporal_client", None)
+    if client is None:
+        raise HTTPException(status_code=503, detail="Durable remediation orchestration is unavailable.")
+    action_preview = engine.build_action(approval)
+    workflow_key = _build_action_idempotency_key(approval, action_preview.action_type)
+    workflow_id = f"kaiops-remediation-{workflow_key}"
+    # Workflow execution failures live in temporalio.exceptions. Importing this
+    # from temporalio.client works in neither the pinned SDK nor current SDKs
+    # and caused every durable execution request to fail before workflow start.
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+    from temporalio.common import WorkflowIDReusePolicy
+
+    try:
+        handle = await client.start_workflow(
+            "KaiOpsRemediationWorkflow",
+            approval.model_dump(mode="json"),
+            id=workflow_id,
+            task_queue=settings.remediation_temporal_task_queue,
+            id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
+        )
+    except WorkflowAlreadyStartedError:
+        handle = client.get_workflow_handle(workflow_id)
+    # The target may be the API gateway carrying this request. A durable
+    # workflow must therefore be acknowledged before remediation can restart
+    # that gateway; completion is delivered through the persisted action/event
+    # stream consumed by the UI.
+    action_preview.idempotency_key = workflow_key
+    action_preview.status = RemediationStatus.RUNNING
+    action_preview.started_at = utc_now()
+    action_preview.parameters["orchestration"] = {
+        "provider": "temporal",
+        "workflow_id": workflow_id,
+        "status": "accepted",
+    }
+    return action_preview
+
+
+@app.get("/executions/{incident_id}/workflow")
+async def remediation_workflow_status(incident_id: str, recommendation_id: str, action_type: str = "rollback_deployment") -> dict[str, Any]:
+    client = getattr(app.state, "temporal_client", None)
+    if not settings.remediation_temporal_enabled or client is None:
+        raise HTTPException(status_code=503, detail="Durable remediation orchestration is unavailable.")
+    approval = Approval(incident_id=UUID(incident_id), recommendation_id=UUID(recommendation_id))
+    workflow_key = _build_action_idempotency_key(approval, action_type)
+    return await client.get_workflow_handle(f"kaiops-remediation-{workflow_key}").query("status")
+
+
+@app.post("/workflow-preflight")
+async def remediation_workflow_preflight(approval: Approval) -> dict[str, Any]:
+    client = getattr(app.state, "temporal_client", None)
+    if not settings.remediation_temporal_enabled or client is None:
+        raise HTTPException(status_code=503, detail="Durable remediation orchestration is unavailable.")
+    workflow_key = _build_action_idempotency_key(approval, engine.build_action(approval).action_type)
+    return await client.execute_workflow(
+        "KaiOpsRemediationPreflightWorkflow",
+        approval.model_dump(mode="json"),
+        id=f"kaiops-remediation-preflight-{workflow_key}-{int(asyncio.get_running_loop().time() * 1000)}",
+        task_queue=settings.remediation_temporal_task_queue,
+    )
 
 
 async def _require_persisted_human_approval(approval: Approval) -> None:
@@ -478,7 +590,8 @@ async def dry_run_approval(approval: Approval) -> dict[str, Any]:
     _require_production_credential_reference(approval, action.action_type)
     allowed = engine.is_action_allowed(action.action_type)
     unsafe_reasons = _unsafe_plan_reasons(approval)
-    passed = allowed and not unsafe_reasons
+    connector_check = await _preflight_live_connector(action)
+    passed = allowed and not unsafe_reasons and connector_check["passed"]
     return {
         "status": "passed" if passed else "blocked",
         "dry_run": True,
@@ -493,9 +606,67 @@ async def dry_run_approval(approval: Approval) -> dict[str, Any]:
             "unsafe_reasons": unsafe_reasons,
             "approval_decision": str(approval.decision.value),
             "idempotency_key": _build_action_idempotency_key(approval, action.action_type),
+            "connector": connector_check,
         },
-        "message": "Dry run passed; no command was executed." if passed else (unsafe_reasons[0] if unsafe_reasons else f"Action type '{action.action_type}' is not allowlisted."),
+        "message": "Dry run passed; no command was executed." if passed else (
+            unsafe_reasons[0] if unsafe_reasons else connector_check.get("message") or f"Action type '{action.action_type}' is not allowlisted."
+        ),
     }
+
+
+async def _preflight_live_connector(action: RemediationAction) -> dict[str, Any]:
+    profile = action.parameters.get("connection_profile")
+    profile = profile if isinstance(profile, dict) else {}
+    executor = str(profile.get("executor_type") or profile.get("connection_type") or "").strip().lower()
+    if executor == "azure_container_apps_job":
+        required = {
+            "subscription_id": profile.get("subscription_id") or os.getenv("AZURE_SUBSCRIPTION_ID"),
+            "resource_group": profile.get("resource_group") or os.getenv("AZURE_RESOURCE_GROUP"),
+            "job_name": profile.get("job_name") or os.getenv("REMEDIATION_ACA_JOB_NAME"),
+            "managed_identity": os.getenv("IDENTITY_ENDPOINT") and os.getenv("IDENTITY_HEADER"),
+        }
+        missing = [name for name, value in required.items() if not str(value or "").strip()]
+        return {
+            "passed": not missing,
+            "executor": executor,
+            "job_name": str(required["job_name"] or ""),
+            "message": "Azure Container Apps Job configuration is ready." if not missing else f"Azure job preflight failed: configure {', '.join(missing)}.",
+        }
+    if executor != "jenkins":
+        return {"passed": True, "executor": executor or "local", "message": "No Jenkins connector selected."}
+
+    endpoint = str(profile.get("endpoint_url") or profile.get("endpoint") or "").strip().rstrip("/")
+    job_name = str(profile.get("job_name") or "").strip("/")
+    username = os.getenv("JENKINS_USERNAME", "").strip()
+    token = os.getenv("JENKINS_API_TOKEN", "").strip()
+    if not endpoint or not job_name or not username or not token:
+        return {
+            "passed": False,
+            "executor": "jenkins",
+            "message": "Jenkins preflight failed: endpoint, job, or runtime credentials are unavailable.",
+        }
+    job_path = "/job/" + "/job/".join(part for part in job_name.split("/") if part)
+    try:
+        async with httpx.AsyncClient(auth=(username, token), timeout=httpx.Timeout(8.0, connect=3.0)) as client:
+            response = await client.get(f"{endpoint}{job_path}/api/json?tree=name,buildable,inQueue")
+            response.raise_for_status()
+            payload = response.json()
+        buildable = bool(payload.get("buildable", True))
+        return {
+            "passed": buildable,
+            "executor": "jenkins",
+            "job_name": job_name,
+            "buildable": buildable,
+            "in_queue": bool(payload.get("inQueue")),
+            "message": "Jenkins job is reachable and buildable." if buildable else "Jenkins preflight failed: the configured job is disabled.",
+        }
+    except (httpx.HTTPError, ValueError) as exc:
+        return {
+            "passed": False,
+            "executor": "jenkins",
+            "job_name": job_name,
+            "message": f"Jenkins preflight failed: {type(exc).__name__}.",
+        }
 
 
 def _unsafe_plan_reasons(approval: Approval) -> list[str]:
@@ -533,6 +704,9 @@ def _require_production_credential_reference(approval: Approval, action_type: st
         return
     if str(action_type or "").strip().lower() in {"status", "query", "inspect", "noop"}:
         return
+    executor_type = str(profile.get("executor_type") or profile.get("connection_type") or "").strip().lower()
+    if executor_type == "azure_container_apps_job" and str(profile.get("identity_type") or "managed_identity").lower() == "managed_identity":
+        return
     credential_ref = str(profile.get("credential_ref") or "").strip()
     valid_prefix = credential_ref.startswith(("vault://", "arn:aws:secretsmanager:", "gcp-secret://", "k8s-secret://")) or (
         credential_ref.startswith("https://") and ".vault.azure.net/secrets/" in credential_ref
@@ -552,6 +726,16 @@ def _require_live_executor_configuration(action: RemediationAction) -> None:
     profile = action.parameters.get("connection_profile")
     profile = profile if isinstance(profile, dict) else {}
     executor_type = str(profile.get("executor_type") or profile.get("connection_type") or "").strip().lower()
+    if executor_type == "azure_container_apps_job":
+        required = {
+            "subscription_id": profile.get("subscription_id") or os.getenv("AZURE_SUBSCRIPTION_ID"),
+            "resource_group": profile.get("resource_group") or os.getenv("AZURE_RESOURCE_GROUP"),
+            "job_name": profile.get("job_name") or os.getenv("REMEDIATION_ACA_JOB_NAME"),
+        }
+        missing = [name for name, value in required.items() if not str(value or "").strip()]
+        if not missing:
+            return
+        raise HTTPException(status_code=409, detail=f"Execution blocked: Azure Container Apps Job connector requires {', '.join(missing)}.")
     if executor_type == "jenkins" or action.action_type == "rollback_deployment":
         required = {
             "endpoint_url": profile.get("endpoint_url") or profile.get("endpoint"),
@@ -728,6 +912,54 @@ def _build_auto_approval(payload: dict[str, Any]) -> Approval | None:
         comment=str(recommendation.get("recommended_action") or "auto-approved remediation"),
         metadata=metadata,
     )
+
+
+async def _request_failure_reconsideration(
+    *, action: RemediationAction, source_payload: dict[str, Any]
+) -> None:
+    """Ask resolution intelligence for a fresh, approval-gated plan after execution failure."""
+    if action.status != RemediationStatus.FAILED:
+        return
+    previous = source_payload.get("recommendation", {}) if isinstance(source_payload.get("recommendation"), dict) else {}
+    if not previous and isinstance(source_payload.get("approval"), dict):
+        approval_metadata = source_payload["approval"].get("metadata", {})
+        approval_metadata = approval_metadata if isinstance(approval_metadata, dict) else {}
+        previous = {
+            "id": source_payload["approval"].get("recommendation_id"),
+            "recommended_action": approval_metadata.get("recommended_action"),
+            "commands": approval_metadata.get("recommended_commands", []),
+            "severity": approval_metadata.get("severity", "warning"),
+            "metadata": approval_metadata,
+        }
+    previous_metadata = previous.get("metadata", {}) if isinstance(previous.get("metadata"), dict) else {}
+    attempt = int(previous_metadata.get("execution_reconsideration_attempt") or 0) + 1
+    maximum = max(0, int(os.getenv("REMEDIATION_FAILURE_RECONSIDERATION_LIMIT", "2")))
+    if attempt > maximum:
+        action.metadata["failure_reconsideration"] = {"status": "limit_reached", "attempt": attempt - 1, "limit": maximum}
+        await _persist_action(app, action)
+        return
+    request = {
+        "incident_id": str(action.incident_id),
+        "action_id": str(action.id),
+        "action_type": action.action_type,
+        "target": action.target,
+        "service": str(action.parameters.get("service") or action.target),
+        "environment": str(action.parameters.get("environment") or "prod"),
+        "error": str(action.error or action.output or "execution failed"),
+        "execution_result": action.parameters.get("execution_result", {}),
+        "previous_recommendation": previous,
+        "attempt": attempt,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(f"{settings.resolution_agent_url.rstrip('/')}/reconsider-execution", json=request)
+            response.raise_for_status()
+            revised_payload = response.json()
+        await app.state.producer.publish(RESOLUTION_EVENTS, revised_payload, key=str(action.incident_id))
+        action.metadata["failure_reconsideration"] = {"status": "awaiting_approval", "attempt": attempt, "limit": maximum}
+    except Exception as exc:
+        action.metadata["failure_reconsideration"] = {"status": "request_failed", "attempt": attempt, "error": str(exc)}
+    await _persist_action(app, action)
 
 
 def _enrich_approval_from_payload(approval: Approval, payload: dict[str, Any]) -> Approval:

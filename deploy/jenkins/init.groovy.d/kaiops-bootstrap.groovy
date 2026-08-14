@@ -1,5 +1,9 @@
 import hudson.security.HudsonPrivateSecurityRealm
 import hudson.security.csrf.DefaultCrumbIssuer
+import hudson.model.BooleanParameterDefinition
+import hudson.model.ParametersDefinitionProperty
+import hudson.model.StringParameterDefinition
+import hudson.model.TextParameterDefinition
 import jenkins.model.Jenkins
 import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition
 import org.jenkinsci.plugins.workflow.job.WorkflowJob
@@ -22,5 +26,21 @@ if (job == null) {
 }
 job.setDefinition(new CpsFlowDefinition(pipelineSource, true))
 job.setDescription('Governed KaiMS application resolution pipeline. Dry-run is enabled by default.')
+// Declarative Pipeline parameters are normally materialized only after the
+// first build. KaiOps calls buildWithParameters for that first build, so seed
+// the same contract during bootstrap and keep it refreshed on every restart.
+job.removeProperty(ParametersDefinitionProperty)
+job.addProperty(new ParametersDefinitionProperty([
+    new StringParameterDefinition('KAI_OPS_INCIDENT_ID', '', 'KaiOps incident UUID'),
+    new StringParameterDefinition('KAI_OPS_APPROVAL_ID', '', 'Recorded approval identifier'),
+    new StringParameterDefinition('KAI_OPS_APPLICATION_ID', '', 'Registered application identifier'),
+    new StringParameterDefinition('KAI_OPS_TARGET', '', 'Governed remediation target'),
+    new StringParameterDefinition('KAI_OPS_SERVICE', '', 'Affected service'),
+    new StringParameterDefinition('KAI_OPS_ENVIRONMENT', 'prod', 'Target environment'),
+    new StringParameterDefinition('KAI_OPS_NAMESPACE', 'default', 'Target namespace'),
+    new StringParameterDefinition('KAI_OPS_RESOLUTION_ID', 'investigate-first', 'Approved resolution'),
+    new BooleanParameterDefinition('KAI_OPS_DRY_RUN', true, 'Validate without applying changes'),
+    new TextParameterDefinition('KAI_OPS_EXECUTION_PLAN', '{"commands":[],"scripts":[],"queries":[]}', 'Approved execution plan'),
+]))
 job.save()
 jenkins.save()

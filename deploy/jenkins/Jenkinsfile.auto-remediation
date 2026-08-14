@@ -1,5 +1,3 @@
-import groovy.json.JsonSlurperClassic
-
 def approvedCommand(String command) {
     def value = (command ?: '').trim()
     def patterns = [
@@ -8,7 +6,10 @@ def approvedCommand(String command) {
         ~/^ansible-playbook\s+playbooks\/[A-Za-z0-9_.\/-]+\.ya?ml\b.*/,
         ~/^redis-cli\s+-h\s+[A-Za-z0-9_.-]+\s+-n\s+\d+\s+FLUSHDB$/,
         ~/^terraform\s+(init|apply)\b.*/,
-        ~/^mysql\s+-e\s+"CALL mysql\.rds_failover\(\);"$/
+        ~/^mysql\s+-e\s+"CALL mysql\.rds_failover\(\);"$/,
+        ~/^curl --fail --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 -X POST http:\/\/docker-socket-proxy:2375\/containers\/[A-Za-z0-9_.-]+\/restart\?t=30$/,
+        ~/^curl --fail --silent --show-error http:\/\/docker-socket-proxy:2375\/containers\/[A-Za-z0-9_.-]+\/json$/,
+        ~/^curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 2 http:\/\/[A-Za-z0-9_.-]+:8000\/healthz$/
     ]
     return patterns.any { value ==~ it }
 }
@@ -41,8 +42,10 @@ pipeline {
                     if (!params.KAI_OPS_INCIDENT_ID?.trim() || !params.KAI_OPS_TARGET?.trim()) {
                         error('KaiOps incident id and remediation target are required')
                     }
-                    def plan = new JsonSlurperClassic().parseText(params.KAI_OPS_EXECUTION_PLAN)
+                    def plan = readJSON text: params.KAI_OPS_EXECUTION_PLAN, returnPojo: true
                     def commands = plan.commands instanceof List ? plan.commands : []
+                    def checks = plan.queries instanceof List ? plan.queries : []
+                    def rollback = plan.rollback instanceof List ? plan.rollback : []
                     def mutating = params.KAI_OPS_RESOLUTION_ID != 'investigate-first'
                     if (mutating && !params.KAI_OPS_APPROVAL_ID?.trim()) {
                         error('A KaiOps approval id is required for mutating resolution steps')
@@ -50,12 +53,18 @@ pipeline {
                     if (!commands && mutating) {
                         error('The approved KaiOps execution plan contains no commands')
                     }
+                    if (mutating && !params.KAI_OPS_DRY_RUN && !checks) {
+                        error('A live remediation requires at least one recovery validation check')
+                    }
+                    if (mutating && !params.KAI_OPS_DRY_RUN && !rollback) {
+                        error('A live remediation requires an explicit rollback contract')
+                    }
                     def rejected = commands.findAll { !approvedCommand(it as String) }
                     if (rejected) {
                         error("Commands outside the Jenkins remediation allowlist: ${rejected.join(', ')}")
                     }
                     currentBuild.description = "${params.KAI_OPS_RESOLUTION_ID} | ${params.KAI_OPS_INCIDENT_ID} | ${params.KAI_OPS_TARGET}"
-                    env.KAI_OPS_COMMANDS_JSON = groovy.json.JsonOutput.toJson(commands)
+                    env.KAI_OPS_COMMANDS_JSON = writeJSON(json: commands, returnText: true)
                 }
             }
         }
@@ -63,7 +72,7 @@ pipeline {
         stage('Execute approved resolution') {
             steps {
                 script {
-                    def commands = new JsonSlurperClassic().parseText(env.KAI_OPS_COMMANDS_JSON)
+                    def commands = readJSON text: env.KAI_OPS_COMMANDS_JSON, returnPojo: true
                     commands.each { command ->
                         if (params.KAI_OPS_DRY_RUN) {
                             echo "DRY RUN: ${command}"
@@ -80,7 +89,7 @@ pipeline {
         stage('Record validation contract') {
             steps {
                 script {
-                    def plan = new JsonSlurperClassic().parseText(params.KAI_OPS_EXECUTION_PLAN)
+                    def plan = readJSON text: params.KAI_OPS_EXECUTION_PLAN, returnPojo: true
                     def checks = plan.queries instanceof List ? plan.queries : []
                     def rollback = plan.rollback instanceof List ? plan.rollback : []
                     writeFile file: "kaiops-remediation-${params.KAI_OPS_INCIDENT_ID}.log", text: "Application: ${params.KAI_OPS_APPLICATION_ID}\nIncident: ${params.KAI_OPS_INCIDENT_ID}\nApproval: ${params.KAI_OPS_APPROVAL_ID}\nResolution: ${params.KAI_OPS_RESOLUTION_ID}\nTarget: ${params.KAI_OPS_TARGET}\nNamespace: ${params.KAI_OPS_NAMESPACE}\nDry run: ${params.KAI_OPS_DRY_RUN}\nExecution: successful\nValidation checks for KaiOps closure service:\n${checks.join('\n')}\nRollback contract:\n${rollback.join('\n')}\n"

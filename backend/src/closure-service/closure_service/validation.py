@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import httpx
+
 from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.models import RemediationAction, RemediationStatus, ResolutionReport
 
@@ -19,12 +21,23 @@ class ClosureValidationAgent(BaseAgent):
         return report
 
     async def validate(self, action: RemediationAction) -> ResolutionReport:
-        validation = {
-            "latency_recovered": action.status == RemediationStatus.SUCCEEDED,
-            "cpu_normalized": action.status == RemediationStatus.SUCCEEDED,
-            "error_rate_reduced": action.status == RemediationStatus.SUCCEEDED,
-            "alerts_cleared": action.status == RemediationStatus.SUCCEEDED,
-        }
+        execution_plan = action.parameters.get("execution_plan")
+        execution_plan = execution_plan if isinstance(execution_plan, dict) else {}
+        queries = execution_plan.get("queries")
+        queries = [str(item).strip() for item in queries] if isinstance(queries, list) else []
+        health_urls = [item for item in queries if item.startswith(("http://", "https://"))]
+        validation: dict[str, bool] = {"remediation_succeeded": action.status == RemediationStatus.SUCCEEDED}
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
+            for index, url in enumerate(health_urls, start=1):
+                try:
+                    response = await client.get(url)
+                    validation[f"health_check_{index}"] = 200 <= response.status_code < 300
+                except httpx.HTTPError:
+                    validation[f"health_check_{index}"] = False
+        validation["validation_supplied"] = bool(health_urls)
+        validation["alerts_cleared"] = bool(health_urls) and all(
+            passed for name, passed in validation.items() if name.startswith("health_check_")
+        )
         restored = all(validation.values())
         action_taken = action.output or action.action_type
         return ResolutionReport(
@@ -42,5 +55,6 @@ class ClosureValidationAgent(BaseAgent):
             lessons_learned=[
                 "Compare alert onset with deployment/change windows.",
                 "Prefer reversible remediation for high-confidence deployment regressions.",
+                "Require an explicit health endpoint or governed recovery query before closure.",
             ],
         )

@@ -32,7 +32,12 @@ try {
     }
 
     docker compose build ui
-    if ($LASTEXITCODE -ne 0) { throw "UI image build failed." }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "BuildKit failed. Retrying the UI once with the classic builder."
+        $env:DOCKER_BUILDKIT = "0"
+        docker compose build ui
+        if ($LASTEXITCODE -ne 0) { throw "UI image build failed with both builders." }
+    }
     docker compose up -d --force-recreate --no-deps ui
     if ($LASTEXITCODE -ne 0) { throw "UI container start failed." }
 

@@ -12,11 +12,12 @@ from opentelemetry import trace
 settings = get_settings()
 
 
-async def _post(base: str, path: str, payload: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+async def _post(base: str, path: str, payload: dict[str, Any], params: dict[str, Any] | None = None, extra_headers: dict[str, str] | None = None) -> dict[str, Any]:
     info = activity.info()
     headers = {"Idempotency-Key": str(info.activity_id)}
     if settings.ai_layer_auth_token:
         headers["Authorization"] = f"Bearer {settings.ai_layer_auth_token}"
+    headers.update(extra_headers or {})
     started = perf_counter()
     stage = path.strip("/") or "activity"
     try:
@@ -48,6 +49,24 @@ async def resolve_recommendation(context: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="execute_remediation_decision")
 async def execute_remediation_decision(approval: dict[str, Any]) -> dict[str, Any]:
     return await _post(settings.remediation_engine_url, "/execute", approval)
+
+
+@activity.defn(name="execute_remediation_action")
+async def execute_remediation_action(approval: dict[str, Any]) -> dict[str, Any]:
+    activity.heartbeat({"stage": "dispatching", "incident_id": approval.get("incident_id")})
+    result = await _post(
+        settings.remediation_engine_url,
+        "/execute-direct",
+        approval,
+        extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
+    )
+    activity.heartbeat({"stage": "terminal", "status": result.get("status")})
+    return result
+
+
+@activity.defn(name="preflight_remediation_action")
+async def preflight_remediation_action(approval: dict[str, Any]) -> dict[str, Any]:
+    return await _post(settings.remediation_engine_url, "/dry-run", approval)
 
 
 @activity.defn(name="request_compensation")

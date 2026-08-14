@@ -18,7 +18,7 @@ import EvidenceDraftReview from "./EvidenceDraftReview";
 import "./RcaPanel.css";
 import "./EvidenceReview.css";
 
-type RcaDetailView = "summary" | "evidence" | "technical";
+type RcaDetailView = "simple" | "detailed" | "evidence" | "technical";
 
 interface RcaPanelProps {
   rcaDetailView: RcaDetailView;
@@ -130,13 +130,26 @@ export default function RcaPanel({
         </div>
       </header>
       <section className="understand-source-matrix" aria-label="External knowledge and evidence coverage">
-        <header><div><Search size={17} /><span><strong>Evidence coverage</strong><small>Live operational data and external knowledge used for this analysis</small></span></div><b>{evidenceSources.filter((source) => source.count).length}/{evidenceSources.length} connected</b></header>
+        <header><div><Search size={17} /><span><strong>Evidence coverage</strong><small>Live operational data and external knowledge used for this analysis</small></span></div><div className="evidence-coverage-actions"><b>{evidenceSources.filter((source) => source.count).length}/{evidenceSources.length} connected</b>{selectedAiTrust.missing.length ? <button type="button" className="button-primary" onClick={() => onSetRcaDetailView("evidence")}>Collect evidence</button> : null}<button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("evidence")}>Inspect evidence</button></div></header>
         <div>{evidenceSources.map(({ id, label, icon: Icon, count, fresh }) => <button type="button" key={id} className={count ? "has-evidence" : "is-missing"} onClick={() => onSetRcaDetailView(count ? "evidence" : "technical")}><i><Icon size={17} /></i><span><strong>{label}</strong><small>{count ? `${count} record${count === 1 ? "" : "s"} · ${fresh} fresh` : "No evidence returned"}</small></span>{count ? <CheckCircle2 size={15} /> : <ShieldAlert size={15} />}</button>)}</div>
       </section>
       <nav className="rca-view-tabs" aria-label="RCA views">
-        {[['summary', 'Summary'], ['evidence', `Evidence (${selectedAiTrust.evidence.length})`], ['technical', 'Technical analysis']].map(([id, label]) => <button key={id} type="button" className={rcaDetailView === id ? "active" : ""} aria-current={rcaDetailView === id ? "page" : undefined} onClick={() => onSetRcaDetailView(id as RcaDetailView)}>{label}</button>)}
+        {[['simple', 'Simple'], ['detailed', 'Detailed'], ['evidence', `Evidence (${selectedAiTrust.evidence.length})`], ['technical', 'Technical trace']].map(([id, label]) => <button key={id} type="button" className={rcaDetailView === id ? "active" : ""} aria-current={rcaDetailView === id ? "page" : undefined} onClick={() => onSetRcaDetailView(id as RcaDetailView)}>{label}</button>)}
       </nav>
-      {rcaDetailView === "summary" ? <section className="rca-decision-brief" aria-labelledby="rca-decision-title">
+      {rcaDetailView === "simple" ? <section className="understand-simple" aria-labelledby="understand-simple-title">
+        <header>
+          <div><span className="discovery-eyebrow">Plain-language explanation</span><h3 id="understand-simple-title">What you need to know</h3><p>A concise, evidence-aware explanation for making the next operational decision.</p></div>
+          <div className={`rca-confidence is-${selectedRcaDecision.confidence >= 0.85 ? "high" : selectedRcaDecision.confidence >= 0.7 ? "medium" : "low"}`}><strong>{formatQualityPercent(selectedRcaDecision.confidence)}</strong><span>confidence</span></div>
+        </header>
+        <div className="understand-simple-grid">
+          <article><span>1 · What happened</span><h4>{selectedRcaDecision.rootCause}</h4><p>{selectedRcaDecision.status === "hypothesis" ? "This is the leading explanation, not yet a confirmed cause." : selectedRcaDecision.status === "insufficient-evidence" ? "There is not enough evidence to confirm a cause yet." : "The available evidence supports this explanation."}</p></article>
+          <article><span>2 · Why it matters</span><h4>{selectedRcaDecision.customerImpact}</h4><p>{selectedRcaDecision.serviceImpact}</p></article>
+          <article><span>3 · What to do next</span><h4>{selectedRcaDecision.action}</h4><p>{selectedRcaDecision.reviewRequired ? "Review the evidence gaps and approve the plan before any change is made." : "Review the target and safeguards, then continue to the governed execution plan."}</p></article>
+        </div>
+        <div className={selectedRcaDecision.reviewRequired ? "understand-simple-callout needs-review" : "understand-simple-callout is-ready"}><ShieldAlert size={18} /><div><strong>{selectedRcaDecision.reviewRequired ? "Human review required" : "Ready for operator review"}</strong><span>{selectedAiTrust.missing.length ? `${selectedAiTrust.missing.length} evidence gap(s) remain. Open Evidence before approving a change.` : `${selectedAiTrust.evidence.length} evidence record(s) support this explanation.`}</span></div></div>
+        <footer><button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("detailed")}>See detailed explanation</button><button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("evidence")}>Inspect evidence</button><button type="button" className="button-primary" onClick={() => onSetHomeDetailTab("execution")}>Review action plan</button></footer>
+      </section> : null}
+      {rcaDetailView === "detailed" ? <section className="rca-decision-brief" aria-labelledby="rca-decision-title">
         <header className="rca-decision-header">
           <div>
             <span className="discovery-eyebrow">Operator decision brief</span>
@@ -155,7 +168,7 @@ export default function RcaPanel({
           <div className="understand-confidence-ring" style={{ "--confidence": `${Math.round(selectedRcaDecision.confidence * 100)}%` } as React.CSSProperties}><span><strong>{formatQualityPercent(selectedRcaDecision.confidence)}</strong><small>confidence</small></span></div>
           <div><span className="discovery-eyebrow">Recommended response</span><h4>{selectedRcaDecision.action}</h4><p>{selectedRcaDecision.reviewRequired ? "Operator confirmation is required before execution." : "Evidence meets the current action threshold."}</p></div>
           <dl><div><dt>Grounding</dt><dd>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</dd></div><div><dt>Citations</dt><dd>{formatQualityPercent(selectedAlertEvaluation.citationCoverage)}</dd></div><div><dt>Evidence gaps</dt><dd>{selectedAiTrust.missing.length}</dd></div></dl>
-          <div className="rca-decision-actions">{selectedAiTrust.missing.length ? <button type="button" className="button-primary" onClick={() => onSetRcaDetailView("evidence")}>Collect evidence</button> : <button type="button" className="button-primary" onClick={() => onSetHomeDetailTab("execution")}>{selectedRcaDecision.reviewRequired ? "Review plan" : "Continue"}</button>}<button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("evidence")}>Inspect evidence</button></div>
+          <div className="rca-decision-actions"><button type="button" className="button-primary" onClick={() => onSetHomeDetailTab("execution")}>{selectedRcaDecision.reviewRequired ? "Review plan" : "Continue"}</button></div>
         </aside></div>
         <section className="resolution-catalog" aria-labelledby="resolution-catalog-title">
           <header><div><span className="discovery-eyebrow">Resolution dictionary</span><h4 id="resolution-catalog-title">Choose the most relevant response</h4></div><span>{resolutionOptions.length} matched options</span></header>
@@ -183,7 +196,7 @@ export default function RcaPanel({
           <div className={`evidence-confidence is-${qualityToneFromScore(selectedAlertEvaluation.confidenceScore)}`}><Sparkles size={17} /><span><strong>{formatQualityPercent(selectedAlertEvaluation.confidenceScore)}</strong><small>analysis confidence</small></span></div>
         </header>
         <div className="evidence-health-strip" aria-label="Evidence health"><span><i><Database size={16} /></i><strong>{selectedAiTrust.evidence.length}</strong><small>linked records</small></span><span><i><Activity size={16} /></i><strong>{selectedAiTrust.evidence.filter((row: any) => !row.cached).length}</strong><small>fresh observations</small></span><span><i><Clock3 size={16} /></i><strong>{selectedAiTrust.evidence.filter((row: any) => row.cached).length}</strong><small>cached context</small></span><span className={selectedAiTrust.conflicting.length ? "has-risk" : "is-clear"}><i><ShieldAlert size={16} /></i><strong>{selectedAiTrust.conflicting.length}</strong><small>conflicts</small></span><span className={selectedAiTrust.missing.length ? "has-risk" : "is-clear"}><i><Search size={16} /></i><strong>{selectedAiTrust.missing.length}</strong><small>evidence gaps</small></span></div>
-        <section className="evidence-inference-brief"><div><span>AI inference</span><strong>{selectedAiTrust.analysis.root_cause || canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).rootCause}</strong></div><button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("summary")}>Compare decision</button></section>
+        <section className="evidence-inference-brief"><div><span>AI inference</span><strong>{selectedAiTrust.analysis.root_cause || canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).rootCause}</strong></div><button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("detailed")}>Compare decision</button></section>
         {selectedAiTrust.evidence.some((row: any) => row.cached && row.freshness === "Stale") ? <p className="ai-trust-warning" role="status">Cached context may predate the current deployment. Validate the target before acting.</p> : null}
         <details className="evidence-model-details"><summary>Analysis diagnostics and model details</summary><div className="ai-trust-summary-grid ai-trust-summary-compact">
           <div><strong>Confidence reasons</strong><ul>{selectedAiTrust.confidenceReasons.map((reason: string) => <li key={reason}>{reason}</li>)}</ul></div>

@@ -114,6 +114,7 @@ class FaultLab:
         self.counters = Counter()
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
+        self.service_outage_expires_at = 0.0
         self.worker = threading.Thread(target=self._tick, daemon=True, name="fault-emitter")
         self.worker.start()
 
@@ -176,6 +177,23 @@ class FaultLab:
         self.counters["faults_recovered"] += 1
         self.emit(scenario, "INFO", "fault_recovered", f"Fault recovered; validation: {scenario['validation']}", fault)
         return True, fault
+
+    def set_service_outage(self, duration: int = 180) -> dict[str, Any]:
+        duration = min(max(duration, 75), 900)
+        with self.lock:
+            self.service_outage_expires_at = time.time() + duration
+        return {"service": "kaiops-fault-lab-service", "state": "DOWN", "duration_seconds": duration}
+
+    def recover_service(self) -> dict[str, Any]:
+        with self.lock:
+            self.service_outage_expires_at = 0.0
+        return {"service": "kaiops-fault-lab-service", "state": "UP"}
+
+    def service_is_down(self) -> bool:
+        with self.lock:
+            if self.service_outage_expires_at and time.time() >= self.service_outage_expires_at:
+                self.service_outage_expires_at = 0.0
+            return self.service_outage_expires_at > 0
 
     def emit(
         self, scenario: dict[str, Any], level: str, event: str, message: str, fault: dict[str, Any]
@@ -282,6 +300,8 @@ class FaultLab:
             f"kaiops_active_faults {len(self.active)}",
             "# HELP kaiops_fault_ratio Current signal divided by its alert threshold.",
             "# TYPE kaiops_fault_ratio gauge",
+            "# HELP kaiops_fault_active Whether a bounded scenario fault is currently active (1 active, 0 healthy).",
+            "# TYPE kaiops_fault_active gauge",
         ]
         for sid, scenario in self.scenarios.items():
             profile = scenario["profile"]
@@ -296,6 +316,7 @@ class FaultLab:
                 f'alert_name="{prom_escape(scenario["alert_name"])}",'
                 f'ticket_example="{prom_escape(scenario["ticket_example"])}"'
             )
+            lines.append(f"kaiops_fault_active{{{labels}}} {1 if sid in self.active else 0}")
             lines.append(f"kaiops_fault_ratio{{{labels}}} {ratio:.6f}")
             metric = profile["metric"]
             lines.extend(
@@ -324,20 +345,24 @@ main{padding:22px;max-width:1300px;margin:auto}.notice{background:#fff7ed;border
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px}.card{background:#fff;border:1px solid #d8e1eb;border-radius:10px;padding:15px}
 .Critical{border-left:6px solid #b91c1c}.High{border-left:6px solid #ea580c}.Medium{border-left:6px solid #d97706}
 button{border:0;border-radius:6px;padding:8px 12px;color:white;cursor:pointer;margin-right:6px}.start{background:#b91c1c}.stop{background:#0f766e}
-.muted{color:#64748b;font-size:13px}pre{background:#111827;color:#d1fae5;padding:12px;max-height:330px;overflow:auto;border-radius:8px}</style>
+.active{box-shadow:0 0 0 3px #22c55e}.state{font-weight:700;color:#15803d}.status{min-height:22px;margin:8px 0;color:#334155}
+button:disabled{cursor:not-allowed;opacity:.5}.muted{color:#64748b;font-size:13px}pre{background:#111827;color:#d1fae5;padding:12px;max-height:330px;overflow:auto;border-radius:8px}</style>
 </head><body><header><h2>KaiOps Fault-Producing Application</h2></header><main>
 <div class="notice"><b>Safe lab only:</b> faults are bounded to this process. Monitoring detects the breached metrics and logs and can create the Jira incidents.</div>
-<p><button class="stop" onclick="refresh()">Refresh</button> <span id="summary"></span></p><div id="grid" class="grid"></div>
+<p><button class="stop" id="refresh-button">Refresh</button><button class="start" id="service-down-button">Test KaiOps service down</button><button class="stop" id="service-up-button">Restore test service</button> <span id="summary"></span></p><div id="status" class="status" role="status"></div><div id="grid" class="grid"></div>
 <h3>Live application errors</h3><pre id="events">Activate a fault to produce errors.</pre>
 <script>
-async function refresh(){let r=await fetch('/api/scenarios'),d=await r.json();document.getElementById('summary').textContent=`${d.items.length} failure scenarios · ${d.active_count} active`;
-document.getElementById('grid').innerHTML=d.items.map(x=>`<div class="card ${x.severity}"><b>${x.scenario_id}: ${x.alert_name}</b><p>${x.service} · ${x.component}</p>
+async function request(url,options){let r=await fetch(url,options);let d=await r.json();if(!r.ok)throw new Error(d.error||`Request failed (${r.status})`);return d}
+async function refresh(){let d=await request('/api/scenarios'),active=await request('/api/faults'),activeIds=new Set(active.items.map(x=>x.scenario_id));document.getElementById('summary').textContent=`${d.items.length} failure scenarios · ${d.active_count} active`;
+document.getElementById('grid').innerHTML=d.items.map(x=>{let isActive=activeIds.has(x.scenario_id);return `<div class="card ${x.severity} ${isActive?'active':''}"><b>${x.scenario_id}: ${x.alert_name}</b><p>${x.service} · ${x.component}</p>
 <p class="muted">${x.root_cause}</p><p>Metric: ${x.profile.metric}<br>Threshold: ${x.profile.threshold}</p>
-<button class="start" onclick="start('${x.scenario_id}')">Start fault</button><button class="stop" onclick="stopFault('${x.scenario_id}')">Recover</button></div>`).join('')}
-async function start(id){await fetch(`/api/faults/${id}/start?duration=90`,{method:'POST'});refresh()}
-async function stopFault(id){await fetch(`/api/faults/${id}/stop`,{method:'POST'});refresh()}
+${isActive?'<p class="state">ACTIVE — emitting breached metrics and logs</p>':''}<button class="start" data-action="start" data-id="${x.scenario_id}" ${isActive?'disabled':''}>Start fault</button><button class="stop" data-action="stop" data-id="${x.scenario_id}" ${isActive?'':'disabled'}>Recover</button></div>`}).join('')}
+async function changeFault(action,id){let status=document.getElementById('status');status.textContent=`${action==='start'?'Starting':'Recovering'} ${id}…`;try{let d=await request(`/api/faults/${id}/${action}${action==='start'?'?duration=90':''}`,{method:'POST'});status.textContent=action==='start'?`✓ ${id} started. Prometheus alert evaluation takes about 15–30 seconds.`:`✓ ${id} recovered.`;await refresh()}catch(e){status.textContent=`Could not ${action} ${id}: ${e.message}`}}
 async function events(){let r=await fetch('/api/events?limit=30'),d=await r.json();document.getElementById('events').textContent=d.items.map(x=>JSON.stringify(x)).join('\n')}
-refresh();setInterval(events,1000);setInterval(refresh,4000)</script></main></body></html>"""
+document.getElementById('refresh-button').addEventListener('click',refresh);document.getElementById('grid').addEventListener('click',e=>{let b=e.target.closest('button[data-action]');if(b&&!b.disabled)changeFault(b.dataset.action,b.dataset.id)});
+document.getElementById('service-down-button').addEventListener('click',async()=>{let s=document.getElementById('status');try{await request('/api/demos/service-down/start?duration=180',{method:'POST'});s.textContent='✓ Test service is DOWN. KaiOpsServiceDown will fire after one minute.'}catch(e){s.textContent=`Could not stop test service: ${e.message}`}});
+document.getElementById('service-up-button').addEventListener('click',async()=>{let s=document.getElementById('status');try{await request('/api/demos/service-down/stop',{method:'POST'});s.textContent='✓ Test service restored. Prometheus will send a resolved event.'}catch(e){s.textContent=`Could not restore test service: ${e.message}`}});
+refresh().catch(e=>document.getElementById('status').textContent=`Dashboard refresh failed: ${e.message}`);events();setInterval(events,1000);setInterval(refresh,4000)</script></main></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -369,6 +394,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_body(200, {"items": list(self.lab.events)[-limit:]})
         if parsed.path == "/metrics":
             return self.send_body(200, self.lab.prometheus(), "text/plain; version=0.0.4")
+        if parsed.path == "/service-health/metrics":
+            if self.lab.service_is_down():
+                return self.send_body(503, "bounded test service outage\n", "text/plain")
+            return self.send_body(200, "# TYPE kaiops_test_service_info gauge\nkaiops_test_service_info 1\n", "text/plain; version=0.0.4")
         match = re.fullmatch(r"/workload/([a-zA-Z0-9_-]+)", parsed.path)
         if match:
             status, body, latency = self.lab.exercise(match.group(1))
@@ -379,6 +408,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        service_match = re.fullmatch(r"/api/demos/service-down/(start|stop)", parsed.path)
+        if service_match:
+            action = service_match.group(1)
+            body = self.lab.set_service_outage(int(query.get("duration", ["180"])[0])) if action == "start" else self.lab.recover_service()
+            return self.send_body(HTTPStatus.ACCEPTED if action == "start" else HTTPStatus.OK, body)
         demo_match = re.fullmatch(r"/api/demos/telemetry/(start|stop)", parsed.path)
         if demo_match:
             action = demo_match.group(1)

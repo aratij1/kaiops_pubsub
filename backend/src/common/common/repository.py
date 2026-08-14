@@ -3447,6 +3447,34 @@ class IncidentRepository:
                 projection_payload["remediation_action"] = action.payload or {}
                 projection_payload["remediation_status"] = action_status
 
+            approval_payload = projection_payload.get("approval") if isinstance(projection_payload.get("approval"), dict) else {}
+            approval_event_payload = projection_payload.get("event_payload") if isinstance(projection_payload.get("event_payload"), dict) else {}
+            approval_event_decision = (
+                approval_event_payload.get("decision")
+                if str(row.latest_event_type or "").strip().lower() == "incident.approval.recorded"
+                else None
+            )
+            approval_status = str(
+                projection_payload.get("approval_status")
+                or approval_payload.get("status")
+                or approval_payload.get("decision")
+                or approval_event_decision
+                or ""
+            ).strip().lower().replace("-", "_").replace(" ", "_")
+            pending_approval_statuses = {
+                "awaiting_approval", "pending_approval", "pending", "queued", "draft", "standby", "required"
+            }
+            terminal_incident_statuses = {"closed", "resolved", "failed", "cancelled", "canceled"}
+            if approval_status in pending_approval_statuses and str(projected_status or "").lower() not in terminal_incident_statuses:
+                projected_status = "awaiting_approval"
+                projection_payload["status"] = projected_status
+            elif approval_status in {"approved", "modified"} and action is None and str(projected_status or "").lower() == "remediating":
+                # Older approval records advanced to remediating before an
+                # action existed. Present them as approved/awaiting execution
+                # so they cannot remain permanently in a false running state.
+                projected_status = "approved"
+                projection_payload["status"] = projected_status
+
             ticket_id = ticket_by_incident.get(row.incident_id) or projection_payload.get("ticket_id")
 
             import os
@@ -3479,6 +3507,7 @@ class IncidentRepository:
                     "environment": row.environment,
                     "severity": row.severity,
                     "status": projected_status,
+                    "approval_status": approval_status or None,
                     "owner": row.owner,
                     "risk_tier": row.risk_tier,
                     "execution_mode": row.execution_mode,
