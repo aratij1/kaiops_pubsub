@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 from common.database import ActionRecord
-from common.models import Approval, ApprovalDecision
+from common.models import Approval, ApprovalDecision, RemediationStatus
 from common.repository import IncidentRepository
 from sqlalchemy import select
 
@@ -34,6 +34,13 @@ def test_build_action_idempotency_key_is_deterministic_per_action_type() -> None
     assert key_one != key_other_action
 
 
+def test_temporal_duplicate_workflow_exception_is_available() -> None:
+    """Keep the durable execution endpoint aligned with the installed SDK."""
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    assert issubclass(WorkflowAlreadyStartedError, Exception)
+
+
 @pytest.mark.asyncio
 async def test_redelivered_approval_message_does_not_re_execute_remediation(sqlite_session_factory) -> None:
     """A RabbitMQ redelivery (e.g. consumer crash between plugin execution and
@@ -45,21 +52,41 @@ async def test_redelivered_approval_message_does_not_re_execute_remediation(sqli
     module.settings.database_enabled = True
     module.app.state.session_factory = sqlite_session_factory
 
+    class ProducerStub:
+        async def publish(self, *_args, **_kwargs):
+            return None
+
+    module.app.state.producer = ProducerStub()
+
     approval = Approval(
         incident_id="11111111-1111-1111-1111-111111111111",
         recommendation_id="22222222-2222-2222-2222-222222222222",
         decision=ApprovalDecision.APPROVED,
         approver="sre@example.com",
         comment="Rollback deployment",
+        metadata={
+            "service": "api-gateway",
+            "connection_profile": {
+                "executor_type": "jenkins",
+                "endpoint_url": "https://jenkins.example",
+                "job_name": "governed-remediation",
+                "credential_ref": "vault://jenkins/api-token",
+            },
+        },
     )
 
     execute_calls = 0
-    original_execute = module.engine.execute
-
     async def counting_execute(action):
         nonlocal execute_calls
         execute_calls += 1
-        return await original_execute(action)
+        action.status = RemediationStatus.SUCCEEDED
+        action.output = "mocked terminal executor success"
+        action.parameters["execution_result"] = {
+            "executed": True,
+            "executor": "jenkins",
+            "build_result": "SUCCESS",
+        }
+        return action
 
     module.engine.execute = counting_execute
 

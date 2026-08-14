@@ -331,7 +331,9 @@ OPENSEARCH_LOG_POLL_INTERVAL_SECONDS = max(
     10.0, float(os.getenv("OPENSEARCH_LOG_POLL_INTERVAL_SECONDS", "30") or 30)
 )
 OPENSEARCH_LOG_LOOKBACK_SECONDS = max(30, int(os.getenv("OPENSEARCH_LOG_LOOKBACK_SECONDS", "300") or 300))
-OPENSEARCH_LOG_BATCH_SIZE = max(1, min(int(os.getenv("OPENSEARCH_LOG_BATCH_SIZE", "100") or 100), 500))
+# Keep telemetry admission deliberately small. The poll worker awaits every
+# record in this batch before it is allowed to request the next one.
+OPENSEARCH_LOG_BATCH_SIZE = max(1, min(int(os.getenv("OPENSEARCH_LOG_BATCH_SIZE", "10") or 10), 15))
 OPENSEARCH_LOG_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "opensearch_log_ingestion_state.json"
 EMAIL_POLL_STATE_FILE = LANDING_PAD_INPUT_DIR.parent / "email_ingestion_state.json"
 OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING = str(
@@ -426,7 +428,9 @@ EMAIL_IMAP_USE_SSL = str(os.getenv("EMAIL_IMAP_USE_SSL", "true")).strip().lower(
 EMAIL_IMAP_SEARCH_CRITERIA = str(os.getenv("EMAIL_IMAP_SEARCH_CRITERIA", "UNSEEN") or "UNSEEN").strip().upper()
 EMAIL_IMAP_MARK_SEEN = str(os.getenv("EMAIL_IMAP_MARK_SEEN", "true")).strip().lower() in {"1", "true", "yes", "on"}
 EMAIL_POLL_INTERVAL_SECONDS = max(15.0, float(os.getenv("EMAIL_POLL_INTERVAL_SECONDS", "60") or 60))
-EMAIL_POLL_BATCH_SIZE = max(1, min(int(os.getenv("EMAIL_POLL_BATCH_SIZE", "25") or 25), 100))
+# Bound IMAP admission so a busy mailbox cannot flood downstream processing.
+# The worker awaits every message before it polls for another batch.
+EMAIL_POLL_BATCH_SIZE = max(1, min(int(os.getenv("EMAIL_POLL_BATCH_SIZE", "10") or 10), 15))
 EMAIL_DEFAULT_SERVICE = str(os.getenv("EMAIL_DEFAULT_SERVICE", "email-inbox") or "email-inbox").strip()
 EMAIL_ALERT_SUBJECT_REGEX = str(
     os.getenv(
@@ -1639,7 +1643,13 @@ async def _email_poll_worker() -> None:
                 await _process_polled_email(message)
                 if message_id:
                     _EMAIL_SESSION_MESSAGE_IDS.add(message_id)
-            logger.info("email_poll_complete mailbox=%s fetched=%s", EMAIL_IMAP_MAILBOX, len(messages))
+            logger.info(
+                "email_poll_complete mailbox=%s fetched=%s batch_limit=%s next_poll_seconds=%s",
+                EMAIL_IMAP_MAILBOX,
+                len(messages),
+                EMAIL_POLL_BATCH_SIZE,
+                EMAIL_POLL_INTERVAL_SECONDS,
+            )
             _record_worker_success("email_poll_worker")
         except Exception as exc:
             _record_worker_failure("email_poll_worker", exc)
@@ -1747,6 +1757,17 @@ async def _opensearch_log_poll_worker() -> None:
             )
             for record in records:
                 await _process_log_line(record)
+                document_id = str(record.get("document_id") or "")
+                if document_id:
+                    seen = state.load()
+                    seen[document_id] = str(record.get("timestamp") or datetime.now(timezone.utc).isoformat())
+                    state.save(seen)
+            logger.info(
+                "opensearch_log_batch_complete fetched=%s batch_limit=%s next_poll_seconds=%s",
+                len(records),
+                OPENSEARCH_LOG_BATCH_SIZE,
+                OPENSEARCH_LOG_POLL_INTERVAL_SECONDS,
+            )
             _record_worker_success("opensearch_log_poll_worker")
         except Exception as exc:
             _record_worker_failure("opensearch_log_poll_worker", exc)
@@ -5081,6 +5102,9 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
             )
             continue
         if CENTRALIZED_JIRA_ROUTING_ENABLED or PROMETHEUS_JIRA_ROUTING_ENABLED:
+            # Keep the firing signal visible immediately. Incident creation
+            # and Jira deduplication still remain centralized below.
+            landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item, status="processed")
             # Prometheus no longer shortcuts into the landing pad — it
             # routes through centralized dedup and Jira create-or-update.
             # Jira's own webhook (unchanged) is what eventually reaches the
@@ -5093,6 +5117,7 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                             "status": status,
                             "alertname": mapped_payload["name"],
                             "service": mapped_payload["service"],
+                            "landing_pad_file": landing_pad_file,
                             "jira_issue_key": result.get("jira_issue_key"),
                             "jira_action": result.get("action"),
                         }
@@ -5120,6 +5145,9 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 )
             continue
 
+        # In file-routing mode the watcher may be disabled or delayed. Keep
+        # Live Alerts truthful by recording intake before queue processing.
+        landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item, status="processed")
         try:
             landing_pad_input_file = _write_alert_to_landing_pad_input(mapped_payload, item)
             queued_rows.append(
@@ -5127,6 +5155,7 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                     "status": status,
                     "alertname": mapped_payload["name"],
                     "service": mapped_payload["service"],
+                    "landing_pad_file": landing_pad_file,
                     "landing_pad_input_file": str(landing_pad_input_file),
                 }
             )

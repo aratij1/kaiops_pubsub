@@ -10,9 +10,12 @@
     "oidcAudience": { "value": "api://REPLACE" },
     "oidcClientId": { "value": "REPLACE" },
     "otlpEndpoint": { "value": "https://REPLACE-otel-collector.internal:4317" },
+    "temporalAddress": { "value": "REPLACE.tmprl.cloud:7233" },
+    "remediationJobImage": { "value": "REPLACE.azurecr.io/kaiops-remediation-runner:latest" },
     "mysqlDatabaseUrlSecretUri": { "value": "https://REPLACE.vault.azure.net/secrets/mysql-database-url" },
     "serviceBusConnectionSecretUri": { "value": "https://REPLACE.vault.azure.net/secrets/servicebus-connection" },
     "azureBlobConnectionSecretUri": { "value": "https://REPLACE.vault.azure.net/secrets/blob-connection" },
+    "remediationInternalTokenSecretUri": { "value": "https://REPLACE.vault.azure.net/secrets/remediation-internal-token" },
     "apps": {
       "value": [
         { "name": "ui", "domain": "platform-api", "image": "REPLACE.azurecr.io/kaiops-ui-aca:latest", "ingress": true, "external": true, "targetPort": 80, "healthPath": "/", "cpu": 0.5, "memory": "1Gi", "minReplicas": 1, "maxReplicas": 3, "queueScale": false, "topic": "", "subscription": "", "env": [] },
@@ -25,6 +28,7 @@
         { "name": "resolution-agent", "domain": "incident-workflow", "image": "REPLACE.azurecr.io/kaiops-service:latest", "command": ["uvicorn"], "args": ["app:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "/app/ai-workbench/src/resolution-agent"], "ingress": true, "external": false, "targetPort": 8000, "healthPath": "/health", "cpu": 1.0, "memory": "2Gi", "minReplicas": 1, "maxReplicas": 10, "queueScale": false, "topic": "", "subscription": "", "env": [] },
         { "name": "approval-service", "domain": "incident-workflow", "image": "REPLACE.azurecr.io/kaiops-service:latest", "command": ["uvicorn"], "args": ["app:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "/app/backend/src/approval-service"], "ingress": true, "external": false, "targetPort": 8000, "healthPath": "/health", "cpu": 0.5, "memory": "1Gi", "minReplicas": 1, "maxReplicas": 6, "queueScale": false, "topic": "", "subscription": "", "env": [] },
         { "name": "remediation-engine", "domain": "integration-remediation", "image": "REPLACE.azurecr.io/kaiops-service:latest", "command": ["uvicorn"], "args": ["app:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "/app/backend/src/remediation-engine"], "ingress": true, "external": false, "targetPort": 8000, "healthPath": "/health", "cpu": 1.0, "memory": "2Gi", "minReplicas": 1, "maxReplicas": 10, "queueScale": true, "topic": "incident.approval.decided", "subscription": "remediation-engine", "env": [] },
+        { "name": "temporal-workflow-worker", "domain": "integration-remediation", "image": "REPLACE.azurecr.io/kaiops-service:latest", "command": ["python"], "args": ["-m", "temporal_pilot.worker"], "ingress": false, "external": false, "targetPort": 8000, "healthPath": "/health", "cpu": 1.0, "memory": "2Gi", "minReplicas": 1, "maxReplicas": 1, "queueScale": false, "topic": "", "subscription": "", "env": [] },
         { "name": "closure-service", "domain": "integration-remediation", "image": "REPLACE.azurecr.io/kaiops-service:latest", "command": ["uvicorn"], "args": ["app:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "/app/backend/src/closure-service"], "ingress": true, "external": false, "targetPort": 8000, "healthPath": "/health", "cpu": 0.5, "memory": "1Gi", "minReplicas": 1, "maxReplicas": 8, "queueScale": true, "topic": "incident.remediation.completed", "subscription": "closure-service", "env": [] },
         { "name": "model-router", "domain": "evaluation-ai", "image": "REPLACE.azurecr.io/kaiops-service:latest", "command": ["uvicorn"], "args": ["app:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "/app/ai-workbench/src/model-router"], "ingress": true, "external": false, "targetPort": 8000, "healthPath": "/health", "cpu": 2.0, "memory": "4Gi", "minReplicas": 1, "maxReplicas": 6, "queueScale": false, "topic": "", "subscription": "", "env": [] }
       ]

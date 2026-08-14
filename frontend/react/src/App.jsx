@@ -7,7 +7,7 @@ import { useOperationalEvents } from "./services/operationalEvents";
 import { beginOidcLogin, completeOidcLogin } from "./services/oidcClient";
 import { RouteRuntimeProvider } from "./app/routeRuntime";
 import { projectIdentityFromAlert } from "./domain/projectIdentity";
-import { effectiveIncidentStatus } from "./domain/incidentStatus";
+import { effectiveExecutionStatus, effectiveIncidentStatus } from "./domain/incidentStatus";
 import { buildOnboardingSources } from "./domain/onboardingSources";
 import { buildAlertDocumentDraft as buildRcaEvidenceDocumentDraft } from "./domain/alertDocumentDraft";
 import RcaPanel from "./routes/incidents/RcaPanel";
@@ -508,7 +508,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const [ingestionStreamPaused, setIngestionStreamPaused] = useState(false);
   const [ingestionStreamUpdatedAt, setIngestionStreamUpdatedAt] = useState("");
   const [ingestionStreamView, setIngestionStreamView] = useState("");
-  const [ingestionStreamFilters, setIngestionStreamFilters] = useState({ timeRange: "all", severity: "all", application: "all", environment: "all" });
+  const [ingestionStreamFilters, setIngestionStreamFilters] = useState({ timeRange: "all", severity: "all", application: "selected", environment: "all" });
   const [ragDocs, setRagDocs] = useState({ loading: false, rows: [], error: "" });
   const [guidanceQuery, setGuidanceQuery] = useState("");
   const [guidanceState, setGuidanceState] = useState({ loading: false, rows: [], error: "" });
@@ -4970,7 +4970,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           setClosedFilters((current) => ({ ...current, ...prefs.closedFilters }));
         }
         if (prefs.ingestionStreamFilters && typeof prefs.ingestionStreamFilters === "object") {
-          setIngestionStreamFilters((current) => ({ ...current, ...prefs.ingestionStreamFilters }));
+          // Version 2 changes Live Stream from a global-by-default feed to the
+          // selected project. Migrate older saved defaults once; operators can
+          // still explicitly select "All applications" afterward.
+          const savedFilters = prefs.liveStreamScopeVersion === 2
+            ? prefs.ingestionStreamFilters
+            : { ...prefs.ingestionStreamFilters, application: "selected" };
+          setIngestionStreamFilters((current) => ({ ...current, ...savedFilters }));
         }
         if (typeof prefs.ingestionStreamView === "string") setIngestionStreamView(prefs.ingestionStreamView);
         if (typeof prefs.ingestionStreamSection === "string") setIngestionStreamSection(prefs.ingestionStreamSection);
@@ -5011,6 +5017,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       ingestionStreamFilters,
       ingestionStreamView,
       ingestionStreamSection,
+      liveStreamScopeVersion: 2,
     };
     window.localStorage.setItem(PREFERENCE_STORAGE_KEY, JSON.stringify(payload));
   }, [applicationToMonitor, uiDensity, uiTheme, selectedFlow, activeTab, closedFilters, ingestionStreamFilters, ingestionStreamView, ingestionStreamSection]);
@@ -6155,18 +6162,32 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const selectedRemediationOutcome = useMemo(() => {
     const latestResponse = unwrap(remediationExecutionState.result);
     const responseOutcome = remediationOutcomeFromAction(latestResponse);
+    const persistedAction = selectedExecutionPlan.remediationAction;
+    const persistedOutcome = remediationOutcomeFromAction(persistedAction);
+    const responseId = String(latestResponse?.id || "");
+    const persistedId = String(persistedAction?.id || "");
+    // Hydrated persistence is authoritative once it represents the same
+    // action. This prevents an earlier in-memory failure from masking the
+    // successful terminal retry written by remediation-engine.
+    if (persistedOutcome && responseId && responseId === persistedId) {
+      return persistedOutcome;
+    }
     if (responseOutcome) {
       return responseOutcome;
     }
-    return remediationOutcomeFromAction(selectedExecutionPlan.remediationAction);
+    return persistedOutcome;
   }, [remediationExecutionState.result, selectedExecutionPlan.remediationAction]);
   const selectedExecutionTechnicalResponse = useMemo(() => {
     const latestResponse = unwrap(remediationExecutionState.result);
+    const persistedAction = selectedExecutionPlan.remediationAction;
+    const responseId = String(latestResponse?.id || "");
+    const persistedId = String(persistedAction?.id || "");
     const candidates = [
+      ...(responseId && responseId === persistedId ? [persistedAction?.parameters?.execution_result, persistedAction] : []),
       latestResponse?.parameters?.execution_result,
       latestResponse,
-      selectedExecutionPlan.remediationAction?.parameters?.execution_result,
-      selectedExecutionPlan.remediationAction,
+      persistedAction?.parameters?.execution_result,
+      persistedAction,
     ];
     return candidates.find((value) => value && typeof value === "object" && Object.keys(value).length > 0) || { message: "No executor details were returned." };
   }, [remediationExecutionState.result, selectedExecutionPlan.remediationAction]);
@@ -7740,6 +7761,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           ...editedPlan.queries.map((item) => `query: ${item}`),
         ],
         execution_plan: editedPlan,
+        rollback_plan: executionRollbackPlan || undefined,
         execution_confirmation_required: true,
         service: selectedApplicationConnection.service !== "-" ? selectedApplicationConnection.service : undefined,
         environment: selectedApplicationConnection.environment,
@@ -8320,7 +8342,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       if (timeWindowMs && (!timestamp || now - timestamp > timeWindowMs)) return false;
       if (ingestionStreamFilters.severity !== "all" && String(row?.severity || "").toLowerCase() !== ingestionStreamFilters.severity) return false;
       const rowApplication = String(row?.application || row?.project_name || row?.project || "").toLowerCase();
-      if (ingestionStreamFilters.application === "selected" && rowApplication !== String(applicationToMonitor || "").toLowerCase()) return false;
+      if (ingestionStreamFilters.application === "selected" && !filterAlertsForMonitor([row], applicationToMonitor).length) return false;
       if (ingestionStreamFilters.application === "assigned" && !String(row?.assignee || row?.owner || row?.jira_assignee || "").trim()) return false;
       if (!["all", "selected", "assigned"].includes(ingestionStreamFilters.application) && rowApplication !== ingestionStreamFilters.application.toLowerCase()) return false;
       if (ingestionStreamFilters.environment !== "all" && String(row?.environment || row?.labels?.environment || "unknown").toLowerCase() !== ingestionStreamFilters.environment) return false;
@@ -8417,11 +8439,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const cockpitApprovalComplete = ["approved", "modified", "rejected"].includes(selectedExecutionBreakdown.approvalStatus);
   const recordedExecutionStatus = String(selectedExecutionPlan.remediationAction?.status || "").trim().toLowerCase();
   const terminalIncidentStatus = String(selectedExecutionBreakdown.incidentStatus || "").trim().toLowerCase();
-  const cockpitExecutionStatus = ["closed", "resolved"].includes(terminalIncidentStatus)
-    ? "succeeded"
-    : terminalIncidentStatus === "failed"
-      ? "failed"
-      : recordedExecutionStatus;
+  const cockpitExecutionStatus = effectiveExecutionStatus(
+    terminalIncidentStatus,
+    recordedExecutionStatus,
+    selectedExecutionTechnicalResponse?.queue_url,
+  );
   const cockpitAnalysis = canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow);
   const executionOutcomeReviewed = String(executionOutcomeReview.reviewedAlertId || "") === String(selectedAlertId || "")
     || selectedAlertRagDocuments.some((document) => String(document?.source_system || document?.metadata?.source_system || "").toLowerCase() === "kaims-execution-review");
@@ -9871,10 +9893,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               ]),
             },
             incidents: {
-              rows: monitorScopedIncidentMetadata,
+              // Alerts & Incidents is the global operations queue. The monitor
+              // selected for dashboard drill-down must not hide incidents from
+              // other sources (for example Docker/application log ingestion).
+              rows: incidentMetadata.rows,
               loading: incidentMetadata.loading,
               error: incidentMetadata.error || "",
-              application: applicationToMonitor,
+              application: "all",
               filters: metadataFilters,
               refresh: loadIncidentMetadata,
               updateFilter: (name, value) => setMetadataFilters((current) => ({ ...current, [name]: value })),
@@ -10168,7 +10193,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                     <button type="button" className="button-primary" onClick={() => { openAlertDetails(selectedAlertRow); setHomeDetailTab(cockpitRecommendedStage); }}>Continue to {cockpitRecommended.label}</button>
                   </section>
                   <nav className="guided-cockpit-mini-journey" aria-label="Incident progress">
-                    {incidentCockpitStages.map((stage) => <button key={`launcher-${stage.id}`} type="button" className={stage.complete ? "is-complete" : stage.id === cockpitRecommendedStage ? "is-current" : ""} onClick={() => { openAlertDetails(selectedAlertRow); setHomeDetailTab(stage.id); }}><span>{stage.complete ? "âœ“" : stage.short}</span><strong>{stage.label}</strong></button>)}
+                    {incidentCockpitStages.map((stage) => <button key={`launcher-${stage.id}`} type="button" className={stage.complete ? "is-complete" : stage.id === cockpitRecommendedStage ? "is-current" : ""} onClick={() => { openAlertDetails(selectedAlertRow); setHomeDetailTab(stage.id); }}><span>{stage.complete ? <CircleCheckBig size={14} strokeWidth={2.5} aria-hidden="true" /> : stage.short}</span><strong>{stage.label}</strong></button>)}
                   </nav>
                   <details className="k-technical-details guided-cockpit-context">
                     <summary>Rule context and severity controls</summary>
@@ -10520,7 +10545,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         aria-selected={homeDetailTab === stage.id}
                         aria-label={stage.accessibleLabel || stage.label}
                       >
-                        <span>{stage.complete ? "âœ“" : stage.short}</span>
+                        <span>{stage.complete ? <CircleCheckBig size={14} strokeWidth={2.5} aria-hidden="true" /> : stage.short}</span>
                         <strong>{stage.label}</strong>
                         <small>{stage.description}</small>
                       </button>
@@ -11163,7 +11188,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         <header className="panel-head"><div><span className="eyebrow">CONTEXT-GROUNDED ACTION</span><h3 id="agentic-action-title">Recommended response</h3><p>Prepared from the persisted RCA, impact, incident evidence, runbooks, and configured discovery sources.</p></div><button type="button" className="button-secondary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Refreshing planâ€¦" : "Refresh with agent"}</button></header>
                         <div className="agentic-action-grid">
                           <article><span>Why this action</span><strong>{selectedRcaDecision.rootCause}</strong><p>{selectedRcaDecision.customerImpact}</p></article>
-                          <article><span>What to do</span><strong>{selectedExecutionPlan.action === "-" ? selectedRcaDecision.action : selectedExecutionPlan.action}</strong><p>Target: {selectedApplicationConnection.service} Â· {selectedApplicationConnection.environment}</p></article>
+                          <article><span>What to do</span><strong>{selectedExecutionPlan.action === "-" ? selectedRcaDecision.action : selectedExecutionPlan.action}</strong><p>Target: {selectedApplicationConnection.service} · {selectedApplicationConnection.environment}</p></article>
                           <article><span>Safety and recovery</span><strong>{executionRollbackPlan || "Rollback plan must be supplied before execution."}</strong><p>{editedExecutionPlan.queries[0] || "Add a recovery validation check."}</p></article>
                         </div>
                         <section className="execution-approval-panel" aria-labelledby="script-approval-heading">
@@ -11188,7 +11213,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         <div className={`production-action-banner ${dangerousProductionAction ? "is-production" : "is-nonproduction"}`}>
                           <strong>{dangerousProductionAction ? "Dangerous production action" : "Non-production or lower-risk action"}</strong>
                           <span>Action: {selectedExecutionPlan.action === "-" ? selectedRcaDecision.action : selectedExecutionPlan.action}</span>
-                          <span>Target: {selectedApplicationConnection.service} Â· {selectedApplicationConnection.environment} Â· Risk: {selectedExecutionPlan.riskTier || "unknown"}</span>
+                          <span>Target: {selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · Risk: {selectedExecutionPlan.riskTier || "unknown"}</span>
                           <span>Duplicate execution is guarded by the remediation idempotency contract; repeated clicks are disabled while a request is active.</span>
                         </div>
                         {jenkinsExecutorSelected ? <section className={`jenkins-process-panel ${selectedJenkinsProcess.configured ? "is-configured" : "is-pending"}`} aria-labelledby="jenkins-process-heading">
@@ -11216,7 +11241,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             </div>
                             <dl>
                               <dt>Action</dt><dd>{selectedExecutionPlan.action || "No recommended action supplied"}</dd>
-                              <dt>Target</dt><dd>{selectedApplicationConnection.service} Â· {selectedApplicationConnection.environment}</dd>
+                              <dt>Target</dt><dd>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment}</dd>
                               <dt>Blast radius</dt><dd>{selectedAlertWorkflow?.recommendation?.blast_radius || selectedAlertWorkflow?.recommendation?.impact || "Not supplied"}</dd>
                               <dt>Plan</dt><dd>{editedExecutionPlan.commands.length} command(s), {editedExecutionPlan.scripts.length} script(s), {editedExecutionPlan.queries.length} validation check(s)</dd>
                             </dl>
@@ -11235,7 +11260,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <div className="execution-checklist" aria-label="Execution readiness checks">
                           {executionPreflightChecks.map((check) => (
                             <article className={`execution-check ${check.passed ? "is-pass" : check.blocking ? "is-block" : "is-warn"}`} key={check.id}>
-                              <span aria-hidden="true">{check.passed ? "âœ“" : check.blocking ? "Ã—" : "!"}</span>
+                              <span aria-hidden="true">{check.passed ? "✓" : check.blocking ? "×" : "!"}</span>
                               <div><strong>{check.label}</strong><p>{check.detail}</p></div>
                               <small>{check.passed ? "Ready" : check.blocking ? "Required" : "Recommended"}</small>
                             </article>
@@ -11243,7 +11268,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           </div>
                         </details>
                         <details className="panel remediation-connection-panel">
-                          <summary className="panel-head"><div><h3>Connection details</h3><p>{selectedApplicationConnection.service} Â· {selectedApplicationConnection.environment} Â· {selectedApplicationConnection.source}</p></div><span className="section-toggle-indicator" /></summary>
+                          <summary className="panel-head"><div><h3>Connection details</h3><p>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedApplicationConnection.source}</p></div><span className="section-toggle-indicator" /></summary>
                           <div className="filter-grid">
                             <label>Application<input value={selectedApplicationConnection.application} readOnly /></label>
                             <label>Service<input value={selectedApplicationConnection.service} readOnly /></label>
@@ -11276,7 +11301,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <li className={remediationExecutionState.loading || executionAllowed ? "is-current" : ""}><span>4</span><div><strong>Execute</strong><small>{remediationExecutionState.loading ? "Running" : executionAllowed ? "Ready" : executionCapabilityBlocked ? "Executor required" : "Locked"}</small></div></li>
                           </ol>
                           <div className="execution-current-step">
-                            {executionSetupBlocked ? <div className="execution-step-form"><div><strong>Complete required setup before dry run</strong><p>{blockingPreflightFailures.map((check) => check.label).join(", ")}</p></div>{!executionIsReadOnly && !jenkinsExecutorSelected ? <button type="button" className="button-primary" onClick={buildRequiredExecutor}>Build required process</button> : null}</div> : !executionPreflightCurrent ? <><div><strong>Validate without making changes</strong><p>KaiMS checks the target, identity, policy, and executable plan.</p></div><button type="button" className="button-primary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running dry runâ€¦" : "Run dry run"}</button></> : !cockpitApprovalAccepted ? <div className="execution-step-form"><div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div><label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this plan safe and appropriate?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading}>{approvalState.loading ? "Recording approvalâ€¦" : "Approve plan"}</button></div> : dangerousProductionAction && !executionConfirmationValid ? <div className="execution-step-form"><label className="typed-execution-confirmation">Type <code>{executionConfirmationPhrase}</code> to confirm production execution<input value={executionConfirmationText} autoComplete="off" autoFocus onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label></div> : executionCapabilityBlocked ? <div className="execution-step-form"><div><strong>Live execution is not configured</strong><p>This approved plan still contains <code>--dry-run true</code>. Preparing live execution changes it to <code>--dry-run false</code> and requires a new dry run, approval, and confirmation.</p></div><button type="button" className="button-primary" onClick={prepareLiveExecutionPlan}>Prepare live execution</button></div> : <><div><strong>All safety gates passed</strong><p>{selectedApplicationConnection.service} Â· {selectedApplicationConnection.environment} Â· {selectedExecutionPlan.riskTier || "unknown risk"}</p></div><button type="button" className="button-primary execution-primary-action" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed}>{remediationExecutionState.loading ? "Executingâ€¦" : "Execute approved plan"}</button></>}
+                            {executionSetupBlocked ? <div className="execution-step-form"><div><strong>Complete required setup before dry run</strong><p>{blockingPreflightFailures.map((check) => check.label).join(", ")}</p></div>{!executionIsReadOnly && !jenkinsExecutorSelected ? <button type="button" className="button-primary" onClick={buildRequiredExecutor}>Build required process</button> : null}</div> : !executionPreflightCurrent ? <><div><strong>Validate without making changes</strong><p>KaiMS checks the target, identity, policy, and executable plan.</p></div><button type="button" className="button-primary" onClick={runExecutionPreflight} disabled={remediationExecutionState.loading}>{remediationExecutionState.loading ? "Running dry run…" : "Run dry run"}</button></> : !cockpitApprovalAccepted ? <div className="execution-step-form"><div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div><label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this plan safe and appropriate?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading}>{approvalState.loading ? "Recording approval…" : "Approve plan"}</button></div> : dangerousProductionAction && !executionConfirmationValid ? <div className="execution-step-form"><label className="typed-execution-confirmation">Type <code>{executionConfirmationPhrase}</code> to confirm production execution<input value={executionConfirmationText} autoComplete="off" autoFocus onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label></div> : executionCapabilityBlocked ? <div className="execution-step-form"><div><strong>Live execution is not configured</strong><p>This approved plan still contains <code>--dry-run true</code>. Preparing live execution changes it to <code>--dry-run false</code> and requires a new dry run, approval, and confirmation.</p></div><button type="button" className="button-primary" onClick={prepareLiveExecutionPlan}>Prepare live execution</button></div> : <><div><strong>All safety gates passed</strong><p>{selectedApplicationConnection.service} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</p></div><button type="button" className="button-primary execution-primary-action" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button></>}
                           </div>
                           {remediationExecutionState.error ? <p className="error">{remediationExecutionState.error}</p> : null}
                           {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
@@ -11958,7 +11983,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             </div>
                             {onboardingForm.connection_auth_type === "managed_identity" ? <div className="credential-managed-identity"><strong>Managed identity selected</strong><span>KaiMS will use the workload identity assigned to the runtime. No stored secret is required.</span></div> : null}
                             {!['none', 'managed_identity'].includes(onboardingForm.connection_auth_type) ? <label className="credential-reference-field">Secret reference<input spellCheck="false" autoComplete="off" placeholder={onboardingForm.connection_secret_store === "hashicorp_vault" ? "vault://kv/data/observability/prometheus#token" : onboardingForm.connection_secret_store === "aws_secrets_manager" ? "aws-sm://prod/observability/prometheus#api-key" : onboardingForm.connection_secret_store === "kubernetes_secret" ? "k8s-secret://monitoring/prometheus-credentials#token" : "azure-kv://kaims-prod/observability-prometheus/token"} value={onboardingForm.connection_secret_ref} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, connection_secret_ref: e.target.value }))} /><span className="field-hint">Paste the secret URI, not its value. Expected format includes the vault or namespace, secret name, and optional key/version.</span></label> : null}
-                            <footer><span aria-hidden="true">âœ“</span><p><strong>Secrets stay outside KaiMS.</strong> Only this reference is saved with the application configuration and passed to authorized runtime connectors.</p></footer>
+                            <footer><span aria-hidden="true"><CircleCheckBig size={16} strokeWidth={2.5} /></span><p><strong>Secrets stay outside KaiMS.</strong> Only this reference is saved with the application configuration and passed to authorized runtime connectors.</p></footer>
                           </section>
                           <label>Network Zone<input placeholder="prod-private / vnet name" value={onboardingForm.network_zone} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, network_zone: e.target.value }))} /></label>
                           <label>Health Check URL<input type="url" placeholder="https://service/health" value={onboardingForm.healthcheck_url} onChange={(e) => setOnboardingForm((curr) => ({ ...curr, healthcheck_url: e.target.value }))} /></label>

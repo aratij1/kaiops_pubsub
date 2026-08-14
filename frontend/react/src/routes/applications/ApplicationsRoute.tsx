@@ -62,7 +62,7 @@ type DetailRow = Record<string, unknown>;
 const nested = (row: DetailRow, key: string) =>
   row[key] && typeof row[key] === "object" ? (row[key] as DetailRow) : {};
 const dateTime = (value: unknown) =>
-  value ? new Date(String(value)).toLocaleString() : "-";
+  value ? `${new Date(String(value)).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST` : "-";
 const check = (value: unknown) => (
   <span className={`pill ${value ? "status-open" : "status-failed"}`}>
     {value ? "Yes" : "No"}

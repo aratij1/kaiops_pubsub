@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, BellRing, Braces, Database, FileCode2, GitMerge, RadioTower, Ticket } from "lucide-react";
 import { compactText, fetchJson, formatIstTimestamp, sourceChannelLabel, statusPillClass } from "../../appHelpers.jsx";
 import { useRouteRuntimeSlice, type AlertStreamFilters, type AlertStreamRow } from "../../app/routeRuntime";
@@ -58,7 +58,9 @@ function displayAlert(row: AlertStreamRow) {
     channel,
     title: compactText(richText(row.name || row.alert_name || metadata.title), 100) || "Unnamed alert",
     summary: compactText(richText(rawSummary), 240) || "Alert received and normalized by the landing pad.",
-    status: String(row.status || metadata.alert_status || "processed").replaceAll("_", " ").toUpperCase(),
+    // `status` describes landing-pad persistence (usually "processed"). The
+    // Alertmanager lifecycle is the operator-facing state and must win.
+    status: String(metadata.alert_status || row.status || "processed").replaceAll("_", " ").toUpperCase(),
     service: String(row.service || metadata.component || "-"),
     project: String(row.application || row.project_name || row.project || labels.application || labels.project_name || labels.project || "-"),
     severity: String(row.severity || metadata.priority || "-").toUpperCase(),
@@ -67,6 +69,37 @@ function displayAlert(row: AlertStreamRow) {
     lastSeen: formatIstTimestamp(row.last_seen || row.ends_at || row.updated_at || row.received_at || row.created_at),
     occurrences: Number(row.occurrence_count || row.occurrences?.length || 1),
     owner: String(row.assignee || row.owner || row.jira_assignee || "Unassigned"),
+  };
+}
+
+const SENSITIVE_SOURCE_KEYS = /authorization|cookie|credential|password|secret|token|api[_-]?key/i;
+
+function redactedSourceValue(value: unknown, depth = 0): unknown {
+  if (depth > 8) return "[maximum depth reached]";
+  if (Array.isArray(value)) return value.map((item) => redactedSourceValue(item, depth + 1));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+      key,
+      SENSITIVE_SOURCE_KEYS.test(key) ? "[redacted]" : redactedSourceValue(item, depth + 1),
+    ]));
+  }
+  return value;
+}
+
+function sourceEvidence(row: AlertStreamRow) {
+  const record = row as AlertStreamRow & Record<string, any>;
+  const payload = record.source_payload || record.original_payload || record.raw_payload || record.event_payload || record.payload || record;
+  return {
+    origin: String(record.origin_system || record.provider || record.source || record.source_channel || "Not recorded"),
+    channel: sourceChannelLabel(normalizedChannel(row)),
+    location: String(record.object_uri || record.source_uri || record.url || record.path || record.file || "Not recorded"),
+    sourceId: String(record.source_event_id || record.event_id || record.alert_id || record.id || "Not recorded"),
+    received: formatIstTimestamp(record.received_at || record.created_at || record.modified_at),
+    observed: formatIstTimestamp(record.starts_at || record.first_seen || record.timestamp || record.created_at),
+    message: richText(record.message || record.description || record.summary || record.annotations?.description || record.error) || "No source message supplied",
+    labels: record.labels && typeof record.labels === "object" ? record.labels : {},
+    annotations: record.annotations && typeof record.annotations === "object" ? record.annotations : {},
+    payload: redactedSourceValue(payload),
   };
 }
 
@@ -151,7 +184,7 @@ function metricTrace(row: AlertStreamRow | null) {
   const expression = String(metadata.rule_expression || metadata.expr || annotations.expression || (metric === "probe_success" ? `${metric} == 0` : "Rule expression not included in alert payload"));
   return {
     alertName, target, metric, value, expression,
-    status: String(row.status || metadata.alert_status || "firing").toLowerCase(),
+    status: String(metadata.alert_status || row.status || "firing").toLowerCase(),
     severity: String(row.severity || labels.severity || "not recorded"),
     job: String(labels.job || "not recorded"),
     started: formatIstTimestamp(row.starts_at || row.first_seen || row.created_at || row.received_at),
@@ -198,15 +231,12 @@ function AlertFlowSummary({ row, workflow, selected, onInspect }: { row: AlertSt
         <span className="metric-trace-sequence">{String(index + 1).padStart(2, "0")}</span><i><Icon size={17} /></i><strong>{label}</strong><small title={detail}>{detail}</small>
       </div>)}
     </div>
-    <button type="button" className="button-secondary" onClick={onInspect}>{selected ? "Viewing details" : "Inspect flow"}</button>
+    <button type="button" className="button-secondary" onClick={onInspect} aria-controls="live-alert-flow-inspector" aria-expanded={selected}>{selected ? "View details" : "Inspect flow"}</button>
   </article>;
 }
 
 export default function AlertsRoute() {
   const alerts = useRouteRuntimeSlice("alerts");
-  useEffect(() => {
-    if (alerts.channel === "telemetry") alerts.setChannel("all");
-  }, [alerts.channel, alerts.setChannel]);
   const [dedupWindow, setDedupWindow] = useState(60);
   const [liveView, setLiveView] = useState<"stream" | "flow">(() => window.localStorage.getItem("kaiops.live-alert-view") === "flow" ? "flow" : "stream");
   useEffect(() => window.localStorage.setItem("kaiops.live-alert-view", liveView), [liveView]);
@@ -215,9 +245,11 @@ export default function AlertsRoute() {
   const prometheusRows = alerts.rows.filter((row) => normalizedChannel(row) === "prometheus");
   const [traceAlert, setTraceAlert] = useState<AlertStreamRow | null>(null);
   const [traceStage, setTraceStage] = useState("alert");
+  const flowInspectorRef = useRef<HTMLElement | null>(null);
   const [traceWorkflow, setTraceWorkflow] = useState<{ loading: boolean; data: any; error: string; alertId: string; state: "idle" | "loading" | "ready" | "pending" | "error" }>({ loading: false, data: null, error: "", alertId: "", state: "idle" });
   const [rowWorkflows, setRowWorkflows] = useState<Record<string, any>>({});
   const [priorityFilter, setPriorityFilter] = useState<"all" | AlertPriority>("all");
+  const [expandedSourceKey, setExpandedSourceKey] = useState("");
   const prioritizedRows = useMemo(() => alerts.rows
     .map((row, index) => ({ row, index, priority: classifyAlert(row, rowWorkflows[alertRowKey(row)]) }))
     .filter(({ priority }) => priorityFilter === "all" || priority.kind === priorityFilter)
@@ -237,7 +269,7 @@ export default function AlertsRoute() {
     service: traceSource.service || traceSource.labels?.service || null,
     application: traceSource.application || traceSource.project_name || traceSource.labels?.application || null,
     severity: traceSource.severity || traceSource.labels?.severity || null,
-    status: traceSource.status || traceSource.alert_status || null,
+    status: traceSource.alert_status || traceSource.status || null,
     source: traceSource.source || traceSource.source_channel || null,
     starts_at: traceSource.starts_at || traceSource.first_seen || traceSource.received_at || null,
     labels: traceSource.labels || {},
@@ -271,14 +303,31 @@ export default function AlertsRoute() {
   useEffect(() => {
     let active = true;
     const loadRows = async () => {
-      const resolved = await Promise.all(alerts.rows.map(async (row) => {
-        const alertId = processedAlertId(row);
-        if (!alertId) return [alertRowKey(row), null] as const;
-        try {
-          const payload = await fetchJson(`/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`, { timeoutMs: 8000, maxAttempts: 1 });
-          return [alertRowKey(row), payload] as const;
-        } catch { return [alertRowKey(row), null] as const; }
-      }));
+      const rows = alerts.rows.slice();
+      const resolved: Array<readonly [string, any]> = new Array(rows.length);
+      let nextIndex = 0;
+      const loadNext = async () => {
+        while (active) {
+          const index = nextIndex++;
+          if (index >= rows.length) return;
+          const row = rows[index];
+          const alertId = processedAlertId(row);
+          if (!alertId) {
+            resolved[index] = [alertRowKey(row), null] as const;
+            continue;
+          }
+          try {
+            const payload = await fetchJson(`/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`, { timeoutMs: 8000, maxAttempts: 1 });
+            resolved[index] = [alertRowKey(row), payload] as const;
+          } catch {
+            resolved[index] = [alertRowKey(row), null] as const;
+          }
+        }
+      };
+      // Enrichment is secondary to rendering the live alert list. Keep only
+      // four requests in flight so a 150-row page cannot exhaust the API/DB
+      // connection pools and prevent /alerts/all from loading.
+      await Promise.all(Array.from({ length: Math.min(4, rows.length) }, loadNext));
       if (active) setRowWorkflows(Object.fromEntries(resolved));
     };
     loadRows();
@@ -313,12 +362,20 @@ export default function AlertsRoute() {
     alerts.setView("");
     alerts.updateFilter(name, value);
   };
+  const inspectFlow = (row: AlertStreamRow) => {
+    setTraceAlert(row);
+    setTraceStage("target");
+    window.requestAnimationFrame(() => {
+      flowInspectorRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      flowInspectorRef.current?.focus({ preventScroll: true });
+    });
+  };
 
   return <section className="grid single-col ingestion-stream-page operations-page">
     <OperationsWorkflowNav active="alerts" />
     <article className="operations-page-hero ingestion-stream-hero">
       <div><span className="discovery-eyebrow">Signal operations</span><h2>Live Alerts</h2><p>Monitor normalized arrivals across every connected application and source.</p></div>
-      <div className="ingestion-live-state"><span className={`ingestion-live-dot ${alerts.loading ? "is-loading" : ""} ${alerts.paused ? "is-paused" : ""}`} aria-hidden="true" /><div><strong>{alerts.paused ? "Updates paused" : alerts.liveState === "connected" ? "Live connection healthy" : alerts.loading ? "Synchronizing" : "Polling fallback active"}</strong><small>{alerts.rows.length} of {alerts.totalRows} arrivals shown</small><small>{alerts.updatedAt ? `Updated ${new Date(alerts.updatedAt).toLocaleString()}` : "Waiting for first sync"}</small></div><button type="button" className="button-secondary" onClick={alerts.refresh} disabled={alerts.loading}>{alerts.loading ? "Refreshing…" : "Refresh"}</button><button type="button" className="button-secondary" aria-pressed={alerts.paused} onClick={alerts.togglePaused}>{alerts.paused ? "Resume" : "Pause"}</button></div>
+      <div className="ingestion-live-state"><span className={`ingestion-live-dot ${alerts.loading ? "is-loading" : ""} ${alerts.paused ? "is-paused" : ""}`} aria-hidden="true" /><div><strong>{alerts.paused ? "Updates paused" : alerts.liveState === "connected" ? "Live connection healthy" : alerts.loading ? "Synchronizing" : "Polling fallback active"}</strong><small>{alerts.rows.length} of {alerts.totalRows} arrivals shown</small><small>{alerts.updatedAt ? `Updated ${formatIstTimestamp(alerts.updatedAt)}` : "Waiting for first sync"}</small></div><button type="button" className="button-secondary" onClick={alerts.refresh} disabled={alerts.loading}>{alerts.loading ? "Refreshing…" : "Refresh"}</button><button type="button" className="button-secondary" aria-pressed={alerts.paused} onClick={alerts.togglePaused}>{alerts.paused ? "Resume" : "Pause"}</button></div>
     </article>
 
     <article className="panel ingestion-control-panel">
@@ -327,6 +384,7 @@ export default function AlertsRoute() {
         <label>Saved view<select value={alerts.view} onChange={(event) => event.target.value ? alerts.applyView(event.target.value) : alerts.setView("")}><option value="">Custom / all active</option>{alerts.savedViews.map((view) => <option key={view.id} value={view.id}>{view.label}</option>)}</select></label>
         <label>Time range<select value={alerts.filters.timeRange} onChange={(event) => updateFilter("timeRange", event.target.value)}><option value="1h">Last hour</option><option value="24h">Last 24 hours</option><option value="7d">Last 7 days</option><option value="all">All loaded</option></select></label>
         <label>Severity<select value={alerts.filters.severity} onChange={(event) => updateFilter("severity", event.target.value)}><option value="all">All severities</option><option value="critical">Critical</option><option value="high">High</option><option value="warning">Warning</option><option value="info">Info</option></select></label>
+        <label>Application<select value={alerts.filters.application} onChange={(event) => updateFilter("application", event.target.value)}><option value="all">All applications</option><option value="selected">Selected monitor</option>{alerts.filterOptions.applications.map((application) => <option key={application} value={application.toLowerCase()}>{application}</option>)}</select></label>
         <label>Environment<select value={alerts.filters.environment} onChange={(event) => updateFilter("environment", event.target.value)}><option value="all">All environments</option>{alerts.filterOptions.environments.map((environment) => <option key={environment} value={environment}>{environment}</option>)}</select></label>
         <label className="ingestion-density-toggle"><input type="checkbox" checked={alerts.density === "compact"} onChange={(event) => alerts.setDensity(event.target.checked ? "compact" : "comfortable")} />Compact rows</label>
         <label>Duplicate window<select value={dedupWindow} disabled={dedupSaving} onChange={(event) => { setDedupWindow(Number(event.target.value)); setDedupMessage(""); }}><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={120}>2 hours</option><option value={240}>4 hours</option><option value={1440}>24 hours</option></select></label>
@@ -348,11 +406,11 @@ export default function AlertsRoute() {
     </div>
 
     {liveView === "flow" ? <div className="live-alert-flow-list">
-      {prioritizedRows.map(({ row }) => <AlertFlowSummary key={alertRowKey(row)} row={row} workflow={rowWorkflows[alertRowKey(row)]} selected={Boolean(activeTraceAlert && alertRowKey(activeTraceAlert) === alertRowKey(row))} onInspect={() => { setTraceAlert(row); setTraceStage("target"); }} />)}
+      {prioritizedRows.map(({ row }) => <AlertFlowSummary key={alertRowKey(row)} row={row} workflow={rowWorkflows[alertRowKey(row)]} selected={Boolean(activeTraceAlert && alertRowKey(activeTraceAlert) === alertRowKey(row))} onInspect={() => inspectFlow(row)} />)}
       {!alerts.rows.length && !alerts.loading ? <div className="ingestion-stream-empty"><strong>No alerts match this view</strong><p>Change the filters or verify the selected connector is delivering events.</p></div> : null}
     </div> : null}
 
-    {liveView === "flow" && trace ? <article className="panel metric-alert-trace live-alert-flow-inspector">
+    {liveView === "flow" && trace ? <article id="live-alert-flow-inspector" ref={flowInspectorRef} tabIndex={-1} className="panel metric-alert-trace live-alert-flow-inspector">
       <div className="panel-head"><div><span className="discovery-eyebrow">Prometheus execution</span><h3>Metric-to-Alert Trace</h3><p>{trace.alertName} · {trace.target}</p></div><span className={`pill ${statusPillClass(trace.status)}`}>{trace.status.toUpperCase()}</span></div>
       <div className="metric-trace-flow" aria-label="Prometheus metric to alert flow">{flowStages.map(([id, label, Icon], index) => <button key={id} type="button" className={`${traceStage === id ? "is-selected" : ""} ${id === "alert" ? "is-alert" : ""}`} onClick={() => setTraceStage(id)} aria-pressed={traceStage === id}><span className="metric-trace-sequence">{String(index + 1).padStart(2, "0")}</span><i><Icon size={19} /></i><strong>{label}</strong><small>{id === "target" ? trace.job : id === "scrape" ? "/metrics polled" : id === "parse" ? `${trace.metric} = ${trace.value}` : id === "store" ? "Time series" : id === "rule" ? "Condition matched" : trace.alertName}</small></button>)}</div>
       <div className="metric-trace-details">
@@ -383,7 +441,10 @@ export default function AlertsRoute() {
         const display = displayAlert(row);
         const channel = display.channel;
         const failed = String(row.status || "").toLowerCase() === "failed" || Boolean(row.error);
-        return <article className={`ingestion-event channel-${channel} priority-${priority.kind} ${failed ? "is-failed" : ""}`} key={alertRowKey(row)}><div className="ingestion-event-marker"><span>{channelIcon(channel)}</span><i aria-hidden="true" /></div><div className="ingestion-event-main"><header><div><span className={`alert-priority-badge is-${priority.kind}`} title={priority.reason}>{priority.label}</span><strong>{display.title}</strong><span className={`source-badge source-${channel}`}>{sourceChannelLabel(channel)}</span></div><time>{display.lastSeen}</time></header><p>{display.summary}</p><div className="alert-priority-reason">{priority.reason}</div><footer><span><b>Service</b>{display.service}</span><span><b>Severity</b>{display.severity}</span><span><b>Occurrences</b>{display.occurrences}</span><span><b>Owner</b>{display.owner}</span></footer>{priority.kind === "action" || priority.kind === "watch" ? <button type="button" className="button-secondary ingestion-open-action" onClick={() => alerts.open(row)}>{priority.kind === "action" ? "Open incident" : "Review alert"}</button> : <button type="button" className="button-secondary ingestion-open-action" onClick={() => alerts.open(row)}>View audit details</button>}{row.error ? <small className="ingestion-event-error">{compactText(richText(row.error), 240)}</small> : null}</div></article>;
+        const rowKey = alertRowKey(row);
+        const source = sourceEvidence(row);
+        const sourceExpanded = expandedSourceKey === rowKey;
+        return <article className={`ingestion-event channel-${channel} priority-${priority.kind} ${failed ? "is-failed" : ""}`} key={rowKey}><div className="ingestion-event-marker"><span>{channelIcon(channel)}</span><i aria-hidden="true" /></div><div className="ingestion-event-main"><header><div><span className={`alert-priority-badge is-${priority.kind}`} title={priority.reason}>{priority.label}</span><strong>{display.title}</strong><span className={`source-badge source-${channel}`}>{sourceChannelLabel(channel)}</span></div><time>{display.lastSeen}</time></header><p>{display.summary}</p><div className="alert-priority-reason">{priority.reason}</div><footer><span><b>Service</b>{display.service}</span><span><b>Severity</b>{display.severity}</span><span><b>Occurrences</b>{display.occurrences}</span><span><b>Owner</b>{display.owner}</span></footer><div className="ingestion-event-actions"><button type="button" className="button-secondary" aria-expanded={sourceExpanded} aria-controls={`source-${rowKey}`} onClick={() => setExpandedSourceKey(sourceExpanded ? "" : rowKey)}><Braces size={15} />{sourceExpanded ? "Hide source details" : "Show source details"}</button><button type="button" className="button-secondary" onClick={() => alerts.open(row)}>{priority.kind === "action" ? "Open incident" : priority.kind === "watch" ? "Review alert" : "View audit details"}</button></div>{sourceExpanded ? <section id={`source-${rowKey}`} className="alert-source-evidence"><header><div><small>Original source evidence</small><strong>{source.origin}</strong></div><span className={`source-badge source-${channel}`}>{source.channel}</span></header><dl><div><dt>Source event ID</dt><dd><code>{source.sourceId}</code></dd></div><div><dt>Source location</dt><dd>{source.location}</dd></div><div><dt>Observed at</dt><dd>{source.observed}</dd></div><div><dt>Received at</dt><dd>{source.received}</dd></div><div className="source-message"><dt>Source message</dt><dd>{source.message}</dd></div></dl><div className="alert-source-structured"><details open><summary>Labels ({Object.keys(source.labels).length})</summary><pre>{JSON.stringify(source.labels, null, 2)}</pre></details><details open><summary>Annotations ({Object.keys(source.annotations).length})</summary><pre>{JSON.stringify(source.annotations, null, 2)}</pre></details><details><summary>Raw source payload (sensitive values redacted)</summary><pre>{JSON.stringify(source.payload, null, 2)}</pre></details></div></section> : null}{row.error ? <small className="ingestion-event-error">{compactText(richText(row.error), 240)}</small> : null}</div></article>;
       })}{!alerts.rows.length && !alerts.loading ? <div className="ingestion-stream-empty"><strong>No alerts match this view</strong><p>Change the filters or verify the selected connector is delivering events.</p></div> : null}</div>
     </article> : null}
   </section>;
