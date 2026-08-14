@@ -8,6 +8,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from api_gateway.modules.users.service import UserService
 
 security = HTTPBearer(auto_error=True)
+optional_security = HTTPBearer(auto_error=False)
 
 
 @dataclass(slots=True)
@@ -67,17 +68,34 @@ async def current_auth_context(
 
 
 async def current_tenant_id(
-    auth: AuthContext = Depends(current_auth_context),
+    credentials: HTTPAuthorizationCredentials | None = Depends(optional_security),
+    user_service: UserService = Depends(get_user_service),
 ) -> str:
-    """Return the tenant from a verified access-token context.
-
-    Missing, invalid, expired, and revoked credentials are rejected by
-    ``current_auth_context`` before this dependency runs.
+    """Best-effort tenant scoping for read endpoints that must keep working
+    for callers that don't yet send a bearer token (e.g. the live alert
+    stream poll), while still real-isolating any caller that IS
+    authenticated. An invalid/expired token here degrades to 'default'
     rather than a 401, since these endpoints don't otherwise require auth —
     making a request reject on a *garbled* token would be a stricter
     behavior change than today, not just narrower results.
+
+    A prior revision switched this to unconditionally depend on
+    current_auth_context (which uses the auto_error=True `security` bearer
+    dependency), so any caller with no Authorization header at all -- not
+    just a garbled one -- got a 401 before this function's body ever ran.
+    That silently broke every unauthenticated caller of /alerts/all,
+    /incidents/closed, /landing-pad/recent, etc., including the frontend's
+    own alert-stream poll, which never attaches a bearer token for these
+    routes. Restoring the optional_security (auto_error=False) dependency
+    below is what actually keeps missing credentials from raising 401 here.
     """
-    return auth.tenant_id
+    if credentials is None:
+        return "default"
+    try:
+        payload = await user_service.decode_access_token(credentials.credentials)
+    except HTTPException:
+        return "default"
+    return str(payload.get("tenant_id") or "default")
 
 
 def require_roles(*allowed_roles: str):

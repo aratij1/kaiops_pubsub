@@ -106,6 +106,9 @@ def save_onboarding_connectivity(payload: dict[str, Any]) -> dict[str, Any]:
         "azure_content_safety_enabled": payload.get("azure_content_safety_enabled", False),
         "azure_content_safety_endpoint": payload.get("azure_content_safety_endpoint", ""),
         "user_assignments": payload.get("user_assignments", {}),
+        "email_url": payload.get("email_url", ""),
+        "logs_url": payload.get("logs_url", ""),
+        "provider_statuses": payload.get("provider_statuses", {}),
         "updated_at": payload.get("updated_at"),
     }
     path.write_text(json.dumps(sanitized, indent=2), encoding="utf-8")

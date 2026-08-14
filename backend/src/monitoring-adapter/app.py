@@ -38,7 +38,7 @@ from common.models import (
 )
 from common.repository import IncidentRepository, ObjectStorageRepository
 from common.object_storage import build_object_storage
-from common.service import create_app
+from common.service import _sanitize_url_credentials, create_app
 from common.telemetry import EVENT_CONTRACTS_EMITTED, EVENT_PUBLISH_LATENCY
 from common.topics import (
     ALERT_CONTEXT_REQUESTED,
@@ -447,8 +447,8 @@ WORKER_FAILURE_COUNTS: dict[str, int] = {
 }
 WORKER_FAILURE_THRESHOLD = max(1, int(os.getenv("WORKER_FAILURE_THRESHOLD", "5") or 5))
 _ALLOWED_PROJECT_ENVIRONMENTS = {"dev", "staging", "prod"}
-_ALLOWED_ONBOARDING_PROVIDERS = {"prometheus", "new_relic", "datadog"}
-_ALLOWED_ACTIVE_PROVIDERS = {"prometheus", "new_relic", "datadog", "azure_service_bus"}
+_ALLOWED_ONBOARDING_PROVIDERS = {"prometheus", "new_relic", "datadog", "email", "logs"}
+_ALLOWED_ACTIVE_PROVIDERS = {"prometheus", "new_relic", "datadog", "azure_service_bus", "email", "logs"}
 _ALLOWED_DEPLOYMENT_MODES = {"cloud_neutral", "on_prem", "private_cloud", "azure_cloud", "aws_cloud", "gcp_cloud"}
 ONBOARDING_RULE_EVENTS = "onboarding-rule-events"
 
@@ -1194,7 +1194,10 @@ class OnboardingConnectivityPayload(BaseModel):
         self.new_relic_url = self._normalize_endpoint(self.new_relic_url, "new_relic_url")
         self.datadog_url = self._normalize_endpoint(self.datadog_url, "datadog_url")
         self.healthcheck_url = self._normalize_endpoint(self.healthcheck_url, "healthcheck_url")
-        self.logs_url = self._normalize_endpoint(self.logs_url, "logs_url")
+        if self.logs_url and self.logs_url.strip().startswith(("http://", "https://")):
+            self.logs_url = self._normalize_endpoint(self.logs_url, "logs_url")
+        else:
+            self.logs_url = str(self.logs_url or "").strip()
         self.traces_url = self._normalize_endpoint(self.traces_url, "traces_url")
         self.telemetry_url = self._normalize_endpoint(self.telemetry_url, "telemetry_url")
         self.ticketing_url = self._normalize_endpoint(self.ticketing_url, "ticketing_url")
@@ -1252,6 +1255,7 @@ class OnboardingConnectivitySnapshot(BaseModel):
     azure_content_safety_enabled: bool = False
     azure_content_safety_endpoint: str = ""
     user_assignments: dict[str, list[str]] = Field(default_factory=dict)
+    provider_statuses: dict[str, OnboardingProviderStatus] = Field(default_factory=dict)
     updated_at: str | None = None
 
 
@@ -2506,7 +2510,7 @@ async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
             last_tested_at=None,
         )
 
-        for provider_name, endpoint_key in (("prometheus", "prometheus_url"), ("new_relic", "new_relic_url"), ("datadog", "datadog_url")):
+        for provider_name, endpoint_key in (("prometheus", "prometheus_url"), ("new_relic", "new_relic_url"), ("datadog", "datadog_url"), ("email", "email_url")):
             provider_state = provider_statuses.get(provider_name, {}) if isinstance(provider_statuses, dict) else {}
             has_test_result = isinstance(provider_state, dict) and ("ok" in provider_state or "message" in provider_state)
             ok = bool(provider_state.get("ok", False)) if has_test_result else False
@@ -6307,17 +6311,198 @@ async def get_incident_stage_completeness(incident_id: str) -> dict[str, Any]:
     return result
 
 
+from urllib.parse import urlparse, unquote
+
+def parse_email_url(email_url: str) -> ImapConfig:
+    parsed = urlparse(email_url)
+    use_ssl = parsed.scheme == "imaps"
+    
+    host = parsed.hostname or EMAIL_IMAP_HOST
+    port = parsed.port or (993 if use_ssl else 143)
+    
+    username = unquote(parsed.username) if parsed.username else EMAIL_IMAP_USER
+    password = unquote(parsed.password) if parsed.password else EMAIL_IMAP_PASSWORD
+    
+    mailbox = parsed.path.strip("/") or "INBOX"
+    
+    return ImapConfig(
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        mailbox=mailbox,
+        use_ssl=use_ssl,
+    )
+
+
+def sanitize_email_url(email_url: str) -> str:
+    if not email_url:
+        return ""
+    try:
+        parsed = urlparse(email_url)
+        if not parsed.password:
+            return email_url
+        netloc = parsed.hostname or ""
+        if parsed.username:
+            netloc = f"{parsed.username}@{netloc}"
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        return parsed._replace(netloc=netloc).geturl()
+    except Exception:
+        return email_url
+
+
+def check_imap_connectivity(config: ImapConfig) -> tuple[bool, str]:
+    import imaplib
+    connection_cls = imaplib.IMAP4_SSL if config.use_ssl else imaplib.IMAP4
+    try:
+        connection = connection_cls(config.host, config.port, timeout=10.0)
+        try:
+            connection.login(config.username, config.password)
+            connection.select(config.mailbox)
+            return True, "Connected"
+        except imaplib.IMAP4.error as login_err:
+            return False, f"Authentication failed: {login_err}"
+        finally:
+            try:
+                connection.close()
+            except Exception:
+                pass
+            try:
+                connection.logout()
+            except Exception:
+                pass
+    except Exception as conn_err:
+        return False, f"Connection failed: {conn_err}"
+
+
+async def check_logs_connectivity(logs_url: str) -> tuple[bool, str]:
+    if not logs_url:
+        return False, "Logs URL or path is empty"
+
+    # 1. If logs_url is an HTTP or HTTPS URL, perform OpenSearch connectivity check
+    if logs_url.startswith(("http://", "https://")):
+        import httpx
+        from urllib.parse import urlparse
+        parsed = urlparse(logs_url)
+        has_auth = bool(parsed.username or parsed.password)
+        raw_password = parsed.password
+        
+        index_pattern = OPENSEARCH_LOG_INDEX or "otel-*"
+        url = f"{logs_url.rstrip('/')}/{index_pattern.strip()}/_search"
+        body = {"size": 0}
+        
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(url, json=body)
+                if response.status_code == 200:
+                    auth_desc = "with URL authentication" if has_auth else "without URL authentication (or anonymous access allowed)"
+                    return True, f"Connected to OpenSearch {auth_desc}"
+                elif response.status_code in (401, 403):
+                    return False, f"Authentication failed: OpenSearch returned {response.status_code} (Unauthorized/Forbidden)"
+                else:
+                    return False, f"OpenSearch returned status code {response.status_code}: {response.text}"
+        except Exception as e:
+            err_msg = f"Connection to OpenSearch failed: {e}"
+            if raw_password:
+                err_msg = err_msg.replace(raw_password, "******")
+            return False, err_msg
+
+    # 2. Otherwise, treat it as a local filesystem path
+    try:
+        from pathlib import Path
+        import os
+        p = Path(logs_url)
+        if not p.exists():
+            return False, f"Path does not exist: {logs_url}"
+        
+        if p.is_dir():
+            if not os.access(p, os.R_OK):
+                return False, f"Directory is not readable: {logs_url}"
+            return True, f"Connected (directory is readable: {logs_url})"
+        else:
+            try:
+                with open(p, "rb") as f:
+                    f.read(1)
+                return True, f"Connected (file is readable: {logs_url})"
+            except Exception as e:
+                err_msg = f"File is not readable: {e}"
+                return False, err_msg
+    except Exception as e:
+        return False, f"Path check failed: {e}"
+
+
 @app.post("/onboarding/connectivity", response_model=OnboardingConnectivityResponse)
 async def post_onboarding_connectivity(
     payload: OnboardingConnectivityPayload = Body(...),
 ) -> OnboardingConnectivityResponse:
     if isinstance(payload, dict):
         payload = OnboardingConnectivityPayload.model_validate(payload)
+    
+    if payload.email_url or EMAIL_IMAP_HOST:
+        try:
+            if payload.email_url:
+                config = parse_email_url(payload.email_url)
+            else:
+                config = ImapConfig(
+                    host=EMAIL_IMAP_HOST,
+                    port=EMAIL_IMAP_PORT,
+                    username=EMAIL_IMAP_USER,
+                    password=EMAIL_IMAP_PASSWORD,
+                    mailbox=EMAIL_IMAP_MAILBOX,
+                    use_ssl=EMAIL_IMAP_USE_SSL,
+                )
+            ok, msg = await asyncio.to_thread(check_imap_connectivity, config)
+            payload.provider_statuses["email"] = OnboardingProviderStatus(ok=ok, message=msg)
+        except Exception as e:
+            payload.provider_statuses["email"] = OnboardingProviderStatus(ok=False, message=str(e))
+        
+        if payload.email_url:
+            payload.email_url = sanitize_email_url(payload.email_url)
+
+    if payload.logs_url or OPENSEARCH_LOG_URL or LOG_WATCH_PATHS:
+        try:
+            if payload.logs_url:
+                ok, msg = await check_logs_connectivity(payload.logs_url)
+            elif OPENSEARCH_LOG_URL:
+                ok, msg = await check_logs_connectivity(OPENSEARCH_LOG_URL)
+            else:
+                # Local paths check fallback
+                readable_paths = []
+                unreadable_paths = []
+                from pathlib import Path
+                import os
+                for p in LOG_WATCH_PATHS:
+                    if p.exists() and os.access(p, os.R_OK):
+                        readable_paths.append(str(p))
+                    else:
+                        unreadable_paths.append(str(p))
+                if unreadable_paths:
+                    ok, msg = False, f"Unreadable or missing paths: {', '.join(unreadable_paths)}"
+                elif readable_paths:
+                    ok, msg = True, f"Connected (local paths readable: {', '.join(readable_paths)})"
+                else:
+                    ok, msg = False, "No local log paths configured or accessible"
+            
+            payload.provider_statuses["logs"] = OnboardingProviderStatus(ok=ok, message=msg)
+        except Exception as e:
+            err_msg = str(e)
+            if payload.logs_url:
+                from urllib.parse import urlparse
+                parsed = urlparse(payload.logs_url)
+                if parsed.password:
+                    err_msg = err_msg.replace(parsed.password, "******")
+            payload.provider_statuses["logs"] = OnboardingProviderStatus(ok=False, message=err_msg)
+
+        if payload.logs_url:
+            payload.logs_url = _sanitize_url_credentials(payload.logs_url)
+
     validated_payload = payload.model_dump(mode="json")
     sanitized = save_onboarding_connectivity(validated_payload)
     await persist_onboarding_connectivity(validated_payload)
     snapshot = OnboardingConnectivitySnapshot.model_validate(sanitized if isinstance(sanitized, dict) else {})
     return OnboardingConnectivityResponse(connectivity=snapshot)
+
 
 
 @app.post("/onboarding/complete")
