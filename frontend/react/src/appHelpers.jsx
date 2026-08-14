@@ -3674,6 +3674,12 @@ function DiscoveryFlowView({ workflow, timelineRows = [], selectedAlert = null, 
   const recommendationMetadata = recommendation?.metadata && typeof recommendation.metadata === "object"
     ? recommendation.metadata
     : {};
+  const rcaAnalysis = recommendationMetadata.rca_analysis && typeof recommendationMetadata.rca_analysis === "object"
+    ? recommendationMetadata.rca_analysis
+    : {};
+  const impactAnalysis = recommendationMetadata.impact_analysis && typeof recommendationMetadata.impact_analysis === "object"
+    ? recommendationMetadata.impact_analysis
+    : {};
   const metadataCandidates = [
     safeWorkflow?.context?.metadata,
     safeWorkflow?.recommendation?.metadata,

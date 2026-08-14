@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Activity, BellRing, Braces, Database, FileCode2, GitMerge, RadioTower, Ticket } from "lucide-react";
 import { compactText, fetchJson, formatIstTimestamp, sourceChannelLabel, statusPillClass } from "../../appHelpers.jsx";
 import { useRouteRuntimeSlice, type AlertStreamFilters, type AlertStreamRow } from "../../app/routeRuntime";
@@ -6,7 +6,7 @@ import { OperationsWorkflowNav } from "../../components/operations/OperationsWor
 
 const channels = [
   ["all", "ALL", "All arrivals"], ["prometheus", "PR", "Prometheus"],
-  ["telemetry", "OT", "Telemetry"], ["email", "EM", "Email"],
+  ["email", "EM", "Email"],
   ["log", "LG", "Logs / OpenSearch"], ["ticket", "TK", "Tickets / Jira"],
   ["failed", "!", "Failed intake"],
 ] as const;
@@ -122,6 +122,23 @@ function workflowFacts(payload: any) {
   return { root, alert, incident, context, recommendation, metadata, report, evidence, timeline, ticket, duplicate };
 }
 
+type AlertPriority = "action" | "watch" | "duplicate" | "noise";
+
+function classifyAlert(row: AlertStreamRow, workflowPayload: any): { kind: AlertPriority; label: string; reason: string; rank: number } {
+  const record = row as AlertStreamRow & Record<string, any>;
+  const facts = workflowFacts(workflowPayload);
+  const metadata = record.metadata && typeof record.metadata === "object" ? record.metadata : {};
+  const noiseMetadata = metadata.noise && typeof metadata.noise === "object" ? metadata.noise : {};
+  const disposition = String(record.incident_disposition || facts.alert.incident_disposition || facts.incident.incident_disposition || "").toLowerCase();
+  const severity = String(row.severity || record.priority || record.labels?.severity || "warning").toLowerCase();
+  const duplicate = Boolean(facts.duplicate) || disposition === "duplicate" || Number(record.deduplicated_count || 1) > 1;
+  const noise = noiseMetadata.classified === true || ["noise", "ignored", "suppressed", "non_actionable", "non-actionable"].includes(disposition);
+  if (noise) return { kind: "noise", label: "Ignored noise", reason: String(noiseMetadata.reason || record.suppression_reason || "Classified as non-actionable"), rank: 4 };
+  if (duplicate) return { kind: "duplicate", label: "Duplicate", reason: String(facts.duplicate || record.deduplication_reason || "Linked to the canonical alert within the duplicate window"), rank: 3 };
+  if (["critical", "high", "p0", "p1"].includes(severity)) return { kind: "action", label: "Action required", reason: facts.ticket ? `Incident tracked in ${facts.ticket}` : "High-impact unique alert requires investigation", rank: 1 };
+  return { kind: "watch", label: "Watch", reason: severity === "warning" ? "Warning signal; monitor before escalation" : "Informational signal with no immediate action", rank: 2 };
+}
+
 function metricTrace(row: AlertStreamRow | null) {
   if (!row) return null;
   const metadata = row as AlertStreamRow & Record<string, any>;
@@ -143,15 +160,72 @@ function metricTrace(row: AlertStreamRow | null) {
   };
 }
 
+function observedAlertStages(row: AlertStreamRow, workflowPayload: any) {
+  const display = displayAlert(row);
+  const trace = metricTrace(row)!;
+  const facts = workflowFacts(workflowPayload);
+  const contextSource = String(facts.metadata.context_source || facts.context.context_source || "").toLowerCase();
+  const stages = [{ id: "source", label: "Source", Icon: RadioTower, detail: display.channel === "prometheus" ? trace.job : sourceChannelLabel(display.channel) }];
+  if (display.channel === "prometheus") stages.push({ id: "alert", label: "Prometheus alert", Icon: BellRing, detail: trace.alertName });
+  else stages.push({ id: "alert", label: "Alert received", Icon: BellRing, detail: trace.alertName });
+  if (!workflowPayload) return stages;
+  if (facts.alert.id || facts.root.alert_id || facts.timeline.some((item: any) => /normaliz/i.test(String(item?.stage || item?.event_type || "")))) stages.push({ id: "normalize", label: "Normalize", Icon: Braces, detail: facts.alert.service || display.service });
+  if (facts.duplicate || facts.alert.incident_disposition || facts.incident.incident_disposition) stages.push({ id: "deduplicate", label: "Deduplicate", Icon: GitMerge, detail: facts.duplicate ? "Duplicate linked" : "Unique signal" });
+  if (facts.incident.id || facts.incident.incident_id) stages.push({ id: "incident", label: "Incident", Icon: Activity, detail: facts.incident.id || facts.incident.incident_id });
+  if (facts.ticket) stages.push({ id: "jira", label: "Jira", Icon: Ticket, detail: String(facts.ticket) });
+  if (facts.context && Object.keys(facts.context).length) stages.push({ id: "context", label: contextSource.includes("cache") ? "Context reused" : "Context", Icon: Database, detail: contextSource || `${facts.evidence.length} evidence item(s)` });
+  if (facts.recommendation && Object.keys(facts.recommendation).length) stages.push({ id: "understand", label: "Understand", Icon: FileCode2, detail: "RCA available" });
+  if (facts.root.approval && Object.keys(facts.root.approval).length) stages.push({ id: "approval", label: "Approval", Icon: Ticket, detail: String(facts.root.approval.status || "Decision recorded") });
+  if (facts.root.remediation_action && Object.keys(facts.root.remediation_action).length) stages.push({ id: "resolve", label: "Resolve", Icon: Activity, detail: String(facts.root.remediation_action.status || "Executed") });
+  if (facts.root.closure_report && Object.keys(facts.root.closure_report).length) stages.push({ id: "validate", label: "Validate", Icon: FileCode2, detail: facts.root.closure_report.health_restored ? "Recovery verified" : "Validation recorded" });
+  return stages;
+}
+
+function AlertFlowSummary({ row, workflow, selected, onInspect }: { row: AlertStreamRow; workflow: any; selected: boolean; onInspect: () => void }) {
+  const display = displayAlert(row);
+  const trace = metricTrace(row);
+  if (!trace) return null;
+  const sourceLabel = sourceChannelLabel(display.channel);
+  const stages = observedAlertStages(row, workflow);
+  const priority = classifyAlert(row, workflow);
+  return <article className={`panel live-alert-flow-card priority-${priority.kind} ${selected ? "is-selected" : ""}`}>
+    <header>
+      <div><span className={`source-badge source-${display.channel}`}>{sourceLabel}</span><strong>{display.title}</strong><small>{display.service} · {display.lastSeen}</small></div>
+      <span className={`alert-priority-badge is-${priority.kind}`} title={priority.reason}>{priority.label}</span>
+    </header>
+    <div className="live-alert-flow-path" aria-label={`${display.title} processing flow`}>
+      {stages.map(({ id, label, Icon, detail }, index) => <div className={id === "alert" ? "is-alert" : ""} key={id}>
+        <span className="metric-trace-sequence">{String(index + 1).padStart(2, "0")}</span><i><Icon size={17} /></i><strong>{label}</strong><small title={detail}>{detail}</small>
+      </div>)}
+    </div>
+    <button type="button" className="button-secondary" onClick={onInspect}>{selected ? "Viewing details" : "Inspect flow"}</button>
+  </article>;
+}
+
 export default function AlertsRoute() {
   const alerts = useRouteRuntimeSlice("alerts");
+  useEffect(() => {
+    if (alerts.channel === "telemetry") alerts.setChannel("all");
+  }, [alerts.channel, alerts.setChannel]);
   const [dedupWindow, setDedupWindow] = useState(60);
+  const [liveView, setLiveView] = useState<"stream" | "flow">(() => window.localStorage.getItem("kaiops.live-alert-view") === "flow" ? "flow" : "stream");
+  useEffect(() => window.localStorage.setItem("kaiops.live-alert-view", liveView), [liveView]);
   const [dedupSaving, setDedupSaving] = useState(false);
   const [dedupMessage, setDedupMessage] = useState("");
   const prometheusRows = alerts.rows.filter((row) => normalizedChannel(row) === "prometheus");
   const [traceAlert, setTraceAlert] = useState<AlertStreamRow | null>(null);
   const [traceStage, setTraceStage] = useState("alert");
   const [traceWorkflow, setTraceWorkflow] = useState<{ loading: boolean; data: any; error: string; alertId: string; state: "idle" | "loading" | "ready" | "pending" | "error" }>({ loading: false, data: null, error: "", alertId: "", state: "idle" });
+  const [rowWorkflows, setRowWorkflows] = useState<Record<string, any>>({});
+  const [priorityFilter, setPriorityFilter] = useState<"all" | AlertPriority>("all");
+  const prioritizedRows = useMemo(() => alerts.rows
+    .map((row, index) => ({ row, index, priority: classifyAlert(row, rowWorkflows[alertRowKey(row)]) }))
+    .filter(({ priority }) => priorityFilter === "all" || priority.kind === priorityFilter)
+    .sort((left, right) => left.priority.rank - right.priority.rank || left.index - right.index), [alerts.rows, rowWorkflows, priorityFilter]);
+  const priorityCounts = useMemo(() => alerts.rows.reduce((counts, row) => {
+    counts[classifyAlert(row, rowWorkflows[alertRowKey(row)]).kind] += 1;
+    return counts;
+  }, { action: 0, watch: 0, duplicate: 0, noise: 0 }), [alerts.rows, rowWorkflows]);
   const activeTraceAlert = traceAlert && alerts.rows.some((row) => alertRowKey(row) === alertRowKey(traceAlert)) ? traceAlert : prometheusRows[0] || null;
   const trace = metricTrace(activeTraceAlert);
   const traceSource = (activeTraceAlert || {}) as AlertStreamRow & Record<string, any>;
@@ -194,6 +268,22 @@ export default function AlertsRoute() {
     load();
     return () => { active = false; };
   }, [activeTraceAlert && alertRowKey(activeTraceAlert)]);
+  useEffect(() => {
+    let active = true;
+    const loadRows = async () => {
+      const resolved = await Promise.all(alerts.rows.map(async (row) => {
+        const alertId = processedAlertId(row);
+        if (!alertId) return [alertRowKey(row), null] as const;
+        try {
+          const payload = await fetchJson(`/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`, { timeoutMs: 8000, maxAttempts: 1 });
+          return [alertRowKey(row), payload] as const;
+        } catch { return [alertRowKey(row), null] as const; }
+      }));
+      if (active) setRowWorkflows(Object.fromEntries(resolved));
+    };
+    loadRows();
+    return () => { active = false; };
+  }, [alerts.rows.map(alertRowKey).join("|")]);
   useEffect(() => {
     let active = true;
     fetchJson("/alert-intelligence/deduplication/config", { timeoutMs: 8000 })
@@ -247,7 +337,22 @@ export default function AlertsRoute() {
 
     <div className="ingestion-channel-grid" aria-label="Alert source counts">{channels.map(([channel, icon, label]) => <button type="button" key={channel} className={`ingestion-channel-card channel-${channel} ${alerts.channel === channel ? "is-active" : ""}`} onClick={() => alerts.setChannel(channel)} aria-pressed={alerts.channel === channel}><span>{icon}</span><div><strong>{alerts.counts[channel] || 0}</strong><small>{label}</small></div></button>)}</div>
 
-    {trace ? <article className="panel metric-alert-trace">
+    <div className="live-alert-view-switch" role="group" aria-label="Live alert presentation">
+      <span>Display</span>
+      <button type="button" className={liveView === "stream" ? "is-active" : ""} aria-pressed={liveView === "stream"} onClick={() => setLiveView("stream")}><RadioTower size={16} /><span><strong>Live stream</strong><small>Latest alert arrivals</small></span></button>
+      <button type="button" className={liveView === "flow" ? "is-active" : ""} aria-pressed={liveView === "flow"} onClick={() => setLiveView("flow")}><GitMerge size={16} /><span><strong>Flow view</strong><small>Metric through incident</small></span></button>
+    </div>
+
+    <div className="alert-priority-filter" role="group" aria-label="Alert operational priority">
+      {([['all', 'All', alerts.rows.length], ['action', 'Action required', priorityCounts.action], ['watch', 'Watch', priorityCounts.watch], ['duplicate', 'Duplicates', priorityCounts.duplicate], ['noise', 'Ignored noise', priorityCounts.noise]] as const).map(([id, label, count]) => <button type="button" key={id} className={priorityFilter === id ? "is-active" : ""} aria-pressed={priorityFilter === id} onClick={() => setPriorityFilter(id)}><strong>{count}</strong><span>{label}</span></button>)}
+    </div>
+
+    {liveView === "flow" ? <div className="live-alert-flow-list">
+      {prioritizedRows.map(({ row }) => <AlertFlowSummary key={alertRowKey(row)} row={row} workflow={rowWorkflows[alertRowKey(row)]} selected={Boolean(activeTraceAlert && alertRowKey(activeTraceAlert) === alertRowKey(row))} onInspect={() => { setTraceAlert(row); setTraceStage("target"); }} />)}
+      {!alerts.rows.length && !alerts.loading ? <div className="ingestion-stream-empty"><strong>No alerts match this view</strong><p>Change the filters or verify the selected connector is delivering events.</p></div> : null}
+    </div> : null}
+
+    {liveView === "flow" && trace ? <article className="panel metric-alert-trace live-alert-flow-inspector">
       <div className="panel-head"><div><span className="discovery-eyebrow">Prometheus execution</span><h3>Metric-to-Alert Trace</h3><p>{trace.alertName} · {trace.target}</p></div><span className={`pill ${statusPillClass(trace.status)}`}>{trace.status.toUpperCase()}</span></div>
       <div className="metric-trace-flow" aria-label="Prometheus metric to alert flow">{flowStages.map(([id, label, Icon], index) => <button key={id} type="button" className={`${traceStage === id ? "is-selected" : ""} ${id === "alert" ? "is-alert" : ""}`} onClick={() => setTraceStage(id)} aria-pressed={traceStage === id}><span className="metric-trace-sequence">{String(index + 1).padStart(2, "0")}</span><i><Icon size={19} /></i><strong>{label}</strong><small>{id === "target" ? trace.job : id === "scrape" ? "/metrics polled" : id === "parse" ? `${trace.metric} = ${trace.value}` : id === "store" ? "Time series" : id === "rule" ? "Condition matched" : trace.alertName}</small></button>)}</div>
       <div className="metric-trace-details">
@@ -271,15 +376,15 @@ export default function AlertsRoute() {
       </div>
     </article> : null}
 
-    <article className="panel ingestion-stream-panel">
+    {liveView === "stream" ? <article className="panel ingestion-stream-panel">
       <div className="ingestion-stream-toolbar"><div><span className="discovery-eyebrow">Landing-pad events</span><h3>{alerts.channel === "all" ? "All source activity" : alerts.channel === "failed" ? "Failed ingestion activity" : `${sourceChannelLabel(alerts.channel)} activity`}</h3></div><label><span>Search alerts</span><input value={alerts.query} onChange={(event) => alerts.setQuery(event.target.value)} placeholder="Alert, service, project, or source" /></label></div>
       {alerts.error ? <p className="error">Live data could not be refreshed. Existing results are preserved. {alerts.error}</p> : null}
-      <div className="ingestion-stream-list" aria-live="off">{alerts.rows.map((row) => {
+      <div className="ingestion-stream-list" aria-live="off">{prioritizedRows.map(({ row, priority }) => {
         const display = displayAlert(row);
         const channel = display.channel;
         const failed = String(row.status || "").toLowerCase() === "failed" || Boolean(row.error);
-        return <article className={`ingestion-event channel-${channel} ${failed ? "is-failed" : ""}`} key={alertRowKey(row)}><div className="ingestion-event-marker"><span>{channelIcon(channel)}</span><i aria-hidden="true" /></div><div className="ingestion-event-main"><header><div><strong>{display.title}</strong><span className={`source-badge source-${channel}`}>{sourceChannelLabel(channel)}</span><span className={`pill ${failed ? "status-failed" : statusPillClass(row.status || "processed")}`}>{display.status}</span></div><time>{display.lastSeen}</time></header><p>{display.summary}</p><footer><span><b>Service</b>{display.service}</span><span><b>Project</b>{display.project}</span><span><b>Severity</b>{display.severity}</span><span title={row.file}><b>File</b>{display.file}</span><span><b>First seen</b>{display.firstSeen}</span><span><b>Last seen</b>{display.lastSeen}</span><span><b>Occurrences</b>{display.occurrences}</span><span><b>Owner</b>{display.owner}</span></footer>{channel === "prometheus" ? <button type="button" className="button-secondary ingestion-open-action" onClick={() => { setTraceAlert(row); setTraceStage("target"); document.querySelector(".metric-alert-trace")?.scrollIntoView({ behavior: "smooth", block: "start" }); }}>Trace metric flow</button> : null}{!failed ? <button type="button" className="button-secondary ingestion-open-action" onClick={() => alerts.open(row)}>Open incident cockpit</button> : null}{row.error ? <small className="ingestion-event-error">{compactText(richText(row.error), 240)}</small> : null}</div></article>;
+        return <article className={`ingestion-event channel-${channel} priority-${priority.kind} ${failed ? "is-failed" : ""}`} key={alertRowKey(row)}><div className="ingestion-event-marker"><span>{channelIcon(channel)}</span><i aria-hidden="true" /></div><div className="ingestion-event-main"><header><div><span className={`alert-priority-badge is-${priority.kind}`} title={priority.reason}>{priority.label}</span><strong>{display.title}</strong><span className={`source-badge source-${channel}`}>{sourceChannelLabel(channel)}</span></div><time>{display.lastSeen}</time></header><p>{display.summary}</p><div className="alert-priority-reason">{priority.reason}</div><footer><span><b>Service</b>{display.service}</span><span><b>Severity</b>{display.severity}</span><span><b>Occurrences</b>{display.occurrences}</span><span><b>Owner</b>{display.owner}</span></footer>{priority.kind === "action" || priority.kind === "watch" ? <button type="button" className="button-secondary ingestion-open-action" onClick={() => alerts.open(row)}>{priority.kind === "action" ? "Open incident" : "Review alert"}</button> : <button type="button" className="button-secondary ingestion-open-action" onClick={() => alerts.open(row)}>View audit details</button>}{row.error ? <small className="ingestion-event-error">{compactText(richText(row.error), 240)}</small> : null}</div></article>;
       })}{!alerts.rows.length && !alerts.loading ? <div className="ingestion-stream-empty"><strong>No alerts match this view</strong><p>Change the filters or verify the selected connector is delivering events.</p></div> : null}</div>
-    </article>
+    </article> : null}
   </section>;
 }

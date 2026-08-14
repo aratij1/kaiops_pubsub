@@ -2,6 +2,7 @@ from importlib import util
 from pathlib import Path
 
 import pytest
+from common.models import Approval, ApprovalDecision
 
 
 def load_remediation_app_module():
@@ -12,6 +13,45 @@ def load_remediation_app_module():
     module = util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_live_execution_rejects_incomplete_jenkins_connector() -> None:
+    module = load_remediation_app_module()
+    approval = Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="sre-user",
+        comment="rollback deployment",
+    )
+    action = module.engine.build_action(approval)
+
+    with pytest.raises(module.HTTPException, match="Jenkins connector is incomplete") as exc_info:
+        module._require_live_executor_configuration(action)
+
+    assert exc_info.value.status_code == 409
+
+
+def test_live_execution_accepts_complete_jenkins_connector() -> None:
+    module = load_remediation_app_module()
+    approval = Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="sre-user",
+        comment="rollback deployment",
+        metadata={
+            "connection_profile": {
+                "executor_type": "jenkins",
+                "endpoint_url": "http://jenkins:8080",
+                "job_name": "kaiops-auto-remediation",
+                "credential_ref": "vault://kaiops/local/jenkins#api-token",
+            }
+        },
+    )
+    action = module.engine.build_action(approval)
+
+    module._require_live_executor_configuration(action)
 
 
 def test_resolution_requires_approval_prefers_decision_payload() -> None:
@@ -168,9 +208,11 @@ def test_validate_auto_execution_policy_accepts_well_formed_payload() -> None:
             "id": "22222222-2222-2222-2222-222222222222",
             "incident_id": "11111111-1111-1111-1111-111111111111",
             "confidence": 0.93,
+            "commands": ["kubectl rollout undo deployment/checkout -n prod"],
             "metadata": {
                 "evidence_ids": ["ev-1"],
                 "reasoning": "Rollback selected from runbook and deployment timeline.",
+                "rca_analysis": {"confidence_score": 0.82},
                 "runbook_id": "rb-checkout-1",
                 "runbook_status": "approved",
                 "runbook_match_score": 0.93,
@@ -192,6 +234,7 @@ def test_validate_auto_execution_policy_rejects_missing_evidence() -> None:
             "confidence": 0.93,
             "metadata": {
                 "reasoning": "Rollback selected from runbook and deployment timeline.",
+                "rca_analysis": {"confidence_score": 0.82},
             },
         },
     }
@@ -208,11 +251,39 @@ def test_validate_auto_execution_policy_rejects_new_or_suspended_runbook() -> No
             "confidence": 0.96,
             "metadata": {
                 "evidence_ids": ["ev-1"], "reasoning": "matched evidence",
+                "rca_analysis": {"confidence_score": 0.96},
                 "runbook_id": "rb-1", "runbook_status": "suspended", "runbook_match_score": 0.96,
             },
         },
     }
     with pytest.raises(module.PolicyViolation, match="approved, active runbook"):
+        module._validate_auto_execution_policy(payload)
+
+
+def test_context_and_resolution_scores_at_configured_threshold_allow_auto_execution() -> None:
+    module = load_remediation_app_module()
+    payload = {
+        "context": {"confidence_score": 0.74},
+        "recommendation": {
+            "confidence": 0.76,
+            "commands": ["kubectl rollout restart deployment/api-gateway -n prod"],
+            "metadata": {"evidence_ids": ["metric-1"], "reasoning": "Error rate followed the deployment."},
+        },
+    }
+    module._validate_auto_execution_policy(payload)
+
+
+def test_context_score_below_configured_threshold_blocks_auto_execution() -> None:
+    module = load_remediation_app_module()
+    payload = {
+        "context": {"confidence_score": 0.69},
+        "recommendation": {
+            "confidence": 0.91,
+            "commands": ["kubectl rollout restart deployment/api-gateway -n prod"],
+            "metadata": {"evidence_ids": ["metric-1"], "reasoning": "Error rate followed the deployment."},
+        },
+    }
+    with pytest.raises(module.PolicyViolation, match="threshold"):
         module._validate_auto_execution_policy(payload)
 
 

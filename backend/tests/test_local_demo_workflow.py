@@ -1,4 +1,4 @@
-import importlib.util
+﻿import importlib.util
 from pathlib import Path
 
 import pytest
@@ -13,7 +13,7 @@ class StaticProvider(ModelProvider):
         self._ensure_available()
         self.breaker.record_success()
         import json
-        
+
         # Build cited evidence list from payload
         evidence_ids = []
         if isinstance(payload, dict):
@@ -22,7 +22,7 @@ class StaticProvider(ModelProvider):
                 for item in disc_evidence:
                     if isinstance(item, dict) and item.get("evidence_id"):
                         evidence_ids.append(str(item["evidence_id"]))
-            
+
             # Fallback/default if none found
             if not evidence_ids and payload.get("alert", {}).get("labels", {}).get("source_event_id"):
                 source_id = payload["alert"]["labels"]["source_event_id"]
@@ -42,7 +42,7 @@ class StaticProvider(ModelProvider):
             "validation_queries": [],
             "rollback_plan": ""
         }
-        
+
         return ModelResponse(
             content=json.dumps(content_obj),
             usage=build_usage(
