@@ -245,6 +245,18 @@ def test_resolution_agent_extracts_values_from_fenced_json_with_introductory_tex
     assert parsed == "Collector endpoint is unreachable"
 
 
+def test_resolution_agent_rejects_malformed_structured_output_as_display_text() -> None:
+    malformed = '{"observed_impact":{"mysql":{"row count high", "connection refused"}}}'
+
+    parsed = ResolutionIntelligenceAgent._extract_model_text(
+        malformed,
+        keys=("impact_summary", "service_impact", "severity_rationale"),
+        fallback_text="Impact is not established from validated evidence.",
+    )
+
+    assert parsed == "Impact is not established from validated evidence."
+
+
 def test_vector_db_connector_loads_rag_documents() -> None:
     connector = VectorDBConnector()
     connector.reload()

@@ -248,6 +248,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
             return fallback_text
         parsed = ResolutionIntelligenceAgent._extract_model_object(text)
         if parsed is None:
+            # A model can return JSON-looking but syntactically invalid output
+            # (for example, set-like braces around multiple impact strings).
+            # Do not persist that machine payload as user-facing prose.
+            if text.startswith(("{", "[", "```")) or text.endswith(("}", "]", "```")):
+                return fallback_text
             return text
         metadata = parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {}
         if metadata.get("fallback"):
