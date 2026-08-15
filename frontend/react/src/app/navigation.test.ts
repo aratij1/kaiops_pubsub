@@ -27,7 +27,7 @@ describe("authoritative navigation", () => {
     expect(canAccessTab("l1_operator", "home")).toBe(true);
     expect(canAccessDestination("l1_operator", "alerts")).toBe(true);
     expect(canAccessDestination("l1_operator", "admin")).toBe(false);
-    expect(allowedLegacyTabsForRole("l1_operator")).toEqual(["home", "stream"]);
+    expect(allowedLegacyTabsForRole("l1_operator")).toEqual(["home", "stream", "summary"]);
     expect(allowedLegacyTabsForRole("administrator")).toContain("executive");
     expect(permissionExplanation("l1_operator", "admin")).toMatch(/not available.*l1 operator/i);
   });

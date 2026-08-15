@@ -47,21 +47,18 @@ test("Resolution tab treats missing routing/approval data as false, not truthy",
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { workflow } }) });
   });
 
-  await page.goto("/");
+  await page.goto("/alerts");
   await page.getByLabel("Username").fill(process.env.KAIOPS_E2E_USERNAME || "admin");
   await page.getByLabel("Password").fill(process.env.KAIOPS_E2E_PASSWORD || "Admin@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
-  await expect(page.getByRole("heading", { name: "KaiOps + Telemetry" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Operations Feed" })).toBeVisible();
 
-  await page.getByRole("button", { name: "Open alert sparse-routing-1" }).click();
-  await expect(page.getByRole("heading", { name: "Alert Details Cockpit" })).toBeVisible();
+  await page.getByRole("button", { name: "Open incident", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Incident Response" })).toBeVisible();
 
   const sectionNavigation = page.getByRole("tablist", { name: "Incident workspace sections" });
-  await sectionNavigation.getByRole("tab", { name: "Resolution", exact: true }).click();
+  await sectionNavigation.getByRole("tab", { name: "Resolve incident", exact: true }).click();
 
-  await expect(page.getByRole("heading", { name: "Resolution", exact: true })).toBeVisible();
-  const approvalRow = page.locator("tr", { hasText: "Approval Required" });
-  await expect(approvalRow).toContainText("no");
-  await expect(page.getByRole("button", { name: "Continue to Execution", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Continue to Approval", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Decision & Approval" })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Plan editor and guarded execution" })).toBeVisible();
 });

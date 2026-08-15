@@ -1,0 +1,6 @@
+{
+  "contract_version": "kaims.model-routing-policy.v1",
+  "generated_at": null,
+  "routes": {},
+  "notes": "No evaluation-qualified overrides are active. Model Router uses its configured default, RCA, and critical providers."
+}

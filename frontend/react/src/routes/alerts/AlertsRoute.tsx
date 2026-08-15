@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Activity, BellRing, Braces, Database, FileCode2, GitMerge, RadioTower, Ticket } from "lucide-react";
+import { Activity, AlertTriangle, BellRing, Braces, Database, FileCode2, GitMerge, LoaderCircle, RadioTower, RotateCcw, Search, Ticket } from "lucide-react";
 import { compactText, fetchJson, formatIstTimestamp, sourceChannelLabel, statusPillClass } from "../../appHelpers.jsx";
 import { useRouteRuntimeSlice, type AlertStreamFilters, type AlertStreamRow } from "../../app/routeRuntime";
 import { OperationsWorkflowNav } from "../../components/operations/OperationsWorkflowNav";
+import "./AlertsRoute.css";
 
 const channels = [
   ["all", "ALL", "All arrivals"], ["prometheus", "PR", "Prometheus"],
@@ -238,7 +239,12 @@ function AlertFlowSummary({ row, workflow, selected, onInspect }: { row: AlertSt
 export default function AlertsRoute() {
   const alerts = useRouteRuntimeSlice("alerts");
   const [dedupWindow, setDedupWindow] = useState(60);
-  const [liveView, setLiveView] = useState<"stream" | "flow">(() => window.localStorage.getItem("kaiops.live-alert-view") === "flow" ? "flow" : "stream");
+  const [liveView, setLiveView] = useState<"inbox" | "split" | "timeline">(() => {
+    const saved = window.localStorage.getItem("kaiops.live-alert-view");
+    if (saved === "split") return "split";
+    if (saved === "timeline" || saved === "flow") return "timeline";
+    return "inbox";
+  });
   useEffect(() => window.localStorage.setItem("kaiops.live-alert-view", liveView), [liveView]);
   const [dedupSaving, setDedupSaving] = useState(false);
   const [dedupMessage, setDedupMessage] = useState("");
@@ -362,6 +368,21 @@ export default function AlertsRoute() {
     alerts.setView("");
     alerts.updateFilter(name, value);
   };
+  const clearAlertFilters = () => {
+    alerts.setView("");
+    alerts.setSection("active");
+    alerts.setChannel("all");
+    alerts.setQuery("");
+    setPriorityFilter("all");
+    alerts.updateFilter("timeRange", "all");
+    alerts.updateFilter("severity", "all");
+    alerts.updateFilter("environment", "all");
+  };
+  const hasActiveFilters = Boolean(
+    alerts.view || alerts.section !== "active" || alerts.channel !== "all" || alerts.query
+    || priorityFilter !== "all" || alerts.filters.timeRange !== "all"
+    || alerts.filters.severity !== "all" || alerts.filters.environment !== "all"
+  );
   const inspectFlow = (row: AlertStreamRow) => {
     setTraceAlert(row);
     setTraceStage("target");
@@ -373,9 +394,9 @@ export default function AlertsRoute() {
 
   return <section className="grid single-col ingestion-stream-page operations-page">
     <OperationsWorkflowNav active="alerts" />
-    <article className="operations-page-hero ingestion-stream-hero">
-      <div><span className="discovery-eyebrow">Signal operations</span><h2>Live Alerts</h2><p>Monitor normalized arrivals across every connected application and source.</p></div>
-      <div className="ingestion-live-state"><span className={`ingestion-live-dot ${alerts.loading ? "is-loading" : ""} ${alerts.paused ? "is-paused" : ""}`} aria-hidden="true" /><div><strong>{alerts.paused ? "Updates paused" : alerts.liveState === "connected" ? "Live connection healthy" : alerts.loading ? "Synchronizing" : "Polling fallback active"}</strong><small>{alerts.rows.length} of {alerts.totalRows} arrivals shown</small><small>{alerts.updatedAt ? `Updated ${formatIstTimestamp(alerts.updatedAt)}` : "Waiting for first sync"}</small></div><button type="button" className="button-secondary" onClick={alerts.refresh} disabled={alerts.loading}>{alerts.loading ? "Refreshing…" : "Refresh"}</button><button type="button" className="button-secondary" aria-pressed={alerts.paused} onClick={alerts.togglePaused}>{alerts.paused ? "Resume" : "Pause"}</button></div>
+    <article className="operations-feed-hero">
+      <div><span className="discovery-eyebrow">Live operations</span><h2>Operations Feed</h2><p>Monitor, prioritize, and inspect normalized signals for {alerts.project} across every connected source.</p></div>
+      <div className="ingestion-live-state" role="status" aria-live="polite"><span className={`ingestion-live-dot ${alerts.loading ? "is-loading" : ""} ${alerts.paused ? "is-paused" : ""}`} aria-hidden="true" /><div><strong>{alerts.paused ? "Updates paused" : alerts.liveState === "connected" ? "Live connection healthy" : alerts.loading ? "Synchronizing" : "Polling fallback active"}</strong><small>{alerts.rows.length} of {alerts.totalRows} arrivals shown</small><small>{alerts.updatedAt ? `Updated ${formatIstTimestamp(alerts.updatedAt)}` : "Waiting for first sync"}</small></div><button type="button" className="button-secondary" onClick={alerts.refresh} disabled={alerts.loading}>{alerts.loading ? <><LoaderCircle className="button-spinner" size={15} aria-hidden="true" />Refreshing…</> : "Refresh"}</button><button type="button" className="button-secondary" aria-pressed={alerts.paused} onClick={alerts.togglePaused}>{alerts.paused ? "Resume" : "Pause"}</button></div>
     </article>
 
     <article className="panel ingestion-control-panel">
@@ -384,7 +405,7 @@ export default function AlertsRoute() {
         <label>Saved view<select value={alerts.view} onChange={(event) => event.target.value ? alerts.applyView(event.target.value) : alerts.setView("")}><option value="">Custom / all active</option>{alerts.savedViews.map((view) => <option key={view.id} value={view.id}>{view.label}</option>)}</select></label>
         <label>Time range<select value={alerts.filters.timeRange} onChange={(event) => updateFilter("timeRange", event.target.value)}><option value="1h">Last hour</option><option value="24h">Last 24 hours</option><option value="7d">Last 7 days</option><option value="all">All loaded</option></select></label>
         <label>Severity<select value={alerts.filters.severity} onChange={(event) => updateFilter("severity", event.target.value)}><option value="all">All severities</option><option value="critical">Critical</option><option value="high">High</option><option value="warning">Warning</option><option value="info">Info</option></select></label>
-        <label>Application<select value={alerts.filters.application} onChange={(event) => updateFilter("application", event.target.value)}><option value="all">All applications</option><option value="selected">Selected monitor</option>{alerts.filterOptions.applications.map((application) => <option key={application} value={application.toLowerCase()}>{application}</option>)}</select></label>
+        <label>Project<input value={alerts.project} readOnly aria-label="Selected project" /></label>
         <label>Environment<select value={alerts.filters.environment} onChange={(event) => updateFilter("environment", event.target.value)}><option value="all">All environments</option>{alerts.filterOptions.environments.map((environment) => <option key={environment} value={environment}>{environment}</option>)}</select></label>
         <label className="ingestion-density-toggle"><input type="checkbox" checked={alerts.density === "compact"} onChange={(event) => alerts.setDensity(event.target.checked ? "compact" : "comfortable")} />Compact rows</label>
         <label>Duplicate window<select value={dedupWindow} disabled={dedupSaving} onChange={(event) => { setDedupWindow(Number(event.target.value)); setDedupMessage(""); }}><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={120}>2 hours</option><option value={240}>4 hours</option><option value={1440}>24 hours</option></select></label>
@@ -395,22 +416,29 @@ export default function AlertsRoute() {
 
     <div className="ingestion-channel-grid" aria-label="Alert source counts">{channels.map(([channel, icon, label]) => <button type="button" key={channel} className={`ingestion-channel-card channel-${channel} ${alerts.channel === channel ? "is-active" : ""}`} onClick={() => alerts.setChannel(channel)} aria-pressed={alerts.channel === channel}><span>{icon}</span><div><strong>{alerts.counts[channel] || 0}</strong><small>{label}</small></div></button>)}</div>
 
-    <div className="live-alert-view-switch" role="group" aria-label="Live alert presentation">
-      <span>Display</span>
-      <button type="button" className={liveView === "stream" ? "is-active" : ""} aria-pressed={liveView === "stream"} onClick={() => setLiveView("stream")}><RadioTower size={16} /><span><strong>Live stream</strong><small>Latest alert arrivals</small></span></button>
-      <button type="button" className={liveView === "flow" ? "is-active" : ""} aria-pressed={liveView === "flow"} onClick={() => setLiveView("flow")}><GitMerge size={16} /><span><strong>Flow view</strong><small>Metric through incident</small></span></button>
+    <div className="live-alert-view-switch" role="radiogroup" aria-label="Alerts and streams view">
+      <span>View</span>
+      <button type="button" role="radio" className={liveView === "inbox" ? "is-active" : ""} aria-checked={liveView === "inbox"} onClick={() => setLiveView("inbox")}><RadioTower size={16} /><span><strong>Unified Signal Inbox</strong><small>Prioritized operational queue</small></span></button>
+      <button type="button" role="radio" className={liveView === "split" ? "is-active" : ""} aria-checked={liveView === "split"} onClick={() => setLiveView("split")}><Activity size={16} /><span><strong>Alert + Stream</strong><small>Queue and evidence side by side</small></span></button>
+      <button type="button" role="radio" className={liveView === "timeline" ? "is-active" : ""} aria-checked={liveView === "timeline"} onClick={() => setLiveView("timeline")}><GitMerge size={16} /><span><strong>Correlation Timeline</strong><small>Signal through incident lifecycle</small></span></button>
     </div>
 
     <div className="alert-priority-filter" role="group" aria-label="Alert operational priority">
       {([['all', 'All', alerts.rows.length], ['action', 'Action required', priorityCounts.action], ['watch', 'Watch', priorityCounts.watch], ['duplicate', 'Duplicates', priorityCounts.duplicate], ['noise', 'Ignored noise', priorityCounts.noise]] as const).map(([id, label, count]) => <button type="button" key={id} className={priorityFilter === id ? "is-active" : ""} aria-pressed={priorityFilter === id} onClick={() => setPriorityFilter(id)}><strong>{count}</strong><span>{label}</span></button>)}
     </div>
 
-    {liveView === "flow" ? <div className="live-alert-flow-list">
+    <div className="alert-results-summary" role="status" aria-live="polite">
+      <div><strong>{prioritizedRows.length}</strong><span>alert{prioritizedRows.length === 1 ? "" : "s"} in this view</span><small>Sorted by operational priority, then newest arrival.</small></div>
+      {hasActiveFilters ? <button type="button" className="button-secondary" onClick={clearAlertFilters}><RotateCcw size={15} aria-hidden="true" />Clear all filters</button> : null}
+    </div>
+
+    {liveView === "timeline" ? <div className="live-alert-flow-list">
       {prioritizedRows.map(({ row }) => <AlertFlowSummary key={alertRowKey(row)} row={row} workflow={rowWorkflows[alertRowKey(row)]} selected={Boolean(activeTraceAlert && alertRowKey(activeTraceAlert) === alertRowKey(row))} onInspect={() => inspectFlow(row)} />)}
-      {!alerts.rows.length && !alerts.loading ? <div className="ingestion-stream-empty"><strong>No alerts match this view</strong><p>Change the filters or verify the selected connector is delivering events.</p></div> : null}
+      {alerts.loading && !alerts.rows.length ? <div className="ingestion-stream-loading" role="status"><LoaderCircle size={22} aria-hidden="true" /><strong>Loading live alerts</strong><p>Connecting to the durable alert stream…</p></div> : null}
+      {!alerts.rows.length && !alerts.loading ? <div className="ingestion-stream-empty"><Search size={24} aria-hidden="true" /><strong>No alerts match this view</strong><p>Clear the active filters or verify that the selected project connector is delivering events.</p>{hasActiveFilters ? <button type="button" className="button-secondary" onClick={clearAlertFilters}>Clear all filters</button> : null}</div> : null}
     </div> : null}
 
-    {liveView === "flow" && trace ? <article id="live-alert-flow-inspector" ref={flowInspectorRef} tabIndex={-1} className="panel metric-alert-trace live-alert-flow-inspector">
+    {liveView === "timeline" && trace ? <article id="live-alert-flow-inspector" ref={flowInspectorRef} tabIndex={-1} className="panel metric-alert-trace live-alert-flow-inspector">
       <div className="panel-head"><div><span className="discovery-eyebrow">Prometheus execution</span><h3>Metric-to-Alert Trace</h3><p>{trace.alertName} · {trace.target}</p></div><span className={`pill ${statusPillClass(trace.status)}`}>{trace.status.toUpperCase()}</span></div>
       <div className="metric-trace-flow" aria-label="Prometheus metric to alert flow">{flowStages.map(([id, label, Icon], index) => <button key={id} type="button" className={`${traceStage === id ? "is-selected" : ""} ${id === "alert" ? "is-alert" : ""}`} onClick={() => setTraceStage(id)} aria-pressed={traceStage === id}><span className="metric-trace-sequence">{String(index + 1).padStart(2, "0")}</span><i><Icon size={19} /></i><strong>{label}</strong><small>{id === "target" ? trace.job : id === "scrape" ? "/metrics polled" : id === "parse" ? `${trace.metric} = ${trace.value}` : id === "store" ? "Time series" : id === "rule" ? "Condition matched" : trace.alertName}</small></button>)}</div>
       <div className="metric-trace-details">
@@ -434,9 +462,14 @@ export default function AlertsRoute() {
       </div>
     </article> : null}
 
-    {liveView === "stream" ? <article className="panel ingestion-stream-panel">
-      <div className="ingestion-stream-toolbar"><div><span className="discovery-eyebrow">Landing-pad events</span><h3>{alerts.channel === "all" ? "All source activity" : alerts.channel === "failed" ? "Failed ingestion activity" : `${sourceChannelLabel(alerts.channel)} activity`}</h3></div><label><span>Search alerts</span><input value={alerts.query} onChange={(event) => alerts.setQuery(event.target.value)} placeholder="Alert, service, project, or source" /></label></div>
-      {alerts.error ? <p className="error">Live data could not be refreshed. Existing results are preserved. {alerts.error}</p> : null}
+    {liveView === "split" ? <section className="alert-split-workspace">
+      <article className="panel alert-split-queue"><header><div><span className="discovery-eyebrow">Action queue</span><h3>Alerts</h3></div><strong>{prioritizedRows.length}</strong></header><div>{prioritizedRows.map(({ row, priority }) => { const item=displayAlert(row); const selected=Boolean(activeTraceAlert&&alertRowKey(activeTraceAlert)===alertRowKey(row)); return <button type="button" className={`${selected?"is-selected":""} priority-${priority.kind}`} key={alertRowKey(row)} onClick={()=>setTraceAlert(row)}><i/><span><strong>{item.title}</strong><small>{item.service} · {item.severity} · {item.lastSeen}</small></span><em>{priority.label}</em></button> })}</div></article>
+      <article className="panel alert-split-evidence">{activeTraceAlert ? (()=>{const item=displayAlert(activeTraceAlert);const source=sourceEvidence(activeTraceAlert);const priority=classifyAlert(activeTraceAlert,rowWorkflows[alertRowKey(activeTraceAlert)]);return <><header><div><span className={`source-badge source-${item.channel}`}>{sourceChannelLabel(item.channel)}</span><h3>{item.title}</h3><p>{item.summary}</p></div><span className={`alert-priority-badge is-${priority.kind}`}>{priority.label}</span></header><dl><div><dt>Service</dt><dd>{item.service}</dd></div><div><dt>Severity</dt><dd>{item.severity}</dd></div><div><dt>Owner</dt><dd>{item.owner}</dd></div><div><dt>Occurrences</dt><dd>{item.occurrences}</dd></div><div><dt>Source</dt><dd>{source.origin}</dd></div><div><dt>Received</dt><dd>{source.received}</dd></div></dl><section><h4>Source message</h4><p>{source.message}</p><details><summary>Labels and annotations</summary><pre>{JSON.stringify({labels:source.labels,annotations:source.annotations},null,2)}</pre></details></section><footer><button className="button-secondary" onClick={()=>setLiveView("timeline")}>Open correlation timeline</button><button className="button-primary" onClick={()=>alerts.open(activeTraceAlert)}>Open incident</button></footer></>} )() : <div className="alert-split-empty"><Activity/><strong>Select an alert</strong><p>Choose a signal from the queue to inspect its evidence.</p></div>}</article>
+    </section> : null}
+
+    {liveView === "inbox" ? <article className="panel ingestion-stream-panel">
+      <div className="ingestion-stream-toolbar"><div><span className="discovery-eyebrow">Prioritized event feed</span><h3>{alerts.channel === "all" ? "All source activity" : alerts.channel === "failed" ? "Failed ingestion activity" : `${sourceChannelLabel(alerts.channel)} activity`}</h3></div><label><span>Search feed</span><div className="alert-search-field"><Search size={16} aria-hidden="true" /><input value={alerts.query} onChange={(event) => alerts.setQuery(event.target.value)} placeholder="Alert, service, project, or source" /></div></label></div>
+      {alerts.error ? <div className="ingestion-refresh-warning" role="alert"><AlertTriangle size={18} aria-hidden="true" /><div><strong>Live refresh failed</strong><span>Existing results are preserved. {alerts.error}</span></div><button type="button" className="button-secondary" onClick={alerts.refresh}>Retry</button></div> : null}
       <div className="ingestion-stream-list" aria-live="off">{prioritizedRows.map(({ row, priority }) => {
         const display = displayAlert(row);
         const channel = display.channel;
@@ -445,7 +478,7 @@ export default function AlertsRoute() {
         const source = sourceEvidence(row);
         const sourceExpanded = expandedSourceKey === rowKey;
         return <article className={`ingestion-event channel-${channel} priority-${priority.kind} ${failed ? "is-failed" : ""}`} key={rowKey}><div className="ingestion-event-marker"><span>{channelIcon(channel)}</span><i aria-hidden="true" /></div><div className="ingestion-event-main"><header><div><span className={`alert-priority-badge is-${priority.kind}`} title={priority.reason}>{priority.label}</span><strong>{display.title}</strong><span className={`source-badge source-${channel}`}>{sourceChannelLabel(channel)}</span></div><time>{display.lastSeen}</time></header><p>{display.summary}</p><div className="alert-priority-reason">{priority.reason}</div><footer><span><b>Service</b>{display.service}</span><span><b>Severity</b>{display.severity}</span><span><b>Occurrences</b>{display.occurrences}</span><span><b>Owner</b>{display.owner}</span></footer><div className="ingestion-event-actions"><button type="button" className="button-secondary" aria-expanded={sourceExpanded} aria-controls={`source-${rowKey}`} onClick={() => setExpandedSourceKey(sourceExpanded ? "" : rowKey)}><Braces size={15} />{sourceExpanded ? "Hide source details" : "Show source details"}</button><button type="button" className="button-secondary" onClick={() => alerts.open(row)}>{priority.kind === "action" ? "Open incident" : priority.kind === "watch" ? "Review alert" : "View audit details"}</button></div>{sourceExpanded ? <section id={`source-${rowKey}`} className="alert-source-evidence"><header><div><small>Original source evidence</small><strong>{source.origin}</strong></div><span className={`source-badge source-${channel}`}>{source.channel}</span></header><dl><div><dt>Source event ID</dt><dd><code>{source.sourceId}</code></dd></div><div><dt>Source location</dt><dd>{source.location}</dd></div><div><dt>Observed at</dt><dd>{source.observed}</dd></div><div><dt>Received at</dt><dd>{source.received}</dd></div><div className="source-message"><dt>Source message</dt><dd>{source.message}</dd></div></dl><div className="alert-source-structured"><details open><summary>Labels ({Object.keys(source.labels).length})</summary><pre>{JSON.stringify(source.labels, null, 2)}</pre></details><details open><summary>Annotations ({Object.keys(source.annotations).length})</summary><pre>{JSON.stringify(source.annotations, null, 2)}</pre></details><details><summary>Raw source payload (sensitive values redacted)</summary><pre>{JSON.stringify(source.payload, null, 2)}</pre></details></div></section> : null}{row.error ? <small className="ingestion-event-error">{compactText(richText(row.error), 240)}</small> : null}</div></article>;
-      })}{!alerts.rows.length && !alerts.loading ? <div className="ingestion-stream-empty"><strong>No alerts match this view</strong><p>Change the filters or verify the selected connector is delivering events.</p></div> : null}</div>
+      })}{alerts.loading && !alerts.rows.length ? <div className="ingestion-stream-loading" role="status"><LoaderCircle size={22} aria-hidden="true" /><strong>Loading live alerts</strong><p>Connecting to the durable alert stream…</p></div> : null}{!alerts.rows.length && !alerts.loading ? <div className="ingestion-stream-empty"><Search size={24} aria-hidden="true" /><strong>No alerts match this view</strong><p>Clear the active filters or verify that the selected project connector is delivering events.</p>{hasActiveFilters ? <button type="button" className="button-secondary" onClick={clearAlertFilters}>Clear all filters</button> : null}</div> : null}</div>
     </article> : null}
   </section>;
 }

@@ -277,11 +277,12 @@ async def test_context_agent_returns_requested_shape() -> None:
     assert any(match["kind"] == "runbook" for match in context.metadata["rag_matches"])
     assert context.metadata["rag_index"]["vector_store"]["provider"] == "local-hybrid-vector-index"
     assert context.metadata["rag_index"]["embedding_model"]["model"] == "hashing-token-counter-v1"
-    assert context.metadata["context_graph"] == {
-        "enabled": True,
-        "stages": ["validate_event", "collect_connector_evidence", "assemble_context"],
-        "connector_count": 9,
-    }
+    graph = context.metadata["context_graph"]
+    assert graph["enabled"] is True
+    assert graph["stages"] == ["validate_event", "collect_connector_evidence", "assemble_context"]
+    assert graph["connector_count"] == 9
+    assert graph["collected_count"] == 9
+    assert graph["degraded"] is False
 
 
 @pytest.mark.asyncio

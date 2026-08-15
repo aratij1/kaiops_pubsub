@@ -74,30 +74,19 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("admin setup keeps source downloads below file inputs and labels adapter contracts", async ({ page }) => {
+test("project onboarding exposes a complete monitoring integration contract", async ({ page }) => {
   test.setTimeout(120_000);
   await page.goto("/");
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill("admin-password");
   await page.getByRole("button", { name: "Sign In" }).click();
 
-  await page.getByRole("button", { name: /Admin/ }).click();
-  await page.getByRole("button", { name: /Continue (guided )?setup|Open workflow status|Review generated artifacts/ }).click();
-  await expect(page.getByRole("heading", { name: "Setup Wizard" })).toBeVisible();
-  await page.getByRole("button", { name: "Show full setup" }).click();
-
-  await page.getByText("Optional supporting file", { exact: true }).click();
-  const sourceCard = page.locator(".source-doc-upload-card").filter({ hasText: "runbook, ticket export, or notes" });
-  await expect(sourceCard.locator("input[type=file]")).toBeVisible();
-  await expect(page.getByRole("link", { name: "Download sample file" })).toBeVisible();
-
-  await expect(page.getByLabel("Setup Details")).toBeVisible();
-  await page.getByText("Advanced Settings (Optional)").click();
-  await page.locator("label").filter({ hasText: "Deployment" }).first().locator("select").selectOption("azure_cloud");
-  await expect(page.getByLabel("Azure Subscription ID")).toBeVisible();
-
-  await page.getByText("Open Advanced Tools").click();
-  await expect(page.getByText("Monitoring Platform Capabilities")).toBeVisible();
-  await expect(page.getByText("real / partial")).toBeVisible();
-  await expect(page.getByText("simulated / stub")).toBeVisible();
+  await page.getByRole("button", { name: "Project Onboarding", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Integrations & Monitoring" })).toBeVisible();
+  await expect(page.getByLabel("tenant id")).toBeVisible();
+  await expect(page.getByLabel("owner team")).toBeVisible();
+  await expect(page.getByLabel("Metrics Endpoint")).toBeVisible();
+  await expect(page.getByLabel("Labels (comma-separated key=value)")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Register Application" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Configured Monitoring Integrations" })).toBeVisible();
 });

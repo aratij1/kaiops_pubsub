@@ -1,6 +1,9 @@
 from importlib import util
 from pathlib import Path
 
+import httpx
+import pytest
+
 from common.models import Incident, RemediationAction, RemediationStatus, ResolutionReport
 
 
@@ -140,3 +143,72 @@ def test_build_final_incident_payload_validates_into_incident_model_without_erro
     assert incident.tenant_id == "default"
     assert incident.status.value == "closed"
     assert incident.ticket_id == "KAN-9999"
+
+
+class _JiraResponse:
+    def __init__(self, status_code: int = 200, payload: dict | None = None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = ""
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class _JiraClient:
+    calls: list[tuple[str, str, dict | None]] = []
+    transitions: list[dict] = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def get(self, url: str, **kwargs):
+        self.calls.append(("GET", url, None))
+        return _JiraResponse(payload={"transitions": self.transitions})
+
+    async def post(self, url: str, json: dict | None = None, **kwargs):
+        self.calls.append(("POST", url, json))
+        return _JiraResponse(status_code=204 if url.endswith("/transitions") else 201)
+
+
+def _configure_jira(monkeypatch) -> None:
+    monkeypatch.setenv("JIRA_URL", "https://jira.example.test")
+    monkeypatch.setenv("JIRA_API_EMAIL", "operator@example.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "test-token")
+    monkeypatch.setattr(httpx, "AsyncClient", _JiraClient)
+    _JiraClient.calls = []
+    _JiraClient.transitions = []
+
+
+@pytest.mark.asyncio
+async def test_jira_remains_open_when_recovery_validation_fails(monkeypatch) -> None:
+    module = load_closure_app_module()
+    _configure_jira(monkeypatch)
+
+    result = await module._sync_closure_to_jira(_existing_incident_payload(), _report(health_restored=False))
+
+    assert result["status"] == "validation_pending"
+    assert result["transitioned"] is False
+    assert len(_JiraClient.calls) == 1
+    assert _JiraClient.calls[0][1].endswith("/comment")
+    assert "remains open" in _JiraClient.calls[0][2]["body"]
+
+
+@pytest.mark.asyncio
+async def test_jira_transitions_by_done_status_category_after_validated_recovery(monkeypatch) -> None:
+    module = load_closure_app_module()
+    _configure_jira(monkeypatch)
+    _JiraClient.transitions = [{"id": "91", "name": "Complete workflow", "to": {"statusCategory": {"key": "done"}}}]
+
+    result = await module._sync_closure_to_jira(_existing_incident_payload(), _report(health_restored=True))
+
+    assert result["status"] == "resolved"
+    assert result["transitioned"] is True
+    assert [call[0] for call in _JiraClient.calls] == ["POST", "GET", "POST"]
+    assert _JiraClient.calls[-1][2] == {"transition": {"id": "91"}}

@@ -5141,32 +5141,20 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 )
             continue
 
-        # In file-routing mode the watcher may be disabled or delayed. Keep
-        # Live Alerts truthful by recording intake before queue processing.
+        # In file-routing mode the watcher may be disabled, delayed, or busy
+        # with another connector. Process the landed alert before acknowledging
+        # Alertmanager so HTTP 200 means the durable feed and message bus have
+        # actually accepted it. Deferring this step created a silent gap where
+        # Alertmanager showed a firing alert but Live Stream and Incidents never
+        # received it.
         landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item, status="processed")
-        try:
-            landing_pad_input_file = _write_alert_to_landing_pad_input(mapped_payload, item)
-            queued_rows.append(
-                {
-                    "status": status,
-                    "alertname": mapped_payload["name"],
-                    "service": mapped_payload["service"],
-                    "landing_pad_file": landing_pad_file,
-                    "landing_pad_input_file": str(landing_pad_input_file),
-                }
-            )
-        except Exception as exc:
+        result = await _ingest_one_alertmanager_alert(mapped_payload, item, status)
+        if result.get("kind") == "ingested":
+            for row in result.get("rows", []):
+                queued_rows.append({**row, "landing_pad_file": landing_pad_file})
+        else:
             _ALERTMANAGER_RECENT_DELIVERIES.pop(delivery_key, None)
-            logger.exception("failed to enqueue alertmanager alert")
-            _persist_alert_to_landing_pad(mapped_payload, item, status="failed", error=str(exc))
-            skipped_rows.append(
-                {
-                    "status": status,
-                    "alertname": mapped_payload["name"],
-                    "service": mapped_payload["service"],
-                    "reason": f"landing pad ingestion failed: {exc}",
-                }
-            )
+            skipped_rows.append({**result, "landing_pad_file": landing_pad_file})
 
     return {
         "received": received,

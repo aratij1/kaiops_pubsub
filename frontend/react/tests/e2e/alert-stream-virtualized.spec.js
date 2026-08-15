@@ -26,7 +26,7 @@ function buildMockAlertRows(count) {
   return rows;
 }
 
-test("alert stream table renders and scrolls through the 150-row balanced source cap", async ({ page }) => {
+test("live alert stream bounds and scrolls the 150-row source-balanced input", async ({ page }) => {
   test.setTimeout(90_000);
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
@@ -47,30 +47,29 @@ test("alert stream table renders and scrolls through the 150-row balanced source
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
   });
 
-  await page.goto("/");
+  await page.goto("/alerts");
   await page.getByLabel("Username").fill(process.env.KAIOPS_E2E_USERNAME || "admin");
   await page.getByLabel("Password").fill(process.env.KAIOPS_E2E_PASSWORD || "Admin@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
-  await expect(page.getByRole("heading", { name: "KaiOps + Telemetry" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Operations Feed" })).toBeVisible();
 
-  const tableWrap = page.locator(".alert-stream-wrap");
-  await expect(tableWrap).toBeVisible({ timeout: 30_000 });
-  await page.locator(".alerts-limit-select select").selectOption("200");
+  const stream = page.locator(".ingestion-stream-list");
+  await expect(stream).toBeVisible({ timeout: 30_000 });
 
   // A row near the top of the mocked data should be visible immediately...
   await expect(page.getByText("Capacity alert 0", { exact: true }).first()).toBeVisible();
 
-  // ...while a row far down the 500-row list should NOT be in the DOM yet
-  // (proving the table is windowed, not rendering all 500 rows at once).
+  // The operational view intentionally bounds the visible working set to 50.
   await expect(page.getByText("Capacity alert 149", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".ingestion-event")).toHaveCount(50);
 
   // Scrolling the virtualized container to the bottom must bring that row
   // into view without a page error, proving the virtualizer keeps rendering
   // newly-scrolled-into-view rows correctly.
-  await tableWrap.evaluate((el) => {
+  await stream.evaluate((el) => {
     el.scrollTop = el.scrollHeight;
   });
-  await expect(page.getByText("Capacity alert 149", { exact: true }).first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText("Capacity alert 49", { exact: true }).first()).toBeVisible({ timeout: 15_000 });
 
   expect(pageErrors).toEqual([]);
 });
