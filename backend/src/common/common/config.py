@@ -74,6 +74,8 @@ class Settings(BaseSettings):
     ai_layer_auth_token: str = Field(default="", alias="AI_LAYER_AUTH_TOKEN")
     context_strategy: str = Field(default="auto", alias="CONTEXT_STRATEGY")
     context_knowledge_ttl_seconds: int = Field(default=604800, alias="CONTEXT_KNOWLEDGE_TTL_SECONDS")
+    context_resolution_reuse_enabled: bool = Field(default=True, alias="CONTEXT_RESOLUTION_REUSE_ENABLED")
+    context_resolution_reuse_min_score: float = Field(default=0.7, alias="CONTEXT_RESOLUTION_REUSE_MIN_SCORE", ge=0.0, le=1.0)
     object_storage_enabled: bool = Field(default=False, alias="OBJECT_STORAGE_ENABLED")
     object_storage_provider: str = Field(default="s3", alias="OBJECT_STORAGE_PROVIDER")
     object_storage_bucket: str = Field(default="kaiops-archive", alias="OBJECT_STORAGE_BUCKET")

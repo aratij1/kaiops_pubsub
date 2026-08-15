@@ -941,12 +941,16 @@ class ResolutionIntelligenceAgent(BaseAgent):
             state["gathered_context"].get("discovery_evidence", []),
             accepted_ids=cited,
             alternative_causes=parsed.get("alternative_causes", []),
+            reference_time=context.alert.created_at,
         )
         model_confidence = min(model_confidence, evidence_quality.confidence_ceiling)
         state["rca_analysis"]["confidence_score"] = model_confidence
         state["rca_analysis"]["evidence_quality"] = {
+            "accepted_evidence": evidence_quality.accepted_evidence,
             "independent_sources": evidence_quality.independent_sources,
             "direct_evidence": evidence_quality.direct_evidence,
+            "fresh_direct_evidence": evidence_quality.fresh_direct_evidence,
+            "average_reliability": evidence_quality.average_reliability,
             "contradictory": evidence_quality.contradictory,
             "sufficiency": evidence_quality.sufficiency,
             "confidence_ceiling": evidence_quality.confidence_ceiling,
@@ -1190,6 +1194,33 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
         state["recommended_action"] = action
         state["commands"] = commands
+        executable_prefixes = (
+            "kubectl ", "curl ", "mysql ", "redis-cli ", "terraform ", "ansible-playbook ",
+        )
+
+        def executable(items: Any) -> list[str]:
+            if isinstance(items, str):
+                items = [items]
+            if not isinstance(items, list):
+                return []
+            output: list[str] = []
+            for item in items:
+                command = str(item or "").strip()
+                lowered = command.lower()
+                # Shell-specific filters and prose are not portable execution contracts.
+                if lowered.startswith(executable_prefixes) and "| findstr" not in lowered and " -- confirm" not in lowered:
+                    output.append(command)
+            return list(dict.fromkeys(output))
+
+        validation_commands = executable(parsed.get("validation_commands") or default_validation_queries)
+        rollback_commands = executable(parsed.get("rollback_commands"))
+        command_text = " ".join(commands).lower()
+        mutation_markers = ("rollout restart", "rollout undo", " scale ", " apply ", "flushdb", "failover")
+        mutating = any(marker in f" {command_text} " for marker in mutation_markers)
+        namespace = re.sub(r"[^a-z0-9-]", "", str(context.alert.labels.get("namespace") or "prod").lower()) or "prod"
+        preflight: list[str] = []
+        if any(str(command).strip().lower().startswith("kubectl ") for command in commands):
+            preflight = [f"kubectl get deployment {remediation_target} -n {namespace}"]
         state["remediation_analysis"] = {
             # Deterministic defaults first, so a real model answer (when
             # RESOLUTION_DEEP_ANALYSIS_ENABLED=true) always wins if it supplies its
@@ -1200,6 +1231,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
             "recommended_action": action,
             "commands": commands,
             "remediation_target": remediation_target,
+            "schema_version": "2.0",
+            "mutating": mutating,
+            "preflight_commands": preflight,
+            "validation_commands": validation_commands,
+            "rollback_commands": rollback_commands,
         }
         return state
 
@@ -1319,6 +1355,14 @@ class ResolutionIntelligenceAgent(BaseAgent):
         recommendation.metadata["rca_analysis"] = state.get("rca_analysis", {})
         recommendation.metadata["impact_analysis"] = state.get("impact_analysis", {})
         recommendation.metadata["remediation_analysis"] = state.get("remediation_analysis", {})
+        remediation_analysis = state.get("remediation_analysis", {})
+        recommendation.metadata["execution_plan"] = {
+            key: remediation_analysis.get(key)
+            for key in (
+                "schema_version", "mutating", "preflight_commands", "commands",
+                "validation_commands", "rollback_commands", "remediation_target",
+            )
+        }
         recommendation.metadata["detected_errors"] = state.get("gathered_context", {}).get("detected_errors", [])
         recommendation.metadata["detected_error_count"] = len(recommendation.metadata["detected_errors"])
         recommendation.metadata["service"] = str(context.alert.service or "")
@@ -1387,6 +1431,16 @@ class ResolutionIntelligenceAgent(BaseAgent):
             risk=recommendation.risk,
             environment=str(context.alert.environment or "prod"),
             fallback_used=bool(fallback_usages),
+            evidence_quality=(
+                rca_analysis.get("evidence_quality")
+                if isinstance(rca_analysis.get("evidence_quality"), dict)
+                else None
+            ),
+            context_degraded=bool(
+                (context.metadata.get("context_graph") or {}).get("degraded")
+                if isinstance(context.metadata.get("context_graph"), dict)
+                else False
+            ),
         )
         citations = [f"incident://{context.incident_id}"]
         if runbook_present:

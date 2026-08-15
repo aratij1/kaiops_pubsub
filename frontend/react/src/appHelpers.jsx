@@ -636,21 +636,39 @@ const MIN_VISIBLE_ALERTS_BY_SOURCE = {
 
 function capLatestAlertsPerSource(rows, maxPerSource = MAX_LATEST_ALERTS_PER_SOURCE) {
   const safeMax = Math.max(1, Number(maxPerSource) || MAX_LATEST_ALERTS_PER_SOURCE);
-  const counters = Object.fromEntries(ALERT_SOURCE_CHANNELS.map((channel) => [channel, 0]));
-  return (Array.isArray(rows) ? rows : [])
+  const sortedRows = (Array.isArray(rows) ? rows : [])
     .slice()
-    .sort((left, right) => alertTimeMs(right) - alertTimeMs(left))
-    .filter((row) => {
-      const channel = normalizeAlertChannel(row);
-      if (!ALERT_SOURCE_CHANNELS.includes(channel)) {
-        return false;
-      }
-      if (counters[channel] >= safeMax) {
-        return false;
-      }
-      counters[channel] += 1;
-      return true;
-    });
+    .sort((left, right) => alertTimeMs(right) - alertTimeMs(left));
+  const selected = new Set();
+  const counters = Object.fromEntries(ALERT_SOURCE_CHANNELS.map((channel) => [channel, 0]));
+  const identities = Object.fromEntries(ALERT_SOURCE_CHANNELS.map((channel) => [channel, new Set()]));
+
+  // Reserve a slot for the newest occurrence of every alert type before a
+  // noisy service can fill the source quota with duplicates. Without this,
+  // bursts from one Prometheus job hid valid alerts such as mysql-exporter
+  // even though their incidents remained visible in the incident table.
+  sortedRows.forEach((row, index) => {
+    const channel = normalizeAlertChannel(row);
+    if (!ALERT_SOURCE_CHANNELS.includes(channel) || counters[channel] >= safeMax) return;
+    const labels = typeof row?.labels === "object" && row.labels ? row.labels : {};
+    const service = String(row?.service || labels?.service || labels?.job || "unknown-service").trim().toLowerCase();
+    const name = String(row?.name || row?.alert_name || labels?.alertname || "unnamed-alert").trim().toLowerCase();
+    const identity = `${service}:${name}`;
+    if (identities[channel].has(identity)) return;
+    identities[channel].add(identity);
+    counters[channel] += 1;
+    selected.add(index);
+  });
+
+  // Use any remaining capacity for repeated occurrences, retaining the
+  // original newest-first ordering expected by the live stream.
+  sortedRows.forEach((row, index) => {
+    const channel = normalizeAlertChannel(row);
+    if (selected.has(index) || !ALERT_SOURCE_CHANNELS.includes(channel) || counters[channel] >= safeMax) return;
+    counters[channel] += 1;
+    selected.add(index);
+  });
+  return sortedRows.filter((_row, index) => selected.has(index));
 }
 
 function ensureMinimumAlertsBySource(rows, sourceRows, minimums = MIN_VISIBLE_ALERTS_BY_SOURCE) {
@@ -6892,6 +6910,13 @@ function buildWorkflowFlowStages(workflow, timelineRows = []) {
     const token = String(row?.agent || row?.service || row?.detail || "").toLowerCase();
     return token.includes("alert intelligence") || token.includes("orchestrator") || token.includes("context") || token.includes("resolution");
   });
+  const remediation = safeWorkflow?.remediation_action && typeof safeWorkflow.remediation_action === "object"
+    ? safeWorkflow.remediation_action
+    : {};
+  const remediationStatus = String(remediation.status || "").trim().toLowerCase();
+  const remediationPolicyBlocked = String(remediation.action_type || "").trim().toLowerCase() === "policy-blocked"
+    || remediation?.metadata?.policy_blocked === true;
+  const closureComplete = safeWorkflow?.closure_report?.health_restored === true;
   return [
     {
       id: "landing-pad",
@@ -6916,14 +6941,20 @@ function buildWorkflowFlowStages(workflow, timelineRows = []) {
     {
       id: "remediation",
       label: "Remediation Execution",
-      detail: `${Array.isArray(safeWorkflow?.remediation_action?.parameters?.execution_plan?.commands) ? safeWorkflow.remediation_action.parameters.execution_plan.commands.length : 0} commands captured for execution or review.`,
-      status: safeWorkflow?.remediation_action?.status ? "done" : "active",
+      detail: remediationPolicyBlocked
+        ? String(remediation.error || remediation.metadata?.policy_reason || "Execution blocked by policy; operator review is required.")
+        : `${Array.isArray(remediation?.parameters?.execution_plan?.commands) ? remediation.parameters.execution_plan.commands.length : 0} commands captured for execution or review.`,
+      status: remediationPolicyBlocked ? "blocked" : remediationStatus ? "done" : "waiting",
     },
     {
       id: "closure",
       label: "Closure & Validation",
-      detail: String(safeWorkflow?.closure_report?.health_restored ? "Service restored and closure completed." : "Validation continues after remediation.").trim(),
-      status: safeWorkflow?.closure_report?.health_restored ? "done" : "active",
+      detail: String(closureComplete
+        ? "Service restored and closure completed."
+        : remediationPolicyBlocked
+          ? "Waiting for an approved remediation outcome before validation."
+          : "Validation starts after remediation completes.").trim(),
+      status: closureComplete ? "done" : "waiting",
     },
   ];
 }

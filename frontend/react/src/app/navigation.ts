@@ -44,7 +44,7 @@ export const NAVIGATION_GROUPS = [
 ] as const satisfies readonly { id: NavigationGroup; label: string }[];
 
 export const NAVIGATION_ITEMS: readonly NavigationItem[] = [
-  { id: "dashboard", legacyTab: "home", path: "/", label: "Incident Summary", pageTitle: "Incident Summary", group: "operations", routeModule: "dashboard", icon: "dashboard", keywords: ["incident", "summary"], allowedRoles: ALL_ROLES, showInNavigation: false },
+  { id: "dashboard", legacyTab: "home", path: "/", label: "Overview", pageTitle: "Incident Summary", group: "operations", routeModule: "dashboard", icon: "dashboard", keywords: ["reliability", "overview", "incident", "summary"], allowedRoles: ALL_ROLES },
   { id: "alerts", legacyTab: "stream", path: "/alerts", label: "Live Stream", pageTitle: "Live Stream", group: "operations", routeModule: "alerts", icon: "alerts", keywords: ["live", "ingestion", "stream", "alerts", "events"], allowedRoles: ALL_ROLES, related: ["incidents"] },
   { id: "incidents", legacyTab: "summary", path: "/incidents", label: "Alerts & Incidents", pageTitle: "Alerts & Incidents", group: "operations", routeModule: "incidents", icon: "incidents", keywords: ["alerts", "case", "investigation", "metadata"], allowedRoles: ALL_ROLES, related: ["alerts", "approvals"] },
   { id: "approvals", legacyTab: "approval", path: "/approvals", label: "Approvals", pageTitle: "Approvals", group: "operations", routeModule: "approvals", icon: "approvals", keywords: ["review", "decision", "human gate"], allowedRoles: INCIDENT_ROLES, related: ["incidents", "closed"], showInNavigation: false },

@@ -127,7 +127,7 @@ def _build_final_incident_payload(
     return final_payload
 
 
-async def _sync_closure_to_jira(incident_payload: dict[str, Any], report: ResolutionReport) -> None:
+async def _sync_closure_to_jira(incident_payload: dict[str, Any], report: ResolutionReport) -> dict[str, Any]:
     import os
     import logging
     import httpx
@@ -137,7 +137,7 @@ async def _sync_closure_to_jira(incident_payload: dict[str, Any], report: Resolu
     ticket_id = str(incident_payload.get("ticket_id") or "").strip()
     if not ticket_id:
         logger.info("No Jira ticket linked to incident %s; skipping closure update", report.incident_id)
-        return
+        return {"status": "skipped", "reason": "no_linked_ticket", "transitioned": False}
 
     base_url = str(os.getenv("JIRA_API_BASE_URL", "") or os.getenv("JIRA_URL", "") or "").rstrip("/")
     email = str(os.getenv("JIRA_API_EMAIL", "") or os.getenv("JIRA_USER_EMAIL", "") or "")
@@ -145,17 +145,18 @@ async def _sync_closure_to_jira(incident_payload: dict[str, Any], report: Resolu
 
     if not (base_url and email and token):
         logger.info("Jira outbound API is not fully configured; skipping closure sync on ticket %s", ticket_id)
-        return
+        return {"status": "skipped", "reason": "jira_not_configured", "ticket_id": ticket_id, "transitioned": False}
 
     auth = (email, token)
     headers = {"Content-Type": "application/json"}
 
     # 1. Post resolution comment
     lessons = "\n".join(f"- {lesson}" for lesson in report.lessons_learned) if report.lessons_learned else "- No additional lessons captured."
+    recovery_validated = bool(report.health_restored and report.alerts_cleared)
     comment_body = (
         "[kaiops-managed-closure]\n"
-        "h2. Incident Resolved & Closed\n"
-        "This incident has been automated resolved by KaiOps workflow.\n\n"
+        f"h2. {'Incident Resolved & Closed' if recovery_validated else 'Remediation Completed — Validation Pending'}\n"
+        f"{'KaiOps validated recovery and completed the incident workflow.' if recovery_validated else 'KaiOps completed remediation, but recovery validation did not pass. This ticket remains open for operator investigation.'}\n\n"
         "h3. Resolution Report\n"
         f"* *Root Cause*: {report.root_cause}\n"
         f"* *Impact*: {report.impact}\n"
@@ -180,6 +181,13 @@ async def _sync_closure_to_jira(incident_payload: dict[str, Any], report: Resolu
             else:
                 logger.info("Successfully posted resolution comment to Jira ticket %s", ticket_id)
 
+            # Execution success alone is not incident resolution. Jira must
+            # remain open until closure validation proves both restored health
+            # and cleared alerts.
+            if not recovery_validated:
+                logger.warning("Jira ticket %s remains open because recovery validation did not pass", ticket_id)
+                return {"status": "validation_pending", "reason": "recovery_not_validated", "ticket_id": ticket_id, "transitioned": False, "commented": comment_resp.status_code < 400}
+
             # 2. Transition Jira ticket to Resolved / Done
             trans_resp = await client.get(
                 f"{base_url}/rest/api/2/issue/{ticket_id}/transitions",
@@ -187,13 +195,16 @@ async def _sync_closure_to_jira(incident_payload: dict[str, Any], report: Resolu
             )
             if trans_resp.status_code >= 400:
                 logger.error("Failed to fetch transitions for Jira ticket %s (%s): %s", ticket_id, trans_resp.status_code, trans_resp.text)
-                return
+                return {"status": "failed", "reason": "transition_lookup_failed", "ticket_id": ticket_id, "transitioned": False, "http_status": trans_resp.status_code}
 
             transitions = trans_resp.json().get("transitions", [])
             transition_id = None
             for t in transitions:
                 name = str(t.get("name") or "").strip().lower()
-                if name in {"done", "resolved", "closed", "resolve", "close", "resolve issue", "close issue"}:
+                destination = t.get("to") if isinstance(t.get("to"), dict) else {}
+                status_category = destination.get("statusCategory") if isinstance(destination.get("statusCategory"), dict) else {}
+                destination_category = str(status_category.get("key") or status_category.get("name") or "").strip().lower()
+                if name in {"done", "resolved", "closed", "resolve", "close", "resolve issue", "close issue"} or destination_category in {"done", "complete", "completed"}:
                     transition_id = t.get("id")
                     break
 
@@ -205,13 +216,17 @@ async def _sync_closure_to_jira(incident_payload: dict[str, Any], report: Resolu
                 )
                 if transition_resp.status_code >= 400:
                     logger.error("Failed to transition Jira ticket %s to resolved state (%s): %s", ticket_id, transition_resp.status_code, transition_resp.text)
+                    return {"status": "failed", "reason": "transition_failed", "ticket_id": ticket_id, "transitioned": False, "http_status": transition_resp.status_code}
                 else:
                     logger.info("Successfully transitioned Jira ticket %s to resolved state using transition id %s", ticket_id, transition_id)
+                    return {"status": "resolved", "ticket_id": ticket_id, "transitioned": True, "transition_id": str(transition_id), "commented": comment_resp.status_code < 400}
             else:
                 logger.warning("No matching transition found for closing Jira ticket %s (available: %s)", ticket_id, [t.get("name") for t in transitions])
+                return {"status": "failed", "reason": "no_resolved_transition", "ticket_id": ticket_id, "transitioned": False}
 
     except Exception as exc:
         logger.exception("Error updating Jira closure for ticket %s: %s", ticket_id, exc)
+        return {"status": "failed", "reason": "jira_request_error", "ticket_id": ticket_id, "transitioned": False, "error": str(exc)}
 
 
 async def _persist_closure_event(
@@ -291,7 +306,10 @@ async def _persist_closure_event(
         )
         await session.commit()
         try:
-            await _sync_closure_to_jira(incident_payload, report)
+            jira_result = await _sync_closure_to_jira(incident_payload, report)
+            if jira_result.get("transitioned") and report.ticket_id:
+                await repo.close_jira_ticket_link(report.ticket_id)
+                await session.commit()
         except Exception:
             logger.exception("Failed to synchronize closure event to Jira ticket")
 

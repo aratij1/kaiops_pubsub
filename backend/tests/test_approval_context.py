@@ -88,7 +88,9 @@ async def test_approval_submission_updates_ticket_projection_status(monkeypatch:
 
     await module.approve(request)
 
-    assert ("update_status", "remediating") in calls
+    # Approval and execution are separate durable stages. The approval service
+    # must not claim remediation has started before remediation-engine accepts it.
+    assert ("update_status", "approved") in calls
     assert ("save_event", "remediating") in calls
 
 
@@ -152,4 +154,4 @@ async def test_approval_submission_resolves_missing_recommendation_id(monkeypatc
     assert str(approval.recommendation_id) == recommendation_id
     assert ("get_recommendation", incident_id) in calls
     assert ("save_approval", recommendation_id) in calls
-    assert ("update_status", "remediating") in calls
+    assert ("update_status", "approved") in calls

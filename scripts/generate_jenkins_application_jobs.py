@@ -29,7 +29,11 @@ def generate(applications: list[dict[str, Any]], catalog: dict[str, Any]) -> dic
         payload = row.get("payload") if isinstance(row.get("payload"), dict) else row
         technology = str(payload.get("technology") or "").lower()
         resolution_ids = list(dict.fromkeys([*profiles.get(technology, []), *defaults]))
-        resolutions = {key: definitions[key] for key in resolution_ids if key in definitions}
+        resolutions = {
+            key: definitions[key]
+            for key in resolution_ids
+            if key in definitions and definitions[key].get("enabled", True) is not False
+        }
         name = str(payload.get("name") or row.get("name") or "application")
         jobs.append({
             "job_name": f"kaiops/remediation/{_slug(name)}",
@@ -43,7 +47,12 @@ def generate(applications: list[dict[str, Any]], catalog: dict[str, Any]) -> dic
             "resolution_ids": list(resolutions),
             "resolutions": resolutions,
         })
-    return {"catalog_version": catalog.get("version", 1), "jobs": jobs}
+    return {
+        "catalog_version": catalog.get("version", 1),
+        "contract": catalog.get("contract", "kaiops.remediation.v1"),
+        "policy": catalog.get("policy", {}),
+        "jobs": jobs,
+    }
 
 
 def main() -> None:
