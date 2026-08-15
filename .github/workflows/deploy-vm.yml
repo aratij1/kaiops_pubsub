@@ -25,30 +25,40 @@ jobs:
           key: ${{ secrets.VM_SSH_KEY }}
           port: ${{ secrets.VM_PORT || '22' }}
           script_stop: true
+          envs: DEPLOY_BRANCH,DEPLOY_COMMIT
           script: |
             set -e
 
             APP_DIR="${{ secrets.VM_APP_DIR }}"
-            BRANCH="${{ secrets.VM_BRANCH }}"
 
             if [ -z "$APP_DIR" ]; then
               echo "VM_APP_DIR secret is required"
               exit 1
             fi
 
-            if [ -z "$BRANCH" ]; then
-              BRANCH="main"
+            if [ -z "$DEPLOY_BRANCH" ] || [ -z "$DEPLOY_COMMIT" ]; then
+              echo "Deployment branch and commit are required"
+              exit 1
             fi
 
             cd "$APP_DIR"
 
             git fetch origin
-            git checkout "$BRANCH"
-            git pull --ff-only origin "$BRANCH"
+            git checkout "$DEPLOY_BRANCH"
+            git pull --ff-only origin "$DEPLOY_BRANCH"
+
+            ACTUAL_COMMIT="$(git rev-parse HEAD)"
+            if [ "$ACTUAL_COMMIT" != "$DEPLOY_COMMIT" ]; then
+              echo "Revision mismatch: expected $DEPLOY_COMMIT, checked out $ACTUAL_COMMIT"
+              exit 1
+            fi
 
             docker compose up -d --build --remove-orphans
             docker image prune -f
 
             # Basic post-deploy health probe
             curl -fsS http://localhost:8010/healthz >/dev/null
-            echo "Deployment successful"
+            echo "Deployment successful: $DEPLOY_BRANCH@$DEPLOY_COMMIT"
+        env:
+          DEPLOY_BRANCH: ${{ github.ref_name }}
+          DEPLOY_COMMIT: ${{ github.sha }}
