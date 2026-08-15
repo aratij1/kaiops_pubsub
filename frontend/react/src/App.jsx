@@ -180,6 +180,36 @@ import {
   buildWorkflowFlowStages,
 } from "./appHelpers.jsx";
 
+function readableImpactText(value, fallback) {
+  if (value == null || value === "") return fallback;
+  if (Array.isArray(value)) {
+    const items = value.map((item) => readableImpactText(item, "")).filter(Boolean);
+    return items.length ? Array.from(new Set(items)).join("; ") : fallback;
+  }
+  if (typeof value === "object") {
+    const rows = Object.entries(value)
+      .map(([key, detail]) => {
+        const text = readableImpactText(detail, "");
+        return text ? `${key.replaceAll("_", " ")}: ${text}` : "";
+      })
+      .filter(Boolean);
+    return rows.length ? rows.join("; ") : fallback;
+  }
+  const raw = String(value).trim();
+  const parsed = parseStructuredIntelligence(raw);
+  if (parsed) {
+    return readableImpactText(
+      parsed.impact_summary || parsed.observed_impact || parsed.service_impact
+        || parsed.customer_impact || parsed.business_impact || parsed.severity_rationale,
+      fallback,
+    );
+  }
+  // Never expose malformed model JSON as operator-facing prose. The detailed
+  // technical view retains the source payload for diagnostics.
+  if (/^[\[{]/.test(raw) || /[}\]]$/.test(raw)) return fallback;
+  return cleanRecommendationText(raw, fallback);
+}
+
 const NAVIGATION_ICONS = {
   dashboard: Database,
   alerts: RadioTower,
@@ -5868,9 +5898,17 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       impactedServices,
       causalDetails,
       impactEvidence: evidenceUsed,
-      customerImpact: cleanRecommendationText(impact.customer_impact || impact.impact_summary || analysis.impact, "Customer and business impact are not established by the collected evidence."),
-      serviceImpact: cleanRecommendationText(impact.observed_impact || impact.service_impact || analysis.impact, "Observed service impact is not yet quantified."),
-      dependencyImpact: cleanRecommendationText(impact.dependency_impact, "Dependency impact was not established by the collected evidence."),
+      customerImpact: readableImpactText(
+        impact.customer_impact || impact.user_impact || impact.business_impact,
+        "No confirmed customer or business impact was found in the collected evidence.",
+      ),
+      serviceImpact: readableImpactText(
+        impact.observed_impact || impact.service_impact || impact.impact_summary || analysis.impact,
+        impactedServices.length
+          ? `Observed operational signals affect ${impactedServices.join(", ")}; customer impact remains unconfirmed.`
+          : "Observed service impact is not yet quantified.",
+      ),
+      dependencyImpact: readableImpactText(impact.dependency_impact, "Dependency impact was not established by the collected evidence."),
       urgency: cleanRecommendationText(impact.severity_rationale || impact.urgency, selectedAlertRow?.severity ? `${selectedAlertRow.severity} alert priority; business urgency requires operator validation.` : "Operational urgency was not established."),
     };
   }, [selectedAlertWorkflow, selectedAlertRow, selectedAlertEvaluation, selectedAiTrust.missing.length]);
