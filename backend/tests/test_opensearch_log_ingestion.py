@@ -91,4 +91,47 @@ async def test_opensearch_fetch_prioritizes_latest_errors(monkeypatch: pytest.Mo
         batch_size=100,
     )
 
+
+def test_kaiops_control_plane_error_is_not_turned_into_customer_alert() -> None:
+    payload = log_line_to_alert_payload(
+        {
+            "service": "alert-intelligence",
+            "project_name": "KaiOps",
+            "source_path": "docker://kaiops-alert-intelligence/container-log-id",
+            "line": '{"level":"ERROR","service":"common.rabbitmq","message":"failed to process rabbitmq message"}',
+        },
+        default_service="log-ingestion",
+    )
+
+    assert payload is None
+
+
+def test_python_json_warning_is_not_promoted_to_log_ingestion_error() -> None:
+    payload = log_line_to_alert_payload(
+        {
+            "service": "model-router",
+            "project_name": "KaiOps",
+            "source_path": "opensearch://otel/doc-warning",
+            "line": '{"levelname":"WARNING","name":"model_router.router","message":"model_routing_policy_ignored","error_type":"FileNotFoundError","service":null}',
+        },
+        default_service="log-ingestion",
+    )
+
+    assert payload is None
+
+
+def test_structured_error_uses_container_service_when_json_service_is_null() -> None:
+    payload = log_line_to_alert_payload(
+        {
+            "service": "checkout",
+            "project_name": "Telemetry",
+            "source_path": "opensearch://otel/doc-error",
+            "line": '{"levelname":"ERROR","message":"checkout failed","service":null}',
+        },
+        default_service="log-ingestion",
+    )
+
+    assert payload is not None
+    assert payload["service"] == "checkout"
+
     assert captured_body["sort"] == [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}]

@@ -621,6 +621,7 @@ class RemediationEngine(BaseAgent):
             and not str(item).strip().lower().endswith((".ps1", ".sh"))
         ]
         execution_plan = {
+            "schema_version": "kaiops.remediation.v2",
             "commands": [
                 str(item).strip()
                 for item in (
@@ -652,6 +653,21 @@ class RemediationEngine(BaseAgent):
                     else [approval.metadata.get("rollback_plan")]
                 )
                 if str(item or "").strip()
+            ],
+            "preflight": [
+                str(item).strip()
+                for item in generated_execution_plan.get("preflight", [])
+                if str(item).strip()
+            ],
+            "validation_commands": [
+                str(item).strip()
+                for item in generated_execution_plan.get("validation_commands", [])
+                if str(item).strip()
+            ],
+            "rollback_commands": [
+                str(item).strip()
+                for item in generated_execution_plan.get("rollback_commands", [])
+                if str(item).strip()
             ],
         }
         supplied_profile = connection_profile
@@ -730,7 +746,7 @@ class RemediationEngine(BaseAgent):
         namespace: str,
         recommended_action: str,
         recommended_commands: list[str],
-    ) -> dict[str, list[str]]:
+    ) -> dict[str, Any]:
         namespace = namespace or "default"
         resolved_target = target or service or "unknown-target"
         execution_platform = os.getenv("REMEDIATION_EXECUTION_PLATFORM", "kubernetes").strip().lower()
@@ -742,12 +758,16 @@ class RemediationEngine(BaseAgent):
             )
             container = f"{compose_project}-{safe_service}-1"
             return {
+                "schema_version": "kaiops.remediation.v2",
                 "commands": [
                     f"curl --fail --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 -X POST http://docker-socket-proxy:2375/containers/{container}/restart?t=30",
                     f"curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 2 http://{safe_service}:8000/healthz",
                 ],
                 "scripts": [],
                 "queries": [f"http://{safe_service}:8000/healthz"],
+                "preflight": [f"curl --fail --silent --show-error http://docker-socket-proxy:2375/containers/{container}/json"],
+                "validation_commands": [f"curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 2 http://{safe_service}:8000/healthz"],
+                "rollback_commands": [f"curl --fail --silent --show-error http://docker-socket-proxy:2375/containers/{container}/json"],
             }
 
         if action_type == "restart_pod":
@@ -844,9 +864,21 @@ class RemediationEngine(BaseAgent):
                 ] or scripts
 
         return {
+            "schema_version": "kaiops.remediation.v2",
             "commands": commands,
             "scripts": scripts,
             "queries": queries,
+            "preflight": [
+                f"kubectl get deployment {resolved_target} -n {namespace}",
+                f"kubectl describe deployment {resolved_target} -n {namespace}",
+            ],
+            "validation_commands": [
+                f"kubectl rollout status deployment/{resolved_target} -n {namespace} --timeout=180s",
+            ],
+            "rollback_commands": [
+                f"kubectl rollout undo deployment/{resolved_target} -n {namespace}",
+                f"kubectl rollout status deployment/{resolved_target} -n {namespace} --timeout=180s",
+            ],
         }
 
     async def execute(self, action: RemediationAction) -> RemediationAction:

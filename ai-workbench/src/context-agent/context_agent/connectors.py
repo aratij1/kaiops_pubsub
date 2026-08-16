@@ -7,6 +7,7 @@ import json
 import os
 import re
 import threading
+from time import monotonic
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypedDict
@@ -1520,6 +1521,8 @@ class ContextGraphState(TypedDict, total=False):
     connector_results: dict[str, dict[str, Any]]
     context: Context
     graph_stages: list[str]
+    connector_health: dict[str, dict[str, Any]]
+    collection_latency_ms: float
 
 
 @dataclass
@@ -1613,22 +1616,80 @@ class ContextIntelligenceAgent(BaseAgent):
     async def collect_connector_evidence(self, state: ContextGraphState) -> ContextGraphState:
         alert = state["alert"]
         incident = state["incident"]
-        results = await asyncio.gather(
-            *[
-                retry_async(lambda connector=connector: self._run_connector(connector, alert, incident))
-                for connector in self.connectors
-            ]
-        )
-        state["connector_results"] = {
-            connector.name: result for connector, result in zip(self.connectors, results, strict=True)
+        budget_seconds = max(5.0, min(float(os.getenv("CONTEXT_COLLECTION_BUDGET_SECONDS", "60")), 180.0))
+        started = monotonic()
+
+        async def collect_one(connector: BaseConnector) -> tuple[dict[str, Any], dict[str, Any]]:
+            connector_started = monotonic()
+            # Expensive discovery/vector operations already have internal retries and
+            # long tool deadlines. Retrying them here amplifies incident latency.
+            attempts = 1 if connector.name in {"vector-db", "discovery-mcp", "local-evidence"} else 2
+            try:
+                result = await retry_async(
+                    lambda: self._run_connector(connector, alert, incident),
+                    attempts=attempts,
+                    base_delay=0.15,
+                )
+                return result, {
+                    "status": "collected",
+                    "latency_ms": round((monotonic() - connector_started) * 1000, 2),
+                    "attempts": attempts,
+                }
+            except Exception as exc:  # A connector failure must not erase healthy evidence.
+                return {}, {
+                    "status": "failed",
+                    "latency_ms": round((monotonic() - connector_started) * 1000, 2),
+                    "attempts": attempts,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:300],
+                }
+
+        tasks = {
+            connector.name: asyncio.create_task(collect_one(connector), name=f"context:{connector.name}")
+            for connector in self.connectors
         }
+        done, pending = await asyncio.wait(tasks.values(), timeout=budget_seconds)
+        results: dict[str, dict[str, Any]] = {}
+        health: dict[str, dict[str, Any]] = {}
+        task_names = {task: name for name, task in tasks.items()}
+        for task in done:
+            name = task_names[task]
+            result, status = task.result()
+            results[name] = result
+            health[name] = status
+        for task in pending:
+            name = task_names[task]
+            task.cancel()
+            results[name] = {}
+            health[name] = {
+                "status": "timed_out",
+                "latency_ms": round(budget_seconds * 1000, 2),
+                "attempts": 1,
+                "error": f"context collection exceeded the {budget_seconds:g}s budget",
+            }
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        state["connector_results"] = results
+        state["connector_health"] = health
+        state["collection_latency_ms"] = round((monotonic() - started) * 1000, 2)
         state["graph_stages"] = [*state.get("graph_stages", []), "collect_connector_evidence"]
         return state
 
     async def assemble_context(self, state: ContextGraphState) -> ContextGraphState:
         alert = state["alert"]
         incident = state["incident"]
-        by_name = state["connector_results"]
+        by_name = {
+            "vector-db": {"matches": [], "document_count": 0, "knowledge_graph": {}},
+            "jenkins": {"recent_deployments": []},
+            "cmdb": {"dependencies": []},
+            "servicenow": {"change_records": []},
+            "github": {"recent_commits": []},
+            "kubernetes": {},
+            "prometheus": {},
+            "local-evidence": {},
+            "discovery-mcp": {},
+            **state["connector_results"],
+        }
         vector_matches = by_name["vector-db"]["matches"]
         vector_connector = next((c for c in self.connectors if isinstance(c, VectorDBConnector)), None)
         service_tagged_match = bool(vector_connector and vector_connector.has_service_tagged_match(alert))
@@ -1660,8 +1721,9 @@ class ContextIntelligenceAgent(BaseAgent):
         deployment_doc = next((doc for doc in vector_matches if doc["kind"] == "deployment" and explicitly_matches_service(doc)), {})
         dependency_docs = [doc for doc in vector_matches if doc["kind"] == "dependency" and explicitly_matches_service(doc)]
         change_docs = [doc for doc in vector_matches if doc["kind"] == "change" and explicitly_matches_service(doc)]
+        recent_deployments = by_name["jenkins"].get("recent_deployments") or [{}]
         deployment = (
-            by_name["jenkins"].get("recent_deployments", [{}])[0].get("version")
+            recent_deployments[0].get("version")
             or alert.labels.get("deployment")
             or deployment_doc.get("deployment")
         )
@@ -1820,6 +1882,16 @@ class ContextIntelligenceAgent(BaseAgent):
                     "enabled": True,
                     "stages": [*state.get("graph_stages", []), "assemble_context"],
                     "connector_count": len(self.connectors),
+                    "collection_latency_ms": state.get("collection_latency_ms", 0.0),
+                    "connectors": state.get("connector_health", {}),
+                    "collected_count": sum(
+                        1 for item in state.get("connector_health", {}).values()
+                        if item.get("status") == "collected"
+                    ),
+                    "degraded": any(
+                        item.get("status") != "collected"
+                        for item in state.get("connector_health", {}).values()
+                    ),
                 },
                 "knowledge_graph": knowledge_graph,
             },

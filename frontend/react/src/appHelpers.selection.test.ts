@@ -1,5 +1,29 @@
 import { describe, expect, it } from "vitest";
-import { shouldRetainAlertSelection, resolveCanonicalAlertForRow } from "./appHelpers.jsx";
+import { capLatestAlertsPerSource, shouldRetainAlertSelection, resolveCanonicalAlertForRow } from "./appHelpers.jsx";
+
+describe("capLatestAlertsPerSource", () => {
+  it("keeps the newest alert type for mysql-exporter during a noisy Prometheus burst", () => {
+    const burst = Array.from({ length: 40 }, (_, index) => ({
+      id: `api-${index}`,
+      source: "prometheus",
+      service: "api-gateway",
+      name: "GatewayRequestFailed",
+      created_at: new Date(Date.UTC(2026, 7, 14, 12, 0, index)).toISOString(),
+    }));
+    const mysqlExporter = {
+      id: "mysql-exporter-alert",
+      source: "prometheus",
+      service: "mysql-exporter",
+      name: "MySQLExporterDown",
+      created_at: "2026-08-14T11:00:00.000Z",
+    };
+
+    const result = capLatestAlertsPerSource([...burst, mysqlExporter], 30);
+
+    expect(result).toHaveLength(30);
+    expect(result.some((row) => row.id === "mysql-exporter-alert")).toBe(true);
+  });
+});
 
 describe("shouldRetainAlertSelection", () => {
   it("retains the selection when a matching, error-free payload is already loaded", () => {

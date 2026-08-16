@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from contextlib import suppress
+import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,7 @@ from urllib.parse import quote, unquote, urlencode, urlparse
 from uuid import uuid4
 
 import httpx
+import aio_pika
 import pymysql
 from redis.asyncio import Redis
 from api_gateway import SafetyAnalyzer
@@ -40,7 +42,7 @@ from common.telemetry import REQUEST_LATENCY
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from opentelemetry import trace
-from prometheus_client import Counter, Gauge
+from prometheus_client import REGISTRY, Counter, Gauge
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 
@@ -325,19 +327,28 @@ async def enforce_operational_auth(request: Request, call_next):
     request.state.auth = auth
     return await call_next(request)
 
-GATEWAY_REQUESTS = Counter(
+def _registered_metric(metric_type, name: str, documentation: str, labelnames: list[str] | None = None):
+    """Return an existing process metric when test/module reloads import this app again."""
+    lookup_name = name.removesuffix("_total") if metric_type is Counter else name
+    existing = REGISTRY._names_to_collectors.get(lookup_name)
+    if existing is not None:
+        return existing
+    return metric_type(name, documentation, labelnames or [])
+
+
+GATEWAY_REQUESTS = _registered_metric(Counter,
     "kaiops_gateway_requests_total",
     "API gateway requests by path and safety decision",
     ["path", "decision", "status"],
 )
-GATEWAY_SAFETY_BLOCKS = Counter(
+GATEWAY_SAFETY_BLOCKS = _registered_metric(Counter,
     "kaiops_gateway_safety_blocks_total",
     "API gateway blocked requests by category",
     ["category"],
 )
-SSE_CONNECTIONS = Gauge("kaiops_sse_connections", "Active authenticated operational SSE connections", ["role"])
-SSE_EVENTS = Counter("kaiops_sse_events_total", "Operational SSE events emitted", ["event_type"])
-ALERTS_TABLE_ROWS = Gauge(
+SSE_CONNECTIONS = _registered_metric(Gauge, "kaiops_sse_connections", "Active authenticated operational SSE connections", ["role"])
+SSE_EVENTS = _registered_metric(Counter, "kaiops_sse_events_total", "Operational SSE events emitted", ["event_type"])
+ALERTS_TABLE_ROWS = _registered_metric(Gauge,
     "kaiops_mysql_alerts_table_rows",
     "Current number of records in MySQL alerts table",
     ["database", "table"],
@@ -2044,6 +2055,62 @@ def _rabbit_management() -> tuple[str, tuple[str, str]]:
     return f"{scheme}://{broker_url.hostname}:15672/api", (unquote(broker_url.username or "guest"), unquote(broker_url.password or "guest"))
 
 
+def _queue_job_id(queue_name: str, body: bytes) -> str:
+    """Return a stable, opaque identity without exposing queued payload data."""
+    digest = hashlib.sha256(queue_name.encode("utf-8") + b"\0" + body).hexdigest()
+    return f"job-{digest[:24]}"
+
+
+async def _mutate_ready_queue_job(*, queue_name: str, job_id: str, rerun: bool, scan_limit: int = 100) -> bool:
+    """Acknowledge one exact ready message, optionally republishing it at the queue tail.
+
+    Non-matching messages are rejected with requeue=True. Messages already
+    owned by a consumer are never interrupted or acknowledged here.
+    """
+    connection = await aio_pika.connect_robust(settings.rabbitmq_url, timeout=10)
+    pending: list[aio_pika.IncomingMessage] = []
+    try:
+        channel = await connection.channel()
+        bounded_limit = max(1, min(scan_limit, 100))
+        await channel.set_qos(prefetch_count=bounded_limit)
+        queue = await channel.declare_queue(queue_name, passive=True)
+        for _ in range(bounded_limit):
+            message = await queue.get(fail=False, timeout=2)
+            if message is None:
+                break
+            if _queue_job_id(queue_name, message.body) != job_id:
+                pending.append(message)
+                continue
+            if rerun:
+                replacement = aio_pika.Message(
+                    body=message.body,
+                    headers=dict(message.headers or {}),
+                    content_type=message.content_type,
+                    content_encoding=message.content_encoding,
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                    correlation_id=message.correlation_id,
+                    message_id=message.message_id,
+                    timestamp=message.timestamp,
+                    type=message.type,
+                    app_id=message.app_id,
+                )
+                await channel.default_exchange.publish(replacement, routing_key=queue_name, mandatory=True)
+            await message.ack()
+            for skipped in pending:
+                await skipped.reject(requeue=True)
+            pending.clear()
+            return True
+        for skipped in pending:
+            await skipped.reject(requeue=True)
+        pending.clear()
+        return False
+    finally:
+        for skipped in pending:
+            with suppress(Exception):
+                await skipped.reject(requeue=True)
+        await connection.close()
+
+
 async def _queue_audit(request: Request, action: str, resource_id: str, payload: dict[str, Any]) -> None:
     auth = getattr(request.state, "auth", None)
     session_factory = getattr(request.app.state, "session_factory", None)
@@ -2088,8 +2155,34 @@ async def sample_processing_queue(queue_name: str, request: Request, count: int 
         try: decoded = json.loads(raw) if isinstance(raw, str) else raw
         except json.JSONDecodeError: decoded = {"raw": str(raw)[:500]}
         payload = decoded.get("payload") if isinstance(decoded, dict) and isinstance(decoded.get("payload"), dict) else decoded
-        messages.append({"alert_id": str((payload or {}).get("alert_id") or (payload or {}).get("id") or ""), "incident_id": str((payload or {}).get("incident_id") or ""), "name": str((payload or {}).get("name") or (payload or {}).get("alert_name") or "Queued event"), "service": str((payload or {}).get("service") or "unknown"), "severity": str((payload or {}).get("severity") or "unknown"), "redelivered": bool(item.get("redelivered")), "payload_bytes": int(item.get("payload_bytes") or 0)})
+        raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        messages.append({"job_id": _queue_job_id(queue_name, raw_bytes), "alert_id": str((payload or {}).get("alert_id") or (payload or {}).get("id") or ""), "incident_id": str((payload or {}).get("incident_id") or ""), "name": str((payload or {}).get("name") or (payload or {}).get("alert_name") or "Queued event"), "service": str((payload or {}).get("service") or "unknown"), "severity": str((payload or {}).get("severity") or "unknown"), "redelivered": bool(item.get("redelivered")), "payload_bytes": int(item.get("payload_bytes") or 0)})
     return {"queue": queue_name, "messages": messages, "sampled": len(messages), "note": "Messages were inspected and requeued; no processing state changed."}
+
+
+async def _queue_job_action(queue_name: str, job_id: str, request: Request, payload: dict[str, Any], *, rerun: bool) -> dict[str, Any]:
+    if not queue_name.startswith(f"{settings.rabbitmq_queue_prefix}."):
+        raise HTTPException(status_code=403, detail="Queue is outside the KaiMS namespace")
+    verb = "RERUN" if rerun else "REMOVE"
+    reason = str(payload.get("reason") or "").strip()
+    if not job_id.startswith("job-") or len(reason) < 8 or payload.get("confirmation") != f"{verb} {job_id}":
+        raise HTTPException(status_code=422, detail=f"A meaningful reason and exact {verb} confirmation are required")
+    found = await _mutate_ready_queue_job(queue_name=queue_name, job_id=job_id, rerun=rerun)
+    if not found:
+        raise HTTPException(status_code=409, detail="The selected job is no longer ready in the inspected queue window. Refresh before trying again.")
+    action = "rerun" if rerun else "removed"
+    await _queue_audit(request, f"queue.job.{action}", job_id, {"queue": queue_name, "reason": reason})
+    return {"status": action, "queue": queue_name, "job_id": job_id, "effect": "The job was moved to the queue tail for another attempt." if rerun else "Only the selected ready job was removed."}
+
+
+@app.post("/operations/queues/{queue_name}/jobs/{job_id}/rerun")
+async def rerun_processing_queue_job(queue_name: str, job_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    return await _queue_job_action(queue_name, job_id, request, payload, rerun=True)
+
+
+@app.delete("/operations/queues/{queue_name}/jobs/{job_id}")
+async def remove_processing_queue_job(queue_name: str, job_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY, _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    return await _queue_job_action(queue_name, job_id, request, payload, rerun=False)
 
 
 @app.post("/operations/queues/cancel-alert")

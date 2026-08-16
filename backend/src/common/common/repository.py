@@ -954,6 +954,30 @@ class IncidentRepository:
             incident_record = explicit_result.scalar_one_or_none()
 
         if incident_record is None:
+            # The projection is the authoritative alert-to-incident relation.
+            # Repeated alerts for the same service/Jira may have many incident
+            # records, so a service/severity fallback can hydrate an alert with
+            # a newer, still-investigating incident and hide its persisted RCA.
+            projection_result = await self.session.execute(
+                select(IncidentProjectionRecord)
+                .where(IncidentProjectionRecord.alert_id == alert_uuid)
+                .order_by(
+                    IncidentProjectionRecord.latest_event_at.desc(),
+                    IncidentProjectionRecord.updated_at.desc(),
+                )
+                .limit(1)
+            )
+            projection_record = projection_result.scalar_one_or_none()
+            projection_incident_uuid = self._parse_uuid(
+                getattr(projection_record, "incident_id", None)
+            )
+            if projection_incident_uuid is not None:
+                projection_incident_result = await self.session.execute(
+                    select(IncidentRecord).where(IncidentRecord.id == projection_incident_uuid)
+                )
+                incident_record = projection_incident_result.scalar_one_or_none()
+
+        if incident_record is None:
             incident_rows = await self.session.execute(
                 select(IncidentRecord).order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc()).limit(300)
             )
@@ -1666,10 +1690,28 @@ class IncidentRepository:
                 if persisted:
                     evidence_sources.append("relational:approvals")
             elif row["stage"] == "remediation_executed" and not persisted:
-                terminal_actions = [action for action in action_rows if str(action.status or "").strip().lower() in {"succeeded", "failed", "skipped"}]
+                policy_blocked_actions = [
+                    action
+                    for action in action_rows
+                    if str(action.action_type or "").strip().lower() == "policy-blocked"
+                    or bool(((action.payload or {}).get("metadata") or {}).get("policy_blocked"))
+                ]
+                terminal_actions = [
+                    action
+                    for action in action_rows
+                    if action not in policy_blocked_actions
+                    and str(action.status or "").strip().lower() in {"succeeded", "failed", "skipped"}
+                ]
                 persisted = bool(terminal_actions)
                 if persisted:
                     evidence_sources.extend(f"relational:actions/{str(action.status or '').strip().lower()}" for action in terminal_actions)
+                elif policy_blocked_actions:
+                    state = "blocked"
+                    evidence_sources.append("relational:actions/policy-blocked")
+                    row = {
+                        **row,
+                        "next_action": "Review the policy reason, select a matching runbook, and record operator approval before execution.",
+                    }
                 elif action_rows or "remediating" in event_statuses:
                     state = "in_progress"
                     evidence_sources.append("relational:actions/in-progress")

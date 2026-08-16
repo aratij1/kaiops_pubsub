@@ -1,0 +1,25 @@
+.rca-reuse-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid #8fcdb7;
+  border-radius: 6px;
+  background: #effaf6;
+  color: #115e49;
+}
+
+.rca-reuse-banner > div {
+  display: grid;
+  gap: 2px;
+}
+
+.rca-reuse-banner span {
+  font-size: .78rem;
+  line-height: 1.45;
+}
+
+.rca-reuse-banner svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}

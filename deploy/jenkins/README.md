@@ -40,13 +40,26 @@ Create a Jenkins Pipeline job for each `jobs[]` entry using its `job_name` and
 same job name, Jenkins endpoint, secret-manager credential reference, and
 allowed operation IDs.
 
-The resolution agent supplies the selected catalog resolution and execution
-plan. Jenkins then:
+The resolution agent supplies a `kaiops.remediation.v2` plan. Jenkins then:
 
 1. validates the incident, target, resolution, command allowlist, and approval;
-2. runs in dry-run mode by default;
-3. executes only the approved commands when dry-run is disabled;
-4. archives application, validation, and rollback evidence for closure.
+2. prevents concurrent and stale builds from mutating the same application;
+3. captures preflight evidence and runs in dry-run mode by default;
+4. executes only allowlisted commands from a persisted approval;
+5. retries recovery validation three times within a global time budget;
+6. automatically runs the executable rollback contract when validation fails;
+7. fingerprints immutable request/result JSON artifacts for closure and audit.
+
+The job uses maximum Pipeline durability because it changes production state.
+Do not replace executable validation or rollback commands with prose. A live
+mutating request without all three phases is rejected before the first change.
+
+Validate the catalog and pipeline safety contract before publishing jobs:
+
+```bash
+python scripts/validate_jenkins_remediation.py
+pytest -q backend/tests/test_jenkins_self_healing_contract.py backend/tests/test_jenkins_application_jobs.py
+```
 
 Jenkins credentials must be injected into remediation-engine as
 `JENKINS_USERNAME` and `JENKINS_API_TOKEN`. Store only the credential reference

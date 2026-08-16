@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Activity, BookOpen, CheckCircle2, Clock3, Code2, Database, FileSearch, GitCommit, Network, Search, ShieldAlert, Sparkles } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Activity, BookOpen, CheckCircle2, Clock3, Code2, Database, FileSearch, GitCommit, Network, RotateCw, Search, ShieldAlert, Sparkles } from "lucide-react";
 import {
   canonicalIncidentAnalysis,
   formatQualityPercent,
@@ -16,9 +16,19 @@ import {
 } from "../../appHelpers.jsx";
 import EvidenceDraftReview from "./EvidenceDraftReview";
 import "./RcaPanel.css";
+import "./RcaReuseBanner.css";
 import "./EvidenceReview.css";
 
 type RcaDetailView = "simple" | "detailed" | "evidence" | "technical";
+
+const EVIDENCE_SOURCE_DEFINITIONS = [
+  { id: "metrics", label: "Metrics", icon: Activity, match: /prometheus|metric/i },
+  { id: "logs", label: "Logs", icon: FileSearch, match: /log|opensearch|elastic/i },
+  { id: "traces", label: "Traces", icon: Network, match: /trace|jaeger|span/i },
+  { id: "changes", label: "Changes", icon: GitCommit, match: /deploy|change|commit|git/i },
+  { id: "code", label: "Source code", icon: Code2, match: /code|source/i },
+  { id: "knowledge", label: "Knowledge", icon: BookOpen, match: /rag|runbook|ticket|jira|document/i },
+] as const;
 
 interface RcaPanelProps {
   rcaDetailView: RcaDetailView;
@@ -36,6 +46,9 @@ interface RcaPanelProps {
   selectedAlertDocumentContract: any;
   selectedAlertId: string | null | undefined;
   aiFeedbackState: any;
+  rcaAnalysisMode: "smart" | "fresh" | "cache";
+  onSetRcaAnalysisMode: (mode: "smart" | "fresh" | "cache") => void;
+  onRerunRca: () => any;
   onDownloadRagDocument: (...args: any[]) => any;
   onLoadRagDocumentContent: (...args: any[]) => any;
   onSubmitAiRecommendationFeedback: (decision: string) => any;
@@ -57,6 +70,9 @@ export default function RcaPanel({
   selectedAlertDocumentContract,
   selectedAlertId,
   aiFeedbackState,
+  rcaAnalysisMode,
+  onSetRcaAnalysisMode,
+  onRerunRca,
   onDownloadRagDocument,
   onLoadRagDocumentContent,
   onSubmitAiRecommendationFeedback,
@@ -65,6 +81,8 @@ export default function RcaPanel({
   const [selectedResolution, setSelectedResolution] = useState<any>(null);
   const [resolutionStatus, setResolutionStatus] = useState("");
   const recommendationMetadata = selectedAlertWorkflow?.recommendation?.metadata || {};
+  const analysisReused = Boolean(recommendationMetadata.analysis_reused);
+  const analysisReuseScore = Number(recommendationMetadata.analysis_reuse_score || 0);
   const discoveryAnalysis = recommendationMetadata?.discovery_report?.report
     || selectedAlertWorkflow?.context?.metadata?.discovery_report?.report
     || {};
@@ -74,17 +92,15 @@ export default function RcaPanel({
       ? discoveryAnalysis.proposed_code_changes
       : [];
   const resolutionService = selectedAlertRow?.service || selectedAlertRow?.application || "unknown";
-  const evidenceSources = [
-    { id: "metrics", label: "Metrics", icon: Activity, match: /prometheus|metric/i },
-    { id: "logs", label: "Logs", icon: FileSearch, match: /log|opensearch|elastic/i },
-    { id: "traces", label: "Traces", icon: Network, match: /trace|jaeger|span/i },
-    { id: "changes", label: "Changes", icon: GitCommit, match: /deploy|change|commit|git/i },
-    { id: "code", label: "Source code", icon: Code2, match: /code|source/i },
-    { id: "knowledge", label: "Knowledge", icon: BookOpen, match: /rag|runbook|ticket|jira|document/i },
-  ].map((source) => {
-    const matches = selectedAiTrust.evidence.filter((row: any) => source.match.test(`${row.source || ""} ${row.citation || ""}`));
-    return { ...source, count: matches.length, fresh: matches.filter((row: any) => !row.cached).length };
-  });
+  const evidenceSources = useMemo(() => EVIDENCE_SOURCE_DEFINITIONS.map((source) => {
+    let count = 0; let fresh = 0;
+    for (const row of selectedAiTrust.evidence || []) {
+      if (!source.match.test(`${row.source || ""} ${row.citation || ""}`)) continue;
+      count += 1;
+      if (!row.cached) fresh += 1;
+    }
+    return { ...source, count, fresh };
+  }), [selectedAiTrust.evidence]);
   useEffect(() => {
     let active = true;
     setSelectedResolution(null);
@@ -122,13 +138,28 @@ export default function RcaPanel({
           <h3>Understand Workspace</h3>
           <p>Evidence, causal analysis, impact, and the safest next action in one operational view.</p>
         </div>
-        <div className="combined-analysis-kpis">
-          <span><strong>{selectedAlertTimelineRows.length}</strong> timeline stages</span>
-          <span><strong>{selectedAlertRagDocuments.length}</strong> linked docs</span>
-          <span><strong>{formatQualityPercent(selectedAlertEvaluation.overallScore)}</strong> quality</span>
-          <span><strong>{Array.isArray(selectedAlertRow?.source_channels) ? selectedAlertRow.source_channels.map(sourceChannelLabel).join(" + ") : sourceChannelLabel(normalizeAlertChannel(selectedAlertRow))}</strong> sources</span>
+        <div className="rca-hero-controls">
+          <div className="combined-analysis-kpis">
+            <span><strong>{selectedAlertTimelineRows.length}</strong> timeline stages</span>
+            <span><strong>{selectedAlertRagDocuments.length}</strong> linked docs</span>
+            <span><strong>{formatQualityPercent(selectedAlertEvaluation.overallScore)}</strong> quality</span>
+            <span><strong>{Array.isArray(selectedAlertRow?.source_channels) ? selectedAlertRow.source_channels.map(sourceChannelLabel).join(" + ") : sourceChannelLabel(normalizeAlertChannel(selectedAlertRow))}</strong> sources</span>
+          </div>
+          <div className="rca-rerun-control">
+            <label htmlFor="rca-analysis-mode">Analysis mode</label>
+            <select id="rca-analysis-mode" value={rcaAnalysisMode} onChange={(event) => onSetRcaAnalysisMode(event.target.value as "smart" | "fresh" | "cache")} disabled={selectedAlertRegeneration.loading}>
+              <option value="smart">Smart reuse</option><option value="fresh">Fresh context</option><option value="cache">Verified cache only</option>
+            </select>
+            <button type="button" className="button-primary" onClick={onRerunRca} disabled={selectedAlertRegeneration.loading}>
+              <RotateCw size={15} aria-hidden="true" className={selectedAlertRegeneration.loading ? "is-spinning" : ""}/>{selectedAlertRegeneration.loading ? "Running RCA…" : "Rerun RCA"}
+            </button>
+          </div>
         </div>
       </header>
+      {analysisReused ? <aside className="rca-reuse-banner" role="status">
+        <CheckCircle2 size={18} />
+        <div><strong>Using verified prior analysis</strong><span>This context and RCA scored {formatQualityPercent(analysisReuseScore)} and were reused for this matching incident. Use <b>Run Full Analysis With Fresh Context</b> above whenever current evidence may have changed.</span></div>
+      </aside> : null}
       <section className="understand-source-matrix" aria-label="External knowledge and evidence coverage">
         <header><div><Search size={17} /><span><strong>Evidence coverage</strong><small>Live operational data and external knowledge used for this analysis</small></span></div><div className="evidence-coverage-actions"><b>{evidenceSources.filter((source) => source.count).length}/{evidenceSources.length} connected</b>{selectedAiTrust.missing.length ? <button type="button" className="button-primary" onClick={() => onSetRcaDetailView("evidence")}>Collect evidence</button> : null}<button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("evidence")}>Inspect evidence</button></div></header>
         <div>{evidenceSources.map(({ id, label, icon: Icon, count, fresh }) => <button type="button" key={id} className={count ? "has-evidence" : "is-missing"} onClick={() => onSetRcaDetailView(count ? "evidence" : "technical")}><i><Icon size={17} /></i><span><strong>{label}</strong><small>{count ? `${count} record${count === 1 ? "" : "s"} · ${fresh} fresh` : "No evidence returned"}</small></span>{count ? <CheckCircle2 size={15} /> : <ShieldAlert size={15} />}</button>)}</div>

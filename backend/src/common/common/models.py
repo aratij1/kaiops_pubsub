@@ -353,6 +353,14 @@ class Incident(BaseEvent):
     summary: str = ""
     owner_team: str | None = None
     ticket_id: str | None = None
+    # Jira enrichment is added after incident creation and is persisted with
+    # the incident projection. Keep these fields in the shared contract so
+    # downstream agents can validate enriched incidents without discarding
+    # their ticket provenance or failing the workflow.
+    jira_key: str | None = None
+    jira_url: str | None = None
+    jira_link: str | None = None
+    jira_status: str | None = None
     closed_at: datetime | None = None
 
 

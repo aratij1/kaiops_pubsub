@@ -90,6 +90,22 @@ class FakePublisher:
         self.calls.append({"topic": topic, "payload": payload, "key": key})
 
 
+def test_incident_contract_accepts_persisted_jira_enrichment() -> None:
+    incident = Incident.model_validate(
+        {
+            "service": "checkout",
+            "title": "Checkout unavailable",
+            "jira_key": "KAN-1576",
+            "jira_url": "https://example.atlassian.net/browse/KAN-1576",
+            "jira_link": "https://example.atlassian.net/browse/KAN-1576",
+            "jira_status": "In Progress",
+        }
+    )
+
+    assert incident.jira_key == "KAN-1576"
+    assert incident.jira_status == "In Progress"
+
+
 @pytest.mark.asyncio
 async def test_publish_orchestration_event_emits_event_contract() -> None:
     alert = Alert(

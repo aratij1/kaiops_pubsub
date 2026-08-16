@@ -28,6 +28,29 @@ const QueueHealth = z.object({
   unacknowledged: z.number().nonnegative(),
 }).passthrough();
 const EvaluationFeedback = z.object({ updated: z.boolean() }).passthrough();
+const CollectedContext = z.object({
+  incident_id: z.string().uuid(),
+  alert: z.object({
+    id: z.string().uuid().optional(),
+    name: z.string().min(1),
+    service: z.string().min(1),
+  }).passthrough(),
+  related_incidents: z.array(JsonRecord).optional(),
+  runbook: z.string().optional(),
+  dependency_services: z.array(z.string()).optional(),
+  recent_changes: z.array(JsonRecord).optional(),
+}).passthrough();
+const ResolutionRecommendation = z.object({
+  incident_id: z.string().uuid(),
+  root_cause: z.string(),
+  confidence: z.number().min(0).max(1),
+  impact: z.string(),
+  recommended_action: z.string(),
+  severity: z.string().min(1),
+  rationale: z.string(),
+  commands: z.array(z.string()).optional(),
+  risk: z.string().optional(),
+}).passthrough();
 const ObjectResponse = z.object({}).passthrough();
 const ObjectOrList = z.union([ObjectResponse, RecordList]);
 const RowsEnvelope = z.union([
@@ -47,6 +70,8 @@ const contracts: readonly Contract[] = [
   { method: "GET", path: /^\/api-gateway\/healthz$/, schema: Health, name: "health" },
   { method: "GET", path: /^\/api-gateway\/operations\/queue-health$/, schema: QueueHealth, name: "queue-health" },
   { method: "POST", path: /^\/api-gateway\/evaluations\/by-recommendation\/[0-9a-f-]+\/feedback$/i, schema: EvaluationFeedback, name: "evaluation-feedback" },
+  { method: "POST", path: /^\/context-agent\/collect$/, schema: CollectedContext, name: "collected-context" },
+  { method: "POST", path: /^\/resolution-agent\/resolve$/, schema: ResolutionRecommendation, name: "resolution-recommendation" },
   { path: /^\/(?:api-gateway|monitoring-adapter)\/alerts(?:\/|$)/, schema: ObjectOrList, name: "alerts" },
   { path: /^\/api-gateway\/landing-pad(?:\/|$)/, schema: RowsEnvelope, name: "landing-pad" },
   { path: /^\/api-gateway\/incidents(?:\/|$)/, schema: ObjectOrList, name: "incidents" },

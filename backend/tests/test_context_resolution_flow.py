@@ -286,6 +286,18 @@ def test_resolution_agent_extracts_values_from_fenced_json_with_introductory_tex
     assert parsed == "Collector endpoint is unreachable"
 
 
+def test_resolution_agent_rejects_malformed_structured_output_as_display_text() -> None:
+    malformed = '{"observed_impact":{"mysql":{"row count high", "connection refused"}}}'
+
+    parsed = ResolutionIntelligenceAgent._extract_model_text(
+        malformed,
+        keys=("impact_summary", "service_impact", "severity_rationale"),
+        fallback_text="Impact is not established from validated evidence.",
+    )
+
+    assert parsed == "Impact is not established from validated evidence."
+
+
 def test_vector_db_connector_loads_rag_documents() -> None:
     connector = VectorDBConnector()
     connector.reload()
@@ -318,11 +330,12 @@ async def test_context_agent_returns_requested_shape() -> None:
     assert any(match["kind"] == "runbook" for match in context.metadata["rag_matches"])
     assert context.metadata["rag_index"]["vector_store"]["provider"] == "local-hybrid-vector-index"
     assert context.metadata["rag_index"]["embedding_model"]["model"] == "hashing-token-counter-v1"
-    assert context.metadata["context_graph"] == {
-        "enabled": True,
-        "stages": ["validate_event", "collect_connector_evidence", "assemble_context"],
-        "connector_count": 9,
-    }
+    graph = context.metadata["context_graph"]
+    assert graph["enabled"] is True
+    assert graph["stages"] == ["validate_event", "collect_connector_evidence", "assemble_context"]
+    assert graph["connector_count"] == 9
+    assert graph["collected_count"] == 9
+    assert graph["degraded"] is False
 
 
 @pytest.mark.asyncio

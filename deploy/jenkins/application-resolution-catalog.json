@@ -1,5 +1,7 @@
 {
-  "version": 1,
+  "version": 2,
+  "contract": "kaiops.remediation.v2",
+  "policy": {"max_attempts": 3, "timeout_minutes": 20, "automatic_rollback": true, "dry_run_default": true},
   "defaults": ["investigate-first"],
   "technology_profiles": {
     "kubernetes": ["restart-workload", "rollback-deployment", "scale-capacity"],
@@ -13,35 +15,51 @@
     "investigate-first": {
       "risk": "low",
       "approval_required": false,
+      "preflight": ["kubectl get deployment ${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}"],
       "commands": ["kubectl get deployment ${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}"],
+      "validation_commands": ["kubectl get deployment ${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}"],
+      "rollback_commands": [],
       "validation": ["Capture workload health, events, logs, and dependency status"],
       "rollback": ["No rollback required; this resolution is read-only"]
     },
     "restart-workload": {
       "risk": "medium",
       "approval_required": true,
-      "commands": ["kubectl rollout restart deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}", "kubectl rollout status deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE} --timeout=300s"],
+      "preflight": ["kubectl get deployment ${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}", "kubectl describe deployment ${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}"],
+      "commands": ["kubectl rollout restart deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}"],
+      "validation_commands": ["kubectl rollout status deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE} --timeout=300s"],
+      "rollback_commands": ["kubectl rollout undo deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}", "kubectl rollout status deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE} --timeout=300s"],
       "validation": ["Readiness is healthy", "Error rate returns to baseline"],
       "rollback": ["kubectl rollout undo deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}"]
     },
     "rollback-deployment": {
       "risk": "high",
       "approval_required": true,
-      "commands": ["kubectl rollout undo deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}", "kubectl rollout status deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE} --timeout=300s"],
+      "preflight": ["kubectl get deployment ${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}", "kubectl describe deployment ${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}"],
+      "commands": ["kubectl rollout undo deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}"],
+      "validation_commands": ["kubectl rollout status deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE} --timeout=300s"],
+      "rollback_commands": ["kubectl rollout undo deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}", "kubectl rollout status deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE} --timeout=300s"],
       "validation": ["Healthy revision is active", "Latency and errors recover", "Critical transactions succeed"],
       "rollback": ["Redeploy the superseded revision only after corrective validation"]
     },
     "scale-capacity": {
       "risk": "medium",
       "approval_required": true,
+      "preflight": ["kubectl get deployment ${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE}"],
       "commands": ["kubectl scale deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE} --replicas=${KAI_OPS_REPLICAS}"],
+      "validation_commands": ["kubectl rollout status deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE} --timeout=300s"],
+      "rollback_commands": ["kubectl scale deployment/${KAI_OPS_TARGET} -n ${KAI_OPS_NAMESPACE} --replicas=${KAI_OPS_PREVIOUS_REPLICAS}"],
       "validation": ["Desired replicas are ready", "Backlog and saturation decrease"],
       "rollback": ["Restore the previously recorded replica count"]
     },
     "dependency-recovery": {
+      "enabled": false,
       "risk": "high",
       "approval_required": true,
+      "preflight": [],
       "commands": [],
+      "validation_commands": [],
+      "rollback_commands": [],
       "validation": ["Dependency health check passes", "Client retries and errors return to baseline"],
       "rollback": ["Restore the last known-good dependency configuration"]
     }

@@ -94,17 +94,34 @@ groups:
         for: 1m
         labels:
           severity: critical
+          service: mysql-exporter
+          environment: prod
           project_name: KaiOps
           application: KaiOps
         annotations:
           summary: "MySQL exporter is down"
           description: "mysql-exporter is not reachable by Prometheus."
 
+      - alert: MySQLExporterDatabaseConnectionFailed
+        expr: mysql_up{job="mysql-exporter"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: mysql-exporter
+          environment: prod
+          project_name: KaiOps
+          application: KaiOps
+        annotations:
+          summary: "MySQL exporter cannot connect to MySQL"
+          description: "mysql-exporter is reachable, but its MySQL connection check is failing. Verify exporter credentials, grants, and the mysql:3306 endpoint."
+
       - alert: MySQLTooManyConnections
         expr: mysql_global_status_threads_connected > 150
         for: 5m
         labels:
           severity: warning
+          service: mysql-exporter
+          environment: prod
           project_name: KaiOps
           application: KaiOps
         annotations:

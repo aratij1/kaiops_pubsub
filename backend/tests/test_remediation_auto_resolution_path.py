@@ -188,6 +188,38 @@ def test_build_auto_approval_includes_policy_metadata() -> None:
     assert approval.metadata.get("policy_reason") == "confidence >= threshold"
 
 
+def test_build_auto_approval_preserves_resolution_executor_profile() -> None:
+    module = load_remediation_app_module()
+    payload = {
+        "incident": {"service": "checkout", "environment": "prod", "application": "storefront"},
+        "decision": {"requires_approval": False},
+        "recommendation": {
+            "id": "22222222-2222-2222-2222-222222222222",
+            "incident_id": "11111111-1111-1111-1111-111111111111",
+            "recommended_action": "restart checkout",
+            "metadata": {
+                "connection_profile": {
+                    "endpoint_url": "https://jenkins.storefront.example",
+                    "job_name": "storefront-checkout-remediation",
+                    "credential_ref": "vault://storefront/prod/jenkins#token",
+                    "namespace": "storefront-prod",
+                }
+            },
+        },
+    }
+
+    approval = module._build_auto_approval(payload)
+
+    assert approval is not None
+    profile = approval.metadata["connection_profile"]
+    assert profile["application"] == "storefront"
+    assert profile["service"] == "checkout"
+    assert profile["endpoint_url"] == "https://jenkins.storefront.example"
+    assert profile["job_name"] == "storefront-checkout-remediation"
+    assert profile["credential_ref"] == "vault://storefront/prod/jenkins#token"
+    assert profile["namespace"] == "storefront-prod"
+
+
 def test_build_auto_approval_returns_none_when_identifiers_missing() -> None:
     module = load_remediation_app_module()
 
