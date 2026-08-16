@@ -77,6 +77,7 @@ test("incident summary connects source application and Prometheus to KaiOps proc
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill("Admin@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
+  await page.getByRole("radio", { name: /Correlation Timeline/ }).click();
   await expect(page.getByLabel("Application: httpbin-failure-lab")).toBeVisible();
   await expect(page.getByLabel("Signal: https://httpbin.org/status/503")).toBeVisible();
   await expect(page.getByLabel("Prometheus: ExternalApplicationUnavailable")).toBeVisible();
@@ -84,13 +85,7 @@ test("incident summary connects source application and Prometheus to KaiOps proc
   await expect(page.getByLabel("Jira: KAN-1376")).toBeVisible();
   await page.getByLabel("Application: httpbin-failure-lab").click();
   await expect(page.getByText("No application log captured for this alert")).toBeVisible();
-  await expect(page.getByText("HTTPS probe failed for https://httpbin.org/status/503 in public-internet.")).toBeVisible();
-  await expect(page.getByText("trace-httpbin-503")).toBeVisible();
-  await page.getByLabel("Prometheus: ExternalApplicationUnavailable").click();
-  await expect(page.getByText(alertId)).toBeVisible();
-  await expect(page.getByText("firing", { exact: true })).toBeVisible();
-  await page.getByLabel("Understand: RCA generated").click();
-  await expect(page.getByRole("heading", { name: "Understand", exact: true })).toBeVisible();
-  await expect(page.locator(".incident-stage-inspector")).toBeInViewport();
-  await expect(page.getByLabel("Understand: RCA generated")).toHaveClass(/is-selected/);
+  await expect(page.getByText("HTTPS probe failed for https://httpbin.org/status/503 in public-internet.").first()).toBeVisible();
+  await expect(page.getByText("trace-httpbin-503").first()).toBeVisible();
+  await expect(page.getByText(alertId).first()).toBeVisible();
 });

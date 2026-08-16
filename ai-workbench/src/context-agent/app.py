@@ -103,6 +103,28 @@ def _context_identity(alert: Alert) -> tuple[str, str, str, str]:
     return tenant_id, service, environment, signature
 
 
+def _resolution_quality_score(payload: Any) -> float:
+    if not isinstance(payload, dict) or not payload:
+        return 0.0
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    evaluation = metadata.get("evaluation") if isinstance(metadata.get("evaluation"), dict) else {}
+    raw = evaluation.get("overall_score")
+    if raw is None:
+        raw = payload.get("confidence")
+    try:
+        score = float(raw or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(score / 100.0 if score > 1.0 else score, 1.0))
+
+
+def _qualified_resolution_cache(payload: Any) -> bool:
+    if not bool(getattr(settings, "context_resolution_reuse_enabled", True)):
+        return False
+    threshold = float(getattr(settings, "context_resolution_reuse_min_score", 0.7) or 0.7)
+    return _resolution_quality_score(payload) > max(0.0, min(threshold, 1.0))
+
+
 async def _collect_context_with_strategy(
     app: FastAPI,
     alert: Alert,
@@ -154,6 +176,11 @@ async def _collect_context_with_strategy(
                 )
                 CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "hit" if cached else "miss").inc()
                 if cached:
+                    cached_resolution = cached.get("resolution_payload", {})
+                    if strategy == "auto" and not _qualified_resolution_cache(cached_resolution):
+                        CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "unqualified").inc()
+                        cached = None
+                if cached:
                     try:
                         context = Context.model_validate(cached.get("payload", {})).model_copy(
                             update={"incident_id": incident.id, "alert": alert}
@@ -187,6 +214,8 @@ async def _collect_context_with_strategy(
                                 "context_reuse_count": reuse_count,
                                 "context_signature": signature,
                                 "prior_resolution": cached.get("resolution_payload", {}),
+                                "prior_resolution_score": _resolution_quality_score(cached.get("resolution_payload", {})),
+                                "resolution_reuse_threshold": float(getattr(settings, "context_resolution_reuse_min_score", 0.7) or 0.7),
                             }
                             await session.commit()
                             CONTEXT_KNOWLEDGE_REUSE_COUNT.observe(reuse_count)
@@ -1254,6 +1283,8 @@ async def context_strategy_status() -> dict[str, Any]:
             "cache_aside": True,
             "ttl_seconds": max(60, int(getattr(settings, "context_knowledge_ttl_seconds", 604800) or 604800)),
             "match_scope": ["tenant", "service", "environment", "alert-family"],
+            "resolution_reuse_enabled": bool(getattr(settings, "context_resolution_reuse_enabled", True)),
+            "resolution_reuse_min_score": float(getattr(settings, "context_resolution_reuse_min_score", 0.7) or 0.7),
         },
         "realtime": {"always_refresh": True},
         "historical": {"always_refresh": False, "cache_miss_collects_realtime": False},

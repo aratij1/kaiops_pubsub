@@ -29,6 +29,36 @@ _VOLATILE_TOKEN = re.compile(
 )
 _QUOTED_LOG_FIELD = re.compile(r'\b(?P<key>msg|message|err|error)="(?P<value>(?:\\.|[^"])*)"')
 
+# Platform control-plane failures belong in KaiOps operational telemetry, not
+# in the customer incident pipeline. Ingesting these containers recursively
+# turns a single broker/agent error into another alert, Jira and RCA request.
+_KAIOPS_CONTROL_PLANE_SERVICES = {
+    "alert-intelligence",
+    "api-gateway",
+    "application-onboarding",
+    "approval-service",
+    "audit-service",
+    "closure-service",
+    "context-agent",
+    "dashboard-generator",
+    "discovery-mcp",
+    "metrics-validation-agent",
+    "model-router",
+    "monitoring-adapter",
+    "notification-service",
+    "orchestrator",
+    "prometheus-config-service",
+    "remediation-engine",
+    "resolution-agent",
+    "rule-generation-agent",
+    "temporal-pilot-worker",
+    "validation-agent",
+}
+
+
+def _is_kaiops_control_plane_service(service: str) -> bool:
+    return str(service or "").strip().lower() in _KAIOPS_CONTROL_PLANE_SERVICES
+
 
 @dataclass
 class LogWatchState:
@@ -147,6 +177,29 @@ def _resource_attributes(source: dict[str, Any]) -> dict[str, Any]:
 async def _docker_container_metadata(client: httpx.AsyncClient, endpoint: str, container_id: str) -> dict[str, str]:
     if not endpoint or not container_id:
         return {}
+    try:
+        response = await client.get(f"{endpoint.rstrip('/')}/containers/{container_id}/json")
+        response.raise_for_status()
+        payload = response.json()
+        config = payload.get("Config") if isinstance(payload.get("Config"), dict) else {}
+        labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
+        name = str(payload.get("Name") or "").lstrip("/")
+        compose_project = str(labels.get("com.docker.compose.project") or "")
+        compose_service = str(labels.get("com.docker.compose.service") or "")
+        if name.startswith("telemetry-"):
+            project_name = "Telemetry"
+        elif name.startswith("kaiops_") or name.startswith("kaiops-") or compose_project.startswith("kaiops"):
+            project_name = "KaiOps"
+        else:
+            project_name = compose_project or "Telemetry"
+        return {
+            "container_name": name,
+            "service": compose_service or name,
+            "project_name": project_name,
+        }
+    except (httpx.HTTPError, ValueError):
+        logger.debug("unable to resolve Docker metadata for %s", container_id)
+        return {}
 
 
 def _decode_docker_log_stream(payload: bytes) -> str:
@@ -175,7 +228,7 @@ async def fetch_docker_error_logs(
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(30, lookback_seconds))
     seen = state.load()
     records: list[dict[str, Any]] = []
-    excluded_services = {"monitoring-ingestion-worker", "otel-collector", "opensearch"}
+    excluded_services = {"monitoring-ingestion-worker", "otel-collector", "opensearch"} | _KAIOPS_CONTROL_PLANE_SERVICES
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
         response = await client.get(f"{endpoint.rstrip('/')}/containers/json", params={"all": "0"})
         response.raise_for_status()
@@ -215,35 +268,8 @@ async def fetch_docker_error_logs(
                     "timestamp": timestamp,
                     "trace_id": "",
                 })
-    # Container listing order is not chronological. Collect a bounded tail
-    # from every container and then take the newest records globally so one
-    # noisy service cannot starve errors from all later containers.
     records.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
-    records = records[:batch_size]
-    return records
-    try:
-        response = await client.get(f"{endpoint.rstrip('/')}/containers/{container_id}/json")
-        response.raise_for_status()
-        payload = response.json()
-        config = payload.get("Config") if isinstance(payload.get("Config"), dict) else {}
-        labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
-        name = str(payload.get("Name") or "").lstrip("/")
-        compose_project = str(labels.get("com.docker.compose.project") or "")
-        compose_service = str(labels.get("com.docker.compose.service") or "")
-        if name.startswith("telemetry-"):
-            project_name = "Telemetry"
-        elif name.startswith("kaiops_") or name.startswith("kaiops-") or compose_project.startswith("kaiops"):
-            project_name = "KaiOps"
-        else:
-            project_name = compose_project or "Telemetry"
-        return {
-            "container_name": name,
-            "service": compose_service or name,
-            "project_name": project_name,
-        }
-    except (httpx.HTTPError, ValueError):
-        logger.debug("unable to resolve Docker metadata for %s", container_id)
-        return {}
+    return records[:batch_size]
 
 
 async def fetch_opensearch_error_logs(
@@ -320,6 +346,8 @@ async def fetch_opensearch_error_logs(
         resource_attributes = _resource_attributes(source)
         container_id = str(resource_attributes.get("container.id") or "")
         container_metadata = docker_metadata.get(container_id, {})
+        if _is_kaiops_control_plane_service(str(container_metadata.get("service") or "")):
+            continue
         line = _source_value(source, "body", "message")
         if not line or not _is_failure_line(line):
             continue
@@ -405,6 +433,11 @@ def log_line_to_alert_payload(record: dict[str, Any], *, default_service: str) -
     line = str(record.get("line") or "")
     source_path = str(record.get("source_path") or "")
 
+    # Defense in depth for records supplied by OpenSearch or tests/direct
+    # callers rather than the Docker fallback collector.
+    if _is_kaiops_control_plane_service(str(record.get("service") or "")):
+        return None
+
     parsed: dict[str, Any] = {}
     try:
         candidate = json.loads(line)
@@ -414,10 +447,13 @@ def log_line_to_alert_payload(record: dict[str, Any], *, default_service: str) -
         parsed = {}
 
     if parsed:
-        level = str(parsed.get("level") or parsed.get("severity") or "").strip()
+        # Python's standard JSON formatter emits ``levelname`` while several
+        # application loggers emit ``level``/``severity``. Treating an
+        # unrecognised WARNING as an ERROR created false log-ingestion alerts.
+        level = str(parsed.get("level") or parsed.get("levelname") or parsed.get("severity") or "").strip()
         if level and level.lower() not in {"error", "critical", "fatal"}:
             return None
-        service = str(parsed.get("service") or default_service)
+        service = str(parsed.get("service") or record.get("service") or default_service)
         message = str(parsed.get("message") or parsed.get("event") or "log alert")
         exception_text = str(parsed.get("exception") or "")
         alert_name = str(parsed.get("alert_name") or message)

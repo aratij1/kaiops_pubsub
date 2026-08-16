@@ -553,7 +553,9 @@ services:
       # The separate telemetry demo can emit its own exporter retry storm.
       # Do not recursively convert those infrastructure retries into KaiOps
       # incidents; enable this explicitly only for a healthy OpenSearch source.
-      OPENSEARCH_LOG_INGESTION_ENABLED: ${KAI_OPS_OPENSEARCH_LOG_INGESTION_ENABLED:-false}
+      # This Compose stack has no OpenSearch service. Do not inherit a host-level
+      # override that makes the worker repeatedly connect to a nonexistent backend.
+      OPENSEARCH_LOG_INGESTION_ENABLED: "false"
       # Avoid background DNS/retry loops when inherited host variables contain
       # stale IMAP settings. Enable explicitly for this compose stack.
       EMAIL_INGESTION_ENABLED: ${KAI_OPS_EMAIL_INGESTION_ENABLED:-false}
@@ -771,6 +773,8 @@ services:
       # discovery and historical uses periodic snapshots without live calls.
       CONTEXT_STRATEGY: ${CONTEXT_STRATEGY:-auto}
       CONTEXT_KNOWLEDGE_TTL_SECONDS: ${CONTEXT_KNOWLEDGE_TTL_SECONDS:-604800}
+      CONTEXT_RESOLUTION_REUSE_ENABLED: ${CONTEXT_RESOLUTION_REUSE_ENABLED:-true}
+      CONTEXT_RESOLUTION_REUSE_MIN_SCORE: ${CONTEXT_RESOLUTION_REUSE_MIN_SCORE:-0.70}
       CONTEXT_HISTORICAL_MAX_AGE_SECONDS: ${CONTEXT_HISTORICAL_MAX_AGE_SECONDS:-2592000}
       MESSAGE_BUS_WORKER_COUNT: ${CONTEXT_AGENT_WORKER_COUNT:-2}
       DISCOVERY_MCP_URL: http://discovery-mcp:8000/mcp
@@ -871,6 +875,8 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: resolution-agent
+      CONTEXT_RESOLUTION_REUSE_ENABLED: ${CONTEXT_RESOLUTION_REUSE_ENABLED:-true}
+      CONTEXT_RESOLUTION_REUSE_MIN_SCORE: ${CONTEXT_RESOLUTION_REUSE_MIN_SCORE:-0.70}
       MESSAGE_BUS_WORKER_COUNT: ${RESOLUTION_AGENT_WORKER_COUNT:-2}
       # RCA always uses the configured model. Deep analysis also asks it for
       # structured impact and remediation proposals; deterministic quality and

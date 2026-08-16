@@ -15,7 +15,7 @@ from common.config import get_settings
 from common.continuous_learning import validate_automatic_runbook_use
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
-from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus
+from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus, utc_now
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app
@@ -647,7 +647,11 @@ async def _preflight_live_connector(action: RemediationAction) -> dict[str, Any]
         }
     job_path = "/job/" + "/job/".join(part for part in job_name.split("/") if part)
     try:
-        async with httpx.AsyncClient(auth=(username, token), timeout=httpx.Timeout(8.0, connect=3.0)) as client:
+        # Jenkins can take longer than eight seconds to answer its first API
+        # request after plugin activity or JVM pressure. Keep connection
+        # failure detection tight, but allow a bounded read window so a healthy
+        # and authenticated controller is not reported as a failed dry run.
+        async with httpx.AsyncClient(auth=(username, token), timeout=httpx.Timeout(25.0, connect=5.0)) as client:
             response = await client.get(f"{endpoint}{job_path}/api/json?tree=name,buildable,inQueue")
             response.raise_for_status()
             payload = response.json()
@@ -878,8 +882,10 @@ def _build_auto_approval(payload: dict[str, Any]) -> Approval | None:
         metadata["incident_service"] = service
     if environment:
         metadata["environment"] = environment
-    metadata["connection_profile"] = {
-        "application": str(incident.get("application") or "KaiMS"),
+    supplied_profile = recommendation_metadata.get("connection_profile")
+    supplied_profile = supplied_profile if isinstance(supplied_profile, dict) else {}
+    default_profile = {
+        "application": str(incident.get("application") or recommendation_metadata.get("application") or service or "unknown"),
         "service": str(service or "unknown"),
         "environment": str(environment or "local"),
         "namespace": str(environment or "default"),
@@ -889,6 +895,10 @@ def _build_auto_approval(payload: dict[str, Any]) -> Approval | None:
         "job_name": "kaiops-auto-remediation",
         "timeout_seconds": 120,
         "credential_ref": f"vault://kaiops/{str(environment or 'local').lower()}/jenkins#api-token",
+    }
+    metadata["connection_profile"] = {
+        **default_profile,
+        **{key: value for key, value in supplied_profile.items() if value is not None and str(value).strip()},
     }
     if remediation_target:
         metadata["remediation_target"] = remediation_target

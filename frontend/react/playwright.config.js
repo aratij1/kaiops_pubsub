@@ -7,7 +7,11 @@ const baseURL = process.env.PLAYWRIGHT_BASE_URL || `http://${host}:${port}`;
 export default defineConfig({
   testDir: "./tests/e2e",
   timeout: 30_000,
-  fullyParallel: true,
+  // These are stateful end-to-end scenarios against one shared KaiMS stack.
+  // Parallel logins with the same users rotate sessions underneath other tests
+  // and parallel remediation/onboarding mutations make results non-deterministic.
+  fullyParallel: false,
+  workers: 1,
   reporter: [["list"]],
   use: {
     baseURL,

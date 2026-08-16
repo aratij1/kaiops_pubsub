@@ -20,15 +20,21 @@ test("extracted Copilot and Closed Incidents routes render exactly once", async 
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill("Admin@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
-  await expect(page.getByRole("heading", { name: "Copilot Studio", exact: true })).toHaveCount(1);
+  await expect(page.getByRole("heading", { name: "Ask KAI", exact: true })).toHaveCount(1);
 
-  await page.getByRole("button", { name: "Closed Incidents", exact: true }).click();
+  await page.goto("/closed-incidents");
+  await page.getByLabel("Username").fill("admin");
+  await page.getByLabel("Password").fill("Admin@123456");
+  await page.getByRole("button", { name: "Sign In" }).click();
   await expect(page).toHaveURL(/\/closed-incidents$/);
   await expect(page.getByRole("heading", { name: "Closed Tickets", exact: true })).toHaveCount(1);
 
-  await page.getByRole("button", { name: "Approvals", exact: true }).click();
+  await page.goto("/approvals");
+  await page.getByLabel("Username").fill("admin");
+  await page.getByLabel("Password").fill("Admin@123456");
+  await page.getByRole("button", { name: "Sign In" }).click();
   await expect(page).toHaveURL(/\/approvals$/);
-  await expect(page.getByRole("heading", { name: "Human Approval Queue", exact: true })).toHaveCount(1);
+  await expect(page.getByRole("heading", { name: "Approval Workspace", exact: true })).toHaveCount(1);
 
   await page.goto("/executive");
   await page.getByLabel("Username").fill("admin");
