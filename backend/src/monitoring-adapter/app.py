@@ -1562,7 +1562,10 @@ async def _landing_pad_archive_worker() -> None:
     stop_event = app.state.monitoring_adapter_stop_event
     while not stop_event.is_set():
         try:
-            result = _sweep_landing_pad_archive_once()
+            # Archive trees can contain tens of thousands of files. Filesystem
+            # traversal is synchronous, so running it on the API event loop
+            # previously froze alert reads and health traffic for seconds.
+            result = await asyncio.to_thread(_sweep_landing_pad_archive_once)
             if result["moved"]:
                 logger.info("landing pad archive sweep moved %s file(s)", result["moved"])
             _record_worker_success("landing_pad_archive_worker")
@@ -5687,7 +5690,11 @@ async def get_recent_alerts(limit: int = 50, tenant_id: str | None = None) -> di
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
-            rows = await repo.list_alerts_source_balanced(limit=safe_limit, tenant_id=tenant_id)
+            rows = await repo.list_alerts(
+                limit=safe_limit,
+                include_incident_context=False,
+                tenant_id=tenant_id,
+            )
         return {"rows": rows, "count": len(rows)}
 
     rows = list(RECENT_ALERTS)[:safe_limit]
@@ -5727,7 +5734,16 @@ async def get_all_alerts(limit: int = 500, tenant_id: str | None = None, compact
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
-            rows = await repo.list_alerts_source_balanced(limit=safe_limit, tenant_id=tenant_id)
+            if compact:
+                # Canonical identifiers are persisted in the alert payload;
+                # avoid incident/source N+1 enrichment for each UI refresh.
+                rows = await repo.list_alerts(
+                    limit=safe_limit,
+                    include_incident_context=False,
+                    tenant_id=tenant_id,
+                )
+            else:
+                rows = await repo.list_alerts_source_balanced(limit=safe_limit, tenant_id=tenant_id)
         if compact:
             rows = [_compact_alert_row(row) for row in rows]
         return {"rows": rows, "count": len(rows)}

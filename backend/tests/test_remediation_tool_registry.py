@@ -6,6 +6,21 @@ from common.models import Approval, ApprovalDecision, RemediationStatus
 from remediation_engine.plugins import AzureContainerAppsJobPlugin, JenkinsRollbackPlugin, RemediationEngine
 
 
+def _jenkins_result(submitted: dict[str, str]) -> dict:
+    dry_run = submitted.get("KAI_OPS_DRY_RUN") == "true"
+    return {
+        "schema_version": "kaiops.remediation.result.v2",
+        "incident_id": submitted["KAI_OPS_INCIDENT_ID"],
+        "approval_id": submitted["KAI_OPS_APPROVAL_ID"],
+        "target": submitted["KAI_OPS_TARGET"],
+        "dry_run": dry_run,
+        "preflight_passed": True,
+        "executed": not dry_run,
+        "recovery_validated": True,
+        "result": "SUCCESS",
+    }
+
+
 @pytest.mark.asyncio
 async def test_remediation_engine_registers_tool_specs() -> None:
     engine = RemediationEngine()
@@ -177,6 +192,75 @@ async def test_jenkins_rollback_requires_runtime_secret_injection(monkeypatch: p
 
 
 @pytest.mark.asyncio
+async def test_jenkins_authorizes_governed_restart_intent_for_triage_script(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("JENKINS_USERNAME", raising=False)
+    monkeypatch.delenv("JENKINS_API_TOKEN", raising=False)
+    action = RemediationEngine().build_action(Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="sre-user",
+        metadata={
+            "service": "closure-service",
+            "execution_plan": {
+                "scripts": ["bash scripts/remediation/kaiops_alert_health_triage.sh --service closure-service --dry-run false"],
+                "commands": ["curl -X POST http://docker-socket-proxy:2375/containers/kaiops_azure-closure-service-1/restart?t=30"],
+                "preflight": ["curl http://docker-socket-proxy:2375/containers/kaiops_azure-closure-service-1/json"],
+                "validation_commands": ["curl http://closure-service:8000/healthz"],
+                "rollback_commands": ["curl http://docker-socket-proxy:2375/containers/kaiops_azure-closure-service-1/json"],
+            },
+            "connection_profile": {
+                "executor_type": "jenkins",
+                "endpoint_url": "https://jenkins.example.com",
+                "job_name": "kaiops-auto-remediation",
+                "credential_ref": "vault://kaiops/prod/default-token",
+                "allowed_operations": ["restart_service"],
+            },
+        },
+    ))
+
+    assert action.action_type == "script_execution"
+    assert action.parameters["execution_plan"]["preflight"] == [
+        "curl http://docker-socket-proxy:2375/containers/kaiops_azure-closure-service-1/json"
+    ]
+    assert action.parameters["execution_plan"]["validation_commands"] == [
+        "curl http://closure-service:8000/healthz"
+    ]
+    result = await JenkinsRollbackPlugin().execute(action)
+
+    assert result.parameters["connector_operation"] == "restart_service"
+    assert result.status == RemediationStatus.SKIPPED
+    assert "runtime secret provider" in str(result.error)
+    assert "does not allow operation" not in str(result.error)
+
+
+def test_jenkins_fills_missing_safety_envelope_from_governed_template(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REMEDIATION_EXECUTION_PLATFORM", "docker-compose")
+    monkeypatch.setenv("REMEDIATION_COMPOSE_PROJECT", "kaiops_pubsub")
+    action = RemediationEngine().build_action(Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="sre-user",
+        comment="restart service",
+        metadata={
+            "service": "kaiops-remediation-engine",
+            "execution_plan": {"commands": ["curl http://approved-command"]},
+            "connection_profile": {"executor_type": "jenkins"},
+        },
+    ))
+
+    plan = action.parameters["execution_plan"]
+    assert plan["commands"] == ["curl http://approved-command"]
+    assert plan["preflight"]
+    assert plan["validation_commands"]
+    assert plan["rollback_commands"] == []
+    assert plan["rollback_mode"] == "not_applicable"
+    assert "kaiops_pubsub-remediation-engine-1" in plan["preflight"][0]
+    assert "--output /dev/null" in plan["preflight"][0]
+
+
+@pytest.mark.asyncio
 async def test_jenkins_submits_application_resolution_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     submitted: dict[str, str] = {}
     build_polls = 0
@@ -192,6 +276,8 @@ async def test_jenkins_submits_application_resolution_contract(monkeypatch: pyte
             if build_polls == 1:
                 return httpx.Response(200, json={"building": False, "result": None})
             return httpx.Response(200, json={"building": False, "result": "SUCCESS"})
+        if request.url.path == "/job/payments/7/artifact/kaiops-result.json":
+            return httpx.Response(200, json=_jenkins_result(submitted))
         submitted.update(dict(request.url.params))
         return httpx.Response(201, headers={"location": "https://jenkins.example/queue/item/7"})
 
@@ -223,6 +309,7 @@ async def test_jenkins_submits_application_resolution_contract(monkeypatch: pyte
 @pytest.mark.asyncio
 async def test_jenkins_does_not_finalize_stale_result_while_building(monkeypatch: pytest.MonkeyPatch) -> None:
     build_polls = 0
+    submitted: dict[str, str] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal build_polls
@@ -235,6 +322,10 @@ async def test_jenkins_does_not_finalize_stale_result_while_building(monkeypatch
             if build_polls == 1:
                 return httpx.Response(200, json={"building": True, "result": "FAILURE"})
             return httpx.Response(200, json={"building": False, "result": "SUCCESS"})
+        if request.url.path == "/job/payments/8/artifact/kaiops-result.json":
+            return httpx.Response(200, json=_jenkins_result(submitted))
+        if request.method == "POST":
+            submitted.update(dict(request.url.params))
         return httpx.Response(201, headers={"location": "/queue/item/8/"})
 
     monkeypatch.setenv("JENKINS_USERNAME", "kaiops")
@@ -261,6 +352,7 @@ async def test_jenkins_does_not_finalize_stale_result_while_building(monkeypatch
 @pytest.mark.asyncio
 async def test_jenkins_waits_until_queue_exposes_executable_url(monkeypatch: pytest.MonkeyPatch) -> None:
     queue_polls = 0
+    submitted: dict[str, str] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal queue_polls
@@ -272,8 +364,11 @@ async def test_jenkins_waits_until_queue_exposes_executable_url(monkeypatch: pyt
             return httpx.Response(200, json={"cancelled": False, "executable": executable})
         if request.url.path == "/job/payments/9/api/json":
             return httpx.Response(200, json={"building": False, "result": "SUCCESS"})
+        if request.url.path == "/job/payments/9/artifact/kaiops-result.json":
+            return httpx.Response(200, json=_jenkins_result(submitted))
         if request.url.path == "/api/json":
             raise AssertionError("queue polling must not fall back to the Jenkins controller URL")
+        submitted.update(dict(request.url.params))
         return httpx.Response(201, headers={"location": "/queue/item/9/"})
 
     monkeypatch.setenv("JENKINS_USERNAME", "kaiops")

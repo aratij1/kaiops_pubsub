@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
@@ -1876,6 +1876,30 @@ class IncidentRepository:
         )
         return result.scalar_one_or_none() is not None
 
+    async def has_accepted_approval_id(
+        self,
+        approval_id: Any,
+        incident_id: Any,
+        recommendation_id: Any,
+        *,
+        tenant_id: str = "default",
+    ) -> bool:
+        approval_uuid = self._parse_uuid(approval_id)
+        incident_uuid = self._parse_uuid(incident_id)
+        recommendation_uuid = self._parse_uuid(recommendation_id)
+        if approval_uuid is None or incident_uuid is None or recommendation_uuid is None:
+            return False
+        result = await self.session.execute(
+            select(ApprovalRecord.id)
+            .where(ApprovalRecord.id == approval_uuid)
+            .where(ApprovalRecord.tenant_id == (str(tenant_id or "default").strip() or "default"))
+            .where(ApprovalRecord.incident_id == incident_uuid)
+            .where(ApprovalRecord.recommendation_id == recommendation_uuid)
+            .where(ApprovalRecord.decision.in_([ApprovalDecision.APPROVED.value, ApprovalDecision.MODIFIED.value]))
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
     async def update_incident_approval_status(
         self,
         incident_id: Any,
@@ -1968,6 +1992,17 @@ class IncidentRepository:
         if record is None:
             return None
         return RemediationAction.model_validate(record.payload)
+
+    async def find_latest_action_by_incident(self, incident_id: UUID) -> RemediationAction | None:
+        """Return authoritative execution state for UI/status polling."""
+        result = await self.session.execute(
+            select(ActionRecord)
+            .where(ActionRecord.incident_id == incident_id)
+            .order_by(ActionRecord.updated_at.desc(), ActionRecord.created_at.desc())
+            .limit(1)
+        )
+        record = result.scalar_one_or_none()
+        return RemediationAction.model_validate(record.payload) if record is not None else None
 
     async def save_action_audit(self, action: RemediationAction, actor: str = "remediation-engine") -> None:
         payload = action.model_dump(mode="json")
@@ -2144,6 +2179,7 @@ class IncidentRepository:
         tenant_id: str,
         service: str,
         environment: str,
+        alert_name: str,
         alert_signature: str,
         not_before: datetime,
     ) -> dict[str, Any] | None:
@@ -2153,7 +2189,10 @@ class IncidentRepository:
                 ContextKnowledgeRecord.tenant_id == tenant_id,
                 ContextKnowledgeRecord.service == service,
                 ContextKnowledgeRecord.environment == environment,
-                ContextKnowledgeRecord.alert_signature == alert_signature,
+                or_(
+                    ContextKnowledgeRecord.alert_signature == alert_signature,
+                    func.lower(ContextKnowledgeRecord.alert_name) == alert_name.strip().lower(),
+                ),
                 ContextKnowledgeRecord.collected_at >= not_before,
             )
             .order_by(ContextKnowledgeRecord.collected_at.desc())
@@ -2162,12 +2201,17 @@ class IncidentRepository:
         record = result.scalar_one_or_none()
         if record is None:
             return None
+        # Transparently migrate knowledge created with an older, label-sensitive
+        # signature. Subsequent occurrences use the stable alert-type key.
+        match_type = "signature" if record.alert_signature == alert_signature else "alert_type"
+        record.alert_signature = alert_signature
         record.reuse_count = int(record.reuse_count or 0) + 1
         return {
             "id": str(record.id),
             "source_alert_id": str(record.source_alert_id) if record.source_alert_id else None,
             "source_incident_id": str(record.source_incident_id) if record.source_incident_id else None,
             "reuse_count": record.reuse_count,
+            "match_type": match_type,
             "payload": record.payload if isinstance(record.payload, dict) else {},
             "resolution_payload": record.resolution_payload if isinstance(record.resolution_payload, dict) else {},
             "collected_at": record.collected_at.isoformat(),
@@ -3560,6 +3604,7 @@ class IncidentRepository:
                     "latest_event_id": str(row.latest_event_id) if row.latest_event_id else None,
                     "latest_event_type": row.latest_event_type,
                     "latest_event_at": row.latest_event_at,
+                    "created_at": row.first_seen_at,
                     "updated_at": row.updated_at,
                     "ticket_id": ticket_id or None,
                     "jira_link": jira_link,
@@ -3588,6 +3633,7 @@ class IncidentRepository:
                 IncidentProjectionRecord.risk_tier,
                 IncidentProjectionRecord.execution_mode,
                 IncidentProjectionRecord.transport_provider,
+                IncidentProjectionRecord.first_seen_at,
                 IncidentProjectionRecord.latest_event_at,
                 IncidentProjectionRecord.updated_at,
                 IncidentProjectionRecord.projection_payload,
@@ -3649,6 +3695,7 @@ class IncidentRepository:
                     "transport_provider": row.transport_provider,
                     "health_restored": bool(event_payload.get("health_restored")) if "health_restored" in event_payload else None,
                     "alerts_cleared": bool(event_payload.get("alerts_cleared")) if "alerts_cleared" in event_payload else None,
+                    "created_at": row.first_seen_at,
                     "closed_at": row.latest_event_at or row.updated_at,
                     "updated_at": row.updated_at,
                     "ticket_id": ticket_id or None,

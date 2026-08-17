@@ -135,7 +135,7 @@ export default function RcaPanel({
       <header className="combined-analysis-hero understand-workspace-hero">
         <div>
           <span className="discovery-eyebrow">Incident intelligence</span>
-          <h3>Understand Workspace</h3>
+          <h3>Evidence & Understanding</h3>
           <p>Evidence, causal analysis, impact, and the safest next action in one operational view.</p>
         </div>
         <div className="rca-hero-controls">

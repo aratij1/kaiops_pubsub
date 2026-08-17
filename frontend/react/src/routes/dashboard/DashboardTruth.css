@@ -1,0 +1,5 @@
+.ro-kpis strong.muted { color: #6b7788; font-size: 1rem; }
+.ro-kpis small,
+.ro-mttr-grid small { display: block; color: #657287; line-height: 1.35; }
+.ro-summary small.ro-source-label { color: #657287; }
+.ro-risk-row > small { color: #718096; font-size: .48rem; text-align: center; }
