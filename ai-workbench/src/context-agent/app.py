@@ -223,13 +223,10 @@ async def _collect_context_with_strategy(
                         logger.exception("invalid cached context knowledge id=%s; refreshing", cached.get("id"))
                     else:
                         complete, missing = _context_completeness(context)
-<<<<<<< ours
-                        if strategy == "auto" and not complete:
-=======
                         has_runbook = bool(context.runbook and str(context.runbook).strip())
                         has_rag = int((context.metadata or {}).get("rag_documents") or 0) > 0
-                        if strategy == "auto" and not (complete or has_runbook or has_rag):
->>>>>>> theirs
+                        has_code_evidence = _has_code_evidence(context)
+                        if strategy == "auto" and not (complete or has_runbook or has_rag or has_code_evidence):
                             CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "incomplete").inc()
                             continue_with_refresh = True
                         else:
