@@ -47,7 +47,7 @@ def validate(catalog: dict[str, Any], jenkinsfile: str) -> list[str]:
         "automatic rollback": "Automatic rollback",
         "audit artifact": "kaiops-result.json",
         "artifact fingerprint": "fingerprint: true",
-        "live safety contract": "Live self-healing requires executable preflight, validation, and rollback commands",
+        "live safety contract": "Live self-healing requires executable preflight and validation commands",
     }
     for capability, token in required_tokens.items():
         if token not in jenkinsfile:

@@ -75,12 +75,12 @@ class KaiOpsIncidentPilotWorkflow:
             self._stage("rejected", approval=approval)
             return dict(self._state)
 
-        self._stage("remediation_decision", approval=approval)
-        remediation = await workflow.execute_activity(
-            "execute_remediation_decision", approval,
-            start_to_close_timeout=timedelta(minutes=10), retry_policy=ACTIVITY_RETRY,
-        )
-        self._stage("completed", remediation=remediation)
+        # Approval authorizes the proposed plan, but it is not the separate
+        # operator confirmation to execute it.  The cockpit's POST /execute
+        # starts KaiOpsRemediationWorkflow with the fully enriched, approved
+        # execution contract.  Executing this sparse signal here loses the
+        # service/plan and can turn the incident UUID into a live target.
+        self._stage("approved_awaiting_execution", approval=approval)
         return dict(self._state)
 
 
@@ -101,15 +101,15 @@ class KaiOpsRemediationWorkflow:
     @workflow.run
     async def run(self, approval: dict[str, Any]) -> dict[str, Any]:
         self._stage(
-            "executing",
+            "dispatching",
             incident_id=str(approval.get("incident_id") or ""),
             recommendation_id=str(approval.get("recommendation_id") or ""),
         )
         action = await workflow.execute_activity(
-            "execute_remediation_action",
+            "dispatch_remediation_action",
             approval,
-            start_to_close_timeout=timedelta(minutes=16),
-            heartbeat_timeout=timedelta(minutes=2),
+            start_to_close_timeout=timedelta(minutes=1),
+            heartbeat_timeout=timedelta(seconds=30),
             retry_policy=RetryPolicy(
                 initial_interval=timedelta(seconds=5),
                 backoff_coefficient=2.0,
@@ -117,8 +117,38 @@ class KaiOpsRemediationWorkflow:
                 maximum_attempts=3,
             ),
         )
-        status = str(action.get("status") or "failed").lower()
-        self._stage("succeeded" if status == "succeeded" else "failed", action=action)
+        status = str(action.get("status") or "dispatch_failed").lower()
+        terminal = {
+            "succeeded", "failed", "skipped", "policy_blocked", "dispatch_failed",
+            "execution_failed", "validation_failed", "rolled_back", "rollback_failed",
+            "timed_out", "cancelled", "manual_intervention_required",
+        }
+        if status in terminal:
+            self._stage(status, action=action)
+            return action
+        self._stage("executor_accepted", action_id=str(action.get("id") or ""))
+        # Temporal owns the wait. Each activity performs one bounded read-only
+        # observation, so worker/API restarts never lose the external build.
+        for attempt in range(150):
+            await workflow.sleep(timedelta(seconds=10))
+            action = await workflow.execute_activity(
+                "reconcile_remediation_action",
+                approval,
+                start_to_close_timeout=timedelta(seconds=45),
+                heartbeat_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            status = str(action.get("status") or "execution_failed").lower()
+            self._stage(status, reconciliation_attempt=attempt + 1, action=action)
+            if status in terminal:
+                return action
+        action = await workflow.execute_activity(
+            "timeout_remediation_action",
+            approval,
+            start_to_close_timeout=timedelta(seconds=45),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+        self._stage("timed_out", action=action)
         return action
 
 

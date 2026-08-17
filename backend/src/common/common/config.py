@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     rabbitmq_queue_prefix: str = Field(default="kaiops", alias="RABBITMQ_QUEUE_PREFIX")
     rabbitmq_consumer_max_retries: int = Field(default=3, alias="RABBITMQ_CONSUMER_MAX_RETRIES")
     rabbitmq_consumer_prefetch_count: int = Field(default=10, alias="RABBITMQ_CONSUMER_PREFETCH_COUNT")
+    rabbitmq_transient_requeue_enabled: bool = Field(default=False, alias="RABBITMQ_TRANSIENT_REQUEUE_ENABLED")
     rabbitmq_handler_timeout_seconds: float = Field(default=120.0, alias="RABBITMQ_HANDLER_TIMEOUT_SECONDS")
     rabbitmq_dlq_suffix: str = Field(default=".dlq", alias="RABBITMQ_DLQ_SUFFIX")
     rabbitmq_startup_attempts: int = Field(default=30, alias="RABBITMQ_STARTUP_ATTEMPTS")
@@ -73,7 +74,10 @@ class Settings(BaseSettings):
     ai_layer_request_timeout_seconds: float = Field(default=120.0, alias="AI_LAYER_REQUEST_TIMEOUT_SECONDS")
     ai_layer_auth_token: str = Field(default="", alias="AI_LAYER_AUTH_TOKEN")
     context_strategy: str = Field(default="auto", alias="CONTEXT_STRATEGY")
-    context_knowledge_ttl_seconds: int = Field(default=604800, alias="CONTEXT_KNOWLEDGE_TTL_SECONDS")
+    # Zero keeps quality-approved alert-type knowledge until evidence invalidates
+    # it. Operators may set a positive TTL when their topology requires periodic
+    # forced refreshes.
+    context_knowledge_ttl_seconds: int = Field(default=0, alias="CONTEXT_KNOWLEDGE_TTL_SECONDS", ge=0)
     context_resolution_reuse_enabled: bool = Field(default=True, alias="CONTEXT_RESOLUTION_REUSE_ENABLED")
     context_resolution_reuse_min_score: float = Field(default=0.7, alias="CONTEXT_RESOLUTION_REUSE_MIN_SCORE", ge=0.0, le=1.0)
     object_storage_enabled: bool = Field(default=False, alias="OBJECT_STORAGE_ENABLED")
@@ -154,6 +158,7 @@ class Settings(BaseSettings):
     model_gateway_provider: str = Field(default="router", alias="MODEL_GATEWAY_PROVIDER")
     alert_correlation_threshold: float = Field(default=0.72, alias="ALERT_CORRELATION_THRESHOLD")
     alert_retention_minutes: int = Field(default=60, alias="ALERT_RETENTION_MINUTES")
+    alert_correlation_candidate_limit: int = Field(default=250, alias="ALERT_CORRELATION_CANDIDATE_LIMIT")
     alert_deduplication_enabled: bool = Field(default=True, alias="ALERT_DEDUPLICATION_ENABLED")
     alert_deduplication_window_minutes: int = Field(default=60, alias="ALERT_DEDUPLICATION_WINDOW_MINUTES")
     confidence_auto_execute_threshold: float = Field(default=0.9, alias="CONFIDENCE_AUTO_EXECUTE_THRESHOLD")

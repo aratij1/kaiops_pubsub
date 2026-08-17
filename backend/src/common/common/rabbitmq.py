@@ -343,7 +343,10 @@ async def consume_forever(
                             "message_identity": identity,
                         },
                     )
-                    if _is_transient_handler_error(last_error):
+                    if (
+                        consumer._settings.rabbitmq_transient_requeue_enabled
+                        and _is_transient_handler_error(last_error)
+                    ):
                         logger.warning(
                             "requeueing rabbitmq message after transient dependency failure: topic=%s identity=%s error=%s",
                             consumer._topic,

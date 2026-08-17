@@ -13,7 +13,7 @@ from common.config import get_settings
 from common.ai_layer_client import AiLayerClient
 from common.event_publishers import build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
-from common.models import Alert
+from common.models import Alert, Incident
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.servicebus import AzureServiceBusConsumer, consume_forever as consume_service_bus_forever
@@ -425,18 +425,20 @@ async def startup(app: FastAPI) -> None:
     if settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
         agent.alert_history_repository = SqlAlertHistoryRepository(
             session_factory=app.state.session_factory,
-            max_items=2000,
+            max_items=max(25, min(int(settings.alert_correlation_candidate_limit), 1000)),
+            max_age_minutes=max(1, int(agent.deduplication_window_minutes or 60)),
         )
 
     workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
-    consumers: list[tuple[str, Any, ConsumeRunner]] = []
+    consumers: list[tuple[str, Any, ConsumeRunner, str]] = []
     for worker in range(workers):
-        consumers.append((f"rabbitmq-w{worker + 1}", RabbitMQConsumer(settings, RAW_ALERTS), consume_rabbitmq_forever))
+        consumers.append((f"rabbitmq-w{worker + 1}", RabbitMQConsumer(settings, RAW_ALERTS), consume_rabbitmq_forever, "alerts"))
         consumers.append(
             (
                 f"rabbitmq-jira-w{worker + 1}",
                 RabbitMQConsumer(settings, JIRA_INVESTIGATIONS),
                 consume_rabbitmq_forever,
+                "jira",
             )
         )
     # Producers may mirror an event to RabbitMQ and Kafka for durability.
@@ -445,13 +447,14 @@ async def startup(app: FastAPI) -> None:
     # requested for a migration.
     if settings.kafka_enabled and MESSAGE_BUS_DUAL_CONSUME_ENABLED:
         for worker in range(workers):
-            consumers.insert(worker, (f"kafka-w{worker + 1}", KafkaConsumer(settings, RAW_ALERTS), consume_kafka_forever))
+            consumers.insert(worker, (f"kafka-w{worker + 1}", KafkaConsumer(settings, RAW_ALERTS), consume_kafka_forever, "alerts"))
             consumers.insert(
                 worker,
                 (
                     f"kafka-jira-w{worker + 1}",
                     KafkaConsumer(settings, JIRA_INVESTIGATIONS),
                     consume_kafka_forever,
+                    "jira",
                 ),
             )
     if settings.azure_service_bus_enabled:
@@ -461,10 +464,11 @@ async def startup(app: FastAPI) -> None:
                     f"servicebus-w{worker + 1}",
                     AzureServiceBusConsumer(settings, RAW_ALERTS),
                     consume_service_bus_forever,
+                    "alerts",
                 )
             )
 
-    async def handle(payload: dict) -> None:
+    async def handle_alert(payload: dict) -> None:
         raw_alert_payload = payload.get("alert") if isinstance(payload.get("alert"), dict) else payload
         alert_input = Alert.model_validate(raw_alert_payload)
         llm_discovery = await _llm_discovery(alert_input)
@@ -483,13 +487,6 @@ async def startup(app: FastAPI) -> None:
         if canonical is not None:
             EVENTS_PROCESSED.labels(settings.service_name, RAW_ALERTS, "duplicate").inc()
             return
-        jira_key: str | None = None
-        try:
-            await _reuse_correlated_jira(incident)
-            jira_key = await _sync_candidate_to_jira(incident)
-        except Exception:
-            logger.exception("failed to synchronize incident candidate to Jira incident=%s", incident.id)
-        _connect_jira_context(alert, incident)
         if settings.database_enabled:
             async with app.state.session_factory() as session:
                 repo = IncidentRepository(session)
@@ -507,15 +504,37 @@ async def startup(app: FastAPI) -> None:
             {"alert": alert, "incident": incident},
             key=str(alert.correlation_id or alert.service),
         )
-        if not jira_key:
-            logger.info(
-                "incident_pipeline stage=jira outcome=no_ticket incident=%s reason=not qualified for a Jira ticket, investigating anyway",
-                incident.id,
-            )
+        # Jira is an external, rate-limited side effect. Keep it off the raw
+        # alert hot path so a slow Atlassian API cannot hold RabbitMQ delivery
+        # credits and stop correlation/context for every other alert.
+        await app.state.producer.publish(
+            JIRA_INVESTIGATIONS,
+            {"alert": alert, "incident": incident},
+            key=str(alert.correlation_id or alert.service),
+        )
         EVENTS_PROCESSED.labels(settings.service_name, RAW_ALERTS, "ok").inc()
 
-    for source, consumer, consume_forever in consumers:
-        task = asyncio.create_task(consume_forever(consumer, handle), name=f"alert-intelligence-{source}-consumer")
+    async def handle_jira(payload: dict) -> None:
+        incident_payload = payload.get("incident") if isinstance(payload.get("incident"), dict) else None
+        if incident_payload is None:
+            raise ValueError("jira investigation payload is missing incident")
+        incident = Incident.model_validate(incident_payload)
+        await _reuse_correlated_jira(incident)
+        jira_key = await _sync_candidate_to_jira(incident)
+        if not jira_key:
+            logger.info(
+                "incident_pipeline stage=jira outcome=no_ticket incident=%s reason=Jira is not configured",
+                incident.id,
+            )
+            return
+        if settings.database_enabled:
+            async with app.state.session_factory() as session:
+                await IncidentRepository(session).save_incident(incident)
+                await session.commit()
+
+    for source, consumer, consume_forever, handler_kind in consumers:
+        handler = handle_jira if handler_kind == "jira" else handle_alert
+        task = asyncio.create_task(consume_forever(consumer, handler), name=f"alert-intelligence-{source}-consumer")
         tasks.append(task)
 
 

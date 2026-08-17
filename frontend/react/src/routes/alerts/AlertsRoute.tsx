@@ -207,8 +207,7 @@ function observedAlertStages(row: AlertStreamRow, workflowPayload: any) {
   if (facts.duplicate || facts.alert.incident_disposition || facts.incident.incident_disposition) stages.push({ id: "deduplicate", label: "Deduplicate", Icon: GitMerge, detail: facts.duplicate ? "Duplicate linked" : "Unique signal" });
   if (facts.incident.id || facts.incident.incident_id) stages.push({ id: "incident", label: "Incident", Icon: Activity, detail: facts.incident.id || facts.incident.incident_id });
   if (facts.ticket) stages.push({ id: "jira", label: "Jira", Icon: Ticket, detail: String(facts.ticket) });
-  if (facts.context && Object.keys(facts.context).length) stages.push({ id: "context", label: contextSource.includes("cache") ? "Context reused" : "Context", Icon: Database, detail: contextSource || `${facts.evidence.length} evidence item(s)` });
-  if (facts.recommendation && Object.keys(facts.recommendation).length) stages.push({ id: "understand", label: "Understand", Icon: FileCode2, detail: "RCA available" });
+  if ((facts.context && Object.keys(facts.context).length) || (facts.recommendation && Object.keys(facts.recommendation).length)) stages.push({ id: "evidence-understanding", label: contextSource.includes("cache") ? "Evidence & understanding reused" : "Evidence & understanding", Icon: Database, detail: `${facts.evidence.length} evidence item(s)${facts.recommendation && Object.keys(facts.recommendation).length ? " · RCA available" : " · RCA pending"}` });
   if (facts.root.approval && Object.keys(facts.root.approval).length) stages.push({ id: "approval", label: "Approval", Icon: Ticket, detail: String(facts.root.approval.status || "Decision recorded") });
   if (facts.root.remediation_action && Object.keys(facts.root.remediation_action).length) stages.push({ id: "resolve", label: "Resolve", Icon: Activity, detail: String(facts.root.remediation_action.status || "Executed") });
   if (facts.root.closure_report && Object.keys(facts.root.closure_report).length) stages.push({ id: "validate", label: "Validate", Icon: FileCode2, detail: facts.root.closure_report.health_restored ? "Recovery verified" : "Validation recorded" });
@@ -289,7 +288,7 @@ export default function AlertsRoute() {
       setTraceWorkflow({ loading: true, data: null, error: "", alertId, state: "loading" });
       try {
         if (!alertId && activeTraceAlert) {
-          const response = await fetchJson("/api-gateway/alerts/all?limit=500&tenant_id=default&compact=false", { timeoutMs: 12000, maxAttempts: 1 }) as any;
+          const response = await fetchJson("/api-gateway/alerts/all?limit=150&tenant_id=default&compact=true", { timeoutMs: 12000, maxAttempts: 1 }) as any;
           const rows = response?.data?.rows || response?.rows || response?.data || [];
           const match = canonicalMatch(activeTraceAlert, Array.isArray(rows) ? rows : []);
           alertId = processedAlertId(match);

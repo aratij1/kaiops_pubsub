@@ -23,6 +23,7 @@ from common.telemetry import EVENTS_PROCESSED
 from common.topics import APPROVAL_EVENTS, REMEDIATION_EVENTS, RESOLUTION_EVENTS
 from fastapi import FastAPI, Header, HTTPException
 from remediation_engine import RemediationEngine
+from remediation_engine.execution_contract import bind_execution_contract, verify_execution_contract
 
 settings = get_settings()
 settings.service_name = "remediation-engine"
@@ -305,6 +306,13 @@ async def startup(app: FastAPI) -> None:
         if approval.metadata.get("execution_confirmation_required"):
             EVENTS_PROCESSED.labels(settings.service_name, APPROVAL_EVENTS, "awaiting-confirmation").inc()
             return
+        if settings.remediation_temporal_enabled:
+            # The message bus must not bypass the durable control plane. Direct
+            # execution is lost if this service is restarted while Jenkins is
+            # running, leaving a permanently non-terminal action behind.
+            await execute_approval(approval)
+            EVENTS_PROCESSED.labels(settings.service_name, APPROVAL_EVENTS, "workflow-accepted").inc()
+            return
         action = await _execute_approval(approval)
         await _request_failure_reconsideration(action=action, source_payload=payload)
         await _persist_remediation_event(app=app, action=action, source_payload=payload, source=APPROVAL_EVENTS)
@@ -344,6 +352,10 @@ async def startup(app: FastAPI) -> None:
             payload_out = _build_remediation_event_payload(action=blocked, source_payload=payload, source=RESOLUTION_EVENTS)
             await app.state.producer.publish(REMEDIATION_EVENTS, payload_out, key=str(blocked.incident_id))
             EVENTS_PROCESSED.labels(settings.service_name, RESOLUTION_EVENTS, "runbook-blocked").inc()
+            return
+        if settings.remediation_temporal_enabled:
+            await execute_approval(approval)
+            EVENTS_PROCESSED.labels(settings.service_name, RESOLUTION_EVENTS, "workflow-accepted").inc()
             return
         action = await _execute_approval(approval)
         await _request_failure_reconsideration(action=action, source_payload=payload)
@@ -404,6 +416,16 @@ async def _execute_approval(approval: Approval) -> RemediationAction:
             action.output = "remediation blocked by allowlist policy"
         else:
             action.idempotency_key = _build_action_idempotency_key(approval, action.action_type)
+            bind_execution_contract(action, approval)
+            verify_execution_contract(action)
+            action.parameters["lifecycle"] = {
+                "state": RemediationStatus.DISPATCHING.value,
+                "history": [
+                    RemediationStatus.POLICY_CHECKED.value,
+                    RemediationStatus.APPROVED.value,
+                    RemediationStatus.DISPATCHING.value,
+                ],
+            }
             lock = idempotency_locks.setdefault(action.idempotency_key, asyncio.Lock())
             async with lock:
                 existing = await _find_existing_action(app, action.idempotency_key)
@@ -431,16 +453,31 @@ async def _execute_approval(approval: Approval) -> RemediationAction:
                         and str(existing_execution.get("executor") or "").lower() == "jenkins"
                         and str(existing_execution.get("build_result") or "").upper() in {"", "UNKNOWN"}
                     )
+                    orchestration = existing.parameters.get("orchestration")
+                    orchestration = orchestration if isinstance(orchestration, dict) else {}
+                    claimable_temporal_intent = (
+                        existing.status in {RemediationStatus.PENDING, RemediationStatus.RUNNING}
+                        and str(orchestration.get("provider") or "").lower() == "temporal"
+                        and str(orchestration.get("status") or "").lower() in {"submitting", "accepted", "workflow_accepted"}
+                        and not existing_execution
+                    )
                     if (
                         retryable_connector_skip
                         or retryable_legacy_queue_ack
                         or corrected_failed_plan
                         or retryable_indeterminate_jenkins
+                        or claimable_temporal_intent
                     ):
                         # Preserve the durable row/idempotency identity while
                         # replacing the historical configuration skip with the
                         # newly configured Jenkins attempt.
                         action.id = existing.id
+                        bind_execution_contract(action, approval)
+                        verify_execution_contract(action)
+                        action.parameters["orchestration"] = {
+                            **orchestration,
+                            "status": "executing",
+                        }
                         action = await engine.execute(action)
                         await _persist_action(app, action)
                         return action
@@ -457,6 +494,11 @@ async def _execute_approval(approval: Approval) -> RemediationAction:
 
 
 async def _finalize_api_execution(approval: Approval, action: RemediationAction) -> RemediationAction:
+    # The action row is the UI's authoritative execution state. Persist the
+    # observed terminal result before publishing its event; otherwise an API
+    # caller sees the terminal response while subsequent reads remain stuck on
+    # the last non-terminal value.
+    await _persist_action(app, action)
     source_payload = {"approval": approval.model_dump(mode="json")}
     await _request_failure_reconsideration(action=action, source_payload=source_payload)
     await _persist_remediation_event(
@@ -484,6 +526,132 @@ async def execute_approval_direct(approval: Approval, x_kaiops_internal_token: s
     return await _finalize_api_execution(approval, await _execute_approval(approval))
 
 
+@app.post("/dispatch-direct", response_model=RemediationAction, include_in_schema=False)
+async def dispatch_approval_direct(approval: Approval, x_kaiops_internal_token: str = Header(default="")) -> RemediationAction:
+    """Temporal-only, idempotent handoff to an asynchronous executor."""
+    expected = settings.remediation_internal_token
+    if not expected or x_kaiops_internal_token != expected:
+        raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
+    if _plan_is_validation_only(approval):
+        raise HTTPException(status_code=409, detail="Execution blocked: the approved plan is validation-only.")
+    if approval.metadata.get("auto_approved"):
+        try:
+            await _require_persisted_approved_runbook(approval)
+        except PolicyViolation as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    else:
+        await _require_persisted_human_approval(approval)
+    action = engine.build_action(approval)
+    _require_production_credential_reference(approval, action.action_type)
+    _require_live_executor_configuration(action)
+    action.idempotency_key = _build_action_idempotency_key(approval, action.action_type)
+    existing = await _find_existing_action(app, action.idempotency_key)
+    if existing is not None:
+        existing_result = existing.parameters.get("execution_result")
+        if isinstance(existing_result, dict) and existing_result.get("accepted"):
+            return existing
+        action.id = existing.id
+    bind_execution_contract(action, approval)
+    verify_execution_contract(action)
+    action.status = RemediationStatus.DISPATCHING
+    action.parameters["lifecycle"] = {
+        "state": RemediationStatus.DISPATCHING.value,
+        "history": [RemediationStatus.POLICY_CHECKED.value, RemediationStatus.APPROVED.value, RemediationStatus.DISPATCHING.value],
+    }
+    await _persist_action(app, action)
+    action = await engine.dispatch(action)
+    lifecycle = action.parameters.get("lifecycle") if isinstance(action.parameters.get("lifecycle"), dict) else {"history": []}
+    lifecycle["state"] = action.status.value
+    lifecycle["history"] = [*lifecycle.get("history", []), action.status.value]
+    action.parameters["lifecycle"] = lifecycle
+    await _persist_action(app, action)
+    return action
+
+
+@app.post("/reconcile-direct", response_model=RemediationAction, include_in_schema=False)
+async def reconcile_execution_direct(payload: dict[str, Any], x_kaiops_internal_token: str = Header(default="")) -> RemediationAction:
+    """Perform one executor observation and persist only observed truth."""
+    expected = settings.remediation_internal_token
+    if not expected or x_kaiops_internal_token != expected:
+        raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
+    approval = Approval.model_validate(payload.get("approval") or {})
+    async with app.state.session_factory() as session:
+        action = await IncidentRepository(session).find_latest_action_by_incident(approval.incident_id)
+    if action is None:
+        raise HTTPException(status_code=404, detail="No dispatched remediation action exists for this incident.")
+    verify_execution_contract(action)
+    previous = action.status.value
+    action = await engine.observe(action)
+    lifecycle = action.parameters.get("lifecycle") if isinstance(action.parameters.get("lifecycle"), dict) else {"history": []}
+    lifecycle["state"] = action.status.value
+    if previous != action.status.value:
+        lifecycle["history"] = [*lifecycle.get("history", []), action.status.value]
+    action.parameters["lifecycle"] = lifecycle
+    terminal = {
+        RemediationStatus.SUCCEEDED,
+        RemediationStatus.EXECUTION_FAILED,
+        RemediationStatus.VALIDATION_FAILED,
+        RemediationStatus.DISPATCH_FAILED,
+        RemediationStatus.POLICY_BLOCKED,
+        RemediationStatus.CANCELLED,
+        RemediationStatus.TIMED_OUT,
+    }
+    if action.status in terminal:
+        return await _finalize_api_execution(approval, action)
+    await _persist_action(app, action)
+    return action
+
+
+@app.post("/timeout-direct", response_model=RemediationAction, include_in_schema=False)
+async def timeout_execution_direct(payload: dict[str, Any], x_kaiops_internal_token: str = Header(default="")) -> RemediationAction:
+    expected = settings.remediation_internal_token
+    if not expected or x_kaiops_internal_token != expected:
+        raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
+    approval = Approval.model_validate(payload.get("approval") or {})
+    async with app.state.session_factory() as session:
+        action = await IncidentRepository(session).find_latest_action_by_incident(approval.incident_id)
+    if action is None:
+        raise HTTPException(status_code=404, detail="No remediation action exists for this incident.")
+    action.status = RemediationStatus.TIMED_OUT
+    action.error = str(payload.get("error") or "Executor did not reach a terminal state before the remediation deadline.")
+    action.completed_at = utc_now()
+    lifecycle = action.parameters.get("lifecycle") if isinstance(action.parameters.get("lifecycle"), dict) else {"history": []}
+    lifecycle["state"] = RemediationStatus.TIMED_OUT.value
+    lifecycle["history"] = [*lifecycle.get("history", []), RemediationStatus.TIMED_OUT.value]
+    action.parameters["lifecycle"] = lifecycle
+    return await _finalize_api_execution(approval, action)
+
+
+@app.post("/execution-failed", response_model=RemediationAction, include_in_schema=False)
+async def record_execution_failure(payload: dict[str, Any], x_kaiops_internal_token: str = Header(default="")) -> RemediationAction:
+    """Persist a truthful terminal result when the durable executor rejects an activity."""
+    expected = settings.remediation_internal_token
+    if not expected or x_kaiops_internal_token != expected:
+        raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
+    approval = Approval.model_validate(payload.get("approval") or {})
+    async with app.state.session_factory() as session:
+        existing = await IncidentRepository(session).find_latest_action_by_incident(approval.incident_id)
+    if existing is None:
+        preview = engine.build_action(approval)
+        preview.idempotency_key = _build_action_idempotency_key(approval, preview.action_type)
+        existing = await _find_existing_action(app, preview.idempotency_key)
+        action = existing or preview
+    else:
+        action = existing
+    action.status = RemediationStatus.FAILED
+    action.error = str(payload.get("error") or "Durable remediation execution failed.").strip()
+    action.completed_at = utc_now()
+    orchestration = action.parameters.get("orchestration")
+    orchestration = orchestration if isinstance(orchestration, dict) else {}
+    action.parameters["orchestration"] = {
+        **orchestration,
+        "status": "failed",
+        "http_status": payload.get("http_status"),
+    }
+    await _persist_action(app, action)
+    return action
+
+
 @app.post("/execute", response_model=RemediationAction, status_code=202)
 async def execute_approval(approval: Approval) -> RemediationAction:
     if not settings.remediation_temporal_enabled:
@@ -493,8 +661,44 @@ async def execute_approval(approval: Approval) -> RemediationAction:
     if client is None:
         raise HTTPException(status_code=503, detail="Durable remediation orchestration is unavailable.")
     action_preview = engine.build_action(approval)
+    # Reject invalid/self-destructive targets before creating a durable
+    # workflow or submitting anything to the external executor.
+    _require_live_executor_configuration(action_preview)
+    readiness = await _execution_plane_readiness(action_preview)
+    if not readiness["ready"]:
+        raise HTTPException(status_code=503, detail=readiness["reason"])
     workflow_key = _build_action_idempotency_key(approval, action_preview.action_type)
     workflow_id = f"kaiops-remediation-{workflow_key}"
+    existing = await _find_existing_action(app, workflow_key)
+    if existing is not None and existing.status in {
+        RemediationStatus.SUCCEEDED,
+        RemediationStatus.SKIPPED,
+    }:
+        return existing
+    if existing is not None:
+        action_preview.id = existing.id
+    action_preview.idempotency_key = workflow_key
+    action_preview.status = RemediationStatus.PENDING
+    bind_execution_contract(action_preview, approval)
+    verify_execution_contract(action_preview)
+    action_preview.parameters["lifecycle"] = {
+        "state": RemediationStatus.DISPATCHING.value,
+        "history": [
+            RemediationStatus.POLICY_CHECKED.value,
+            RemediationStatus.APPROVED.value,
+            RemediationStatus.DISPATCHING.value,
+        ],
+    }
+    action_preview.parameters["orchestration"] = {
+        "provider": "temporal",
+        "workflow_id": workflow_id,
+        "status": "submitting",
+        "executor_readiness": readiness,
+    }
+    # Persist intent before contacting Temporal. If the process exits between
+    # submission and acknowledgement, the deterministic workflow/idempotency
+    # IDs make reconciliation safe instead of losing the operator action.
+    await _persist_action(app, action_preview)
     # Workflow execution failures live in temporalio.exceptions. Importing this
     # from temporalio.client works in neither the pinned SDK nor current SDKs
     # and caused every durable execution request to fail before workflow start.
@@ -511,19 +715,86 @@ async def execute_approval(approval: Approval) -> RemediationAction:
         )
     except WorkflowAlreadyStartedError:
         handle = client.get_workflow_handle(workflow_id)
+    except Exception as exc:
+        action_preview.error = f"Temporal workflow submission failed: {type(exc).__name__}"
+        action_preview.parameters["orchestration"]["status"] = "submission_failed"
+        await _persist_action(app, action_preview)
+        raise HTTPException(status_code=503, detail=action_preview.error) from exc
     # The target may be the API gateway carrying this request. A durable
     # workflow must therefore be acknowledged before remediation can restart
     # that gateway; completion is delivered through the persisted action/event
     # stream consumed by the UI.
-    action_preview.idempotency_key = workflow_key
-    action_preview.status = RemediationStatus.RUNNING
+    # Temporal acceptance proves durable orchestration only. It does not prove
+    # that Jenkins (or another adapter) accepted or started the mutation.
+    action_preview.status = RemediationStatus.DISPATCHING
     action_preview.started_at = utc_now()
     action_preview.parameters["orchestration"] = {
         "provider": "temporal",
         "workflow_id": workflow_id,
-        "status": "accepted",
+        "status": "workflow_accepted",
+        "executor_readiness": readiness,
     }
+    await _persist_action(app, action_preview)
     return action_preview
+
+
+@app.get("/actions/by-incident/{incident_id}/latest", response_model=RemediationAction)
+async def latest_action_for_incident(incident_id: UUID) -> RemediationAction:
+    session_factory = getattr(app.state, "session_factory", None)
+    if session_factory is None:
+        raise HTTPException(status_code=503, detail="Remediation persistence is unavailable.")
+    async with session_factory() as session:
+        action = await IncidentRepository(session).find_latest_action_by_incident(incident_id)
+    if action is None:
+        raise HTTPException(status_code=404, detail="No remediation action exists for this incident.")
+    return action
+
+
+async def _execution_plane_readiness(action: RemediationAction) -> dict[str, Any]:
+    profile = action.parameters.get("connection_profile")
+    profile = profile if isinstance(profile, dict) else {}
+    executor = str(profile.get("executor_type") or profile.get("connection_type") or action.action_type).strip().lower()
+    if executor != "jenkins":
+        return {"ready": True, "executor": executor or "native", "reason": "executor configuration accepted"}
+    endpoint = str(profile.get("endpoint_url") or "").rstrip("/")
+    if not endpoint:
+        return {"ready": False, "executor": "jenkins", "reason": "Jenkins endpoint is not configured."}
+    username = os.getenv("JENKINS_USERNAME", "").strip()
+    token = os.getenv("JENKINS_API_TOKEN", "").strip()
+    if not username or not token:
+        return {"ready": False, "executor": "jenkins", "reason": "Jenkins runtime credentials are not available."}
+    try:
+        async with httpx.AsyncClient(auth=(username, token), timeout=httpx.Timeout(6.0, connect=3.0)) as client:
+            response = await client.get(f"{endpoint}/api/json")
+            response.raise_for_status()
+    except Exception as exc:
+        return {
+            "ready": False,
+            "executor": "jenkins",
+            "endpoint": endpoint,
+            "reason": f"Jenkins execution plane is unavailable ({type(exc).__name__}).",
+        }
+    return {"ready": True, "executor": "jenkins", "endpoint": endpoint, "reason": "Jenkins API is reachable"}
+
+
+@app.get("/executors/readiness")
+async def execution_plane_readiness() -> dict[str, Any]:
+    profile = {
+        "executor_type": os.getenv("REMEDIATION_DEFAULT_EXECUTOR", "jenkins"),
+        "endpoint_url": os.getenv("REMEDIATION_JENKINS_URL", "http://jenkins:8080"),
+    }
+    probe = RemediationAction(
+        incident_id=UUID("00000000-0000-4000-8000-000000000001"),
+        action_type=str(profile["executor_type"]),
+        target="readiness-probe",
+        parameters={"connection_profile": profile},
+    )
+    result = await _execution_plane_readiness(probe)
+    result["temporal_connected"] = getattr(app.state, "temporal_client", None) is not None
+    result["ready"] = bool(result["ready"] and result["temporal_connected"])
+    if not result["ready"]:
+        raise HTTPException(status_code=503, detail=result)
+    return result
 
 
 @app.get("/executions/{incident_id}/workflow")
@@ -556,7 +827,8 @@ async def _require_persisted_human_approval(approval: Approval) -> None:
     if not settings.database_enabled or session_factory is None:
         raise HTTPException(status_code=503, detail="Durable approval verification is unavailable.")
     async with session_factory() as session:
-        accepted = await IncidentRepository(session).has_accepted_approval(
+        accepted = await IncidentRepository(session).has_accepted_approval_id(
+            approval.id,
             approval.incident_id,
             approval.recommendation_id,
             tenant_id=approval.tenant_id or "default",
@@ -564,7 +836,7 @@ async def _require_persisted_human_approval(approval: Approval) -> None:
     if not accepted:
         raise HTTPException(
             status_code=409,
-            detail="Execution blocked: persist an approved or modified human decision for this recommendation first.",
+            detail="Execution blocked: the exact approval ID is not a persisted accepted decision for this recommendation.",
         )
 
 
@@ -724,12 +996,38 @@ def _require_production_credential_reference(approval: Approval, action_type: st
 
 def _require_live_executor_configuration(action: RemediationAction) -> None:
     """Reject non-executable approvals before they emit a failed closure event."""
-    if action.action_type == "script_execution":
-        return
-
     profile = action.parameters.get("connection_profile")
     profile = profile if isinstance(profile, dict) else {}
     executor_type = str(profile.get("executor_type") or profile.get("connection_type") or "").strip().lower()
+    normalized_target = str(action.target or "").strip().lower().removeprefix("kaiops-")
+    if (
+        normalized_target == "remediation-engine"
+        and executor_type == "jenkins"
+        and not settings.remediation_temporal_enabled
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Execution blocked: remediation-engine cannot synchronously restart itself through Jenkins. "
+                "Use an external remediation control-plane worker with durable Jenkins reconciliation."
+            ),
+        )
+    try:
+        UUID(str(action.target))
+    except (TypeError, ValueError, AttributeError):
+        target_is_incident_uuid = False
+    else:
+        target_is_incident_uuid = True
+    if target_is_incident_uuid and executor_type in {"jenkins", "azure_container_apps_job"}:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Execution blocked: the live remediation target is an incident UUID. "
+                "Attach the approved service/resource target and execution plan before executing."
+            ),
+        )
+    if action.action_type == "script_execution" and executor_type not in {"jenkins", "azure_container_apps_job"}:
+        return
     if executor_type == "azure_container_apps_job":
         required = {
             "subscription_id": profile.get("subscription_id") or os.getenv("AZURE_SUBSCRIPTION_ID"),
@@ -893,7 +1191,7 @@ def _build_auto_approval(payload: dict[str, Any]) -> Approval | None:
         "connection_type": "jenkins",
         "executor_type": "jenkins",
         "job_name": "kaiops-auto-remediation",
-        "timeout_seconds": 120,
+        "timeout_seconds": 1200,
         "credential_ref": f"vault://kaiops/{str(environment or 'local').lower()}/jenkins#api-token",
     }
     metadata["connection_profile"] = {
