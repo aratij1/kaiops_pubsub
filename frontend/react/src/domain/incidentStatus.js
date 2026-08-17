@@ -35,8 +35,14 @@ export function effectiveExecutionStatus(incidentStatus, remediationStatus, queu
       || ["closed", "resolved"].includes(incident)) {
     return "succeeded";
   }
-  if (String(queueUrl || "").trim()) {
-    return "queued";
+  if (["failed", "skipped", "policy_blocked", "dispatch_failed", "execution_failed", "validation_failed", "rollback_failed", "timed_out", "cancelled", "manual_intervention_required"].includes(remediation)) {
+    return remediation;
+  }
+  if (["rolled_back", "dispatching", "executor_accepted", "running", "verifying", "rolling_back"].includes(remediation)) {
+    return remediation;
+  }
+  if (String(queueUrl || "").trim() && !remediation) {
+    return "executor_accepted";
   }
   if (incident === "failed") {
     return "failed";

@@ -6,6 +6,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import Index, JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, MetaData, Numeric, String, Text, Uuid, event, text
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -65,6 +66,8 @@ class AlertRecord(Base, TimestampMixin):
     __table_args__ = (
         Index("idx_alerts_created_at", "created_at"),
         Index("idx_alerts_tenant_updated", "tenant_id", "updated_at"),
+        Index("idx_alerts_tenant_created", "tenant_id", "created_at"),
+        Index("idx_alerts_tenant_env_created", "tenant_id", "environment", "created_at"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -165,7 +168,7 @@ class KnowledgeBaseRecord(Base, TimestampMixin):
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     service: Mapped[str] = mapped_column(String(128), index=True)
     title: Mapped[str] = mapped_column(String(255))
-    content: Mapped[str] = mapped_column(Text)
+    content: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"))
     embedding_ref: Mapped[str | None] = mapped_column(String(255))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
@@ -855,6 +858,8 @@ async def create_schema(engine: AsyncEngine) -> None:
                 # filesort path, which otherwise sorts full JSON-bearing rows.
                 live_event_indexes = (
                     ("alerts", "idx_alerts_tenant_updated", "tenant_id, updated_at"),
+                    ("alerts", "idx_alerts_tenant_created", "tenant_id, created_at"),
+                    ("alerts", "idx_alerts_tenant_env_created", "tenant_id, environment, created_at"),
                     ("actions", "idx_actions_tenant_updated", "tenant_id, updated_at"),
                     ("incident_projections", "idx_incident_projections_tenant_updated", "tenant_id, updated_at"),
                     ("monitoring_connection_health", "idx_monitoring_health_updated", "updated_at"),
@@ -870,6 +875,18 @@ async def create_schema(engine: AsyncEngine) -> None:
                     )
                     if int(has_index or 0) == 0:
                         await connection.execute(text(f"CREATE INDEX {index_name} ON {table_name} ({columns})"))
+
+                knowledge_content_type = await connection.scalar(
+                    text(
+                        "SELECT DATA_TYPE FROM information_schema.columns "
+                        "WHERE table_schema = DATABASE() "
+                        "AND table_name = 'knowledge_base' AND column_name = 'content'"
+                    )
+                )
+                if str(knowledge_content_type or "").lower() != "longtext":
+                    await connection.execute(
+                        text("ALTER TABLE knowledge_base MODIFY COLUMN content LONGTEXT NOT NULL")
+                    )
 
                 has_onboarding_tenant = await connection.scalar(
                     text(

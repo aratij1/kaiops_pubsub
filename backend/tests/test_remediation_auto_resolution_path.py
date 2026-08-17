@@ -41,6 +41,7 @@ def test_live_execution_accepts_complete_jenkins_connector() -> None:
         approver="sre-user",
         comment="rollback deployment",
         metadata={
+            "service": "checkout-api",
             "connection_profile": {
                 "executor_type": "jenkins",
                 "endpoint_url": "http://jenkins:8080",
@@ -52,6 +53,82 @@ def test_live_execution_accepts_complete_jenkins_connector() -> None:
     action = module.engine.build_action(approval)
 
     module._require_live_executor_configuration(action)
+
+
+def test_live_execution_rejects_incident_uuid_as_jenkins_target() -> None:
+    module = load_remediation_app_module()
+    approval = Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="sre-user",
+        comment="rollback deployment",
+        metadata={
+            "connection_profile": {
+                "executor_type": "jenkins",
+                "endpoint_url": "http://jenkins:8080",
+                "job_name": "kaiops-auto-remediation",
+                "credential_ref": "vault://kaiops/local/jenkins#api-token",
+            }
+        },
+    )
+    action = module.engine.build_action(approval)
+
+    with pytest.raises(module.HTTPException, match="incident UUID") as exc_info:
+        module._require_live_executor_configuration(action)
+
+    assert exc_info.value.status_code == 409
+
+
+def test_live_execution_accepts_durable_remediation_engine_self_restart() -> None:
+    module = load_remediation_app_module()
+    approval = Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="sre-user",
+        comment="restart service",
+        metadata={
+            "service": "kaiops-remediation-engine",
+            "connection_profile": {
+                "executor_type": "jenkins",
+                "endpoint_url": "http://jenkins:8080",
+                "job_name": "kaiops-auto-remediation",
+                "credential_ref": "vault://kaiops/prod/jenkins",
+            },
+        },
+    )
+    action = module.engine.build_action(approval)
+
+    module.settings.remediation_temporal_enabled = True
+    module._require_live_executor_configuration(action)
+
+
+def test_live_execution_rejects_synchronous_remediation_engine_self_restart() -> None:
+    module = load_remediation_app_module()
+    approval = Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="sre-user",
+        comment="restart service",
+        metadata={
+            "service": "kaiops-remediation-engine",
+            "connection_profile": {
+                "executor_type": "jenkins",
+                "endpoint_url": "http://jenkins:8080",
+                "job_name": "kaiops-auto-remediation",
+                "credential_ref": "vault://kaiops/prod/jenkins",
+            },
+        },
+    )
+    action = module.engine.build_action(approval)
+
+    module.settings.remediation_temporal_enabled = False
+    with pytest.raises(module.HTTPException, match="cannot synchronously restart itself") as exc_info:
+        module._require_live_executor_configuration(action)
+
+    assert exc_info.value.status_code == 409
 
 
 def test_resolution_requires_approval_prefers_decision_payload() -> None:

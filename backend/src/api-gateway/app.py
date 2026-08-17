@@ -2458,6 +2458,19 @@ async def remediation_dry_run(
     )
 
 
+@app.get("/remediation/actions/by-incident/{incident_id}/latest")
+async def remediation_latest_action(incident_id: str, request: Request) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/actions/by-incident/{quote(incident_id, safe='')}/latest",
+        target_base=settings.remediation_engine_url,
+        payload=None,
+        trace_id=trace_id_from_header(None),
+        timeout_seconds=30.0,
+    )
+
+
 @app.post("/rag/documents")
 async def ingest_rag_document(
     request: Request,

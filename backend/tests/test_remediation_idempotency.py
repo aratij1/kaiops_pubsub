@@ -124,4 +124,26 @@ async def test_execute_rejects_unpersisted_human_approval(sqlite_session_factory
         await module.execute_approval(approval)
 
     assert getattr(exc_info.value, "status_code", None) == 409
-    assert "persist an approved or modified human decision" in str(getattr(exc_info.value, "detail", ""))
+    assert "exact approval ID" in str(getattr(exc_info.value, "detail", ""))
+
+
+@pytest.mark.asyncio
+async def test_execute_rejects_different_id_for_same_approved_recommendation(sqlite_session_factory) -> None:
+    module = load_remediation_app_module()
+    module.settings.database_enabled = True
+    module.app.state.session_factory = sqlite_session_factory
+    persisted = Approval(
+        incident_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        recommendation_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        decision=ApprovalDecision.APPROVED,
+        approver="operator@example.com",
+    )
+    forged = persisted.model_copy(update={"id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"})
+    async with sqlite_session_factory() as session:
+        await IncidentRepository(session).save_approval(persisted)
+        await session.commit()
+
+    with pytest.raises(Exception) as exc_info:
+        await module.execute_approval(forged)
+
+    assert getattr(exc_info.value, "status_code", None) == 409

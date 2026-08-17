@@ -37,7 +37,7 @@ x-service-env: &service-env
   CONTEXT_AGENT_URL: http://context-agent:8000
   RESOLUTION_AGENT_URL: http://resolution-agent:8000
   REMEDIATION_EXECUTION_PLATFORM: ${REMEDIATION_EXECUTION_PLATFORM:-docker-compose}
-  REMEDIATION_COMPOSE_PROJECT: ${REMEDIATION_COMPOSE_PROJECT:-kaiops_azure}
+  REMEDIATION_COMPOSE_PROJECT: ${REMEDIATION_COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-kaiops_azure}}
   APPROVAL_SERVICE_URL: http://approval-service:8000
   ORCHESTRATOR_URL: http://orchestrator:8000
   MODEL_ROUTER_URL: http://model-router:8000
@@ -175,6 +175,11 @@ x-service-env: &service-env
   RABBITMQ_CONSUMER_PREFETCH_COUNT: ${RABBITMQ_CONSUMER_PREFETCH_COUNT:-2}
   RABBITMQ_HANDLER_TIMEOUT_SECONDS: ${RABBITMQ_HANDLER_TIMEOUT_SECONDS:-60}
   RABBITMQ_CONSUMER_MAX_RETRIES: ${RABBITMQ_CONSUMER_MAX_RETRIES:-1}
+  # Docker restarts containers concurrently and does not re-apply depends_on
+  # ordering. Give the broker its full cold-start window instead of making
+  # every Python service enter a CPU-heavy restart loop after 60 seconds.
+  RABBITMQ_STARTUP_ATTEMPTS: ${RABBITMQ_STARTUP_ATTEMPTS:-90}
+  RABBITMQ_STARTUP_RETRY_SECONDS: ${RABBITMQ_STARTUP_RETRY_SECONDS:-2}
   RABBITMQ_DLQ_SUFFIX: .dlq
   DATABASE_ENABLED: "true"
   AZURE_SERVICE_BUS_ENABLED: ${AZURE_SERVICE_BUS_ENABLED:-false}
@@ -329,7 +334,11 @@ services:
 
   rabbitmq:
     image: rabbitmq:3.13-management
-    restart: unless-stopped
+    # Core dependency: recover after Docker Desktop/WSL restarts even if a
+    # previous diagnostic session explicitly stopped the container.
+    restart: always
+    init: true
+    stop_grace_period: 90s
     mem_limit: 1g
     mem_reservation: 384m
     cpus: 2.0
@@ -727,7 +736,8 @@ services:
       # Cheap normalization/correlation can safely reserve a larger batch.
       # Context and resolution retain the shared prefetch of two so LLM work
       # remains bounded even during an alert storm.
-      RABBITMQ_CONSUMER_PREFETCH_COUNT: ${ALERT_INTELLIGENCE_PREFETCH_COUNT:-16}
+      RABBITMQ_CONSUMER_PREFETCH_COUNT: ${ALERT_INTELLIGENCE_PREFETCH_COUNT:-2}
+      ALERT_CORRELATION_CANDIDATE_LIMIT: ${ALERT_CORRELATION_CANDIDATE_LIMIT:-250}
       # Correlation/qualification already has a deterministic implementation.
       # One remote model call per raw alert created the ingestion backlog and
       # delayed context/RCA for newer alerts.
@@ -772,10 +782,10 @@ services:
       # Auto reuses complete cached context. Per event, realtime forces fresh
       # discovery and historical uses periodic snapshots without live calls.
       CONTEXT_STRATEGY: ${CONTEXT_STRATEGY:-auto}
-      CONTEXT_KNOWLEDGE_TTL_SECONDS: ${CONTEXT_KNOWLEDGE_TTL_SECONDS:-604800}
+      CONTEXT_KNOWLEDGE_TTL_SECONDS: ${CONTEXT_KNOWLEDGE_TTL_SECONDS:-0}
       CONTEXT_RESOLUTION_REUSE_ENABLED: ${CONTEXT_RESOLUTION_REUSE_ENABLED:-true}
       CONTEXT_RESOLUTION_REUSE_MIN_SCORE: ${CONTEXT_RESOLUTION_REUSE_MIN_SCORE:-0.70}
-      CONTEXT_HISTORICAL_MAX_AGE_SECONDS: ${CONTEXT_HISTORICAL_MAX_AGE_SECONDS:-2592000}
+      CONTEXT_HISTORICAL_MAX_AGE_SECONDS: ${CONTEXT_HISTORICAL_MAX_AGE_SECONDS:-0}
       MESSAGE_BUS_WORKER_COUNT: ${CONTEXT_AGENT_WORKER_COUNT:-2}
       DISCOVERY_MCP_URL: http://discovery-mcp:8000/mcp
       DISCOVERY_MCP_TIMEOUT_SECONDS: ${DISCOVERY_MCP_TIMEOUT_SECONDS:-15}
@@ -935,12 +945,18 @@ services:
       REMEDIATION_TEMPORAL_ENABLED: "true"
       REMEDIATION_TEMPORAL_TASK_QUEUE: kaiops-remediation
       REMEDIATION_INTERNAL_TOKEN: ${REMEDIATION_INTERNAL_TOKEN:-kaiops-local-temporal-remediation}
-      AI_LAYER_REQUEST_TIMEOUT_SECONDS: "1000"
+      AI_LAYER_REQUEST_TIMEOUT_SECONDS: "1500"
     command: ["python", "-m", "temporal_pilot.worker"]
     working_dir: /app
     depends_on:
       mysql: { condition: service_healthy }
       temporal: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import pathlib; assert any('temporal_pilot.worker' in p.read_bytes().decode('utf-8','ignore') for p in pathlib.Path('/proc').glob('[0-9]*/cmdline'))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
 
   remediation-engine:
     build: *service-build
@@ -959,15 +975,22 @@ services:
       REMEDIATION_JENKINS_JOB: ${REMEDIATION_JENKINS_JOB:-kaiops-auto-remediation}
       REMEDIATION_JENKINS_CREDENTIAL_REF: ${REMEDIATION_JENKINS_CREDENTIAL_REF:-vault://kaiops/local/jenkins#api-token}
       REMEDIATION_EXECUTION_PLATFORM: ${REMEDIATION_EXECUTION_PLATFORM:-docker-compose}
-      REMEDIATION_COMPOSE_PROJECT: ${REMEDIATION_COMPOSE_PROJECT:-kaiops_azure}
+      REMEDIATION_COMPOSE_PROJECT: ${REMEDIATION_COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-kaiops_azure}}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/remediation-engine
     ports: ["8008:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/executors/readiness', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 4
+      start_period: 30s
     depends_on:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
-      jenkins: { condition: service_started }
+      jenkins: { condition: service_healthy }
       temporal: { condition: service_healthy }
+      temporal-pilot-worker: { condition: service_healthy }
 
   jenkins:
     build:
@@ -979,12 +1002,18 @@ services:
       JENKINS_BOOTSTRAP_PASSWORD: ${JENKINS_API_TOKEN:-kaiops-local-token}
       JAVA_OPTS: -Djenkins.install.runSetupWizard=false
       DOCKER_HOST: tcp://docker-socket-proxy:2375
-    ports: ["8082:8080"]
+    ports: ["${JENKINS_HOST_PORT:-8083}:8080"]
     volumes:
       - jenkins-data:/var/jenkins_home
       - ./deploy/jenkins:/opt/kaiops:ro
     depends_on:
       docker-socket-proxy: { condition: service_started }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/login >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 8s
+      retries: 20
+      start_period: 60s
 
   closure-service:
     build: *service-build
@@ -1018,10 +1047,9 @@ services:
     # forwarding them. Bind IPv4 explicitly so Windows falls back from ::1.
     ports: ["${UI_BIND_ADDRESS:-127.0.0.1}:8501:80"]
     restart: unless-stopped
-    depends_on:
-      api-gateway: { condition: service_healthy }
-      approval-service: { condition: service_started }
-      monitoring-adapter: { condition: service_started }
+    # The static UI must remain available while backend services recover. Its
+    # nginx proxy reports backend failures without preventing the UI/login page
+    # from starting, so backend health is intentionally not a startup gate.
 
   ui-dev:
     profiles: ["ui-dev"]

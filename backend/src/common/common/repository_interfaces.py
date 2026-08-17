@@ -3,10 +3,11 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Protocol
 
 from sqlalchemy import select
+from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from common.database import AlertRecord
@@ -47,13 +48,17 @@ class InMemoryAlertHistoryRepository:
 class SqlAlertHistoryRepository:
     session_factory: async_sessionmaker[AsyncSession]
     max_items: int = 1000
+    max_age_minutes: int = 60
 
     async def list_recent_alerts(
         self, *, environment: str | None = None, tenant_id: str | None = None
     ) -> Sequence[Alert]:
         safe_limit = max(1, min(int(self.max_items), 5000))
         async with self.session_factory() as session:
-            query = select(AlertRecord)
+            cutoff = datetime.now().astimezone() - timedelta(minutes=max(1, int(self.max_age_minutes)))
+            query = select(AlertRecord).options(
+                load_only(AlertRecord.id, AlertRecord.payload, AlertRecord.created_at, AlertRecord.updated_at)
+            ).where(AlertRecord.created_at >= cutoff)
             if environment:
                 # Bounds the correlation/dedup candidate scan to the incoming
                 # alert's own environment (prod/staging/... never legitimately

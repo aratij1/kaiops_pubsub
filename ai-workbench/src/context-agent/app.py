@@ -85,9 +85,13 @@ def _context_identity(alert: Alert) -> tuple[str, str, str, str]:
     tenant_id = str(metadata.get("tenant_id") or labels.get("tenant_id") or "default").strip() or "default"
     service = str(alert.service or "unknown").strip().lower() or "unknown"
     environment = str(alert.environment or labels.get("environment") or "prod").strip().lower() or "prod"
+    # Alert type identity must not include deployment-specific labels. A pod,
+    # namespace, project, or application change is another occurrence of the
+    # same alert type and should reuse validated knowledge. Service and
+    # environment retain the safety boundary between distinct workloads.
     stable_labels = {
         key: str(labels.get(key) or "").strip().lower()
-        for key in ("application", "project", "namespace", "category", "alert_family")
+        for key in ("category", "alert_family")
         if str(labels.get(key) or "").strip()
     }
     signature_input = {
@@ -161,9 +165,14 @@ async def _collect_context_with_strategy(
                 return provided
 
     if strategy in {"auto", "historical"} and database_available:
-        configured_ttl = int(getattr(settings, "context_knowledge_ttl_seconds", 604800) or 604800)
-        historical_ttl = int(os.getenv("CONTEXT_HISTORICAL_MAX_AGE_SECONDS", "2592000") or 2592000)
-        ttl_seconds = max(60, historical_ttl if strategy == "historical" else configured_ttl)
+        configured_ttl = int(getattr(settings, "context_knowledge_ttl_seconds", 0) or 0)
+        historical_ttl = int(os.getenv("CONTEXT_HISTORICAL_MAX_AGE_SECONDS", "0") or 0)
+        ttl_seconds = historical_ttl if strategy == "historical" else configured_ttl
+        not_before = (
+            datetime.now(timezone.utc) - timedelta(seconds=max(60, ttl_seconds))
+            if ttl_seconds > 0
+            else datetime.min.replace(tzinfo=timezone.utc)
+        )
         try:
             async with session_factory() as session:
                 repo = IncidentRepository(session)
@@ -171,8 +180,9 @@ async def _collect_context_with_strategy(
                     tenant_id=tenant_id,
                     service=service,
                     environment=environment,
+                    alert_name=str(alert.name or "unknown"),
                     alert_signature=signature,
-                    not_before=datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds),
+                    not_before=not_before,
                 )
                 CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "hit" if cached else "miss").inc()
                 if cached:
@@ -190,7 +200,7 @@ async def _collect_context_with_strategy(
                         logger.exception("invalid cached context knowledge id=%s; refreshing", cached.get("id"))
                     else:
                         complete, missing = _context_completeness(context)
-                        if strategy == "auto" and (not complete or not _has_code_evidence(context)):
+                        if strategy == "auto" and not complete:
                             CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "incomplete").inc()
                             continue_with_refresh = True
                         else:
@@ -202,8 +212,11 @@ async def _collect_context_with_strategy(
                             context.metadata = {
                                 **(context.metadata if isinstance(context.metadata, dict) else {}),
                                 "context_strategy": strategy,
-                                "context_source": "periodic_cache" if strategy == "historical" else "cache",
+                                "context_source": "periodic_knowledge",
                                 "context_reused": True,
+                                "alert_type_known": True,
+                                "knowledge_route": "reuse_periodic_knowledge",
+                                "knowledge_match_type": cached.get("match_type", "signature"),
                                 "context_complete": complete,
                                 "context_missing_sections": missing,
                                 "realtime_collection_performed": False,
@@ -255,6 +268,8 @@ async def _collect_context_with_strategy(
         "context_strategy": strategy,
         "context_reused": False,
         "context_source": "realtime_collection",
+        "alert_type_known": False,
+        "knowledge_route": "full_context_then_learn",
         "context_complete": _context_completeness(context)[0],
         "context_missing_sections": _context_completeness(context)[1],
         "realtime_collection_performed": True,
@@ -1281,7 +1296,8 @@ async def context_strategy_status() -> dict[str, Any]:
         "supported": ["auto", "realtime", "historical"],
         "auto": {
             "cache_aside": True,
-            "ttl_seconds": max(60, int(getattr(settings, "context_knowledge_ttl_seconds", 604800) or 604800)),
+            "ttl_seconds": int(getattr(settings, "context_knowledge_ttl_seconds", 0) or 0) or None,
+            "refresh_policy": "new_type_or_unqualified_knowledge",
             "match_scope": ["tenant", "service", "environment", "alert-family"],
             "resolution_reuse_enabled": bool(getattr(settings, "context_resolution_reuse_enabled", True)),
             "resolution_reuse_min_score": float(getattr(settings, "context_resolution_reuse_min_score", 0.7) or 0.7),

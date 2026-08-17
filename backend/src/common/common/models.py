@@ -37,11 +37,28 @@ class ApprovalDecision(StrEnum):
 
 
 class RemediationStatus(StrEnum):
+    DRAFT = "draft"
+    POLICY_CHECKED = "policy_checked"
+    AWAITING_APPROVAL = "awaiting_approval"
+    APPROVED = "approved"
+    DISPATCHING = "dispatching"
+    EXECUTOR_ACCEPTED = "executor_accepted"
     PENDING = "pending"
     RUNNING = "running"
+    VERIFYING = "verifying"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     SKIPPED = "skipped"
+    POLICY_BLOCKED = "policy_blocked"
+    DISPATCH_FAILED = "dispatch_failed"
+    EXECUTION_FAILED = "execution_failed"
+    VALIDATION_FAILED = "validation_failed"
+    ROLLING_BACK = "rolling_back"
+    ROLLED_BACK = "rolled_back"
+    ROLLBACK_FAILED = "rollback_failed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+    MANUAL_INTERVENTION_REQUIRED = "manual_intervention_required"
 
 
 class SafetyDecision(StrEnum):
