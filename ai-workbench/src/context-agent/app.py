@@ -79,6 +79,29 @@ def _has_code_evidence(context: Context) -> bool:
     )
 
 
+def normalize_alert_name(name: str) -> str:
+    if not name:
+        return ""
+    cleaned = name.strip().lower()
+    cleaned = re.sub(r"\d{4}-?\d{2}-?\d{2}[tT]\d{2}:?\d{2}:?\d{2}(?:\.\d+)?(?:[zZ]|[+-]\d{2}:?\d{2})?", "", cleaned)
+    cleaned = re.sub(r"\d{8}[tT]\d{6}[zZ]", "", cleaned)
+    cleaned = re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "", cleaned)
+    cleaned = re.sub(r"[-_][0-9a-f]{6,12}\b", "", cleaned)
+    cleaned = re.sub(r"[-_]\d+\b", "", cleaned)
+    cleaned = re.sub(r"[-_]+", "-", cleaned)
+    cleaned = cleaned.strip("-")
+    return cleaned or name.strip().lower()
+
+
+def _alert_family_token(name: str) -> str:
+    normalized = normalize_alert_name(name)
+    keywords = ("latency", "timeout", "unavailable", "down", "error", "saturation", "lag", "throughput", "quality")
+    for kw in keywords:
+        if kw in normalized:
+            return kw
+    return normalized
+
+
 def _context_identity(alert: Alert) -> tuple[str, str, str, str]:
     metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
     labels = alert.labels if isinstance(alert.labels, dict) else {}
@@ -96,7 +119,7 @@ def _context_identity(alert: Alert) -> tuple[str, str, str, str]:
     }
     signature_input = {
         "source": str(alert.source or "").strip().lower(),
-        "name": str(alert.name or "").strip().lower(),
+        "name": _alert_family_token(alert.name or ""),
         "service": service,
         "environment": environment,
         "labels": stable_labels,
@@ -200,7 +223,13 @@ async def _collect_context_with_strategy(
                         logger.exception("invalid cached context knowledge id=%s; refreshing", cached.get("id"))
                     else:
                         complete, missing = _context_completeness(context)
+<<<<<<< ours
                         if strategy == "auto" and not complete:
+=======
+                        has_runbook = bool(context.runbook and str(context.runbook).strip())
+                        has_rag = int((context.metadata or {}).get("rag_documents") or 0) > 0
+                        if strategy == "auto" and not (complete or has_runbook or has_rag):
+>>>>>>> theirs
                             CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "incomplete").inc()
                             continue_with_refresh = True
                         else:
