@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from time import perf_counter
 
@@ -54,14 +55,64 @@ async def execute_remediation_decision(approval: dict[str, Any]) -> dict[str, An
 @activity.defn(name="execute_remediation_action")
 async def execute_remediation_action(approval: dict[str, Any]) -> dict[str, Any]:
     activity.heartbeat({"stage": "dispatching", "incident_id": approval.get("incident_id")})
-    result = await _post(
+    execution = asyncio.create_task(_post(
+        settings.remediation_engine_url, "/execute-direct", approval,
+        extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
+    ))
+    while not execution.done():
+        done, _ = await asyncio.wait({execution}, timeout=30.0)
+        if not done:
+            activity.heartbeat({"stage": "executor_running", "incident_id": approval.get("incident_id")})
+    try:
+        result = await execution
+    except httpx.HTTPStatusError as exc:
+        detail = ""
+        try:
+            body = exc.response.json()
+            detail = str(body.get("detail") or body)
+        except (ValueError, AttributeError):
+            detail = str(exc.response.text or "").strip()
+        error = detail or f"Remediation executor rejected the request with HTTP {exc.response.status_code}."
+        result = await _post(
+            settings.remediation_engine_url,
+            "/execution-failed",
+            {"approval": approval, "error": error, "http_status": exc.response.status_code},
+            extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
+        )
+    activity.heartbeat({"stage": "terminal", "status": result.get("status")})
+    return result
+
+
+@activity.defn(name="dispatch_remediation_action")
+async def dispatch_remediation_action(approval: dict[str, Any]) -> dict[str, Any]:
+    activity.heartbeat({"stage": "dispatching", "incident_id": approval.get("incident_id")})
+    return await _post(
         settings.remediation_engine_url,
-        "/execute-direct",
+        "/dispatch-direct",
         approval,
         extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
     )
-    activity.heartbeat({"stage": "terminal", "status": result.get("status")})
-    return result
+
+
+@activity.defn(name="reconcile_remediation_action")
+async def reconcile_remediation_action(approval: dict[str, Any]) -> dict[str, Any]:
+    activity.heartbeat({"stage": "reconciling", "incident_id": approval.get("incident_id")})
+    return await _post(
+        settings.remediation_engine_url,
+        "/reconcile-direct",
+        {"approval": approval},
+        extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
+    )
+
+
+@activity.defn(name="timeout_remediation_action")
+async def timeout_remediation_action(approval: dict[str, Any]) -> dict[str, Any]:
+    return await _post(
+        settings.remediation_engine_url,
+        "/timeout-direct",
+        {"approval": approval, "error": "Executor did not reach a terminal state within 25 minutes."},
+        extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
+    )
 
 
 @activity.defn(name="preflight_remediation_action")

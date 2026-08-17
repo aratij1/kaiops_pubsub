@@ -19,7 +19,7 @@ const stageOrder = [
   { id: "jira", cockpit: "overview", label: "Jira", detail: "Ticket created" },
   { id: "decision", cockpit: "overview", label: "Decision", detail: "Incident or noise" },
   { id: "context", cockpit: "evidence", label: "Context", detail: "Evidence collected" },
-  { id: "understand", cockpit: "rca", label: "Understand", detail: "RCA and impact" },
+  { id: "understand", cockpit: "evidence", label: "Evidence & Understanding", detail: "Evidence, RCA, and impact" },
   { id: "approval", cockpit: "execution", label: "Approval", detail: "Decision gate" },
   { id: "resolve", cockpit: "execution", label: "Resolve", detail: "Plan and remediate" },
   { id: "validate", cockpit: "audit", label: "Validate", detail: "Verify and close" },

@@ -7,7 +7,7 @@ def approvedCommand(String command) {
         ~/^redis-cli\s+-h\s+[A-Za-z0-9_.-]+\s+-n\s+\d+\s+FLUSHDB$/,
         ~/^terraform\s+(init|apply)\b.*/,
         ~/^mysql\s+-e\s+"CALL mysql\.rds_failover\(\);"$/,
-        ~/^curl --fail --silent --show-error( --retry \d+)?( --retry-all-errors)?( --retry-connrefused)?( --retry-delay \d+)?( -X POST)? http:\/\/[A-Za-z0-9_.:-]+\/[A-Za-z0-9_./?=&-]+$/
+        ~/^curl --fail --silent --show-error( --output \/dev\/null)?( --retry \d+)?( --retry-all-errors)?( --retry-connrefused)?( --retry-delay \d+)?( -X POST)? http:\/\/[A-Za-z0-9_.:-]+\/[A-Za-z0-9_.\/?=&-]+$/
     ]
     return value && value.length() <= 1000 && !value.contains('\n') && patterns.any { value ==~ it }
 }
@@ -23,7 +23,6 @@ pipeline {
     options {
         disableConcurrentBuilds()
         timeout(time: 20, unit: 'MINUTES')
-        timestamps()
         buildDiscarder(logRotator(numToKeepStr: '50', artifactNumToKeepStr: '20'))
         preserveStashes(buildCount: 5)
         durabilityHint('MAX_SURVIVABILITY')
@@ -56,12 +55,14 @@ pipeline {
                     def preflight = plan.preflight instanceof List ? plan.preflight : []
                     def validation = plan.validation_commands instanceof List ? plan.validation_commands : []
                     def rollback = plan.rollback_commands instanceof List ? plan.rollback_commands : []
+                    def rollbackMode = (plan.rollback_mode ?: 'automatic') as String
                     if (mutating && !params.KAI_OPS_APPROVAL_ID?.trim()) { error('A persisted KaiOps approval id is required for a mutating resolution') }
                     if (mutating && !commands) { error('The governed plan contains no remediation commands') }
-                    if (mutating && !params.KAI_OPS_DRY_RUN && (!preflight || !validation || !rollback)) { error('Live self-healing requires executable preflight, validation, and rollback commands') }
+                    if (mutating && !params.KAI_OPS_DRY_RUN && (!preflight || !validation)) { error('Live self-healing requires executable preflight and validation commands') }
+                    if (mutating && !params.KAI_OPS_DRY_RUN && rollbackMode == 'automatic' && !rollback) { error('An automatic rollback mode requires executable rollback commands') }
                     def rejected = [*commands, *preflight, *validation, *rollback].findAll { !approvedCommand(it as String) }
                     if (rejected) { error("Plan contains commands outside the allowlist: ${rejected.join(', ')}") }
-                    env.KAI_OPS_PLAN_JSON = writeJSON(json: [commands: commands, preflight: preflight, validation: validation, rollback: rollback], returnText: true)
+                    env.KAI_OPS_PLAN_JSON = writeJSON(json: [commands: commands, preflight: preflight, validation: validation, rollback: rollback, rollback_mode: rollbackMode], returnText: true)
                     currentBuild.description = "${params.KAI_OPS_RESOLUTION_ID} | ${params.KAI_OPS_INCIDENT_ID} | ${params.KAI_OPS_TARGET}"
                     writeJSON file: 'kaiops-request.json', json: [schema_version:'kaiops.remediation.audit.v2', incident_id:params.KAI_OPS_INCIDENT_ID, approval_id:params.KAI_OPS_APPROVAL_ID, application_id:params.KAI_OPS_APPLICATION_ID, target:params.KAI_OPS_TARGET, environment:params.KAI_OPS_ENVIRONMENT, namespace:params.KAI_OPS_NAMESPACE, resolution_id:params.KAI_OPS_RESOLUTION_ID, policy_version:params.KAI_OPS_POLICY_VERSION, dry_run:params.KAI_OPS_DRY_RUN, build_url:env.BUILD_URL]
                 }
@@ -86,7 +87,7 @@ pipeline {
                         env.KAI_OPS_VALIDATED = 'true'
                     } catch (failure) {
                         env.KAI_OPS_FAILURE = failure.message.take(500)
-                        if (!params.KAI_OPS_DRY_RUN && env.KAI_OPS_EXECUTED == 'true') {
+                        if (!params.KAI_OPS_DRY_RUN && env.KAI_OPS_EXECUTED == 'true' && plan.rollback_mode == 'automatic' && plan.rollback) {
                             env.KAI_OPS_ROLLBACK_ATTEMPTED = 'true'
                             plan.rollback.reverseEach { runGovernedCommand('Automatic rollback', it as String, false) }
                             env.KAI_OPS_ROLLBACK_SUCCEEDED = 'true'
@@ -99,7 +100,7 @@ pipeline {
         stage('Publish recovery evidence') {
             steps {
                 milestone ordinal: 30, label: 'validated-recovery'
-                script { writeJSON file: 'kaiops-result.json', json: [schema_version:'kaiops.remediation.result.v2', incident_id:params.KAI_OPS_INCIDENT_ID, approval_id:params.KAI_OPS_APPROVAL_ID, resolution_id:params.KAI_OPS_RESOLUTION_ID, target:params.KAI_OPS_TARGET, dry_run:params.KAI_OPS_DRY_RUN, preflight_passed:env.KAI_OPS_PREFLIGHT_PASSED == 'true', executed:env.KAI_OPS_EXECUTED == 'true', recovery_validated:env.KAI_OPS_VALIDATED == 'true', rollback_attempted:false, result:'SUCCESS', completed_at:new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")] }
+                script { writeJSON file: 'kaiops-result.json', json: [schema_version:'kaiops.remediation.result.v2', incident_id:params.KAI_OPS_INCIDENT_ID, approval_id:params.KAI_OPS_APPROVAL_ID, resolution_id:params.KAI_OPS_RESOLUTION_ID, target:params.KAI_OPS_TARGET, dry_run:params.KAI_OPS_DRY_RUN, preflight_passed:env.KAI_OPS_PREFLIGHT_PASSED == 'true', executed:env.KAI_OPS_EXECUTED == 'true', recovery_validated:env.KAI_OPS_VALIDATED == 'true', rollback_attempted:env.KAI_OPS_ROLLBACK_ATTEMPTED == 'true', rollback_succeeded:env.KAI_OPS_ROLLBACK_SUCCEEDED == 'true', result:'SUCCESS', completed_at:new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")] }
             }
         }
     }

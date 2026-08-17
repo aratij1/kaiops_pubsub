@@ -1752,6 +1752,7 @@ function deriveExecutionCommands(workflow, traceRows) {
     (Array.isArray(plan.commands) ? plan.commands : []).forEach((item) => pushUnique(item, "cmd: "));
     (Array.isArray(plan.scripts) ? plan.scripts : []).forEach((item) => pushUnique(item, "script: "));
     (Array.isArray(plan.queries) ? plan.queries : []).forEach((item) => pushUnique(item, "query: "));
+    (Array.isArray(plan.validation_commands) ? plan.validation_commands : []).forEach((item) => pushUnique(item, "query: "));
   };
 
   explicit.forEach((item) => pushUnique(item, "cmd: "));
@@ -1813,8 +1814,16 @@ function remediationOutcomeFromAction(action) {
     title = "Automatic execution deferred for human approval";
   } else if (status === "skipped") {
     title = "Remediation was not executed";
-  } else if (status === "failed") {
+  } else if (["failed", "dispatch_failed", "execution_failed", "validation_failed", "rollback_failed", "timed_out"].includes(status)) {
     title = "Remediation execution failed";
+  } else if (status === "executor_accepted") {
+    title = "Executor accepted the remediation";
+  } else if (status === "dispatching") {
+    title = "Dispatching remediation";
+  } else if (status === "verifying") {
+    title = "Verifying recovery";
+  } else if (status === "rolled_back") {
+    title = "Remediation rolled back";
   }
 
   let detail = reason || `Remediation engine returned status ${status || "unknown"}.`;

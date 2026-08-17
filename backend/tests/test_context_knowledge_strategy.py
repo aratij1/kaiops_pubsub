@@ -100,6 +100,43 @@ async def test_auto_mode_collects_once_then_reuses_complete_durable_context(sqli
     assert second.metadata["context_source_alert_id"] == str(first_alert.id)
     assert second.metadata["context_knowledge_id"] == first.metadata["context_knowledge_id"]
     assert second.metadata["prior_resolution"]["root_cause"].startswith("A blocked worker")
+    assert second.metadata["alert_type_known"] is True
+    assert second.metadata["knowledge_route"] == "reuse_periodic_knowledge"
+
+
+@pytest.mark.asyncio
+async def test_same_alert_type_reuses_knowledge_across_volatile_labels(sqlite_session_factory) -> None:
+    module = load_context_app_module()
+    collector = CountingContextAgent()
+    module.agent = collector
+    module.settings.database_enabled = True
+    module.settings.context_strategy = "auto"
+    module.settings.context_knowledge_ttl_seconds = 3600
+    module.settings.context_resolution_reuse_enabled = True
+    module.settings.context_resolution_reuse_min_score = 0.7
+    module.app.state.session_factory = sqlite_session_factory
+
+    first_alert = make_alert()
+    first = await module._collect_context_with_strategy(module.app, first_alert, make_incident(first_alert))
+    async with sqlite_session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.attach_context_knowledge_resolution(
+            first.metadata["context_knowledge_id"],
+            {"root_cause": "Known queue saturation", "impact": "Delayed orders", "confidence": 0.91},
+        )
+        await session.commit()
+
+    repeated_alert = make_alert().model_copy(
+        update={"labels": {"application": "orders-v2", "namespace": "blue", "project": "migration"}}
+    )
+    repeated = await module._collect_context_with_strategy(
+        module.app, repeated_alert, make_incident(repeated_alert)
+    )
+
+    assert collector.calls == 1
+    assert repeated.metadata["context_reused"] is True
+    assert repeated.metadata["context_source"] == "periodic_knowledge"
+    assert repeated.metadata["realtime_collection_performed"] is False
 
 
 @pytest.mark.asyncio
