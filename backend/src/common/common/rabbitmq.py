@@ -268,6 +268,9 @@ async def consume_forever(
                 await asyncio.sleep(1)
                 continue
 
+            max_concurrent = max(1, int(getattr(consumer._settings, "rabbitmq_max_concurrent_handlers", 10) or 10))
+            semaphore = asyncio.Semaphore(max_concurrent)
+
             async with consumer._queue.iterator() as iterator:
                 async for message in iterator:
                     try:
@@ -282,112 +285,199 @@ async def consume_forever(
                         await message.ack()
                         continue
 
-                    identity = extract_message_identity(payload)
-                    if await processing_cancelled(consumer._settings, payload):
-                        logger.warning("cancelled alert removed from rabbitmq processing", extra={"topic": consumer._topic, "message_identity": identity})
-                        await message.ack()
-                        continue
-                    if processed_cache.contains(identity):
-                        logger.info("skipping duplicate rabbitmq message", extra={"topic": consumer._topic, "message_identity": identity})
-                        await message.ack()
-                        continue
-
-                    attempts = 0
-                    max_retries = max(0, int(consumer._settings.rabbitmq_consumer_max_retries or 0))
-                    success = False
-                    dlq_published = False
-
-                    last_error = ""
+                    # Stale Message Discard: If older than threshold, acknowledge instantly and skip
                     produced_at = decoded.get("produced_at") if isinstance(decoded, dict) else None
+                    is_stale = False
                     if produced_at:
                         try:
                             produced = datetime.fromisoformat(str(produced_at).replace("Z", "+00:00"))
-                            QUEUE_AGE.labels("rabbitmq", consumer._topic).observe(max(0.0, (datetime.now(timezone.utc) - produced).total_seconds()))
+                            age_seconds = (datetime.now(timezone.utc) - produced).total_seconds()
+                            max_age = float(getattr(consumer._settings, "rabbitmq_max_message_age_seconds", 300.0) or 300.0)
+                            if age_seconds > max_age:
+                                is_stale = True
+                                logger.warning(
+                                    "discarding stale rabbitmq message: topic=%s age=%.1fs threshold=%.1fs",
+                                    consumer._topic,
+                                    age_seconds,
+                                    max_age,
+                                )
                         except (TypeError, ValueError):
                             pass
-                    parent_context = propagate.extract(dict(getattr(message, "headers", None) or {}))
-                    while attempts <= max_retries:
-                        try:
-                            with trace.get_tracer("kaiops.rabbitmq").start_as_current_span("rabbitmq.consume", context=parent_context) as span:
-                                span.set_attribute("messaging.system", "rabbitmq")
-                                span.set_attribute("messaging.destination.name", consumer._topic)
-                                await asyncio.wait_for(handler(payload), timeout=consumer._settings.rabbitmq_handler_timeout_seconds)
-                            success = True
-                            processed_cache.mark(identity)
-                            break
-                        except Exception as exc:
-                            # Includes asyncio.TimeoutError: without a bound here a
-                            # single hung downstream call could block this consumer
-                            # (and its whole prefetch batch) indefinitely.
-                            last_error = str(exc) or exc.__class__.__name__
-                            attempts += 1
-                            if attempts > max_retries:
-                                break
-                            await asyncio.sleep(min(2**attempts, 5))
 
-                    if success:
+                    if is_stale:
                         await message.ack()
                         continue
 
-                    logger.error(
-                        "failed to process rabbitmq message: topic=%s identity=%s attempts=%s error=%s",
-                        consumer._topic,
-                        identity,
-                        attempts,
-                        last_error,
-                        extra={
-                            "topic": consumer._topic,
-                            "attempts": attempts,
-                            "max_retries": max_retries,
-                            "error": last_error,
-                            "message_identity": identity,
-                        },
-                    )
-                    if (
-                        consumer._settings.rabbitmq_transient_requeue_enabled
-                        and _is_transient_handler_error(last_error)
-                    ):
-                        logger.warning(
-                            "requeueing rabbitmq message after transient dependency failure: topic=%s identity=%s error=%s",
-                            consumer._topic,
-                            identity,
-                            last_error,
-                        )
-                        await asyncio.sleep(min(5.0, max(1.0, float(attempts))))
-                        await message.nack(requeue=True)
-                        continue
-                    if consumer._exchange is not None and consumer._dlq_routing_key:
+                    # Bounded concurrency backpressure
+                    await semaphore.acquire()
+
+                    async def process_message(msg=message, dec=decoded, pay=payload):
                         try:
-                            envelope = {
-                                "failed_topic": consumer._topic,
-                                "payload": payload,
-                                "error": last_error or "handler_failed",
-                                "attempts": attempts,
-                                "failed_at": datetime.now(timezone.utc).isoformat(),
-                            }
-                            await consumer._exchange.publish(
-                                Message(
-                                    json.dumps(envelope, default=str).encode("utf-8"),
-                                    content_type="application/json",
-                                    delivery_mode=DeliveryMode.PERSISTENT,
-                                    type=consumer._dlq_routing_key,
-                                    app_id="kaiops",
-                                ),
-                                routing_key=consumer._dlq_routing_key,
+                            identity = extract_message_identity(pay)
+                            if await processing_cancelled(consumer._settings, pay):
+                                logger.warning("cancelled alert removed from rabbitmq processing", extra={"topic": consumer._topic, "message_identity": identity})
+                                await msg.ack()
+                                return
+                            if processed_cache.contains(identity):
+                                logger.info("skipping duplicate rabbitmq message", extra={"topic": consumer._topic, "message_identity": identity})
+                                await msg.ack()
+                                return
+
+                            attempts = 0
+                            max_retries = max(0, int(consumer._settings.rabbitmq_consumer_max_retries or 0))
+                            success = False
+                            dlq_published = False
+
+                            last_error = ""
+                            produced_at_val = dec.get("produced_at") if isinstance(dec, dict) else None
+                            if produced_at_val:
+                                try:
+                                    produced_dt = datetime.fromisoformat(str(produced_at_val).replace("Z", "+00:00"))
+                                    QUEUE_AGE.labels("rabbitmq", consumer._topic).observe(max(0.0, (datetime.now(timezone.utc) - produced_dt).total_seconds()))
+                                except (TypeError, ValueError):
+                                    pass
+                            parent_context = propagate.extract(dict(getattr(msg, "headers", None) or {}))
+                            timed_out = False
+                            while attempts <= max_retries:
+                                try:
+                                    with trace.get_tracer("kaiops.rabbitmq").start_as_current_span("rabbitmq.consume", context=parent_context) as span:
+                                        span.set_attribute("messaging.system", "rabbitmq")
+                                        span.set_attribute("messaging.destination.name", consumer._topic)
+                                        await asyncio.wait_for(handler(pay), timeout=consumer._settings.rabbitmq_handler_timeout_seconds)
+                                    success = True
+                                    processed_cache.mark(identity)
+                                    break
+                                except Exception as exc:
+                                    timed_out = isinstance(exc, asyncio.TimeoutError)
+                                    last_error = str(exc) or exc.__class__.__name__
+                                    attempts += 1
+                                    if attempts > max_retries:
+                                        break
+                                    await asyncio.sleep(min(2**attempts, 5))
+
+                            if success:
+                                await msg.ack()
+                                return
+
+                            logger.error(
+                                "failed to process rabbitmq message: topic=%s identity=%s attempts=%s error=%s",
+                                consumer._topic,
+                                identity,
+                                attempts,
+                                last_error,
+                                extra={
+                                    "topic": consumer._topic,
+                                    "attempts": attempts,
+                                    "max_retries": max_retries,
+                                    "error": last_error,
+                                    "message_identity": identity,
+                                },
                             )
-                            processed_cache.mark(identity)
-                            dlq_published = True
-                            DEAD_LETTER_EVENTS.labels("rabbitmq", consumer._topic, "handler_failed").inc()
+                            requeue_eligible = timed_out or (
+                                consumer._settings.rabbitmq_transient_requeue_enabled
+                                and _is_transient_handler_error(last_error)
+                            )
+                            if requeue_eligible:
+                                # attempts above are in-process retries for this single
+                                # delivery only; they reset to 0 on every redelivery, so
+                                # a persistently-failing dependency could requeue this
+                                # message forever without a counter that survives
+                                # redelivery. Native nack(requeue=True) redelivers the
+                                # message exactly as originally published — RabbitMQ
+                                # does not merge in any local header mutation — so the
+                                # counter has to travel as a re-published copy instead.
+                                headers = dict(getattr(msg, "headers", None) or {})
+                                redelivery_count = int(headers.get("x-kaiops-requeue-count") or 0) + 1
+                                max_redeliveries = max(
+                                    1, int(consumer._settings.rabbitmq_transient_requeue_max_redeliveries or 1)
+                                )
+                                if redelivery_count <= max_redeliveries and consumer._exchange is not None:
+                                    headers["x-kaiops-requeue-count"] = redelivery_count
+                                    try:
+                                        await asyncio.sleep(min(5.0, max(1.0, float(attempts))))
+                                        await consumer._exchange.publish(
+                                            Message(
+                                                msg.body,
+                                                content_type="application/json",
+                                                delivery_mode=DeliveryMode.PERSISTENT,
+                                                type=msg.type,
+                                                app_id="kaiops",
+                                                headers=headers,
+                                            ),
+                                            routing_key=consumer._topic,
+                                        )
+                                    except Exception:
+                                        logger.exception(
+                                            "failed to republish rabbitmq message for transient retry; "
+                                            "falling through to dlq/poison-pill: topic=%s identity=%s",
+                                            consumer._topic,
+                                            identity,
+                                        )
+                                    else:
+                                        logger.warning(
+                                            "requeueing rabbitmq message after transient/timeout failure: "
+                                            "topic=%s identity=%s error=%s redelivery_count=%s max=%s",
+                                            consumer._topic,
+                                            identity,
+                                            last_error,
+                                            redelivery_count,
+                                            max_redeliveries,
+                                        )
+                                        await msg.ack()
+                                        return
+                                else:
+                                    logger.error(
+                                        "rabbitmq message exceeded max redeliveries; routing to dlq/poison-pill: "
+                                        "topic=%s identity=%s redelivery_count=%s max=%s",
+                                        consumer._topic,
+                                        identity,
+                                        redelivery_count,
+                                        max_redeliveries,
+                                    )
+                            if consumer._exchange is not None and consumer._dlq_routing_key:
+                                try:
+                                    envelope = {
+                                        "failed_topic": consumer._topic,
+                                        "payload": pay,
+                                        "error": last_error or "handler_failed",
+                                        "attempts": attempts,
+                                        "failed_at": datetime.now(timezone.utc).isoformat(),
+                                    }
+                                    await consumer._exchange.publish(
+                                        Message(
+                                            json.dumps(envelope, default=str).encode("utf-8"),
+                                            content_type="application/json",
+                                            delivery_mode=DeliveryMode.PERSISTENT,
+                                            type=consumer._dlq_routing_key,
+                                            app_id="kaiops",
+                                        ),
+                                        routing_key=consumer._dlq_routing_key,
+                                    )
+                                    processed_cache.mark(identity)
+                                    dlq_published = True
+                                    DEAD_LETTER_EVENTS.labels("rabbitmq", consumer._topic, "handler_failed").inc()
+                                except Exception:
+                                    logger.exception(
+                                        "failed to publish rabbitmq dlq message",
+                                        extra={"topic": consumer._topic, "dlq": consumer._dlq_routing_key},
+                                    )
+                            if dlq_published:
+                                await msg.ack()
+                                return
+
+                            # Prevent infinite requeuing by nacking with requeue=False
+                            logger.error(
+                                "rejecting poison rabbitmq message without requeue: topic=%s identity=%s",
+                                consumer._topic,
+                                identity,
+                            )
+                            await msg.nack(requeue=False)
                         except Exception:
-                            logger.exception(
-                                "failed to publish rabbitmq dlq message",
-                                extra={"topic": consumer._topic, "dlq": consumer._dlq_routing_key},
-                            )
-                    if dlq_published:
-                        await message.ack()
-                        continue
+                            logger.exception("exception in concurrent rabbitmq task")
+                        finally:
+                            semaphore.release()
 
-                    await message.nack(requeue=True)
+                    asyncio.create_task(process_message())
         except asyncio.CancelledError:
             raise
         except Exception:
