@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     rabbitmq_startup_attempts: int = Field(default=30, alias="RABBITMQ_STARTUP_ATTEMPTS")
     rabbitmq_startup_retry_seconds: float = Field(default=2.0, alias="RABBITMQ_STARTUP_RETRY_SECONDS")
     rabbitmq_publisher_channel_pool_size: int = Field(default=4, alias="RABBITMQ_PUBLISHER_CHANNEL_POOL_SIZE")
+    rabbitmq_max_concurrent_handlers: int = Field(default=10, alias="RABBITMQ_MAX_CONCURRENT_HANDLERS")
+    rabbitmq_max_message_age_seconds: float = Field(default=300.0, alias="RABBITMQ_MAX_MESSAGE_AGE_SECONDS")
+    rabbitmq_transient_requeue_max_redeliveries: int = Field(default=5, alias="RABBITMQ_TRANSIENT_REQUEUE_MAX_REDELIVERIES")
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     database_url: str = Field(
         default=_LOCAL_MYSQL_DEFAULT_URL,

@@ -89,8 +89,10 @@ async def test_start_defaults_prefetch_to_ten(fake_connection: _FakeConnection) 
 
 
 class _FakeMessage:
-    def __init__(self, body: bytes) -> None:
+    def __init__(self, body: bytes, headers: dict | None = None) -> None:
         self.body = body
+        self.type = None
+        self.headers = headers or {}
         self.acked = 0
         self.nacked: list[bool] = []
 
@@ -99,6 +101,14 @@ class _FakeMessage:
 
     async def nack(self, requeue: bool = True) -> None:
         self.nacked.append(requeue)
+
+
+class _FakeExchange:
+    def __init__(self) -> None:
+        self.published: list[tuple[object, str]] = []
+
+    async def publish(self, message: object, routing_key: str) -> None:
+        self.published.append((message, routing_key))
 
 
 class _FakeIterator:
@@ -143,12 +153,18 @@ class _FakeConsumerQueue:
         return self._ctx
 
 
-async def test_hung_handler_times_out_and_nacks_instead_of_blocking_forever() -> None:
+async def test_hung_handler_times_out_and_requeues_via_republish_instead_of_blocking_forever() -> None:
+    # A bare handler timeout is inherently ambiguous (could be a slow
+    # downstream dependency) so it's always requeue-eligible regardless of
+    # RABBITMQ_TRANSIENT_REQUEUE_ENABLED. Requeue happens via a republished
+    # copy (not native nack(requeue=True), which redelivers the original
+    # message unchanged) so a redelivery counter can travel with it.
     settings = Settings(RABBITMQ_HANDLER_TIMEOUT_SECONDS=0.05, RABBITMQ_CONSUMER_MAX_RETRIES=0)
     consumer = RabbitMQConsumer(settings, "raw-alerts")
     consumer._connection = object()  # bypass real start(): already "connected"
-    consumer._exchange = None
-    consumer._dlq_routing_key = None
+    exchange = _FakeExchange()
+    consumer._exchange = exchange
+    consumer._dlq_routing_key = "raw-alerts.dlq"
 
     message = _FakeMessage(json.dumps({"payload": {"id": "evt-1"}}).encode("utf-8"))
     consumer._queue = _FakeConsumerQueue([message])
@@ -159,15 +175,179 @@ async def test_hung_handler_times_out_and_nacks_instead_of_blocking_forever() ->
     task = asyncio.create_task(consume_forever(consumer, hanging_handler))
     try:
         for _ in range(200):
-            if message.nacked:
+            if message.acked or exchange.published:
                 break
             await asyncio.sleep(0.01)
         else:
-            pytest.fail("handler timeout never resulted in a nack")
+            pytest.fail("handler timeout never resulted in a requeue republish")
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert message.nacked == [True]
-    assert message.acked == 0
+    # Original delivery is ack'd (removed from the queue) and a fresh copy
+    # carrying an incremented redelivery counter is republished in its place.
+    assert message.acked == 1
+    assert message.nacked == []
+    assert len(exchange.published) == 1
+    republished_message, routing_key = exchange.published[0]
+    assert routing_key == "raw-alerts"
+    assert republished_message.headers.get("x-kaiops-requeue-count") == 1
+
+
+async def test_hung_handler_exceeding_max_redeliveries_is_poisoned() -> None:
+    settings = Settings(
+        RABBITMQ_HANDLER_TIMEOUT_SECONDS=0.05,
+        RABBITMQ_CONSUMER_MAX_RETRIES=0,
+        RABBITMQ_TRANSIENT_REQUEUE_MAX_REDELIVERIES=1,
+    )
+    consumer = RabbitMQConsumer(settings, "raw-alerts")
+    consumer._connection = object()
+    exchange = _FakeExchange()
+    consumer._exchange = exchange
+    consumer._dlq_routing_key = "raw-alerts.dlq"
+
+    # Simulate a message already redelivered once (at the configured max).
+    message = _FakeMessage(
+        json.dumps({"payload": {"id": "evt-1"}}).encode("utf-8"),
+        headers={"x-kaiops-requeue-count": 1},
+    )
+    consumer._queue = _FakeConsumerQueue([message])
+
+    async def hanging_handler(_payload: dict) -> None:
+        await asyncio.sleep(10)
+
+    task = asyncio.create_task(consume_forever(consumer, hanging_handler))
+    try:
+        for _ in range(200):
+            if message.nacked or message.acked:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("message stuck past max redeliveries never resolved")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Past the redelivery cap: routed to DLQ (published) and ack'd, not
+    # requeued again — the loop is bounded even under a persistent failure.
+    assert len(exchange.published) == 1
+    dlq_message, routing_key = exchange.published[0]
+    assert routing_key == "raw-alerts.dlq"
+    assert message.acked == 1
+    assert message.nacked == []
+
+
+async def test_consume_forever_bounded_concurrency() -> None:
+    settings = Settings(RABBITMQ_MAX_CONCURRENT_HANDLERS=2, RABBITMQ_CONSUMER_MAX_RETRIES=0)
+    consumer = RabbitMQConsumer(settings, "raw-alerts")
+    consumer._connection = object()
+    consumer._exchange = None
+    consumer._dlq_routing_key = None
+
+    m1 = _FakeMessage(json.dumps({"payload": {"id": "evt-1"}}).encode("utf-8"))
+    m2 = _FakeMessage(json.dumps({"payload": {"id": "evt-2"}}).encode("utf-8"))
+    m3 = _FakeMessage(json.dumps({"payload": {"id": "evt-3"}}).encode("utf-8"))
+    m4 = _FakeMessage(json.dumps({"payload": {"id": "evt-4"}}).encode("utf-8"))
+    consumer._queue = _FakeConsumerQueue([m1, m2, m3, m4])
+
+    active_count = 0
+    max_seen_active = 0
+    lock = asyncio.Lock()
+
+    async def handler(_payload: dict) -> None:
+        nonlocal active_count, max_seen_active
+        async with lock:
+            active_count += 1
+            if active_count > max_seen_active:
+                max_seen_active = active_count
+        await asyncio.sleep(0.05)
+        async with lock:
+            active_count -= 1
+
+    task = asyncio.create_task(consume_forever(consumer, handler))
+    try:
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert max_seen_active <= 2
+    assert max_seen_active > 0
+
+
+async def test_consume_forever_stale_message_discard() -> None:
+    settings = Settings(RABBITMQ_MAX_MESSAGE_AGE_SECONDS=10.0, RABBITMQ_CONSUMER_MAX_RETRIES=0)
+    consumer = RabbitMQConsumer(settings, "raw-alerts")
+    consumer._connection = object()
+    consumer._exchange = None
+    consumer._dlq_routing_key = None
+
+    from datetime import datetime, timezone, timedelta
+    stale_time = (datetime.now(timezone.utc) - timedelta(seconds=20)).isoformat()
+    m_stale = _FakeMessage(json.dumps({
+        "produced_at": stale_time,
+        "payload": {"id": "evt-stale"}
+    }).encode("utf-8"))
+
+    fresh_time = datetime.now(timezone.utc).isoformat()
+    m_fresh = _FakeMessage(json.dumps({
+        "produced_at": fresh_time,
+        "payload": {"id": "evt-fresh"}
+    }).encode("utf-8"))
+
+    consumer._queue = _FakeConsumerQueue([m_stale, m_fresh])
+
+    processed_ids = []
+    async def handler(payload: dict) -> None:
+        processed_ids.append(payload.get("id"))
+
+    task = asyncio.create_task(consume_forever(consumer, handler))
+    try:
+        await asyncio.sleep(0.1)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert m_stale.acked == 1
+    assert "evt-fresh" in processed_ids
+    assert "evt-stale" not in processed_ids
+
+
+async def test_consume_forever_dlq_failure_prevents_infinite_requeue() -> None:
+    settings = Settings(RABBITMQ_CONSUMER_MAX_RETRIES=0)
+    consumer = RabbitMQConsumer(settings, "raw-alerts")
+    consumer._connection = object()
+    
+    class _FailingExchange:
+        async def publish(self, *args, **kwargs) -> None:
+            raise RuntimeError("failing to publish to DLQ exchange")
+            
+    consumer._exchange = _FailingExchange()
+    consumer._dlq_routing_key = "raw-alerts.dlq"
+
+    m = _FakeMessage(json.dumps({"payload": {"id": "evt-failure"}}).encode("utf-8"))
+    consumer._queue = _FakeConsumerQueue([m])
+
+    async def failing_handler(_payload: dict) -> None:
+        raise ValueError("processing failed")
+
+    task = asyncio.create_task(consume_forever(consumer, failing_handler))
+    try:
+        await asyncio.sleep(0.1)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert m.nacked == [False]
+

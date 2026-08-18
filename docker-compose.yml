@@ -737,6 +737,7 @@ services:
       # Context and resolution retain the shared prefetch of two so LLM work
       # remains bounded even during an alert storm.
       RABBITMQ_CONSUMER_PREFETCH_COUNT: ${ALERT_INTELLIGENCE_PREFETCH_COUNT:-2}
+      RABBITMQ_MAX_CONCURRENT_HANDLERS: ${RABBITMQ_MAX_CONCURRENT_HANDLERS:-10}
       ALERT_CORRELATION_CANDIDATE_LIMIT: ${ALERT_CORRELATION_CANDIDATE_LIMIT:-250}
       # Correlation/qualification already has a deterministic implementation.
       # One remote model call per raw alert created the ingestion backlog and
