@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime
@@ -12,18 +13,21 @@ import httpx
 from ai_workbench_common.models import Context
 from common.config import get_settings
 from common.event_publishers import build_agent_event_contract, build_event_envelope
+from common.resolution_lifecycle import ResolutionState, create_lifecycle, decide_resolution_control
 from common.kafka import KafkaConsumer
 from common.kafka import consume_forever as consume_kafka_forever
 from common.models import Incident, Recommendation
+from common.orchestration.execution_plan import resolve_execution_plan
 from common.rabbitmq import RabbitMQConsumer
 from common.rabbitmq import consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import CONTEXT_KNOWLEDGE_OPERATIONS, EVENTS_PROCESSED
 from common.topics import CONTEXT_EVENTS, RESOLUTION_EVENTS
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from resolution_agent import ResolutionIntelligenceAgent
+from resolution_agent.investigation import IterativeInvestigator
 from resolution_agent.catalog import (
     RESOLUTION_CATALOG,
     prepare_resolution_plan,
@@ -33,7 +37,9 @@ from resolution_agent.catalog import (
 
 settings = get_settings()
 settings.service_name = "resolution-agent"
+logger = logging.getLogger("kaiops.resolution_agent.app")
 agent = ResolutionIntelligenceAgent()
+investigator = IterativeInvestigator()
 tasks: list[asyncio.Task] = []
 _GLOBAL_KNOWLEDGE_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _GLOBAL_KNOWLEDGE_CACHE_TTL_SECONDS = 300.0
@@ -79,7 +85,76 @@ async def _resolve_context(context: Context) -> Recommendation:
         and score > _resolution_reuse_threshold()
     )
     if not may_reuse:
-        return await agent.resolve_with_runtime(context)
+        investigation_report: dict[str, Any] = {}
+        investigation_enabled = str(os.getenv("RESOLUTION_ITERATIVE_INVESTIGATION_ENABLED", "true")).strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if investigation_enabled:
+            async def persist_investigation(event: str, payload: dict[str, Any]) -> None:
+                if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+                    return
+                try:
+                    async with app.state.session_factory() as session:
+                        repo = IncidentRepository(session)
+                        if event == "started":
+                            await repo.create_resolution_investigation(payload)
+                        elif event == "step":
+                            await repo.append_resolution_investigation_step(payload)
+                        elif event == "completed":
+                            await repo.complete_resolution_investigation(payload)
+                        await session.commit()
+                except Exception as exc:
+                    # Investigation remains useful in-memory when persistence is
+                    # temporarily unavailable; expose degradation in the report.
+                    logger.exception("failed to persist resolution investigation event=%s", event)
+                    investigation_report.setdefault("persistence_errors", []).append(str(exc)[:300])
+
+            investigation_report = await investigator.investigate(context, persist=persist_investigation)
+            metadata = dict(context.metadata if isinstance(context.metadata, dict) else {})
+            context_evidence = dict(
+                metadata.get("context_evidence") if isinstance(metadata.get("context_evidence"), dict) else {}
+            )
+            for row in investigation_report.get("evidence", []):
+                if not isinstance(row, dict):
+                    continue
+                source = investigator._source(row)
+                bucket = {
+                    "history": "tickets", "data": "database", "alert": "telemetry",
+                }.get(source, source)
+                rows = list(context_evidence.get(bucket) if isinstance(context_evidence.get(bucket), list) else [])
+                known = {str(item.get("evidence_id") or item.get("uri") or "") for item in rows if isinstance(item, dict)}
+                identity = str(row.get("evidence_id") or row.get("uri") or "")
+                if identity and identity not in known:
+                    rows.append(row)
+                context_evidence[bucket] = rows
+            metadata["context_evidence"] = context_evidence
+            metadata["iterative_investigation"] = {
+                key: value for key, value in investigation_report.items() if key != "evidence"
+            }
+            context = context.model_copy(update={"metadata": metadata})
+        recommendation = await agent.resolve_with_runtime(context)
+        if investigation_report:
+            recommendation.metadata["iterative_investigation"] = {
+                key: value for key, value in investigation_report.items() if key != "evidence"
+            }
+            recommendation.metadata["investigation_id"] = investigation_report.get("investigation_id")
+            recommendation.metadata["investigation_status"] = investigation_report.get("status")
+            if not investigation_report.get("conclusive"):
+                missing = ", ".join(str(item.get("source")) for item in investigation_report.get("next_evidence", []))
+                recommendation.root_cause = (
+                    "Investigation inconclusive: the collected evidence does not independently corroborate a causal hypothesis."
+                )
+                recommendation.recommended_action = (
+                    f"Collect the next required read-only evidence ({missing or 'missing application sources'}) and rerun resolution."
+                )
+                recommendation.confidence = min(float(recommendation.confidence), 0.49)
+                recommendation.metadata["resolution_outcome"] = "inconclusive"
+        recommendation.metadata = {
+            **(recommendation.metadata if isinstance(recommendation.metadata, dict) else {}),
+            "analysis_reused": False,
+            "analysis_source": "fresh_evidence_analysis",
+        }
+        return recommendation
     try:
         cached_recommendation = Recommendation.model_validate(prior)
     except Exception:
@@ -105,6 +180,146 @@ async def _resolve_context(context: Context) -> Recommendation:
     }
     CONTEXT_KNOWLEDGE_OPERATIONS.labels("reuse_resolution", "success").inc()
     return recommendation
+
+
+def _catalog_plan_for(
+    context: Context,
+    decision: dict[str, Any] | None = None,
+    recommendation: Recommendation | None = None,
+) -> dict[str, Any]:
+    routing = decision if isinstance(decision, dict) else {}
+    supplied = routing.get("execution_plan")
+    supplied_values = []
+    if isinstance(supplied, dict):
+        for key in ("commands", "preflight_commands", "validation_commands", "rollback_commands"):
+            values = supplied.get(key, [])
+            supplied_values.extend(str(value) for value in (values if isinstance(values, list) else [values]))
+    legacy_compose_binding = any(
+        "docker-socket-proxy:2375/containers/" in value
+        and "/containers/$container_id/" not in value
+        and "/containers/json?filters=" not in value
+        for value in supplied_values
+    )
+    if (
+        isinstance(supplied, dict)
+        and supplied.get("schema_version") == "kaims.execution-plan.v2"
+        and not legacy_compose_binding
+    ):
+        return supplied
+    return resolve_execution_plan(
+        alert=context.alert,
+        workflow_name=str(routing.get("workflow") or "resolution-rerun"),
+        requires_approval=bool(routing.get("requires_approval", True)),
+        risk_tier=str(routing.get("risk_tier") or "medium"),
+        execution_mode=str(routing.get("execution_mode") or "human-approval"),
+        resolution_hints=" ".join(
+            filter(
+                None,
+                (
+                    str(recommendation.root_cause or "") if recommendation else "",
+                    str(recommendation.recommended_action or "") if recommendation else "",
+                    " ".join(
+                        str(item.get("cause") or "")
+                        for item in (
+                            recommendation.metadata.get("hypothesis_analysis", {}).get("ranked", [])
+                            if recommendation and isinstance(recommendation.metadata, dict)
+                            else []
+                        )
+                        if isinstance(item, dict)
+                    ),
+                ),
+            )
+        )[:4000],
+    )
+
+
+def _apply_catalog_plan(recommendation: Recommendation, context: Context, decision: dict[str, Any] | None = None) -> dict[str, Any]:
+    plan = dict(_catalog_plan_for(context, decision, recommendation))
+    metadata = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
+    metadata["model_proposed_execution_plan"] = metadata.get("execution_plan", {})
+    investigation = metadata.get("investigation_report") if isinstance(metadata.get("investigation_report"), dict) else {}
+    rca_analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
+    plan["evidence_basis"] = list(rca_analysis.get("evidence_used") or [])
+    plan["investigation_report"] = investigation
+    plan["historical_precedents"] = list(
+        metadata.get("hypothesis_analysis", {}).get("ranked", [])
+        if isinstance(metadata.get("hypothesis_analysis"), dict)
+        else []
+    )[:5]
+    iterative = metadata.get("iterative_investigation") if isinstance(metadata.get("iterative_investigation"), dict) else {}
+    if iterative and iterative.get("conclusive") is not True:
+        candidate_plan = dict(plan)
+        plan = {
+            **plan,
+            "plan_kind": "diagnostic",
+            "diagnostic_only": True,
+            "mutating": False,
+            "execution_ready": False,
+            "commands": [],
+            "scripts": [],
+            "rollback_commands": [],
+            "readiness_blocks": list(dict.fromkeys([
+                *(plan.get("readiness_blocks") or []),
+                "Iterative investigation is inconclusive; corrective execution is not authorized.",
+                *(
+                    f"Missing evidence source: {source}"
+                    for source in iterative.get("missing_sources", [])[:5]
+                ),
+            ])),
+            "investigation_status": iterative.get("status"),
+            "investigation_id": iterative.get("investigation_id"),
+            "next_evidence": iterative.get("next_evidence", []),
+        }
+        metadata["candidate_execution_plan"] = candidate_plan
+    metadata["execution_plan"] = plan
+    metadata["remediation_target"] = str(plan.get("remediation_target") or context.alert.service or "")
+    metadata["recommended_commands"] = list(plan.get("commands") or [])
+    routing = decision if isinstance(decision, dict) else {}
+    requires_approval = bool(routing.get("requires_approval", plan.get("requires_approval", True)))
+    control = decide_resolution_control(
+        plan,
+        requires_approval=requires_approval,
+        sources=(routing, metadata, context.alert.metadata if isinstance(context.alert.metadata, dict) else {}),
+    )
+    metadata["resolution_control"] = control
+    analysis_reused = metadata.get("analysis_reused") is True
+    disposition = str(control.get("disposition") or "investigate")
+    if disposition in {"watch_only", "investigate"}:
+        path_id, path_label = "diagnostic", "Diagnostic completion"
+        skipped = ["approval", "execution"]
+    elif analysis_reused and disposition == "execution_ready":
+        path_id, path_label = "verified_fast_path", "Verified context fast path"
+        skipped = ["context_collection", "rca_generation", "approval"]
+    elif analysis_reused:
+        path_id, path_label = "guided_reuse", "Reused analysis with approval"
+        skipped = ["context_collection", "rca_generation"]
+    elif disposition == "execution_ready":
+        path_id, path_label = "autonomous", "Fresh analysis autonomous path"
+        skipped = ["approval"]
+    else:
+        path_id, path_label = "guided", "Fresh analysis guided path"
+        skipped = []
+    metadata["orchestration_path"] = {
+        "schema_version": "kaims.orchestration-path.v1",
+        "id": path_id,
+        "label": path_label,
+        "context_reused": bool(context.metadata.get("context_reused")),
+        "analysis_reused": analysis_reused,
+        "disposition": disposition,
+        "skipped_stages": skipped,
+    }
+    metadata["resolution_lifecycle"] = create_lifecycle(
+        tenant_id=str(getattr(context, "tenant_id", None) or "default"),
+        incident_id=recommendation.incident_id,
+        recommendation_id=recommendation.id,
+        plan=plan,
+        state=ResolutionState(control["initial_state"]),
+        reason_code=str(control["reason_code"]),
+        control=control,
+    )
+    recommendation.metadata = metadata
+    recommendation.commands = list(plan.get("commands") or [])
+    return plan
 
 
 def _build_resolution_event_payload(
@@ -138,6 +353,7 @@ def _build_resolution_event_payload(
     )
     return {
         "recommendation": recommendation,
+        "resolution_lifecycle": recommendation.metadata.get("resolution_lifecycle"),
         "context": context,
         "incident": incident,
         "decision": decision_payload,
@@ -162,7 +378,16 @@ async def _persist_resolution_event(
     requires_approval = decision_payload.get("requires_approval")
     if requires_approval is None:
         requires_approval = orchestration.get("requires_approval")
-    status = "awaiting_approval" if bool(requires_approval) else "remediating"
+    lifecycle = metadata.get("resolution_lifecycle") if isinstance(metadata.get("resolution_lifecycle"), dict) else {}
+    lifecycle_state = str(lifecycle.get("state") or "").strip().lower()
+    if bool(requires_approval) or lifecycle_state == "awaiting_approval":
+        status = "awaiting_approval"
+    elif lifecycle_state == "ready_to_execute":
+        # A reviewed plan is execution-ready, but no mutation has started yet.
+        # Only remediation-engine may advance the projection to remediating.
+        status = "approved"
+    else:
+        status = "investigating"
     provider = decision_payload.get("message_bus_provider") or orchestration.get("message_bus_provider") or "unknown"
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
@@ -233,6 +458,7 @@ async def _persist_resolution_event(
                     "root_cause": recommendation.root_cause,
                     "impact": recommendation.impact,
                     "risk": recommendation.risk,
+                    "resolution_lifecycle": lifecycle or None,
                 },
             )
         )
@@ -288,6 +514,9 @@ async def startup(app: FastAPI) -> None:
         recommendation.metadata["discovery_report"] = context.metadata.get("discovery_report", {})
         recommendation.metadata["discovery_evidence"] = context.metadata.get("discovery_evidence", {})
         recommendation.metadata["runbook_found"] = bool(context.runbook)
+        # Apply the reviewed catalog even on direct RCA reruns and legacy
+        # messages whose orchestration decision predates execution-plan v2.
+        catalog_plan = _apply_catalog_plan(recommendation, context, decision_payload)
         policy_version = str(decision_payload.get("policy_version") or "").strip()
         policy_reason = str(decision_payload.get("policy_reason") or "").strip()
         if policy_version:
@@ -301,6 +530,9 @@ async def startup(app: FastAPI) -> None:
                 "message_bus_provider": decision_payload.get("message_bus_provider"),
                 "stream_count": decision_payload.get("stream_count"),
                 "stream_threshold": decision_payload.get("stream_threshold"),
+                "execution_plan_fingerprint": catalog_plan.get("plan_fingerprint")
+                if isinstance(catalog_plan, dict)
+                else None,
             }
         if settings.database_enabled:
             async with app.state.session_factory() as session:
@@ -349,6 +581,19 @@ class ResolutionSelectionRequest(BaseModel):
     incident_id: str = ""
 
 
+@app.get("/investigations/{incident_id}")
+async def latest_investigation(incident_id: str, tenant_id: str = "default") -> dict[str, Any]:
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        raise HTTPException(status_code=503, detail="investigation persistence is unavailable")
+    async with app.state.session_factory() as session:
+        report = await IncidentRepository(session).latest_resolution_investigation(
+            incident_id, tenant_id=tenant_id,
+        )
+    if report is None:
+        raise HTTPException(status_code=404, detail="resolution investigation not found")
+    return report
+
+
 class ExecutionFailureRequest(BaseModel):
     incident_id: UUID
     action_id: UUID
@@ -395,6 +640,11 @@ async def reconsider_execution(request: ExecutionFailureRequest) -> dict[str, An
             f"The previous executor attempt failed ({failure}). Verify Jenkins tooling "
             "and cluster credentials before approving this revised Kubernetes plan."
         )
+    # A failed execution is evidence, not authority to synthesize another live
+    # command. Re-enter planning with a non-executable contract; the normal
+    # catalog resolver must produce and bind the replacement plan.
+    proposed_commands = commands
+    commands = []
     recommendation_id = uuid4()
     recommendation = {
         "id": str(recommendation_id),
@@ -409,7 +659,20 @@ async def reconsider_execution(request: ExecutionFailureRequest) -> dict[str, An
         "risk": "high",
         "metadata": {
             **previous_metadata,
-            "execution_plan": {"commands": commands, "scripts": [], "queries": [f"http://{safe_service}:8000/healthz"]},
+            "execution_plan": {
+                "schema_version": "kaims.execution-plan.v2",
+                "commands": [],
+                "scripts": [],
+                "queries": [f"http://{safe_service}:8000/healthz"],
+                "preflight_commands": [],
+                "validation_commands": [],
+                "rollback_commands": [],
+                "mutating": False,
+                "plan_kind": "diagnostic",
+                "execution_ready": False,
+                "readiness_blocks": ["failed execution requires catalog re-planning against fresh evidence"],
+            },
+            "model_proposed_execution_plan": {"commands": proposed_commands},
             "execution_reconsideration_attempt": request.attempt,
             "failed_action_id": str(request.action_id),
             "failure_feedback": failure,
@@ -493,6 +756,7 @@ async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, An
 @app.post("/resolve", response_model=Recommendation)
 async def resolve(context: Context, publish_events: bool = True) -> Recommendation:
     recommendation = await _resolve_context(context)
+    _apply_catalog_plan(recommendation, context)
     recommendation.trace_id = str(context.alert.trace_id or "") or None
     recommendation.metadata["rag_documents"] = context.metadata.get("rag_documents", 0)
     recommendation.metadata["rag_matches"] = context.metadata.get("rag_matches", [])

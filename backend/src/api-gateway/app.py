@@ -18,15 +18,7 @@ import pymysql
 from redis.asyncio import Redis
 from api_gateway import SafetyAnalyzer
 from api_gateway.auth_policy import route_auth_rule
-from api_gateway.copilot import (
-    classify_intent,
-    compose_assignment_answer,
-    compose_capacity_answer,
-    compose_forbidden_onboarding_answer,
-    compose_onboarding_answer,
-    compose_unsupported_answer,
-    extract_incident_id,
-)
+from api_gateway.control_routes import build_control_router
 from api_gateway.modules.users.models import SystemRole
 from api_gateway.modules.users.permissions import AuthContext, current_auth_context, current_tenant_id, require_roles
 from api_gateway.modules.users.router import router as user_management_router
@@ -863,6 +855,17 @@ async def guarded_proxy(
         REQUEST_LATENCY.labels(settings.service_name, path).observe(latency_ms / 1000)
 
         if status_code >= 400:
+            downstream = response_payload.get("downstream") if isinstance(response_payload, dict) else None
+            downstream = downstream if isinstance(downstream, dict) else {}
+            downstream_detail = downstream.get("detail") if isinstance(downstream.get("detail"), dict) else {}
+            if downstream_detail.get("retryable") is True:
+                wrapped.update(
+                    {
+                        "retryable": True,
+                        "code": str(downstream_detail.get("code") or f"http_{status_code}"),
+                        "message": str(downstream_detail.get("message") or "The downstream request can be retried."),
+                    }
+                )
             raise HTTPException(status_code=status_code, detail=wrapped)
         return wrapped
 
@@ -1537,8 +1540,6 @@ async def get_closed_incidents(
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
-
-
 @app.get("/incidents/metadata")
 async def get_incident_metadata(
     request: Request,
@@ -1588,6 +1589,25 @@ async def get_incident_stage_completeness(
         method="GET",
         path=path,
         target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/resolution/investigations/{incident_id}")
+async def get_resolution_investigation(
+    incident_id: str,
+    request: Request,
+    tenant_id: str = "default",
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Return the latest durable iterative investigation for an incident."""
+    path = f"/investigations/{quote(incident_id, safe='')}?{urlencode({'tenant_id': tenant_id})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.resolution_agent_url,
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
@@ -2136,7 +2156,30 @@ async def list_processing_queues(request: Request, _: AuthContext = Depends(requ
         parts = name.split(".")
         rows.append({"name": name, "consumer_service": parts[1] if len(parts) > 2 else "unknown", "stage": ".".join(parts[2:]) if len(parts) > 2 else name, "ready": int(row.get("messages_ready") or 0), "in_flight": int(row.get("messages_unacknowledged") or 0), "total": int(row.get("messages") or 0), "consumers": int(row.get("consumers") or 0), "state": row.get("state") or "unknown", "dead_letter": name.endswith(".dlq")})
     rows.sort(key=lambda item: (-item["total"], item["name"]))
-    return {"provider": "rabbitmq", "queues": rows, "summary": {"queues": len(rows), "ready": sum(row["ready"] for row in rows), "in_flight": sum(row["in_flight"] for row in rows), "dead_letter": sum(row["total"] for row in rows if row["dead_letter"])}}
+    scalable = [
+        {
+            "queue": row["name"],
+            "service": row["consumer_service"],
+            "current_consumers": row["consumers"],
+            "recommended_consumers": min(16, max(row["consumers"] + 1, (row["ready"] + 4) // 5)),
+            "reason": "ready backlog exceeds two messages per active consumer",
+        }
+        for row in rows
+        if not row["dead_letter"]
+        and row["ready"] > max(5, row["consumers"] * 2)
+    ]
+    return {
+        "provider": "rabbitmq",
+        "queues": rows,
+        "summary": {
+            "queues": len(rows),
+            "ready": sum(row["ready"] for row in rows),
+            "in_flight": sum(row["in_flight"] for row in rows),
+            "dead_letter": sum(row["total"] for row in rows if row["dead_letter"]),
+            "worker_action": "scale" if scalable else "hold",
+            "scale_recommendations": scalable,
+        },
+    }
 
 
 @app.post("/operations/queues/{queue_name}/sample")
@@ -2425,52 +2468,6 @@ async def approval_action(
     )
 
 
-@app.post("/remediation/execute")
-async def remediation_execute(
-    request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="POST",
-        path="/execute",
-        target_base=settings.remediation_engine_url,
-        payload=payload,
-        trace_id=trace_id_from_header(x_trace_id),
-        timeout_seconds=1000.0,
-    )
-
-
-@app.post("/remediation/dry-run")
-async def remediation_dry_run(
-    request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="POST",
-        path="/dry-run",
-        target_base=settings.remediation_engine_url,
-        payload=payload,
-        trace_id=trace_id_from_header(x_trace_id),
-    )
-
-
-@app.get("/remediation/actions/by-incident/{incident_id}/latest")
-async def remediation_latest_action(incident_id: str, request: Request) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="GET",
-        path=f"/actions/by-incident/{quote(incident_id, safe='')}/latest",
-        target_base=settings.remediation_engine_url,
-        payload=None,
-        trace_id=trace_id_from_header(None),
-        timeout_seconds=30.0,
-    )
-
-
 @app.post("/rag/documents")
 async def ingest_rag_document(
     request: Request,
@@ -2483,21 +2480,6 @@ async def ingest_rag_document(
         path="/rag/documents",
         target_base=settings.context_agent_url,
         payload=payload,
-        trace_id=trace_id_from_header(x_trace_id),
-    )
-
-
-@app.get("/context/strategy")
-async def get_context_strategy(
-    request: Request,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="GET",
-        path="/context/strategy",
-        target_base=settings.context_agent_url,
-        payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
 
@@ -2765,220 +2747,15 @@ async def flow_catalog(
     )
 
 
-@app.post("/model/route")
-async def model_route(
-    request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="POST",
-        path="/route",
-        target_base=settings.model_router_url,
-        payload=payload,
-        trace_id=trace_id_from_header(x_trace_id),
+app.include_router(
+    build_control_router(
+        settings=settings,
+        guarded_proxy=guarded_proxy,
+        raw_proxy=proxy,
+        trace_id_from_header=trace_id_from_header,
+        analyzer=analyzer,
+        load_recent_events=lambda limit: _load_recent_gateway_audit_events(app, limit),
+        build_audit_contract=_build_gateway_audit_contract,
+        load_audit_summary=lambda: _load_gateway_audit_summary(app),
     )
-
-
-@app.post("/model/route/provider/{provider_name}")
-async def model_route_provider(
-    provider_name: str,
-    request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="POST",
-        path=f"/route/provider/{provider_name}",
-        target_base=settings.model_router_url,
-        payload=payload,
-        trace_id=trace_id_from_header(x_trace_id),
-    )
-
-
-@app.get("/model/providers/status")
-async def model_providers_status(
-    request: Request,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="GET",
-        path="/providers/status",
-        target_base=settings.model_router_url,
-        payload={},
-        trace_id=trace_id_from_header(x_trace_id),
-    )
-
-
-@app.get("/approval/incident/{incident_id}")
-async def get_incident(
-    incident_id: str,
-    request: Request,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="GET",
-        path=f"/incident/{incident_id}",
-        target_base=settings.approval_service_url,
-        payload={},
-        trace_id=trace_id_from_header(x_trace_id),
-    )
-
-
-@app.get("/knowledge-graph")
-async def get_knowledge_graph(
-    request: Request,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="GET",
-        path="/knowledge-graph",
-        target_base=settings.context_agent_url,
-        payload={},
-        trace_id=trace_id_from_header(x_trace_id),
-    )
-
-
-@app.get("/knowledge-graph/context")
-async def get_knowledge_graph_context(
-    request: Request,
-    service: str,
-    depth: int = 2,
-    limit: int = 80,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="GET",
-        path="/knowledge-graph/context",
-        target_base=settings.context_agent_url,
-        payload={},
-        params={"service": service, "depth": depth, "limit": limit},
-        trace_id=trace_id_from_header(x_trace_id),
-    )
-
-
-@app.get("/approval/capacity")
-async def get_approval_capacity(
-    request: Request,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(request=request, method="GET", path="/capacity", target_base=settings.approval_service_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=8.0)
-
-
-@app.put("/approval/capacity/{username}")
-async def put_approval_capacity(
-    username: str,
-    request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(request=request, method="PUT", path=f"/capacity/{username}", target_base=settings.approval_service_url, payload=payload, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=8.0)
-
-
-@app.get("/approval/assignments")
-async def get_approval_assignments(
-    request: Request,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(request=request, method="GET", path="/assignments", target_base=settings.approval_service_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=8.0)
-
-
-@app.post("/approval/auto-assign")
-async def post_approval_auto_assign(
-    request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await guarded_proxy(request=request, method="POST", path="/auto-assign", target_base=settings.approval_service_url, payload=payload, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=12.0)
-
-
-@app.post("/copilot/query")
-async def post_copilot_query(
-    request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """Phase 0 Copilot: deterministic intent matching only, no model-router call.
-
-    Reuses the exact same read-only proxy path (`proxy()` against the existing
-    /capacity, /assignments, /onboarding/state endpoints) that the Capacity,
-    Assignments, and Onboarding pages already use -- no assignment/onboarding
-    business logic is duplicated here, only composed into a plain-language
-    answer."""
-    query = str(payload.get("query") or "").strip()
-    trace_id = trace_id_from_header(x_trace_id)
-    if not query:
-        raise HTTPException(status_code=422, detail="query is required")
-
-    intent = classify_intent(query)
-    auth = getattr(request.state, "auth", None)
-
-    try:
-        if intent == "onboarding":
-            # /onboarding/* is Administrator-only per auth_policy.py's route table;
-            # /copilot/query is a different path prefix and would not otherwise
-            # inherit that check, so it is re-applied explicitly here. `auth` is
-            # only None when the auth middleware itself is bypassed (local/demo/
-            # test environment), matching every other route's behavior in that mode.
-            if auth is not None and auth.role != SystemRole.ADMINISTRATOR.value:
-                result = compose_forbidden_onboarding_answer()
-            else:
-                _, response_payload = await proxy(
-                    method="GET", path="/onboarding/state", target_base=settings.monitoring_adapter_url,
-                    payload={}, trace_id=trace_id,
-                )
-                rows = response_payload.get("rows", []) if isinstance(response_payload, dict) else []
-                result = compose_onboarding_answer(rows)
-        elif intent == "capacity":
-            _, response_payload = await proxy(
-                method="GET", path="/capacity", target_base=settings.approval_service_url,
-                payload={}, trace_id=trace_id,
-            )
-            rows = response_payload.get("rows", []) if isinstance(response_payload, dict) else []
-            result = compose_capacity_answer(rows)
-        elif intent == "assignment":
-            _, response_payload = await proxy(
-                method="GET", path="/assignments", target_base=settings.approval_service_url,
-                payload={}, trace_id=trace_id,
-            )
-            rows = response_payload.get("rows", []) if isinstance(response_payload, dict) else []
-            result = compose_assignment_answer(rows, extract_incident_id(query))
-        else:
-            result = compose_unsupported_answer(query)
-    except httpx.HTTPError:
-        result = {
-            "intent": intent,
-            "answer": "I couldn't reach the service that has this data right now. Please try again shortly.",
-            "data": {},
-            "links": [],
-        }
-
-    return {"trace_id": trace_id, **result}
-
-
-@app.post("/security/check")
-async def security_check(payload: dict[str, Any] = REQUEST_BODY) -> dict[str, Any]:
-    safety = analyzer.analyze(payload)
-    return {"safety": safety.model_dump(mode="json")}
-
-
-@app.get("/observability/recent")
-async def recent_events(limit: int = 25) -> dict[str, Any]:
-    events = await _load_recent_gateway_audit_events(app, limit)
-    response_rows: list[dict[str, Any]] = []
-    for event in events:
-        row = event.model_dump(mode="json")
-        row["event_contract"] = _build_gateway_audit_contract(event)
-        response_rows.append(row)
-    return {"events": response_rows}
-
-
-@app.get("/observability/summary")
-async def observability_summary() -> dict[str, Any]:
-    return await _load_gateway_audit_summary(app)
+)

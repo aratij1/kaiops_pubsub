@@ -39,6 +39,7 @@ x-service-env: &service-env
   REMEDIATION_EXECUTION_PLATFORM: ${REMEDIATION_EXECUTION_PLATFORM:-docker-compose}
   REMEDIATION_COMPOSE_PROJECT: ${REMEDIATION_COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-kaiops_azure}}
   APPROVAL_SERVICE_URL: http://approval-service:8000
+  CLOSURE_SERVICE_URL: http://closure-service:8000
   ORCHESTRATOR_URL: http://orchestrator:8000
   MODEL_ROUTER_URL: http://model-router:8000
   MONITORING_ADAPTER_URL: http://monitoring-adapter:8000
@@ -127,7 +128,9 @@ x-service-env: &service-env
   GROQ_API_KEY: ${GROQ_API_KEY:-}
   GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
   GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
-  LOCAL_LLM_ENABLED: ${LOCAL_LLM_ENABLED:-false}
+  LOCAL_LLM_ENABLED: ${LOCAL_LLM_ENABLED:-true}
+  LOCAL_LLM_ENDPOINT: ${LOCAL_LLM_ENDPOINT:-http://host.docker.internal:11434}
+  LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-qwen2.5:7b}
   LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-120}
   MODEL_ROUTER_CRITICAL_PROVIDER: ${MODEL_ROUTER_CRITICAL_PROVIDER:-reasoning-critical}
   MODEL_ROUTER_RCA_PROVIDER: ${MODEL_ROUTER_RCA_PROVIDER:-reasoning-standard}
@@ -157,6 +160,14 @@ x-service-env: &service-env
   MESSAGE_BUS_STREAM_THRESHOLD: ${MESSAGE_BUS_STREAM_THRESHOLD:-250}
   MESSAGE_BUS_DEFAULT_PROVIDER: ${MESSAGE_BUS_DEFAULT_PROVIDER:-rabbitmq}
   MESSAGE_BUS_WORKER_COUNT: ${MESSAGE_BUS_WORKER_COUNT:-1}
+  # Startup repair is observable but non-mutating by default. Set to apply
+  # only after reviewing candidates; even apply replays proof-qualified work.
+  CLOSURE_RECONCILIATION_MODE: ${CLOSURE_RECONCILIATION_MODE:-apply}
+  CLOSURE_RECONCILIATION_BATCH_SIZE: ${CLOSURE_RECONCILIATION_BATCH_SIZE:-100}
+  CLOSURE_RECONCILIATION_INTERVAL_SECONDS: ${CLOSURE_RECONCILIATION_INTERVAL_SECONDS:-15}
+  RESOLUTION_OUTBOX_BATCH_SIZE: ${RESOLUTION_OUTBOX_BATCH_SIZE:-100}
+  RESOLUTION_OUTBOX_POLL_SECONDS: ${RESOLUTION_OUTBOX_POLL_SECONDS:-5}
+  RESOLUTION_OUTBOX_INITIAL_DELAY_SECONDS: ${RESOLUTION_OUTBOX_INITIAL_DELAY_SECONDS:-60}
   # The Temporal worker is profile-gated. Keep the default incident path on
   # the always-on message bus unless the temporal-pilot profile is explicitly
   # enabled; otherwise the orchestrator starts a workflow that no worker runs.
@@ -291,7 +302,9 @@ services:
   redis:
     image: redis:7
     restart: unless-stopped
-    ports: ["6379:6379"]
+    # Keep the container address stable while avoiding collisions with other
+    # local projects that commonly publish Redis on the default host port.
+    ports: ["${KAI_OPS_REDIS_PORT:-6380}:6379"]
     volumes:
       - redis-data:/data
     healthcheck:
@@ -777,16 +790,28 @@ services:
   context-agent:
     build: *service-build
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    pids_limit: 256
+    mem_limit: ${CONTEXT_AGENT_MEMORY_LIMIT:-1536m}
+    cpus: ${CONTEXT_AGENT_CPU_LIMIT:-1.50}
     environment:
       <<: *service-env
       SERVICE_NAME: context-agent
       # Auto reuses complete cached context. Per event, realtime forces fresh
       # discovery and historical uses periodic snapshots without live calls.
       CONTEXT_STRATEGY: ${CONTEXT_STRATEGY:-auto}
-      CONTEXT_KNOWLEDGE_TTL_SECONDS: ${CONTEXT_KNOWLEDGE_TTL_SECONDS:-0}
+      CONTEXT_KNOWLEDGE_TTL_SECONDS: ${CONTEXT_KNOWLEDGE_TTL_SECONDS:-3600}
+      CONTEXT_MIN_QUALITY_SCORE: ${CONTEXT_MIN_QUALITY_SCORE:-0.70}
+      CONTEXT_MAX_EVIDENCE_PER_SOURCE: ${CONTEXT_MAX_EVIDENCE_PER_SOURCE:-20}
+      CONTEXT_COLLECTION_BUDGET_SECONDS: ${CONTEXT_COLLECTION_BUDGET_SECONDS:-45}
+      CONTEXT_COLLECTION_LEASE_WAIT_SECONDS: ${CONTEXT_COLLECTION_LEASE_WAIT_SECONDS:-30}
       CONTEXT_RESOLUTION_REUSE_ENABLED: ${CONTEXT_RESOLUTION_REUSE_ENABLED:-true}
       CONTEXT_RESOLUTION_REUSE_MIN_SCORE: ${CONTEXT_RESOLUTION_REUSE_MIN_SCORE:-0.70}
-      CONTEXT_HISTORICAL_MAX_AGE_SECONDS: ${CONTEXT_HISTORICAL_MAX_AGE_SECONDS:-0}
+      CONTEXT_HISTORICAL_MAX_AGE_SECONDS: ${CONTEXT_HISTORICAL_MAX_AGE_SECONDS:-86400}
       MESSAGE_BUS_WORKER_COUNT: ${CONTEXT_AGENT_WORKER_COUNT:-2}
       DISCOVERY_MCP_URL: http://discovery-mcp:8000/mcp
       DISCOVERY_MCP_TIMEOUT_SECONDS: ${DISCOVERY_MCP_TIMEOUT_SECONDS:-15}
@@ -800,8 +825,18 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/ai-workbench/src/context-agent
     ports: ["8004:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 5
+      start_period: 30s
     volumes:
       - ./backend/rag:/app/rag
+      # Review drafts are runtime state. Keep them on a Docker-managed volume
+      # so hardened/rootless hosts can write them even when the source bind
+      # mount is read-only or owned by the deployment account.
+      - context-evidence-review:/app/rag/_review
       - ./fault-lab:/data/fault-lab:ro
       - ./backend/ingested_alerts:/data/landing:ro
       - ./observability:/app/observability:ro
@@ -883,23 +918,43 @@ services:
   resolution-agent:
     build: *service-build
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    pids_limit: 256
+    mem_limit: ${RESOLUTION_AGENT_MEMORY_LIMIT:-1536m}
+    cpus: ${RESOLUTION_AGENT_CPU_LIMIT:-1.50}
     environment:
       <<: *service-env
       SERVICE_NAME: resolution-agent
       CONTEXT_RESOLUTION_REUSE_ENABLED: ${CONTEXT_RESOLUTION_REUSE_ENABLED:-true}
       CONTEXT_RESOLUTION_REUSE_MIN_SCORE: ${CONTEXT_RESOLUTION_REUSE_MIN_SCORE:-0.70}
+      RESOLUTION_MODEL_PAYLOAD_MAX_BYTES: ${RESOLUTION_MODEL_PAYLOAD_MAX_BYTES:-48000}
       MESSAGE_BUS_WORKER_COUNT: ${RESOLUTION_AGENT_WORKER_COUNT:-2}
-      # RCA always uses the configured model. Deep analysis also asks it for
-      # structured impact and remediation proposals; deterministic quality and
-      # approval gates still control whether a proposal can be executed.
+      # RCA is the synchronous model call. Impact and remediation use the
+      # evidence-aware deterministic path by default, avoiding two serialized
+      # provider round trips; opt in only for investigations that need them.
       RESOLUTION_DEEP_ANALYSIS_ENABLED: ${RESOLUTION_DEEP_ANALYSIS_ENABLED:-true}
+      RESOLUTION_ITERATIVE_INVESTIGATION_ENABLED: ${RESOLUTION_ITERATIVE_INVESTIGATION_ENABLED:-true}
+      RESOLUTION_INVESTIGATION_MAX_STEPS: ${RESOLUTION_INVESTIGATION_MAX_STEPS:-4}
+      RESOLUTION_INVESTIGATION_MAX_EVIDENCE: ${RESOLUTION_INVESTIGATION_MAX_EVIDENCE:-40}
+      RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD: ${RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD:-0.78}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/ai-workbench/src/resolution-agent
     ports: ["8006:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 5
+      start_period: 30s
     depends_on:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       model-router: { condition: service_started }
+      discovery-mcp: { condition: service_started }
 
   approval-service:
     build: *service-build
@@ -1006,7 +1061,8 @@ services:
     ports: ["${JENKINS_HOST_PORT:-8083}:8080"]
     volumes:
       - jenkins-data:/var/jenkins_home
-      - ./deploy/jenkins:/opt/kaiops:ro
+      - ./deploy/jenkins/Jenkinsfile.auto-remediation:/opt/kaiops/Jenkinsfile.auto-remediation:ro
+      - ./scripts/remediation:/opt/kaiops/scripts/remediation:ro
     depends_on:
       docker-socket-proxy: { condition: service_started }
     healthcheck:
@@ -1467,3 +1523,4 @@ volumes:
   ui-dev-node-modules:
   ui-dev-npm-cache:
   jenkins-data:
+  context-evidence-review:

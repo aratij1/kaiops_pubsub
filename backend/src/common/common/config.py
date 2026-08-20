@@ -66,6 +66,7 @@ class Settings(BaseSettings):
     context_agent_url: str = Field(default="http://context-agent:8000", alias="CONTEXT_AGENT_URL")
     resolution_agent_url: str = Field(default="http://resolution-agent:8000", alias="RESOLUTION_AGENT_URL")
     approval_service_url: str = Field(default="http://approval-service:8000", alias="APPROVAL_SERVICE_URL")
+    closure_service_url: str = Field(default="http://closure-service:8000", alias="CLOSURE_SERVICE_URL")
     orchestrator_url: str = Field(default="http://orchestrator:8000", alias="ORCHESTRATOR_URL")
     remediation_engine_url: str = Field(default="http://remediation-engine:8000", alias="REMEDIATION_ENGINE_URL")
     monitoring_adapter_url: str = Field(default="http://monitoring-adapter:8000", alias="MONITORING_ADAPTER_URL")
@@ -77,10 +78,13 @@ class Settings(BaseSettings):
     ai_layer_request_timeout_seconds: float = Field(default=120.0, alias="AI_LAYER_REQUEST_TIMEOUT_SECONDS")
     ai_layer_auth_token: str = Field(default="", alias="AI_LAYER_AUTH_TOKEN")
     context_strategy: str = Field(default="auto", alias="CONTEXT_STRATEGY")
-    # Zero keeps quality-approved alert-type knowledge until evidence invalidates
-    # it. Operators may set a positive TTL when their topology requires periodic
-    # forced refreshes.
-    context_knowledge_ttl_seconds: int = Field(default=0, alias="CONTEXT_KNOWLEDGE_TTL_SECONDS", ge=0)
+    # Context uses both this outer snapshot lifetime and stricter per-source
+    # freshness windows. Operational signals expire before reviewed knowledge.
+    context_knowledge_ttl_seconds: int = Field(default=3600, alias="CONTEXT_KNOWLEDGE_TTL_SECONDS", ge=60)
+    context_min_quality_score: float = Field(default=0.70, alias="CONTEXT_MIN_QUALITY_SCORE", ge=0.0, le=1.0)
+    context_max_evidence_per_source: int = Field(default=20, alias="CONTEXT_MAX_EVIDENCE_PER_SOURCE", ge=1, le=100)
+    context_collection_budget_seconds: float = Field(default=45.0, alias="CONTEXT_COLLECTION_BUDGET_SECONDS", ge=5.0, le=180.0)
+    context_collection_lease_wait_seconds: int = Field(default=30, alias="CONTEXT_COLLECTION_LEASE_WAIT_SECONDS", ge=0, le=120)
     context_resolution_reuse_enabled: bool = Field(default=True, alias="CONTEXT_RESOLUTION_REUSE_ENABLED")
     context_resolution_reuse_min_score: float = Field(default=0.7, alias="CONTEXT_RESOLUTION_REUSE_MIN_SCORE", ge=0.0, le=1.0)
     object_storage_enabled: bool = Field(default=False, alias="OBJECT_STORAGE_ENABLED")
@@ -146,6 +150,12 @@ class Settings(BaseSettings):
     orchestration_config_path: str = Field(default="", alias="ORCHESTRATION_CONFIG_PATH")
     connection_config_path: str = Field(default="backend/config/kaiops-connections.json", alias="CONNECTION_CONFIG_PATH")
     message_bus_worker_count: int = Field(default=1, alias="MESSAGE_BUS_WORKER_COUNT")
+    closure_reconciliation_mode: str = Field(default="apply", alias="CLOSURE_RECONCILIATION_MODE")
+    closure_reconciliation_batch_size: int = Field(default=100, alias="CLOSURE_RECONCILIATION_BATCH_SIZE")
+    closure_reconciliation_interval_seconds: float = Field(default=15.0, alias="CLOSURE_RECONCILIATION_INTERVAL_SECONDS")
+    resolution_outbox_batch_size: int = Field(default=100, alias="RESOLUTION_OUTBOX_BATCH_SIZE")
+    resolution_outbox_poll_seconds: float = Field(default=5.0, alias="RESOLUTION_OUTBOX_POLL_SECONDS")
+    resolution_outbox_initial_delay_seconds: float = Field(default=60.0, alias="RESOLUTION_OUTBOX_INITIAL_DELAY_SECONDS")
     temporal_pilot_enabled: bool = Field(default=False, alias="TEMPORAL_PILOT_ENABLED")
     temporal_address: str = Field(default="temporal:7233", alias="TEMPORAL_ADDRESS")
     temporal_namespace: str = Field(default="default", alias="TEMPORAL_NAMESPACE")
@@ -180,6 +190,7 @@ class Settings(BaseSettings):
     )
     local_llm_endpoint: str = Field(default="http://ollama:11434", alias="LOCAL_LLM_ENDPOINT")
     local_llm_enabled: bool = Field(default=False, alias="LOCAL_LLM_ENABLED")
+    local_llm_model: str = Field(default="qwen2.5:7b", alias="LOCAL_LLM_MODEL")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_base_url: str = Field(default="https://api.openai.com/v1", alias="OPENAI_BASE_URL")
     openai_gpt5_model: str = Field(default="gpt-5", alias="OPENAI_GPT5_MODEL")
@@ -209,6 +220,12 @@ class Settings(BaseSettings):
     model_router_prompt_cache_max_entries: int = Field(default=512, alias="MODEL_ROUTER_PROMPT_CACHE_MAX_ENTRIES")
     model_router_max_prompt_chars: int = Field(default=60000, alias="MODEL_ROUTER_MAX_PROMPT_CHARS")
     model_router_max_payload_bytes: int = Field(default=750000, alias="MODEL_ROUTER_MAX_PAYLOAD_BYTES")
+    resolution_model_payload_max_bytes: int = Field(
+        default=48000,
+        alias="RESOLUTION_MODEL_PAYLOAD_MAX_BYTES",
+        ge=8000,
+        le=250000,
+    )
     model_router_critical_provider: str = Field(default="reasoning-critical", alias="MODEL_ROUTER_CRITICAL_PROVIDER")
     model_router_rca_provider: str = Field(default="reasoning-standard", alias="MODEL_ROUTER_RCA_PROVIDER")
     model_router_default_provider: str = Field(default="gpt-4o", alias="MODEL_ROUTER_DEFAULT_PROVIDER")
