@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+from time import monotonic
 from enum import StrEnum
 from typing import Any, TypedDict
 from uuid import NAMESPACE_URL, uuid5
@@ -25,6 +26,7 @@ from ai_workbench_common.prompts import (
 from ai_workbench_common.resolution_quality import assess_evidence_quality, remediation_quality_gate
 from common.config import get_settings
 from common.models import AlertSeverity, Recommendation
+from common.telemetry import AGENT_STAGE_LATENCY
 from langgraph.graph import END, StateGraph
 
 logger = logging.getLogger("kaiops.resolution_agent")
@@ -56,6 +58,8 @@ class ResolutionState(TypedDict, total=False):
     rca_analysis: dict[str, Any]
     impact_analysis: dict[str, Any]
     remediation_analysis: dict[str, Any]
+    investigation_report: dict[str, Any]
+    hypothesis_analysis: dict[str, Any]
 
 
 class ResolutionIntelligenceAgent(BaseAgent):
@@ -80,6 +84,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
             self.model_gateway = HttpModelGateway(
                 settings.model_router_url,
                 timeout_seconds=settings.llm_request_timeout_seconds,
+                max_payload_bytes=settings.resolution_model_payload_max_bytes,
             )
         self.runtime = runtime or AgentRuntime(max_attempts=2)
         self.memory_store = memory_store or InMemoryStore()
@@ -94,7 +99,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         # builders below; making two additional remote calls serialized every
         # alert added 30-90 seconds without being required to persist an RCA.
         self.deep_analysis_enabled = str(
-            os.getenv("RESOLUTION_DEEP_ANALYSIS_ENABLED", "false")
+            os.getenv("RESOLUTION_DEEP_ANALYSIS_ENABLED", "true")
         ).strip().lower() in {"1", "true", "yes", "on"}
         # Keeps strong references to fire-and-forget evaluation-publish tasks so they
         # aren't garbage-collected mid-flight; discarded automatically once done.
@@ -507,6 +512,21 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "No rollback needed: granting REPLICATION CLIENT is read-only and does not modify data. "
                 "If the privilege should not be permanent, revoke it: REVOKE REPLICATION CLIENT ON *.* FROM CURRENT_USER();",
             )
+        mysql_signal = " ".join((description, root, self._norm(context.alert.name), self._norm(context.alert.service)))
+        if "mysql" in mysql_signal and any(token in mysql_signal for token in ("table", "row count", "growth", "capacity", "disk")):
+            table = re.sub(r"[^a-zA-Z0-9_]", "", str(labels.get("table") or "alerts")) or "alerts"
+            return (
+                "Collect MySQL capacity, growth, workload, and lock evidence; select a reviewed retention or capacity action only after the breach mechanism is proven.",
+                [
+                    f'mysql -e "SELECT COUNT(*) AS row_count, MIN(created_at) AS oldest_row, MAX(created_at) AS newest_row FROM {table};"',
+                    f'mysql -e "SELECT table_rows, ROUND((data_length + index_length)/1024/1024,2) AS total_mb FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=\'{table}\';"',
+                    'mysql -e "SELECT variable_name, variable_value FROM performance_schema.global_status WHERE variable_name IN (\'Threads_connected\',\'Threads_running\',\'Slow_queries\',\'Aborted_connects\');"',
+                    'mysql -e "SELECT COUNT(*) AS lock_waits FROM performance_schema.data_lock_waits;"',
+                ],
+                str(context.alert.service or "mysql").strip(),
+                [f'mysql -e "SELECT COUNT(*) AS row_count, MIN(created_at) AS oldest_row, MAX(created_at) AS newest_row FROM {table};"'],
+                "No rollback is required for this read-only diagnostic plan. Any later archive, purge, index, or capacity change must define its own backup, rollback, and validation contract.",
+            )
         runbook = str(context.runbook or "")
         runbook_text = self._norm(runbook)
         runbook_matches_alert = any(
@@ -696,18 +716,33 @@ class ResolutionIntelligenceAgent(BaseAgent):
 
     def _build_graph(self):
         workflow = StateGraph(ResolutionState)
-        workflow.add_node("collect_context", self.collect_context)
-        workflow.add_node("generate_rca", self.generate_rca)
-        workflow.add_node("impact_analysis", self.impact_analysis)
-        workflow.add_node("generate_fix", self.generate_fix)
-        workflow.add_node("confidence_scoring", self.confidence_scoring)
+        workflow.add_node("collect_context", self._measured_stage("collect_context", self.collect_context))
+        workflow.add_node("plan_investigation", self._measured_stage("plan_investigation", self.plan_investigation))
+        workflow.add_node("rank_hypotheses", self._measured_stage("rank_hypotheses", self.rank_hypotheses))
+        workflow.add_node("generate_rca", self._measured_stage("generate_rca", self.generate_rca))
+        workflow.add_node("impact_analysis", self._measured_stage("impact_analysis", self.impact_analysis))
+        workflow.add_node("generate_fix", self._measured_stage("generate_fix", self.generate_fix))
+        workflow.add_node("confidence_scoring", self._measured_stage("confidence_scoring", self.confidence_scoring))
         workflow.set_entry_point("collect_context")
-        workflow.add_edge("collect_context", "generate_rca")
+        workflow.add_edge("collect_context", "plan_investigation")
+        workflow.add_edge("plan_investigation", "rank_hypotheses")
+        workflow.add_edge("rank_hypotheses", "generate_rca")
         workflow.add_edge("generate_rca", "impact_analysis")
         workflow.add_edge("impact_analysis", "generate_fix")
         workflow.add_edge("generate_fix", "confidence_scoring")
         workflow.add_edge("confidence_scoring", END)
         return workflow.compile()
+
+    @staticmethod
+    def _measured_stage(name: str, handler: Any) -> Any:
+        async def measured(state: ResolutionState) -> ResolutionState:
+            started = monotonic()
+            try:
+                return await handler(state)
+            finally:
+                AGENT_STAGE_LATENCY.labels("resolution-agent", name).observe(monotonic() - started)
+
+        return measured
 
     async def collect_context(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
@@ -718,8 +753,14 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "title": str(item.get("title", ""))[:120],
                 "service": item.get("service"),
                 "severity": item.get("severity"),
+                "status": item.get("status"),
+                "root_cause": str(item.get("root_cause") or item.get("summary") or "")[:320],
+                "resolution": str(item.get("resolution") or item.get("action_taken") or item.get("recommended_action") or "")[:320],
+                "outcome": str(item.get("outcome") or item.get("remediation_status") or "")[:80],
+                "similarity": item.get("similarity") or item.get("match_confidence"),
+                "incident_id": item.get("incident_id") or item.get("id"),
             }
-            for item in context.related_incidents[:3]
+            for item in context.related_incidents[:8]
         ]
         recent_change_preview = [
             {
@@ -755,7 +796,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
             if isinstance(context.metadata.get("context_evidence"), dict)
             else {}
         )
-        for source_name in ("logs", "code", "tickets", "telemetry", "database", "rag"):
+        knowledge_evidence = [
+            row
+            for row in context_evidence.get("rag", [])
+            if isinstance(row, dict)
+        ] if isinstance(context_evidence.get("rag"), list) else []
+        for source_name in ("logs", "code", "tickets", "telemetry", "database"):
             rows = context_evidence.get(source_name)
             if isinstance(rows, list):
                 raw_evidence.extend(row for row in rows if isinstance(row, dict))
@@ -829,6 +875,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
             },
             "observability": context.observability,
             "discovery_evidence": relevant_evidence,
+            "knowledge_evidence_count": len(knowledge_evidence),
+            "knowledge_role": "historical_guidance_not_current_observation",
+            "historical_knowledge": knowledge_evidence[:12],
             "log_intelligence": log_evidence[:8],
             "code_evidence": code_evidence[:8],
             "code_review": code_review,
@@ -838,13 +887,152 @@ class ResolutionIntelligenceAgent(BaseAgent):
             "runbook": runbook_preview,
             "dependency_services": context.dependency_services[:8],
             "recent_changes": recent_change_preview,
+            "iterative_investigation": (
+                context.metadata.get("iterative_investigation")
+                if isinstance(context.metadata.get("iterative_investigation"), dict)
+                else {}
+            ),
+        }
+        return state
+
+    async def plan_investigation(self, state: ResolutionState) -> ResolutionState:
+        """Build an auditable crawl manifest from the persisted context package."""
+        gathered = state.get("gathered_context", {})
+        evidence = gathered.get("discovery_evidence", []) if isinstance(gathered.get("discovery_evidence"), list) else []
+        aliases = {
+            "log": "logs", "logs": "logs", "opensearch": "logs", "elasticsearch": "logs",
+            "code": "code", "source": "code", "github": "code", "gitlab": "code",
+            "metric": "telemetry", "metrics": "telemetry", "prometheus": "telemetry", "telemetry": "telemetry",
+            "ticket": "history", "tickets": "history", "incident": "history", "rag": "history", "runbook": "history",
+            "database": "data", "mysql": "data", "deployment": "changes", "change": "changes",
+        }
+        buckets: dict[str, list[dict[str, Any]]] = {
+            "logs": [], "code": [], "telemetry": [], "history": [], "data": [], "changes": [], "alert": [],
+        }
+        for row in evidence:
+            if not isinstance(row, dict):
+                continue
+            source = self._norm(row.get("source"))
+            bucket = aliases.get(source, "alert" if source == self._norm(gathered.get("alert", {}).get("source")) else "")
+            if bucket:
+                buckets[bucket].append(row)
+        if gathered.get("related_incidents"):
+            buckets["history"].extend(
+                {"evidence_id": f"incident:{item.get('incident_id') or index}", **item}
+                for index, item in enumerate(gathered["related_incidents"])
+                if isinstance(item, dict)
+            )
+        if gathered.get("historical_knowledge"):
+            buckets["history"].extend(
+                item for item in gathered["historical_knowledge"] if isinstance(item, dict)
+            )
+        if gathered.get("recent_changes"):
+            buckets["changes"].extend(item for item in gathered["recent_changes"] if isinstance(item, dict))
+        if gathered.get("observability") and not buckets["telemetry"]:
+            buckets["telemetry"].append({"evidence_id": "context:observability", "source": "telemetry"})
+        required = ["logs", "code", "telemetry", "history", "changes"]
+        coverage = {name: len(rows) for name, rows in buckets.items()}
+        gaps = [name for name in required if coverage.get(name, 0) == 0]
+        crawl_steps = [
+            {
+                "source": name,
+                "status": "collected" if coverage.get(name, 0) else "missing",
+                "evidence_count": coverage.get(name, 0),
+                "objective": {
+                    "logs": "find errors and correlate timestamps",
+                    "code": "trace the failing path and configuration",
+                    "telemetry": "confirm the operational symptom and blast radius",
+                    "history": "compare prior causes, actions, and outcomes",
+                    "changes": "correlate deployments and configuration changes",
+                }.get(name, "inspect available evidence"),
+            }
+            for name in required
+        ]
+        state["investigation_report"] = {
+            "schema_version": "kaims.resolution-investigation.v1",
+            "service": gathered.get("alert", {}).get("service"),
+            "coverage": coverage,
+            "missing_sources": gaps,
+            "crawl_steps": crawl_steps,
+            "evidence_count": sum(coverage.values()),
+            "application_evidence_available": bool(buckets["code"] or buckets["logs"] or buckets["telemetry"]),
+            "historical_evidence_available": bool(buckets["history"]),
+            "source_evidence_ids": {
+                name: [str(row.get("evidence_id")) for row in rows if str(row.get("evidence_id") or "")][:12]
+                for name, rows in buckets.items()
+            },
+        }
+        return state
+
+    async def rank_hypotheses(self, state: ResolutionState) -> ResolutionState:
+        """Normalize hypotheses from discovery, code findings, logs, changes and prior incidents."""
+        context = state["context"]
+        gathered = state.get("gathered_context", {})
+        discovery = self._discovery_report_analysis(context)
+        candidates: list[dict[str, Any]] = []
+        iterative = gathered.get("iterative_investigation", {})
+        for item in iterative.get("hypotheses", []) if isinstance(iterative, dict) and isinstance(iterative.get("hypotheses"), list) else []:
+            if isinstance(item, dict) and str(item.get("cause") or item.get("summary") or "").strip():
+                candidates.append({
+                    "cause": str(item.get("cause") or item.get("summary"))[:500],
+                    "confidence": float(item.get("confidence") or 0.0),
+                    "evidence_ids": list(item.get("evidence_ids") or item.get("supporting_evidence") or []),
+                    "source": "iterative_investigation",
+                    "status": item.get("status"),
+                    "contradicting_evidence": list(item.get("contradicting_evidence") or []),
+                    "falsification_check": item.get("falsification_check") or item.get("next_check"),
+                })
+        for item in discovery.get("hypotheses", []) if isinstance(discovery.get("hypotheses"), list) else []:
+            if isinstance(item, dict):
+                candidates.append({
+                    "cause": str(item.get("cause") or item.get("summary") or "").strip(),
+                    "confidence": float(item.get("confidence") or 0.45),
+                    "evidence_ids": list(item.get("evidence_ids") or item.get("evidence_used") or []),
+                    "source": "discovery",
+                    "falsification_check": item.get("falsification_check") or item.get("next_check"),
+                })
+        for finding in (gathered.get("code_review") or {}).get("findings", []) if isinstance(gathered.get("code_review"), dict) else []:
+            if isinstance(finding, dict) and str(finding.get("title") or finding.get("explanation") or "").strip():
+                candidates.append({
+                    "cause": str(finding.get("explanation") or finding.get("title"))[:500],
+                    "confidence": float(finding.get("confidence") or 0.55),
+                    "evidence_ids": [str(finding.get("evidence_id"))] if finding.get("evidence_id") else [],
+                    "source": "code",
+                    "falsification_check": "Confirm the cited code path is exercised by the failing request or process.",
+                })
+        for incident in gathered.get("related_incidents", []) if isinstance(gathered.get("related_incidents"), list) else []:
+            if isinstance(incident, dict) and str(incident.get("root_cause") or "").strip():
+                candidates.append({
+                    "cause": str(incident.get("root_cause"))[:500],
+                    "confidence": min(0.65, float(incident.get("similarity") or 0.4)),
+                    "evidence_ids": [f"incident:{incident.get('incident_id')}"] if incident.get("incident_id") else [],
+                    "source": "historical_incident",
+                    "prior_resolution": incident.get("resolution"),
+                    "prior_outcome": incident.get("outcome"),
+                    "falsification_check": "Compare current signals and deployment state with the historical incident before reusing its action.",
+                })
+        deduped: dict[str, dict[str, Any]] = {}
+        for item in candidates:
+            key = re.sub(r"\W+", " ", self._norm(item.get("cause")))[:160]
+            if key and (key not in deduped or float(item.get("confidence") or 0) > float(deduped[key].get("confidence") or 0)):
+                deduped[key] = item
+        ranked = sorted(deduped.values(), key=lambda item: float(item.get("confidence") or 0), reverse=True)[:8]
+        state["hypothesis_analysis"] = {
+            "ranked": ranked,
+            "unresolved_count": len(ranked),
+            "historical_matches": sum(1 for item in ranked if item.get("source") == "historical_incident"),
         }
         return state
 
     async def generate_rca(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
         prompt = PROMPT_IDENTIFY_ROOT_CAUSE
-        payload = {"summary": context.alert.description, **state["gathered_context"]}
+        payload = {
+            "summary": context.alert.description,
+            **state["gathered_context"],
+            "investigation_report": state.get("investigation_report", {}),
+            "ranked_hypotheses": state.get("hypothesis_analysis", {}).get("ranked", []),
+        }
         response = await self._generate_with_fallback(
             context=context,
             task=ModelTask.RCA,
@@ -1139,6 +1327,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
             "impact_analysis": state.get("impact_analysis", {}),
             "evidence": state.get("gathered_context", {}).get("discovery_evidence", []),
             "recent_changes": state.get("gathered_context", {}).get("recent_changes", []),
+            "investigation_report": state.get("investigation_report", {}),
+            "ranked_hypotheses": state.get("hypothesis_analysis", {}).get("ranked", []),
+            "code_review": state.get("gathered_context", {}).get("code_review", {}),
+            "log_intelligence": state.get("gathered_context", {}).get("log_intelligence", []),
+            "related_incidents": state.get("gathered_context", {}).get("related_incidents", []),
         }
         if self.deep_analysis_enabled:
             response = await self._generate_with_fallback(
@@ -1220,12 +1413,29 @@ class ResolutionIntelligenceAgent(BaseAgent):
         validation_commands = executable(parsed.get("validation_commands") or default_validation_queries)
         rollback_commands = executable(parsed.get("rollback_commands"))
         command_text = " ".join(commands).lower()
-        mutation_markers = ("rollout restart", "rollout undo", " scale ", " apply ", "flushdb", "failover")
+        mutation_markers = (
+            "rollout restart", "rollout undo", " scale ", " apply ", "flushdb", "failover",
+            " delete ", " update ", " insert ", " alter ", " grant ", " revoke ", " restart",
+        )
         mutating = any(marker in f" {command_text} " for marker in mutation_markers)
         namespace = re.sub(r"[^a-z0-9-]", "", str(context.alert.labels.get("namespace") or "prod").lower()) or "prod"
         preflight: list[str] = []
         if any(str(command).strip().lower().startswith("kubectl ") for command in commands):
             preflight = [f"kubectl get deployment {remediation_target} -n {namespace}"]
+        plan_kind = "remediation" if mutating else "diagnostic"
+        readiness_blocks: list[str] = []
+        if not mutating:
+            readiness_blocks.append("No corrective operation is present; this plan only gathers evidence.")
+        if mutating and not validation_commands:
+            readiness_blocks.append("No executable recovery validation is defined.")
+        if mutating and not str(default_rollback_plan or "").strip() and not rollback_commands:
+            readiness_blocks.append("No rollback or explicit non-reversible recovery strategy is defined.")
+        investigation = state.get("investigation_report", {})
+        evidence_quality = state.get("rca_analysis", {}).get("evidence_quality", {})
+        if mutating and not investigation.get("application_evidence_available"):
+            readiness_blocks.append("No application runtime, log, telemetry, or code evidence supports this corrective action.")
+        if mutating and evidence_quality.get("sufficiency") != "sufficient":
+            readiness_blocks.append("The causal hypothesis is not independently corroborated by sufficient evidence.")
         state["remediation_analysis"] = {
             # Deterministic defaults first, so a real model answer (when
             # RESOLUTION_DEEP_ANALYSIS_ENABLED=true) always wins if it supplies its
@@ -1238,9 +1448,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
             "remediation_target": remediation_target,
             "schema_version": "2.0",
             "mutating": mutating,
+            "plan_kind": plan_kind,
+            "execution_ready": not readiness_blocks,
+            "readiness_blocks": readiness_blocks,
             "preflight_commands": preflight,
             "validation_commands": validation_commands,
             "rollback_commands": rollback_commands,
+            "evidence_basis": state.get("rca_analysis", {}).get("evidence_used", []),
+            "investigation_report": investigation,
+            "ranked_hypotheses": state.get("hypothesis_analysis", {}).get("ranked", []),
         }
         return state
 
@@ -1267,6 +1483,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
             state.get("rca_analysis", {}).get("evidence_quality", {}).get("confidence_ceiling") or 0.49
         )
         score = min(score, evidence_ceiling)
+        missing_sources = state.get("investigation_report", {}).get("missing_sources", [])
+        if isinstance(missing_sources, list):
+            # A confident model answer cannot compensate for an application
+            # crawl that never reached most of its required evidence planes.
+            coverage_ceiling = max(0.55, 0.9 - (0.07 * len(missing_sources)))
+            score = min(score, coverage_ceiling)
 
         fallback_hits = 0
         for usage in state.get("model_usage", []):
@@ -1360,12 +1582,16 @@ class ResolutionIntelligenceAgent(BaseAgent):
         recommendation.metadata["rca_analysis"] = state.get("rca_analysis", {})
         recommendation.metadata["impact_analysis"] = state.get("impact_analysis", {})
         recommendation.metadata["remediation_analysis"] = state.get("remediation_analysis", {})
+        recommendation.metadata["investigation_report"] = state.get("investigation_report", {})
+        recommendation.metadata["hypothesis_analysis"] = state.get("hypothesis_analysis", {})
         remediation_analysis = state.get("remediation_analysis", {})
         recommendation.metadata["execution_plan"] = {
             key: remediation_analysis.get(key)
             for key in (
                 "schema_version", "mutating", "preflight_commands", "commands",
                 "validation_commands", "rollback_commands", "remediation_target",
+                "plan_kind", "execution_ready", "readiness_blocks",
+                "evidence_basis", "investigation_report", "ranked_hypotheses",
             )
         }
         recommendation.metadata["detected_errors"] = state.get("gathered_context", {}).get("detected_errors", [])
@@ -1539,7 +1765,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
             raise ContextFailure("resolution agent requires serialized context payload")
         return {
             "phase": "resolution",
-            "steps": ["collect_context", "generate_rca", "impact_analysis", "generate_fix", "confidence_scoring"],
+            "steps": ["collect_context", "plan_investigation", "rank_hypotheses", "generate_rca", "impact_analysis", "generate_fix", "confidence_scoring"],
             "model_task_count": model_task_count,
         }
 

@@ -3,13 +3,16 @@
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
+
+from common.incident_status import reduce_incident_status
+from common.resolution_lifecycle import select_current_lifecycle
 
 from common.database import (
     ActionRecord,
@@ -30,6 +33,7 @@ from common.database import (
     JiraTicketLinkRecord,
     KnowledgeBaseRecord,
     ContextKnowledgeRecord,
+    ContextSnapshotRecord,
     MonitoringProfileRecord,
     MonitoringIntegrationRecord,
     MonitoringCredentialRecord,
@@ -45,6 +49,7 @@ from common.database import (
     RunbookOutcomeRecord,
     PrometheusConfigRecord,
     RecordingRuleRecord,
+    ResolutionOutboxRecord,
     OnboardingStateRecord,
     ObjectStorageRecord,
     PendingWorkflowRecord,
@@ -144,6 +149,7 @@ _STATUS_PRECEDENCE = {
     "failed": 6,
     "closed": 7,
 }
+_CLOSED_INCIDENT_STATUSES = frozenset({"closed", "resolved", "cancelled", "canceled"})
 
 _EVENT_TABLE_HINTS: dict[str, list[str]] = {
     "incident.alert.enriched": ["alerts", "incidents", "agent_work_items"],
@@ -1503,6 +1509,17 @@ class IncidentRepository:
             "recommended_action": str(recommendation.get("recommended_action") or ""),
         }
 
+        lifecycle_candidates = (
+            closure_report.get("metadata", {}).get("resolution_lifecycle") if isinstance(closure_report.get("metadata"), dict) else None,
+            remediation_action.get("parameters", {}).get("resolution_lifecycle") if isinstance(remediation_action.get("parameters"), dict) else None,
+            remediation_action.get("metadata", {}).get("resolution_lifecycle") if isinstance(remediation_action.get("metadata"), dict) else None,
+            recommendation.get("metadata", {}).get("resolution_lifecycle") if isinstance(recommendation.get("metadata"), dict) else None,
+            incident_payload.get("metadata", {}).get("resolution_lifecycle") if isinstance(incident_payload.get("metadata"), dict) else None,
+        )
+        resolution_lifecycle = select_current_lifecycle(
+            *({"resolution_lifecycle": item} for item in lifecycle_candidates if isinstance(item, dict))
+        )
+
         return {
             "mode": "db-processed",
             "scenario": scenario,
@@ -1527,6 +1544,7 @@ class IncidentRepository:
             "approval": approval,
             "remediation_action": remediation_action,
             "closure_report": closure_report,
+            "resolution_lifecycle": resolution_lifecycle,
             "metrics": metrics,
             "finops": {
                 "totals": finops_totals,
@@ -1599,12 +1617,16 @@ class IncidentRepository:
         work_rows = work_result.scalars().all()
 
         approval_result = await self.session.execute(
-            select(ApprovalRecord).where(ApprovalRecord.incident_id == incident_uuid)
+            select(ApprovalRecord)
+            .where(ApprovalRecord.incident_id == incident_uuid)
+            .order_by(ApprovalRecord.updated_at.desc(), ApprovalRecord.created_at.desc())
         )
         approval_rows = approval_result.scalars().all()
 
         action_result = await self.session.execute(
-            select(ActionRecord).where(ActionRecord.incident_id == incident_uuid)
+            select(ActionRecord)
+            .where(ActionRecord.incident_id == incident_uuid)
+            .order_by(ActionRecord.updated_at.desc(), ActionRecord.created_at.desc())
         )
         action_rows = action_result.scalars().all()
 
@@ -1612,7 +1634,20 @@ class IncidentRepository:
             select(RcaReportRecord).where(RcaReportRecord.incident_id == incident_uuid)
         )
         report_rows = report_result.scalars().all()
-        incident_status = str(incident_record.status or "").strip().lower()
+        projection_record = await self.session.get(IncidentProjectionRecord, incident_uuid)
+        latest_approval = approval_rows[0] if approval_rows else None
+        latest_action = action_rows[0] if action_rows else None
+        lifecycle_status = reduce_incident_status(
+            projection_status=projection_record.status if projection_record is not None else None,
+            projection_updated_at=projection_record.updated_at if projection_record is not None else None,
+            canonical_status=incident_record.status,
+            canonical_updated_at=incident_record.updated_at,
+            approval_status=latest_approval.decision if latest_approval is not None else None,
+            approval_updated_at=latest_approval.updated_at if latest_approval is not None else None,
+            action_status=latest_action.status if latest_action is not None else None,
+            action_updated_at=latest_action.updated_at if latest_action is not None else None,
+        )
+        incident_status = lifecycle_status["status"]
 
         stage_matrix = [
             {
@@ -1643,7 +1678,7 @@ class IncidentRepository:
                 "stage": "approval_recorded",
                 "label": "Human Approval Layer",
                 "event_types": ["incident.approval.recorded", "incident.approval.requested"],
-                "next_action": "Complete dry run and record an authorized operator decision.",
+                "next_action": "Record an authorized operator decision.",
             },
             {
                 "stage": "remediation_executed",
@@ -1658,6 +1693,17 @@ class IncidentRepository:
                 "next_action": "Validate recovery and close or escalate the incident.",
             },
         ]
+        diagnostic_completion = any(
+            str(action.action_type or "").strip().lower() == "diagnostic_completion"
+            and str(action.status or "").strip().lower() == "skipped"
+            and bool(((action.payload or {}).get("parameters") or {}).get("diagnostic_closure"))
+            for action in action_rows
+        )
+        if diagnostic_completion:
+            # Approval is not part of a non-mutating diagnostic branch. Count
+            # the lifecycle that actually ran instead of reporting a permanent
+            # missing approval after the incident was correctly auto-closed.
+            stage_matrix = [row for row in stage_matrix if row["stage"] != "approval_recorded"]
 
         stages = []
         for row in stage_matrix:
@@ -1742,7 +1788,9 @@ class IncidentRepository:
 
         return {
             "incident_id": str(incident_record.id),
-            "status": str(incident_record.status or "unknown"),
+            "status": incident_status,
+            "status_source": lifecycle_status["source"],
+            "status_reason": lifecycle_status["reason"],
             "service": str(incident_record.service or "unknown"),
             "counts": {
                 "incident_events": len(event_rows),
@@ -1763,14 +1811,39 @@ class IncidentRepository:
         }
 
     async def save_incident(self, incident: Incident) -> None:
+        incident_id = self._require("incident.id", incident.id)
+        incoming_status = self._require("incident.status", incident.status.value)
+        existing = await self.session.get(IncidentRecord, incident_id)
+        if (
+            existing is not None
+            and str(existing.status or "").strip().lower() in _CLOSED_INCIDENT_STATUSES
+            and str(incoming_status).strip().lower() not in _CLOSED_INCIDENT_STATUSES
+        ):
+            # Delayed alert/Jira messages can arrive after closure and still
+            # carry the pre-closure Incident object. They may enrich identity,
+            # but they must never reopen a terminal incident implicitly.
+            stored_payload = dict(existing.payload or {})
+            incoming_payload = incident.model_dump(mode="json")
+            if not existing.ticket_id and incident.ticket_id:
+                existing.ticket_id = incident.ticket_id
+                stored_payload["ticket_id"] = incident.ticket_id
+            stored_alert_ids = [str(item) for item in stored_payload.get("alert_ids", []) if str(item).strip()]
+            incoming_alert_ids = [str(item) for item in incoming_payload.get("alert_ids", []) if str(item).strip()]
+            if incoming_alert_ids:
+                stored_payload["alert_ids"] = list(dict.fromkeys([*stored_alert_ids, *incoming_alert_ids]))
+            stored_payload["status"] = existing.status
+            stored_payload["state"] = existing.status
+            existing.payload = stored_payload
+            await self.session.merge(existing)
+            return
         await self.session.merge(
             IncidentRecord(
-                id=self._require("incident.id", incident.id),
+                id=incident_id,
                 tenant_id=incident.tenant_id or "default",
                 service=self._require("incident.service", incident.service),
                 environment=self._require("incident.environment", incident.environment),
                 severity=self._require("incident.severity", incident.severity.value),
-                status=self._require("incident.status", incident.status.value),
+                status=incoming_status,
                 title=self._require("incident.title", incident.title),
                 ticket_id=incident.ticket_id,
                 payload=incident.model_dump(mode="json"),
@@ -1785,16 +1858,18 @@ class IncidentRepository:
         record = result.scalar_one_or_none()
         return record.payload if record else None
 
-    async def find_open_jira_by_correlation_key(self, correlation_key: str) -> str | None:
+    async def find_open_jira_by_correlation_key(self, correlation_key: str, *, tenant_id: str = "default") -> str | None:
         """Resolve a previously qualified Jira incident for a correlated signal."""
-        incident = await self.find_open_incident_by_correlation_key(correlation_key)
+        incident = await self.find_open_incident_by_correlation_key(correlation_key, tenant_id=tenant_id)
         if not incident:
             return None
         metadata = incident.get("metadata") if isinstance(incident.get("metadata"), dict) else {}
         candidate = metadata.get("incident_candidate") if isinstance(metadata.get("incident_candidate"), dict) else {}
         return str(incident.get("ticket_id") or candidate.get("jira_key") or "").strip() or None
 
-    async def find_open_incident_by_correlation_key(self, correlation_key: str) -> dict[str, Any] | None:
+    async def find_open_incident_by_correlation_key(
+        self, correlation_key: str, *, tenant_id: str = "default"
+    ) -> dict[str, Any] | None:
         """Resolve the canonical open incident that owns a correlated alert group."""
         normalized = str(correlation_key or "").strip()
         if not normalized:
@@ -1802,6 +1877,8 @@ class IncidentRepository:
         result = await self.session.execute(
             select(IncidentRecord)
             .where(IncidentRecord.ticket_id.is_not(None))
+            .where(IncidentRecord.tenant_id == tenant_id)
+            .where(IncidentRecord.status.not_in(("closed", "resolved", "cancelled", "canceled")))
             .order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc())
             .limit(1000)
         )
@@ -1816,6 +1893,52 @@ class IncidentRepository:
             if str(candidate.get("correlation_key") or "").strip() == normalized:
                 return payload
         return None
+
+    async def list_unresolved_incident_family(
+        self,
+        *,
+        incident_id: str,
+        service: str,
+        environment: str,
+        category: str,
+        tenant_id: str = "default",
+        limit: int = 100,
+        window_minutes: int = 60,
+    ) -> list[dict[str, Any]]:
+        """Find unresolved members of the same operational symptom family."""
+        from common.incident_identity import same_environment_family
+
+        current_id = self._parse_uuid(incident_id)
+        current_record = await self.session.get(IncidentRecord, current_id) if current_id is not None else None
+        if current_record is None:
+            return []
+        family_cutoff = current_record.created_at - timedelta(minutes=max(1, min(int(window_minutes), 1440)))
+        query = (
+            select(IncidentRecord)
+            .where(IncidentRecord.tenant_id == tenant_id)
+            .where(IncidentRecord.service == self._require("service", service))
+            .where(IncidentRecord.status.not_in(("closed", "resolved", "cancelled", "canceled")))
+            .where(IncidentRecord.created_at >= family_cutoff)
+            .where(IncidentRecord.created_at <= current_record.created_at)
+            .order_by(IncidentRecord.created_at.desc())
+            .limit(max(1, min(int(limit), 500)))
+        )
+        result = await self.session.execute(query)
+        related: list[dict[str, Any]] = []
+        normalized_category = str(category or "unknown").strip().lower()
+        for record in result.scalars().all():
+            if current_id is not None and record.id == current_id:
+                continue
+            payload = record.payload if isinstance(record.payload, dict) else {}
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            candidate = metadata.get("incident_candidate") if isinstance(metadata.get("incident_candidate"), dict) else {}
+            candidate_category = str(candidate.get("category") or "unknown").strip().lower()
+            if candidate_category != normalized_category:
+                continue
+            if not same_environment_family(environment, payload.get("environment") or record.environment):
+                continue
+            related.append(payload)
+        return related
 
     async def get_latest_recommendation_for_incident(self, incident_id: Any) -> dict[str, Any] | None:
         incident_uuid = self._parse_uuid(incident_id)
@@ -1964,6 +2087,7 @@ class IncidentRepository:
         return updated
 
     async def save_action(self, action: RemediationAction) -> None:
+        action_status = self._require("action.status", action.status.value)
         await self.session.merge(
             ActionRecord(
                 id=self._require("action.id", action.id),
@@ -1972,10 +2096,117 @@ class IncidentRepository:
                 action_type=self._require("action.action_type", action.action_type),
                 target=self._require("action.target", action.target),
                 idempotency_key=action.idempotency_key,
-                status=self._require("action.status", action.status.value),
+                status=action_status,
                 payload=action.model_dump(mode="json"),
             )
         )
+        # Keep the incident read model synchronized with the durable action.
+        # Action persistence is the lifecycle source of truth; relying only on
+        # asynchronous events leaves incidents permanently "remediating" when
+        # a consumer is restarted or an older producer omits a terminal event.
+        incident_status = {
+            "pending": "remediating",
+            "policy_checked": "remediating",
+            "approved": "remediating",
+            "dispatching": "remediating",
+            "running": "remediating",
+            "succeeded": "validating",
+            "failed": "failed",
+            "skipped": "failed",
+            "execution_failed": "failed",
+            "validation_failed": "failed",
+            "dispatch_failed": "failed",
+            "policy_blocked": "awaiting_approval",
+            "awaiting_approval": "awaiting_approval",
+            "rollback_failed": "failed",
+            "timed_out": "failed",
+            "cancelled": "failed",
+            "manual_intervention_required": "failed",
+            "rolled_back": "validating",
+        }.get(str(action_status).lower())
+        if action_status == "skipped" and action.action_type == "diagnostic_completion":
+            incident_status = "validating"
+        if incident_status:
+            projection = await self.session.get(IncidentProjectionRecord, action.incident_id)
+            if (
+                projection is not None
+                and str(projection.status or "").strip().lower() not in _CLOSED_INCIDENT_STATUSES
+            ):
+                now = utc_now()
+                projection.status = incident_status
+                projection.latest_event_type = "incident.remediation.status"
+                projection.latest_event_at = now
+                projection.updated_at = now
+                payload = dict(projection.projection_payload or {})
+                payload["status"] = incident_status
+                payload["state"] = incident_status
+                payload["remediation_status"] = action_status
+                payload["remediation_action"] = action.model_dump(mode="json")
+                projection.projection_payload = payload
+                await self.session.merge(projection)
+
+    async def enqueue_resolution_event(
+        self,
+        *,
+        event_id: str,
+        aggregate_id: str,
+        topic: str,
+        partition_key: str,
+        payload: dict[str, Any],
+        tenant_id: str = "default",
+        available_after_seconds: float = 60.0,
+    ) -> bool:
+        normalized_event_id = self._require("outbox.event_id", event_id)
+        if await self.session.get(ResolutionOutboxRecord, normalized_event_id) is not None:
+            return False
+        self.session.add(
+            ResolutionOutboxRecord(
+                event_id=normalized_event_id,
+                tenant_id=tenant_id or "default",
+                aggregate_id=self._require("outbox.aggregate_id", aggregate_id),
+                topic=self._require("outbox.topic", topic),
+                partition_key=self._require("outbox.partition_key", partition_key),
+                payload=payload,
+                status="pending",
+                attempts=0,
+                next_attempt_at=utc_now() + timedelta(seconds=max(0.0, float(available_after_seconds))),
+            )
+        )
+        return True
+
+    async def list_pending_resolution_events(self, *, limit: int = 100) -> list[ResolutionOutboxRecord]:
+        rows = await self.session.execute(
+            select(ResolutionOutboxRecord)
+            .where(
+                ResolutionOutboxRecord.published_at.is_(None),
+                ResolutionOutboxRecord.status.in_(("pending", "retry")),
+                ResolutionOutboxRecord.next_attempt_at <= utc_now(),
+            )
+            .order_by(ResolutionOutboxRecord.created_at.asc())
+            .limit(max(1, min(int(limit), 1000)))
+        )
+        return list(rows.scalars().all())
+
+    async def mark_resolution_event_published(self, event_id: str) -> None:
+        row = await self.session.get(ResolutionOutboxRecord, event_id)
+        if row is None:
+            return
+        row.status = "published"
+        row.published_at = utc_now()
+        row.last_error = None
+        row.attempts = int(row.attempts or 0) + 1
+        await self.session.merge(row)
+
+    async def mark_resolution_event_retry(self, event_id: str, error: str) -> None:
+        row = await self.session.get(ResolutionOutboxRecord, event_id)
+        if row is None:
+            return
+        attempts = int(row.attempts or 0) + 1
+        row.status = "retry"
+        row.attempts = attempts
+        row.last_error = str(error)[:4000]
+        row.next_attempt_at = utc_now() + timedelta(seconds=min(300, 2 ** min(attempts, 8)))
+        await self.session.merge(row)
 
     async def find_action_by_idempotency_key(self, idempotency_key: str) -> RemediationAction | None:
         """Look up a previously-persisted action by its deterministic idempotency key.
@@ -2274,6 +2505,206 @@ class IncidentRepository:
         record.resolution_payload = resolution_payload
         await self.session.flush()
         return True
+
+    async def save_context_snapshot(
+        self,
+        *,
+        snapshot_id: UUID,
+        tenant_id: str,
+        incident_id: str,
+        source_incident_id: str | None,
+        alert_signature: str,
+        subject_fingerprint: str,
+        context_fingerprint: str,
+        contract_version: str,
+        quality_score: float,
+        reusable: bool,
+        source_manifest: dict[str, Any],
+        payload: dict[str, Any],
+        collected_at: datetime,
+        expires_at: datetime,
+    ) -> None:
+        if await self.session.get(ContextSnapshotRecord, snapshot_id) is not None:
+            return
+        self.session.add(
+            ContextSnapshotRecord(
+                snapshot_id=snapshot_id,
+                tenant_id=tenant_id or "default",
+                incident_id=self._require("context_snapshot.incident_id", incident_id),
+                source_incident_id=source_incident_id,
+                alert_signature=self._require("context_snapshot.alert_signature", alert_signature),
+                subject_fingerprint=self._require("context_snapshot.subject_fingerprint", subject_fingerprint),
+                context_fingerprint=self._require("context_snapshot.context_fingerprint", context_fingerprint),
+                contract_version=contract_version or "kaiops.context.v2",
+                quality_score=max(0.0, min(float(quality_score), 1.0)),
+                reusable=bool(reusable),
+                source_manifest=source_manifest if isinstance(source_manifest, dict) else {},
+                payload=payload if isinstance(payload, dict) else {},
+                collected_at=collected_at,
+                expires_at=expires_at,
+            )
+        )
+        await self.session.flush()
+
+    async def latest_context_snapshot(self, incident_id: str, *, tenant_id: str = "default") -> dict[str, Any] | None:
+        row = (
+            await self.session.execute(
+                select(ContextSnapshotRecord)
+                .where(
+                    ContextSnapshotRecord.tenant_id == (tenant_id or "default"),
+                    ContextSnapshotRecord.incident_id == incident_id,
+                )
+                .order_by(ContextSnapshotRecord.collected_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return {
+            "snapshot_id": str(row.snapshot_id),
+            "tenant_id": row.tenant_id,
+            "incident_id": row.incident_id,
+            "source_incident_id": row.source_incident_id,
+            "alert_signature": row.alert_signature,
+            "subject_fingerprint": row.subject_fingerprint,
+            "context_fingerprint": row.context_fingerprint,
+            "contract_version": row.contract_version,
+            "quality_score": float(row.quality_score or 0.0),
+            "reusable": bool(row.reusable),
+            "source_manifest": row.source_manifest if isinstance(row.source_manifest, dict) else {},
+            "context": row.payload if isinstance(row.payload, dict) else {},
+            "collected_at": row.collected_at.isoformat(),
+            "expires_at": row.expires_at.isoformat(),
+        }
+
+    async def create_resolution_investigation(self, payload: dict[str, Any]) -> None:
+        await self.session.execute(
+            text(
+                "INSERT INTO resolution_investigations "
+                "(investigation_id,tenant_id,incident_id,alert_id,status,step_budget,steps_used,evidence_count,"
+                "tool_budget,source_coverage,missing_sources,conclusion,payload,started_at) "
+                "VALUES (:investigation_id,:tenant_id,:incident_id,:alert_id,:status,:step_budget,0,:evidence_count,"
+                ":tool_budget,:source_coverage,:missing_sources,:conclusion,:payload,NOW(6)) "
+                "ON DUPLICATE KEY UPDATE status=VALUES(status), updated_at=NOW(6)"
+            ),
+            {
+                "investigation_id": self._require("investigation_id", payload.get("investigation_id")),
+                "tenant_id": str(payload.get("tenant_id") or "default"),
+                "incident_id": self._require("incident_id", payload.get("incident_id")),
+                "alert_id": str(payload.get("alert_id") or "") or None,
+                "status": str(payload.get("status") or "running"),
+                "step_budget": int(payload.get("step_budget") or 1),
+                "evidence_count": int(payload.get("evidence_count") or 0),
+                "tool_budget": json.dumps({"max_steps": int(payload.get("step_budget") or 1)}),
+                "source_coverage": json.dumps({}),
+                "missing_sources": json.dumps([]),
+                "conclusion": json.dumps({}),
+                "payload": json.dumps(payload, default=str),
+            },
+        )
+
+    async def append_resolution_investigation_step(self, payload: dict[str, Any]) -> None:
+        await self.session.execute(
+            text(
+                "INSERT INTO resolution_investigation_steps "
+                "(step_id,investigation_id,sequence_no,tool_name,query_payload,status,result_count,evidence_ids,"
+                "hypothesis_updates,error_message,started_at,completed_at) "
+                "VALUES (:step_id,:investigation_id,:sequence_no,:tool_name,:query_payload,:status,:result_count,"
+                ":evidence_ids,:hypothesis_updates,:error_message,:started_at,:completed_at) "
+                "ON DUPLICATE KEY UPDATE status=VALUES(status),result_count=VALUES(result_count),"
+                "evidence_ids=VALUES(evidence_ids),hypothesis_updates=VALUES(hypothesis_updates),"
+                "error_message=VALUES(error_message),completed_at=VALUES(completed_at)"
+            ),
+            {
+                "step_id": self._require("step_id", payload.get("step_id")),
+                "investigation_id": self._require("investigation_id", payload.get("investigation_id")),
+                "sequence_no": int(payload.get("sequence_no") or 0),
+                "tool_name": self._require("tool_name", payload.get("tool_name")),
+                "query_payload": json.dumps(payload.get("query") or {}, default=str),
+                "status": str(payload.get("status") or "completed"),
+                "result_count": int(payload.get("result_count") or 0),
+                "evidence_ids": json.dumps(payload.get("evidence_ids") or []),
+                "hypothesis_updates": json.dumps(payload.get("hypothesis_updates") or [], default=str),
+                "error_message": str(payload.get("error") or "")[:1000] or None,
+                "started_at": payload.get("started_at") or utc_now(),
+                "completed_at": payload.get("completed_at") or utc_now(),
+            },
+        )
+
+    async def complete_resolution_investigation(self, payload: dict[str, Any]) -> None:
+        investigation_id = self._require("investigation_id", payload.get("investigation_id"))
+        await self.session.execute(
+            text(
+                "UPDATE resolution_investigations SET status=:status,stop_reason=:stop_reason,steps_used=:steps_used,"
+                "evidence_count=:evidence_count,source_coverage=:source_coverage,missing_sources=:missing_sources,"
+                "conclusion=:conclusion,payload=:payload,completed_at=NOW(6),updated_at=NOW(6) "
+                "WHERE investigation_id=:investigation_id"
+            ),
+            {
+                "investigation_id": investigation_id,
+                "status": str(payload.get("status") or "inconclusive"),
+                "stop_reason": str(payload.get("stop_reason") or "")[:128] or None,
+                "steps_used": int(payload.get("steps_used") or 0),
+                "evidence_count": int(payload.get("evidence_count") or 0),
+                "source_coverage": json.dumps(payload.get("source_coverage") or {}),
+                "missing_sources": json.dumps(payload.get("missing_sources") or []),
+                "conclusion": json.dumps(payload.get("conclusion") or {}, default=str),
+                "payload": json.dumps(payload, default=str),
+            },
+        )
+        for hypothesis in payload.get("hypotheses") or []:
+            if not isinstance(hypothesis, dict) or not str(hypothesis.get("claim") or "").strip():
+                continue
+            claim = str(hypothesis["claim"]).strip()
+            digest = hashlib.sha256(claim.lower().encode()).hexdigest()
+            await self.session.execute(
+                text(
+                    "INSERT INTO resolution_hypotheses "
+                    "(hypothesis_id,investigation_id,claim_digest,claim_text,status,confidence,supporting_evidence_ids,"
+                    "contradicting_evidence_ids,falsification_query,source,payload) "
+                    "VALUES (:hypothesis_id,:investigation_id,:claim_digest,:claim_text,:status,:confidence,"
+                    ":supporting,:contradicting,:falsification,:source,:payload) "
+                    "ON DUPLICATE KEY UPDATE status=VALUES(status),confidence=VALUES(confidence),"
+                    "supporting_evidence_ids=VALUES(supporting_evidence_ids),"
+                    "contradicting_evidence_ids=VALUES(contradicting_evidence_ids),payload=VALUES(payload),updated_at=NOW(6)"
+                ),
+                {
+                    "hypothesis_id": str(hypothesis.get("hypothesis_id") or uuid4()),
+                    "investigation_id": investigation_id,
+                    "claim_digest": digest,
+                    "claim_text": claim,
+                    "status": str(hypothesis.get("status") or "viable"),
+                    "confidence": max(0.0, min(float(hypothesis.get("confidence") or 0.0), 1.0)),
+                    "supporting": json.dumps(hypothesis.get("supporting_evidence_ids") or []),
+                    "contradicting": json.dumps(hypothesis.get("contradicting_evidence_ids") or []),
+                    "falsification": json.dumps(hypothesis.get("falsification_query") or {}, default=str),
+                    "source": str(hypothesis.get("source") or "unknown")[:64],
+                    "payload": json.dumps(hypothesis, default=str),
+                },
+            )
+
+    async def latest_resolution_investigation(
+        self, incident_id: str, *, tenant_id: str = "default"
+    ) -> dict[str, Any] | None:
+        row = (
+            await self.session.execute(
+                text(
+                    "SELECT payload FROM resolution_investigations "
+                    "WHERE tenant_id=:tenant_id AND incident_id=:incident_id "
+                    "ORDER BY started_at DESC LIMIT 1"
+                ),
+                {"tenant_id": tenant_id or "default", "incident_id": incident_id},
+            )
+        ).scalar_one_or_none()
+        if isinstance(row, dict):
+            return row
+        if isinstance(row, str):
+            try:
+                parsed = json.loads(row)
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                return None
+        return None
 
     async def save_application(self, application: ApplicationRegistration) -> None:
         await self.session.merge(
@@ -3300,6 +3731,19 @@ class IncidentRepository:
         if document_available is not None:
             projection.document_available = document_available
 
+        incoming_status_token = str(event_record.status or "").strip().lower()
+        existing_status_token = str(projection.status or "").strip().lower()
+        if (
+            existing_status_token in _CLOSED_INCIDENT_STATUSES
+            and incoming_status_token not in _CLOSED_INCIDENT_STATUSES
+            and event_record.event_type != "incident.reopened"
+        ):
+            # Event delivery is at-least-once and cross-service timestamps can
+            # be tied at database precision. A late remediation/alert event is
+            # not an authorized reopen operation, so terminal state wins.
+            await self.session.merge(projection)
+            return
+
         # Do not regress projection lifecycle when two events share the same timestamp.
         # In local/demo runs, recommendation and closed can be written within the same second.
         existing_latest = _utc_dt(projection.latest_event_at)
@@ -3328,7 +3772,13 @@ class IncidentRepository:
         projection.service = event_record.service
         projection.environment = event_record.environment
         projection.severity = event_record.severity
-        projection.status = event_record.status or projection.status or "open"
+        incoming_status = event_record.status or projection.status or "open"
+        if event_record.event_type == "incident.recommendation.generated" and str(incoming_status).lower() == "remediating":
+            # A recommendation establishes readiness, never proof that an
+            # executor started. This also protects projection rebuild/replay
+            # from restoring the legacy false-remediating state.
+            incoming_status = "awaiting_approval" if event_record.requires_approval else "approved"
+        projection.status = incoming_status
         projection.risk_tier = event_record.risk_tier
         projection.execution_mode = event_record.execution_mode
         projection.requires_approval = event_record.requires_approval
@@ -3406,9 +3856,44 @@ class IncidentRepository:
         )
         rows = list(result.scalars().all())
         rows.sort(key=lambda row: row.created_at)
+        # This worker is a repair path, not a second lifecycle consumer. Replaying
+        # historical events into an existing projection can undo a newer status
+        # written by remediation/closure (especially for legacy events with tied
+        # timestamps). Only reconstruct projections that are actually missing.
+        incident_ids = {row.incident_id for row in rows}
+        existing_ids: set[UUID] = set()
+        if incident_ids:
+            existing_result = await self.session.execute(
+                select(IncidentProjectionRecord.incident_id).where(
+                    IncidentProjectionRecord.incident_id.in_(incident_ids)
+                )
+            )
+            existing_ids = set(existing_result.scalars().all())
+        rebuilt_ids = incident_ids - existing_ids
         for row in rows:
-            await self._upsert_projection_from_record(row)
-        return len(rows)
+            if row.incident_id in rebuilt_ids:
+                await self._upsert_projection_from_record(row)
+        # Legacy batches may contain a recommendation marked remediating and a
+        # policy-blocked action event with the same timestamp. Normalize after
+        # the whole ordered replay so tie-breaking cannot leave a projection
+        # claiming execution without an active executor action.
+        await self.session.execute(
+            text(
+                "UPDATE incident_projections p SET "
+                "p.status=CASE "
+                "WHEN EXISTS (SELECT 1 FROM actions a WHERE a.incident_id=p.incident_id "
+                "AND a.status IN ('awaiting_approval','policy_blocked')) THEN 'awaiting_approval' "
+                "WHEN COALESCE(p.requires_approval,0)=1 THEN 'awaiting_approval' ELSE 'approved' END, "
+                "p.projection_payload=JSON_SET(COALESCE(p.projection_payload, JSON_OBJECT()), '$.status', "
+                "CASE WHEN EXISTS (SELECT 1 FROM actions a WHERE a.incident_id=p.incident_id "
+                "AND a.status IN ('awaiting_approval','policy_blocked')) THEN 'awaiting_approval' "
+                "WHEN COALESCE(p.requires_approval,0)=1 THEN 'awaiting_approval' ELSE 'approved' END) "
+                "WHERE p.status='remediating' "
+                "AND NOT EXISTS (SELECT 1 FROM actions active WHERE active.incident_id=p.incident_id "
+                "AND active.status IN ('pending','dispatching','executor_accepted','running','verifying','rolling_back'))"
+            )
+        )
+        return len(rebuilt_ids)
 
     async def list_incident_projections(
         self,
@@ -3441,13 +3926,14 @@ class IncidentRepository:
             latest_stmt = latest_stmt.where(
                 IncidentProjectionRecord.transport_provider == str(transport_provider).strip().lower()
             )
-        if status:
-            latest_stmt = latest_stmt.where(
-                IncidentProjectionRecord.status == str(status).strip().lower()
-            )
         if service:
             latest_stmt = latest_stmt.where(IncidentProjectionRecord.service == str(service).strip())
-        latest = latest_stmt.order_by(IncidentProjectionRecord.updated_at.desc()).limit(safe_limit).subquery()
+        # Status is intentionally filtered after lifecycle reduction below. The
+        # projection value can lag a newer approval or remediation action, and
+        # filtering it here would make the summary omit incidents whose visible
+        # canonical status matches the requested filter.
+        query_limit = 1000 if status else safe_limit
+        latest = latest_stmt.order_by(IncidentProjectionRecord.updated_at.desc()).limit(query_limit).subquery()
         stmt = (
             select(IncidentProjectionRecord)
             .join(latest, IncidentProjectionRecord.incident_id == latest.c.incident_id)
@@ -3457,17 +3943,30 @@ class IncidentRepository:
         rows = result.scalars().all()
 
         ticket_by_incident: dict[UUID, str] = {}
+        canonical_status_by_incident: dict[UUID, str] = {}
+        canonical_updated_at_by_incident: dict[UUID, datetime] = {}
         projection_incident_ids = [row.incident_id for row in rows]
         if projection_incident_ids:
             ticket_result = await self.session.execute(
-                select(IncidentRecord.id, IncidentRecord.ticket_id).where(
+                select(IncidentRecord.id, IncidentRecord.ticket_id, IncidentRecord.status, IncidentRecord.updated_at).where(
                     IncidentRecord.id.in_(projection_incident_ids)
                 )
             )
+            incident_rows = ticket_result.all()
             ticket_by_incident = {
                 incident_id: str(ticket_id).strip()
-                for incident_id, ticket_id in ticket_result.all()
+                for incident_id, ticket_id, _incident_status, _updated_at in incident_rows
                 if str(ticket_id or "").strip()
+            }
+            canonical_status_by_incident = {
+                incident_id: str(incident_status).strip().lower()
+                for incident_id, _ticket_id, incident_status, _updated_at in incident_rows
+                if str(incident_status or "").strip()
+            }
+            canonical_updated_at_by_incident = {
+                incident_id: updated_at
+                for incident_id, _ticket_id, _incident_status, updated_at in incident_rows
+                if updated_at is not None
             }
 
         pending_by_incident: dict[UUID, PendingWorkflowRecord] = {}
@@ -3485,14 +3984,44 @@ class IncidentRepository:
 
         action_by_incident: dict[UUID, ActionRecord] = {}
         incident_ids = [row.incident_id for row in rows]
-        if include_enrichment and incident_ids:
-            action_result = await self.session.execute(
+        if incident_ids:
+            action_stmt = (
                 select(ActionRecord)
                 .where(ActionRecord.incident_id.in_(incident_ids))
                 .order_by(ActionRecord.updated_at.desc(), ActionRecord.created_at.desc())
             )
+            if not include_enrichment:
+                action_stmt = action_stmt.options(
+                    load_only(
+                        ActionRecord.id,
+                        ActionRecord.incident_id,
+                        ActionRecord.status,
+                        ActionRecord.updated_at,
+                        ActionRecord.created_at,
+                    )
+                )
+            action_result = await self.session.execute(action_stmt)
             for action in action_result.scalars().all():
                 action_by_incident.setdefault(action.incident_id, action)
+
+        approval_by_incident: dict[UUID, ApprovalRecord] = {}
+        if incident_ids:
+            approval_result = await self.session.execute(
+                select(ApprovalRecord)
+                .where(ApprovalRecord.incident_id.in_(incident_ids))
+                .order_by(ApprovalRecord.updated_at.desc(), ApprovalRecord.created_at.desc())
+                .options(
+                    load_only(
+                        ApprovalRecord.id,
+                        ApprovalRecord.incident_id,
+                        ApprovalRecord.decision,
+                        ApprovalRecord.updated_at,
+                        ApprovalRecord.created_at,
+                    )
+                )
+            )
+            for approval in approval_result.scalars().all():
+                approval_by_incident.setdefault(approval.incident_id, approval)
 
         evaluation_by_incident: dict[UUID, EvaluationRecord] = {}
         if include_enrichment and incident_ids:
@@ -3503,6 +4032,20 @@ class IncidentRepository:
             )
             for evaluation in evaluation_result.scalars().all():
                 evaluation_by_incident.setdefault(evaluation.incident_id, evaluation)
+
+        recommendation_by_id: dict[UUID, dict[str, Any]] = {}
+        recommendation_ids = [row.recommendation_id for row in rows if row.recommendation_id is not None]
+        if include_enrichment and recommendation_ids:
+            recommendation_result = await self.session.execute(
+                select(AuditLogRecord).where(
+                    AuditLogRecord.id.in_(recommendation_ids),
+                    AuditLogRecord.action == "recommendation.generated",
+                )
+            )
+            recommendation_by_id = {
+                record.id: dict(record.payload or {})
+                for record in recommendation_result.scalars().all()
+            }
 
         response_rows: list[dict[str, Any]] = []
         for row in rows:
@@ -3523,15 +4066,66 @@ class IncidentRepository:
                     },
                 )
             action = action_by_incident.get(row.incident_id)
-            projected_status = row.status
+            approval_record = approval_by_incident.get(row.incident_id)
+            canonical_status = canonical_status_by_incident.get(row.incident_id, "")
             if action is not None:
                 action_status = str(action.status or "").lower()
-                if str(row.status or "").lower() == "remediating" and action_status in {"skipped", "failed", "rejected"}:
-                    projected_status = "failed"
-                elif str(row.status or "").lower() == "remediating" and action_status == "succeeded":
-                    projected_status = "validating"
-                projection_payload["remediation_action"] = action.payload or {}
+                if include_enrichment:
+                    projection_payload["remediation_action"] = action.payload or {}
                 projection_payload["remediation_status"] = action_status
+
+            event_payload = projection_payload.get("event_payload") if isinstance(projection_payload.get("event_payload"), dict) else {}
+            action_payload = action.payload if include_enrichment and action is not None and isinstance(action.payload, dict) else {}
+            lifecycle_candidates = (
+                event_payload.get("resolution_lifecycle"),
+                (action_payload.get("parameters") or {}).get("resolution_lifecycle") if isinstance(action_payload.get("parameters"), dict) else None,
+                (action_payload.get("metadata") or {}).get("resolution_lifecycle") if isinstance(action_payload.get("metadata"), dict) else None,
+            )
+            resolution_lifecycle = select_current_lifecycle(
+                *({"resolution_lifecycle": item} for item in lifecycle_candidates if isinstance(item, dict))
+            )
+            if resolution_lifecycle:
+                projection_payload["resolution_lifecycle"] = resolution_lifecycle
+
+            recommendation_payload = recommendation_by_id.get(merged_recommendation_id, {})
+            recommendation_metadata = (
+                recommendation_payload.get("metadata")
+                if isinstance(recommendation_payload.get("metadata"), dict)
+                else {}
+            )
+            orchestration_path = (
+                recommendation_metadata.get("orchestration_path")
+                if isinstance(recommendation_metadata.get("orchestration_path"), dict)
+                else {}
+            )
+            if not orchestration_path:
+                lifecycle_control = (
+                    resolution_lifecycle.get("control")
+                    if isinstance(resolution_lifecycle, dict) and isinstance(resolution_lifecycle.get("control"), dict)
+                    else {}
+                )
+                disposition = str(lifecycle_control.get("disposition") or "").strip().lower()
+                analysis_reused = recommendation_metadata.get("analysis_reused") is True
+                diagnostic = "diagnostic" in str(row.execution_mode or "").lower() or disposition in {"watch_only", "investigate"}
+                path_id = "diagnostic" if diagnostic else "guided_reuse" if analysis_reused and row.requires_approval else "verified_fast_path" if analysis_reused else "guided" if row.requires_approval else "autonomous"
+                labels = {
+                    "diagnostic": "Diagnostic completion",
+                    "guided_reuse": "Reused analysis with approval",
+                    "verified_fast_path": "Verified context fast path",
+                    "guided": "Fresh analysis guided path",
+                    "autonomous": "Fresh analysis autonomous path",
+                }
+                orchestration_path = {
+                    "schema_version": "kaims.orchestration-path.v1",
+                    "id": path_id,
+                    "label": labels[path_id],
+                    "context_reused": bool(recommendation_metadata.get("context_reused")),
+                    "analysis_reused": analysis_reused,
+                    "disposition": disposition or ("investigate" if diagnostic else "approval_required" if row.requires_approval else "execution_ready"),
+                    "skipped_stages": ["approval", "execution"] if diagnostic else ["context_collection", "rca_generation"] if analysis_reused else ["approval"] if not row.requires_approval else [],
+                    "derived_for_legacy_record": True,
+                }
+            projection_payload["orchestration_path"] = orchestration_path
 
             approval_payload = projection_payload.get("approval") if isinstance(projection_payload.get("approval"), dict) else {}
             approval_event_payload = projection_payload.get("event_payload") if isinstance(projection_payload.get("event_payload"), dict) else {}
@@ -3541,25 +4135,27 @@ class IncidentRepository:
                 else None
             )
             approval_status = str(
-                projection_payload.get("approval_status")
+                (approval_record.decision if approval_record is not None else None)
+                or projection_payload.get("approval_status")
                 or approval_payload.get("status")
                 or approval_payload.get("decision")
                 or approval_event_decision
                 or ""
             ).strip().lower().replace("-", "_").replace(" ", "_")
-            pending_approval_statuses = {
-                "awaiting_approval", "pending_approval", "pending", "queued", "draft", "standby", "required"
-            }
-            terminal_incident_statuses = {"closed", "resolved", "failed", "cancelled", "canceled"}
-            if approval_status in pending_approval_statuses and str(projected_status or "").lower() not in terminal_incident_statuses:
-                projected_status = "awaiting_approval"
-                projection_payload["status"] = projected_status
-            elif approval_status in {"approved", "modified"} and action is None and str(projected_status or "").lower() == "remediating":
-                # Older approval records advanced to remediating before an
-                # action existed. Present them as approved/awaiting execution
-                # so they cannot remain permanently in a false running state.
-                projected_status = "approved"
-                projection_payload["status"] = projected_status
+            lifecycle_status = reduce_incident_status(
+                projection_status=row.status,
+                projection_updated_at=row.updated_at,
+                canonical_status=canonical_status,
+                canonical_updated_at=canonical_updated_at_by_incident.get(row.incident_id),
+                approval_status=approval_status,
+                approval_updated_at=approval_record.updated_at if approval_record is not None else None,
+                action_status=action.status if action is not None else None,
+                action_updated_at=action.updated_at if action is not None else None,
+            )
+            projected_status = lifecycle_status["status"]
+            projection_payload["status"] = projected_status
+            projection_payload["status_source"] = lifecycle_status["source"]
+            projection_payload["status_reason"] = lifecycle_status["reason"]
 
             ticket_id = ticket_by_incident.get(row.incident_id) or projection_payload.get("ticket_id")
 
@@ -3593,6 +4189,8 @@ class IncidentRepository:
                     "environment": row.environment,
                     "severity": row.severity,
                     "status": projected_status,
+                    "status_source": lifecycle_status["source"],
+                    "status_reason": lifecycle_status["reason"],
                     "approval_status": approval_status or None,
                     "owner": row.owner,
                     "risk_tier": row.risk_tier,
@@ -3600,6 +4198,8 @@ class IncidentRepository:
                     "requires_approval": row.requires_approval,
                     "policy_version": row.policy_version,
                     "policy_reason": row.policy_reason,
+                    "resolution_lifecycle": resolution_lifecycle,
+                    "orchestration_path": orchestration_path,
                     "transport_provider": row.transport_provider,
                     "latest_event_id": str(row.latest_event_id) if row.latest_event_id else None,
                     "latest_event_type": row.latest_event_type,
@@ -3615,7 +4215,15 @@ class IncidentRepository:
                 }
             )
 
-        return response_rows
+        if status:
+            requested_status = str(status).strip().lower().replace("-", "_").replace(" ", "_")
+            response_rows = [
+                item
+                for item in response_rows
+                if str(item.get("status") or "").strip().lower().replace("-", "_").replace(" ", "_")
+                == requested_status
+            ]
+        return response_rows[:safe_limit]
 
     async def list_closed_incidents(self, *, limit: int = 100) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 1000))
@@ -3638,7 +4246,9 @@ class IncidentRepository:
                 IncidentProjectionRecord.updated_at,
                 IncidentProjectionRecord.projection_payload,
             )
-            .where(IncidentProjectionRecord.status.in_(["closed", "resolved", "failed"]))
+            # This endpoint feeds closure/MTTR reporting. Failed incidents are
+            # unresolved terminal attempts and must not be counted as closures.
+            .where(IncidentProjectionRecord.status.in_(["closed", "resolved"]))
             .order_by(IncidentProjectionRecord.latest_event_at.desc())
             .limit(safe_limit)
         )
@@ -3660,6 +4270,23 @@ class IncidentRepository:
         for row in rows:
             projection_payload = dict(row.projection_payload) if isinstance(row.projection_payload, dict) else {}
             event_payload = projection_payload.get("event_payload") if isinstance(projection_payload.get("event_payload"), dict) else {}
+            source_alert = projection_payload.get("source_alert") if isinstance(projection_payload.get("source_alert"), dict) else {}
+            alert_payload = event_payload.get("alert") if isinstance(event_payload.get("alert"), dict) else {}
+            alert_labels = alert_payload.get("labels") if isinstance(alert_payload.get("labels"), dict) else {}
+            closed_severity = next(
+                (
+                    str(value).strip()
+                    for value in (
+                        row.severity,
+                        event_payload.get("severity"),
+                        alert_payload.get("severity"),
+                        alert_labels.get("severity"),
+                        source_alert.get("severity"),
+                    )
+                    if str(value or "").strip()
+                ),
+                None,
+            )
 
             ticket_id = ticket_id_by_incident.get(row.incident_id) or projection_payload.get("ticket_id")
 
@@ -3688,7 +4315,7 @@ class IncidentRepository:
                     "flow_id": row.flow_id,
                     "service": row.service,
                     "environment": row.environment,
-                    "severity": row.severity,
+                    "severity": closed_severity,
                     "status": row.status,
                     "risk_tier": row.risk_tier,
                     "execution_mode": row.execution_mode,

@@ -150,6 +150,28 @@ class ActionRecord(Base, TimestampMixin):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class ResolutionOutboxRecord(Base, TimestampMixin):
+    """Durable handoff between a committed lifecycle change and the broker."""
+
+    __tablename__ = "resolution_outbox"
+    __table_args__ = (
+        Index("idx_resolution_outbox_pending", "status", "next_attempt_at", "created_at"),
+        Index("idx_resolution_outbox_aggregate", "tenant_id", "aggregate_id", "created_at"),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    aggregate_id: Mapped[str] = mapped_column(String(128), index=True)
+    topic: Mapped[str] = mapped_column(String(255), index=True)
+    partition_key: Mapped[str] = mapped_column(String(255))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
 class RcaReportRecord(Base, TimestampMixin):
     __tablename__ = "rca_reports"
 
@@ -200,6 +222,31 @@ class ContextKnowledgeRecord(Base, TimestampMixin):
     reuse_count: Mapped[int] = mapped_column(Integer, default=0)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     resolution_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class ContextSnapshotRecord(Base):
+    """Immutable per-incident context package used for audit and RCA replay."""
+
+    __tablename__ = "context_snapshots"
+    __table_args__ = (
+        Index("idx_context_snapshots_incident_collected", "tenant_id", "incident_id", "collected_at"),
+        Index("idx_context_snapshots_subject_collected", "tenant_id", "subject_fingerprint", "collected_at"),
+    )
+
+    snapshot_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    incident_id: Mapped[str] = mapped_column(String(128), index=True)
+    source_incident_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    alert_signature: Mapped[str] = mapped_column(String(64), index=True)
+    subject_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    context_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    contract_version: Mapped[str] = mapped_column(String(32), default="kaiops.context.v2")
+    quality_score: Mapped[float] = mapped_column(Numeric(5, 4), default=0.0)
+    reusable: Mapped[bool] = mapped_column(Boolean, default=False)
+    source_manifest: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class AuditLogRecord(Base, TimestampMixin):
