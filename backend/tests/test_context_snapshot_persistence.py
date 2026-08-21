@@ -31,6 +31,7 @@ async def test_context_snapshot_and_outbox_are_committed_once(sqlite_session_fac
     module.settings.database_enabled = True
     module.app.state.session_factory = sqlite_session_factory
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="CheckoutErrorRateHigh",
         service="checkout",
@@ -39,9 +40,10 @@ async def test_context_snapshot_and_outbox_are_committed_once(sqlite_session_fac
         description="checkout HTTP 5xx rate is elevated",
         metadata={"tenant_id": "tenant-a", "observability": {"http_5xx_rate": 0.08}},
     )
-    incident = Incident(service=alert.service, environment=alert.environment, severity=alert.severity, title=alert.name)
+    incident = Incident(tenant_id=alert.tenant_id, service=alert.service, environment=alert.environment, severity=alert.severity, title=alert.name)
     context = govern_context(
         Context(
+            tenant_id=alert.tenant_id,
             incident_id=incident.id,
             alert=alert,
             observability={"http_5xx_rate": 0.08},

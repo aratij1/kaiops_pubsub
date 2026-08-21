@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 from alert_intelligence import AlertIntelligenceAgent
-from common.models import Alert, AlertSeverity, Incident, RemediationAction, RemediationStatus
+from common.models import Alert, AlertSeverity, Incident, RemediationAction, RemediationStatus, ResolutionReport
 from common.repository import IncidentRepository
 from common.repository_interfaces import SqlAlertHistoryRepository
 
@@ -89,3 +89,39 @@ async def test_actions_table_tenant_id_persists_and_is_isolated(sqlite_session_f
 
     assert len(rows) == 1
     assert rows[0].tenant_id == "tenant-a"
+
+
+@pytest.mark.asyncio
+async def test_resolution_report_and_observations_persist_non_default_tenant(sqlite_session_factory) -> None:
+    incident = Incident(tenant_id="tenant-a", service="payments", title="tenant report test")
+    report = ResolutionReport(
+        tenant_id="tenant-a",
+        incident_id=incident.id,
+        root_cause="Deployment regression",
+        impact="Elevated payment latency",
+        action_taken="Rolled back the governed deployment",
+        metadata={"independent_validation_observations": [{
+            "validator_id": "validator-availability",
+            "connector_id": "fake-observer",
+            "target_resource_id": "payments-api",
+            "observed_at": "2026-08-21T10:00:00+00:00",
+            "passed": True,
+            "result_checksum": f"sha256:{'a' * 64}",
+        }]},
+    )
+    async with sqlite_session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_incident(incident)
+        await repo.save_report(report)
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        from common.database import RcaReportRecord, ValidationObservationRecord
+        from sqlalchemy import select
+
+        stored_report = (await session.execute(select(RcaReportRecord))).scalar_one()
+        stored_observation = (await session.execute(select(ValidationObservationRecord))).scalar_one()
+
+    assert stored_report.tenant_id == "tenant-a"
+    assert stored_observation.tenant_id == "tenant-a"
+    assert stored_observation.incident_id == incident.id

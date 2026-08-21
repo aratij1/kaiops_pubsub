@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 from collections.abc import Awaitable, Callable, Coroutine
@@ -22,8 +23,8 @@ from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED, LIFECYCLE_RECONCILIATION
 from common.topics import CLOSURE_EVENTS, REMEDIATION_EVENTS
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
 
 settings = get_settings()
 settings.service_name = "closure-service"
@@ -197,8 +198,16 @@ def _extract_remediation_action_payload(payload: dict[str, Any]) -> dict[str, An
     return payload
 
 
-def _is_diagnostic_closure(report: ResolutionReport) -> bool:
+def _is_diagnostic_report(report: ResolutionReport) -> bool:
     return str(report.metadata.get("closure_kind") or "").strip().lower() == "diagnostic"
+
+
+def _is_diagnostic_closure(report: ResolutionReport) -> bool:
+    return _is_diagnostic_report(report) and report.metadata.get("watch_only_authorized") is True
+
+
+def _is_manual_closure(report: ResolutionReport) -> bool:
+    return str(report.metadata.get("closure_kind") or "").strip().lower() == "manual"
 
 
 def _build_closure_event_payload(
@@ -236,7 +245,13 @@ def _build_closure_event_payload(
         citations=[f"report://{report.id}"],
         evidence_ids=[f"action:{action.id}", f"incident:{incident_id}"],
     )
-    closure_outcome = "closed" if report.health_restored or _is_diagnostic_closure(report) else "validation_failed"
+    closure_outcome = (
+        "closed"
+        if report.health_restored or _is_diagnostic_closure(report) or _is_manual_closure(report)
+        else "diagnostic_recorded"
+        if _is_diagnostic_report(report)
+        else "validation_failed"
+    )
     event_contract["event_id"] = f"closure:{action.id}:{closure_outcome}"
     return {
         "report": report,
@@ -267,14 +282,24 @@ def _build_final_incident_payload(
     source_contract_map = source_contract if isinstance(source_contract, dict) else {}
     service_name = _resolve_closure_service_name(action, incident_payload_map)
     existing_metadata = incident_payload_map.get("metadata")
+    diagnostic_report = _is_diagnostic_report(report)
     diagnostic_closure = _is_diagnostic_closure(report)
-    closure_complete = bool(report.health_restored or diagnostic_closure)
+    manual_closure = _is_manual_closure(report)
+    closure_complete = bool(report.health_restored or diagnostic_closure or manual_closure)
+    existing_status = str(incident_payload_map.get("status") or IncidentStatus.INVESTIGATING.value).lower()
+    final_status = (
+        IncidentStatus.CLOSED.value
+        if closure_complete
+        else existing_status
+        if diagnostic_report
+        else IncidentStatus.FAILED.value
+    )
     final_payload = {
         "id": str(action.incident_id),
         "service": service_name,
         "environment": str(incident_payload_map.get("environment") or action.parameters.get("environment") or "prod"),
         "severity": str(incident_payload_map.get("severity") or recommendation_map.get("severity") or "warning").lower(),
-        "status": IncidentStatus.CLOSED.value if closure_complete else IncidentStatus.FAILED.value,
+        "status": final_status,
         "title": str(incident_payload_map.get("title") or f"Incident {action.incident_id}"),
         "summary": str(incident_payload_map.get("summary") or ""),
         "owner_team": incident_payload_map.get("owner_team"),
@@ -302,7 +327,7 @@ def _build_final_incident_payload(
         recommendation_map,
         incident_payload_map.get("metadata"),
     ) or create_lifecycle(
-        tenant_id=action.tenant_id or incident_payload_map.get("tenant_id") or "default",
+        tenant_id=action.tenant_id,
         incident_id=action.incident_id,
         recommendation_id=(
             action.parameters.get("recommendation_id")
@@ -314,12 +339,28 @@ def _build_final_incident_payload(
         reason_code="legacy_lifecycle_reconstructed",
     )
     final_payload["metadata"] = dict(final_payload["metadata"])
-    final_payload["metadata"]["resolution_lifecycle"] = transition_lifecycle(
-        lifecycle,
-        ResolutionState.CLOSED if closure_complete else ResolutionState.FAILED_RETRYABLE,
-        actor=LifecycleActor.CLOSURE,
-        reason_code="diagnostic_completed_no_corrective_action" if diagnostic_closure else None if report.health_restored else "recovery_validation_failed",
-        validation={"checks": report.validation, "passed": closure_complete},
+    final_payload["metadata"]["resolution_lifecycle"] = (
+        lifecycle
+        if diagnostic_report and not diagnostic_closure
+        else transition_lifecycle(
+            lifecycle,
+            ResolutionState.CLOSED if closure_complete else ResolutionState.FAILED_RETRYABLE,
+            actor=LifecycleActor.CLOSURE,
+            reason_code=(
+                "watch_only_policy_completed"
+                if diagnostic_closure
+                else "operator_administrative_closure"
+                if manual_closure
+                else None
+                if report.health_restored
+                else "recovery_validation_failed"
+            ),
+            validation={
+                "checks": report.validation,
+                "passed": bool(report.health_restored or diagnostic_closure),
+                "administrative_disposition": manual_closure,
+            },
+        )
     )
     final_payload["alert_ids"] = incident_payload_map.get("alert_ids") if isinstance(incident_payload_map.get("alert_ids"), list) else []
     if final_payload["created_at"] is None:
@@ -455,12 +496,18 @@ async def _persist_closure_event(
     source_contract = source_payload.get("event_contract", {}) if isinstance(source_payload.get("event_contract"), dict) else {}
     source_recommendation = source_payload.get("source_payload", {}).get("recommendation") if isinstance(source_payload.get("source_payload"), dict) else {}
     recommendation = source_recommendation if isinstance(source_recommendation, dict) else {}
-    status = "closed" if bool(report.health_restored) or _is_diagnostic_closure(report) else "failed"
+    status = (
+        "closed"
+        if bool(report.health_restored) or _is_diagnostic_closure(report) or _is_manual_closure(report)
+        else "investigating"
+        if _is_diagnostic_report(report)
+        else "failed"
+    )
     related_incidents: list[dict[str, Any]] = []
 
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
-        incident_payload = await repo.get_incident(str(action.incident_id)) or {}
+        incident_payload = await repo.get_incident(str(action.incident_id), tenant_id=action.tenant_id) or {}
         report.ticket_id = str(incident_payload.get("ticket_id") or "").strip() or None
         final_incident_payload = _build_final_incident_payload(
             action=action,
@@ -487,7 +534,7 @@ async def _persist_closure_event(
         await repo.save_incident(Incident.model_validate(final_incident_payload))
         await repo.save_incident_event(
             build_event_envelope(
-                event_type="incident.closure.completed",
+                event_type="incident.diagnostic.recorded" if _is_diagnostic_report(report) and not _is_diagnostic_closure(report) else "incident.closure.completed",
                 identity={
                     "incident_id": str(action.incident_id),
                     "alert_id": None,
@@ -497,7 +544,7 @@ async def _persist_closure_event(
                     "parent_event_id": None,
                 },
                 scope={
-                    "tenant_id": "default",
+                    "tenant_id": action.tenant_id,
                     "service": service_name,
                     "environment": str(final_incident_payload.get("environment") or "prod"),
                     "region": None,
@@ -544,7 +591,7 @@ async def _persist_closure_event(
             topic=CLOSURE_EVENTS,
             partition_key=str(action.incident_id),
             payload=durable_event_payload,
-            tenant_id=action.tenant_id or "default",
+            tenant_id=action.tenant_id,
             available_after_seconds=float(getattr(settings, "resolution_outbox_initial_delay_seconds", 60.0) or 60.0),
         )
         await session.commit()
@@ -731,7 +778,7 @@ async def _validate_and_store(action: RemediationAction) -> ResolutionReport:
     if settings.database_enabled:
         async with app.state.session_factory() as session:
             repo = IncidentRepository(session)
-            incident_payload = await repo.get_incident(str(action.incident_id)) or {}
+            incident_payload = await repo.get_incident(str(action.incident_id), tenant_id=action.tenant_id) or {}
             report.ticket_id = str(incident_payload.get("ticket_id") or "").strip() or None
             await repo.save_report(report)
             reviewed_success = _eligible_for_reusable_knowledge(action, report)
@@ -745,7 +792,7 @@ async def _validate_and_store(action: RemediationAction) -> ResolutionReport:
                     successful=bool(report.health_restored and report.alerts_cleared),
                     modified=bool(action.parameters.get("operator_modified")),
                     actor=str(action.parameters.get("approved_by") or "closure-service"),
-                    tenant_id=action.tenant_id or "default",
+                    tenant_id=action.tenant_id,
                     metadata=action.parameters,
                 )
             await session.commit()
@@ -753,7 +800,15 @@ async def _validate_and_store(action: RemediationAction) -> ResolutionReport:
 
 
 @app.post("/validate", response_model=ResolutionReport)
-async def validate(action: RemediationAction) -> ResolutionReport:
+async def validate(
+    action: RemediationAction,
+    x_kaiops_internal_token: str = Header(default=""),
+) -> ResolutionReport:
+    expected_token = settings.service_internal_token
+    if not expected_token:
+        raise HTTPException(status_code=503, detail="Internal service authentication is not configured")
+    if not hmac.compare_digest(x_kaiops_internal_token, expected_token):
+        raise HTTPException(status_code=403, detail="Internal service authentication failed")
     report = await _validate_and_store(action)
     payload_out = _build_closure_event_payload(action=action, report=report, source_payload={})
     persistence = await _persist_closure_event(
@@ -769,37 +824,62 @@ async def validate(action: RemediationAction) -> ResolutionReport:
 
 
 class ManualClosureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     comment: str = Field(min_length=10, max_length=4000)
-    closed_by: str = Field(min_length=1, max_length=255)
+    actor_id: str = Field(min_length=1, max_length=255)
+    actor_role: str = Field(min_length=1, max_length=64)
+    tenant_id: str = Field(min_length=1, max_length=255)
+    auth_jti: str = Field(min_length=1, max_length=255)
 
 
 @app.post("/incidents/{incident_id}/manual-close")
-async def manual_close_incident(incident_id: str, request: ManualClosureRequest) -> dict[str, Any]:
+async def manual_close_incident(
+    incident_id: str,
+    request: ManualClosureRequest,
+    x_kaiops_internal_token: str = Header(default=""),
+) -> dict[str, Any]:
+    expected_token = settings.service_internal_token
+    if not expected_token:
+        raise HTTPException(status_code=503, detail="Internal service authentication is not configured")
+    if not hmac.compare_digest(x_kaiops_internal_token, expected_token):
+        raise HTTPException(status_code=403, detail="Internal service authentication failed")
+    if request.actor_role not in {"Administrator", "L3 Engineer"}:
+        raise HTTPException(status_code=403, detail="Operator role is not authorized for manual closure")
     related_incidents: list[dict[str, Any]] = []
     async with app.state.session_factory() as session:
-        incident_payload = await IncidentRepository(session).get_incident(incident_id)
+        incident_payload = await IncidentRepository(session).get_incident(incident_id, tenant_id=request.tenant_id)
     if not incident_payload:
         raise HTTPException(status_code=404, detail="Incident not found")
     if str(incident_payload.get("status") or "").lower() in {"closed", "resolved"}:
         return {"status": "already_closed", "incident_id": incident_id}
     action = RemediationAction(
+        tenant_id=str(incident_payload.get("tenant_id") or ""),
         incident_id=incident_id,
         action_type="manual_closure",
         target=str(incident_payload.get("service") or "unknown"),
         status=RemediationStatus.SKIPPED,
         completed_at=datetime.now(timezone.utc),
-        output=f"Incident manually closed by {request.closed_by}.",
-        parameters={"operator_comment": request.comment, "closed_by": request.closed_by, "manual_closure": True},
+        output=f"Incident administratively closed by {request.actor_id}.",
+        parameters={"operator_comment": request.comment, "actor_id": request.actor_id, "actor_role": request.actor_role, "manual_closure": True},
     )
     report = ResolutionReport(
+        tenant_id=str(incident_payload.get("tenant_id") or ""),
         incident_id=incident_id,
         root_cause="Operator-directed closure",
         impact=str(incident_payload.get("summary") or "Impact reviewed by operator."),
-        action_taken=f"Manual closure by {request.closed_by}: {request.comment}",
-        validation={"operator_attested": True},
-        alerts_cleared=True,
-        health_restored=True,
-        metadata={"closure_kind": "manual", "operator_comment": request.comment, "closed_by": request.closed_by},
+        action_taken=f"Administrative closure by {request.actor_id}: {request.comment}",
+        validation={"operator_attested": True, "technical_recovery_verified": False},
+        alerts_cleared=False,
+        health_restored=False,
+        metadata={
+            "closure_kind": "manual",
+            "operator_comment": request.comment,
+            "actor_id": request.actor_id,
+            "actor_role": request.actor_role,
+            "auth_jti": request.auth_jti,
+            "technical_recovery_verified": False,
+        },
     )
     jira_result = await _sync_closure_to_jira(incident_payload, report)
     if incident_payload.get("ticket_id") and not jira_result.get("transitioned"):
@@ -820,4 +900,11 @@ async def manual_close_incident(incident_id: str, request: ManualClosureRequest)
     )
     if persistence.get("outbox_enqueued"):
         await _publish_closure_event(app, payload_out, key=incident_id)
-    return {"status": "closed", "incident_id": incident_id, "closed_by": request.closed_by, "comment": request.comment, "jira": jira_result}
+    return {
+        "status": "closed",
+        "closure_kind": "manual",
+        "technical_recovery_verified": False,
+        "incident_id": incident_id,
+        "comment": request.comment,
+        "jira": jira_result,
+    }

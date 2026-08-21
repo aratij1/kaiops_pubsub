@@ -4,7 +4,11 @@ metadata:
   name: kaiops-default-restricted
   namespace: kaiops
 spec:
-  podSelector: {}
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: NotIn
+        values: [approval-service]
   policyTypes: [Ingress, Egress]
   ingress:
     - from:
@@ -19,6 +23,54 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kaiops
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: approval-service-internal-only
+  namespace: kaiops
+spec:
+  podSelector:
+    matchLabels:
+      app: approval-service
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [api-gateway, remediation-engine]
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mysql
+      ports:
+        - protocol: TCP
+          port: 3306
+    - to:
+        - podSelector:
+            matchLabels:
+              app: rabbitmq
+      ports:
+        - protocol: TCP
+          port: 5672
     - to:
         - namespaceSelector:
             matchLabels:

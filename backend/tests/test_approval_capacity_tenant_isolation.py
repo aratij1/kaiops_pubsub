@@ -28,7 +28,8 @@ async def test_capacity_is_isolated_by_tenant(sqlite_session_factory, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_capacity_rejects_placeholder_tenant(sqlite_session_factory) -> None:
+async def test_capacity_rejects_placeholder_tenant(sqlite_session_factory, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
     module = load_approval_app_module()
     module.app.state.session_factory = sqlite_session_factory
 

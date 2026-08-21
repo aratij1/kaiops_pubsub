@@ -21,14 +21,16 @@ class FakeDiscoveryClient:
 
 def make_context(*, hypotheses: list[dict[str, Any]] | None = None) -> Context:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="CheckoutPoolTimeout",
         service="checkout",
         severity=AlertSeverity.HIGH,
         description="checkout connection pool timeout after deployment",
     )
-    incident = Incident(service="checkout", severity=AlertSeverity.HIGH, title=alert.name)
+    incident = Incident(tenant_id="tenant-a", service="checkout", severity=AlertSeverity.HIGH, title=alert.name)
     return Context(
+        tenant_id=alert.tenant_id,
         incident_id=incident.id,
         alert=alert,
         metadata={
@@ -78,7 +80,10 @@ async def test_keyword_overlap_alone_cannot_confirm_a_hypothesis() -> None:
     assert report["conclusive"] is False
     assert report["steps_used"] == 4
     assert report["conclusion"]["confidence"] < investigator.conclusive_threshold
-    assert set(report["conclusion"]["evidence_ids"]) == {"CODE-POOL", "LOG-POOL"}
+    tested = next(row for row in report["hypotheses"] if row["claim"] == hypothesis["cause"])
+    collected_ids = {row["evidence_id"] for row in report["evidence"]}
+    assert {"CODE-POOL", "LOG-POOL"} <= collected_ids, (client.calls, report["steps"])
+    assert tested["status"] != "confirmed"
 
 
 @pytest.mark.asyncio

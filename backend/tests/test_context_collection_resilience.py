@@ -24,13 +24,14 @@ class FailedKubernetes(BaseConnector):
 @pytest.mark.asyncio
 async def test_context_collection_preserves_healthy_evidence_when_a_connector_fails() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="CheckoutLatencyHigh",
         service="checkout",
         severity=AlertSeverity.HIGH,
         description="latency is elevated",
     )
-    incident = Incident(service="checkout", severity=AlertSeverity.HIGH, title="checkout latency")
+    incident = Incident(tenant_id="tenant-a", service="checkout", severity=AlertSeverity.HIGH, title="checkout latency")
 
     context = await ContextIntelligenceAgent(connectors=[HealthyPrometheus(), FailedKubernetes()]).collect(alert, incident)
 

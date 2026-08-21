@@ -21,6 +21,7 @@ def test_real_discovery_rows_compile_to_immutable_evidence() -> None:
                 "service": "api-gateway",
             }
         ],
+        tenant_id="tenant-a",
         incident_id=uuid4(),
         service="api-gateway",
         environment="prod",
@@ -48,6 +49,7 @@ def test_duplicate_content_and_lineage_does_not_increase_independent_sources() -
             "snippet": "connection refused",
             "sha256": "b" * 64,
             "lineage_id": "container://api",
+            "timestamp": "2026-08-20T09:59:30Z",
         },
         {
             "evidence_id": "LOG-COPY",
@@ -56,10 +58,11 @@ def test_duplicate_content_and_lineage_does_not_increase_independent_sources() -
             "snippet": "connection refused",
             "sha256": "b" * 64,
             "lineage_id": "container://api",
+            "timestamp": "2026-08-20T09:59:30Z",
         },
     ]
 
-    records = compiler.compile(rows, incident_id=incident_id, service="api", environment="prod")
+    records = compiler.compile(rows, tenant_id="tenant-a", incident_id=incident_id, service="api", environment="prod")
 
     assert len(records) == 1
     assert compiler.independent_source_count(records) == 1
@@ -69,6 +72,7 @@ def test_historical_ticket_is_guidance_not_current_proof() -> None:
     compiler = EvidenceCompiler()
     records = compiler.compile(
         [{"source": "ticket", "uri": "jira://OPS-42", "summary": "Prior outage used a restart."}],
+        tenant_id="tenant-a",
         incident_id=uuid4(),
         service="api",
         environment="prod",
@@ -77,3 +81,14 @@ def test_historical_ticket_is_guidance_not_current_proof() -> None:
     assert records[0].metadata["guidance_only"] is True
     assert records[0].metadata["current_operational_evidence"] is False
     assert compiler.independent_source_count(records) == 0
+
+
+def test_missing_timestamp_is_unknown_and_never_current_operational_evidence() -> None:
+    record = EvidenceCompiler().compile(
+        [{"source": "metric", "uri": "prometheus://up", "summary": "service is healthy", "connector_id": "prometheus-a"}],
+        tenant_id="tenant-a", incident_id=uuid4(), service="api", environment="prod",
+    )[0]
+
+    assert record.freshness_status == "unknown"
+    assert record.current_operational_evidence is False
+    assert record.metadata["timestamp_missing"] is True

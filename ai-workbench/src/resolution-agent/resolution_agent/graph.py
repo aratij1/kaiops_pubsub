@@ -99,7 +99,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         # builders below; making two additional remote calls serialized every
         # alert added 30-90 seconds without being required to persist an RCA.
         self.deep_analysis_enabled = str(
-            os.getenv("RESOLUTION_DEEP_ANALYSIS_ENABLED", "true")
+            os.getenv("RESOLUTION_DEEP_ANALYSIS_ENABLED", "false")
         ).strip().lower() in {"1", "true", "yes", "on"}
         # Keeps strong references to fire-and-forget evaluation-publish tasks so they
         # aren't garbage-collected mid-flight; discarded automatically once done.
@@ -109,6 +109,38 @@ class ResolutionIntelligenceAgent(BaseAgent):
     @staticmethod
     def _norm(value: Any) -> str:
         return str(value or "").strip().lower()
+
+    @staticmethod
+    def _model_call_audit(
+        *,
+        task: ModelTask,
+        response: dict[str, Any],
+        prompt: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return traceable model-call metadata without operational content."""
+
+        prompt_bytes = prompt.encode("utf-8")
+        payload_bytes = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        response_bytes = str(response.get("content") or "").encode("utf-8")
+        usage = dict(response.get("usage") or {})
+        return {
+            "task": task.value,
+            "provider": str(response.get("model") or usage.get("provider") or "unknown"),
+            "model": str(usage.get("model") or "unknown"),
+            "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+            "prompt_bytes": len(prompt_bytes),
+            "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
+            "payload_bytes": len(payload_bytes),
+            "response_sha256": hashlib.sha256(response_bytes).hexdigest(),
+            "response_bytes": len(response_bytes),
+            "usage": usage,
+        }
 
     @staticmethod
     def _extract_runbook_commands(runbook: str, *, max_items: int = 4) -> list[str]:
@@ -334,7 +366,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         analysis = self._discovery_report_analysis(context)
         hypotheses = analysis.get("hypotheses") if isinstance(analysis.get("hypotheses"), list) else []
         primary = hypotheses[0] if hypotheses and isinstance(hypotheses[0], dict) else {}
-        cause = str(primary.get("cause") or primary.get("summary") or analysis.get("summary") or "").strip()
+        cause = str(primary.get("claim") or primary.get("cause") or primary.get("summary") or analysis.get("summary") or "").strip()
         confidence_raw = primary.get("confidence")
         try:
             confidence = max(0.0, min(0.6, float(confidence_raw)))
@@ -972,9 +1004,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
         candidates: list[dict[str, Any]] = []
         iterative = gathered.get("iterative_investigation", {})
         for item in iterative.get("hypotheses", []) if isinstance(iterative, dict) and isinstance(iterative.get("hypotheses"), list) else []:
-            if isinstance(item, dict) and str(item.get("cause") or item.get("summary") or "").strip():
+            if isinstance(item, dict) and str(item.get("claim") or item.get("cause") or item.get("summary") or "").strip():
                 candidates.append({
-                    "cause": str(item.get("cause") or item.get("summary"))[:500],
+                    "claim": str(item.get("claim") or item.get("cause") or item.get("summary"))[:500],
                     "confidence": float(item.get("confidence") or 0.0),
                     "evidence_ids": list(item.get("evidence_ids") or item.get("supporting_evidence") or []),
                     "source": "iterative_investigation",
@@ -985,7 +1017,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         for item in discovery.get("hypotheses", []) if isinstance(discovery.get("hypotheses"), list) else []:
             if isinstance(item, dict):
                 candidates.append({
-                    "cause": str(item.get("cause") or item.get("summary") or "").strip(),
+                    "claim": str(item.get("claim") or item.get("cause") or item.get("summary") or "").strip(),
                     "confidence": float(item.get("confidence") or 0.45),
                     "evidence_ids": list(item.get("evidence_ids") or item.get("evidence_used") or []),
                     "source": "discovery",
@@ -1045,7 +1077,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         rca_fallback_text = f"Evidence is insufficient to determine the root cause of {context.alert.service} degradation."
         content = self._extract_model_text(
             response["content"],
-            keys=("root_cause", "cause", "summary"),
+            keys=("root_cause", "claim", "cause", "summary"),
             fallback_text=rca_fallback_text,
         )
         if model_fallback:
@@ -1159,22 +1191,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
             )
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
-            {
-                "task": ModelTask.RCA.value,
-                "provider": response["model"],
-                "model": response["usage"].get("model"),
-                "prompt": prompt,
-                "payload": payload,
-                "response": {
-                    "text": response["content"],
-                    "parameters": {
-                        "provider": response["model"],
-                        "model": response["usage"].get("model"),
-                        "task": ModelTask.RCA.value,
-                    },
-                },
-                "usage": response["usage"],
-            }
+            self._model_call_audit(task=ModelTask.RCA, response=response, prompt=prompt, payload=payload)
         )
         return state
 
@@ -1296,22 +1313,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         }
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
-            {
-                "task": ModelTask.IMPACT.value,
-                "provider": response["model"],
-                "model": response["usage"].get("model"),
-                "prompt": prompt,
-                "payload": payload,
-                "response": {
-                    "text": response["content"],
-                    "parameters": {
-                        "provider": response["model"],
-                        "model": response["usage"].get("model"),
-                        "task": ModelTask.IMPACT.value,
-                    },
-                },
-                "usage": response["usage"],
-            }
+            self._model_call_audit(task=ModelTask.IMPACT, response=response, prompt=prompt, payload=payload)
         )
         return state
 
@@ -1373,22 +1375,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         state["remediation_target"] = remediation_target
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
-            {
-                "task": ModelTask.FIX.value,
-                "provider": response["model"],
-                "model": response["usage"].get("model"),
-                "prompt": prompt,
-                "payload": payload,
-                "response": {
-                    "text": response["content"],
-                    "parameters": {
-                        "provider": response["model"],
-                        "model": response["usage"].get("model"),
-                        "task": ModelTask.FIX.value,
-                    },
-                },
-                "usage": response["usage"],
-            }
+            self._model_call_audit(task=ModelTask.FIX, response=response, prompt=prompt, payload=payload)
         )
         state["recommended_action"] = action
         state["commands"] = commands
@@ -1550,6 +1537,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         model_risk = str(state.get("remediation_analysis", {}).get("risk_level") or "").strip().lower()
         risk = model_risk if model_risk in {"low", "medium", "high", "critical"} else severity_risk
         recommendation = Recommendation(
+            tenant_id=context.tenant_id,
             incident_id=context.incident_id,
             root_cause=state["root_cause"],
             confidence=state["confidence"],

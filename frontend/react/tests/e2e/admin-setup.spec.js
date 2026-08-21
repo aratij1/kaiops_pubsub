@@ -11,12 +11,22 @@ test.beforeEach(async ({ page }) => {
     const url = new URL(route.request().url());
     const path = url.pathname.replace(/^\/api-gateway/, "");
 
+    if (path === "/auth/config") {
+      await route.fulfill(json({ mode: "local", local_development_only: true }));
+      return;
+    }
+
     if (path === "/auth/login") {
       await route.fulfill(json({
         access_token: "admin-token",
         refresh_token: "refresh-token",
         user: { id: 1, username: "admin", role_name: "Administrator" },
       }));
+      return;
+    }
+
+    if (path === "/healthz") {
+      await route.fulfill(json({ status: "ok", service: "api-gateway" }));
       return;
     }
 

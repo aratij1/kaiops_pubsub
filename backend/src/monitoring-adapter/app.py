@@ -37,6 +37,7 @@ from common.models import (
     ResolutionReport,
 )
 from common.repository import IncidentRepository, ObjectStorageRepository
+from common.orchestration.execution_plan import resolve_execution_plan
 from common.object_storage import build_object_storage
 from common.service import create_app
 from common.telemetry import EVENT_CONTRACTS_EMITTED, EVENT_PUBLISH_LATENCY
@@ -2897,6 +2898,7 @@ async def run_local_payment_workflow(
         recommendation = await ai_client.resolve(context=context)
     except Exception as exc:
         recommendation = Recommendation(
+            tenant_id=alert.tenant_id,
             incident_id=incident.id,
             root_cause=cleaned_resolution["root_cause"],
             confidence=0.72,
@@ -2958,6 +2960,25 @@ async def run_local_payment_workflow(
         "stream_count": decision.stream_count,
         "stream_threshold": decision.stream_threshold,
     }
+    execution_plan = resolve_execution_plan(
+        alert=enriched_alert,
+        workflow_name=decision.workflow,
+        requires_approval=True,
+        risk_tier=decision.risk_tier,
+        execution_mode="human-approval",
+        resolution_hints=" ".join((recommendation.root_cause, recommendation.recommended_action)),
+        evidence_basis=list(recommendation.metadata.get("evidence_ids", [])),
+        incident_id=incident.id,
+        root_cause=recommendation.root_cause,
+        confidence=recommendation.confidence,
+    )
+    recommendation.metadata["execution_plan"] = execution_plan
+    recommendation.metadata["remediation_target"] = execution_plan.get("remediation_target", "")
+    recommendation.metadata["runbook_id"] = execution_plan.get("runbook_governance_id") or ""
+    recommendation.metadata["runbook_slug"] = execution_plan.get("playbook_id") or ""
+    recommendation.metadata["runbook_version"] = execution_plan.get("playbook_version")
+    recommendation.metadata["runbook_status"] = execution_plan.get("runbook_status") or ""
+    recommendation.metadata["runbook_checksum"] = execution_plan.get("runbook_checksum") or ""
     recommendation.metadata["evaluation"] = build_quality_evaluation(
         prediction={
             "root_cause": recommendation.root_cause,
@@ -3108,6 +3129,7 @@ async def run_local_payment_workflow(
 
     if requires_human_approval and not auto_approve:
         pending_approval = Approval(
+            tenant_id=context.tenant_id,
             incident_id=incident.id,
             recommendation_id=recommendation.id,
             decision=ApprovalDecision.PENDING,
@@ -3119,6 +3141,7 @@ async def run_local_payment_workflow(
                 "policy_version": decision.policy_version,
                 "policy_reason": decision.policy_reason,
                 "orchestration_decision": recommendation.metadata.get("orchestration_decision", {}),
+                "execution_plan": execution_plan,
             },
         )
         approval_event = {
@@ -3237,11 +3260,20 @@ async def run_local_payment_workflow(
             "next_step": "Awaiting user approval for high-risk action. Approve in Approval tab to continue workflow.",
         }
 
+    local_execution_ready = bool(
+        execution_plan.get("execution_ready") is True
+        and isinstance(execution_plan.get("actions"), list)
+        and len(execution_plan["actions"]) == 1
+    )
     approval = Approval(
+        tenant_id=context.tenant_id,
         incident_id=incident.id,
         recommendation_id=recommendation.id,
-        decision=ApprovalDecision.APPROVED,
-        approver="kaiops-demo",
+        plan_id=execution_plan.get("plan_id"),
+        plan_fingerprint=execution_plan.get("plan_fingerprint"),
+        approval_expires_at=execution_plan.get("expiry"),
+        decision=ApprovalDecision.APPROVED if local_execution_ready else ApprovalDecision.PENDING,
+        approver="kaiops-demo" if local_execution_ready else None,
         channel="web",
         comment=scenario["remediation_comment"],
         trace_id=trace_id,
@@ -3256,6 +3288,11 @@ async def run_local_payment_workflow(
             "target": recommendation.metadata.get("remediation_target") or context.alert.service,
             "recommended_action": recommendation.recommended_action,
             "recommended_commands": recommendation.commands,
+            "execution_plan": execution_plan,
+            "runbook_id": recommendation.metadata.get("runbook_id", ""),
+            "runbook_version": recommendation.metadata.get("runbook_version"),
+            "runbook_status": recommendation.metadata.get("runbook_status", ""),
+            "runbook_checksum": recommendation.metadata.get("runbook_checksum", ""),
         },
     )
     await persist_step(lambda repo: repo.save_approval(approval))
@@ -3298,9 +3335,31 @@ async def run_local_payment_workflow(
         )
     )
     engine = RemediationEngine()
-    action = engine.build_action(approval)
-    action.parameters.update({"root_cause": recommendation.root_cause, "impact": recommendation.impact})
-    action = await engine.execute(action)
+    if local_execution_ready:
+        action = engine.build_action(approval)
+        action.parameters.update({"root_cause": recommendation.root_cause, "impact": recommendation.impact})
+        action = await engine.execute(action)
+    else:
+        action = RemediationAction(
+            tenant_id=context.tenant_id,
+            incident_id=incident.id,
+            approval_id=approval.id,
+            action_type="diagnostic_completion",
+            target=str(execution_plan.get("remediation_target") or context.alert.service),
+            status=RemediationStatus.SKIPPED,
+            output="Execution was not performed because the governed plan is not execution-ready.",
+            parameters={
+                "policy_version": decision.policy_version,
+                "policy_reason": decision.policy_reason,
+                "root_cause": recommendation.root_cause,
+                "impact": recommendation.impact,
+                "diagnostic_closure": True,
+                "diagnostic_details": {
+                    "readiness_blocks": list(execution_plan.get("readiness_blocks") or []),
+                },
+                "execution_plan": execution_plan,
+            },
+        )
     action.trace_id = trace_id
     await persist_step(
         lambda repo: repo.save_action(action),
@@ -3502,9 +3561,12 @@ async def continue_pending_workflow(
         "approved": ApprovalDecision.APPROVED,
         "reject": ApprovalDecision.REJECTED,
         "rejected": ApprovalDecision.REJECTED,
-        "modify": ApprovalDecision.MODIFIED,
-        "modified": ApprovalDecision.MODIFIED,
     }
+    if token in {"modify", "modified"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Free-text approval modifications are disabled; generate and approve a new typed plan.",
+        )
     approval_decision = decision_map.get(token)
     if approval_decision is None:
         raise HTTPException(status_code=400, detail="Invalid approval decision")
@@ -3563,10 +3625,20 @@ async def continue_pending_workflow(
 
     incident_data = pending.get("incident", {}) if isinstance(pending.get("incident"), dict) else {}
     recommendation_metadata = recommendation_data.get("metadata", {}) if isinstance(recommendation_data.get("metadata"), dict) else {}
+    approved_plan = recommendation_metadata.get("execution_plan") if isinstance(recommendation_metadata.get("execution_plan"), dict) else {}
     recommended_commands = recommendation_data.get("commands") if isinstance(recommendation_data.get("commands"), list) else []
     approval = Approval(
+        tenant_id=str(
+            approved_plan.get("tenant_id")
+            or recommendation_data.get("tenant_id")
+            or incident_data.get("tenant_id")
+            or ""
+        ),
         incident_id=incident_uuid,
         recommendation_id=recommendation_uuid,
+        plan_id=approved_plan.get("plan_id"),
+        plan_fingerprint=approved_plan.get("plan_fingerprint"),
+        approval_expires_at=approved_plan.get("expiry"),
         decision=approval_decision,
         approver=(approver or "sre@example.com").strip() or "sre@example.com",
         channel=(channel or "web").strip() or "web",
@@ -3613,6 +3685,11 @@ async def continue_pending_workflow(
             "recommended_commands": [
                 str(item).strip() for item in recommended_commands if str(item).strip()
             ],
+            "execution_plan": approved_plan,
+            "runbook_id": str(recommendation_metadata.get("runbook_id") or ""),
+            "runbook_version": recommendation_metadata.get("runbook_version"),
+            "runbook_status": str(recommendation_metadata.get("runbook_status") or ""),
+            "runbook_checksum": str(recommendation_metadata.get("runbook_checksum") or ""),
         },
     )
 
@@ -3637,6 +3714,7 @@ async def continue_pending_workflow(
 
     if approval.decision == ApprovalDecision.REJECTED:
         action = RemediationAction(
+            tenant_id=approval.tenant_id,
             incident_id=incident_uuid,
             approval_id=approval.id,
             action_type="manual-review",
@@ -3646,6 +3724,7 @@ async def continue_pending_workflow(
             trace_id=approval_trace_id,
         )
         closure_report = ResolutionReport(
+            tenant_id=str(action.tenant_id),
             incident_id=incident_uuid,
             recommendation_id=recommendation_uuid,
             remediation_action_id=action.id,
@@ -3668,8 +3747,6 @@ async def continue_pending_workflow(
                 "impact": str(recommendation_data.get("impact", "N/A")),
             }
         )
-        if approval.decision == ApprovalDecision.MODIFIED and approval.modified_action:
-            action.action_type = approval.modified_action
         action = await engine.execute(action)
         action.trace_id = approval_trace_id
 

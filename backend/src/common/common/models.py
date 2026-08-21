@@ -7,6 +7,8 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from common.tenant_identity import require_tenant_id
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -50,6 +52,7 @@ class RemediationStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     VERIFYING = "verifying"
+    PENDING_STABILITY = "pending_stability"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     SKIPPED = "skipped"
@@ -386,6 +389,7 @@ class Incident(BaseEvent):
 
 
 class Recommendation(BaseEvent):
+    tenant_id: str
     incident_id: UUID
     root_cause: str
     confidence: float = Field(ge=0.0, le=1.0)
@@ -396,9 +400,14 @@ class Recommendation(BaseEvent):
     commands: list[str] = Field(default_factory=list)
     risk: str = "medium"
 
+    @field_validator("tenant_id")
+    @classmethod
+    def tenant_must_be_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="recommendation identity")
+
 
 class Approval(BaseEvent):
-    tenant_id: str = "default"
+    tenant_id: str
     incident_id: UUID
     recommendation_id: UUID
     plan_id: UUID | None = None
@@ -412,9 +421,14 @@ class Approval(BaseEvent):
     comment: str | None = None
     modified_action: str | None = None
 
+    @field_validator("tenant_id")
+    @classmethod
+    def tenant_must_be_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="approval identity")
+
 
 class RemediationAction(BaseEvent):
-    tenant_id: str = "default"
+    tenant_id: str
     incident_id: UUID
     approval_id: UUID | None = None
     action_type: str
@@ -431,8 +445,14 @@ class RemediationAction(BaseEvent):
     output: str = ""
     error: str | None = None
 
+    @field_validator("tenant_id")
+    @classmethod
+    def tenant_must_be_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="remediation action identity")
+
 
 class ResolutionReport(BaseEvent):
+    tenant_id: str
     incident_id: UUID
     ticket_id: str | None = None
     recommendation_id: UUID | None = None
@@ -445,6 +465,11 @@ class ResolutionReport(BaseEvent):
     health_restored: bool = False
     knowledge_base_entry: str = ""
     lessons_learned: list[str] = Field(default_factory=list)
+
+    @field_validator("tenant_id")
+    @classmethod
+    def tenant_must_be_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="resolution report identity")
 
 
 class SafetyCheckResult(BaseModel):

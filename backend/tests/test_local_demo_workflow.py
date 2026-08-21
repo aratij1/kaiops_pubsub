@@ -130,7 +130,10 @@ async def test_local_payment_workflow_generates_recommendation() -> None:
     assert "gpt-5" in providers or "gpt-4o" in providers
     resolution_event = next(event for event in workflow["events"] if event["agent"] == "Resolution Intelligence Agent")
     assert resolution_event["llm_calls"]
-    assert {"prompt", "payload", "response", "usage"}.issubset(resolution_event["llm_calls"][0])
+    assert {"prompt_sha256", "payload_sha256", "response_sha256", "usage"}.issubset(
+        resolution_event["llm_calls"][0]
+    )
+    assert {"prompt", "payload", "response"}.isdisjoint(resolution_event["llm_calls"][0])
     assert [event["agent"] for event in workflow["events"]] == [
         "Alert Intelligence Agent",
         "Orchestrator Agent",

@@ -19,6 +19,11 @@ def test_mcp_lists_read_only_discovery_tools() -> None:
         "code.search",
         "mysql.search",
         "telemetry.search",
+        "traces.search",
+        "topology.search",
+        "dependency-health.search",
+        "changes.search",
+        "runbooks.search",
         "external.search",
     }
 

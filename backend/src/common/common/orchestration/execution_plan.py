@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 import os
 import re
 from datetime import timedelta
@@ -235,31 +236,37 @@ def _looks_executable(command: str) -> bool:
     return command.strip().lower().startswith(_EXECUTABLE_PREFIXES)
 
 
-def _governed_validation_endpoints(commands: list[str], *, connector_id: str) -> list[dict[str, Any]]:
-    """Project approved HTTP health probes into an explicit closure allowlist."""
-    endpoints: list[dict[str, Any]] = []
+def _typed_validator_specs(
+    commands: list[str], *, tenant_id: str, connector_id: str, target_resource_id: str,
+) -> list[dict[str, Any]]:
+    """Project catalog checks into immutable registry references, never URLs."""
+    validators: list[dict[str, Any]] = []
     seen: set[str] = set()
     for command in commands:
-        for url in _HTTP_URL.findall(str(command or "")):
-            normalized = url.rstrip(".,;)")
-            path = normalized.split("?", 1)[0].lower()
-            if not any(marker in path for marker in ("/health", "/healthz", "/ready", "/readiness")):
-                continue
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            endpoints.append(
-                {
-                    "url": normalized,
-                    "method": "GET",
-                    "kind": "availability",
-                    "onboarded": True,
-                    "authoritative": True,
-                    "connector_id": connector_id,
-                    "source": "approved-execution-catalog",
-                }
-            )
-    return endpoints
+        reference_hash = sha256(str(command or "").encode()).hexdigest()
+        if not str(command or "").strip() or reference_hash in seen:
+            continue
+        seen.add(reference_hash)
+        kind = "availability"
+        material = f"{tenant_id}:{connector_id}:{target_resource_id}:{kind}:{reference_hash}"
+        validator_id = f"validator-{sha256(material.encode()).hexdigest()[:24]}"
+        validators.append({
+            "validator_id": validator_id,
+            "tenant_id": tenant_id,
+            "connector_id": connector_id,
+            "target_resource_id": target_resource_id,
+            "kind": kind,
+            "check_reference": f"catalog-check:{reference_hash}",
+            "expected_condition": "catalog validation check succeeds",
+            "evaluation_operator": "eq",
+            "threshold": True,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 2,
+            "timeout_seconds": 10,
+            "authoritative_source": connector_id,
+            "onboarding_registry_reference": f"validator-registry:{validator_id}",
+        })
+    return validators
 
 
 def _playbook_operations(playbook: dict[str, Any], actions: dict[str, Any]) -> set[str]:
@@ -508,9 +515,11 @@ def resolve_execution_plan(
         if execution_ready and isinstance(command, dict) and str(command.get("command") or "").strip()
     ]
     approval_decision = "hitl_required" if mutating else "recommend_only"
-    validation_endpoints = _governed_validation_endpoints(
+    validators = _typed_validator_specs(
         phase_commands["validation"],
+        tenant_id=tenant_id,
         connector_id=str(connector.get("connector_id") or ""),
+        target_resource_id=execution_service,
     )
     plan = {
         "version": "execution-plan-v2",
@@ -596,10 +605,9 @@ def resolve_execution_plan(
         "preflight_commands": phase_commands["diagnostic"],
         "commands": phase_commands["remediation"] if execution_ready else [],
         "validation_commands": phase_commands["validation"],
-        "validation_endpoints": validation_endpoints,
-        "required_validation_kinds": [
-            "availability", "alert_clearance", "error_rate", "latency", "dependency_health", "critical_alerts"
-        ],
+        "validation_endpoints": [],
+        "validators": validators,
+        "required_validation_kinds": sorted({str(item["kind"]) for item in validators}),
         "stability_window_seconds": 300,
         "rollback_commands": phase_commands["rollback"] if execution_ready else [],
         "rollback_mode": rollback_mode,

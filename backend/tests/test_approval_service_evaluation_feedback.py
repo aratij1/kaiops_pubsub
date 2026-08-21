@@ -25,7 +25,7 @@ def _set_pending_plan(incident_id, recommendation_id) -> dict:
         "expiry": "2099-01-01T00:00:00+00:00",
     }
     plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
-    approval_service_app.PENDING_INCIDENTS[str(incident_id)] = {
+    approval_service_app.PENDING_INCIDENTS[approval_service_app._pending_key("tenant-a", incident_id)] = {
         "recommendation": {
             "id": str(recommendation_id),
             "incident_id": str(incident_id),
@@ -51,6 +51,7 @@ async def test_publish_evaluation_feedback_body_and_url(monkeypatch) -> None:
     monkeypatch.setattr(approval_service_app, "_post_evaluation_feedback", fake_post)
 
     approval = approval_service_app.Approval(
+        tenant_id="tenant-a",
         incident_id=uuid4(),
         recommendation_id=uuid4(),
         decision=approval_service_app.ApprovalDecision.APPROVED,

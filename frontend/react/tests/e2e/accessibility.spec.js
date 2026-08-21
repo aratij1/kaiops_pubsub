@@ -10,6 +10,10 @@ const json = (payload) => ({
 test.beforeEach(async ({ page }) => {
   await page.route("**/api-gateway/**", async (route) => {
     const path = new URL(route.request().url()).pathname.replace(/^\/api-gateway/, "");
+    if (path === "/auth/config") {
+      await route.fulfill(json({ mode: "local", local_development_only: true }));
+      return;
+    }
     if (path === "/auth/login") {
       await route.fulfill(json({
         access_token: "accessibility-token",

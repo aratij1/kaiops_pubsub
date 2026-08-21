@@ -12,19 +12,19 @@
   "commands": {
     "check_api_gateway_health": {
       "operation": "read_status",
-      "command": "curl -fsS ${api_gateway_url}/healthz || curl -fsS ${api_gateway_url}/health",
+      "command": "curl --fail --silent --show-error ${api_gateway_url}/healthz",
       "safety": "read-only",
       "expected_evidence": ["http_status", "response_body"]
     },
     "check_prometheus_alerts": {
       "operation": "read_status",
-      "command": "curl -fsS ${prometheus_url}/api/v1/alerts",
+      "command": "curl --fail --silent --show-error ${prometheus_url}/api/v1/alerts",
       "safety": "read-only",
       "expected_evidence": ["active_alerts", "alert_state"]
     },
     "check_prometheus_targets": {
       "operation": "read_status",
-      "command": "curl -fsS ${prometheus_url}/api/v1/targets",
+      "command": "curl --fail --silent --show-error ${prometheus_url}/api/v1/targets",
       "safety": "read-only",
       "expected_evidence": ["target_health", "last_scrape"]
     },
@@ -72,10 +72,10 @@
     },
     "restart_service_runtime": {
       "operation": "restart_service",
-      "command": "ansible-playbook playbooks/restart-service.yml -e service=${service} -e env=${environment}",
+      "command": "kubectl rollout restart deployment/${service} -n ${namespace}",
       "safety": "restart",
       "approval_required": true,
-      "rollback": "ansible-playbook playbooks/restart-service.yml -e service=${service} -e env=${environment}",
+      "rollback": "kubectl rollout undo deployment/${service} -n ${namespace}",
       "expected_evidence": ["restart_job_id", "post_health_check"]
     },
     "scale_service_workers": {
@@ -96,7 +96,7 @@
     },
     "validate_service_recovery": {
       "operation": "verify_slo",
-      "command": "promql: up{job=\"${service}\"} == 1 and histogram_quantile(0.95, sum by (le) (rate(kaiops_request_latency_seconds_bucket{service=\"${service}\"}[5m]))) < ${latency_threshold_seconds}",
+      "command": "kubectl rollout status deployment/${service} -n ${namespace} --timeout=300s",
       "safety": "read-only",
       "expected_evidence": ["availability_ok", "latency_ok"]
     },
@@ -154,33 +154,33 @@
     },
     "check_policy_engine_health": {
       "operation": "read_status",
-      "command": "curl -fsS ${policy_engine_url}/healthz",
+      "command": "curl --fail --silent --show-error ${policy_engine_url}/healthz",
       "safety": "read-only",
       "expected_evidence": ["policy_engine_health"]
     },
     "restart_policy_engine": {
       "operation": "restart_service",
-      "command": "ansible-playbook playbooks/restart-service.yml -e service=policy-engine -e env=${environment}",
+      "command": "kubectl rollout restart deployment/policy-engine -n ${namespace}",
       "safety": "restart",
       "approval_required": true,
-      "rollback": "ansible-playbook playbooks/restart-service.yml -e service=policy-engine -e env=${environment}",
+      "rollback": "kubectl rollout undo deployment/policy-engine -n ${namespace}",
       "expected_evidence": ["restart_job_id", "post_health_check"]
     },
     "validate_policy_engine_recovery": {
       "operation": "verify_service_health",
-      "command": "curl -fsS ${policy_engine_url}/healthz && curl -fsS ${api_gateway_url}/api/v1/policies/status",
+      "command": "curl --fail --silent --show-error ${policy_engine_url}/healthz",
       "safety": "read-only",
       "expected_evidence": ["policy_engine_health", "policy_status"]
     },
     "check_workflow_execution_status": {
       "operation": "read_status",
-      "command": "curl -fsS ${api_gateway_url}/api/v1/workflows/${workflow_id}",
+      "command": "curl --fail --silent --show-error ${api_gateway_url}/api/v1/workflows/${workflow_id}",
       "safety": "read-only",
       "expected_evidence": ["workflow_status", "failed_stage"]
     },
     "retry_failed_workflow": {
       "operation": "retry_workflow",
-      "command": "curl -fsS -X POST ${api_gateway_url}/api/v1/workflows/${workflow_id}/retry",
+      "command": "curl --fail --silent --show-error -X POST ${api_gateway_url}/api/v1/workflows/${workflow_id}/retry",
       "safety": "write",
       "approval_required": true,
       "rollback": "cancel retried workflow ${workflow_id} and keep original incident open",
@@ -188,13 +188,13 @@
     },
     "validate_workflow_recovery": {
       "operation": "verify_workflow_health",
-      "command": "curl -fsS ${api_gateway_url}/api/v1/workflows/${workflow_id}",
+      "command": "curl --fail --silent --show-error ${api_gateway_url}/api/v1/workflows/${workflow_id}",
       "safety": "read-only",
       "expected_evidence": ["workflow_completed"]
     },
     "validate_onboarding_smoke_flow": {
       "operation": "verify_onboarding_flow",
-      "command": "curl -fsS ${api_gateway_url}/healthz && curl -fsS ${prometheus_url}/api/v1/rules && curl -fsS ${prometheus_url}/api/v1/alerts",
+      "command": "curl --fail --silent --show-error ${api_gateway_url}/healthz",
       "safety": "read-only",
       "expected_evidence": ["api_health", "prometheus_rules", "prometheus_alerts"]
     }

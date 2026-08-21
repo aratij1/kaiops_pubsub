@@ -71,7 +71,8 @@ def test_execution_contract_binds_approval_plan_and_target() -> None:
     ).read_text(encoding="utf-8")
 
     assert 'CONTRACT_VERSION = "kaims.remediation.v3"' in contract
-    assert '"approved_plan_digest"' in contract
+    assert '"binding_fingerprint"' in contract
+    assert '"plan_fingerprint"' in contract
     assert "verify_execution_contract" in contract
 
 

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from common.models import Incident, RemediationAction, RemediationStatus, ResolutionReport
 
@@ -18,6 +19,20 @@ def load_closure_app_module():
 
 
 INCIDENT_ID = "11111111-1111-1111-1111-111111111111"
+
+
+def test_manual_closure_contract_forbids_client_supplied_identity() -> None:
+    module = load_closure_app_module()
+
+    with pytest.raises(ValidationError):
+        module.ManualClosureRequest.model_validate({
+            "comment": "Reviewed evidence and accepted the operational risk.",
+            "closed_by": "attacker",
+            "actor_id": "reviewer@example.com",
+            "actor_role": "Administrator",
+            "tenant_id": "tenant-a",
+            "auth_jti": "jwt-1",
+        })
 
 
 def _existing_incident_payload() -> dict:
@@ -52,6 +67,7 @@ def test_only_reviewed_successful_unedited_outcome_is_reusable_knowledge() -> No
     module = load_closure_app_module()
     report = _report(health_restored=True)
     action = RemediationAction(
+        tenant_id="tenant-a",
         incident_id=INCIDENT_ID,
         action_type="restart_service",
         target="payment",
@@ -69,6 +85,7 @@ def test_only_reviewed_successful_unedited_outcome_is_reusable_knowledge() -> No
 
 def _action() -> RemediationAction:
     return RemediationAction(
+        tenant_id="tenant-a",
         incident_id=INCIDENT_ID,
         action_type="rollback_deployment",
         target="robot-shop-payment",
@@ -78,6 +95,7 @@ def _action() -> RemediationAction:
 
 def _report(*, health_restored: bool) -> ResolutionReport:
     return ResolutionReport(
+        tenant_id="tenant-a",
         incident_id=INCIDENT_ID,
         root_cause="deployment rollback",
         impact="payment service unavailable",

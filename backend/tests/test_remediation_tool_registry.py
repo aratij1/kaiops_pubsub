@@ -4,9 +4,51 @@ import json
 
 import pytest
 import httpx
-from common.models import ApprovalDecision, RemediationStatus
+from common.models import ApprovalDecision, RemediationAction, RemediationStatus
 from remediation_test_helpers import governed_approval as Approval
-from remediation_engine.plugins import AzureContainerAppsJobPlugin, JenkinsRollbackPlugin, RemediationEngine
+from remediation_engine.plugins import AzureContainerAppsJobPlugin, FakeCapabilityAdapter, JenkinsRollbackPlugin, RemediationEngine
+
+
+@pytest.mark.asyncio
+async def test_fake_capability_adapter_requires_onboarded_resource_and_credential() -> None:
+    adapter = FakeCapabilityAdapter()
+    action = RemediationAction(
+        tenant_id="tenant-a",
+        incident_id="11111111-1111-1111-1111-111111111111",
+        action_type="fake_test",
+        target="display-name-is-not-an-identity",
+    )
+
+    with pytest.raises(ValueError, match="target_resource_id"):
+        await adapter.preflight(action)
+
+    action.parameters["target_resource_id"] = "azure:/subscriptions/sub-a/resourceGroups/rg-a/apps/api"
+    with pytest.raises(ValueError, match="credential reference"):
+        await adapter.preflight(action)
+
+
+@pytest.mark.asyncio
+async def test_fake_capability_adapter_implements_full_lifecycle_contract() -> None:
+    adapter = FakeCapabilityAdapter()
+    action = RemediationAction(
+        tenant_id="tenant-a",
+        incident_id="11111111-1111-1111-1111-111111111111",
+        action_type="fake_test",
+        target="api",
+        parameters={
+            "target_resource_id": "k8s:/clusters/prod/namespaces/payments/deployments/api",
+            "credential_ref": "vault://tenant-a/k8s/prod-remediator",
+            "required_permissions": ["deployments.patch"],
+        },
+    )
+
+    assert (await adapter.discover(action))["discovered"] is True
+    assert (await adapter.diagnose(action))["diagnostic_only"] is True
+    assert (await adapter.preflight(action))["required_permissions"] == ["deployments.patch"]
+    completed = await adapter.execute(action)
+    assert completed.status == RemediationStatus.SUCCEEDED
+    assert (await adapter.validate(completed))["passed"] is True
+    assert (await adapter.health())["live_execution"] is False
 
 
 def _jenkins_result(submitted: dict[str, str]) -> dict:

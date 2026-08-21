@@ -25,6 +25,7 @@ from common.config import get_settings
 from ai_workbench_common.embeddings import describe_embedding_model, get_embedding_model, cosine_similarity
 from ai_workbench_common.models import Context
 from common.models import Alert, Incident
+from common.tenant_identity import require_tenant_id
 from common.resilience import retry_async
 from common.tool_registry import ToolRegistry, ToolSpec
 from context_agent.context_quality import context_subject_fingerprint, govern_context, plan_connectors
@@ -1962,7 +1963,7 @@ class ContextIntelligenceAgent(BaseAgent):
     async def assemble_context(self, state: ContextGraphState) -> ContextGraphState:
         alert = state["alert"]
         incident = state["incident"]
-        by_name = {
+        connector_defaults = {
             "vector-db": {"matches": [], "document_count": 0, "knowledge_graph": {}},
             "jenkins": {"recent_deployments": []},
             "cmdb": {"dependencies": []},
@@ -1972,8 +1973,23 @@ class ContextIntelligenceAgent(BaseAgent):
             "prometheus": {},
             "local-evidence": {},
             "discovery-mcp": {},
-            **state["connector_results"],
         }
+        by_name = {
+            name: {
+                **defaults,
+                **(
+                    state["connector_results"].get(name, {})
+                    if isinstance(state["connector_results"].get(name), dict)
+                    else {}
+                ),
+            }
+            for name, defaults in connector_defaults.items()
+        }
+        by_name.update({
+            name: result
+            for name, result in state["connector_results"].items()
+            if name not in by_name and isinstance(result, dict)
+        })
         raw_vector_matches = by_name["vector-db"]["matches"]
         vector_connector = next((c for c in self.connectors if isinstance(c, VectorDBConnector)), None)
         vector_matches = [
@@ -2131,6 +2147,7 @@ class ContextIntelligenceAgent(BaseAgent):
                 ],
             }
         context = Context(
+            tenant_id=alert.tenant_id,
             incident_id=incident.id,
             alert=alert,
             deployment=deployment,
@@ -2186,7 +2203,7 @@ class ContextIntelligenceAgent(BaseAgent):
                 "knowledge_graph": knowledge_graph,
             },
         )
-        tenant_id = str(alert.metadata.get("tenant_id") or alert.labels.get("tenant_id") or "default")
+        tenant_id = require_tenant_id(alert.tenant_id, source="context collection alert identity")
         context = govern_context(
             context,
             tenant_id=tenant_id,

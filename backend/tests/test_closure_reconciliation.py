@@ -10,6 +10,7 @@ from common.models import RemediationAction, RemediationStatus
 
 def action(*, status: RemediationStatus, action_type: str = "restart_service", parameters: dict | None = None):
     return RemediationAction(
+        tenant_id="tenant-a",
         incident_id=uuid4(),
         action_type=action_type,
         target="payments-api",

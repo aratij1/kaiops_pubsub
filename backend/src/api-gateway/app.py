@@ -687,6 +687,8 @@ async def proxy(
 ) -> tuple[int, dict[str, Any]]:
     target_url = f"{target_base.rstrip('/')}/{path.lstrip('/')}"
     headers = {"x-trace-id": trace_id}
+    if settings.service_internal_token:
+        headers["x-kaiops-internal-token"] = settings.service_internal_token
     client = getattr(app.state, "proxy_client", None)
     if client is None:
         raise httpx.ConnectError("API gateway proxy client is not initialized")
@@ -2039,6 +2041,120 @@ async def recalculate_cloud_service_readiness(
     )
 
 
+@app.post("/cloud-ops/plans/compile")
+async def compile_cloud_plan(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="POST", path="/plans/compile", target_base=settings.cloud_operations_url,
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=15.0,
+    )
+
+
+@app.get("/cloud-ops/plans/{plan_id}")
+async def get_cloud_plan(
+    plan_id: str, request: Request, x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="GET",
+        path=f"/plans/{quote(plan_id, safe='')}?{urlencode({'tenant_id': tenant_id})}",
+        target_base=settings.cloud_operations_url, payload={}, trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/cloud-ops/plans/{plan_id}/simulate")
+async def simulate_cloud_plan(
+    plan_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="POST", path=f"/plans/{quote(plan_id, safe='')}/simulate",
+        target_base=settings.cloud_operations_url,
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=15.0,
+    )
+
+
+@app.post("/cloud-ops/plans/{plan_id}/approval")
+async def approve_cloud_plan(
+    plan_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="POST", path=f"/plans/{quote(plan_id, safe='')}/approval",
+        target_base=settings.cloud_operations_url,
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=15.0,
+    )
+
+
+@app.post("/cloud-ops/plans/{plan_id}/execute")
+async def execute_cloud_plan(
+    plan_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="POST", path=f"/plans/{quote(plan_id, safe='')}/execute",
+        target_base=settings.cloud_operations_url,
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=60.0,
+    )
+
+
+@app.post("/cloud-ops/executions/{execution_id}/rollback")
+async def rollback_cloud_execution(
+    execution_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="POST", path=f"/executions/{quote(execution_id, safe='')}/rollback",
+        target_base=settings.cloud_operations_url,
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=60.0,
+    )
+
+
+@app.put("/cloud-ops/governance/policy")
+async def put_cloud_execution_policy(
+    request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None), auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="PUT", path="/governance/policy", target_base=settings.cloud_operations_url, payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.post("/cloud-ops/governance/maintenance-windows")
+async def post_cloud_maintenance_window(
+    request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None), auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="POST", path="/governance/maintenance-windows", target_base=settings.cloud_operations_url, payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.post("/cloud-ops/governance/leases/recover")
+async def recover_cloud_execution_leases(
+    request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None), auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="POST", path="/governance/leases/recover", target_base=settings.cloud_operations_url, payload={**payload, "tenant_id": auth.tenant_id}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.get("/cloud-ops/providers/status")
+async def get_cloud_provider_status(
+    request: Request, x_trace_id: str | None = Header(default=None),
+    _: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path="/providers/status", target_base=settings.cloud_operations_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
+
+
 @app.post("/monitoring/integrations")
 async def post_monitoring_integrations(
     request: Request,
@@ -2999,9 +3115,10 @@ async def search_rag(
     query: str,
     request: Request,
     limit: int = 8,
+    tenant_id: str = Depends(current_tenant_id),
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    query_string = urlencode({"query": query, "limit": limit})
+    query_string = urlencode({"query": query, "limit": limit, "tenant_id": tenant_id})
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -3037,5 +3154,6 @@ app.include_router(
         load_recent_events=lambda limit: _load_recent_gateway_audit_events(app, limit),
         build_audit_contract=_build_gateway_audit_contract,
         load_audit_summary=lambda: _load_gateway_audit_summary(app),
+        auth_context_from_request=_auth_context_from_request,
     )
 )

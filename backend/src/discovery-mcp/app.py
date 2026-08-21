@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+from datetime import UTC, datetime
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
@@ -648,7 +649,7 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
     sources: list[dict[str, Any]] = []
     timeout = httpx.Timeout(max(2.0, min(float(os.getenv("DISCOVERY_MCP_TELEMETRY_TIMEOUT_SECONDS", "6")), 20.0)))
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
         prometheus_url = str(telemetry.get("prometheus_url") or "").rstrip("/")
         if prometheus_url:
             query = f'{{service_name="{service}"}}' if service else "up"
@@ -759,6 +760,145 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _search_traces(arguments: dict[str, Any]) -> dict[str, Any]:
+    result = await _search_telemetry(arguments)
+    evidence = [row for row in result.get("evidence", []) if str(row.get("source") or "").lower() == "trace"]
+    return {**result, "tool": "traces.search", "result_count": len(evidence), "evidence": evidence}
+
+
+def _search_changes(arguments: dict[str, Any]) -> dict[str, Any]:
+    terms = _code_search_terms(arguments)
+    limit = max(1, min(int(arguments.get("limit", 8)), 20))
+    rows = _search_text_files(
+        _code_roots(arguments),
+        {".yml", ".yaml", ".json", ".toml", ".xml", ".tf", ".py"},
+        terms,
+        "change",
+        limit,
+    )
+    for row in rows:
+        try:
+            modified_at = Path(str(row.get("path") or "")).stat().st_mtime
+            row["observed_at"] = datetime.fromtimestamp(modified_at, tz=UTC).isoformat()
+        except OSError:
+            pass
+        row["change_evidence_kind"] = "configuration_or_deployment_artifact"
+    return {"tool": "changes.search", "query_terms": terms, "result_count": len(rows), "evidence": rows}
+
+
+def _search_runbooks(arguments: dict[str, Any]) -> dict[str, Any]:
+    terms = list(dict.fromkeys([str(arguments.get("service") or "").lower(), *_terms(arguments)]))
+    terms = [term for term in terms if term]
+    limit = max(1, min(int(arguments.get("limit", 8)), 20))
+    path = Path(
+        os.getenv("DISCOVERY_MCP_PLAYBOOKS_FILE", "/workspace/backend/rag/execution/playbooks.json")
+    )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        payload = {}
+    rows: list[dict[str, Any]] = []
+    for index, playbook in enumerate(payload.get("playbooks", []) if isinstance(payload, dict) else [], 1):
+        if not isinstance(playbook, dict):
+            continue
+        searchable = json.dumps(playbook, sort_keys=True, ensure_ascii=False, default=str).lower()
+        matched = [term for term in terms if term in searchable]
+        if terms and not matched:
+            continue
+        summary = json.dumps(
+            {
+                "id": playbook.get("id"),
+                "name": playbook.get("name"),
+                "status": playbook.get("status"),
+                "risk_class": playbook.get("risk_class"),
+                "match": playbook.get("match"),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        row = _evidence("runbook", path, index, summary, matched)
+        row.update(
+            {
+                "observed_at": playbook.get("approved_at"),
+                "status": str(playbook.get("status") or "unregistered").lower(),
+                "runbook_id": str(playbook.get("governance_id") or ""),
+                "runbook_slug": str(playbook.get("id") or ""),
+                "version": playbook.get("version"),
+                "checksum_sha256": playbook.get("checksum_sha256"),
+            }
+        )
+        rows.append(row)
+    return {"tool": "runbooks.search", "query_terms": terms, "result_count": len(rows[:limit]), "evidence": rows[:limit]}
+
+
+async def _search_runtime_topology(arguments: dict[str, Any], *, health_only: bool) -> dict[str, Any]:
+    tool_name = "dependency-health.search" if health_only else "topology.search"
+    limit = max(1, min(int(arguments.get("limit", 8)), 20))
+    docker_host = str(os.getenv("DOCKER_LOG_DISCOVERY_HOST", "docker-socket-proxy:2375")).strip()
+    if not docker_host:
+        return {"tool": tool_name, "result_count": 0, "evidence": [], "provider_status": "unavailable"}
+    service = str(arguments.get("service") or "").strip().lower()
+    project = str(arguments.get("project") or arguments.get("application") or "").strip().lower()
+    evidence: list[dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient(
+            base_url=f"http://{docker_host}", timeout=httpx.Timeout(8.0), trust_env=False
+        ) as client:
+            response = await client.get("/containers/json", params={"all": "true", "limit": "100"})
+            response.raise_for_status()
+            containers = response.json()
+        for index, container in enumerate(containers, 1):
+            if not isinstance(container, dict):
+                continue
+            labels = container.get("Labels") if isinstance(container.get("Labels"), dict) else {}
+            compose_project = str(labels.get("com.docker.compose.project") or "").lower()
+            compose_service = str(labels.get("com.docker.compose.service") or "").lower()
+            identity = " ".join(
+                [compose_project, compose_service, *(str(item).lower() for item in container.get("Names", []))]
+            )
+            if project and project not in identity and not (project.startswith("kaiops") and "kaiops" in identity):
+                continue
+            if not project and service and service not in identity:
+                continue
+            state = str(container.get("State") or "unknown").lower()
+            status = str(container.get("Status") or "unknown")
+            networks = sorted((container.get("NetworkSettings") or {}).get("Networks", {}).keys())
+            kind = "dependency" if health_only else "topology"
+            snippet = json.dumps(
+                {
+                    "project": compose_project,
+                    "service": compose_service,
+                    "state": state,
+                    "status": status,
+                    "networks": networks,
+                    "related_to": service,
+                },
+                ensure_ascii=False,
+            )
+            row = _evidence(kind, Path(f"docker/{compose_project or 'runtime'}/{compose_service or index}"), 1, snippet, [service] if service else [])
+            row.update(
+                {
+                    "uri": f"docker://{compose_project or 'runtime'}/{compose_service or index}",
+                    "service": compose_service or service,
+                    "runtime_state": state,
+                    "runtime_status": status,
+                    "healthy": state == "running" and "unhealthy" not in status.lower(),
+                }
+            )
+            evidence.append(row)
+            if len(evidence) >= limit:
+                break
+    except Exception as exc:
+        return {
+            "tool": tool_name,
+            "result_count": 0,
+            "evidence": [],
+            "provider_status": "failed",
+            "provider_error": str(exc)[:240],
+        }
+    return {"tool": tool_name, "result_count": len(evidence), "evidence": evidence, "provider_status": "completed"}
+
+
 TOOLS = [
     {
         "name": "logs.search",
@@ -796,6 +936,31 @@ TOOLS = [
         },
     },
     {
+        "name": "traces.search",
+        "description": "Read-only correlated trace search through the onboarded telemetry project.",
+        "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "service": {"type": "string"}, "trace_id": {"type": "string"}, "limit": {"type": "integer"}}},
+    },
+    {
+        "name": "topology.search",
+        "description": "Read-only runtime topology discovery through the scoped Docker API proxy.",
+        "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "service": {"type": "string"}, "limit": {"type": "integer"}}},
+    },
+    {
+        "name": "dependency-health.search",
+        "description": "Read-only dependency runtime health discovery through the scoped Docker API proxy.",
+        "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "service": {"type": "string"}, "limit": {"type": "integer"}}},
+    },
+    {
+        "name": "changes.search",
+        "description": "Read-only bounded search of deployment and configuration change artifacts.",
+        "inputSchema": {"type": "object", "properties": {"terms": {"type": "array"}, "service": {"type": "string"}, "limit": {"type": "integer"}}},
+    },
+    {
+        "name": "runbooks.search",
+        "description": "Read-only lookup of immutable governed runbook catalog entries.",
+        "inputSchema": {"type": "object", "properties": {"terms": {"type": "array"}, "service": {"type": "string"}, "limit": {"type": "integer"}}},
+    },
+    {
         "name": "external.search",
         "description": "Read-only search through the explicitly configured external knowledge provider.",
         "inputSchema": {
@@ -820,6 +985,10 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         )
     elif name == "tickets.search":
         rows = _search_tickets(terms, limit)
+    elif name == "changes.search":
+        return _search_changes(arguments)
+    elif name == "runbooks.search":
+        return _search_runbooks(arguments)
     else:
         raise ValueError(f"unknown MCP tool: {name}")
     return {"tool": name, "query_terms": terms, "result_count": len(rows), "evidence": rows}
@@ -966,6 +1135,12 @@ async def mcp(request: MCPRequest) -> dict[str, Any]:
                 result = await _call_mysql_tool(safe_arguments)
             elif name == "telemetry.search":
                 result = await _search_telemetry(safe_arguments)
+            elif name == "traces.search":
+                result = await _search_traces(safe_arguments)
+            elif name == "topology.search":
+                result = await _search_runtime_topology(safe_arguments, health_only=False)
+            elif name == "dependency-health.search":
+                result = await _search_runtime_topology(safe_arguments, health_only=True)
             elif name == "tickets.search":
                 result = await _call_ticket_tool(safe_arguments)
             elif name == "logs.search":

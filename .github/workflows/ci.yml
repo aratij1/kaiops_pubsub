@@ -3,7 +3,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: ["**"]
   workflow_dispatch:
     inputs:
       total_alerts:
@@ -37,12 +37,11 @@ jobs:
       - name: Lint
         run: ruff check .
       - name: Validate RAG metadata
+        run: python scripts/validate-rag-metadata.py --rag-root backend/rag
+      - name: Validate governed execution catalogs and checksums
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            python scripts/validate-rag-metadata-delta.py --rag-root backend/rag --base-ref origin/${{ github.base_ref }}
-          else
-            python scripts/validate-rag-metadata.py --rag-root backend/rag
-          fi
+          python scripts/validate_execution_catalog.py
+          python scripts/update_execution_catalog_checksums.py --check
       - name: Test
         run: pytest
 

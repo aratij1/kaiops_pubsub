@@ -49,10 +49,11 @@ class StubJudgeClient:
 
 async def _sample_context() -> Context:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus", name="PaymentLatencyHigh", service="payments", severity=AlertSeverity.CRITICAL,
         description="payment latency after deployment", labels={"deployment": "payments-api"},
     )
-    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    incident = Incident(tenant_id="tenant-a", service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
     return await ContextIntelligenceAgent().collect(alert, incident)
 
 
@@ -116,6 +117,7 @@ async def test_publish_evaluation_schedules_task_with_correct_payload() -> None:
     agent._post_evaluation = fake_post_evaluation  # type: ignore[method-assign]
 
     recommendation = Recommendation(
+        tenant_id="tenant-a",
         incident_id=Incident(service="payments", severity=AlertSeverity.HIGH, title="t").id,
         root_cause="deploy", confidence=0.8, impact="latency", recommended_action="Rollback deployment",
         severity=AlertSeverity.HIGH, rationale="because", commands=[],
@@ -145,6 +147,7 @@ async def test_publish_evaluation_handles_missing_model_calls_gracefully() -> No
     agent._post_evaluation = fake_post_evaluation  # type: ignore[method-assign]
 
     recommendation = Recommendation(
+        tenant_id="tenant-a",
         incident_id=Incident(service="payments", severity=AlertSeverity.HIGH, title="t").id,
         root_cause="deploy", confidence=0.8, impact="latency", recommended_action="Rollback deployment",
         severity=AlertSeverity.HIGH, rationale="because", commands=[],

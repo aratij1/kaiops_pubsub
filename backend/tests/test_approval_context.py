@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from starlette.requests import Request
 from common.orchestration.execution_plan_contract import canonical_plan_fingerprint
 
 
@@ -19,7 +20,7 @@ def _approval_plan(incident_id: str) -> dict:
 
 def _set_pending_plan(module, incident_id: str, recommendation_id: str) -> dict:
     plan = _approval_plan(incident_id)
-    module.PENDING_INCIDENTS[incident_id] = {
+    module.PENDING_INCIDENTS[module._pending_key("tenant-a", incident_id)] = {
         "recommendation": {
             "id": recommendation_id,
             "incident_id": incident_id,
@@ -38,6 +39,33 @@ def load_approval_app_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.asyncio
+async def test_approval_mutations_require_internal_service_authentication() -> None:
+    module = load_approval_app_module()
+    module.settings.service_internal_token = "internal-test-token"
+    called = False
+
+    async def call_next(_request):
+        nonlocal called
+        called = True
+        return module.JSONResponse({"ok": True})
+
+    unauthenticated = Request({"type": "http", "method": "POST", "path": "/approve", "headers": []})
+    denied = await module.require_internal_mutation_auth(unauthenticated, call_next)
+    assert denied.status_code == 403
+    assert called is False
+
+    authenticated = Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/approve",
+        "headers": [(b"x-kaiops-internal-token", b"internal-test-token")],
+    })
+    allowed = await module.require_internal_mutation_auth(authenticated, call_next)
+    assert allowed.status_code == 200
+    assert called is True
 
 
 def test_approval_incident_context_resolves_nested_recommendation_id() -> None:
@@ -63,6 +91,56 @@ def test_approval_incident_context_resolves_nested_recommendation_id() -> None:
 
     assert context["recommendation_id"] == recommendation_id
     assert context["flow_id"] == "flow-1"
+
+
+def test_approval_readiness_is_backend_signed_only_when_every_gate_passes() -> None:
+    module = load_approval_app_module()
+    module.settings.service_internal_token = "internal-test-token"
+    plan = {
+        "tenant_id": "tenant-a",
+        "incident_id": "11111111-1111-1111-1111-111111111111",
+        "plan_id": "33333333-3333-3333-3333-333333333333",
+        "target_resource_id": "k8s:/clusters/prod/namespaces/payments/deployments/api",
+        "connector_id": "kubernetes-prod",
+        "validators": [{"validator_id": "availability-1"}],
+        "rollback_commands": ["governed:rollback-deployment"],
+        "rollback_mode": "automatic",
+        "policy_decision": {"decision": "allow"},
+    }
+    plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
+    context = module._build_incident_context({
+        "tenant_id": "tenant-a",
+        "incident_id": plan["incident_id"],
+        "recommendation": {
+            "id": "22222222-2222-2222-2222-222222222222",
+            "tenant_id": "tenant-a",
+            "metadata": {
+                "execution_plan": plan,
+                "runbook_status": "approved",
+                "connection_profile": {"credential_ref": "vault://tenant-a/prod-remediator"},
+                "evidence_quality": {
+                    "evidence_coverage": 0.9,
+                    "citation_coverage": 0.8,
+                    "evidence_fresh": True,
+                    "conflict_count": 0,
+                },
+            },
+        },
+    }, None)
+
+    receipt = context["approval_readiness"]
+    assert receipt["state"] == "execution_eligible"
+    assert receipt["missing"] == []
+    assert receipt["signature"].startswith("hmac-sha256:")
+
+
+def test_approval_readiness_fails_closed_without_signing_key() -> None:
+    module = load_approval_app_module()
+    module.settings.service_internal_token = ""
+    receipt = module._build_incident_context({"incident_id": "incident-1"}, None)["approval_readiness"]
+    assert receipt["state"] == "blocked"
+    assert "readiness_signing_key" in receipt["missing"]
+    assert receipt["signature"] == ""
 
 
 def test_approval_request_rejects_placeholder_tenant(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -228,7 +306,7 @@ async def test_approval_submission_resolves_missing_recommendation_id(monkeypatc
     module.app.state.producer = _FakeProducer()
     module.PENDING_INCIDENTS.clear()
     plan = _set_pending_plan(module, incident_id, recommendation_id)
-    module.PENDING_INCIDENTS[incident_id]["recommendation"].pop("id")
+    module.PENDING_INCIDENTS[module._pending_key("tenant-a", incident_id)]["recommendation"].pop("id")
 
     request = module.ApprovalRequest(
         incident_id=incident_id,
@@ -251,7 +329,7 @@ async def test_approval_submission_resolves_missing_recommendation_id(monkeypatc
 @pytest.mark.parametrize(
     ("tenant_id", "plan_id", "fingerprint", "status_code"),
     [
-        ("tenant-b", "33333333-3333-3333-3333-333333333333", None, 403),
+        ("tenant-b", "33333333-3333-3333-3333-333333333333", None, 404),
         ("tenant-a", "44444444-4444-4444-4444-444444444444", None, 409),
         ("tenant-a", "33333333-3333-3333-3333-333333333333", "sha256:" + "f" * 64, 409),
     ],

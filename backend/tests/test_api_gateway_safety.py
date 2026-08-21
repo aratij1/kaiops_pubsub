@@ -268,6 +268,7 @@ def test_gateway_operational_auth_policy_marks_admin_routes() -> None:
     assert route_auth_rule("POST", "/remediation/actions/action-id/emergency-stop") == {"Administrator", "L2 Engineer", "L3 Engineer"}
     assert route_auth_rule("GET", "/approval/capacity") == {"Administrator"}
     assert route_auth_rule("POST", "/approval/auto-assign") == {"Administrator"}
+    assert route_auth_rule("POST", "/incidents/incident-1/manual-close") == {"Administrator", "L3 Engineer"}
     assert route_auth_rule("GET", "/events/operations") is None
     assert route_auth_rule("POST", "/api/v1/alerts/prometheus") is False
 

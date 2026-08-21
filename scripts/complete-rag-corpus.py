@@ -81,6 +81,7 @@ def csv_first(value: str) -> str:
 
 
 def serialize(metadata: dict[str, Any], body: str) -> str:
+    metadata = {"tenant_scope": str(metadata.get("tenant_scope") or "global"), **metadata}
     header_lines = [f"{key}: {value}" for key, value in metadata.items() if str(value).strip()]
     return "\n".join(header_lines) + "\n\n" + body.strip() + "\n"
 
@@ -175,8 +176,31 @@ def ensure_sops_complete() -> None:
         path.write_text(serialize(ordered, body), encoding="utf-8")
 
 
+def ensure_existing_scoped_metadata() -> None:
+    """Preserve existing metadata while adding global scope and deployment identity."""
+
+    for path in sorted(RAG.rglob("*.md")):
+        section = path.relative_to(RAG).parts[0]
+        if section not in {"changes", "dependencies", "deployments", "onboarding"}:
+            continue
+        metadata, body = parse_metadata_and_body(path)
+        if not metadata:
+            continue
+        metadata["tenant_scope"] = metadata.get("tenant_scope") or "global"
+        if section == "deployments":
+            metadata["deployment"] = (
+                metadata.get("deployment")
+                or metadata.get("root_cause")
+                or metadata.get("source_ref")
+                or path.stem
+            )
+        path.write_text(serialize(metadata, body), encoding="utf-8")
+
+
 def write_coverage_docs(records: list[IncidentRecord]) -> None:
     records = sorted(records, key=lambda item: item.alert_id)
+    for section in ("changes", "dependencies", "deployments", "runbooks", "onboarding"):
+        (RAG / section).mkdir(parents=True, exist_ok=True)
 
     changes_rows = "\n".join(
         [f"- {r.alert_id} | {r.service} | Change context summary maintained for incident-aware troubleshooting." for r in records]
@@ -400,6 +424,7 @@ def main() -> int:
     records = ensure_incidents_complete()
     ensure_runbooks_complete()
     ensure_sops_complete()
+    ensure_existing_scoped_metadata()
     write_coverage_docs(records)
     write_per_incident_docs(records)
     print(f"Completed RAG corpus normalization and coverage updates for {len(records)} incidents")

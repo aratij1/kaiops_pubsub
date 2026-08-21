@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS discovered_resources (
     provider_account_id VARCHAR(255) NOT NULL,
     region VARCHAR(128) NOT NULL,
     provider_resource_id VARCHAR(768) NOT NULL,
+    provider_resource_key CHAR(64) NOT NULL,
     resource_type VARCHAR(128) NOT NULL,
     display_name VARCHAR(255) NOT NULL,
     status VARCHAR(32) NOT NULL DEFAULT 'active',
@@ -95,7 +96,7 @@ CREATE TABLE IF NOT EXISTS discovered_resources (
     version INT NOT NULL DEFAULT 1,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uq_discovered_resources_provider_id (tenant_id, project_id, provider_resource_id),
+    UNIQUE KEY uq_discovered_resources_provider_key (tenant_id, project_id, provider_resource_key),
     KEY idx_discovered_resources_scope_type (tenant_id, project_id, provider, resource_type),
     KEY idx_discovered_resources_service_env (tenant_id, service_id, environment),
     KEY idx_discovered_resources_status (tenant_id, project_id, status)

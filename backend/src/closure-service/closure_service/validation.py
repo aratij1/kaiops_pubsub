@@ -5,46 +5,49 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
-import httpx
 from uuid import NAMESPACE_URL, uuid5
 
 from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.models import RemediationAction, RemediationStatus, ResolutionReport
-from common.orchestration.execution_plan_contract import canonical_plan_fingerprint, verify_plan_fingerprint
+from common.orchestration.execution_plan_contract import ValidatorSpec, canonical_plan_fingerprint, verify_plan_fingerprint
 from common.resolution_lifecycle import LifecycleActor, ResolutionState, extract_lifecycle, transition_lifecycle
 
 
 def _validation_urls(plan: dict) -> tuple[list[str], int]:
-    accepted = _validation_endpoints(plan)
-    endpoints = plan.get("validation_endpoints")
-    endpoints = endpoints if isinstance(endpoints, list) else []
-    urls = [str(item["url"]) for item in accepted]
-    return list(dict.fromkeys(urls)), len(endpoints)
+    # v1 URL validation is permanently non-executable. The tuple remains only
+    # for compatibility telemetry while producers migrate to ValidatorSpec.
+    return [], 0
 
 
 def _validation_endpoints(plan: dict[str, Any]) -> list[dict[str, str]]:
-    endpoints = plan.get("validation_endpoints")
-    endpoints = endpoints if isinstance(endpoints, list) else []
-    accepted: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for item in endpoints:
-        if not isinstance(item, dict):
+    return []
+
+
+def _typed_validators(action: RemediationAction, plan: dict[str, Any]) -> list[ValidatorSpec]:
+    supplied = plan.get("validators") if isinstance(plan.get("validators"), list) else []
+    registry = action.parameters.get("validator_registry_snapshot")
+    registry = registry if isinstance(registry, list) else []
+    registered = {
+        str(item.get("validator_id") or ""): item
+        for item in registry
+        if isinstance(item, dict) and str(item.get("validator_id") or "")
+    }
+    accepted: list[ValidatorSpec] = []
+    for payload in supplied:
+        if not isinstance(payload, dict):
             continue
-        url = str(item.get("url") or "").strip()
-        kind = str(item.get("kind") or "").strip().lower()
-        method = str(item.get("method") or "GET").strip().upper()
-        key = (url, kind)
+        try:
+            spec = ValidatorSpec.model_validate(payload)
+        except ValueError:
+            continue
+        registry_payload = registered.get(spec.validator_id)
         if (
-            item.get("onboarded") is not True
-            or item.get("authoritative") is not True
-            or method != "GET"
-            or not kind
-            or not _safe_validation_url(url)
-            or key in seen
+            registry_payload != spec.model_dump(mode="json")
+            or spec.tenant_id != action.tenant_id
+            or spec.target_resource_id != action.target
         ):
             continue
-        seen.add(key)
-        accepted.append({"url": url, "kind": kind, "method": method})
+        accepted.append(spec)
     return accepted
 
 
@@ -174,40 +177,44 @@ class ClosureValidationAgent(BaseAgent):
             and str(execution_result.get("build_result") or "").upper() == "SUCCESS"
         )
         validation["executor_recovery_validated"] = executor_recovery_validated
-        governed_endpoints = _validation_endpoints(execution_plan)
+        governed_validators = _typed_validators(action, execution_plan)
+        supplied_validators = execution_plan.get("validators") if isinstance(execution_plan.get("validators"), list) else []
+        supplied_observations = action.parameters.get("validation_observations")
+        supplied_observations = supplied_observations if isinstance(supplied_observations, list) else []
         observations: list[dict[str, Any]] = []
         passed_kinds: set[str] = set()
         observed_at = datetime.now(timezone.utc)
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(10.0, connect=3.0),
-            trust_env=False,
-            follow_redirects=False,
-        ) as client:
-            for index, endpoint in enumerate(governed_endpoints, start=1):
-                url = endpoint["url"]
-                kind = endpoint["kind"]
-                passed = False
-                status_code: int | None = None
+        stability_required = max(60, min(int(execution_plan.get("stability_window_seconds") or 300), 3600))
+        validator_windows_complete = True
+        for index, validator in enumerate(governed_validators, start=1):
+            samples: list[tuple[datetime, dict[str, Any]]] = []
+            for item in supplied_observations:
+                if not isinstance(item, dict) or str(item.get("validator_id") or "") != validator.validator_id:
+                    continue
+                if (
+                    str(item.get("connector_id") or "") != validator.connector_id
+                    or str(item.get("target_resource_id") or "") != validator.target_resource_id
+                    or not str(item.get("result_checksum") or "").startswith("sha256:")
+                ):
+                    continue
                 try:
-                    response = await client.get(url)
-                    status_code = response.status_code
-                    passed = 200 <= response.status_code < 300
-                except httpx.HTTPError:
-                    passed = False
-                validation[f"health_check_{index}"] = passed
-                if passed:
-                    passed_kinds.add(kind)
-                observations.append(
-                    {
-                        "url": url,
-                        "kind": kind,
-                        "status_code": status_code,
-                        "passed": passed,
-                        "observed_at": observed_at.isoformat(),
-                    }
-                )
-        validation["validation_supplied"] = supplied_count > 0
-        validation["validation_executable"] = supplied_count > 0 and len(governed_endpoints) == supplied_count
+                    timestamp = datetime.fromisoformat(str(item.get("observed_at") or "").replace("Z", "+00:00"))
+                    if timestamp.tzinfo is None:
+                        continue
+                except ValueError:
+                    continue
+                samples.append((timestamp.astimezone(timezone.utc), item))
+            samples.sort(key=lambda row: row[0])
+            passed = len(samples) >= validator.minimum_sample_count and all(item.get("passed") is True for _, item in samples)
+            required_window = max(stability_required, validator.observation_window_seconds)
+            window_complete = bool(samples) and (samples[-1][0] - samples[0][0]).total_seconds() >= required_window
+            validator_windows_complete = validator_windows_complete and window_complete
+            validation[f"validator_{index}"] = passed
+            if passed:
+                passed_kinds.add(validator.kind)
+            observations.extend({**item, "kind": validator.kind} for _, item in samples)
+        validation["validation_supplied"] = bool(supplied_validators)
+        validation["validation_executable"] = bool(supplied_validators) and len(governed_validators) == len(supplied_validators)
         required_kinds = {
             str(item).strip().lower()
             for item in execution_plan.get(
@@ -216,15 +223,16 @@ class ClosureValidationAgent(BaseAgent):
             )
             if str(item).strip()
         }
-        independent_checks_passed = bool(governed_endpoints) and all(
-            passed for name, passed in validation.items() if name.startswith("health_check_")
+        independent_checks_passed = bool(governed_validators) and all(
+            passed for name, passed in validation.items() if name.startswith("validator_")
         ) and required_kinds.issubset(passed_kinds)
         validation["independent_checks_passed"] = independent_checks_passed
-        stability_passed, stability_elapsed, stability_required = _stability_window(
+        elapsed_stability_passed, stability_elapsed, stability_required = _stability_window(
             action,
             execution_plan,
             observed_at=observed_at,
         )
+        stability_passed = elapsed_stability_passed and validator_windows_complete
         recovery_checks = {
             "triggering_alert_cleared": "alert_clearance" in passed_kinds,
             "availability_recovered": "availability" in passed_kinds,
@@ -260,11 +268,12 @@ class ClosureValidationAgent(BaseAgent):
                     actor=LifecycleActor.REMEDIATION,
                     execution={"action_id": str(action.id), "status": action.status.value},
                 )
+            stability_pending = independent_checks_passed and not stability_passed
             lifecycle = transition_lifecycle(
                 lifecycle,
-                ResolutionState.RECOVERED if restored else ResolutionState.FAILED_RETRYABLE,
+                ResolutionState.RECOVERED if restored else ResolutionState.PENDING_STABILITY if stability_pending else ResolutionState.FAILED_RETRYABLE,
                 actor=LifecycleActor.CLOSURE,
-                reason_code=None if restored else "recovery_validation_failed",
+                reason_code=None if restored else "stability_window_incomplete" if stability_pending else "recovery_validation_failed",
                 validation={"checks": validation, "passed": restored},
             )
         action_taken = action.output or action.action_type
@@ -296,6 +305,7 @@ class ClosureValidationAgent(BaseAgent):
                     "required_seconds": stability_required,
                     "elapsed_seconds": round(stability_elapsed, 3),
                     "observed_at": observed_at.isoformat(),
+                    "status": "recovered" if restored else "pending" if independent_checks_passed and not stability_passed else "failed",
                 },
                 **({"resolution_lifecycle": lifecycle} if lifecycle else {}),
             },

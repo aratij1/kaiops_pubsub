@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
+
+from common.orchestration.execution_plan_contract import canonical_plan_fingerprint
+from common.tenant_identity import require_tenant_id
 
 SCHEMA_VERSION = "kaims.resolution-lifecycle.v4"
 
@@ -17,6 +18,7 @@ class ResolutionState(StrEnum):
     EXECUTING = "executing"
     BLOCKED_RETRYABLE = "blocked_retryable"
     VALIDATING = "validating"
+    PENDING_STABILITY = "pending_stability"
     RECOVERED = "recovered"
     ROLLED_BACK = "rolled_back"
     FAILED_RETRYABLE = "failed_retryable"
@@ -126,6 +128,7 @@ PERMITTED_ACTIONS = {
     ResolutionState.EXECUTING: ["observe", "cancel"],
     ResolutionState.BLOCKED_RETRYABLE: ["retry", "edit_plan", "escalate"],
     ResolutionState.VALIDATING: ["validate", "rollback"],
+    ResolutionState.PENDING_STABILITY: ["observe", "rollback"],
     ResolutionState.RECOVERED: ["close", "revalidate"],
     ResolutionState.ROLLED_BACK: ["regenerate_plan", "escalate"],
     ResolutionState.FAILED_RETRYABLE: ["retry", "regenerate_plan", "rollback", "escalate"],
@@ -166,6 +169,13 @@ ALLOWED_TRANSITIONS: dict[ResolutionState, frozenset[ResolutionState]] = {
         ResolutionState.ANALYZING,
     }),
     ResolutionState.VALIDATING: frozenset({
+        ResolutionState.PENDING_STABILITY,
+        ResolutionState.RECOVERED,
+        ResolutionState.FAILED_RETRYABLE,
+        ResolutionState.ROLLED_BACK,
+    }),
+    ResolutionState.PENDING_STABILITY: frozenset({
+        ResolutionState.PENDING_STABILITY,
         ResolutionState.RECOVERED,
         ResolutionState.FAILED_RETRYABLE,
         ResolutionState.ROLLED_BACK,
@@ -210,6 +220,11 @@ TRANSITION_ACTORS: dict[tuple[ResolutionState, ResolutionState], frozenset[Lifec
     (ResolutionState.BLOCKED_RETRYABLE, ResolutionState.READY_TO_EXECUTE): frozenset({LifecycleActor.APPROVAL, LifecycleActor.REMEDIATION}),
     (ResolutionState.BLOCKED_RETRYABLE, ResolutionState.ANALYZING): frozenset({LifecycleActor.RESOLUTION, LifecycleActor.OPERATOR}),
     (ResolutionState.VALIDATING, ResolutionState.RECOVERED): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
+    (ResolutionState.VALIDATING, ResolutionState.PENDING_STABILITY): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
+    (ResolutionState.PENDING_STABILITY, ResolutionState.PENDING_STABILITY): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
+    (ResolutionState.PENDING_STABILITY, ResolutionState.RECOVERED): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
+    (ResolutionState.PENDING_STABILITY, ResolutionState.FAILED_RETRYABLE): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
+    (ResolutionState.PENDING_STABILITY, ResolutionState.ROLLED_BACK): frozenset({LifecycleActor.CLOSURE}),
     (ResolutionState.VALIDATING, ResolutionState.FAILED_RETRYABLE): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
     (ResolutionState.VALIDATING, ResolutionState.ROLLED_BACK): frozenset({LifecycleActor.CLOSURE}),
     (ResolutionState.RECOVERED, ResolutionState.CLOSED): frozenset({LifecycleActor.CLOSURE, LifecycleActor.RECONCILER}),
@@ -226,8 +241,7 @@ TRANSITION_ACTORS: dict[tuple[ResolutionState, ResolutionState], frozenset[Lifec
 
 
 def plan_fingerprint(plan: dict[str, Any] | None) -> str:
-    canonical = json.dumps(plan or {}, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(canonical.encode()).hexdigest()
+    return canonical_plan_fingerprint(plan or {})
 
 
 def create_lifecycle(*, tenant_id: str, incident_id: Any, recommendation_id: Any,
@@ -236,8 +250,9 @@ def create_lifecycle(*, tenant_id: str, incident_id: Any, recommendation_id: Any
                      control: dict[str, Any] | None = None) -> dict[str, Any]:
     state = ResolutionState(state)
     now = datetime.now(UTC).isoformat()
+    verified_tenant_id = require_tenant_id(tenant_id, source="resolution lifecycle identity")
     return {
-        "schema_version": SCHEMA_VERSION, "tenant_id": tenant_id or "default",
+        "schema_version": SCHEMA_VERSION, "tenant_id": verified_tenant_id,
         "incident_id": str(incident_id), "recommendation_id": str(recommendation_id),
         "plan_fingerprint": plan_fingerprint(plan), "state": state.value, "state_version": 1,
         "reason_code": reason_code, "retryable": state in {ResolutionState.BLOCKED_RETRYABLE, ResolutionState.FAILED_RETRYABLE},
