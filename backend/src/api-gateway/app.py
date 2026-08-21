@@ -1577,6 +1577,23 @@ async def get_incident_metadata(
     )
 
 
+@app.get("/incidents/lowest-confidence-recommendations")
+async def get_lowest_confidence_recommendations(
+    request: Request,
+    limit: int = 5,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    path = f"/incidents/lowest-confidence-recommendations?{urlencode({'limit': str(limit)})}"
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=path,
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/incidents/{incident_id}/stage-completeness")
 async def get_incident_stage_completeness(
     incident_id: str,

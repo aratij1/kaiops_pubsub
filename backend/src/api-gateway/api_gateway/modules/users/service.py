@@ -437,7 +437,7 @@ class UserService:
 
         return await run_in_session(self.session_factory, op)
 
-    async def create_user(self, *, actor: str, payload: UserCreate, ip_address: str | None) -> dict:
+    async def create_user(self, *, actor: str, tenant_id: str, payload: UserCreate, ip_address: str | None) -> dict:
         self.validate_password_policy(payload.password)
 
         async def op(repo: UserRepository):
@@ -450,8 +450,12 @@ class UserService:
             if role is None:
                 raise HTTPException(status_code=404, detail="Role not found")
 
+            # A caller can only ever provision users into their own tenant --
+            # payload.tenant_id is ignored, not merely defaulted, so an
+            # Administrator token can't plant/re-parent a user into a
+            # different tenant by setting this field explicitly.
             rec = UserRecord(
-                tenant_id=payload.tenant_id or "default",
+                tenant_id=tenant_id or "default",
                 username=payload.username,
                 email=str(payload.email),
                 password_hash=self.hash_password(payload.password),
@@ -484,6 +488,7 @@ class UserService:
         status: str | None,
         sort_by: str,
         sort_dir: str,
+        tenant_id: str,
     ) -> tuple[list[dict], int]:
         async def op(repo: UserRepository):
             rows, total = await repo.list_users(
@@ -494,15 +499,16 @@ class UserService:
                 status=status,
                 sort_by=sort_by,
                 sort_dir=sort_dir,
+                tenant_id=tenant_id,
             )
             role_map = {role.id: role.name for role in await repo.list_roles()}
             return [self._user_to_dict(item, role_map.get(item.role_id, "Unknown")) for item in rows], total
 
         return await run_in_session(self.session_factory, op)
 
-    async def get_user(self, user_id: int) -> dict:
+    async def get_user(self, user_id: int, *, tenant_id: str) -> dict:
         async def op(repo: UserRepository):
-            user = await repo.get_user(user_id)
+            user = await repo.get_user(user_id, tenant_id=tenant_id)
             if user is None:
                 raise HTTPException(status_code=404, detail="User not found")
             role = await repo.get_role(user.role_id)
@@ -510,9 +516,11 @@ class UserService:
 
         return await run_in_session(self.session_factory, op)
 
-    async def update_user(self, *, actor: str, user_id: int, payload: UserUpdate, ip_address: str | None) -> dict:
+    async def update_user(
+        self, *, actor: str, tenant_id: str, user_id: int, payload: UserUpdate, ip_address: str | None
+    ) -> dict:
         async def op(repo: UserRepository):
-            user = await repo.get_user(user_id)
+            user = await repo.get_user(user_id, tenant_id=tenant_id)
             if user is None:
                 raise HTTPException(status_code=404, detail="User not found")
             old = self._user_to_dict(user, (await repo.get_role(user.role_id)).name if await repo.get_role(user.role_id) else "Unknown")
@@ -554,13 +562,14 @@ class UserService:
         self,
         *,
         actor: str,
+        tenant_id: str,
         user_id: int,
         status: str,
         is_active: bool,
         ip_address: str | None,
     ) -> dict:
         async def op(repo: UserRepository):
-            user = await repo.get_user(user_id)
+            user = await repo.get_user(user_id, tenant_id=tenant_id)
             if user is None:
                 raise HTTPException(status_code=404, detail="User not found")
             user.status = status
@@ -579,11 +588,13 @@ class UserService:
 
         return await run_in_session(self.session_factory, op)
 
-    async def reset_password(self, *, actor: str, user_id: int, new_password: str, ip_address: str | None) -> dict:
+    async def reset_password(
+        self, *, actor: str, tenant_id: str, user_id: int, new_password: str, ip_address: str | None
+    ) -> dict:
         self.validate_password_policy(new_password)
 
         async def op(repo: UserRepository):
-            user = await repo.get_user(user_id)
+            user = await repo.get_user(user_id, tenant_id=tenant_id)
             if user is None:
                 raise HTTPException(status_code=404, detail="User not found")
             user.password_hash = self.hash_password(new_password)
@@ -600,9 +611,9 @@ class UserService:
 
         return await run_in_session(self.session_factory, op)
 
-    async def unlock_user(self, *, actor: str, user_id: int, ip_address: str | None) -> dict:
+    async def unlock_user(self, *, actor: str, tenant_id: str, user_id: int, ip_address: str | None) -> dict:
         async def op(repo: UserRepository):
-            user = await repo.get_user(user_id)
+            user = await repo.get_user(user_id, tenant_id=tenant_id)
             if user is None:
                 raise HTTPException(status_code=404, detail="User not found")
             user.failed_login_attempts = 0
@@ -619,9 +630,9 @@ class UserService:
 
         return await run_in_session(self.session_factory, op)
 
-    async def delete_user(self, *, actor: str, user_id: int, ip_address: str | None) -> dict:
+    async def delete_user(self, *, actor: str, tenant_id: str, user_id: int, ip_address: str | None) -> dict:
         async def op(repo: UserRepository):
-            user = await repo.get_user(user_id)
+            user = await repo.get_user(user_id, tenant_id=tenant_id)
             if user is None:
                 raise HTTPException(status_code=404, detail="User not found")
             await repo.session.delete(user)
@@ -637,9 +648,11 @@ class UserService:
 
         return await run_in_session(self.session_factory, op)
 
-    async def list_audit_logs(self, *, page: int, page_size: int, action: str | None) -> tuple[list[dict], int]:
+    async def list_audit_logs(
+        self, *, page: int, page_size: int, action: str | None, tenant_id: str
+    ) -> tuple[list[dict], int]:
         async def op(repo: UserRepository):
-            rows, total = await repo.list_audit_logs(page=page, page_size=page_size, action=action)
+            rows, total = await repo.list_audit_logs(page=page, page_size=page_size, action=action, tenant_id=tenant_id)
             payload_rows = [
                 {
                     "id": str(row.id),

@@ -6329,6 +6329,18 @@ async def get_incident_metadata(
     return {"rows": rows, "count": len(rows)}
 
 
+@app.get("/incidents/lowest-confidence-recommendations")
+async def get_lowest_confidence_recommendations(limit: int = 5) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit), 50))
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        return {"rows": [], "count": 0}
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        rows = await repo.list_lowest_confidence_recommendations(limit=safe_limit)
+    return {"rows": rows, "count": len(rows)}
+
+
 @app.get("/incidents/{incident_id}/stage-completeness")
 async def get_incident_stage_completeness(incident_id: str) -> dict[str, Any]:
     session_factory = getattr(app.state, "session_factory", None)

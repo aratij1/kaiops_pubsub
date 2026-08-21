@@ -207,6 +207,10 @@ class Settings(BaseSettings):
     groq_api_key: str | None = Field(default=None, alias="GROQ_API_KEY")
     groq_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_MODEL")
     groq_base_url: str = Field(default="https://api.groq.com/openai/v1", alias="GROQ_BASE_URL")
+    anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
+    anthropic_model: str = Field(default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL")
+    anthropic_base_url: str = Field(default="https://api.anthropic.com/v1", alias="ANTHROPIC_BASE_URL")
+    anthropic_version: str = Field(default="2023-06-01", alias="ANTHROPIC_VERSION")
     # Separate from azure_openai_embeddings_deployment above (used only for RAG
     # embeddings) and azure_ai_evaluation_deployment (used only for the LLM-judge
     # groundedness scorer) — this is the deployment model-router's own
@@ -243,6 +247,8 @@ class Settings(BaseSettings):
     gemini_output_cost_per_million: float = Field(default=0.30, alias="GEMINI_OUTPUT_COST_PER_MILLION")
     groq_input_cost_per_million: float = Field(default=0.59, alias="GROQ_INPUT_COST_PER_MILLION")
     groq_output_cost_per_million: float = Field(default=0.79, alias="GROQ_OUTPUT_COST_PER_MILLION")
+    anthropic_input_cost_per_million: float = Field(default=3.0, alias="ANTHROPIC_INPUT_COST_PER_MILLION")
+    anthropic_output_cost_per_million: float = Field(default=15.0, alias="ANTHROPIC_OUTPUT_COST_PER_MILLION")
     jwt_secret_key: str = Field(default="change-me-in-prod", alias="JWT_SECRET_KEY")
     jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
     jwt_access_token_minutes: int = Field(default=30, alias="JWT_ACCESS_TOKEN_MINUTES")

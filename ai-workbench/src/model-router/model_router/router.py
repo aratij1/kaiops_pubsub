@@ -378,6 +378,82 @@ class GroqModelProvider(ModelProvider):
 
 
 @dataclass
+class AnthropicModelProvider(ModelProvider):
+    """Anthropic Messages API. Distinct from the OpenAI-compatible providers:
+    auth header is x-api-key (not Bearer), a required anthropic-version
+    header, and the system prompt is a top-level "system" field rather than
+    a message in the messages array."""
+
+    model: str = "claude-sonnet-4-6"
+    api_key: str | None = None
+    base_url: str = "https://api.anthropic.com/v1"
+    anthropic_version: str = "2023-06-01"
+    max_tokens: int = 1024
+    timeout_seconds: float = 45.0
+    input_cost_per_million: float = 0.0
+    output_cost_per_million: float = 0.0
+
+    async def generate(self, prompt: str, payload: dict[str, Any]) -> ModelResponse:
+        self._ensure_available()
+        if not self.api_key:
+            self.breaker.record_failure()
+            raise RuntimeError(f"{self.name} unavailable: ANTHROPIC_API_KEY is not configured")
+
+        prompt_text = render_task_payload_prompt(prompt, payload)
+        request_payload = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "system": SYSTEM_PROMPT_SRE,
+            "messages": [
+                {"role": "user", "content": prompt_text},
+            ],
+        }
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": self.anthropic_version,
+            "content-type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.post(
+                    f"{self.base_url.rstrip('/')}/messages",
+                    headers=headers,
+                    json=request_payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPStatusError as exc:
+            self.breaker.record_failure()
+            raise RuntimeError(provider_error_message(self.name, self.model, exc.response)) from exc
+        except Exception:
+            self.breaker.record_failure()
+            raise
+
+        self.breaker.record_success()
+        content_text = self._extract_text(data)
+        if not content_text:
+            raise RuntimeError(f"{self.name} returned no text")
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        model_usage = build_usage(
+            provider=self.name,
+            model=str(data.get("model") or self.model),
+            input_tokens=int(usage.get("input_tokens", estimate_tokens(prompt_text))),
+            output_tokens=int(usage.get("output_tokens", estimate_tokens(content_text))),
+            input_cost_per_million=self.input_cost_per_million,
+            output_cost_per_million=self.output_cost_per_million,
+            estimated=not bool(usage),
+        )
+        return ModelResponse(content=content_text, usage=model_usage)
+
+    def _extract_text(self, data: dict[str, Any]) -> str:
+        content = data.get("content") if isinstance(data.get("content"), list) else []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                return str(block.get("text"))
+        return ""
+
+
+@dataclass
 class GeminiModelProvider(ModelProvider):
     model: str = "gemini-2.5-flash"
     api_key: str | None = None
@@ -890,9 +966,15 @@ def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
             input_cost_per_million=settings.openai_gpt4o_input_cost_per_million,
             output_cost_per_million=settings.openai_gpt4o_output_cost_per_million,
         ),
-        "claude": UnconfiguredModelProvider(
+        "claude": AnthropicModelProvider(
             name="claude",
-            reason="set ANTHROPIC_API_KEY and add a Claude provider implementation",
+            model=settings.anthropic_model,
+            api_key=settings.anthropic_api_key,
+            base_url=settings.anthropic_base_url,
+            anthropic_version=settings.anthropic_version,
+            timeout_seconds=settings.llm_request_timeout_seconds,
+            input_cost_per_million=settings.anthropic_input_cost_per_million,
+            output_cost_per_million=settings.anthropic_output_cost_per_million,
         ),
         "gemini": GeminiModelProvider(
             name="gemini",

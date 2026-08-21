@@ -41,3 +41,4 @@ backend/rag/changes/**
 backend/rag/dependencies/*.md
 backend/rag/incidents/*-rule-onboarding.md
 backend/rag/runbooks/*-rule-runbook.md
+.env*

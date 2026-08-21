@@ -9,10 +9,13 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
 
 from api_gateway.copilot import (
     classify_intent,
+    compose_approval_status_answer,
     compose_assignment_answer,
     compose_capacity_answer,
     compose_forbidden_onboarding_answer,
+    compose_incident_summary_answer,
     compose_onboarding_answer,
+    compose_rca_answer,
     compose_unsupported_answer,
     extract_incident_id,
 )
@@ -66,6 +69,16 @@ def build_control_router(
         )
         rows = response.get("rows", []) if isinstance(response, dict) else []
         return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    async def fetch_object(path: str, target: str, trace_id: str) -> dict[str, Any] | None:
+        _, response = await raw_proxy(
+            method="GET",
+            path=path,
+            target_base=target,
+            payload={},
+            trace_id=trace_id,
+        )
+        return response if isinstance(response, dict) else None
 
     @router.post("/model/route")
     async def model_route(
@@ -272,6 +285,36 @@ def build_control_router(
                 result = compose_assignment_answer(
                     await fetch_rows("/assignments", settings.approval_service_url, trace_id),
                     extract_incident_id(query),
+                )
+            elif intent == "rca":
+                incident_id = extract_incident_id(query)
+                was_auto_selected = False
+                if not incident_id:
+                    candidates = await fetch_rows(
+                        "/incidents/lowest-confidence-recommendations",
+                        settings.monitoring_adapter_url,
+                        trace_id,
+                    )
+                    if candidates:
+                        incident_id = str(candidates[0].get("incident_id") or "") or None
+                        was_auto_selected = True
+                incident = (
+                    await fetch_object(f"/incident/{incident_id}", settings.approval_service_url, trace_id)
+                    if incident_id
+                    else None
+                )
+                result = compose_rca_answer(incident, incident_id, was_auto_selected=was_auto_selected)
+            elif intent == "approval_status":
+                incident_id = extract_incident_id(query)
+                incident = (
+                    await fetch_object(f"/incident/{incident_id}", settings.approval_service_url, trace_id)
+                    if incident_id
+                    else None
+                )
+                result = compose_approval_status_answer(incident, incident_id)
+            elif intent == "incident_summary":
+                result = compose_incident_summary_answer(
+                    await fetch_rows("/incidents/metadata", settings.monitoring_adapter_url, trace_id)
                 )
             else:
                 result = compose_unsupported_answer(query)

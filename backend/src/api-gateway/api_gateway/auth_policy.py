@@ -18,6 +18,14 @@ AUTHENTICATED_WRITE_RULES: tuple[tuple[set[str] | None, str, set[str] | None], .
     ({"POST", "PUT", "DELETE", "PATCH"}, "/model", {ADMIN_ROLE}),
     ({"POST", "PUT", "DELETE", "PATCH"}, "/approval", None),
     ({"POST"}, "/copilot", None),
+    # Any authenticated role -- incident/closure data is read broadly across
+    # the Overview, Live Stream, Alerts & Incidents, and Dashboard views by
+    # every operator role (including L1), not just governance-facing roles.
+    ({"GET"}, "/incidents", None),
+    # Administrator/L2/L3 only -- gateway trace and safety-decision data
+    # backs Agent Flow and Gateway Safety, which are engineering-role-only
+    # in the UI navigation (see frontend ENGINEERING_ROLES).
+    ({"GET"}, "/observability", DOCUMENT_PROVIDER_ROLES),
 )
 
 
