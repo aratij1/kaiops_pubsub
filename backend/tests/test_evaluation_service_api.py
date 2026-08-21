@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -36,6 +37,23 @@ def test_summary_route_registered_before_parameterized_id_route() -> None:
         if getattr(route, "path", "").startswith("/evaluations")
     ]
     assert paths.index("/evaluations/summary") < paths.index("/evaluations/{evaluation_id}")
+    assert paths.index("/evaluations/autonomy/assess") < paths.index("/evaluations/{evaluation_id}")
+
+
+@pytest.mark.asyncio
+async def test_autonomy_assessment_is_read_only_and_stops_at_hitl(eval_client: httpx.AsyncClient) -> None:
+    response = await eval_client.post("/evaluations/autonomy/assess", json={
+        "tenant_id": "tenant-a", "service": "payments-api", "action_type": "restart_service",
+        "current_tier": "HITL", "reviewed_attempts": 30, "successful_attempts": 30,
+        "rollback_attempts": 0, "operator_corrections": 0, "critical_failures": 0,
+        "calibration_samples": [{"confidence": 1.0, "correct": True} for _ in range(30)],
+        "approved_runbook": True, "rollback_tested": True,
+        "credential_scope_verified": True, "blast_radius_verified": True,
+    })
+
+    assert response.status_code == 200
+    assert response.json()["disposition"] == "HOLD"
+    assert response.json()["recommended_tier"] == "HITL"
 
 
 @pytest.mark.asyncio
@@ -82,6 +100,59 @@ async def test_create_evaluation_accepts_non_deterministic_report_shape(eval_cli
         },
     )
     assert response.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_create_evaluation_persists_typed_memory_trace_and_outcome(eval_client: httpx.AsyncClient) -> None:
+    incident_id = str(uuid4())
+    now = datetime.now(UTC)
+    response = await eval_client.post("/evaluations", json={
+        "report": {"overall_score": 0.96}, "agent": "resolution-agent", "incident_id": incident_id,
+        "outcome_label": "RECOVERED",
+        "incident_memory": {
+            "tenant_id": "tenant-a", "incident_id": incident_id, "service": "payments-api",
+            "environment": "prod", "issue_signature": "sig-1", "root_cause": "Pool exhaustion",
+            "resolution_option_id": "restart", "execution_id": str(uuid4()), "outcome": "RECOVERED",
+            "validation_evidence_ids": ["validation:1"], "rollback_disposition": "NOT_REQUIRED",
+            "operator_reviewed": True,
+        },
+        "agent_trace": {
+            "trace_id": "trace-1", "tenant_id": "tenant-a", "incident_id": incident_id,
+            "agent": "resolution-agent", "started_at": now.isoformat(), "completed_at": now.isoformat(),
+            "tool_calls": 4, "outcome": "completed",
+        },
+    })
+
+    assert response.status_code == 201
+    record = await eval_client.get(f"/evaluations/{response.json()['id']}")
+    assert record.json()["report"]["outcome_label"] == "RECOVERED"
+    assert record.json()["report"]["incident_memory"]["operator_reviewed"] is True
+    assert record.json()["report"]["agent_trace"]["tool_calls"] == 4
+
+
+@pytest.mark.asyncio
+async def test_create_evaluation_persists_non_executing_differentiator_artifacts(eval_client: httpx.AsyncClient) -> None:
+    incident_id = str(uuid4())
+    response = await eval_client.post("/evaluations", json={
+        "report": {"overall_score": 0.9}, "agent": "resolution-agent", "incident_id": incident_id,
+        "code_patch_proposals": [{
+            "tenant_id": "tenant-a", "incident_id": incident_id, "repository_id": "payments",
+            "base_revision": "abc123", "source_uri": "repo://payments/app.py", "title": "Bound the pool",
+            "explanation": "Evidence-backed review proposal", "unified_diff": "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+new",
+            "supporting_code_evidence_ids": ["CODE-1"], "test_plan": ["Run pool tests"],
+        }],
+        "preventive_recommendations": [{
+            "tenant_id": "tenant-a", "service": "payments-api", "risk_signal": "Pool pressure rising",
+            "forecast_window_seconds": 3600, "confidence": 0.8, "evidence_ids": ["METRIC-1", "METRIC-2"],
+            "recommended_review": "Review capacity before the forecast window.",
+        }],
+    })
+
+    assert response.status_code == 201
+    record = await eval_client.get(f"/evaluations/{response.json()['id']}")
+    report = record.json()["report"]
+    assert report["code_patch_proposals"][0]["executable"] is False
+    assert report["preventive_recommendations"][0]["execution_authorized"] is False
 
 
 @pytest.mark.asyncio

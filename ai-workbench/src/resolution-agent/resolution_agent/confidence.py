@@ -5,15 +5,17 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class ConfidenceInputs:
-    evidence_completeness: float
+    evidence_quality: float
+    evidence_consistency: float
+    causal_strength: float
     independent_source_corroboration: float
     temporal_alignment: float
-    topology_support: float
-    change_correlation: float
-    approved_runbook_applicability: float
-    historical_success_rate: float
+    topology_alignment: float
+    historical_similarity: float
+    successful_test_ratio: float
     contradiction_penalty: float = 0.0
     freshness_penalty: float = 0.0
+    missing_data_penalty: float = 0.0
     sources_unavailable: bool = False
     stale_evidence: bool = False
     model_fallback: bool = False
@@ -40,17 +42,19 @@ def score_confidence(inputs: ConfidenceInputs) -> ConfidenceResult:
     """Calculate confidence from evidence facts, never model self-assessment."""
 
     components = {
-        "evidence_completeness": 0.25 * _unit(inputs.evidence_completeness),
-        "independent_source_corroboration": 0.20 * _unit(inputs.independent_source_corroboration),
+        "evidence_quality": 0.18 * _unit(inputs.evidence_quality),
+        "evidence_consistency": 0.14 * _unit(inputs.evidence_consistency),
+        "causal_strength": 0.18 * _unit(inputs.causal_strength),
+        "independent_source_corroboration": 0.14 * _unit(inputs.independent_source_corroboration),
         "temporal_alignment": 0.15 * _unit(inputs.temporal_alignment),
-        "topology_support": 0.15 * _unit(inputs.topology_support),
-        "change_correlation": 0.10 * _unit(inputs.change_correlation),
-        "approved_runbook_applicability": 0.10 * _unit(inputs.approved_runbook_applicability),
-        "historical_success_rate": 0.05 * _unit(inputs.historical_success_rate),
+        "topology_alignment": 0.10 * _unit(inputs.topology_alignment),
+        "historical_similarity": 0.05 * _unit(inputs.historical_similarity),
+        "successful_test_ratio": 0.06 * _unit(inputs.successful_test_ratio),
     }
     penalties = {
         "contradictions": min(_unit(inputs.contradiction_penalty), 0.35),
         "freshness": min(_unit(inputs.freshness_penalty), 0.25),
+        "missing_data": min(_unit(inputs.missing_data_penalty), 0.30),
     }
     raw = max(0.0, min(sum(components.values()) - sum(penalties.values()), 1.0))
     ceilings: list[tuple[str, float]] = []

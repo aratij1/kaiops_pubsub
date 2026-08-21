@@ -9,6 +9,7 @@ from uuid import UUID, uuid5
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from common.tenant_identity import require_tenant_id
+from common.orchestration.safe_remediation import SafeRemediationBinding
 
 SCHEMA_VERSION = "kaims.execution-plan.v2"
 _PLAN_NAMESPACE = UUID("f863e8a9-0e87-47b0-8324-f6896a149683")
@@ -45,6 +46,7 @@ class PlanAction(BaseModel):
     reversible: bool = False
     blast_radius: str = "single-service"
     required_permissions: list[str] = Field(default_factory=list)
+    safety_binding: SafeRemediationBinding | None = None
 
     @field_validator("action_id", "connector_id", "target_resource_id", "expected_outcome")
     @classmethod
@@ -187,6 +189,8 @@ class ExecutionPlanV2(BaseModel):
     def enforce_mutation_safety(self) -> ExecutionPlanV2:
         if self.execution_ready and not self.actions:
             raise ValueError("execution-ready mutation requires typed actions")
+        if self.execution_ready and any(action.safety_binding is None for action in self.actions):
+            raise ValueError("execution-ready mutation requires safe remediation bindings")
         if self.execution_ready and (not self.validation or not self.rollback):
             raise ValueError("execution-ready mutation requires validation and rollback")
         if self.execution_ready and self.approval_policy.decision != "hitl_required":

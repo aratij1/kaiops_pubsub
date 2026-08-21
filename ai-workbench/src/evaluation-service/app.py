@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 from common.config import get_settings
 from common.repository import EvaluationRepository
+from common.learning_contracts import AgentOpsTrace, IncidentMemoryRecord, PromotionEvidence, assess_autonomy_promotion
+from common.differentiator_contracts import (
+    CodePatchProposal,
+    EvidenceCouncilDecision,
+    PreventiveRecommendation,
+    TemporalServiceGraph,
+)
 from common.service import create_app
+from common.models import utc_now
 from fastapi import Body, HTTPException
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 settings = get_settings()
 settings.service_name = "evaluation-service"
@@ -16,12 +25,22 @@ app = create_app(title="KaiMS Evaluation Service", settings=settings)
 
 class EvaluationCreateRequest(BaseModel):
     report: dict[str, Any]
+    tenant_id: str = "default"
+    retention_days: int = Field(default=90, ge=7, le=2555)
+    artifact_signature: str | None = None
     agent: str
     incident_id: str | None = None
     recommendation_id: str | None = None
     model_provider: str | None = None
     model_name: str | None = None
     evaluation_id: str | None = None
+    outcome_label: str | None = None
+    incident_memory: IncidentMemoryRecord | None = None
+    agent_trace: AgentOpsTrace | None = None
+    code_patch_proposals: list[CodePatchProposal] = Field(default_factory=list)
+    temporal_service_graph: TemporalServiceGraph | None = None
+    evidence_council: EvidenceCouncilDecision | None = None
+    preventive_recommendations: list[PreventiveRecommendation] = Field(default_factory=list)
 
 
 class EvaluationFeedbackRequest(BaseModel):
@@ -38,6 +57,11 @@ class EvaluationFeedbackRequest(BaseModel):
         if decision in {"incorrect", "incomplete"} and not str(self.reason_category or "").strip():
             raise ValueError("reason_category is required when feedback is incorrect or incomplete")
         return self
+
+
+class RetentionSweepRequest(BaseModel):
+    tenant_id: str
+    limit: int = Field(default=100, ge=1, le=1000)
 
 
 def _require_storage() -> None:
@@ -61,14 +85,32 @@ async def create_evaluation(payload: EvaluationCreateRequest = Body(...)) -> dic
     try:
         async with app.state.session_factory() as session:
             repo = EvaluationRepository(session)
+            enriched_report = dict(payload.report)
+            if payload.outcome_label is not None:
+                enriched_report["outcome_label"] = payload.outcome_label
+            if payload.incident_memory is not None:
+                enriched_report["incident_memory"] = payload.incident_memory.model_dump(mode="json")
+            if payload.agent_trace is not None:
+                enriched_report["agent_trace"] = payload.agent_trace.model_dump(mode="json")
+            if payload.code_patch_proposals:
+                enriched_report["code_patch_proposals"] = [item.model_dump(mode="json") for item in payload.code_patch_proposals]
+            if payload.temporal_service_graph is not None:
+                enriched_report["temporal_service_graph"] = payload.temporal_service_graph.model_dump(mode="json")
+            if payload.evidence_council is not None:
+                enriched_report["evidence_council"] = payload.evidence_council.model_dump(mode="json")
+            if payload.preventive_recommendations:
+                enriched_report["preventive_recommendations"] = [item.model_dump(mode="json") for item in payload.preventive_recommendations]
             evaluation_id = await repo.save_evaluation(
-                report=payload.report,
+                report=enriched_report,
                 agent=payload.agent,
                 incident_id=payload.incident_id,
                 recommendation_id=payload.recommendation_id,
                 model_provider=payload.model_provider,
                 model_name=payload.model_name,
                 evaluation_id=payload.evaluation_id,
+                tenant_id=payload.tenant_id,
+                expires_at=utc_now() + timedelta(days=payload.retention_days),
+                artifact_signature=payload.artifact_signature,
             )
             await session.commit()
     except ValueError as exc:
@@ -85,13 +127,37 @@ async def summarize_evaluations(agent: str | None = None, limit: int = 1000) -> 
         return await repo.summarize_evaluations(agent=agent, limit=limit)
 
 
-@app.get("/evaluations/{evaluation_id}")
-async def get_evaluation(evaluation_id: str) -> dict[str, Any]:
+@app.post("/evaluations/autonomy/assess")
+async def assess_autonomy(payload: PromotionEvidence = Body(...)) -> dict[str, Any]:
+    """Return an evidence-based recommendation; never mutates autonomy policy."""
+    return assess_autonomy_promotion(payload).model_dump(mode="json")
+
+
+@app.post("/evaluations/retention/sweep")
+async def sweep_expired_evaluations(payload: RetentionSweepRequest = Body(...)) -> dict[str, Any]:
+    """Delete one bounded tenant slice; the repository preserves an audit tombstone per row."""
     _require_storage()
     try:
         async with app.state.session_factory() as session:
             repo = EvaluationRepository(session)
-            record = await repo.get_evaluation(evaluation_id)
+            purged_ids = await repo.purge_expired_evaluations(
+                tenant_id=payload.tenant_id,
+                now=utc_now(),
+                limit=payload.limit,
+            )
+            await session.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"purged_ids": purged_ids, "count": len(purged_ids)}
+
+
+@app.get("/evaluations/{evaluation_id}")
+async def get_evaluation(evaluation_id: str, tenant_id: str = "default") -> dict[str, Any]:
+    _require_storage()
+    try:
+        async with app.state.session_factory() as session:
+            repo = EvaluationRepository(session)
+            record = await repo.get_evaluation(evaluation_id, tenant_id=tenant_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if record is None:
@@ -136,6 +202,7 @@ async def list_evaluations(
     agent: str | None = None,
     min_score: float | None = None,
     limit: int = 100,
+    tenant_id: str = "default",
 ) -> dict[str, Any]:
     _require_storage()
     try:
@@ -146,6 +213,7 @@ async def list_evaluations(
                 agent=agent,
                 min_score=min_score,
                 limit=limit,
+                tenant_id=tenant_id,
             )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

@@ -10,6 +10,7 @@ from uuid import NAMESPACE_URL, uuid5
 from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.models import RemediationAction, RemediationStatus, ResolutionReport
 from common.orchestration.execution_plan_contract import ValidatorSpec, canonical_plan_fingerprint, verify_plan_fingerprint
+from common.orchestration.outcome_validation import ValidationObservation, decide_outcome_validation
 from common.resolution_lifecycle import LifecycleActor, ResolutionState, extract_lifecycle, transition_lifecycle
 
 
@@ -191,19 +192,21 @@ class ClosureValidationAgent(BaseAgent):
             for item in supplied_observations:
                 if not isinstance(item, dict) or str(item.get("validator_id") or "") != validator.validator_id:
                     continue
-                if (
-                    str(item.get("connector_id") or "") != validator.connector_id
-                    or str(item.get("target_resource_id") or "") != validator.target_resource_id
-                    or not str(item.get("result_checksum") or "").startswith("sha256:")
-                ):
-                    continue
                 try:
-                    timestamp = datetime.fromisoformat(str(item.get("observed_at") or "").replace("Z", "+00:00"))
-                    if timestamp.tzinfo is None:
-                        continue
+                    observation = ValidationObservation.model_validate(item)
                 except ValueError:
                     continue
-                samples.append((timestamp.astimezone(timezone.utc), item))
+                if (
+                    str(observation.execution_id) != str(action.id)
+                    or observation.plan_fingerprint != str(execution_plan.get("plan_fingerprint") or "")
+                    or observation.connector_id != validator.connector_id
+                    or observation.target_resource_id != validator.target_resource_id
+                ):
+                    continue
+                timestamp = observation.observed_at
+                if timestamp.tzinfo is None or timestamp.astimezone(timezone.utc) > observed_at:
+                    continue
+                samples.append((timestamp.astimezone(timezone.utc), observation.model_dump(mode="json")))
             samples.sort(key=lambda row: row[0])
             passed = len(samples) >= validator.minimum_sample_count and all(item.get("passed") is True for _, item in samples)
             required_window = max(stability_required, validator.observation_window_seconds)
@@ -255,6 +258,29 @@ class ClosureValidationAgent(BaseAgent):
             and validation["independent_checks_passed"]
             and validation["all_recovery_checks_passed"]
         )
+        rollback_action = next(
+            (
+                str(item.get("rollback_action"))
+                for item in execution_plan.get("actions", [])
+                if isinstance(item, dict) and str(item.get("rollback_action") or "").strip()
+            ),
+            None,
+        )
+        outcome_decision = decide_outcome_validation(
+            execution_id=action.id,
+            incident_id=action.incident_id,
+            plan_fingerprint=str(execution_plan.get("plan_fingerprint") or ""),
+            target_resource_id=action.target,
+            execution_succeeded=validation["remediation_succeeded"],
+            integrity_preserved=validation["approved_plan_fingerprint_preserved"],
+            checks=recovery_checks,
+            independent_checks_passed=independent_checks_passed,
+            stability_passed=stability_passed,
+            stability_window_seconds=stability_required,
+            observation_ids=[str(item.get("result_checksum")) for item in observations],
+            rollback_action=rollback_action,
+        )
+        restored = restored and outcome_decision.closure_authorized
         lifecycle = extract_lifecycle(action.parameters, action.metadata)
         # Closure never reclassifies an executor failure. The remediation
         # service owns that attempt outcome and the event handler will not
@@ -300,6 +326,7 @@ class ClosureValidationAgent(BaseAgent):
                 "Require an explicit health endpoint or governed recovery query before closure.",
             ],
             metadata={
+                "outcome_validation": outcome_decision.model_dump(mode="json"),
                 "independent_validation_observations": observations,
                 "stability_window": {
                     "required_seconds": stability_required,

@@ -21,6 +21,13 @@ from common.orchestration.execution_plan_contract import (
     deterministic_plan_id,
     utc_now,
 )
+from common.orchestration.safe_remediation import (
+    BlastRadiusAssessment,
+    CapabilitySpec,
+    CredentialReference,
+    PreflightEvidence,
+    SafeRemediationBinding,
+)
 
 
 _VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -234,6 +241,65 @@ def _bind_command(template: str, variables: dict[str, str]) -> tuple[str, list[s
 
 def _looks_executable(command: str) -> bool:
     return command.strip().lower().startswith(_EXECUTABLE_PREFIXES)
+
+
+def _safe_remediation_binding(
+    *,
+    tenant_id: str,
+    connector: dict[str, Any],
+    operation: str,
+    target_resource_id: str,
+    service: str,
+    preflight_commands: list[str],
+    evidence_ids: list[str],
+    reversible: bool,
+) -> SafeRemediationBinding:
+    connector_id = str(connector.get("connector_id") or "").strip()
+    credential_ref = str(connector.get("credential_ref") or connector.get("secret_ref") or "").strip()
+    capability_id = f"{connector_id}:{operation}"
+    capability = CapabilitySpec(
+        capability_id=capability_id,
+        connector_id=connector_id,
+        operation=operation,
+        allowed_resource_ids=[target_resource_id],
+        required_permissions=[operation],
+        mutating=True,
+        reversible=reversible,
+        dry_run_supported=True,
+    )
+    credential = CredentialReference(
+        reference=credential_ref,
+        tenant_id=tenant_id,
+        connector_id=connector_id,
+        resource_ids=[target_resource_id],
+    )
+    blast_radius = BlastRadiusAssessment(
+        target_resource_id=target_resource_id,
+        scope="single-service",
+        affected_resource_ids=[target_resource_id],
+        affected_services=[service],
+        evidence_ids=evidence_ids,
+        verified=True,
+        unknown_dependencies=False,
+    )
+    preflight = PreflightEvidence(
+        status="PLANNED",
+        capability_id=capability_id,
+        target_resource_id=target_resource_id,
+        check_references=[
+            f"catalog-check:{sha256(command.encode()).hexdigest()}"
+            for command in preflight_commands
+            if command.strip()
+        ],
+        dry_run_required=True,
+        credential_reference=credential_ref,
+    )
+    return SafeRemediationBinding(
+        capability=capability,
+        credential=credential,
+        blast_radius=blast_radius,
+        preflight=preflight,
+    )
 
 
 def _typed_validator_specs(
@@ -478,6 +544,17 @@ def resolve_execution_plan(
             )
     if mutating and not phase_commands["rollback"]:
         readiness_blocks.append("mutating plan has no executable rollback")
+    credential_ref = str(connector.get("credential_ref") or connector.get("secret_ref") or "").strip()
+    if mutating:
+        try:
+            CredentialReference(
+                reference=credential_ref,
+                tenant_id=str(getattr(alert, "tenant_id", "") or "").strip(),
+                connector_id=str(connector.get("connector_id") or "").strip(),
+                resource_ids=[execution_service],
+            )
+        except ValueError:
+            readiness_blocks.append("approved resource-scoped credential reference is missing")
     diagnostic_only = not mutating
     execution_ready = mutating and not readiness_blocks
     tenant_id = str(getattr(alert, "tenant_id", "") or "").strip()
@@ -508,6 +585,16 @@ def resolve_execution_plan(
             rollback_action=(phase_commands["rollback"][0] if phase_commands["rollback"] else None),
             reversible=bool(phase_commands["rollback"]),
             required_permissions=[str(command.get("operation") or "")],
+            safety_binding=_safe_remediation_binding(
+                tenant_id=tenant_id,
+                connector=connector,
+                operation=str(command.get("operation") or ""),
+                target_resource_id=execution_service,
+                service=str(alert.service or "").strip(),
+                preflight_commands=phase_commands["diagnostic"],
+                evidence_ids=sorted({str(item) for item in (evidence_basis or []) if str(item).strip()}),
+                reversible=bool(phase_commands["rollback"]),
+            ),
         )
         for step in resolved_steps
         if str(step.get("type") or "").strip().lower() == "remediation"

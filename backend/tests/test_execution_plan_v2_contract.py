@@ -50,6 +50,12 @@ def test_execution_plan_v2_has_one_normalized_top_level_contract() -> None:
     assert plan["commands"]
     assert plan["validation_commands"]
     assert plan["rollback_commands"]
+    assert all(action["safety_binding"] for action in plan["actions"])
+    binding = plan["actions"][0]["safety_binding"]
+    assert binding["capability"]["registered"] is True
+    assert binding["credential"]["reference"].startswith(("vault://", "https://"))
+    assert binding["blast_radius"]["verified"] is True
+    assert binding["preflight"]["status"] == "PLANNED"
 
 
 def test_unapproved_runbook_cannot_create_a_mutating_plan(monkeypatch) -> None:

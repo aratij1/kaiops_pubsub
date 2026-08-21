@@ -161,6 +161,8 @@ def test_closure_requires_exact_plan_all_independent_checks_and_real_stability(m
     action.parameters["validation_observations"] = [
         {
             "validator_id": f"validator-{kind}",
+            "execution_id": str(action.id),
+            "plan_fingerprint": action.parameters["execution_plan"]["plan_fingerprint"],
             "connector_id": "fake-observer",
             "target_resource_id": "payments-api",
             "observed_at": (now - timedelta(seconds=offset)).isoformat(),
@@ -179,6 +181,9 @@ def test_closure_requires_exact_plan_all_independent_checks_and_real_stability(m
     assert report.validation["all_recovery_checks_passed"] is True
     assert report.health_restored is True
     assert report.alerts_cleared is True
+    assert report.metadata["outcome_validation"]["outcome"] == "RECOVERED"
+    assert report.metadata["outcome_validation"]["closure_authorized"] is True
+    assert report.metadata["outcome_validation"]["rollback"]["disposition"] == "NOT_REQUIRED"
     assert len(report.metadata["independent_validation_observations"]) == len(endpoint_kinds) * 2
 
 
@@ -189,6 +194,8 @@ def test_incomplete_stability_window_remains_pending() -> None:
     action.parameters["validation_observations"] = [
         {
             "validator_id": validator["validator_id"],
+            "execution_id": str(action.id),
+            "plan_fingerprint": action.parameters["execution_plan"]["plan_fingerprint"],
             "connector_id": validator["connector_id"],
             "target_resource_id": validator["target_resource_id"],
             "observed_at": (now - timedelta(seconds=offset)).isoformat(),
@@ -203,6 +210,33 @@ def test_incomplete_stability_window_remains_pending() -> None:
 
     assert report.health_restored is False
     assert report.metadata["stability_window"]["status"] == "pending"
+    assert report.metadata["outcome_validation"]["outcome"] == "PENDING_STABILITY"
+
+
+def test_observations_from_another_execution_cannot_close_incident() -> None:
+    plan = _plan(stability_seconds=60)
+    action = _action(plan=plan, completed_seconds_ago=90)
+    now = datetime.now(UTC)
+    action.parameters["validation_observations"] = [
+        {
+            "validator_id": validator["validator_id"],
+            "execution_id": str(uuid4()),
+            "plan_fingerprint": plan["plan_fingerprint"],
+            "connector_id": validator["connector_id"],
+            "target_resource_id": validator["target_resource_id"],
+            "observed_at": (now - timedelta(seconds=offset)).isoformat(),
+            "passed": True,
+            "result_checksum": f"sha256:{'c' * 64}",
+        }
+        for validator in plan["validators"]
+        for offset in (65, 0)
+    ]
+
+    report = asyncio.run(ClosureValidationAgent().validate(action))
+
+    assert report.health_restored is False
+    assert report.metadata["independent_validation_observations"] == []
+    assert report.metadata["outcome_validation"]["closure_authorized"] is False
 
 
 def test_replayed_action_produces_the_same_resolution_report_identity() -> None:

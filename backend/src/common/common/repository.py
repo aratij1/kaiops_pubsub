@@ -25,6 +25,7 @@ from common.database import (
     ApplicationRecord,
     ApprovalRecord,
     AuditLogRecord,
+    DraftPullRequestOutboxRecord,
     EvaluationRecord,
     GrafanaDashboardRecord,
     IncidentEventRecord,
@@ -2999,6 +3000,9 @@ class IncidentRepository:
         return {
             "id": str(row.id),
             "tenant_id": row.tenant_id,
+            "expires_at": row.expires_at,
+            "artifact_signature": row.artifact_signature,
+            "tenant_id": row.tenant_id,
             "project_name": row.project_name,
             "provider": row.provider,
             "status": row.status,
@@ -4514,6 +4518,126 @@ class IncidentRepository:
         return response_rows
 
 
+class DraftPullRequestOutboxRepository:
+    """Persistence boundary for bounded draft-PR delivery and reconciliation."""
+
+    TERMINAL_STATUSES = frozenset({"completed", "dead_letter"})
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def enqueue(
+        self,
+        *,
+        idempotency_key: str,
+        tenant_id: str,
+        proposal_id: UUID | str,
+        request_payload: dict[str, Any],
+        max_attempts: int = 3,
+    ) -> tuple[str, bool]:
+        normalized_key = str(idempotency_key).strip()
+        normalized_tenant = require_tenant_id(tenant_id, source="draft PR outbox")
+        if not normalized_key:
+            raise ValueError("draft PR idempotency_key is required")
+        existing = await self.session.scalar(
+            select(DraftPullRequestOutboxRecord).where(
+                DraftPullRequestOutboxRecord.idempotency_key == normalized_key
+            ).limit(1)
+        )
+        if existing is not None:
+            if existing.tenant_id != normalized_tenant or str(existing.proposal_id) != str(proposal_id):
+                raise ValueError("draft PR idempotency key is already bound to another request")
+            return str(existing.job_id), False
+        job_id = uuid4()
+        self.session.add(
+            DraftPullRequestOutboxRecord(
+                job_id=job_id,
+                idempotency_key=normalized_key,
+                tenant_id=normalized_tenant,
+                proposal_id=UUID(str(proposal_id)),
+                request_payload=request_payload,
+                status="pending",
+                attempts=0,
+                max_attempts=max(1, min(int(max_attempts), 5)),
+                next_attempt_at=utc_now(),
+            )
+        )
+        return str(job_id), True
+
+    async def list_due(self, *, now: datetime | None = None, limit: int = 25) -> list[DraftPullRequestOutboxRecord]:
+        result = await self.session.execute(
+            select(DraftPullRequestOutboxRecord).where(
+                DraftPullRequestOutboxRecord.status.in_(("pending", "retry")),
+                DraftPullRequestOutboxRecord.next_attempt_at <= (now or utc_now()),
+            ).order_by(DraftPullRequestOutboxRecord.created_at.asc()).limit(max(1, min(int(limit), 100)))
+        )
+        return list(result.scalars().all())
+
+    async def mark_completed(self, job_id: UUID | str, *, provider_response: dict[str, Any]) -> None:
+        row = await self.session.get(DraftPullRequestOutboxRecord, UUID(str(job_id)))
+        if row is None or row.status in self.TERMINAL_STATUSES:
+            return
+        row.status = "completed"
+        row.attempts = int(row.attempts or 0) + 1
+        row.provider_response = provider_response
+        row.last_error = None
+        row.completed_at = utc_now()
+        self.session.add(AuditLogRecord(
+            tenant_id=row.tenant_id,
+            actor="draft-pr-outbox-worker",
+            action="draft_pull_request.created",
+            resource_type="code_patch_proposal",
+            resource_id=str(row.proposal_id),
+            payload={
+                "job_id": str(row.job_id),
+                "provider_pull_request_id": provider_response.get("provider_pull_request_id"),
+                "url": provider_response.get("url"),
+                "state": provider_response.get("state"),
+                "attempts": row.attempts,
+            },
+        ))
+
+    async def mark_failed(self, job_id: UUID | str, *, error: str, now: datetime | None = None) -> str:
+        row = await self.session.get(DraftPullRequestOutboxRecord, UUID(str(job_id)))
+        if row is None:
+            raise ValueError("draft PR outbox job not found")
+        if row.status in self.TERMINAL_STATUSES:
+            return row.status
+        attempts = int(row.attempts or 0) + 1
+        row.attempts = attempts
+        row.last_error = str(error)[:2000]
+        if attempts >= int(row.max_attempts or 1):
+            row.status = "dead_letter"
+            action = "draft_pull_request.dead_lettered"
+        else:
+            row.status = "retry"
+            row.next_attempt_at = (now or utc_now()) + timedelta(seconds=min(300, 2 ** attempts))
+            action = "draft_pull_request.retry_scheduled"
+        self.session.add(AuditLogRecord(
+            tenant_id=row.tenant_id,
+            actor="draft-pr-outbox-worker",
+            action=action,
+            resource_type="code_patch_proposal",
+            resource_id=str(row.proposal_id),
+            payload={"job_id": str(row.job_id), "attempts": attempts, "max_attempts": row.max_attempts},
+        ))
+        return row.status
+
+    async def get_by_idempotency_key(self, idempotency_key: str, *, tenant_id: str) -> dict[str, Any] | None:
+        row = await self.session.scalar(select(DraftPullRequestOutboxRecord).where(
+            DraftPullRequestOutboxRecord.idempotency_key == str(idempotency_key).strip(),
+            DraftPullRequestOutboxRecord.tenant_id == require_tenant_id(tenant_id, source="draft PR reconciliation"),
+        ).limit(1))
+        if row is None:
+            return None
+        return {
+            "job_id": str(row.job_id), "proposal_id": str(row.proposal_id), "status": row.status,
+            "attempts": row.attempts, "max_attempts": row.max_attempts,
+            "provider_response": row.provider_response, "last_error": row.last_error,
+            "completed_at": row.completed_at,
+        }
+
+
 class EvaluationRepository:
     """Persistence for AI Workbench evaluation reports.
 
@@ -4542,6 +4666,9 @@ class EvaluationRepository:
     def _row_to_dict(row: EvaluationRecord) -> dict[str, Any]:
         return {
             "id": str(row.id),
+            "tenant_id": row.tenant_id,
+            "expires_at": row.expires_at,
+            "artifact_signature": row.artifact_signature,
             "incident_id": str(row.incident_id) if row.incident_id else None,
             "recommendation_id": str(row.recommendation_id) if row.recommendation_id else None,
             "agent": row.agent,
@@ -4566,11 +4693,17 @@ class EvaluationRepository:
         model_provider: str | None = None,
         model_name: str | None = None,
         evaluation_id: UUID | str | None = None,
+        tenant_id: str = "default",
+        expires_at: datetime | None = None,
+        artifact_signature: str | None = None,
     ) -> str:
         record_id = self._to_uuid(evaluation_id) or uuid4()
         await self.session.merge(
             EvaluationRecord(
                 id=record_id,
+                tenant_id=self._require("tenant_id", tenant_id),
+                expires_at=expires_at,
+                artifact_signature=artifact_signature,
                 incident_id=self._to_uuid(incident_id),
                 recommendation_id=self._to_uuid(recommendation_id),
                 agent=self._require("agent", agent),
@@ -4584,9 +4717,12 @@ class EvaluationRepository:
         )
         return str(record_id)
 
-    async def get_evaluation(self, evaluation_id: UUID | str) -> dict[str, Any] | None:
+    async def get_evaluation(self, evaluation_id: UUID | str, *, tenant_id: str = "default") -> dict[str, Any] | None:
         result = await self.session.execute(
-            select(EvaluationRecord).where(EvaluationRecord.id == self._to_uuid(evaluation_id))
+            select(EvaluationRecord).where(
+                EvaluationRecord.id == self._to_uuid(evaluation_id),
+                EvaluationRecord.tenant_id == self._require("tenant_id", tenant_id),
+            )
         )
         row = result.scalar_one_or_none()
         return self._row_to_dict(row) if row is not None else None
@@ -4598,9 +4734,10 @@ class EvaluationRepository:
         agent: str | None = None,
         min_score: float | None = None,
         limit: int = 100,
+        tenant_id: str = "default",
     ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 1000))
-        stmt = select(EvaluationRecord)
+        stmt = select(EvaluationRecord).where(EvaluationRecord.tenant_id == self._require("tenant_id", tenant_id))
         if incident_id:
             stmt = stmt.where(EvaluationRecord.incident_id == self._to_uuid(incident_id))
         if agent:
@@ -4610,6 +4747,46 @@ class EvaluationRepository:
         stmt = stmt.order_by(EvaluationRecord.created_at.desc()).limit(safe_limit)
         result = await self.session.execute(stmt)
         return [self._row_to_dict(row) for row in result.scalars().all()]
+
+    async def purge_expired_evaluations(
+        self,
+        *,
+        tenant_id: str,
+        now: datetime,
+        limit: int = 100,
+        actor: str = "evaluation-retention-sweeper",
+    ) -> list[str]:
+        """Delete a bounded tenant slice while retaining non-sensitive audit evidence."""
+        normalized_tenant = self._require("tenant_id", tenant_id)
+        safe_limit = max(1, min(int(limit), 1000))
+        result = await self.session.execute(
+            select(EvaluationRecord).where(
+                EvaluationRecord.tenant_id == normalized_tenant,
+                EvaluationRecord.expires_at.is_not(None),
+                EvaluationRecord.expires_at <= now,
+            ).order_by(EvaluationRecord.expires_at.asc()).limit(safe_limit)
+        )
+        rows = list(result.scalars().all())
+        for row in rows:
+            expired_at = row.expires_at
+            if expired_at is not None and expired_at.tzinfo is None:
+                expired_at = expired_at.replace(tzinfo=timezone.utc)
+            await self.session.delete(row)
+            self.session.add(
+                AuditLogRecord(
+                    tenant_id=normalized_tenant,
+                    actor=self._require("audit.actor", actor),
+                    action="evaluation.retention.expired",
+                    resource_type="evaluation",
+                    resource_id=str(row.id),
+                    payload={
+                        "expired_at": expired_at.isoformat() if expired_at else None,
+                        "had_artifact_signature": bool(row.artifact_signature),
+                    },
+                )
+            )
+        await self.session.flush()
+        return [str(row.id) for row in rows]
 
     async def summarize_evaluations(self, *, agent: str | None = None, limit: int = 1000) -> dict[str, Any]:
         safe_limit = max(1, min(int(limit), 5000))

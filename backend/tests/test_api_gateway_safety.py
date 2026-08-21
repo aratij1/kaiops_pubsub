@@ -46,6 +46,15 @@ def load_api_gateway_app_module():
     return module
 
 
+def test_gateway_exposes_guarded_evaluation_artifact_routes() -> None:
+    module = load_api_gateway_app_module()
+    routes = {(method, route.path) for route in module.app.routes for method in getattr(route, "methods", set())}
+    assert ("POST", "/evaluations") in routes
+    assert ("GET", "/evaluations") in routes
+    assert ("GET", "/evaluations/{evaluation_id}") in routes
+    assert ("POST", "/evaluations/autonomy/assess") in routes
+
+
 @pytest.mark.asyncio
 async def test_proxy_retries_post_after_connection_establishment_failure(monkeypatch) -> None:
     module = load_api_gateway_app_module()
