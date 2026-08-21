@@ -15,6 +15,7 @@ from context_agent.context_quality import (
 def make_context(*, stale: bool = False) -> Context:
     observed_at = datetime.now(timezone.utc) - (timedelta(minutes=20) if stale else timedelta(seconds=5))
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="WorkerQueueLagHigh",
         service="worker",
@@ -24,8 +25,9 @@ def make_context(*, stale: bool = False) -> Context:
         labels={"application": "orders", "namespace": "production"},
         metadata={"tenant_id": "tenant-a"},
     )
-    incident = Incident(service="worker", environment="prod", severity=alert.severity, title=alert.name)
+    incident = Incident(tenant_id=alert.tenant_id, service="worker", environment="prod", severity=alert.severity, title=alert.name)
     return Context(
+        tenant_id=alert.tenant_id,
         incident_id=incident.id,
         alert=alert,
         deployment="orders-worker-v42",

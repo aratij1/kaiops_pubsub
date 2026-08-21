@@ -1,4 +1,5 @@
-from common.models import Approval, ApprovalDecision
+from common.models import ApprovalDecision
+from remediation_test_helpers import governed_approval as Approval
 from remediation_engine import RemediationEngine
 
 

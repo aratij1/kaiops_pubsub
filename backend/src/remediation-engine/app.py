@@ -20,7 +20,7 @@ from common.event_publishers import build_agent_event_contract, build_event_enve
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus, utc_now
 from common.orchestration.execution_plan_contract import verify_plan_fingerprint
-from common.tenant_identity import verify_event_envelope
+from common.tenant_identity import require_tenant_id, verify_event_envelope
 from common.resolution_lifecycle import LifecycleActor, ResolutionState, create_lifecycle, decide_resolution_control, extract_lifecycle, transition_lifecycle
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
@@ -931,8 +931,10 @@ async def _execute_approval(approval: Approval) -> RemediationAction:
                 status_code=409,
                 detail="Execution blocked: this plan contains diagnostics but no corrective capability. Select a cataloged, target-specific remediation with executable recovery checks.",
             )
-        if not approval.metadata.get("auto_approved"):
-            await _require_persisted_human_approval(approval)
+        # Body/event metadata is evidence only. P0 production execution always
+        # requires the exact durable HITL receipt, even if a caller forges the
+        # legacy auto_approved flag.
+        await _require_persisted_human_approval(approval)
         try:
             await _require_persisted_approved_runbook(approval)
         except PolicyViolation as exc:
@@ -1096,13 +1098,11 @@ async def dispatch_approval_direct(approval: Approval, x_kaiops_internal_token: 
         raise HTTPException(status_code=409, detail=unsafe_reasons[0])
     if _plan_is_validation_only(approval):
         raise HTTPException(status_code=409, detail="Execution blocked: the approved plan is validation-only.")
-    if approval.metadata.get("auto_approved"):
-        try:
-            await _require_persisted_approved_runbook(approval)
-        except PolicyViolation as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-    else:
-        await _require_persisted_human_approval(approval)
+    await _require_persisted_human_approval(approval)
+    try:
+        await _require_persisted_approved_runbook(approval)
+    except PolicyViolation as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     action = engine.build_action(approval)
     _require_production_credential_reference(approval, action.action_type)
     _require_live_executor_configuration(action)
@@ -1565,6 +1565,7 @@ async def execution_plane_readiness() -> dict[str, Any]:
         "endpoint_url": os.getenv("REMEDIATION_JENKINS_URL", "http://jenkins:8080"),
     }
     probe = RemediationAction(
+        tenant_id="readiness-probe",
         incident_id=UUID("00000000-0000-4000-8000-000000000001"),
         action_type=str(profile["executor_type"]),
         target="readiness-probe",
@@ -1650,7 +1651,7 @@ async def _require_persisted_approved_runbook(approval: Approval) -> None:
     version = int(approval.metadata.get("runbook_version") or 1)
     async with app.state.session_factory() as session:
         governance = await IncidentRepository(session).get_runbook_governance(
-            runbook_id, version, tenant_id=approval.tenant_id or "default"
+            runbook_id, version, tenant_id=approval.tenant_id
         )
     if not governance or governance.get("status") != "approved":
         raise PolicyViolation("automatic execution blocked: runbook version is not durably approved or is suspended")
@@ -2356,6 +2357,12 @@ def _build_policy_blocked_action(payload: dict[str, Any], reason: str) -> Remedi
     if incident_id is None:
         return None
     lifecycle = extract_lifecycle(recommendation)
+    tenant_id = require_tenant_id(
+        recommendation.get("tenant_id")
+        or incident.get("tenant_id")
+        or (lifecycle or {}).get("tenant_id"),
+        source="policy-blocked remediation event",
+    )
     if lifecycle:
         lifecycle = transition_lifecycle(
             lifecycle,
@@ -2364,6 +2371,7 @@ def _build_policy_blocked_action(payload: dict[str, Any], reason: str) -> Remedi
             actor=LifecycleActor.REMEDIATION,
         )
     return RemediationAction(
+        tenant_id=tenant_id,
         incident_id=incident_id,
         approval_id=None,
         action_type="policy-blocked",

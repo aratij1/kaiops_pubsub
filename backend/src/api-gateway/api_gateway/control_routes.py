@@ -33,6 +33,7 @@ def build_control_router(
     load_recent_events: Callable[[int], Awaitable[list[Any]]],
     build_audit_contract: Callable[[Any], dict[str, Any]],
     load_audit_summary: Callable[[], Awaitable[dict[str, Any]]],
+    auth_context_from_request: Callable[[Request], Awaitable[Any]] | None = None,
 ) -> APIRouter:
     """Gateway control routes with dependencies injected by the composition root."""
     router = APIRouter()
@@ -92,7 +93,15 @@ def build_control_router(
     async def get_incident(
         incident_id: str, request: Request, x_trace_id: str | None = Header(default=None)
     ) -> dict[str, Any]:
-        return await forward(request, "GET", f"/incident/{incident_id}", settings.approval_service_url, {}, x_trace_id)
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            if auth_context_from_request is None:
+                raise HTTPException(status_code=500, detail="Gateway authentication resolver is not configured")
+            auth = await auth_context_from_request(request)
+        return await forward(
+            request, "GET", f"/incident/{quote(incident_id, safe='')}", settings.approval_service_url,
+            {}, x_trace_id, params={"tenant_id": auth.tenant_id},
+        )
 
     @router.get("/knowledge-graph")
     async def get_knowledge_graph(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
@@ -156,9 +165,34 @@ def build_control_router(
         payload: dict[str, Any] = REQUEST_BODY,
         x_trace_id: str | None = Header(default=None),
     ) -> dict[str, Any]:
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            if auth_context_from_request is None:
+                raise HTTPException(status_code=500, detail="Gateway authentication resolver is not configured")
+            auth = await auth_context_from_request(request)
+        allowed_roles = {SystemRole.ADMINISTRATOR.value, SystemRole.L3_ENGINEER.value}
+        if auth.role not in allowed_roles:
+            raise HTTPException(status_code=403, detail="Manual closure requires an Administrator or L3 Engineer")
+        forbidden_identity_fields = {"closed_by", "actor_id", "actor_role", "tenant_id"}.intersection(payload)
+        if forbidden_identity_fields:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Operator identity fields are server-derived: {', '.join(sorted(forbidden_identity_fields))}",
+            )
+        comment = str(payload.get("comment") or "").strip()
+        if len(comment) < 10 or len(comment) > 4000:
+            raise HTTPException(status_code=422, detail="Manual closure comment must contain 10 to 4000 characters")
+        actor_id = str(auth.email or auth.username or auth.user_id).strip()
         return await forward(
-            request, "POST", f"/incidents/{incident_id}/manual-close", settings.closure_service_url,
-            payload, x_trace_id, timeout_seconds=25.0,
+            request, "POST", f"/incidents/{quote(incident_id, safe='')}/manual-close", settings.closure_service_url,
+            {
+                "comment": comment,
+                "actor_id": actor_id,
+                "actor_role": auth.role,
+                "tenant_id": auth.tenant_id,
+                "auth_jti": auth.jwt_id,
+            },
+            x_trace_id, timeout_seconds=25.0,
         )
 
     @router.post("/remediation/execute")

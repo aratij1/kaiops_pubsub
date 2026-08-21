@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 from common.database import ActionRecord
-from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus
+from common.models import ApprovalDecision, RemediationAction, RemediationStatus
+from remediation_test_helpers import governed_approval as Approval
 from common.orchestration.execution_plan_contract import canonical_plan_fingerprint
 from common.repository import IncidentRepository
 from sqlalchemy import select
@@ -67,6 +68,7 @@ async def test_target_execution_is_exclusive_until_terminal(sqlite_session_facto
     module.settings.database_enabled = True
     module.app.state.session_factory = sqlite_session_factory
     first = RemediationAction(
+        tenant_id="tenant-a",
         incident_id="11111111-1111-4111-8111-111111111111",
         approval_id="21111111-1111-4111-8111-111111111111",
         action_type="restart_service",
@@ -75,6 +77,7 @@ async def test_target_execution_is_exclusive_until_terminal(sqlite_session_facto
         parameters={"environment": "prod"},
     )
     second = RemediationAction(
+        tenant_id="tenant-a",
         incident_id="33333333-3333-4333-8333-333333333333",
         approval_id="43333333-3333-4333-8333-333333333333",
         action_type="restart_service",
@@ -100,6 +103,7 @@ async def test_target_execution_scope_allows_distinct_targets(sqlite_session_fac
     module.settings.database_enabled = True
     module.app.state.session_factory = sqlite_session_factory
     prod = RemediationAction(
+        tenant_id="tenant-a",
         incident_id="51111111-1111-4111-8111-111111111111",
         approval_id="61111111-1111-4111-8111-111111111111",
         action_type="restart_service",
@@ -108,6 +112,7 @@ async def test_target_execution_scope_allows_distinct_targets(sqlite_session_fac
         parameters={"environment": "prod"},
     )
     inventory = RemediationAction(
+        tenant_id="tenant-a",
         incident_id="73333333-3333-4333-8333-333333333333",
         approval_id="83333333-3333-4333-8333-333333333333",
         action_type="restart_service",
@@ -121,7 +126,7 @@ async def test_target_execution_scope_allows_distinct_targets(sqlite_session_fac
 
 
 @pytest.mark.asyncio
-async def test_redelivered_approval_message_does_not_re_execute_remediation(sqlite_session_factory) -> None:
+async def test_redelivered_approval_message_does_not_re_execute_remediation(sqlite_session_factory, monkeypatch) -> None:
     """A RabbitMQ redelivery (e.g. consumer crash between plugin execution and
     ack) resends the same approval payload. Without the idempotency check this
     would run a real remediation plugin (K8s restart, Jenkins rollback, ...)
@@ -137,6 +142,11 @@ async def test_redelivered_approval_message_does_not_re_execute_remediation(sqli
 
     module.app.state.producer = ProducerStub()
 
+    async def approved_runbook(_approval):
+        return None
+
+    monkeypatch.setattr(module, "_require_persisted_approved_runbook", approved_runbook)
+
     plan = {
         "schema_version": "kaims.execution-plan.v2",
         "tenant_id": "tenant-a",
@@ -144,6 +154,10 @@ async def test_redelivered_approval_message_does_not_re_execute_remediation(sqli
         "plan_id": "33333333-3333-3333-3333-333333333333",
         "expiry": "2099-01-01T00:00:00+00:00",
         "execution_ready": True,
+        "actions": [{
+            "action_id": "rollback_deployment",
+            "inputs": {"operation": "rollback_deployment"},
+        }],
         "commands": ["approved-connector-action"],
         "validation_commands": ["approved-health-check"],
         "rollback_commands": ["approved-rollback-action"],
@@ -232,13 +246,41 @@ async def test_execute_rejects_unpersisted_human_approval(sqlite_session_factory
         decision=ApprovalDecision.APPROVED,
         approver="operator@example.com",
         comment="unpersisted request body",
+        metadata={
+            "service": "api-gateway",
+            "execution_plan": {
+                "commands": ["kubectl rollout restart deployment/api-gateway -n prod"],
+                "validation_commands": ["kubectl rollout status deployment/api-gateway -n prod"],
+                "rollback_commands": ["kubectl rollout undo deployment/api-gateway -n prod"],
+            },
+        },
     )
 
     with pytest.raises(Exception) as exc_info:
         await module.execute_approval(approval)
 
     assert getattr(exc_info.value, "status_code", None) == 409
-    assert "immutable execution plan" in str(getattr(exc_info.value, "detail", ""))
+    assert "exact approval ID" in str(getattr(exc_info.value, "detail", ""))
+
+
+@pytest.mark.asyncio
+async def test_forged_auto_approved_flag_cannot_bypass_durable_receipt(sqlite_session_factory) -> None:
+    module = load_remediation_app_module()
+    module.settings.database_enabled = True
+    module.app.state.session_factory = sqlite_session_factory
+    approval = Approval(
+        tenant_id="tenant-a",
+        incident_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        recommendation_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        decision=ApprovalDecision.APPROVED,
+        approver="attacker@example.com",
+        metadata={"auto_approved": True},
+    )
+
+    with pytest.raises(module.HTTPException) as exc_info:
+        await module._require_persisted_human_approval(approval)
+
+    assert exc_info.value.status_code == 409
 
 
 @pytest.mark.asyncio

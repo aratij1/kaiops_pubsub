@@ -30,6 +30,7 @@ class CountingContextAgent:
     async def collect_with_runtime(self, alert: Alert, incident: Incident) -> Context:
         self.calls += 1
         return Context(
+            tenant_id=alert.tenant_id,
             incident_id=incident.id,
             alert=alert,
             deployment="release-42",
@@ -47,6 +48,7 @@ class CountingContextAgent:
 
 def make_alert() -> Alert:
     return Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="WorkerQueueLagHigh",
         service="worker",
@@ -60,6 +62,7 @@ def make_alert() -> Alert:
 
 def make_incident(alert: Alert) -> Incident:
     return Incident(
+        tenant_id=alert.tenant_id,
         alert_ids=[alert.id],
         service=alert.service,
         environment=alert.environment,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Awaitable, Callable, Protocol
+from collections import deque
+from time import monotonic
 from uuid import uuid5, NAMESPACE_URL
 
 from common.cloud_operations.models import (
@@ -22,6 +24,9 @@ class CloudConnector(Protocol):
     async def validate_connection(self, connection: CloudConnection) -> ConnectionValidationResult: ...
 
     async def discover_resources(self, connection: CloudConnection, request: DiscoveryRequest) -> DiscoveryResult: ...
+    async def execute_action(self, *, action: dict[str, Any], idempotency_key: str) -> dict[str, Any]: ...
+    async def rollback_action(self, *, action: dict[str, Any], idempotency_key: str) -> dict[str, Any]: ...
+    async def validate_action(self, *, action: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class SimulatorConnector:
@@ -31,11 +36,11 @@ class SimulatorConnector:
             connector_version="simulator-v1",
             resource_types=["application", "api", "kubernetes_deployment", "database", "queue"],
             supported_read_operations=["validate_connection", "discover_resources", "get_health", "get_metrics"],
-            supported_write_operations=[],
+            supported_write_operations=["restart_kubernetes_deployment"],
             required_permission_scopes=["simulator.read"],
             risk_classification="low",
             dry_run_support=True,
-            rollback_support=False,
+            rollback_support=True,
             validation_support=True,
             health_status="healthy",
         )
@@ -144,8 +149,97 @@ class SimulatorConnector:
             message=f"Discovered {len(resources)} simulator resource(s).",
         )
 
+    async def execute_action(self, *, action: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+        if str(action.get("action_type") or "") not in self.list_capabilities().supported_write_operations:
+            raise ValueError("Simulator action is not in the connector capability manifest")
+        return {"status": "succeeded", "resource_id": action["resource_id"], "action_type": action["action_type"], "idempotency_key": idempotency_key, "simulated": True}
 
-def connector_for(provider: ProviderType) -> CloudConnector:
+    async def rollback_action(self, *, action: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+        if not str(action.get("rollback_action") or "").strip():
+            raise ValueError("Approved plan action has no rollback action")
+        return {"status": "rolled_back", "resource_id": action["resource_id"], "rollback_action": action["rollback_action"], "idempotency_key": idempotency_key, "simulated": True}
+
+    async def validate_action(self, *, action: dict[str, Any]) -> dict[str, Any]:
+        return {"passed": True, "resource_id": action["resource_id"], "checks": ["resource_reachable", "desired_state_observed"], "simulated": True}
+
+
+AzureExecutor = Callable[[str, dict[str, Any], str], Awaitable[dict[str, Any]]]
+
+
+class AzurePilotConnector:
+    """Canary-only Azure adapter. Live mutation requires an injected managed executor."""
+
+    def __init__(self, *, execution_enabled: bool = False, kill_switch: bool = True, canary_resource_ids: set[str] | None = None, rate_limit_per_minute: int = 2, executor: AzureExecutor | None = None) -> None:
+        self.execution_enabled = execution_enabled
+        self.kill_switch = kill_switch
+        self.canary_resource_ids = canary_resource_ids or set()
+        self.rate_limit_per_minute = rate_limit_per_minute
+        self.executor = executor
+        self._attempts: deque[float] = deque()
+
+    def list_capabilities(self) -> CapabilityManifest:
+        return CapabilityManifest(
+            provider=ProviderType.AZURE, connector_version="azure-pilot-v1",
+            resource_types=["azure_container_app", "azure_container_app_revision"],
+            supported_read_operations=["validate_connection", "get_revision_health"],
+            supported_write_operations=["restart_container_app_revision"],
+            required_permission_scopes=["Microsoft.App/containerApps/read", "Microsoft.App/containerApps/revisions/read", "Microsoft.App/containerApps/revisions/restart/action"],
+            risk_classification="high", dry_run_support=True, rollback_support=True, validation_support=True,
+            health_status="disabled" if not self.execution_enabled or self.kill_switch else "canary",
+        )
+
+    async def validate_connection(self, connection: CloudConnection) -> ConnectionValidationResult:
+        reference_ok = connection.credential_ref.startswith(("managed-identity://", "vault://"))
+        missing = [] if reference_ok else ["managed_identity_or_vault_reference"]
+        return ConnectionValidationResult(
+            status="validated" if reference_ok and connection.read_capability else "failed",
+            connectivity_ok=reference_ok, authentication_ok=reference_ok,
+            requested_permissions=self.list_capabilities().required_permission_scopes,
+            granted_permissions=self.list_capabilities().required_permission_scopes if reference_ok else [],
+            missing_permissions=missing, read_only=not connection.write_capability,
+            message="Azure pilot identity reference passed structural validation; live permission proof is still required." if reference_ok else "Azure pilot requires a managed-identity or vault credential reference.",
+        )
+
+    async def discover_resources(self, connection: CloudConnection, request: DiscoveryRequest) -> DiscoveryResult:
+        raise NotImplementedError("Azure pilot discovery requires the certified external executor")
+
+    def _authorize(self, action: dict[str, Any]) -> None:
+        if not self.execution_enabled:
+            raise ValueError("Azure pilot execution flag is disabled")
+        if self.kill_switch:
+            raise ValueError("Azure pilot kill switch is engaged")
+        if str(action.get("resource_id") or "") not in self.canary_resource_ids:
+            raise ValueError("Azure target is outside the certified canary scope")
+        if str(action.get("action_type") or "") not in self.list_capabilities().supported_write_operations:
+            raise ValueError("Azure action is outside the certified capability manifest")
+        now = monotonic()
+        while self._attempts and now - self._attempts[0] >= 60:
+            self._attempts.popleft()
+        if len(self._attempts) >= self.rate_limit_per_minute:
+            raise ValueError("Azure pilot rate limit exceeded")
+        if self.executor is None:
+            raise ValueError("Azure managed executor is not configured")
+        self._attempts.append(now)
+
+    async def execute_action(self, *, action: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+        self._authorize(action)
+        return await self.executor("execute", action, idempotency_key)  # type: ignore[misc]
+
+    async def rollback_action(self, *, action: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+        self._authorize(action)
+        if str(action.get("rollback_action") or "") != "restore_container_app_revision":
+            raise ValueError("Azure rollback is outside the certified capability manifest")
+        return await self.executor("rollback", action, idempotency_key)  # type: ignore[misc]
+
+    async def validate_action(self, *, action: dict[str, Any]) -> dict[str, Any]:
+        if self.executor is None:
+            raise ValueError("Azure managed executor is not configured")
+        return await self.executor("validate", action, "validation")
+
+
+def connector_for(provider: ProviderType, **options: Any) -> CloudConnector:
     if provider == ProviderType.SIMULATOR:
         return SimulatorConnector()
+    if provider == ProviderType.AZURE:
+        return AzurePilotConnector(**options)
     raise NotImplementedError(f"{provider.value} connector is registered but not enabled for live use")

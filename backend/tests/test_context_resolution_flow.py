@@ -323,6 +323,7 @@ def test_context_rag_gate_rejects_weak_untagged_history() -> None:
 @pytest.mark.asyncio
 async def test_resolution_does_not_treat_rag_history_as_current_observation() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="CheckoutLatencyHigh",
         service="checkout",
@@ -331,6 +332,7 @@ async def test_resolution_does_not_treat_rag_history_as_current_observation() ->
     )
     incident = Incident(service="checkout", severity=AlertSeverity.HIGH, title=alert.name)
     context = Context(
+        tenant_id=alert.tenant_id,
         incident_id=incident.id,
         alert=alert,
         metadata={
@@ -355,6 +357,7 @@ async def test_resolution_does_not_treat_rag_history_as_current_observation() ->
 @pytest.mark.asyncio
 async def test_resolution_builds_application_crawl_and_historical_hypotheses() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="CheckoutTimeouts",
         service="checkout",
@@ -363,6 +366,7 @@ async def test_resolution_builds_application_crawl_and_historical_hypotheses() -
     )
     incident = Incident(service="checkout", severity=AlertSeverity.HIGH, title=alert.name)
     context = Context(
+        tenant_id=alert.tenant_id,
         incident_id=incident.id,
         alert=alert,
         related_incidents=[{
@@ -408,6 +412,7 @@ async def test_resolution_builds_application_crawl_and_historical_hypotheses() -
 @pytest.mark.asyncio
 async def test_context_agent_returns_requested_shape() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentLatencyHigh",
         service="payments",
@@ -443,6 +448,7 @@ async def test_context_agent_returns_requested_shape() -> None:
 @pytest.mark.asyncio
 async def test_context_agent_persists_multi_source_evidence_manifest() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="TelemetryCollectorUnavailable",
         service="otel-collector",
@@ -469,6 +475,7 @@ async def test_context_agent_persists_multi_source_evidence_manifest() -> None:
 @pytest.mark.asyncio
 async def test_resolution_agent_generates_recommendation() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentLatencyHigh",
         service="payments",
@@ -495,6 +502,7 @@ async def test_resolution_agent_uses_severity_heuristic_risk_when_model_omits_ri
     returns a risk_level, so recommendation.risk keeps falling back to the severity-only
     heuristic exactly as before this change."""
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentLatencyHigh",
         service="payments",
@@ -531,6 +539,7 @@ async def test_resolution_agent_prefers_model_risk_level_over_severity_heuristic
             }
 
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PodCrashLoop",
         service="checkout",
@@ -565,6 +574,7 @@ async def test_resolution_agent_ignores_unrecognized_model_risk_level() -> None:
             }
 
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus", name="PodCrashLoop", service="checkout",
         severity=AlertSeverity.CRITICAL, description="pod crashloop",
     )
@@ -586,6 +596,7 @@ async def test_resolution_agent_adds_validation_and_rollback_without_changing_co
     (rather than through the full resolve() pipeline) so the test isn't at the mercy of
     what a mocked model echoes back as root_cause text."""
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PodCrashLoop",
         service="checkout",
@@ -612,6 +623,7 @@ async def test_resolution_agent_adds_validation_and_rollback_without_changing_co
 @pytest.mark.asyncio
 async def test_resolution_agent_clamps_all_model_fallback_confidence() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="KaiOpsServiceDown",
         service="kaiops-platform",
@@ -633,6 +645,7 @@ async def test_resolution_agent_clamps_all_model_fallback_confidence() -> None:
 @pytest.mark.asyncio
 async def test_resolution_agent_grounds_mysql_exporter_privilege_rca_in_raw_alert() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="logs",
         name="[WARNING] mysql-exporter: Error from scraper",
         service="mysql-exporter",
@@ -649,6 +662,7 @@ async def test_resolution_agent_grounds_mysql_exporter_privilege_rca_in_raw_aler
     )
     incident = Incident(service="mysql-exporter", severity=AlertSeverity.HIGH, title="exporter scrape failure")
     context = Context(
+        tenant_id=alert.tenant_id,
         incident_id=incident.id,
         alert=alert,
         metadata={
@@ -677,6 +691,7 @@ async def test_resolution_agent_grounds_mysql_exporter_privilege_rca_in_raw_aler
 @pytest.mark.asyncio
 async def test_resolution_agent_runtime_persists_reflection_memory() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentLatencyHigh",
         service="payments",

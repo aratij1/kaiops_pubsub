@@ -25,6 +25,7 @@ describe("ResolutionPanel", () => {
           executionMode: "jenkins",
           target: "payments-api",
           expectedOutcome: "The payments API passes independent recovery validation.",
+          readinessDecision: { decision_id: "decision-1", signature: "signed-value", state: "execution_eligible" },
         }}
         readinessChecks={[
           { id: "evidence", label: "Grounded evidence", detail: "Evidence threshold met.", passed: true },
@@ -46,8 +47,14 @@ describe("ResolutionPanel", () => {
 
   it("does not claim readiness while a safeguard is missing", () => {
     render(<ResolutionPanel workflow={{ recommendation: { recommended_action: "Restart", root_cause: "Deadlock" } }} alertRow={{ service: "api" }} confidenceScore={0.9} executionPlan={{}} readinessChecks={[{ id: "rollback", label: "Rollback", detail: "No rollback supplied.", passed: false, action: "attach rollback instructions" }]} onNavigateTab={vi.fn()} />);
-    expect(screen.getByText("Evidence review required")).toBeVisible();
+    expect(screen.getByText("Backend readiness required")).toBeVisible();
     expect(screen.getByText(/Not ready/)).toBeVisible();
     expect(screen.getByText(/attach rollback instructions/)).toBeVisible();
+  });
+
+  it("never claims approval eligibility from local fields without a signed backend receipt", () => {
+    render(<ResolutionPanel workflow={{ recommendation: { recommended_action: "Restart", root_cause: "Deadlock" } }} alertRow={{ service: "api" }} confidenceScore={0.99} executionPlan={{ target: "api" }} readinessChecks={[{ id: "rollback", label: "Rollback", detail: "Ready.", passed: true }]} onNavigateTab={vi.fn()} />);
+    expect(screen.queryByText("Eligible for guarded approval")).not.toBeInTheDocument();
+    expect(screen.getByText("Signed backend readiness")).toBeVisible();
   });
 });

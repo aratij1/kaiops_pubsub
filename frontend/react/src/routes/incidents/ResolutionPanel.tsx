@@ -11,6 +11,7 @@ interface ExecutionPlan {
   target?: string;
   expectedOutcome?: string;
   catalogPlan?: any;
+  readinessDecision?: any;
 }
 
 interface ResolutionPanelProps {
@@ -45,6 +46,15 @@ export default function ResolutionPanel({
     || typedAction?.expected_outcome
     || "Independent recovery checks pass for the approved target.";
   const environment = alertRow?.environment || workflow?.incident?.environment || "Environment not identified";
+  const readinessReceipt = executionPlan.readinessDecision
+    || executionPlan.catalogPlan?.approval_readiness
+    || workflow?.recommendation?.metadata?.approval_readiness
+    || {};
+  const backendEligibilityProven = Boolean(
+    readinessReceipt.decision_id
+    && readinessReceipt.signature
+    && ["eligible", "execution_eligible"].includes(String(readinessReceipt.state || readinessReceipt.decision || "").toLowerCase())
+  );
   const planComplete = Boolean(analysis.rootCause && analysis.rootCause !== "-" && action && action !== "-");
   const decisionChecks: ReadinessCheck[] = [
     ...readinessChecks,
@@ -64,7 +74,7 @@ export default function ResolutionPanel({
     },
   ];
   const readinessComplete = decisionChecks.length > 0 && decisionChecks.every((check) => check.passed);
-  const readyForDecision = planComplete && confidencePercent >= 85 && readinessComplete && target !== "Target not identified";
+  const readyForDecision = planComplete && readinessComplete && backendEligibilityProven;
 
   return (
     <section className="panel incident-workspace-section incident-resolution-section resolution-decision-brief" role="tabpanel" aria-labelledby="resolution-recommendation-title">
@@ -76,7 +86,7 @@ export default function ResolutionPanel({
         </div>
         <span className={`decision-readiness ${readyForDecision ? "is-ready" : "is-blocked"}`}>
           {readyForDecision ? <CheckCircle2 size={17} /> : <TriangleAlert size={17} />}
-          {readyForDecision ? "Ready for review" : planComplete ? "Evidence review required" : "Plan incomplete"}
+          {readyForDecision ? "Backend eligibility verified" : planComplete ? "Backend readiness required" : "Plan incomplete"}
         </span>
       </header>
 
@@ -124,7 +134,13 @@ export default function ResolutionPanel({
 
       <DecisionReadinessPanel
         title="Approval eligibility"
-        checks={decisionChecks}
+        checks={[...decisionChecks, {
+          id: "backend-readiness-receipt",
+          label: "Signed backend readiness",
+          detail: backendEligibilityProven ? `Verified decision ${readinessReceipt.decision_id}.` : "No signed backend readiness decision proves execution eligibility.",
+          passed: backendEligibilityProven,
+          action: "request a fresh backend approval-readiness evaluation",
+        }]}
         eligibleLabel="Eligible for guarded approval"
         onReviewEvidence={() => onNavigateTab("evidence")}
       />

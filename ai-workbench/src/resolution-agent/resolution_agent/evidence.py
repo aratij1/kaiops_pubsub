@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 EvidenceSourceType = Literal[
-    "alert", "metric", "log", "trace", "topology", "change", "code", "ticket", "runbook", "database"
+    "alert", "metric", "log", "trace", "topology", "dependency", "change", "code", "ticket", "runbook", "database"
 ]
 
 
@@ -20,8 +20,12 @@ class EvidenceRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     evidence_id: str
+    tenant_id: str
     incident_id: UUID
     source_type: EvidenceSourceType
+    source_system: str
+    connector_id: str
+    target_resource_id: str
     source_uri: str
     observed_at: datetime
     collected_at: datetime
@@ -30,6 +34,12 @@ class EvidenceRecord(BaseModel):
     summary: str
     content_hash: str
     lineage_id: str
+    incident_window_relation: Literal["before", "during", "after", "unknown"]
+    freshness_status: Literal["fresh", "stale", "unknown"]
+    query_reference: str
+    result_checksum: str
+    citation_provenance: str
+    current_operational_evidence: bool
     freshness_seconds: int = Field(ge=0)
     reliability_score: float = Field(ge=0.0, le=1.0)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -47,7 +57,7 @@ class EvidenceCompiler:
         "opensearch": "log",
         "trace": "trace",
         "topology": "topology",
-        "dependency": "topology",
+        "dependency": "dependency",
         "change": "change",
         "deployment": "change",
         "code": "code",
@@ -68,6 +78,7 @@ class EvidenceCompiler:
         "log": 0.85,
         "trace": 0.9,
         "topology": 0.8,
+        "dependency": 0.85,
         "change": 0.8,
         "code": 0.75,
         "database": 0.9,
@@ -103,6 +114,7 @@ class EvidenceCompiler:
         rows: list[dict[str, Any]],
         *,
         incident_id: UUID,
+        tenant_id: str,
         service: str,
         environment: str,
         collected_at: datetime | None = None,
@@ -148,8 +160,12 @@ class EvidenceCompiler:
             compiled.append(
                 EvidenceRecord(
                     evidence_id=evidence_id,
+                    tenant_id=tenant_id,
                     incident_id=incident_id,
                     source_type=source_type,
+                    source_system=str(row.get("source_system") or raw_source),
+                    connector_id=str(row.get("connector_id") or "unavailable"),
+                    target_resource_id=str(row.get("target_resource_id") or row.get("service") or service),
                     source_uri=source_uri,
                     observed_at=observed,
                     collected_at=collected,
@@ -158,12 +174,18 @@ class EvidenceCompiler:
                     summary=summary,
                     content_hash=content_hash,
                     lineage_id=lineage_id,
+                    incident_window_relation="unknown" if timestamp_missing else "before" if outside_incident_window else "during",
+                    freshness_status="unknown" if timestamp_missing else "fresh" if freshness <= 900 else "stale",
+                    query_reference=str(row.get("query_reference") or row.get("query") or source_uri),
+                    result_checksum=f"sha256:{content_hash.removeprefix('sha256:')}",
+                    citation_provenance=str(row.get("citation") or row.get("provenance") or source_uri),
+                    current_operational_evidence=not timestamp_missing and not guidance_only and not outside_incident_window,
                     freshness_seconds=freshness,
                     reliability_score=max(0.0, min(reliability, 1.0)),
                     metadata={
                         **{key: value for key, value in row.items() if key not in {"content", "snippet"}},
                         "guidance_only": guidance_only,
-                        "current_operational_evidence": not guidance_only and not outside_incident_window,
+                        "current_operational_evidence": not timestamp_missing and not guidance_only and not outside_incident_window,
                         "timestamp_missing": timestamp_missing,
                         "outside_incident_window": outside_incident_window,
                     },
@@ -173,4 +195,4 @@ class EvidenceCompiler:
 
     @staticmethod
     def independent_source_count(records: list[EvidenceRecord]) -> int:
-        return len({(record.source_type, record.lineage_id) for record in records if record.metadata.get("current_operational_evidence")})
+        return len({record.connector_id for record in records if record.current_operational_evidence})

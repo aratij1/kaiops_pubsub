@@ -187,6 +187,7 @@ async def test_resolution_event_payload_includes_event_contract() -> None:
     incident = Incident(tenant_id="tenant-a", service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
     context = await ContextIntelligenceAgent().collect(alert, incident)
     recommendation = Recommendation(
+        tenant_id=context.tenant_id,
         incident_id=context.incident_id,
         root_cause="Deployment 2.5",
         confidence=0.91,
@@ -252,6 +253,7 @@ def test_remediation_payload_builder_and_approval_extractor_compatibility() -> N
     assert extracted["incident_id"] == "11111111-1111-1111-1111-111111111111"
 
     action = RemediationAction(
+        tenant_id="tenant-a",
         incident_id="11111111-1111-1111-1111-111111111111",
         action_type="restart_pod",
         target="payments",
@@ -273,6 +275,7 @@ def test_remediation_payload_builder_and_approval_extractor_compatibility() -> N
 def test_closure_payload_builder_and_action_extractor_compatibility() -> None:
     raw = {
         "remediation_action": {
+            "tenant_id": "tenant-a",
             "incident_id": "11111111-1111-1111-1111-111111111111",
             "action_type": "restart_pod",
             "target": "payments",
@@ -285,6 +288,7 @@ def test_closure_payload_builder_and_action_extractor_compatibility() -> None:
 
     action = RemediationAction.model_validate(extracted)
     report = ResolutionReport(
+        tenant_id=action.tenant_id,
         incident_id=action.incident_id,
         root_cause="Deployment regression",
         impact="Payment latency",
@@ -308,6 +312,7 @@ def test_closure_payload_builder_and_action_extractor_compatibility() -> None:
 
 def test_closure_service_name_prefers_incident_service_over_action_target() -> None:
     action = RemediationAction(
+        tenant_id="tenant-a",
         incident_id="11111111-1111-1111-1111-111111111111",
         action_type="validate_pipeline",
         target="11111111-1111-1111-1111-111111111111",
@@ -320,6 +325,7 @@ def test_closure_service_name_prefers_incident_service_over_action_target() -> N
 
 def test_closure_final_incident_payload_ignores_ui_approval_fields() -> None:
     action = RemediationAction(
+        tenant_id="tenant-a",
         incident_id="11111111-1111-1111-1111-111111111111",
         action_type="script_execution",
         target="mysql",
@@ -328,6 +334,7 @@ def test_closure_final_incident_payload_ignores_ui_approval_fields() -> None:
         parameters={"environment": "prod"},
     )
     report = ResolutionReport(
+        tenant_id=action.tenant_id,
         incident_id=action.incident_id,
         remediation_action_id=action.id,
         root_cause="Alert table growth",

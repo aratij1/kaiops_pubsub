@@ -19,9 +19,18 @@ function Invoke-DockerCommand {
             $process.Kill()
             throw "$Description timed out after $DockerCommandTimeoutSeconds seconds. Docker Desktop is saturated; restart Docker Desktop before retrying."
         }
+        # WaitForExit(timeout) can observe termination before PowerShell has
+        # populated ExitCode and drained redirected output. Complete the
+        # synchronous wait before inspecting either result.
+        $process.WaitForExit()
         Get-Content $stdout -ErrorAction SilentlyContinue | Write-Host
         Get-Content $stderr -ErrorAction SilentlyContinue | Write-Host
-        if ($process.ExitCode -ne 0) { throw "$Description failed with exit code $($process.ExitCode)." }
+        # Windows PowerShell can leave ExitCode unset for a completed
+        # Start-Process instance with redirected streams. Do not mistake that
+        # host-specific null for a non-zero Docker exit code.
+        if ($null -ne $process.ExitCode -and $process.ExitCode -ne 0) {
+            throw "$Description failed with exit code $($process.ExitCode)."
+        }
     }
     finally {
         Remove-Item $stdout, $stderr -Force -ErrorAction SilentlyContinue

@@ -13,6 +13,7 @@ from sqlalchemy.orm import load_only
 
 from common.incident_status import reduce_incident_status
 from common.resolution_lifecycle import select_current_lifecycle
+from common.tenant_identity import require_tenant_id
 
 from common.database import (
     ActionRecord,
@@ -54,6 +55,7 @@ from common.database import (
     ObjectStorageRecord,
     PendingWorkflowRecord,
     ValidationHistoryRecord,
+    ValidationObservationRecord,
 )
 
 
@@ -1850,11 +1852,14 @@ class IncidentRepository:
             )
         )
 
-    async def get_incident(self, incident_id: str) -> dict[str, Any] | None:
+    async def get_incident(self, incident_id: str, *, tenant_id: str | None = None) -> dict[str, Any] | None:
         incident_uuid = self._parse_uuid(incident_id)
         if incident_uuid is None:
             return None
-        result = await self.session.execute(select(IncidentRecord).where(IncidentRecord.id == incident_uuid))
+        query = select(IncidentRecord).where(IncidentRecord.id == incident_uuid)
+        if tenant_id is not None:
+            query = query.where(IncidentRecord.tenant_id == self._require("tenant_id", tenant_id))
+        result = await self.session.execute(query)
         record = result.scalar_one_or_none()
         return record.payload if record else None
 
@@ -1940,7 +1945,12 @@ class IncidentRepository:
             related.append(payload)
         return related
 
-    async def get_latest_recommendation_for_incident(self, incident_id: Any) -> dict[str, Any] | None:
+    async def get_latest_recommendation_for_incident(
+        self,
+        incident_id: Any,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any] | None:
         incident_uuid = self._parse_uuid(incident_id)
         if incident_uuid is None:
             return None
@@ -1952,14 +1962,21 @@ class IncidentRepository:
             .order_by(AuditLogRecord.updated_at.desc(), AuditLogRecord.created_at.desc())
             .limit(1)
         )
+        if tenant_id is not None:
+            audit_stmt = audit_stmt.where(AuditLogRecord.tenant_id == self._require("tenant_id", tenant_id))
         audit_result = await self.session.execute(audit_stmt)
         audit_record = audit_result.scalar_one_or_none()
         if audit_record is not None and isinstance(audit_record.payload, dict):
             return audit_record.payload
 
-        projection_result = await self.session.execute(
-            select(IncidentProjectionRecord).where(IncidentProjectionRecord.incident_id == incident_uuid)
+        projection_stmt = select(IncidentProjectionRecord).where(
+            IncidentProjectionRecord.incident_id == incident_uuid
         )
+        if tenant_id is not None:
+            projection_stmt = projection_stmt.where(
+                IncidentProjectionRecord.tenant_id == self._require("tenant_id", tenant_id)
+            )
+        projection_result = await self.session.execute(projection_stmt)
         projection = projection_result.scalar_one_or_none()
         if projection is not None and projection.recommendation_id is not None:
             return {"id": str(projection.recommendation_id), "incident_id": str(incident_uuid)}
@@ -1998,7 +2015,7 @@ class IncidentRepository:
             .where(ApprovalRecord.tenant_id == (str(tenant_id or "default").strip() or "default"))
             .where(ApprovalRecord.incident_id == incident_uuid)
             .where(ApprovalRecord.recommendation_id == recommendation_uuid)
-            .where(ApprovalRecord.decision.in_([ApprovalDecision.APPROVED.value, ApprovalDecision.MODIFIED.value]))
+            .where(ApprovalRecord.decision == ApprovalDecision.APPROVED.value)
             .limit(1)
         )
         return result.scalar_one_or_none() is not None
@@ -2027,7 +2044,7 @@ class IncidentRepository:
             .where(ApprovalRecord.tenant_id == normalized_tenant)
             .where(ApprovalRecord.incident_id == incident_uuid)
             .where(ApprovalRecord.recommendation_id == recommendation_uuid)
-            .where(ApprovalRecord.decision.in_([ApprovalDecision.APPROVED.value, ApprovalDecision.MODIFIED.value]))
+            .where(ApprovalRecord.decision == ApprovalDecision.APPROVED.value)
             .limit(1)
         )
         record = result.scalar_one_or_none()
@@ -2290,14 +2307,20 @@ class IncidentRepository:
         )
 
     async def get_runbook_governance(
-        self, runbook_id: str, version: int = 1, *, tenant_id: str = "default"
+        self, runbook_id: str, version: int = 1, *, tenant_id: str
     ) -> dict[str, Any] | None:
+        normalized_tenant = self._require("tenant_id", tenant_id)
         result = await self.session.execute(
             select(RunbookVersionRecord).where(
-                RunbookVersionRecord.tenant_id == tenant_id,
+                or_(
+                    RunbookVersionRecord.tenant_id == normalized_tenant,
+                    RunbookVersionRecord.tenant_id == "global",
+                ),
                 RunbookVersionRecord.runbook_id == self._parse_uuid(runbook_id),
                 RunbookVersionRecord.version == int(version),
-            ).limit(1)
+            )
+            .order_by((RunbookVersionRecord.tenant_id == normalized_tenant).desc())
+            .limit(1)
         )
         row = result.scalar_one_or_none()
         if row is None:
@@ -2311,8 +2334,9 @@ class IncidentRepository:
 
     async def approve_runbook_version(
         self, *, runbook_id: str, version: int, approved_by: str,
-        tenant_id: str = "default", payload: dict[str, Any] | None = None,
+        tenant_id: str, payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        tenant_id = self._require("tenant_id", tenant_id)
         result = await self.session.execute(
             select(RunbookVersionRecord).where(
                 RunbookVersionRecord.tenant_id == tenant_id,
@@ -2338,8 +2362,9 @@ class IncidentRepository:
 
     async def record_runbook_execution_outcome(
         self, *, runbook_id: str, version: int, successful: bool, modified: bool,
-        actor: str, tenant_id: str = "default", metadata: dict[str, Any] | None = None,
+        actor: str, tenant_id: str, metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        tenant_id = self._require("tenant_id", tenant_id)
         result = await self.session.execute(
             select(RunbookVersionRecord).where(
                 RunbookVersionRecord.tenant_id == tenant_id,
@@ -2399,23 +2424,54 @@ class IncidentRepository:
         await self.session.flush()
         return {"runbook_id": str(row.runbook_id), "version": row.version, "status": row.approval_status}
 
-    async def save_report(self, report: ResolutionReport, *, tenant_id: str = "default") -> None:
+    async def save_report(self, report: ResolutionReport, *, tenant_id: str | None = None) -> None:
+        verified_tenant = require_tenant_id(report.tenant_id, source="resolution report persistence")
+        if tenant_id is not None and require_tenant_id(tenant_id, source="resolution report persistence") != verified_tenant:
+            raise ValueError("report tenant does not match persistence tenant")
         await self.session.merge(
             RcaReportRecord(
                 id=self._require("report.id", report.id),
-                tenant_id=tenant_id or "default",
+                tenant_id=verified_tenant,
                 incident_id=self._require("report.incident_id", report.incident_id),
                 root_cause=self._require("report.root_cause", report.root_cause),
                 impact=self._require("report.impact", report.impact),
                 payload=report.model_dump(mode="json"),
             )
         )
+        await self._save_validation_observations(report, tenant_id=verified_tenant)
 
-    async def save_recommendation_as_audit(self, recommendation: Recommendation, *, tenant_id: str = "default") -> None:
+    async def _save_validation_observations(self, report: ResolutionReport, *, tenant_id: str) -> None:
+        observations = report.metadata.get("independent_validation_observations")
+        observations = observations if isinstance(observations, list) else []
+        for observation in observations:
+            if not isinstance(observation, dict):
+                continue
+            observed_at = datetime.fromisoformat(str(observation.get("observed_at") or "").replace("Z", "+00:00"))
+            material = ":".join((
+                str(report.id), str(observation.get("validator_id") or ""),
+                observed_at.isoformat(), str(observation.get("result_checksum") or ""),
+            ))
+            await self.session.merge(ValidationObservationRecord(
+                id=hashlib.sha256(material.encode()).hexdigest(), tenant_id=tenant_id,
+                incident_id=report.incident_id, report_id=report.id,
+                remediation_action_id=report.remediation_action_id,
+                validator_id=self._require("validation.validator_id", observation.get("validator_id")),
+                connector_id=self._require("validation.connector_id", observation.get("connector_id")),
+                target_resource_id=self._require("validation.target_resource_id", observation.get("target_resource_id")),
+                observed_at=observed_at, collected_at=utc_now(),
+                authoritative_source=self._require("validation.authoritative_source", observation.get("connector_id")),
+                result_checksum=self._require("validation.result_checksum", observation.get("result_checksum")),
+                passed=observation.get("passed") is True, payload=observation,
+            ))
+
+    async def save_recommendation_as_audit(self, recommendation: Recommendation, *, tenant_id: str | None = None) -> None:
+        verified_tenant = require_tenant_id(recommendation.tenant_id, source="recommendation audit persistence")
+        if tenant_id is not None and require_tenant_id(tenant_id, source="recommendation audit persistence") != verified_tenant:
+            raise ValueError("recommendation tenant does not match persistence tenant")
         await self.session.merge(
             AuditLogRecord(
                 id=self._require("recommendation.id", recommendation.id),
-                tenant_id=tenant_id or "default",
+                tenant_id=verified_tenant,
                 actor=self._require("audit.actor", "resolution-agent"),
                 action=self._require("audit.action", "recommendation.generated"),
                 resource_type="incident",
@@ -2424,11 +2480,14 @@ class IncidentRepository:
             )
         )
 
-    async def save_knowledge_base(self, report: ResolutionReport, service: str = "unknown", *, tenant_id: str = "default") -> None:
+    async def save_knowledge_base(self, report: ResolutionReport, service: str = "unknown", *, tenant_id: str | None = None) -> None:
+        verified_tenant = require_tenant_id(report.tenant_id, source="resolution knowledge persistence")
+        if tenant_id is not None and require_tenant_id(tenant_id, source="resolution knowledge persistence") != verified_tenant:
+            raise ValueError("report tenant does not match knowledge tenant")
         await self.session.merge(
             KnowledgeBaseRecord(
                 id=self._require("knowledge_base.id", report.id),
-                tenant_id=tenant_id or "default",
+                tenant_id=verified_tenant,
                 service=self._require("knowledge_base.service", service),
                 title=self._require("knowledge_base.title", f"RCA for incident {report.incident_id}"),
                 content=self._require("knowledge_base.content", report.knowledge_base_entry),
@@ -2562,7 +2621,7 @@ class IncidentRepository:
         self.session.add(
             ContextSnapshotRecord(
                 snapshot_id=snapshot_id,
-                tenant_id=tenant_id or "default",
+                tenant_id=tenant_id,
                 incident_id=self._require("context_snapshot.incident_id", incident_id),
                 source_incident_id=source_incident_id,
                 alert_signature=self._require("context_snapshot.alert_signature", alert_signature),

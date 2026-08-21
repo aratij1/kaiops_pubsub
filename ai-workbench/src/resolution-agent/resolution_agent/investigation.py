@@ -37,7 +37,8 @@ PersistEvent = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 class ReadOnlyDiscoveryClient:
     ALLOWED_TOOLS = frozenset({
-        "logs.search", "code.search", "telemetry.search", "tickets.search", "mysql.search",
+        "logs.search", "code.search", "telemetry.search", "traces.search", "topology.search",
+        "dependency-health.search", "changes.search", "runbooks.search", "tickets.search", "mysql.search",
     })
 
     def __init__(self) -> None:
@@ -53,7 +54,7 @@ class ReadOnlyDiscoveryClient:
             "method": "tools/call",
             "params": {"name": tool_name, "arguments": arguments},
         }
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+        async with httpx.AsyncClient(timeout=self.timeout_seconds, trust_env=False) as client:
             response = await client.post(self.url, json=request)
             response.raise_for_status()
             payload = response.json()
@@ -86,6 +87,11 @@ class IterativeInvestigator:
         "logs": "logs.search",
         "code": "code.search",
         "telemetry": "telemetry.search",
+        "traces": "traces.search",
+        "topology": "topology.search",
+        "dependency": "dependency-health.search",
+        "changes": "changes.search",
+        "runbooks": "runbooks.search",
         "history": "tickets.search",
         "data": "mysql.search",
     }
@@ -93,6 +99,10 @@ class IterativeInvestigator:
         "log": "logs", "logs": "logs", "opensearch": "logs", "elasticsearch": "logs",
         "code": "code", "source": "code", "github": "code", "gitlab": "code",
         "prometheus": "telemetry", "metric": "telemetry", "metrics": "telemetry", "telemetry": "telemetry",
+        "trace": "traces", "traces": "traces", "jaeger": "traces",
+        "topology": "topology", "dependency": "dependency", "dependencies": "dependency",
+        "change": "changes", "changes": "changes", "deployment": "changes",
+        "runbook": "runbooks", "runbooks": "runbooks",
         "ticket": "history", "tickets": "history", "incident": "history", "rag": "history",
         "mysql": "data", "database": "data",
     }
@@ -100,7 +110,7 @@ class IterativeInvestigator:
     def __init__(self, client: ReadOnlyDiscoveryClient | None = None) -> None:
         self.client = client or ReadOnlyDiscoveryClient()
         self.evidence_compiler = EvidenceCompiler()
-        self.max_steps = max(5, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_STEPS", "5")), 10))
+        self.max_steps = max(8, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_STEPS", "8")), 12))
         self.max_evidence = max(8, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_EVIDENCE", "40")), 100))
         self.conclusive_threshold = max(0.6, min(float(os.getenv("RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD", "0.85")), 0.98))
 
@@ -109,6 +119,7 @@ class IterativeInvestigator:
             record.model_dump(mode="json")
             for record in self.evidence_compiler.compile(
                 rows,
+                tenant_id=context.tenant_id,
                 incident_id=context.incident_id,
                 service=context.alert.service,
                 environment=context.alert.environment,
@@ -156,7 +167,7 @@ class IterativeInvestigator:
         for item in candidates:
             if not isinstance(item, dict):
                 continue
-            claim = str(item.get("cause") or item.get("summary") or "").strip()
+            claim = str(item.get("claim") or item.get("cause") or item.get("summary") or "").strip()
             if not claim:
                 continue
             hypotheses.append({
@@ -166,7 +177,11 @@ class IterativeInvestigator:
                 "confidence": max(0.05, min(float(item.get("confidence") or 0.35), 0.75)),
                 "supporting_evidence_ids": list(item.get("evidence_ids") or item.get("evidence_used") or []),
                 "contradicting_evidence_ids": [],
-                "falsification_query": item.get("falsification_query") or item.get("next_check") or {},
+                "affected_resource_ids": list(item.get("affected_resource_ids") or []),
+                "causal_sequence": list(item.get("causal_sequence") or []),
+                "confidence_components": dict(item.get("confidence_components") or {}),
+                "falsification_check": item.get("falsification_check") or item.get("falsification_query") or item.get("next_check") or {},
+                "next_evidence_requests": list(item.get("next_evidence_requests") or []),
                 "source": "context",
             })
         return hypotheses[:8]
@@ -182,7 +197,9 @@ class IterativeInvestigator:
     @staticmethod
     def _required_sources(context: Context) -> set[str]:
         text = " ".join((context.alert.name, context.alert.description, context.alert.service)).lower()
-        required = {"logs", "telemetry"}
+        required = {"logs", "telemetry", "topology", "dependency", "changes", "runbooks"}
+        if any(token in text for token in ("latency", "timeout", "availability", "down", "error", "5xx")):
+            required.add("traces")
         if any(token in text for token in ("deploy", "release", "config", "traceback", "exception")):
             required.add("code")
         if any(token in text for token in ("database", "mysql", "query", "replica", "table", "data")):
@@ -204,16 +221,30 @@ class IterativeInvestigator:
             context.alert.name, context.alert.description, context.alert.service,
             *(str(item.get("claim") or "") for item in hypotheses[:3]),
         ]).lower()
-        priority = ["logs", "telemetry", "code", "history", "data"]
+        priority = [
+            "logs", "telemetry", "traces", "topology", "dependency", "changes", "runbooks",
+            "code", "history", "data",
+        ]
         if any(token in haystack for token in ("deploy", "release", "config", "stack", "traceback")):
-            priority = ["code", "logs", "telemetry", "history", "data"]
+            priority = ["changes", "code", "logs", "telemetry", "traces", "topology", "dependency", "runbooks", "history", "data"]
         elif any(token in haystack for token in ("database", "mysql", "query", "replica", "table")):
-            priority = ["data", "logs", "telemetry", "code", "history"]
+            priority = ["data", "logs", "telemetry", "topology", "dependency", "changes", "runbooks", "code", "history", "traces"]
         elif any(token in haystack for token in ("recurring", "repeat", "known issue")):
-            priority = ["history", "logs", "telemetry", "code", "data"]
+            priority = ["history", "logs", "telemetry", "topology", "dependency", "changes", "runbooks", "code", "data", "traces"]
         required = self._required_sources(context)
         priority = [source for source in priority if source in required]
-        source = next((name for name in priority if coverage.get(name, 0) == 0), None)
+        # An unavailable/empty source must not consume the entire investigation
+        # budget. Query every required evidence plane once before issuing a
+        # bounded refinement query to any one tool.
+        source = next(
+            (
+                name
+                for name in priority
+                if coverage.get(name, 0) == 0
+                and tool_counts.get(self.SOURCE_TOOL[name], 0) == 0
+            ),
+            None,
+        )
         if source is None:
             # A second query to the same plane is allowed when it refines or
             # falsifies the leading hypothesis. Bound it to two calls per tool.
@@ -267,7 +298,9 @@ class IterativeInvestigator:
                     "confidence": 0.3,
                     "supporting_evidence_ids": [str(diagnostic.get("evidence_id"))] if diagnostic.get("evidence_id") else [],
                     "contradicting_evidence_ids": [],
-                    "falsification_query": {"objective": "Find an independent source that confirms the causal mechanism."},
+                    "affected_resource_ids": [], "causal_sequence": [], "confidence_components": {},
+                    "falsification_check": {"objective": "Find an independent source that confirms the causal mechanism."},
+                    "next_evidence_requests": [],
                     "source": "derived_observation",
                 }]
         # Keep a falsifiable 3-5 candidate set.  These are investigation
@@ -292,7 +325,8 @@ class IterativeInvestigator:
                 "confidence": 0.0,
                 "supporting_evidence_ids": [],
                 "contradicting_evidence_ids": [],
-                "falsification_query": {"objective": objective},
+                "affected_resource_ids": [], "causal_sequence": [], "confidence_components": {},
+                "falsification_check": {"objective": objective}, "next_evidence_requests": [],
                 "source": "mechanism_candidate",
             })
             existing_claims.add(claim.lower())
@@ -311,7 +345,8 @@ class IterativeInvestigator:
                 if len(overlap) >= 2 or (claim_tokens and len(overlap) / len(claim_tokens) >= 0.35):
                     if evidence_id:
                         support.append(evidence_id)
-                    sources.add(self._source(row))
+                    if row.get("metadata", {}).get("current_operational_evidence", True):
+                        sources.add(self._source(row))
                 if evidence_id and any(token in text.lower() for token in ("healthy", "normal", "no errors", "recovered")) and overlap:
                     contradiction.append(evidence_id)
             supporting_rows = [row for row in evidence if str(row.get("evidence_id") or "") in set(support)]
@@ -321,7 +356,7 @@ class IterativeInvestigator:
                 and row.get("metadata", {}).get("current_operational_evidence", True)
             ]
             temporal_alignment = len(fresh_support) / max(1, len(supporting_rows))
-            topology_support = 1.0 if any(row.get("source_type") == "topology" for row in supporting_rows) else (
+            topology_support = 1.0 if any(row.get("source_type") in {"topology", "dependency"} for row in supporting_rows) else (
                 0.5 if len({str(row.get("service") or "") for row in supporting_rows if row.get("service")}) > 1 else 0.0
             )
             change_correlation = 1.0 if any(row.get("source_type") == "change" for row in supporting_rows) else 0.0
@@ -368,6 +403,7 @@ class IterativeInvestigator:
                 "penalties": scored.penalties,
                 "ceiling_reasons": list(scored.ceiling_reasons),
             }
+            hypothesis["confidence_components"] = scored.components
             hypothesis["status"] = (
                 "confirmed" if hypothesis["confidence"] >= self.conclusive_threshold and len(sources) >= 2
                 else "falsified" if hypothesis["confidence"] <= 0.15 and bool(contradiction)
@@ -467,7 +503,8 @@ class IterativeInvestigator:
             else:
                 status, stop_reason = InvestigationStatus.BUDGET_EXHAUSTED, "step_budget_exhausted"
         coverage = self._coverage(evidence)
-        missing = [source for source, count in coverage.items() if count == 0]
+        required_sources = self._required_sources(context)
+        missing = [source for source in required_sources if coverage.get(source, 0) == 0]
         leading = hypotheses[0] if hypotheses else None
         report = {
             "schema_version": "kaims.iterative-investigation.v1",

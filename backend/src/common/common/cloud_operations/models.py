@@ -4,6 +4,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID, uuid4
+from hashlib import sha256
+import json
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -248,6 +250,14 @@ class ServiceOnboardingProfile(BaseModel):
     escalation_policies: list[str] = Field(default_factory=list)
     hitl_policy: dict[str, Any] = Field(default_factory=dict)
     dependencies: list[str] = Field(default_factory=list)
+    resource_ids: list[str] = Field(default_factory=list)
+    topology: list[dict[str, Any]] = Field(default_factory=list)
+    approved_capabilities: list[str] = Field(default_factory=list)
+    prohibited_operations: list[str] = Field(default_factory=list)
+    maintenance_windows: list[dict[str, Any]] = Field(default_factory=list)
+    change_freeze_periods: list[dict[str, Any]] = Field(default_factory=list)
+    rollback_procedures: list[str] = Field(default_factory=list)
+    runbook_owners: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     actor: str = Field(default="system", max_length=255)
 
@@ -256,7 +266,139 @@ class ServiceOnboardingProfile(BaseModel):
     def onboarding_tenant_is_verified(cls, value: str) -> str:
         return require_tenant_id(value, source="cloud operations service onboarding")
 
-    @field_validator("owners", "support_groups", "connection_ids", "monitoring_sources", "log_sources", "metric_sources", "trace_sources", "event_sources", "change_sources", "knowledge_refs", "diagnostic_capabilities", "remediation_capabilities", "validation_rules", "escalation_policies", "dependencies")
+    @field_validator("owners", "support_groups", "connection_ids", "monitoring_sources", "log_sources", "metric_sources", "trace_sources", "event_sources", "change_sources", "knowledge_refs", "diagnostic_capabilities", "remediation_capabilities", "validation_rules", "escalation_policies", "dependencies", "resource_ids", "approved_capabilities", "prohibited_operations", "rollback_procedures", "runbook_owners")
     @classmethod
     def compact_string_list(cls, values: list[str]) -> list[str]:
         return [item for item in (str(value).strip() for value in values) if item]
+
+
+class PlanAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action_type: str = Field(min_length=1, max_length=128)
+    resource_id: str = Field(min_length=1, max_length=128)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    rollback_action: str | None = Field(default=None, max_length=128)
+
+
+class PlanCompileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    project_id: str = Field(min_length=1, max_length=128)
+    service_id: str = Field(min_length=1, max_length=128)
+    environment: str = Field(default="prod", min_length=1, max_length=64)
+    intent: str = Field(min_length=1, max_length=512)
+    actions: list[PlanAction] = Field(min_length=1, max_length=25)
+    actor: str = Field(default="system", max_length=255)
+
+    @field_validator("tenant_id")
+    @classmethod
+    def plan_tenant_is_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="cloud operations plan")
+
+
+class CompiledPlan(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    tenant_id: str
+    project_id: str
+    service_id: str
+    environment: str
+    intent: str
+    actions: list[PlanAction]
+    risk_level: Literal["low", "medium", "high", "critical"]
+    requires_approval: bool
+    checksum: str
+    status: Literal["compiled"] = "compiled"
+    compiled_by: str
+    compiled_at: datetime = Field(default_factory=utc_now)
+
+    @classmethod
+    def from_request(cls, request: PlanCompileRequest, *, risk_level: Literal["low", "medium", "high", "critical"]) -> "CompiledPlan":
+        canonical = {
+            "tenant_id": request.tenant_id,
+            "project_id": request.project_id,
+            "service_id": request.service_id,
+            "environment": request.environment,
+            "intent": request.intent,
+            "actions": [action.model_dump(mode="json") for action in request.actions],
+        }
+        checksum = sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return cls(**canonical, risk_level=risk_level, requires_approval=request.environment.lower() == "prod" or risk_level in {"high", "critical"}, checksum=checksum, compiled_by=request.actor)
+
+
+class SimulationGate(BaseModel):
+    gate: str
+    passed: bool
+    message: str
+
+
+class PlanSimulation(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    plan_id: UUID
+    tenant_id: str
+    verdict: Literal["passed", "blocked"]
+    gates: list[SimulationGate]
+    simulated_by: str
+    simulated_at: datetime = Field(default_factory=utc_now)
+
+
+class PlanApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tenant_id: str
+    checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    decision: Literal["approved", "rejected"]
+    reason: str = Field(min_length=1, max_length=1000)
+    actor: str = Field(min_length=1, max_length=255)
+
+    @field_validator("tenant_id")
+    @classmethod
+    def approval_tenant_is_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="cloud plan approval")
+
+
+class PlanExecutionResult(BaseModel):
+    execution_id: UUID
+    plan_id: UUID
+    status: Literal["succeeded", "failed", "rolled_back", "rollback_failed", "validation_failed"]
+    provider: ProviderType
+    action_results: list[dict[str, Any]] = Field(default_factory=list)
+    validation: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+
+
+class ExecutionPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tenant_id: str
+    project_id: str
+    environment: str = "prod"
+    allowed_providers: list[ProviderType] = Field(default_factory=lambda: [ProviderType.SIMULATOR])
+    allowed_actions: list[str] = Field(default_factory=list)
+    maximum_risk: Literal["low", "medium", "high", "critical"] = "high"
+    require_rollback: bool = True
+    require_maintenance_window: bool = True
+    enabled: bool = True
+    actor: str = "system"
+
+    @field_validator("tenant_id")
+    @classmethod
+    def policy_tenant_is_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="cloud execution policy")
+
+
+class MaintenanceWindow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tenant_id: str
+    project_id: str
+    environment: str = "prod"
+    starts_at: datetime
+    ends_at: datetime
+    reason: str = Field(min_length=1, max_length=512)
+    actor: str = "system"
+
+    @model_validator(mode="after")
+    def valid_window(self) -> "MaintenanceWindow":
+        self.tenant_id = require_tenant_id(self.tenant_id, source="cloud maintenance window")
+        if self.ends_at <= self.starts_at:
+            raise ValueError("maintenance window must end after it starts")
+        return self

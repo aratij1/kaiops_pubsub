@@ -184,9 +184,32 @@ class RcaReportRecord(Base, TimestampMixin):
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
-    root_cause: Mapped[str] = mapped_column(String(255))
-    impact: Mapped[str] = mapped_column(String(255))
+    root_cause: Mapped[str] = mapped_column(Text)
+    impact: Mapped[str] = mapped_column(Text)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class ValidationObservationRecord(Base):
+    __tablename__ = "validation_observations"
+    __table_args__ = (
+        Index("idx_validation_observations_incident_time", "tenant_id", "incident_id", "observed_at"),
+        Index("idx_validation_observations_validator_time", "tenant_id", "validator_id", "observed_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    report_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    remediation_action_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    validator_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    connector_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    target_resource_id: Mapped[str] = mapped_column(String(768), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    authoritative_source: Mapped[str] = mapped_column(String(255), nullable=False)
+    result_checksum: Mapped[str] = mapped_column(String(80), nullable=False)
+    passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class KnowledgeBaseRecord(Base, TimestampMixin):
@@ -861,7 +884,7 @@ class DiscoveryRunRecord(Base, TimestampMixin):
 class DiscoveredResourceRecord(Base, TimestampMixin):
     __tablename__ = "discovered_resources"
     __table_args__ = (
-        UniqueConstraint("tenant_id", "project_id", "provider_resource_id", name="uq_discovered_resources_provider_id"),
+        UniqueConstraint("tenant_id", "project_id", "provider_resource_key", name="uq_discovered_resources_provider_key"),
         Index("idx_discovered_resources_scope_type", "tenant_id", "project_id", "provider", "resource_type"),
         Index("idx_discovered_resources_service_env", "tenant_id", "service_id", "environment"),
         Index("idx_discovered_resources_status", "tenant_id", "project_id", "status"),
@@ -876,6 +899,7 @@ class DiscoveredResourceRecord(Base, TimestampMixin):
     provider_account_id: Mapped[str] = mapped_column(String(255), index=True)
     region: Mapped[str] = mapped_column(String(128), index=True)
     provider_resource_id: Mapped[str] = mapped_column(String(768))
+    provider_resource_key: Mapped[str] = mapped_column(String(64))
     resource_type: Mapped[str] = mapped_column(String(128), index=True)
     display_name: Mapped[str] = mapped_column(String(255), index=True)
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
@@ -1001,6 +1025,125 @@ class CloudAuditEventRecord(Base):
     resource_id: Mapped[str] = mapped_column(String(255), index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class CloudCompiledPlanRecord(Base):
+    __tablename__ = "cloud_compiled_plans"
+    __table_args__ = (Index("idx_cloud_plan_scope", "tenant_id", "project_id", "service_id", "environment"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    service_id: Mapped[str] = mapped_column(String(128), index=True)
+    environment: Mapped[str] = mapped_column(String(64), index=True)
+    intent: Mapped[str] = mapped_column(String(512))
+    actions: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    risk_level: Mapped[str] = mapped_column(String(32), index=True)
+    requires_approval: Mapped[bool] = mapped_column(Boolean, default=True)
+    checksum: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="compiled", index=True)
+    compiled_by: Mapped[str] = mapped_column(String(255), index=True)
+    compiled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class CloudPlanSimulationRecord(Base):
+    __tablename__ = "cloud_plan_simulations"
+    __table_args__ = (Index("idx_cloud_simulation_plan", "tenant_id", "plan_id", "simulated_at"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    plan_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    verdict: Mapped[str] = mapped_column(String(32), index=True)
+    gates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    simulated_by: Mapped[str] = mapped_column(String(255), index=True)
+    simulated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class CloudPlanApprovalRecord(Base):
+    __tablename__ = "cloud_plan_approvals"
+    __table_args__ = (UniqueConstraint("tenant_id", "plan_id", "checksum", name="uq_cloud_plan_approval_binding"),)
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    plan_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    checksum: Mapped[str] = mapped_column(String(64), index=True)
+    decision: Mapped[str] = mapped_column(String(32), index=True)
+    reason: Mapped[str] = mapped_column(String(1000))
+    actor: Mapped[str] = mapped_column(String(255), index=True)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class CloudPlanExecutionRecord(Base):
+    __tablename__ = "cloud_plan_executions"
+    __table_args__ = (UniqueConstraint("tenant_id", "idempotency_key", name="uq_cloud_execution_lease"),)
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    plan_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    checksum: Mapped[str] = mapped_column(String(64), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), index=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="leased")
+    action_results: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    validation: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text)
+    actor: Mapped[str] = mapped_column(String(255), index=True)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class CloudExecutionPolicyRecord(Base, TimestampMixin):
+    __tablename__ = "cloud_execution_policies"
+    __table_args__ = (UniqueConstraint("tenant_id", "project_id", "environment", name="uq_cloud_execution_policy_scope"),)
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    environment: Mapped[str] = mapped_column(String(64), index=True)
+    allowed_providers: Mapped[list[str]] = mapped_column(JSON, default=list)
+    allowed_actions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    maximum_risk: Mapped[str] = mapped_column(String(32), default="high")
+    require_rollback: Mapped[bool] = mapped_column(Boolean, default=True)
+    require_maintenance_window: Mapped[bool] = mapped_column(Boolean, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    actor: Mapped[str] = mapped_column(String(255), index=True)
+
+
+class CloudMaintenanceWindowRecord(Base):
+    __tablename__ = "cloud_maintenance_windows"
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    environment: Mapped[str] = mapped_column(String(64), index=True)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    reason: Mapped[str] = mapped_column(String(512))
+    actor: Mapped[str] = mapped_column(String(255), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class CloudCredentialSessionRecord(Base):
+    __tablename__ = "cloud_credential_sessions"
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    execution_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    credential_ref: Mapped[str] = mapped_column(String(512))
+    scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class CloudCompensationRecord(Base):
+    __tablename__ = "cloud_compensations"
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    execution_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    resource_id: Mapped[str] = mapped_column(String(128), index=True)
+    rollback_action: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class JiraTicketLinkRecord(Base, TimestampMixin):

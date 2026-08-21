@@ -2,6 +2,19 @@
   "version": "connectors-v2",
   "last_reviewed": "2026-07-22",
   "default_connector": "kaiops-api",
+  "auto_onboarding": {
+    "enabled": true,
+    "template_connector": "generic-api",
+    "requires_reusable_playbook": true,
+    "allowed_operations": [
+      "read_status",
+      "read_metrics",
+      "script_execution",
+      "restart_service",
+      "verify_slo",
+      "verify_service_health"
+    ]
+  },
   "connection_policy": {
     "live_execution_requires_secret_ref": true,
     "dry_run_default": true,

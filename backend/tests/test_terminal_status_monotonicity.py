@@ -65,6 +65,7 @@ async def test_late_action_and_event_cannot_regress_closed_projection(sqlite_ses
             event_type="incident.closure.completed",
         ))
         await repo.save_action(RemediationAction(
+            tenant_id="tenant-a",
             incident_id=incident_id,
             action_type="diagnostic_completion",
             target="checkout",
@@ -112,6 +113,7 @@ async def test_diagnostic_stage_summary_omits_inapplicable_approval(sqlite_sessi
                 event_type=event_type,
             ))
         await repo.save_action(RemediationAction(
+            tenant_id="tenant-a",
             incident_id=incident_id,
             action_type="diagnostic_completion",
             target="checkout",

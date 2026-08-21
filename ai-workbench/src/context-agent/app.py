@@ -22,6 +22,7 @@ from common.models import Alert, Incident
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app
+from common.tenant_identity import require_tenant_id
 from common.telemetry import (
     CONTEXT_KNOWLEDGE_OPERATIONS,
     CONTEXT_KNOWLEDGE_REUSE_COUNT,
@@ -107,7 +108,7 @@ def _has_code_evidence(context: Context) -> bool:
 def _context_identity(alert: Alert) -> tuple[str, str, str, str]:
     metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
     labels = alert.labels if isinstance(alert.labels, dict) else {}
-    tenant_id = str(metadata.get("tenant_id") or labels.get("tenant_id") or "default").strip() or "default"
+    tenant_id = require_tenant_id(alert.tenant_id, source="context alert identity")
     service = str(alert.service or "unknown").strip().lower() or "unknown"
     environment = str(alert.environment or labels.get("environment") or "prod").strip().lower() or "prod"
     # Alert type identity must not include deployment-specific labels. A pod,
@@ -302,7 +303,7 @@ async def _collect_context_with_strategy_unlocked(
         CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "unavailable").inc()
 
     if strategy == "historical":
-        context = Context(incident_id=incident.id, alert=alert)
+        context = Context(tenant_id=tenant_id, incident_id=incident.id, alert=alert)
         context.metadata = {
             "context_strategy": "historical",
             "context_source": "historical_cache_miss",
@@ -938,7 +939,9 @@ class KnowledgePackRequest(BaseModel):
 
 class KnowledgePackApproveRequest(KnowledgePackRequest):
     accepted_facts: dict[str, Any] = Field(default_factory=dict)
-    approved_by: str | None = Field(default=None, max_length=160)
+    tenant_id: str = Field(min_length=1, max_length=128)
+    approved_by: str = Field(min_length=1, max_length=160)
+    approval_expires_at: datetime
 
 
 def vector_connector() -> VectorDBConnector:
@@ -1798,12 +1801,19 @@ async def approve_knowledge_pack(request: KnowledgePackApproveRequest) -> dict[s
     rag_request = _knowledge_pack_to_rag_request(pack, request.approved_by)
     result = write_rag_document(rag_request)
     runbook_id = str(uuid5(NAMESPACE_URL, rag_request.content))
+    checksum = f"sha256:{hashlib.sha256(rag_request.content.encode('utf-8')).hexdigest()}"
     governance = {"runbook_id": runbook_id, "version": 1, "status": "approved"}
     if settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
         async with app.state.session_factory() as session:
             governance = await IncidentRepository(session).approve_runbook_version(
                 runbook_id=runbook_id, version=1, approved_by=request.approved_by,
-                payload={"rag_document": result, "knowledge_pack": pack},
+                tenant_id=require_tenant_id(request.tenant_id, source="knowledge pack approval"),
+                payload={
+                    "rag_document": result,
+                    "knowledge_pack": pack,
+                    "checksum_sha256": checksum,
+                    "approval_expires_at": request.approval_expires_at.isoformat(),
+                },
             )
             await session.commit()
     return {"status": "approved", "knowledge_pack": pack, "rag_document": result, "runbook_governance": governance}
@@ -1906,16 +1916,23 @@ async def sync_rag_index() -> dict[str, Any]:
 @app.get("/rag/search")
 async def search_rag(
     query: str,
+    tenant_id: str,
     limit: int = 8,
     kind: str | None = None,
     service: str | None = None,
 ) -> dict[str, Any]:
+    tenant_id = require_tenant_id(tenant_id, source="RAG search identity")
     matches = vector_connector().search(
         query,
         limit=max(1, min(limit, 20)),
         preferred_kind=kind,
         service=service,
     )
+    matches = [
+        match for match in matches
+        if str(match.get("tenant_id") or "").strip() == tenant_id
+        or str(match.get("tenant_scope") or "").strip().lower() == "global"
+    ]
     return {
         "query": query,
         "index": vector_connector().index_info(),

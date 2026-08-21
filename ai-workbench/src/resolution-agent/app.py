@@ -27,6 +27,7 @@ from common.rabbitmq import consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import CONTEXT_KNOWLEDGE_OPERATIONS, EVENTS_PROCESSED
+from common.tenant_identity import require_tenant_id
 from common.topics import CONTEXT_EVENTS, RESOLUTION_EVENTS
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -176,6 +177,7 @@ async def _resolve_context(context: Context) -> Recommendation:
         return await agent.resolve_with_runtime(context)
     recommendation = cached_recommendation.model_copy(
         update={
+            "tenant_id": context.tenant_id,
             "id": _deterministic_recommendation_id(context),
             "created_at": datetime.now(UTC),
             "incident_id": context.incident_id,
@@ -375,6 +377,11 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
     metadata["execution_plan"] = plan
     metadata["remediation_target"] = str(plan.get("remediation_target") or context.alert.service or "")
     metadata["recommended_commands"] = list(plan.get("commands") or [])
+    metadata["runbook_id"] = str(plan.get("runbook_governance_id") or "")
+    metadata["runbook_slug"] = str(plan.get("playbook_id") or "")
+    metadata["runbook_version"] = plan.get("playbook_version")
+    metadata["runbook_status"] = str(plan.get("runbook_status") or "")
+    metadata["runbook_checksum"] = str(plan.get("runbook_checksum") or "")
     routing = decision if isinstance(decision, dict) else {}
     requires_approval = bool(routing.get("requires_approval", plan.get("requires_approval", True)))
     control = decide_resolution_control(
@@ -410,7 +417,7 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
         "skipped_stages": skipped,
     }
     metadata["resolution_lifecycle"] = create_lifecycle(
-        tenant_id=str(getattr(context, "tenant_id", None) or "default"),
+        tenant_id=context.tenant_id,
         incident_id=recommendation.incident_id,
         recommendation_id=recommendation.id,
         plan=plan,
@@ -504,7 +511,7 @@ async def _persist_resolution_event(
                     "parent_event_id": None,
                 },
                 scope={
-                    "tenant_id": "default",
+                    "tenant_id": context.tenant_id,
                     "service": str(context.alert.service or "unknown"),
                     "environment": str(context.alert.environment or "prod"),
                     "region": None,
@@ -592,7 +599,7 @@ async def _persist_resolution_event(
         for sequence, (previous_state, new_state, reason_code) in enumerate(transition_path, 1):
             event_id = uuid5(NAMESPACE_URL, f"kaims:resolution-transition:{recommendation.id}:{sequence}:{new_state.value}")
             transition_payload = {
-                "tenant_id": str(getattr(context, "tenant_id", None) or "default"),
+                "tenant_id": context.tenant_id,
                 "incident_id": str(incident.id),
                 "recommendation_id": str(recommendation.id),
                 "execution_plan_id": None,
@@ -683,7 +690,7 @@ async def startup(app: FastAPI) -> None:
         if settings.database_enabled:
             async with app.state.session_factory() as session:
                 repo = IncidentRepository(session)
-                await repo.save_recommendation_as_audit(recommendation)
+                await repo.save_recommendation_as_audit(recommendation, tenant_id=context.tenant_id)
                 await session.commit()
         await _persist_resolution_event(
             app=app,
@@ -715,6 +722,7 @@ app = create_app(title="KaiMS Resolution Intelligence Agent", settings=settings,
 
 
 class ResolutionCatalogRequest(BaseModel):
+    tenant_id: str
     issue: str
     service: str = "unknown"
     recommended_action: str = ""
@@ -728,7 +736,8 @@ class ResolutionSelectionRequest(BaseModel):
 
 
 @app.get("/investigations/{incident_id}")
-async def latest_investigation(incident_id: str, tenant_id: str = "default") -> dict[str, Any]:
+async def latest_investigation(incident_id: str, tenant_id: str) -> dict[str, Any]:
+    tenant_id = require_tenant_id(tenant_id, source="investigation query")
     if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
         raise HTTPException(status_code=503, detail="investigation persistence is unavailable")
     async with app.state.session_factory() as session:
@@ -845,6 +854,7 @@ async def reconsider_execution(request: ExecutionFailureRequest) -> dict[str, An
 
 @app.post("/resolution-catalog/relevant")
 async def resolution_catalog(request: ResolutionCatalogRequest) -> dict[str, Any]:
+    tenant_id = require_tenant_id(request.tenant_id, source="resolution catalog request")
     rows = relevant_resolutions(
         issue=request.issue, service=request.service, recommended_action=request.recommended_action
     )
@@ -856,7 +866,7 @@ async def resolution_catalog(request: ResolutionCatalogRequest) -> dict[str, Any
             part for part in (request.issue, request.service, request.recommended_action, "remediation runbook") if part
         ).strip()
         try:
-            cache_key = " ".join(query.lower().split())
+            cache_key = f"{tenant_id}:" + " ".join(query.lower().split())
             cached = _GLOBAL_KNOWLEDGE_CACHE.get(cache_key)
             if cached and monotonic() - cached[0] < _GLOBAL_KNOWLEDGE_CACHE_TTL_SECONDS:
                 matches = cached[1]
@@ -865,7 +875,7 @@ async def resolution_catalog(request: ResolutionCatalogRequest) -> dict[str, Any
                 async with httpx.AsyncClient(timeout=httpx.Timeout(12.0)) as client:
                     response = await client.get(
                         f"{settings.context_agent_url.rstrip('/')}/rag/search",
-                        params={"query": query, "limit": 6, "kind": "runbook"},
+                        params={"query": query, "limit": 6, "kind": "runbook", "tenant_id": tenant_id},
                     )
                     response.raise_for_status()
                     payload_matches = response.json().get("matches", [])

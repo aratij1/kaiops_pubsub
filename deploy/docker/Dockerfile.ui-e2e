@@ -1,10 +1,16 @@
 ARG UI_TEST_DEPS_IMAGE=kaiops-ui-test:latest
 FROM ${UI_TEST_DEPS_IMAGE} AS ui-deps
 
-FROM mcr.microsoft.com/playwright:v1.62.1-jammy
+# Keep this tag aligned with frontend/react/package-lock.json. The dependency
+# image is built from the same lockfile by Dockerfile.ui. A linked copy of only
+# node_modules makes this build deterministic and registry-independent without
+# copying build output or stale source from that image.
+FROM mcr.microsoft.com/playwright:v1.61.1-jammy
 
 WORKDIR /app
 
-COPY --from=ui-deps /app/ /app/
+COPY frontend/react/package.json frontend/react/package-lock.json ./
+COPY --link --from=ui-deps /app/node_modules/ ./node_modules/
+COPY frontend/react/ ./
 
 CMD ["npm", "run", "test:e2e"]

@@ -3,7 +3,6 @@ import react from "@vitejs/plugin-react";
 
 const apiGatewayTarget = process.env.KAIMS_DEV_API_GATEWAY || "http://localhost:8010";
 const monitoringTarget = process.env.KAIMS_DEV_MONITORING_ADAPTER || "http://localhost:8001";
-const approvalTarget = process.env.KAIMS_DEV_APPROVAL_SERVICE || "http://localhost:8007";
 
 export default defineConfig({
   plugins: [react()],
@@ -48,11 +47,6 @@ export default defineConfig({
         target: monitoringTarget,
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/monitoring-adapter/, ""),
-      },
-      "/approval-service": {
-        target: approvalTarget,
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/approval-service/, ""),
       },
     },
   },

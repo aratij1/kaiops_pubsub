@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from api_gateway.control_routes import build_control_router
+from api_gateway.modules.users.permissions import AuthContext
 
 
 class _AuditEvent:
@@ -78,3 +79,85 @@ def test_control_router_owns_the_complete_remediation_gateway_surface() -> None:
         "/context/strategy",
         "/context/snapshots/{incident_id}",
     }.issubset(paths)
+
+
+def _manual_closure_test_app(*, role: str = "Administrator") -> tuple[FastAPI, dict[str, object]]:
+    captured: dict[str, object] = {}
+
+    async def guarded_proxy(**kwargs):
+        captured.update(kwargs)
+        return {"status": "closed"}
+
+    async def auth_context(_request):
+        return AuthContext(
+            user_id="user-1",
+            role=role,
+            tenant_id="tenant-a",
+            jwt_id="jwt-1",
+            session_jti="session-1",
+            token_type="access",
+            email="reviewer@example.com",
+        )
+
+    async def unused_proxy(**_kwargs):
+        raise AssertionError("raw proxy should not be called")
+
+    async def load_summary() -> dict[str, int]:
+        return {}
+
+    app = FastAPI()
+    app.include_router(build_control_router(
+        settings=SimpleNamespace(closure_service_url="http://closure-service:8000"),
+        guarded_proxy=guarded_proxy,
+        raw_proxy=unused_proxy,
+        trace_id_from_header=lambda value: value or "test-trace",
+        analyzer=SimpleNamespace(),
+        load_recent_events=lambda _limit: [],
+        build_audit_contract=lambda _event: {},
+        load_audit_summary=load_summary,
+        auth_context_from_request=auth_context,
+    ))
+    return app, captured
+
+
+def test_manual_closure_derives_identity_and_tenant_from_auth_context() -> None:
+    app, captured = _manual_closure_test_app()
+
+    response = TestClient(app).post(
+        "/incidents/incident%20one/manual-close",
+        json={"comment": "Reviewed evidence and accepted the operational risk."},
+    )
+
+    assert response.status_code == 200
+    assert captured["path"] == "/incidents/incident%20one/manual-close"
+    assert captured["payload"] == {
+        "comment": "Reviewed evidence and accepted the operational risk.",
+        "actor_id": "reviewer@example.com",
+        "actor_role": "Administrator",
+        "tenant_id": "tenant-a",
+        "auth_jti": "jwt-1",
+    }
+
+
+def test_manual_closure_rejects_spoofed_identity_fields() -> None:
+    app, captured = _manual_closure_test_app()
+
+    response = TestClient(app).post(
+        "/incidents/incident-1/manual-close",
+        json={"comment": "Reviewed evidence and accepted the operational risk.", "closed_by": "attacker"},
+    )
+
+    assert response.status_code == 422
+    assert captured == {}
+
+
+def test_manual_closure_rejects_unauthorized_role() -> None:
+    app, captured = _manual_closure_test_app(role="L1 Operator")
+
+    response = TestClient(app).post(
+        "/incidents/incident-1/manual-close",
+        json={"comment": "Reviewed evidence and accepted the operational risk."},
+    )
+
+    assert response.status_code == 403
+    assert captured == {}

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 from collections.abc import Awaitable, Callable, Coroutine
 import logging
 from datetime import datetime, timedelta, timezone
@@ -20,7 +23,8 @@ from common.repository import IncidentRepository
 from common.service import create_app
 from common.topics import APPROVAL_EVENTS, RESOLUTION_EVENTS
 from common.tenant_identity import require_tenant_id
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 
@@ -35,6 +39,10 @@ PENDING_INCIDENTS: dict[str, dict] = {}
 _HIGH_RISK_SEVERITIES = {"high", "critical"}
 _NON_HUMAN_APPROVERS = {"", "system", "rca-agent", "automation-agent", "orchestrator"}
 logger = logging.getLogger("kaiops.approval_service")
+
+
+def _pending_key(tenant_id: str, incident_id: Any) -> str:
+    return f"{require_tenant_id(tenant_id, source='approval cache identity')}:{str(incident_id)}"
 
 
 def _looks_like_uuid(value: Any) -> bool:
@@ -98,6 +106,53 @@ def _recommendation_id_from_repository_payload(payload: Any) -> str:
     return ""
 
 
+def _signed_approval_readiness(context: dict[str, Any]) -> dict[str, Any]:
+    recommendation = context.get("recommendation") if isinstance(context.get("recommendation"), dict) else {}
+    metadata = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
+    plan = metadata.get("execution_plan") if isinstance(metadata.get("execution_plan"), dict) else {}
+    quality = metadata.get("evidence_quality") if isinstance(metadata.get("evidence_quality"), dict) else {}
+    policy = plan.get("policy_decision") if isinstance(plan.get("policy_decision"), dict) else {}
+    profile = metadata.get("connection_profile") if isinstance(metadata.get("connection_profile"), dict) else {}
+    rollback = plan.get("rollback_commands") if isinstance(plan.get("rollback_commands"), list) else []
+    validators = plan.get("validators") if isinstance(plan.get("validators"), list) else []
+    checks = {
+        "approved_runbook": str(metadata.get("runbook_status") or plan.get("runbook_status") or "").lower() == "approved",
+        "valid_plan": bool(plan.get("plan_id") and plan.get("plan_fingerprint") and verify_plan_fingerprint(plan)),
+        "governed_target": bool(plan.get("target_resource_id") or plan.get("remediation_target")),
+        "available_connector": bool(plan.get("connector_id") or profile.get("connector_id") or profile.get("executor_type")),
+        "current_credentials": bool(profile.get("credential_ref") or profile.get("secret_ref") or metadata.get("credential_ref")),
+        "required_validators": bool(validators),
+        "rollback_readiness": str(plan.get("rollback_mode") or "").lower() == "not_applicable" or bool(rollback),
+        "policy_acceptance": str(policy.get("decision") or metadata.get("policy_decision") or "").lower() in {"allow", "approved", "accept"},
+        "evidence_threshold": (
+            float(quality.get("evidence_coverage") or 0.0) >= 0.85
+            and float(quality.get("citation_coverage") or 0.0) > 0.0
+            and quality.get("evidence_fresh") is not False
+            and int(quality.get("conflict_count") or quality.get("contradiction_count") or 0) == 0
+        ),
+    }
+    signing_key = str(settings.service_internal_token or "").strip()
+    if not signing_key:
+        checks["readiness_signing_key"] = False
+    missing = [name for name, passed in checks.items() if not passed]
+    issued_at = datetime.now(timezone.utc).isoformat()
+    material = {
+        "tenant_id": str(context.get("tenant_id") or recommendation.get("tenant_id") or ""),
+        "incident_id": str(context.get("incident_id") or recommendation.get("incident_id") or ""),
+        "recommendation_id": _first_recommendation_id(context, recommendation),
+        "plan_id": str(plan.get("plan_id") or ""),
+        "plan_fingerprint": str(plan.get("plan_fingerprint") or ""),
+        "state": "execution_eligible" if not missing else "blocked",
+        "checks": checks,
+        "missing": missing,
+        "issued_at": issued_at,
+    }
+    canonical = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    decision_id = hashlib.sha256(canonical.encode()).hexdigest()
+    signature = hmac.new(signing_key.encode(), canonical.encode(), hashlib.sha256).hexdigest() if signing_key else ""
+    return {**material, "decision_id": decision_id, "signature": f"hmac-sha256:{signature}" if signature else ""}
+
+
 async def startup(app: FastAPI) -> None:
     workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
     consumers: list[tuple[str, Any, ConsumeRunner]] = []
@@ -115,12 +170,17 @@ async def startup(app: FastAPI) -> None:
     async def handle(payload: dict) -> None:
         incident_id = str(payload["recommendation"]["incident_id"])
         recommendation = payload.get("recommendation", {}) if isinstance(payload.get("recommendation"), dict) else {}
+        tenant_id = require_tenant_id(
+            recommendation.get("tenant_id") or payload.get("tenant_id") or (payload.get("incident") or {}).get("tenant_id"),
+            source="resolution approval event",
+        )
+        cache_key = _pending_key(tenant_id, incident_id)
         metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
         control = metadata.get("resolution_control", {}) if isinstance(metadata.get("resolution_control"), dict) else {}
         if control.get("disposition") in {"watch_only", "investigate", "execution_ready"}:
-            PENDING_INCIDENTS.pop(incident_id, None)
+            PENDING_INCIDENTS.pop(cache_key, None)
             return
-        PENDING_INCIDENTS[incident_id] = payload
+        PENDING_INCIDENTS[cache_key] = payload
 
     for source, consumer, consume_forever in consumers:
         task = asyncio.create_task(consume_forever(consumer, handle), name=f"approval-service-{source}-consumer")
@@ -133,6 +193,19 @@ async def shutdown(_: FastAPI) -> None:
 
 
 app = create_app(title="KaiMS Approval Service", settings=settings, startup=startup, shutdown=shutdown)
+
+
+@app.middleware("http")
+async def require_internal_mutation_auth(request: Request, call_next):
+    if request.method.upper() not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return await call_next(request)
+    expected_token = settings.service_internal_token
+    if not expected_token:
+        return JSONResponse(status_code=503, content={"detail": "Internal service authentication is not configured"})
+    supplied_token = str(request.headers.get("x-kaiops-internal-token") or "")
+    if not hmac.compare_digest(supplied_token, expected_token):
+        return JSONResponse(status_code=403, content={"detail": "Internal service authentication failed"})
+    return await call_next(request)
 
 
 class ApprovalRequest(BaseModel):
@@ -405,7 +478,8 @@ async def _approval_from_request(
 async def _load_approval_context(incident_id: UUID, *, tenant_id: str) -> dict[str, Any]:
     normalized_incident_id = str(incident_id)
     normalized_tenant = require_tenant_id(tenant_id, source="approval request identity")
-    memory_payload = PENDING_INCIDENTS.get(normalized_incident_id)
+    cache_key = _pending_key(normalized_tenant, normalized_incident_id)
+    memory_payload = PENDING_INCIDENTS.get(cache_key)
     if isinstance(memory_payload, dict):
         recommendation = memory_payload.get("recommendation")
         metadata = recommendation.get("metadata") if isinstance(recommendation, dict) else {}
@@ -416,6 +490,10 @@ async def _load_approval_context(incident_id: UUID, *, tenant_id: str) -> dict[s
                 return memory_payload
             if plan_tenant:
                 raise HTTPException(status_code=403, detail="Approval tenant does not match the execution plan tenant.")
+    elif any(key.endswith(f":{normalized_incident_id}") for key in PENDING_INCIDENTS):
+        # Deliberately indistinguishable from a missing incident for callers in
+        # another tenant.
+        raise HTTPException(status_code=404, detail="No tenant-scoped incident exists for this approval.")
 
     if not settings.database_enabled:
         return memory_payload if isinstance(memory_payload, dict) else {}
@@ -449,13 +527,14 @@ async def _load_approval_context(incident_id: UUID, *, tenant_id: str) -> dict[s
     )
     if isinstance(recommendation, dict):
         restored["recommendation"] = recommendation
-    PENDING_INCIDENTS[normalized_incident_id] = restored
+    PENDING_INCIDENTS[cache_key] = restored
     return restored
 
 
 async def _resolve_recommendation_id(incident_id: UUID, *, tenant_id: str) -> UUID:
     normalized_incident_id = str(incident_id)
-    memory_payload = PENDING_INCIDENTS.get(normalized_incident_id)
+    normalized_tenant = require_tenant_id(tenant_id, source="approval recommendation identity")
+    memory_payload = PENDING_INCIDENTS.get(_pending_key(normalized_tenant, normalized_incident_id))
     token = _first_recommendation_id(memory_payload)
     if token:
         return UUID(token)
@@ -485,12 +564,13 @@ async def _resolve_recommendation_id(incident_id: UUID, *, tenant_id: str) -> UU
 
 
 @app.get("/incident/{incident_id}")
-async def get_incident(incident_id: str) -> dict:
+async def get_incident(incident_id: str, tenant_id: str = Query(min_length=1, max_length=128)) -> dict:
     normalized_incident_id = str(incident_id or "").strip()
+    normalized_tenant = require_tenant_id(tenant_id, source="approval incident query")
     if not normalized_incident_id:
         return {"incident_id": incident_id, "status": "unknown"}
 
-    memory_payload = PENDING_INCIDENTS.get(normalized_incident_id)
+    memory_payload = PENDING_INCIDENTS.get(_pending_key(normalized_tenant, normalized_incident_id))
     if isinstance(memory_payload, dict):
         memory_payload.setdefault("incident_id", normalized_incident_id)
 
@@ -498,9 +578,9 @@ async def get_incident(incident_id: str) -> dict:
         try:
             async with app.state.session_factory() as session:
                 repo = IncidentRepository(session)
-                incident = await repo.get_incident(normalized_incident_id)
+                incident = await repo.get_incident(normalized_incident_id, tenant_id=normalized_tenant)
                 pending = await repo.get_pending_workflow(normalized_incident_id)
-                recommendation = await repo.get_latest_recommendation_for_incident(normalized_incident_id)
+                recommendation = await repo.get_latest_recommendation_for_incident(normalized_incident_id, tenant_id=normalized_tenant)
                 if isinstance(recommendation, dict):
                     memory_payload = {
                         **(memory_payload if isinstance(memory_payload, dict) else {}),
@@ -572,6 +652,8 @@ def _build_incident_context(base_payload: dict[str, Any], pending_workflow: dict
     if incident_id:
         context["incident_id"] = incident_id
 
+    context["approval_readiness"] = _signed_approval_readiness(context)
+
     return context
 
 
@@ -579,10 +661,11 @@ async def _store_and_publish(approval: Approval) -> None:
     _attach_policy_metadata(approval)
     _enforce_high_risk_human_gate(approval)
     incident_id = str(approval.incident_id)
-    pending_context = PENDING_INCIDENTS.get(incident_id, {})
+    cache_key = _pending_key(approval.tenant_id, incident_id)
+    pending_context = PENDING_INCIDENTS.get(cache_key, {})
     if not isinstance(pending_context, dict):
         pending_context = {}
-    PENDING_INCIDENTS[incident_id] = {
+    PENDING_INCIDENTS[cache_key] = {
         **pending_context,
         "approval": approval.model_dump(mode="json"),
     }
@@ -590,7 +673,7 @@ async def _store_and_publish(approval: Approval) -> None:
         async with app.state.session_factory() as session:
             repo = IncidentRepository(session)
             await repo.save_approval(approval)
-            pending = PENDING_INCIDENTS.get(incident_id, {})
+            pending = PENDING_INCIDENTS.get(cache_key, {})
             recommendation = pending.get("recommendation", {}) if isinstance(pending.get("recommendation"), dict) else {}
             decision = pending.get("decision", {}) if isinstance(pending.get("decision"), dict) else {}
             recommendation_id = str(approval.recommendation_id)
@@ -698,7 +781,7 @@ def _publish_evaluation_feedback(approval: Approval) -> None:
 
 def _build_approval_event_payload(approval: Approval) -> dict[str, Any]:
     incident_id = str(approval.incident_id)
-    pending = PENDING_INCIDENTS.get(incident_id, {})
+    pending = PENDING_INCIDENTS.get(_pending_key(approval.tenant_id, incident_id), {})
     recommendation = pending.get("recommendation", {}) if isinstance(pending.get("recommendation"), dict) else {}
     decision = pending.get("decision", {}) if isinstance(pending.get("decision"), dict) else {}
     incident = pending.get("incident", {}) if isinstance(pending.get("incident"), dict) else {}
@@ -765,8 +848,8 @@ def _build_approval_event_payload(approval: Approval) -> dict[str, Any]:
     }
 
 
-def _pending_severity_for_incident(incident_id: str) -> str:
-    payload = PENDING_INCIDENTS.get(incident_id, {})
+def _pending_severity_for_incident(tenant_id: str, incident_id: str) -> str:
+    payload = PENDING_INCIDENTS.get(_pending_key(tenant_id, incident_id), {})
     if not isinstance(payload, dict):
         return ""
 
@@ -784,7 +867,7 @@ def _pending_severity_for_incident(incident_id: str) -> str:
 
 
 def _attach_policy_metadata(approval: Approval) -> None:
-    payload = PENDING_INCIDENTS.get(str(approval.incident_id), {})
+    payload = PENDING_INCIDENTS.get(_pending_key(approval.tenant_id, approval.incident_id), {})
     if not isinstance(payload, dict):
         return
 
@@ -814,7 +897,7 @@ def _attach_policy_metadata(approval: Approval) -> None:
 
 
 def _enforce_high_risk_human_gate(approval: Approval) -> None:
-    severity = _pending_severity_for_incident(str(approval.incident_id))
+    severity = _pending_severity_for_incident(approval.tenant_id, str(approval.incident_id))
     if severity not in _HIGH_RISK_SEVERITIES:
         return
 

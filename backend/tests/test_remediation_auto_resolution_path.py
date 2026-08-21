@@ -396,7 +396,7 @@ def test_build_auto_approval_preserves_catalog_execution_contract() -> None:
 def test_policy_blocked_action_displays_service_target_not_incident_uuid() -> None:
     module = load_remediation_app_module()
     payload = {
-        "incident": {"service": "payments"},
+        "incident": {"service": "payments", "tenant_id": "tenant-a"},
         "recommendation": {
             "id": "22222222-2222-2222-2222-222222222222",
             "incident_id": "11111111-1111-1111-1111-111111111111",
@@ -602,7 +602,7 @@ def test_diagnostic_completion_waits_for_closure_owner() -> None:
         approver="system-auto-approval",
         metadata={
             "resolution_lifecycle": module.create_lifecycle(
-                tenant_id="default",
+                tenant_id="tenant-a",
                 incident_id="11111111-1111-1111-1111-111111111111",
                 recommendation_id="22222222-2222-2222-2222-222222222222",
                 plan={"plan_kind": "diagnostic"},
@@ -626,7 +626,7 @@ def test_diagnostic_completion_rebases_stale_executable_lifecycle() -> None:
     incident_id = "11111111-1111-1111-1111-111111111111"
     recommendation_id = "22222222-2222-2222-2222-222222222222"
     stale_lifecycle = module.create_lifecycle(
-        tenant_id="default",
+        tenant_id="tenant-a",
         incident_id=incident_id,
         recommendation_id=recommendation_id,
         plan={"execution_ready": True, "commands": ["kubectl rollout restart deployment/api"]},
@@ -709,6 +709,7 @@ def test_build_policy_blocked_action_returns_approval_wait_state() -> None:
         "recommendation": {
             "id": "22222222-2222-2222-2222-222222222222",
             "incident_id": "11111111-1111-1111-1111-111111111111",
+            "tenant_id": "tenant-a",
         }
     }
 

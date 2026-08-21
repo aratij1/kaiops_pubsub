@@ -61,6 +61,47 @@ class ApprovalPolicy(BaseModel):
     approval_expiry_seconds: int = Field(default=900, ge=60, le=86400)
 
 
+ValidatorKind = Literal[
+    "availability", "alert_clearance", "error_rate", "latency", "dependency_health",
+    "critical_alerts", "business_transaction", "data_integrity", "database_replication", "queue_lag",
+]
+EvaluationOperator = Literal["eq", "ne", "lt", "lte", "gt", "gte", "contains", "not_contains"]
+
+
+class ValidatorSpec(BaseModel):
+    """Immutable reference to an onboarded validator; never an arbitrary URL."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    validator_id: str
+    tenant_id: str
+    connector_id: str
+    target_resource_id: str
+    kind: ValidatorKind
+    check_reference: str
+    expected_condition: str
+    evaluation_operator: EvaluationOperator
+    threshold: float | str | bool
+    observation_window_seconds: int = Field(ge=0, le=86400)
+    minimum_sample_count: int = Field(ge=1, le=10000)
+    timeout_seconds: int = Field(ge=1, le=300)
+    authoritative_source: str
+    onboarding_registry_reference: str
+
+    @field_validator(
+        "validator_id", "connector_id", "target_resource_id", "check_reference",
+        "expected_condition", "authoritative_source", "onboarding_registry_reference",
+    )
+    @classmethod
+    def require_validator_identity(cls, value: str, info: Any) -> str:
+        return _required_text(value, field=info.field_name)
+
+    @field_validator("tenant_id")
+    @classmethod
+    def require_validator_tenant(cls, value: str) -> str:
+        return require_tenant_id(value, source="validator registry identity")
+
+
 class ExecutionPlanV2(BaseModel):
     """Canonical execution plan; flat command fields are temporary v1 consumer projections."""
 
@@ -113,6 +154,7 @@ class ExecutionPlanV2(BaseModel):
     commands: list[str] = Field(default_factory=list)
     validation_commands: list[str] = Field(default_factory=list)
     validation_endpoints: list[dict[str, Any]] = Field(default_factory=list)
+    validators: list[ValidatorSpec] = Field(default_factory=list)
     required_validation_kinds: list[str] = Field(default_factory=lambda: [
         "availability", "alert_clearance", "error_rate", "latency", "dependency_health", "critical_alerts"
     ])
@@ -151,6 +193,12 @@ class ExecutionPlanV2(BaseModel):
             raise ValueError("P0 execution-ready plans require HITL")
         if self.commands != [str(action.inputs.get("catalog_command") or "") for action in self.actions]:
             raise ValueError("flat commands must be the exact typed-action compatibility projection")
+        if self.execution_ready:
+            validator_kinds = {validator.kind for validator in self.validators}
+            if not validator_kinds or validator_kinds != set(self.required_validation_kinds):
+                raise ValueError("required validation kinds must exactly match typed validators")
+            if any(validator.tenant_id != self.tenant_id for validator in self.validators):
+                raise ValueError("validator tenant must match execution plan tenant")
         return self
 
     def canonical_fingerprint(self) -> str:

@@ -11,6 +11,10 @@ from common.cloud_operations.models import (
     CloudConnectionCreate,
     DiscoveryRequest,
     ProviderType,
+    PlanCompileRequest,
+    PlanApprovalRequest,
+    ExecutionPolicy,
+    MaintenanceWindow,
     ServiceOnboardingProfile,
     ServiceResourceMappingCreate,
 )
@@ -79,6 +83,22 @@ def _feature_enabled() -> None:
         raise HTTPException(status_code=404, detail="Cloud operations are not enabled")
 
 
+def _provider_execution_enabled(provider: ProviderType) -> bool:
+    return bool(getattr(settings, f"cloud_execution_{provider.value}_enabled", False))
+
+
+def _connector(provider: ProviderType):
+    if provider == ProviderType.AZURE:
+        return connector_for(
+            provider,
+            execution_enabled=settings.cloud_execution_azure_enabled,
+            kill_switch=settings.cloud_azure_kill_switch_engaged,
+            canary_resource_ids={item.strip() for item in settings.cloud_azure_canary_resource_ids.split(",") if item.strip()},
+            rate_limit_per_minute=settings.cloud_azure_rate_limit_per_minute,
+        )
+    return connector_for(provider)
+
+
 @asynccontextmanager
 async def _repo():
     _feature_enabled()
@@ -139,7 +159,7 @@ async def list_connections(
 async def list_capabilities(provider: ProviderType = ProviderType.SIMULATOR) -> dict[str, Any]:
     _feature_enabled()
     try:
-        manifest = connector_for(provider).list_capabilities()
+        manifest = _connector(provider).list_capabilities()
     except NotImplementedError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"capabilities": [manifest.model_dump(mode="json")]}
@@ -164,7 +184,7 @@ async def validate_connection(
             raise HTTPException(status_code=404, detail="Connection not found")
         connection = CloudConnection.model_validate(repo.connection_payload(row))
         try:
-            result = await connector_for(connection.provider_type).validate_connection(connection)
+            result = await _connector(connection.provider_type).validate_connection(connection)
         except NotImplementedError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         await repo.record_validation(row, result, actor=actor)
@@ -194,7 +214,7 @@ async def discover_resources(
             raise HTTPException(status_code=403, detail="Connection does not grant read capability")
         connection = CloudConnection.model_validate(repo.connection_payload(row))
         try:
-            connector = connector_for(connection.provider_type)
+            connector = _connector(connection.provider_type)
             run = await repo.start_discovery(row, request)
             result = await connector.discover_resources(connection, request)
             result.run_id = run.id
@@ -348,3 +368,170 @@ async def recalculate_service_readiness(service_id: str, payload: dict[str, Any]
             payload={"environment": environment, "readiness_state": score.readiness_state, "overall_score": float(score.overall_score or 0.0)},
         )
         return {"state": score.readiness_state, "overall_score": float(score.overall_score or 0.0), "scores": score.scores or {}}
+
+
+@app.post("/plans/compile")
+async def compile_plan(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    request = PlanCompileRequest.model_validate(payload)
+    async with _repo() as repo:
+        try:
+            row = await repo.compile_plan(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await _publish(
+            "plan.compiled", tenant_id=request.tenant_id, project_id=request.project_id,
+            service_id=request.service_id, payload={"plan_id": str(row.id), "checksum": row.checksum},
+        )
+        return {"plan": repo.plan_payload(row)}
+
+
+@app.get("/plans/{plan_id}")
+async def get_plan(plan_id: UUID, tenant_id: str = Query(min_length=1, max_length=128)) -> dict[str, Any]:
+    tenant_id = require_tenant_id(tenant_id, source="cloud plan lookup")
+    async with _repo() as repo:
+        row = await repo.get_plan(plan_id, tenant_id=tenant_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Compiled plan not found")
+        return {"plan": repo.plan_payload(row)}
+
+
+@app.post("/plans/{plan_id}/simulate")
+async def simulate_plan(plan_id: UUID, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    tenant_id = require_tenant_id(payload.get("tenant_id"), source="cloud plan simulation")
+    actor = str(payload.get("actor") or "system").strip() or "system"
+    async with _repo() as repo:
+        plan = await repo.get_plan(plan_id, tenant_id=tenant_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="Compiled plan not found")
+        row = await repo.simulate_plan(plan, actor=actor)
+        await _publish(
+            "plan.simulated", tenant_id=tenant_id, project_id=plan.project_id,
+            service_id=plan.service_id, payload={"plan_id": str(plan.id), "simulation_id": str(row.id), "verdict": row.verdict},
+        )
+        return {"simulation": repo.simulation_payload(row)}
+
+
+@app.post("/plans/{plan_id}/approval")
+async def approve_plan(plan_id: UUID, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    request = PlanApprovalRequest.model_validate(payload)
+    async with _repo() as repo:
+        plan = await repo.get_plan(plan_id, tenant_id=request.tenant_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="Compiled plan not found")
+        try:
+            approval = await repo.approve_plan(plan, request)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"approval": {"id": str(approval.id), "plan_id": str(plan.id), "checksum": approval.checksum, "decision": approval.decision, "reason": approval.reason, "actor": approval.actor}}
+
+
+@app.post("/plans/{plan_id}/execute")
+async def execute_plan(plan_id: UUID, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    tenant_id = require_tenant_id(payload.get("tenant_id"), source="cloud plan execution")
+    actor = str(payload.get("actor") or "system").strip() or "system"
+    async with _repo() as repo:
+        plan = await repo.get_plan(plan_id, tenant_id=tenant_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="Compiled plan not found")
+        resources = await repo.list_resources(tenant_id=tenant_id, project_id=plan.project_id, service_id=plan.service_id, environment=plan.environment)
+        providers = {row.provider for row in resources if str(row.id) in {str(action.get("resource_id")) for action in plan.actions}}
+        if len(providers) != 1:
+            raise HTTPException(status_code=409, detail="Execution requires all targets to use one enabled provider adapter")
+        provider = ProviderType(next(iter(providers)))
+        if not _provider_execution_enabled(provider):
+            raise HTTPException(status_code=409, detail=f"Provider execution adapter {provider.value} is disabled")
+        await repo.recover_expired_leases(tenant_id=tenant_id)
+        governance_blocks = await repo.evaluate_execution_governance(plan, provider=provider.value)
+        if governance_blocks:
+            raise HTTPException(status_code=409, detail={"message": "Execution blocked by policy", "reasons": governance_blocks})
+        try:
+            execution, acquired = await repo.acquire_execution(plan, actor=actor, provider=provider.value)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not acquired:
+            return {"execution": repo.execution_payload(execution), "reused": True}
+        results: list[dict[str, Any]] = []
+        credential_session = None
+        try:
+            credential_session = await repo.broker_credential_session(plan, execution, provider=provider.value, ttl_minutes=settings.cloud_credential_session_minutes)
+            connector = _connector(provider)
+            for index, action in enumerate(plan.actions):
+                results.append(await connector.execute_action(action=action, idempotency_key=f"{execution.idempotency_key}:{index}"))
+            checks = [await connector.validate_action(action=action) for action in plan.actions]
+            validation = {"passed": all(bool(check.get("passed")) for check in checks), "checks": checks}
+            status = "succeeded" if validation["passed"] else "validation_failed"
+            await repo.finalize_execution(execution, status=status, action_results=results, validation=validation)
+        except (NotImplementedError, ValueError) as exc:
+            await repo.finalize_execution(execution, status="failed", action_results=results, validation={}, error=str(exc))
+        finally:
+            if credential_session is not None:
+                await repo.revoke_credential_session(credential_session)
+        return {"execution": repo.execution_payload(execution), "reused": False}
+
+
+@app.post("/executions/{execution_id}/rollback")
+async def rollback_execution(execution_id: UUID, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    tenant_id = require_tenant_id(payload.get("tenant_id"), source="cloud execution rollback")
+    actor = str(payload.get("actor") or "system").strip() or "system"
+    async with _repo() as repo:
+        execution = await repo.get_execution(execution_id, tenant_id=tenant_id)
+        if execution is None:
+            raise HTTPException(status_code=404, detail="Execution not found")
+        if execution.status == "rolled_back":
+            return {"execution": repo.execution_payload(execution), "reused": True}
+        plan = await repo.get_plan(execution.plan_id, tenant_id=tenant_id)
+        if plan is None or execution.checksum != plan.checksum:
+            raise HTTPException(status_code=409, detail="Rollback blocked: execution is not bound to the current immutable plan")
+        results: list[dict[str, Any]] = []
+        try:
+            connector = _connector(ProviderType(execution.provider))
+            for index, action in enumerate(reversed(plan.actions)):
+                result = await connector.rollback_action(action=action, idempotency_key=f"{execution.idempotency_key}:rollback:{index}")
+                results.append(result)
+                await repo.record_compensation(execution, sequence=index, action=action, status=str(result.get("status") or "unknown"), evidence=result)
+            checks = [await connector.validate_action(action=action) for action in plan.actions]
+            validation = {"passed": all(bool(check.get("passed")) for check in checks), "checks": checks, "rollback": True}
+            status = "rolled_back" if validation["passed"] else "rollback_failed"
+            execution.actor = actor
+            await repo.finalize_execution(execution, status=status, action_results=results, validation=validation)
+        except (NotImplementedError, ValueError) as exc:
+            execution.actor = actor
+            await repo.finalize_execution(execution, status="rollback_failed", action_results=results, validation={}, error=str(exc))
+        return {"execution": repo.execution_payload(execution), "reused": False}
+
+
+@app.put("/governance/policy")
+async def upsert_execution_policy(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    policy = ExecutionPolicy.model_validate(payload)
+    async with _repo() as repo:
+        row = await repo.upsert_execution_policy(policy)
+        return {"policy": {"id": str(row.id), "tenant_id": row.tenant_id, "project_id": row.project_id, "environment": row.environment, "allowed_providers": row.allowed_providers, "allowed_actions": row.allowed_actions, "maximum_risk": row.maximum_risk, "require_rollback": row.require_rollback, "require_maintenance_window": row.require_maintenance_window, "enabled": row.enabled}}
+
+
+@app.post("/governance/maintenance-windows")
+async def create_maintenance_window(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    window = MaintenanceWindow.model_validate(payload)
+    async with _repo() as repo:
+        row = await repo.create_maintenance_window(window)
+        return {"window": {"id": str(row.id), "starts_at": row.starts_at.isoformat(), "ends_at": row.ends_at.isoformat(), "reason": row.reason}}
+
+
+@app.post("/governance/leases/recover")
+async def recover_execution_leases(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    tenant_id = require_tenant_id(payload.get("tenant_id"), source="cloud lease recovery")
+    async with _repo() as repo:
+        return {"recovered": await repo.recover_expired_leases(tenant_id=tenant_id)}
+
+
+@app.get("/providers/status")
+async def provider_status() -> dict[str, Any]:
+    _feature_enabled()
+    rows = []
+    for provider in (ProviderType.SIMULATOR, ProviderType.AZURE, ProviderType.AWS, ProviderType.GCP):
+        enabled = _provider_execution_enabled(provider)
+        try:
+            manifest = _connector(provider).list_capabilities()
+            rows.append({"provider": provider.value, "registered": True, "execution_enabled": enabled, "health_status": manifest.health_status, "connector_version": manifest.connector_version, "write_operations": manifest.supported_write_operations, "kill_switch_engaged": settings.cloud_azure_kill_switch_engaged if provider == ProviderType.AZURE else False, "canary_target_count": len({item.strip() for item in settings.cloud_azure_canary_resource_ids.split(',') if item.strip()}) if provider == ProviderType.AZURE else 0})
+        except NotImplementedError:
+            rows.append({"provider": provider.value, "registered": False, "execution_enabled": enabled, "health_status": "unavailable", "write_operations": []})
+    return {"providers": rows}

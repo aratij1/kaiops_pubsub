@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+import hashlib
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.cloud_operations.models import (
     CloudConnection,
     CloudConnectionCreate,
+    CompiledPlan,
     ConnectionStatus,
     ConnectionValidationResult,
     DiscoveredResource,
@@ -17,11 +19,25 @@ from common.cloud_operations.models import (
     DiscoveryResult,
     DiscoveryStatus,
     ResourceRelationship,
+    PlanCompileRequest,
+    PlanApprovalRequest,
+    ExecutionPolicy,
+    MaintenanceWindow,
+    PlanSimulation,
+    SimulationGate,
     ServiceOnboardingProfile,
     ServiceOnboardingState,
 )
 from common.database import (
     CloudAuditEventRecord,
+    CloudCompiledPlanRecord,
+    CloudPlanSimulationRecord,
+    CloudPlanApprovalRecord,
+    CloudPlanExecutionRecord,
+    CloudExecutionPolicyRecord,
+    CloudMaintenanceWindowRecord,
+    CloudCredentialSessionRecord,
+    CloudCompensationRecord,
     ConnectionHealthCheckRecord,
     DiscoveredResourceRecord,
     DiscoveryRunRecord,
@@ -193,11 +209,13 @@ class CloudOperationsRepository:
         await self.session.flush()
 
     async def upsert_resource(self, resource: DiscoveredResource) -> DiscoveredResourceRecord:
+        provider_resource_key = hashlib.sha256(resource.provider_resource_id.encode("utf-8")).hexdigest()
         existing = (
             await self.session.execute(
                 select(DiscoveredResourceRecord).where(
                     DiscoveredResourceRecord.tenant_id == resource.tenant_id,
                     DiscoveredResourceRecord.project_id == resource.project_id,
+                    DiscoveredResourceRecord.provider_resource_key == provider_resource_key,
                     DiscoveredResourceRecord.provider_resource_id == resource.provider_resource_id,
                 )
             )
@@ -214,6 +232,7 @@ class CloudOperationsRepository:
                 provider_account_id=resource.provider_account_id,
                 region=resource.region,
                 provider_resource_id=resource.provider_resource_id,
+                provider_resource_key=provider_resource_key,
                 resource_type=resource.resource_type,
                 display_name=resource.display_name,
                 status=resource.status.value,
@@ -361,6 +380,17 @@ class CloudOperationsRepository:
             "trace_sources": profile.trace_sources,
             "event_sources": profile.event_sources,
         }
+        metadata_payload = dict(profile.metadata)
+        metadata_payload["operational_contract"] = {
+            "resource_ids": profile.resource_ids,
+            "topology": profile.topology,
+            "approved_capabilities": profile.approved_capabilities,
+            "prohibited_operations": profile.prohibited_operations,
+            "maintenance_windows": profile.maintenance_windows,
+            "change_freeze_periods": profile.change_freeze_periods,
+            "rollback_procedures": profile.rollback_procedures,
+            "runbook_owners": profile.runbook_owners,
+        }
         if existing is None:
             existing = ServiceOnboardingProfileRecord(
                 tenant_id=profile.tenant_id,
@@ -383,7 +413,7 @@ class CloudOperationsRepository:
                 escalation_policies=profile.escalation_policies,
                 hitl_policy=profile.hitl_policy,
                 dependencies=profile.dependencies,
-                metadata_payload=profile.metadata,
+                metadata_payload=metadata_payload,
             )
             self.session.add(existing)
         else:
@@ -403,7 +433,7 @@ class CloudOperationsRepository:
             existing.escalation_policies = profile.escalation_policies
             existing.hitl_policy = profile.hitl_policy
             existing.dependencies = profile.dependencies
-            existing.metadata_payload = profile.metadata
+            existing.metadata_payload = metadata_payload
             existing.version = int(existing.version or 1) + 1
         await self.audit(
             tenant_id=profile.tenant_id,
@@ -591,6 +621,310 @@ class CloudOperationsRepository:
             ],
         }
 
+    async def compile_plan(self, request: PlanCompileRequest) -> CloudCompiledPlanRecord:
+        resources = await self.list_resources(
+            tenant_id=request.tenant_id,
+            project_id=request.project_id,
+            service_id=request.service_id,
+            environment=request.environment,
+        )
+        known_ids = {str(row.id) for row in resources}
+        unknown_ids = sorted({action.resource_id for action in request.actions} - known_ids)
+        if unknown_ids:
+            raise ValueError(f"Actions reference resources outside the governed service scope: {', '.join(unknown_ids)}")
+        profile = await self.get_service_onboarding(
+            tenant_id=request.tenant_id,
+            project_id=request.project_id,
+            service_id=request.service_id,
+            environment=request.environment,
+        )
+        allowed = set(profile.remediation_capabilities or []) if profile else set()
+        unsupported = sorted({action.action_type for action in request.actions} - allowed)
+        if unsupported:
+            raise ValueError(f"Actions are not declared remediation capabilities: {', '.join(unsupported)}")
+        criticality = str(profile.business_criticality if profile else "high").lower()
+        risk_level = "critical" if criticality == "critical" else "high" if request.environment.lower() == "prod" else "medium"
+        plan = CompiledPlan.from_request(request, risk_level=risk_level)
+        existing = (
+            await self.session.execute(
+                select(CloudCompiledPlanRecord).where(
+                    CloudCompiledPlanRecord.tenant_id == request.tenant_id,
+                    CloudCompiledPlanRecord.checksum == plan.checksum,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing:
+            return existing
+        row = CloudCompiledPlanRecord(**plan.model_dump(mode="python"))
+        self.session.add(row)
+        await self.audit(
+            tenant_id=request.tenant_id, project_id=request.project_id, actor=request.actor,
+            action="plan.compiled", resource_type="compiled_plan", resource_id=str(row.id),
+            payload={"checksum": plan.checksum, "risk_level": risk_level, "action_count": len(plan.actions)},
+        )
+        await self.session.flush()
+        return row
+
+    async def get_plan(self, plan_id: UUID, *, tenant_id: str) -> CloudCompiledPlanRecord | None:
+        return (
+            await self.session.execute(
+                select(CloudCompiledPlanRecord).where(
+                    CloudCompiledPlanRecord.id == plan_id,
+                    CloudCompiledPlanRecord.tenant_id == tenant_id,
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def simulate_plan(self, plan: CloudCompiledPlanRecord, *, actor: str) -> CloudPlanSimulationRecord:
+        readiness = (
+            await self.session.execute(
+                select(ServiceReadinessScoreRecord).where(
+                    ServiceReadinessScoreRecord.tenant_id == plan.tenant_id,
+                    ServiceReadinessScoreRecord.project_id == plan.project_id,
+                    ServiceReadinessScoreRecord.service_id == plan.service_id,
+                    ServiceReadinessScoreRecord.environment == plan.environment,
+                )
+            )
+        ).scalar_one_or_none()
+        resources = await self.list_resources(
+            tenant_id=plan.tenant_id, project_id=plan.project_id, service_id=plan.service_id, environment=plan.environment,
+        )
+        known_ids = {str(row.id) for row in resources}
+        target_ids = {str(action.get("resource_id") or "") for action in (plan.actions or [])}
+        approval = await self.get_plan_approval(plan)
+        gates = [
+            SimulationGate(gate="immutable_checksum", passed=len(plan.checksum or "") == 64, message="Compiled plan identity is immutable."),
+            SimulationGate(gate="service_readiness", passed=bool(readiness and readiness.readiness_state == "OPERABLE"), message=f"Service readiness is {readiness.readiness_state if readiness else 'missing'}."),
+            SimulationGate(gate="target_scope", passed=target_ids <= known_ids, message="All action targets remain in the governed service scope." if target_ids <= known_ids else "One or more action targets are no longer governed."),
+            SimulationGate(gate="rollback", passed=all(bool(action.get("rollback_action")) for action in (plan.actions or [])), message="Every action declares rollback."),
+            SimulationGate(gate="human_approval", passed=not plan.requires_approval or bool(approval and approval.decision == "approved"), message="Approval is bound to the immutable checksum." if approval and approval.decision == "approved" else "Approval is required before execution." if plan.requires_approval else "No mandatory approval gate applies."),
+        ]
+        simulation = PlanSimulation(
+            plan_id=plan.id, tenant_id=plan.tenant_id,
+            verdict="passed" if all(gate.passed for gate in gates) else "blocked",
+            gates=gates, simulated_by=actor,
+        )
+        row = CloudPlanSimulationRecord(**simulation.model_dump(mode="python"))
+        self.session.add(row)
+        await self.audit(
+            tenant_id=plan.tenant_id, project_id=plan.project_id, actor=actor,
+            action="plan.simulated", resource_type="compiled_plan", resource_id=str(plan.id),
+            payload={"simulation_id": str(row.id), "verdict": simulation.verdict, "gates": simulation.model_dump(mode="json")["gates"]},
+        )
+        await self.session.flush()
+        return row
+
+    @staticmethod
+    def plan_payload(row: CloudCompiledPlanRecord) -> dict[str, Any]:
+        return {
+            "id": str(row.id), "tenant_id": row.tenant_id, "project_id": row.project_id,
+            "service_id": row.service_id, "environment": row.environment, "intent": row.intent,
+            "actions": list(row.actions or []), "risk_level": row.risk_level,
+            "requires_approval": bool(row.requires_approval), "checksum": row.checksum,
+            "status": row.status, "compiled_by": row.compiled_by,
+            "compiled_at": row.compiled_at.isoformat() if row.compiled_at else None,
+        }
+
+    @staticmethod
+    def simulation_payload(row: CloudPlanSimulationRecord) -> dict[str, Any]:
+        return {
+            "id": str(row.id), "plan_id": str(row.plan_id), "tenant_id": row.tenant_id,
+            "verdict": row.verdict, "gates": list(row.gates or []), "simulated_by": row.simulated_by,
+            "simulated_at": row.simulated_at.isoformat() if row.simulated_at else None,
+        }
+
+    async def approve_plan(self, plan: CloudCompiledPlanRecord, request: PlanApprovalRequest) -> CloudPlanApprovalRecord:
+        if request.checksum != plan.checksum:
+            raise ValueError("Approval checksum does not match the immutable compiled plan")
+        existing = await self.get_plan_approval(plan)
+        if existing:
+            if existing.decision != request.decision:
+                raise ValueError("An immutable approval decision already exists for this plan checksum")
+            return existing
+        row = CloudPlanApprovalRecord(
+            plan_id=plan.id, tenant_id=plan.tenant_id, checksum=plan.checksum,
+            decision=request.decision, reason=request.reason, actor=request.actor,
+        )
+        self.session.add(row)
+        await self.audit(
+            tenant_id=plan.tenant_id, project_id=plan.project_id, actor=request.actor,
+            action=f"plan.{request.decision}", resource_type="compiled_plan", resource_id=str(plan.id),
+            payload={"checksum": plan.checksum, "reason": request.reason},
+        )
+        await self.session.flush()
+        return row
+
+    async def get_plan_approval(self, plan: CloudCompiledPlanRecord) -> CloudPlanApprovalRecord | None:
+        return (
+            await self.session.execute(
+                select(CloudPlanApprovalRecord).where(
+                    CloudPlanApprovalRecord.tenant_id == plan.tenant_id,
+                    CloudPlanApprovalRecord.plan_id == plan.id,
+                    CloudPlanApprovalRecord.checksum == plan.checksum,
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def latest_simulation(self, plan: CloudCompiledPlanRecord) -> CloudPlanSimulationRecord | None:
+        return (
+            await self.session.execute(
+                select(CloudPlanSimulationRecord).where(
+                    CloudPlanSimulationRecord.tenant_id == plan.tenant_id,
+                    CloudPlanSimulationRecord.plan_id == plan.id,
+                ).order_by(CloudPlanSimulationRecord.simulated_at.desc()).limit(1)
+            )
+        ).scalar_one_or_none()
+
+    async def acquire_execution(self, plan: CloudCompiledPlanRecord, *, actor: str, provider: str) -> tuple[CloudPlanExecutionRecord, bool]:
+        approval = await self.get_plan_approval(plan)
+        if plan.requires_approval and (approval is None or approval.decision != "approved"):
+            raise ValueError("Execution blocked: immutable plan approval is missing")
+        simulation = await self.latest_simulation(plan)
+        if simulation is None or simulation.verdict != "passed":
+            raise ValueError("Execution blocked: the latest simulation did not pass all safety gates")
+        idempotency_key = f"cloud-plan:{plan.checksum}"
+        existing = (
+            await self.session.execute(
+                select(CloudPlanExecutionRecord).where(
+                    CloudPlanExecutionRecord.tenant_id == plan.tenant_id,
+                    CloudPlanExecutionRecord.idempotency_key == idempotency_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing:
+            return existing, False
+        row = CloudPlanExecutionRecord(
+            plan_id=plan.id, tenant_id=plan.tenant_id, checksum=plan.checksum,
+            idempotency_key=idempotency_key, provider=provider, status="leased", actor=actor,
+            lease_expires_at=utc_now() + timedelta(minutes=15),
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row, True
+
+    async def upsert_execution_policy(self, policy: ExecutionPolicy) -> CloudExecutionPolicyRecord:
+        row = (
+            await self.session.execute(select(CloudExecutionPolicyRecord).where(
+                CloudExecutionPolicyRecord.tenant_id == policy.tenant_id,
+                CloudExecutionPolicyRecord.project_id == policy.project_id,
+                CloudExecutionPolicyRecord.environment == policy.environment,
+            ))
+        ).scalar_one_or_none()
+        values = policy.model_dump(mode="json")
+        values["allowed_providers"] = [str(item) for item in values["allowed_providers"]]
+        if row is None:
+            row = CloudExecutionPolicyRecord(**values)
+            self.session.add(row)
+        else:
+            for key, value in values.items():
+                setattr(row, key, value)
+        await self.session.flush()
+        return row
+
+    async def create_maintenance_window(self, window: MaintenanceWindow) -> CloudMaintenanceWindowRecord:
+        row = CloudMaintenanceWindowRecord(**window.model_dump(mode="python"))
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def evaluate_execution_governance(self, plan: CloudCompiledPlanRecord, *, provider: str, at: datetime | None = None) -> list[str]:
+        at = at or utc_now()
+        policy = (
+            await self.session.execute(select(CloudExecutionPolicyRecord).where(
+                CloudExecutionPolicyRecord.tenant_id == plan.tenant_id,
+                CloudExecutionPolicyRecord.project_id == plan.project_id,
+                CloudExecutionPolicyRecord.environment == plan.environment,
+                CloudExecutionPolicyRecord.enabled.is_(True),
+            ))
+        ).scalar_one_or_none()
+        if policy is None:
+            return ["No enabled execution policy exists for this scope"]
+        reasons: list[str] = []
+        risk_order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+        if provider not in set(policy.allowed_providers or []):
+            reasons.append(f"Provider {provider} is not allowed by policy")
+        if risk_order.get(plan.risk_level, 99) > risk_order.get(policy.maximum_risk, -1):
+            reasons.append(f"Plan risk {plan.risk_level} exceeds policy maximum {policy.maximum_risk}")
+        action_types = {str(action.get("action_type") or "") for action in plan.actions or []}
+        if action_types - set(policy.allowed_actions or []):
+            reasons.append("One or more plan actions are not allowed by policy")
+        if policy.require_rollback and any(not str(action.get("rollback_action") or "").strip() for action in plan.actions or []):
+            reasons.append("Policy requires rollback for every action")
+        if policy.require_maintenance_window:
+            window = (
+                await self.session.execute(select(CloudMaintenanceWindowRecord).where(
+                    CloudMaintenanceWindowRecord.tenant_id == plan.tenant_id,
+                    CloudMaintenanceWindowRecord.project_id == plan.project_id,
+                    CloudMaintenanceWindowRecord.environment == plan.environment,
+                    CloudMaintenanceWindowRecord.starts_at <= at,
+                    CloudMaintenanceWindowRecord.ends_at >= at,
+                ).limit(1))
+            ).scalar_one_or_none()
+            if window is None:
+                reasons.append("No active maintenance window exists")
+        return reasons
+
+    async def broker_credential_session(self, plan: CloudCompiledPlanRecord, execution: CloudPlanExecutionRecord, *, provider: str, ttl_minutes: int = 10) -> CloudCredentialSessionRecord:
+        connection = (
+            await self.session.execute(select(ProviderConnectionRecord).where(
+                ProviderConnectionRecord.tenant_id == plan.tenant_id,
+                ProviderConnectionRecord.project_id == plan.project_id,
+                ProviderConnectionRecord.provider_type == provider,
+                ProviderConnectionRecord.status == "validated",
+                ProviderConnectionRecord.write_capability.is_(True),
+            ).limit(1))
+        ).scalar_one_or_none()
+        if connection is None:
+            raise ValueError("No validated write-capable provider connection is available")
+        row = CloudCredentialSessionRecord(
+            tenant_id=plan.tenant_id, execution_id=execution.id, provider=provider,
+            credential_ref=connection.credential_ref, scopes=[f"{provider}:execute"],
+            expires_at=utc_now() + timedelta(minutes=ttl_minutes),
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def revoke_credential_session(self, session: CloudCredentialSessionRecord) -> None:
+        session.revoked_at = utc_now()
+        await self.session.flush()
+
+    async def recover_expired_leases(self, *, tenant_id: str | None = None, at: datetime | None = None) -> int:
+        at = at or utc_now()
+        stmt = select(CloudPlanExecutionRecord).where(CloudPlanExecutionRecord.status == "leased", CloudPlanExecutionRecord.lease_expires_at < at)
+        if tenant_id:
+            stmt = stmt.where(CloudPlanExecutionRecord.tenant_id == tenant_id)
+        rows = list((await self.session.execute(stmt)).scalars().all())
+        for row in rows:
+            row.status, row.error, row.completed_at = "failed", "Execution lease expired before completion", at
+        await self.session.flush()
+        return len(rows)
+
+    async def record_compensation(self, execution: CloudPlanExecutionRecord, *, sequence: int, action: dict[str, Any], status: str, evidence: dict[str, Any]) -> CloudCompensationRecord:
+        row = CloudCompensationRecord(tenant_id=execution.tenant_id, execution_id=execution.id, sequence=sequence, resource_id=str(action.get("resource_id") or ""), rollback_action=str(action.get("rollback_action") or ""), status=status, evidence=evidence)
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def finalize_execution(self, row: CloudPlanExecutionRecord, *, status: str, action_results: list[dict[str, Any]], validation: dict[str, Any], error: str | None = None) -> None:
+        row.status, row.action_results, row.validation, row.error = status, action_results, validation, error
+        row.completed_at = utc_now()
+        await self.audit(
+            tenant_id=row.tenant_id, project_id="execution", actor=row.actor,
+            action=f"plan.execution.{status}", resource_type="cloud_execution", resource_id=str(row.id),
+            payload={"plan_id": str(row.plan_id), "checksum": row.checksum, "validation": validation, "error": error},
+        )
+        await self.session.flush()
+
+    async def get_execution(self, execution_id: UUID, *, tenant_id: str) -> CloudPlanExecutionRecord | None:
+        return (
+            await self.session.execute(select(CloudPlanExecutionRecord).where(CloudPlanExecutionRecord.id == execution_id, CloudPlanExecutionRecord.tenant_id == tenant_id))
+        ).scalar_one_or_none()
+
+    @staticmethod
+    def execution_payload(row: CloudPlanExecutionRecord) -> dict[str, Any]:
+        return {"id": str(row.id), "plan_id": str(row.plan_id), "tenant_id": row.tenant_id, "checksum": row.checksum, "idempotency_key": row.idempotency_key, "provider": row.provider, "status": row.status, "action_results": list(row.action_results or []), "validation": dict(row.validation or {}), "error": row.error, "actor": row.actor, "started_at": row.started_at.isoformat() if row.started_at else None, "completed_at": row.completed_at.isoformat() if row.completed_at else None}
+
     async def _relationships_for_resources(
         self,
         *,
@@ -697,6 +1031,8 @@ class CloudOperationsRepository:
     @staticmethod
     def onboarding_payload(row: ServiceOnboardingProfileRecord) -> dict[str, Any]:
         telemetry = dict(row.telemetry or {})
+        metadata = dict(row.metadata_payload or {})
+        contract = metadata.get("operational_contract") if isinstance(metadata.get("operational_contract"), dict) else {}
         return {
             "id": str(row.id),
             "tenant_id": row.tenant_id,
@@ -724,7 +1060,15 @@ class CloudOperationsRepository:
             "escalation_policies": row.escalation_policies or [],
             "hitl_policy": row.hitl_policy or {},
             "dependencies": row.dependencies or [],
-            "metadata": row.metadata_payload or {},
+            "resource_ids": contract.get("resource_ids", []),
+            "topology": contract.get("topology", []),
+            "approved_capabilities": contract.get("approved_capabilities", []),
+            "prohibited_operations": contract.get("prohibited_operations", []),
+            "maintenance_windows": contract.get("maintenance_windows", []),
+            "change_freeze_periods": contract.get("change_freeze_periods", []),
+            "rollback_procedures": contract.get("rollback_procedures", []),
+            "runbook_owners": contract.get("runbook_owners", []),
+            "metadata": metadata,
             "version": row.version,
             "created_at": row.created_at.isoformat() if isinstance(row.created_at, datetime) else None,
             "updated_at": row.updated_at.isoformat() if isinstance(row.updated_at, datetime) else None,

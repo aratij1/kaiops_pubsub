@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -60,7 +61,9 @@ async def test_knowledge_pack_approval_writes_rag_document(tmp_path) -> None:
         service="checkout-api",
         environment="prod",
         owner_team="platform-ops",
+        tenant_id="tenant-a",
         approved_by="administrator",
+        approval_expires_at=datetime(2099, 1, 1, tzinfo=UTC),
         documents=[
             module.KnowledgePackSourceDocument(
                 name="checkout-triage.md",

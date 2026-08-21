@@ -25,13 +25,85 @@ from common.tool_registry import ToolRegistry, ToolSpec
 class RemediationPlugin(Protocol):
     action_type: str
 
+    async def discover(self, action: RemediationAction) -> dict[str, Any]: ...
+    async def diagnose(self, action: RemediationAction) -> dict[str, Any]: ...
+    async def preflight(self, action: RemediationAction) -> dict[str, Any]: ...
+    async def dry_run(self, action: RemediationAction) -> RemediationAction: ...
     async def execute(self, action: RemediationAction) -> RemediationAction: ...
+    async def validate(self, action: RemediationAction) -> dict[str, Any]: ...
+    async def rollback(self, action: RemediationAction) -> RemediationAction: ...
+    async def emergency_stop(self, action: RemediationAction) -> RemediationAction: ...
+    def required_permissions(self, action: RemediationAction) -> list[str]: ...
+    async def health(self) -> dict[str, Any]: ...
 
 
 @dataclass
 class BasePlugin:
     action_type: str
     breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
+
+    @staticmethod
+    def _governed_binding(action: RemediationAction) -> tuple[str, str]:
+        resource_id = str(
+            action.parameters.get("target_resource_id")
+            or action.parameters.get("onboarding_resource_id")
+            or ""
+        ).strip()
+        profile = action.parameters.get("connection_profile")
+        profile = profile if isinstance(profile, dict) else {}
+        credential_ref = str(
+            action.parameters.get("credential_ref")
+            or profile.get("credential_ref")
+            or profile.get("secret_ref")
+            or ""
+        ).strip()
+        if not resource_id:
+            raise ValueError("immutable onboarded target_resource_id is required")
+        if not credential_ref:
+            raise ValueError("onboarded credential reference is required")
+        return resource_id, credential_ref
+
+    async def discover(self, action: RemediationAction) -> dict[str, Any]:
+        resource_id, _ = self._governed_binding(action)
+        return {"adapter": self.action_type, "target_resource_id": resource_id, "discovered": True}
+
+    async def diagnose(self, action: RemediationAction) -> dict[str, Any]:
+        resource_id, _ = self._governed_binding(action)
+        return {"adapter": self.action_type, "target_resource_id": resource_id, "diagnostic_only": True}
+
+    async def preflight(self, action: RemediationAction) -> dict[str, Any]:
+        resource_id, credential_ref = self._governed_binding(action)
+        return {
+            "passed": True,
+            "target_resource_id": resource_id,
+            "credential_ref": credential_ref,
+            "required_permissions": self.required_permissions(action),
+        }
+
+    async def dry_run(self, action: RemediationAction) -> RemediationAction:
+        await self.preflight(action)
+        action.parameters["dry_run"] = True
+        return await self.execute(action)
+
+    async def validate(self, action: RemediationAction) -> dict[str, Any]:
+        return {"passed": action.status == RemediationStatus.SUCCEEDED, "adapter": self.action_type}
+
+    async def rollback(self, action: RemediationAction) -> RemediationAction:
+        action.status = RemediationStatus.MANUAL_INTERVENTION_REQUIRED
+        action.error = f"No governed rollback adapter is configured for {self.action_type}"
+        return action
+
+    async def emergency_stop(self, action: RemediationAction) -> RemediationAction:
+        action.status = RemediationStatus.MANUAL_INTERVENTION_REQUIRED
+        action.error = f"Emergency stop requested for {self.action_type}; operator confirmation required"
+        return action
+
+    def required_permissions(self, action: RemediationAction) -> list[str]:
+        permissions = action.parameters.get("required_permissions")
+        return [str(item) for item in permissions] if isinstance(permissions, list) else []
+
+    async def health(self) -> dict[str, Any]:
+        return {"adapter": self.action_type, "healthy": True, "live_execution": False}
 
     async def _not_configured(self, action: RemediationAction, executor_name: str) -> RemediationAction:
         await asyncio.sleep(0)
@@ -63,6 +135,26 @@ class BasePlugin:
         }
         return action
 
+
+class FakeCapabilityAdapter(BasePlugin):
+    """Deterministic, side-effect-free adapter for lifecycle contract tests."""
+
+    def __init__(self, action_type: str = "fake_test") -> None:
+        super().__init__(action_type)
+
+    async def execute(self, action: RemediationAction) -> RemediationAction:
+        resource_id, credential_ref = self._governed_binding(action)
+        action.status = RemediationStatus.SUCCEEDED
+        action.started_at = action.started_at or utc_now()
+        action.completed_at = utc_now()
+        action.output = f"fake execution completed for {resource_id}"
+        action.parameters["execution_result"] = {
+            "executor": self.action_type,
+            "executed": not bool(action.parameters.get("dry_run")),
+            "target_resource_id": resource_id,
+            "credential_ref": credential_ref,
+        }
+        return action
 
 class JenkinsRollbackPlugin(BasePlugin):
     def __init__(self) -> None:

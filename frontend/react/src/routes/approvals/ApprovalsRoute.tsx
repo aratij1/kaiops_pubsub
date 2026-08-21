@@ -32,6 +32,12 @@ export default function ApprovalsRoute() {
     const plan = objectValue(metadata.execution_plan, projection.execution_plan, event.execution_plan);
     const quality = objectValue(metadata.evidence_quality, metadata.readiness, projection.evidence_quality);
     const policy = objectValue(plan.policy_decision, metadata.policy_decision);
+    const readinessReceipt = objectValue(row.approval_readiness, metadata.approval_readiness, plan.approval_readiness, projection.approval_readiness);
+    const backendEligibilityProven = Boolean(
+      readinessReceipt.decision_id
+      && readinessReceipt.signature
+      && ["eligible", "execution_eligible"].includes(String(readinessReceipt.state || readinessReceipt.decision || "").toLowerCase())
+    );
     const readiness = decisionReadiness({
       citationCoverage: quality.citation_coverage ?? recommendation.citation_coverage ?? 0,
       evidenceCoverage: quality.evidence_coverage ?? recommendation.evidence_coverage ?? 0,
@@ -43,9 +49,9 @@ export default function ApprovalsRoute() {
       dryRunComplete: Boolean(metadata.dry_run_complete),
       risk: plan.risk_tier || row.risk_tier,
     });
-    return { row, recommendation, plan, quality, policy, readiness };
+    return { row, recommendation, plan, quality, policy, readiness, readinessReceipt, backendEligibilityProven };
   }, [selected]);
-  const approvalDisabled = !approvals.selectedRecommendationId || approvals.actionLoading || !packet.readiness.eligible;
+  const approvalDisabled = !approvals.selectedRecommendationId || approvals.actionLoading || !packet.readiness.eligible || !packet.backendEligibilityProven;
 
   function review(row: any) {
     approvals.select(row);
@@ -62,7 +68,7 @@ export default function ApprovalsRoute() {
       <div className="approval-card-list">{approvals.rows.map((row, index) => { const incidentId = approvals.incidentId(row); return <button type="button" className="approval-ticket" key={incidentId || index} onClick={() => review(row)}><span><b>{row.service || "Service not recorded"}</b><small>{row.environment || "Environment not recorded"}</small></span><span className={`pill status-${String(row.status || "awaiting_approval").toLowerCase()}`}>{String(row.status || "Awaiting approval").replaceAll("_", " ")}</span><span><small>Risk</small><b>{row.risk_tier || row.severity || "Not assessed"}</b></span><span><small>Incident</small><b>{incidentId || "Identifier unavailable"}</b></span><strong>Review packet →</strong></button>; })}{!approvals.rows.length && !approvals.contextLoading ? <div className="empty-state"><CheckCircle2 aria-hidden="true" /><strong>No approvals need your decision</strong><p>Refresh the queue or return to Incident Queue.</p></div> : null}</div>
     </article> : <article className="panel approval-review">
       <div className="panel-head"><div><span className="eyebrow">IMMUTABLE DECISION PACKET</span><h3>{textValue(packet.row.title, packet.row.service, "Incident review")}</h3><p>{textValue(packet.row.service)} · {textValue(packet.row.environment)} · {textValue(packet.row.severity, packet.row.risk_tier)} risk</p></div><button className="button-secondary" type="button" onClick={() => setView("queue")}>Back to queue</button></div>
-      <section className={`approval-readiness status-${packet.readiness.state}`} aria-live="polite">{packet.readiness.eligible ? <ShieldCheck aria-hidden="true" /> : <AlertTriangle aria-hidden="true" />}<div><strong>{packet.readiness.label}</strong>{packet.readiness.missing.length ? <p>Missing: {packet.readiness.missing.join(", ")}.</p> : <p>Required evidence and safety controls are present.</p>}</div></section>
+      <section className={`approval-readiness status-${packet.backendEligibilityProven ? packet.readiness.state : "blocked"}`} aria-live="polite">{packet.backendEligibilityProven ? <ShieldCheck aria-hidden="true" /> : <AlertTriangle aria-hidden="true" />}<div><strong>{packet.backendEligibilityProven ? packet.readiness.label : "Signed backend readiness required"}</strong>{packet.readiness.missing.length ? <p>Missing: {packet.readiness.missing.join(", ")}.</p> : packet.backendEligibilityProven ? <p>Backend decision {String(packet.readinessReceipt.decision_id)} proves the required controls are present.</p> : <p>Local UI fields are advisory and cannot authorize execution.</p>}</div></section>
       <div className="approval-review-summary"><div><small>Incident</small><strong>{approvals.selectedIncidentId || "Unavailable"}</strong></div><div><small>Recommendation</small><strong>{approvals.selectedRecommendationId || "Unavailable"}</strong></div><div><small>Reviewer</small><strong>{session.username}</strong></div><div><small>Plan</small><strong>{textValue(packet.plan.plan_id)}</strong></div><div><small>Plan expiry</small><strong>{textValue(packet.plan.expiry)}</strong></div><div><small>Fingerprint</small><strong>{textValue(packet.plan.plan_fingerprint)}</strong></div></div>
       <div className="approval-capacity-layout"><section><h4>Evidence and root cause</h4><dl className="decision-packet-list"><div><dt>Proposed cause</dt><dd>{textValue(packet.recommendation.root_cause, packet.recommendation.summary)}</dd></div><div><dt>RCA confidence</dt><dd>{percentage(packet.recommendation.confidence)}</dd></div><div><dt>Evidence coverage</dt><dd>{percentage(packet.quality.evidence_coverage)}</dd></div><div><dt>Citation grounding</dt><dd>{percentage(packet.quality.citation_coverage)}</dd></div><div><dt>Conflicting evidence</dt><dd>{textValue(packet.quality.conflict_count ?? packet.quality.contradiction_count ?? 0)}</dd></div></dl></section><section><h4>Action safety</h4><dl className="decision-packet-list"><div><dt>Catalog action</dt><dd>{textValue(packet.plan.playbook_id, packet.plan.runbook_id, packet.plan.connector_id)}</dd></div><div><dt>Target</dt><dd>{textValue(packet.plan.remediation_target, packet.plan.target_resource_id)}</dd></div><div><dt>Risk</dt><dd>{textValue(packet.plan.risk_tier, packet.row.risk_tier)}</dd></div><div><dt>Policy</dt><dd>{textValue(packet.policy.decision, "HITL required")}</dd></div><div><dt>Rollback</dt><dd>{packet.readiness.missing.includes("rollback readiness") ? "Not ready" : "Ready"}</dd></div></dl></section></div>
       <details><summary>Technical details</summary><pre>{JSON.stringify({ plan: packet.plan, policy: packet.policy }, null, 2)}</pre></details>

@@ -23,9 +23,6 @@ spec:
           - path: /gateway(/|$)(.*)
             pathType: ImplementationSpecific
             backend: { service: { name: api-gateway, port: { number: 8000 } } }
-          - path: /approval(/|$)(.*)
-            pathType: ImplementationSpecific
-            backend: { service: { name: approval-service, port: { number: 8000 } } }
           - path: /model-router(/|$)(.*)
             pathType: ImplementationSpecific
             backend: { service: { name: model-router, port: { number: 8000 } } }
