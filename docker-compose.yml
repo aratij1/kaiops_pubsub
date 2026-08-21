@@ -111,6 +111,8 @@ x-service-env: &service-env
   EVALUATION_SERVICE_URL: http://evaluation-service:8000
   API_GATEWAY_URL: http://api-gateway:8000
   APPLICATION_ONBOARDING_URL: http://application-onboarding:8000
+  CLOUD_OPERATIONS_URL: http://cloud-operations:8000
+  CLOUD_OPERATIONS_ENABLED: ${CLOUD_OPERATIONS_ENABLED:-true}
   AI_LAYER_MODE: ${AI_LAYER_MODE:-endpoint}
   AI_LAYER_REQUEST_TIMEOUT_SECONDS: ${AI_LAYER_REQUEST_TIMEOUT_SECONDS:-120}
   AI_LAYER_AUTH_TOKEN: ${AI_LAYER_AUTH_TOKEN:-}
@@ -605,6 +607,17 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/application-onboarding
     ports: ["8011:8000"]
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  cloud-operations:
+    build: *service-build
+    restart: unless-stopped
+    environment: { <<: *service-env, SERVICE_NAME: cloud-operations }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/cloud-operations
+    ports: ["8027:8000"]
     depends_on:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }

@@ -71,6 +71,8 @@ class Settings(BaseSettings):
     knowledge_development_url: str = Field(default="http://knowledge-development-worker:8000", alias="KNOWLEDGE_DEVELOPMENT_URL")
     api_gateway_url: str = Field(default="http://api-gateway:8000", alias="API_GATEWAY_URL")
     application_onboarding_url: str = Field(default="http://application-onboarding:8000", alias="APPLICATION_ONBOARDING_URL")
+    cloud_operations_url: str = Field(default="http://cloud-operations:8000", alias="CLOUD_OPERATIONS_URL")
+    cloud_operations_enabled: bool = Field(default=False, alias="CLOUD_OPERATIONS_ENABLED")
     ai_layer_mode: str = Field(default="endpoint", alias="AI_LAYER_MODE")
     ai_layer_request_timeout_seconds: float = Field(default=120.0, alias="AI_LAYER_REQUEST_TIMEOUT_SECONDS")
     ai_layer_auth_token: str = Field(default="", alias="AI_LAYER_AUTH_TOKEN")
