@@ -160,6 +160,9 @@ class Settings(BaseSettings):
     remediation_temporal_enabled: bool = Field(default=False, alias="REMEDIATION_TEMPORAL_ENABLED")
     remediation_temporal_task_queue: str = Field(default="kaiops-remediation", alias="REMEDIATION_TEMPORAL_TASK_QUEUE")
     remediation_internal_token: str = Field(default="", alias="REMEDIATION_INTERNAL_TOKEN")
+    event_envelope_signing_required: bool = Field(default=False, alias="EVENT_ENVELOPE_SIGNING_REQUIRED")
+    event_envelope_signing_key: str = Field(default="", alias="EVENT_ENVELOPE_SIGNING_KEY")
+    event_envelope_signing_issuer: str = Field(default="", alias="EVENT_ENVELOPE_SIGNING_ISSUER")
     temporal_approval_timeout_hours: int = Field(default=24, alias="TEMPORAL_APPROVAL_TIMEOUT_HOURS")
     orchestration_llm_planner_enabled: bool = Field(default=False, alias="ORCHESTRATION_LLM_PLANNER_ENABLED")
     kafka_startup_attempts: int = Field(default=30, alias="KAFKA_STARTUP_ATTEMPTS")
@@ -339,6 +342,12 @@ class Settings(BaseSettings):
             raise ValueError(f"Missing production OIDC settings: {', '.join(name.upper() for name in missing_oidc)}")
         if not self.oidc_issuer.lower().startswith("https://"):
             raise ValueError("Production OIDC_ISSUER must use HTTPS")
+        if not self.event_envelope_signing_required:
+            raise ValueError("Production requires EVENT_ENVELOPE_SIGNING_REQUIRED=true")
+        if len(self.event_envelope_signing_key) < 32:
+            raise ValueError("Production EVENT_ENVELOPE_SIGNING_KEY must contain at least 32 characters")
+        if not self.event_envelope_signing_issuer.strip():
+            raise ValueError("Production EVENT_ENVELOPE_SIGNING_ISSUER is required")
         # Local JWT keys and seeded passwords are not authentication inputs in
         # OIDC mode; do not force operators to create unused production secrets.
         return

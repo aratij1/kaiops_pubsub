@@ -35,6 +35,7 @@ class CountingContextAgent:
             deployment="release-42",
             runbook="Restart the worker and verify queue recovery.",
             dependency_services=["redis"],
+            observability={"queue_lag": 42, "source": "test-metric"},
             metadata={
                 "collector_call": self.calls,
                 "discovery_report": {
@@ -101,11 +102,12 @@ async def test_auto_mode_collects_once_then_reuses_complete_durable_context(sqli
     assert second.metadata["context_knowledge_id"] == first.metadata["context_knowledge_id"]
     assert second.metadata["prior_resolution"]["root_cause"].startswith("A blocked worker")
     assert second.metadata["alert_type_known"] is True
-    assert second.metadata["knowledge_route"] == "reuse_periodic_knowledge"
+    assert second.metadata["knowledge_route"] == "reuse_validated_context_snapshot"
+    assert second.metadata["context_quality"]["reusable"] is True
 
 
 @pytest.mark.asyncio
-async def test_same_alert_type_reuses_knowledge_across_volatile_labels(sqlite_session_factory) -> None:
+async def test_same_alert_family_refreshes_when_subject_scope_changes(sqlite_session_factory) -> None:
     module = load_context_app_module()
     collector = CountingContextAgent()
     module.agent = collector
@@ -133,14 +135,14 @@ async def test_same_alert_type_reuses_knowledge_across_volatile_labels(sqlite_se
         module.app, repeated_alert, make_incident(repeated_alert)
     )
 
-    assert collector.calls == 1
-    assert repeated.metadata["context_reused"] is True
-    assert repeated.metadata["context_source"] == "periodic_knowledge"
-    assert repeated.metadata["realtime_collection_performed"] is False
+    assert collector.calls == 2
+    assert repeated.metadata["context_reused"] is False
+    assert repeated.metadata["context_source"] == "realtime_collection"
+    assert repeated.metadata["context_subject_fingerprint"] != first.metadata["context_subject_fingerprint"]
 
 
 @pytest.mark.asyncio
-async def test_auto_mode_refreshes_when_prior_rca_score_does_not_exceed_threshold(sqlite_session_factory) -> None:
+async def test_auto_mode_reuses_good_context_but_not_low_quality_prior_rca(sqlite_session_factory) -> None:
     module = load_context_app_module()
     collector = CountingContextAgent()
     module.agent = collector
@@ -163,9 +165,11 @@ async def test_auto_mode_refreshes_when_prior_rca_score_does_not_exceed_threshol
     second_alert = make_alert()
     second = await module._collect_context_with_strategy(module.app, second_alert, make_incident(second_alert))
 
-    assert collector.calls == 2
-    assert second.metadata["context_reused"] is False
-    assert second.metadata["context_source"] == "realtime_collection"
+    assert collector.calls == 1
+    assert second.metadata["context_reused"] is True
+    assert second.metadata["context_source"] == "periodic_knowledge"
+    assert second.metadata["prior_resolution_reusable"] is False
+    assert second.metadata["prior_resolution"] == {}
 
 
 @pytest.mark.asyncio

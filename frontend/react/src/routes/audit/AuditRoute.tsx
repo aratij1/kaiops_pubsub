@@ -1,1 +1,5 @@
-export { GatewaySafetyView as default } from "../gateway-safety/GatewaySafetyView";
+import { GatewaySafetyView } from "../gateway-safety/GatewaySafetyView";
+
+export default function AuditRoute() {
+  return <GatewaySafetyView mode="audit" />;
+}

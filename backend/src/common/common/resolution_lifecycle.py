@@ -52,7 +52,7 @@ class LifecycleTransitionError(ValueError):
 
 
 CONTROL_SCHEMA_VERSION = "kaims.resolution-control.v1"
-_WATCH_ONLY_TOKENS = {"watch_only", "monitor_only", "observation_only", "observe_only", "no_action"}
+_WATCH_ONLY_TOKENS = {"watch_only", "monitor_only", "observation_only", "observe_only"}
 
 
 def _explicit_watch_only(*sources: Any) -> bool:
@@ -61,7 +61,9 @@ def _explicit_watch_only(*sources: Any) -> bool:
             continue
         if source.get("watch_only") is True:
             return True
-        for key in ("disposition", "resolution_mode", "handling_mode", "action_mode", "outcome"):
+        # A generic model outcome such as "no_action" is not authorization to
+        # close. Only dedicated policy/mode fields can opt into watch-only.
+        for key in ("disposition", "resolution_mode", "handling_mode", "action_mode"):
             token = str(source.get(key) or "").strip().lower().replace("-", "_").replace(" ", "_")
             if token in _WATCH_ONLY_TOKENS:
                 return True
@@ -105,7 +107,11 @@ def decide_resolution_control(plan: dict[str, Any] | None, *, requires_approval:
         # Diagnostic completion may close the workflow without execution. The
         # closure report must still distinguish that outcome from validated
         # alert clearance and service recovery.
-        "auto_close": state == ResolutionState.DIAGNOSTIC_ONLY and not conflicts,
+        # A missing corrective capability means "investigate", not "resolved".
+        # Only an explicit watch-only policy may authorize closure without
+        # execution and recovery validation.
+        "auto_close": disposition == ResolutionDisposition.WATCH_ONLY and not conflicts,
+        "watch_only_authorized": disposition == ResolutionDisposition.WATCH_ONLY and not conflicts,
         "approval_required": disposition == ResolutionDisposition.APPROVAL_REQUIRED,
         "execution_allowed": disposition == ResolutionDisposition.EXECUTION_READY,
         "conflicts": conflicts,

@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime
 from time import monotonic
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import httpx
 from ai_workbench_common.models import Context
@@ -18,6 +18,10 @@ from common.kafka import KafkaConsumer
 from common.kafka import consume_forever as consume_kafka_forever
 from common.models import Incident, Recommendation
 from common.orchestration.execution_plan import resolve_execution_plan
+from common.orchestration.execution_plan_contract import (
+    ExecutionPlanV2,
+    verify_plan_fingerprint,
+)
 from common.rabbitmq import RabbitMQConsumer
 from common.rabbitmq import consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
@@ -28,6 +32,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from resolution_agent import ResolutionIntelligenceAgent
 from resolution_agent.investigation import IterativeInvestigator
+from resolution_agent.policy import ResolutionPolicyInput, evaluate_resolution_policy
+from resolution_agent.metrics import HITL_TOTAL, HOTL_TOTAL, PLAN_BLOCKED_TOTAL
+from resolution_agent.workflow import ResolutionWorkflowState, transition_idempotency_key
 from resolution_agent.catalog import (
     RESOLUTION_CATALOG,
     prepare_resolution_plan,
@@ -72,6 +79,12 @@ def _resolution_quality_score(payload: Any) -> float:
 def _resolution_reuse_threshold() -> float:
     configured = float(getattr(settings, "context_resolution_reuse_min_score", 0.7) or 0.7)
     return max(0.0, min(configured, 1.0))
+
+
+def _deterministic_recommendation_id(context: Context) -> UUID:
+    metadata = context.metadata if isinstance(context.metadata, dict) else {}
+    identity = metadata.get("context_fingerprint") or context.alert.id
+    return uuid5(NAMESPACE_URL, f"kaims:recommendation:{context.incident_id}:{identity}:v2")
 
 
 async def _resolve_context(context: Context) -> Recommendation:
@@ -154,6 +167,7 @@ async def _resolve_context(context: Context) -> Recommendation:
             "analysis_reused": False,
             "analysis_source": "fresh_evidence_analysis",
         }
+        recommendation.id = _deterministic_recommendation_id(context)
         return recommendation
     try:
         cached_recommendation = Recommendation.model_validate(prior)
@@ -162,7 +176,7 @@ async def _resolve_context(context: Context) -> Recommendation:
         return await agent.resolve_with_runtime(context)
     recommendation = cached_recommendation.model_copy(
         update={
-            "id": uuid4(),
+            "id": _deterministic_recommendation_id(context),
             "created_at": datetime.now(UTC),
             "incident_id": context.incident_id,
             "trace_id": str(context.alert.trace_id or "") or None,
@@ -205,7 +219,13 @@ def _catalog_plan_for(
         and supplied.get("schema_version") == "kaims.execution-plan.v2"
         and not legacy_compose_binding
     ):
-        return supplied
+        try:
+            validated = ExecutionPlanV2.model_validate(supplied)
+        except ValueError:
+            pass
+        else:
+            if verify_plan_fingerprint(supplied):
+                return validated.model_dump(mode="json")
     return resolve_execution_plan(
         alert=context.alert,
         workflow_name=str(routing.get("workflow") or "resolution-rerun"),
@@ -230,6 +250,21 @@ def _catalog_plan_for(
                 ),
             )
         )[:4000],
+        evidence_basis=(
+            [
+                str(evidence_id)
+                for evidence_ids in recommendation.metadata.get("investigation_report", {}).get("source_evidence_ids", {}).values()
+                for evidence_id in (evidence_ids if isinstance(evidence_ids, list) else [])
+                if str(evidence_id).strip()
+            ]
+            if recommendation
+            and isinstance(recommendation.metadata, dict)
+            and isinstance(recommendation.metadata.get("investigation_report"), dict)
+            else []
+        ),
+        incident_id=recommendation.incident_id if recommendation else None,
+        root_cause=str(recommendation.root_cause or "RCA not yet established") if recommendation else "RCA not yet established",
+        confidence=float(recommendation.confidence or 0.0) if recommendation else 0.0,
     )
 
 
@@ -271,6 +306,72 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
             "next_evidence": iterative.get("next_evidence", []),
         }
         metadata["candidate_execution_plan"] = candidate_plan
+    confidence = float(
+        (iterative.get("conclusion") or {}).get("confidence")
+        or recommendation.confidence
+        or 0.0
+    )
+    connector = plan.get("connection", {}).get("connector", {}) if isinstance(plan.get("connection"), dict) else {}
+    policy_risk = str(plan.get("risk_tier") or "medium").lower()
+    if policy_risk not in {"low", "medium", "high", "critical"}:
+        policy_risk = "medium"
+    policy = evaluate_resolution_policy(ResolutionPolicyInput(
+        environment=str(context.alert.environment or "unknown").lower(),
+        risk=policy_risk,
+        confidence=max(0.0, min(confidence, 1.0)),
+        runbook_status=str(plan.get("runbook_status") or "unregistered"),
+        runbook_success_rate=float(plan.get("runbook_success_rate") or 0.0),
+        mutating=bool(plan.get("mutating")),
+        reversible=bool(plan.get("rollback_commands")),
+        canary_supported=bool(plan.get("canary_supported")),
+        blast_radius=str(plan.get("blast_radius") or "single-service"),
+        target_verified=bool(str(plan.get("remediation_target") or "").strip()),
+        validation_available=bool(plan.get("validation_commands")),
+        rollback_available=bool(plan.get("rollback_commands")),
+        contradiction_count=len((iterative.get("conclusion") or {}).get("contradicting_evidence_ids") or []),
+        database_change=str(connector.get("type") or "").lower() in {"database", "mysql"},
+        rca_conclusive=bool(iterative.get("conclusive")),
+    ))
+    plan["policy_decision"] = policy.model_dump(mode="json")
+    if policy.decision == "hitl":
+        HITL_TOTAL.inc()
+    elif policy.decision == "hotl":
+        HOTL_TOTAL.inc()
+    elif policy.decision == "block":
+        PLAN_BLOCKED_TOTAL.inc()
+    if policy.decision in {"block", "investigate"} and plan.get("mutating"):
+        metadata["candidate_execution_plan"] = dict(plan)
+        plan["plan_kind"] = "diagnostic"
+        plan["diagnostic_only"] = True
+        plan["mutating"] = False
+        plan["execution_ready"] = False
+        plan["commands"] = []
+        plan["rollback_commands"] = []
+        plan["readiness_blocks"] = list(dict.fromkeys([
+            *(plan.get("readiness_blocks") or []),
+            *(f"policy:{reason}" for reason in policy.reason_codes),
+        ]))
+    plan["requires_approval"] = policy.decision == "hitl"
+    plan["approval_required"] = policy.decision == "hitl"
+    if not plan.get("commands"):
+        plan["actions"] = []
+    plan["preflight"] = list(plan.get("preflight_commands") or [])
+    plan["validation"] = list(plan.get("validation_commands") or [])
+    plan["rollback"] = list(plan.get("rollback_commands") or [])
+    plan["evidence_references"] = list(plan.get("evidence_basis") or [])
+    plan["approval_policy"] = {
+        "decision": (
+            "hitl_required"
+            if policy.decision == "hitl"
+            else "denied"
+            if policy.decision == "block"
+            else "recommend_only"
+        ),
+        "required_approver_role": "hitl-reviewer",
+        "reason_codes": list(policy.reason_codes),
+        "approval_expiry_seconds": 900,
+    }
+    plan = ExecutionPlanV2.model_validate(plan).finalized().model_dump(mode="json")
     metadata["execution_plan"] = plan
     metadata["remediation_target"] = str(plan.get("remediation_target") or context.alert.service or "")
     metadata["recommended_commands"] = list(plan.get("commands") or [])
@@ -462,6 +563,51 @@ async def _persist_resolution_event(
                 },
             )
         )
+        iterative = metadata.get("iterative_investigation") if isinstance(metadata.get("iterative_investigation"), dict) else {}
+        plan = metadata.get("execution_plan") if isinstance(metadata.get("execution_plan"), dict) else {}
+        policy_decision = plan.get("policy_decision") if isinstance(plan.get("policy_decision"), dict) else {}
+        evidence_ids = list((iterative.get("conclusion") or {}).get("evidence_ids") or [])
+        transition_path: list[tuple[ResolutionWorkflowState, ResolutionWorkflowState, str]]
+        if iterative.get("conclusive") is not True:
+            transition_path = [(
+                ResolutionWorkflowState.EVIDENCE_PENDING,
+                ResolutionWorkflowState.ESCALATED,
+                "evidence_inconclusive",
+            )]
+        else:
+            policy_target = (
+                ResolutionWorkflowState.AWAITING_APPROVAL
+                if policy_decision.get("decision") == "hitl"
+                else ResolutionWorkflowState.READY_TO_EXECUTE
+                if policy_decision.get("decision") == "hotl"
+                else ResolutionWorkflowState.ESCALATED
+            )
+            transition_path = [
+                (ResolutionWorkflowState.EVIDENCE_PENDING, ResolutionWorkflowState.EVIDENCE_READY, "evidence_compiled"),
+                (ResolutionWorkflowState.EVIDENCE_READY, ResolutionWorkflowState.HYPOTHESES_READY, "hypotheses_ranked"),
+                (ResolutionWorkflowState.HYPOTHESES_READY, ResolutionWorkflowState.PLAN_SELECTED, "approved_runbook_selected"),
+                (ResolutionWorkflowState.PLAN_SELECTED, ResolutionWorkflowState.POLICY_CHECKED, "policy_evaluated"),
+                (ResolutionWorkflowState.POLICY_CHECKED, policy_target, str((policy_decision.get("reason_codes") or ["policy_decision"])[0])),
+            ]
+        for sequence, (previous_state, new_state, reason_code) in enumerate(transition_path, 1):
+            event_id = uuid5(NAMESPACE_URL, f"kaims:resolution-transition:{recommendation.id}:{sequence}:{new_state.value}")
+            transition_payload = {
+                "tenant_id": str(getattr(context, "tenant_id", None) or "default"),
+                "incident_id": str(incident.id),
+                "recommendation_id": str(recommendation.id),
+                "execution_plan_id": None,
+                "previous_state": previous_state.value,
+                "new_state": new_state.value,
+                "event_id": str(event_id),
+                "correlation_id": str(context.alert.correlation_id or "") or None,
+                "causation_id": str(context.alert.id),
+                "idempotency_key": transition_idempotency_key(str(incident.id), event_id, new_state),
+                "actor": "resolution-agent",
+                "reason_code": reason_code,
+                "evidence_ids": evidence_ids,
+                "policy_decision": policy_decision,
+            }
+            await repo.record_resolution_transition(transition_payload)
         await session.commit()
     knowledge_id = str(context.metadata.get("context_knowledge_id") or "").strip()
     if not knowledge_id:

@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 def make_alert() -> Alert:
     return Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="DatabaseReplicaLag",
         service="orders-db",

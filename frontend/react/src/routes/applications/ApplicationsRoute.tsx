@@ -526,11 +526,17 @@ export default function ApplicationsRoute() {
   };
   if (legacyKnowledgeWorkspace) return null;
   return (
-    <section className="grid single-col">
-      <article className="panel">
+    <section className="grid single-col operational-route applications-workspace">
+      <section className="route-insight-strip" aria-label="Application portfolio summary">
+        <article><span className="route-insight-mark">A</span><span><small>Applications in scope</small><strong>{rows.length}</strong></span></article>
+        <article><span className="route-insight-mark">R</span><span><small>Registered</small><strong>{rows.filter((row) => !String(row.id).startsWith("observed:")).length}</strong></span></article>
+        <article><span className="route-insight-mark">O</span><span><small>Observed only</small><strong>{rows.filter((row) => String(row.id).startsWith("observed:")).length}</strong></span></article>
+      </section>
+      <article className="panel route-data-panel">
         <div className="panel-head">
           <div>
-            <h2>Application Portfolio</h2>
+            <span className="discovery-eyebrow">Managed estate</span>
+            <h2>Application portfolio</h2>
             <p>
               Onboarded applications, managed platform services, and services
               observed in live alerts.

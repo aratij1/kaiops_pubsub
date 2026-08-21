@@ -6,7 +6,7 @@ from common.config import get_settings
 from common.repository import EvaluationRepository
 from common.service import create_app
 from fastapi import Body, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 settings = get_settings()
 settings.service_name = "evaluation-service"
@@ -28,6 +28,16 @@ class EvaluationFeedbackRequest(BaseModel):
     decision: str
     approver: str | None = None
     comment: str | None = None
+    reason_category: str | None = None
+    corrected_cause: str | None = None
+    missing_evidence: str | None = None
+
+    @model_validator(mode="after")
+    def validate_structured_review(self) -> EvaluationFeedbackRequest:
+        decision = self.decision.strip().lower()
+        if decision in {"incorrect", "incomplete"} and not str(self.reason_category or "").strip():
+            raise ValueError("reason_category is required when feedback is incorrect or incomplete")
+        return self
 
 
 def _require_storage() -> None:
@@ -106,6 +116,10 @@ async def attach_evaluation_feedback(
         "approver": payload.approver,
         "comment": payload.comment,
     }
+    for field in ("reason_category", "corrected_cause", "missing_evidence"):
+        value = getattr(payload, field)
+        if value is not None:
+            feedback[field] = value
     try:
         async with app.state.session_factory() as session:
             repo = EvaluationRepository(session)

@@ -91,6 +91,8 @@ async def test_opensearch_fetch_prioritizes_latest_errors(monkeypatch: pytest.Mo
         batch_size=100,
     )
 
+    assert captured_body["sort"] == [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}]
+
 
 def test_kaiops_control_plane_error_is_not_turned_into_customer_alert() -> None:
     payload = log_line_to_alert_payload(
@@ -133,5 +135,3 @@ def test_structured_error_uses_container_service_when_json_service_is_null() -> 
 
     assert payload is not None
     assert payload["service"] == "checkout"
-
-    assert captured_body["sort"] == [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}]

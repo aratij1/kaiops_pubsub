@@ -7,7 +7,7 @@ describe("authoritative navigation", () => {
   it("has unique canonical paths and destination identifiers", () => {
     expect(new Set(NAVIGATION_ITEMS.map((item) => item.path)).size).toBe(NAVIGATION_ITEMS.length);
     expect(new Set(NAVIGATION_ITEMS.map((item) => item.id)).size).toBe(NAVIGATION_ITEMS.length);
-    expect(NAVIGATION_GROUPS.map((group) => group.label)).toEqual(["Operations", "Intelligence", "Governance", "Platform", "Administration"]);
+    expect(NAVIGATION_GROUPS.map((group) => group.label)).toEqual(["Review work", "Administration"]);
   });
 
   it("maps every route through its legacy compatibility tab", () => {
@@ -24,22 +24,22 @@ describe("authoritative navigation", () => {
   });
 
   it("keeps restricted destinations out of role navigation and explains why", () => {
-    expect(canAccessTab("l1_operator", "home")).toBe(true);
-    expect(canAccessDestination("l1_operator", "alerts")).toBe(true);
-    expect(canAccessDestination("l1_operator", "admin")).toBe(false);
-    expect(allowedLegacyTabsForRole("l1_operator")).toEqual(["home", "stream", "summary"]);
+    expect(canAccessTab("hitl_reviewer", "home")).toBe(true);
+    expect(canAccessDestination("hitl_reviewer", "alerts")).toBe(true);
+    expect(canAccessDestination("hitl_reviewer", "admin")).toBe(false);
+    expect(allowedLegacyTabsForRole("hitl_reviewer")).toEqual(["home", "stream", "summary", "approval", "closed", "copilot"]);
     expect(allowedLegacyTabsForRole("administrator")).toContain("executive");
-    expect(permissionExplanation("l1_operator", "admin")).toMatch(/not available.*l1 operator/i);
+    expect(permissionExplanation("hitl_reviewer", "admin")).toMatch(/not available.*hitl reviewer/i);
   });
 
   it("uses the same permitted registry for global navigation search", () => {
-    expect(searchNavigation("connector", "administrator").map((item) => item.id)).toEqual(["integrations"]);
-    expect(searchNavigation("connector", "l1_operator")).toEqual([]);
+    expect(searchNavigation("connectors", "administrator").map((item) => item.id)).toEqual(["applications"]);
+    expect(searchNavigation("connectors", "hitl_reviewer")).toEqual([]);
     expect(searchNavigation("human gate", "administrator").map((item) => item.id)).toEqual(["approvals"]);
   });
 
   it("derives breadcrumbs and contextual workflow relationships", () => {
-    expect(breadcrumbForPath("/approvals").map((item) => item.label)).toEqual(["Operations", "Approvals"]);
+    expect(breadcrumbForPath("/approvals").map((item) => item.label)).toEqual(["Review work", "My Approvals"]);
     expect(NAVIGATION_ITEMS.find((item) => item.id === "incidents")?.related).toEqual(["alerts", "approvals"]);
   });
 });

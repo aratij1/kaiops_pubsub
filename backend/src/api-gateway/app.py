@@ -20,9 +20,10 @@ from api_gateway import SafetyAnalyzer
 from api_gateway.auth_policy import route_auth_rule
 from api_gateway.control_routes import build_control_router
 from api_gateway.modules.users.models import SystemRole
-from api_gateway.modules.users.permissions import AuthContext, current_auth_context, current_tenant_id, require_roles
+from api_gateway.modules.users.permissions import AuthContext, current_tenant_id, require_roles
 from api_gateway.modules.users.router import router as user_management_router
-from api_gateway.modules.triage.router import TriageCorrectionCreate, router as triage_router
+from api_gateway.modules.triage.router import TriageCorrectionCreate as TriageCorrectionCreate
+from api_gateway.modules.triage.router import router as triage_router
 from api_gateway.modules.users.service import UserService
 from common.config import get_settings
 from common.database import ActionRecord, AlertRecord, ApprovalRecord, AuditLogRecord, IncidentProjectionRecord, MonitoringConnectionHealthRecord
@@ -35,7 +36,6 @@ from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from opentelemetry import trace
 from prometheus_client import REGISTRY, Counter, Gauge
-from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 
 REQUEST_BODY = Body(default={})
@@ -2031,8 +2031,8 @@ async def run_knowledge_development(request: Request, x_trace_id: str | None = H
 
 
 @app.get("/knowledge-development/report")
-async def knowledge_development_report(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
-    return await guarded_proxy(request=request, method="GET", path="/report", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30)
+async def knowledge_development_report(request: Request, x_trace_id: str | None = Header(default=None), auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value))) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path=f"/report?{urlencode({'tenant_id': auth.tenant_id})}", target_base=settings.knowledge_development_url, payload={}, trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30)
 
 
 @app.get("/operations/queue-health")
@@ -2456,8 +2456,27 @@ async def approval_action(
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    if action not in {"approve", "reject", "modify"}:
+    if action not in {"approve", "reject", "modify", "request-evidence", "auto-assign"}:
         raise HTTPException(status_code=404, detail="unknown approval action")
+    auth = getattr(request.state, "auth", None)
+    if auth is None:
+        # Local/demo mode permits anonymous reads, so the global middleware
+        # does not populate request.state.auth. Approval mutations still need
+        # a validated token because tenant and approver identity must never be
+        # accepted from the request body.
+        auth = await _auth_context_from_request(request)
+    if action == "auto-assign":
+        payload = {**payload, "tenant_id": auth.tenant_id}
+    else:
+        # Approval identity and tenant are security context, never editable
+        # request data. Legacy role names remain accepted during migration but
+        # are recorded as one of the two supported business roles.
+        payload = {
+            **payload,
+            "tenant_id": auth.tenant_id,
+            "approver": auth.email or auth.username or str(auth.user_id),
+            "approver_role": "admin" if auth.role == SystemRole.ADMINISTRATOR.value else "hitl-reviewer",
+        }
     return await guarded_proxy(
         request=request,
         method="POST",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -14,6 +15,8 @@ import httpx
 
 from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.models import Approval, RemediationAction, RemediationStatus, utc_now
+from common.orchestration.execution_plan import docker_compose_restart_plan
+from common.resolution_lifecycle import ResolutionState, create_lifecycle, extract_lifecycle
 from common.resilience import CircuitBreaker, circuit_breaker
 from common.tool_registry import ToolRegistry, ToolSpec
 
@@ -63,6 +66,15 @@ class BasePlugin:
 class JenkinsRollbackPlugin(BasePlugin):
     def __init__(self) -> None:
         super().__init__("rollback_deployment")
+
+    @staticmethod
+    def _execution_plan_envelope(action: RemediationAction) -> tuple[str, str, int]:
+        plan = action.parameters.get("execution_plan")
+        plan = plan if isinstance(plan, dict) else {}
+        serialized = json.dumps(plan, sort_keys=True, separators=(",", ":"))
+        digest = f"sha256:{hashlib.sha256(serialized.encode('utf-8')).hexdigest()}"
+        scripts = plan.get("scripts") if isinstance(plan.get("scripts"), list) else []
+        return serialized, digest, len(scripts)
 
     @staticmethod
     def _connector_url(endpoint: str, advertised_url: str) -> str:
@@ -126,6 +138,7 @@ class JenkinsRollbackPlugin(BasePlugin):
             action.error = f"Runtime credentials for {secret_ref} are unavailable"
             return action
         job_path = "/job/" + "/job/".join(part for part in job_name.split("/") if part)
+        execution_plan_json, execution_plan_digest, expected_script_count = self._execution_plan_envelope(action)
         parameters = {
             "KAI_OPS_INCIDENT_ID": str(action.incident_id),
             "KAI_OPS_APPROVAL_ID": str(action.approval_id or ""),
@@ -136,7 +149,8 @@ class JenkinsRollbackPlugin(BasePlugin):
             "KAI_OPS_NAMESPACE": str(action.parameters.get("namespace") or "default"),
             "KAI_OPS_RESOLUTION_ID": str(action.parameters.get("resolution_id") or operation),
             "KAI_OPS_DRY_RUN": str(bool(action.parameters.get("dry_run", False))).lower(),
-            "KAI_OPS_EXECUTION_PLAN": json.dumps(action.parameters.get("execution_plan") or {}, separators=(",", ":")),
+            "KAI_OPS_EXECUTION_PLAN": execution_plan_json,
+            "KAI_OPS_PLAN_DIGEST": execution_plan_digest,
         }
         async with httpx.AsyncClient(auth=(username, token), timeout=httpx.Timeout(30.0, connect=10.0)) as client:
             headers: dict[str, str] = {}
@@ -164,6 +178,8 @@ class JenkinsRollbackPlugin(BasePlugin):
             "queue_url": queue_url,
             "build_url": "",
             "secret_ref": secret_ref,
+            "approved_plan_digest": execution_plan_digest,
+            "expected_script_count": expected_script_count,
         }
         return action
 
@@ -218,10 +234,28 @@ class JenkinsRollbackPlugin(BasePlugin):
             artifact = await client.get(f"{build_url.rstrip('/')}/artifact/kaiops-result.json")
             artifact.raise_for_status()
             evidence = artifact.json()
-        expected = {"incident_id": str(action.incident_id), "approval_id": str(action.approval_id or ""), "target": str(action.target)}
+        expected = {
+            "incident_id": str(action.incident_id),
+            "approval_id": str(action.approval_id or ""),
+            "target": str(action.target),
+            "plan_digest": str(result.get("approved_plan_digest") or ""),
+        }
         mismatched = [key for key, value in expected.items() if str(evidence.get(key) or "") != value]
-        truthful = not mismatched and bool(evidence.get("preflight_passed")) and bool(evidence.get("recovery_validated")) and (bool(action.parameters.get("dry_run")) or bool(evidence.get("executed")))
-        result.update({"phase": "terminal", "recovery_evidence": evidence, "executed": bool(evidence.get("executed")), "recovery_validated": bool(evidence.get("recovery_validated"))})
+        truthful = (
+            not mismatched
+            and bool(evidence.get("preflight_passed"))
+            and bool(evidence.get("recovery_validated"))
+            and (bool(action.parameters.get("dry_run")) or bool(evidence.get("executed")))
+            and int(evidence.get("executed_script_count") or 0) == int(result.get("expected_script_count") or 0)
+        )
+        result.update({
+            "phase": "terminal",
+            "recovery_evidence": evidence,
+            "executed": bool(evidence.get("executed")),
+            "recovery_validated": bool(evidence.get("recovery_validated")),
+            "executed_plan_digest": str(evidence.get("plan_digest") or ""),
+            "executed_script_count": int(evidence.get("executed_script_count") or 0),
+        })
         action.parameters["execution_result"] = result
         action.completed_at = utc_now()
         if truthful:
@@ -262,6 +296,7 @@ class JenkinsRollbackPlugin(BasePlugin):
         job_path = "/job/" + "/job/".join(part for part in job_name.split("/") if part)
         build_url = f"{endpoint}{job_path}/buildWithParameters"
         timeout_seconds = max(30.0, min(float(profile.get("timeout_seconds") or 1200), 1500.0))
+        execution_plan_json, execution_plan_digest, expected_script_count = self._execution_plan_envelope(action)
         parameters = {
             "KAI_OPS_INCIDENT_ID": str(action.incident_id),
             "KAI_OPS_APPROVAL_ID": str(action.approval_id or ""),
@@ -272,7 +307,8 @@ class JenkinsRollbackPlugin(BasePlugin):
             "KAI_OPS_NAMESPACE": str(action.parameters.get("namespace") or "default"),
             "KAI_OPS_RESOLUTION_ID": str(action.parameters.get("resolution_id") or connector_operation),
             "KAI_OPS_DRY_RUN": str(bool(action.parameters.get("dry_run", False))).lower(),
-            "KAI_OPS_EXECUTION_PLAN": json.dumps(action.parameters.get("execution_plan") or {}, separators=(",", ":")),
+            "KAI_OPS_EXECUTION_PLAN": execution_plan_json,
+            "KAI_OPS_PLAN_DIGEST": execution_plan_digest,
         }
         async with httpx.AsyncClient(auth=(username, token), timeout=httpx.Timeout(timeout_seconds, connect=10.0)) as client:
             headers: dict[str, str] = {}
@@ -338,6 +374,7 @@ class JenkinsRollbackPlugin(BasePlugin):
                         "incident_id": str(action.incident_id),
                         "approval_id": str(action.approval_id or ""),
                         "target": str(action.target),
+                        "plan_digest": execution_plan_digest,
                     }
                     mismatched = [key for key, value in expected.items() if str(candidate.get(key) or "") != value]
                     if mismatched:
@@ -348,6 +385,7 @@ class JenkinsRollbackPlugin(BasePlugin):
                         and bool(candidate.get("recovery_validated"))
                         and (dry_run or bool(candidate.get("executed")))
                         and str(candidate.get("result") or "").upper() == "SUCCESS"
+                        and int(candidate.get("executed_script_count") or 0) == expected_script_count
                     )
                     if not truthful_success:
                         raise ValueError("result artifact does not prove execution and recovery validation")
@@ -373,7 +411,6 @@ class JenkinsRollbackPlugin(BasePlugin):
             action.error = f"Jenkins build finished with result {build_result}"
             action.output = f"Jenkins remediation failed for {job_name}"
         action.parameters["execution_result"] = {
-            "executed": action.status == RemediationStatus.SUCCEEDED,
             "executor": "jenkins",
             "connector_endpoint": endpoint,
             "job_name": job_name,
@@ -384,6 +421,9 @@ class JenkinsRollbackPlugin(BasePlugin):
             "recovery_evidence": recovery_evidence,
             "executed": bool(recovery_evidence.get("executed")),
             "recovery_validated": bool(recovery_evidence.get("recovery_validated")),
+            "approved_plan_digest": execution_plan_digest,
+            "executed_plan_digest": str(recovery_evidence.get("plan_digest") or ""),
+            "executed_script_count": int(recovery_evidence.get("executed_script_count") or 0),
             "secret_ref": secret_ref,
             "submitted_parameters": {key: value for key, value in parameters.items() if key != "KAI_OPS_EXECUTION_PLAN"},
             "summary": action.error or action.output,
@@ -735,11 +775,19 @@ class RemediationEngine(BaseAgent):
 
         if "kaiops_alert_health_triage.sh" in haystack:
             return "script_execution"
+        # Classify the immutable catalog commands before interpreting prose.
+        # Service-down recommendations often say "restart the <service>" and
+        # the previous generic fallback mislabeled their Docker restart as a
+        # deployment rollback, which then failed connector authorization.
+        if "rollout undo" in command_blob:
+            return "rollback_deployment"
+        if "containers/" in command_blob and "/restart" in command_blob:
+            return "restart_service"
         if any(keyword in haystack for keyword in ["restart pod", "rollout restart", "crashloop", "oom"]):
             return "restart_pod"
         if any(keyword in haystack for keyword in ["scale", "replicas", "hpa"]):
             return "scale_deployment"
-        if any(keyword in haystack for keyword in ["restart service", "systemctl restart", "ansible"]):
+        if any(keyword in haystack for keyword in ["restart service", "restart the", "systemctl restart", "ansible"]):
             return "restart_service"
         if any(keyword in haystack for keyword in ["cache", "redis", "flushdb"]):
             return "clear_cache"
@@ -768,6 +816,13 @@ class RemediationEngine(BaseAgent):
         action_type = self._infer_action_type(action_text=action_text, commands=command_list)
         policy_version = str(approval.metadata.get("policy_version", "")).strip()
         policy_reason = str(approval.metadata.get("policy_reason", "")).strip()
+        connection_profile = approval.metadata.get("connection_profile") if isinstance(approval.metadata.get("connection_profile"), dict) else {}
+
+        def usable_target(value: Any) -> str:
+            candidate = str(value or "").strip()
+            if not candidate or candidate.lower() in {"-", "unknown", "unknown service", "not configured", "none", "null"}:
+                return ""
+            return candidate
 
         target_candidates = [
             approval.metadata.get("remediation_target"),
@@ -776,14 +831,23 @@ class RemediationEngine(BaseAgent):
             approval.metadata.get("resource"),
             approval.metadata.get("service"),
             approval.metadata.get("incident_service"),
+            connection_profile.get("target"),
+            connection_profile.get("resource"),
+            connection_profile.get("deployment"),
+            connection_profile.get("service"),
+            connection_profile.get("application"),
+            approved_execution_plan.get("remediation_target"),
+            approved_execution_plan.get("target"),
+            approved_execution_plan.get("resource"),
+            approved_execution_plan.get("service"),
             inferred_target,
             approval.metadata.get("incident_id"),
             approval.incident_id,
         ]
-        target = str(next((value for value in target_candidates if value), approval.incident_id)).strip()
-        service = str(approval.metadata.get("service") or approval.metadata.get("incident_service") or inferred_target or "").strip()
-        environment = str(approval.metadata.get("environment") or "").strip()
-        namespace = str(approval.metadata.get("namespace") or "default").strip()
+        target = next((candidate for value in target_candidates if (candidate := usable_target(value))), str(approval.incident_id))
+        service = next((candidate for value in [approval.metadata.get("service"), approval.metadata.get("incident_service"), connection_profile.get("service"), approved_execution_plan.get("service"), inferred_target] if (candidate := usable_target(value))), "")
+        environment = str(approval.metadata.get("environment") or connection_profile.get("environment") or approved_execution_plan.get("environment") or "").strip()
+        namespace = str(approval.metadata.get("namespace") or connection_profile.get("namespace") or approved_execution_plan.get("namespace") or "default").strip()
         if self._looks_like_uuid(target) and service:
             target = service
         generated_execution_plan = self._build_execution_plan(
@@ -795,7 +859,6 @@ class RemediationEngine(BaseAgent):
             recommended_action=recommended_action,
             recommended_commands=command_list,
         )
-        connection_profile = approval.metadata.get("connection_profile") if isinstance(approval.metadata.get("connection_profile"), dict) else {}
         requested_executor = str(
             connection_profile.get("executor_type")
             or connection_profile.get("connection_type")
@@ -809,9 +872,17 @@ class RemediationEngine(BaseAgent):
         execution_platform = os.getenv("REMEDIATION_EXECUTION_PLATFORM", "kubernetes").strip().lower()
         stale_platform_plan = (
             execution_platform in {"docker", "docker-compose", "compose"}
-            and any(str(item).strip().lower().startswith("kubectl ") for item in plan_commands)
+            and any(
+                str(item).strip().lower().startswith(("kubectl ", "ansible-playbook "))
+                for item in plan_commands
+            )
         )
-        use_generated_commands = requested_executor == "jenkins" and (not plan_commands or stale_platform_plan)
+        # A reviewed script-only plan is complete in its own execution domain.
+        # Do not silently graft an inferred container restart and health check
+        # onto it merely because its commands list is empty.
+        use_generated_commands = requested_executor == "jenkins" and not plan_scripts and (
+            stale_platform_plan or not plan_commands
+        )
         governed_generated_commands = [
             str(item).strip()
             for item in generated_execution_plan.get("commands", [])
@@ -832,14 +903,18 @@ class RemediationEngine(BaseAgent):
             ],
             "scripts": [
                 str(item).strip()
-                for item in (plan_scripts if has_approved_execution_plan else generated_execution_plan.get("scripts", []))
+                for item in (
+                    ([] if use_generated_commands else plan_scripts)
+                    if has_approved_execution_plan
+                    else generated_execution_plan.get("scripts", [])
+                )
                 if str(item).strip()
             ],
             "queries": [
                 str(item).strip()
                 for item in (
                     generated_execution_plan.get("queries", [])
-                    if use_generated_commands and not plan_queries
+                    if use_generated_commands
                     else plan_queries if has_approved_execution_plan else generated_execution_plan.get("queries", [])
                 )
                 if str(item).strip()
@@ -856,7 +931,13 @@ class RemediationEngine(BaseAgent):
             "preflight": [
                 str(item).strip()
                 for item in (
-                    (approved_execution_plan.get("preflight") or generated_execution_plan.get("preflight", []))
+                    generated_execution_plan.get("preflight", [])
+                    if use_generated_commands
+                    else (
+                        approved_execution_plan.get("preflight", []) or approved_execution_plan.get("preflight_commands", [])
+                        if plan_scripts
+                        else approved_execution_plan.get("preflight") or approved_execution_plan.get("preflight_commands") or generated_execution_plan.get("preflight", [])
+                    )
                     if has_approved_execution_plan
                     else generated_execution_plan.get("preflight", [])
                 )
@@ -865,7 +946,13 @@ class RemediationEngine(BaseAgent):
             "validation_commands": [
                 str(item).strip()
                 for item in (
-                    (approved_execution_plan.get("validation_commands") or generated_execution_plan.get("validation_commands", []))
+                    generated_execution_plan.get("validation_commands", [])
+                    if use_generated_commands
+                    else (
+                        approved_execution_plan.get("validation_commands", [])
+                        if plan_scripts
+                        else approved_execution_plan.get("validation_commands") or generated_execution_plan.get("validation_commands", [])
+                    )
                     if has_approved_execution_plan
                     else generated_execution_plan.get("validation_commands", [])
                 )
@@ -874,17 +961,27 @@ class RemediationEngine(BaseAgent):
             "rollback_commands": [
                 str(item).strip()
                 for item in (
-                    (approved_execution_plan.get("rollback_commands") or generated_execution_plan.get("rollback_commands", []))
+                    generated_execution_plan.get("rollback_commands", [])
+                    if use_generated_commands
+                    else (
+                        approved_execution_plan.get("rollback_commands", [])
+                        if plan_scripts
+                        else approved_execution_plan.get("rollback_commands") or generated_execution_plan.get("rollback_commands", [])
+                    )
                     if has_approved_execution_plan
                     else generated_execution_plan.get("rollback_commands", [])
                 )
                 if str(item).strip()
             ],
             "rollback_mode": str(
-                approved_execution_plan.get("rollback_mode")
+                generated_execution_plan.get("rollback_mode")
+                if use_generated_commands
+                else approved_execution_plan.get("rollback_mode")
                 or generated_execution_plan.get("rollback_mode")
                 or "automatic"
             ).strip().lower(),
+            "source_schema_version": str(approved_execution_plan.get("schema_version") or ""),
+            "plan_fingerprint": str(approved_execution_plan.get("plan_fingerprint") or ""),
         }
         supplied_profile = connection_profile
         default_executor = os.getenv("REMEDIATION_DEFAULT_EXECUTOR", "").strip().lower()
@@ -927,6 +1024,7 @@ class RemediationEngine(BaseAgent):
             connection_profile = supplied_profile
 
         return RemediationAction(
+            tenant_id=approval.tenant_id,
             incident_id=approval.incident_id,
             approval_id=approval.id,
             action_type=action_type,
@@ -947,6 +1045,14 @@ class RemediationEngine(BaseAgent):
                 "runbook_status": str(approval.metadata.get("runbook_status") or ""),
                 "runbook_match_score": approval.metadata.get("runbook_match_score"),
                 "operator_modified": bool(approval.modified_action),
+                "recommendation_id": str(approval.recommendation_id),
+                "resolution_lifecycle": extract_lifecycle(approval.metadata) or create_lifecycle(
+                    tenant_id=approval.tenant_id,
+                    incident_id=approval.incident_id,
+                    recommendation_id=approval.recommendation_id,
+                    plan=execution_plan,
+                    state=ResolutionState.READY_TO_EXECUTE,
+                ),
             },
             started_at=utc_now(),
             status=RemediationStatus.RUNNING,
@@ -973,7 +1079,8 @@ class RemediationEngine(BaseAgent):
             # canonical service key.
             internal_services = {
                 "api-gateway", "approval-service", "closure-service", "context-agent",
-                "monitoring-adapter", "orchestrator", "remediation-engine", "resolution-agent",
+                "discovery-mcp", "monitoring-adapter", "orchestrator", "remediation-engine",
+                "resolution-agent",
             }
             unqualified_service = safe_service.removeprefix("kaiops-")
             if unqualified_service in internal_services:
@@ -982,16 +1089,15 @@ class RemediationEngine(BaseAgent):
                 r"[^a-zA-Z0-9_.-]", "",
                 os.getenv("REMEDIATION_COMPOSE_PROJECT", "kaiops_azure"),
             )
-            container = f"{compose_project}-{safe_service}-1"
+            docker_plan = docker_compose_restart_plan(project=compose_project, service=safe_service)
             return {
                 "schema_version": "kaiops.remediation.v2",
-                "commands": [
-                    f"curl --fail --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 -X POST http://docker-socket-proxy:2375/containers/{container}/restart?t=30",
+                "commands": [*docker_plan["commands"],
                     f"curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 2 http://{safe_service}:8000/healthz",
                 ],
                 "scripts": [],
                 "queries": [f"http://{safe_service}:8000/healthz"],
-                "preflight": [f"curl --fail --silent --show-error --output /dev/null http://docker-socket-proxy:2375/containers/{container}/json"],
+                "preflight": docker_plan["preflight"],
                 "validation_commands": [f"curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 2 http://{safe_service}:8000/healthz"],
                 # A process restart has no meaningful inverse operation. Do
                 # not label a read-only container inspection as a rollback.

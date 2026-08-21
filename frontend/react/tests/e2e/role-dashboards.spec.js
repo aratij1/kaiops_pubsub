@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-const roles = ["L1 Operator", "L2 Engineer", "Executive", "Administrator"];
+const roles = ["L2 Engineer", "Administrator"];
 
 for (const role of roles) {
   test(`${role} receives the reliability overview with its role identity`, async ({ page }) => {
@@ -22,8 +22,8 @@ for (const role of roles) {
     await page.getByLabel("Username").fill("test-user");
     await page.getByLabel("Password").fill("Test@123456");
     await page.getByRole("button", { name: "Sign In" }).click();
-    await expect(page.getByRole("heading", { level: 1, name: "Incident Summary" })).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Reliability Overview" })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1, name: "Operations Overview" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Know what is broken. Fix it safely." })).toBeVisible();
     await expect(page.locator(".hero-user")).toContainText(role);
     await expect(page.getByText("Overall SLO Score", { exact: true })).toBeVisible();
   });

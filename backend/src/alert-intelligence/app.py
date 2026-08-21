@@ -287,6 +287,13 @@ async def _reuse_correlated_jira(incident: Any) -> str | None:
     return jira_key
 
 
+def _incident_from_persisted_payload(payload: dict[str, Any], incident_type: type[Incident] = Incident) -> Incident:
+    """Hydrate a strict Incident from its enriched persistence/read payload."""
+    return incident_type.model_validate({
+        key: value for key, value in payload.items() if key in incident_type.model_fields
+    })
+
+
 async def _merge_duplicate_into_canonical(alert: Alert, incident: Any) -> Any | None:
     deduplication = alert.metadata.get("deduplication") if isinstance(alert.metadata, dict) else {}
     if not isinstance(deduplication, dict) or deduplication.get("disposition") != "duplicate":
@@ -300,7 +307,12 @@ async def _merge_duplicate_into_canonical(alert: Alert, incident: Any) -> Any | 
         payload = await repo.find_open_incident_by_correlation_key(correlation_key)
         if not payload:
             return None
-        canonical = type(incident).model_validate(payload)
+        # Persistence payloads intentionally include read-model annotations
+        # such as approval_status/state. The strict domain model forbids those
+        # extras, so hydrate only its declared fields. This keeps a delayed
+        # duplicate from failing merely because the canonical incident has
+        # already advanced to an approval or terminal lifecycle state.
+        canonical = _incident_from_persisted_payload(payload, type(incident))
         if alert.id not in canonical.alert_ids:
             canonical.alert_ids.append(alert.id)
         canonical_metadata = canonical.metadata if isinstance(canonical.metadata, dict) else {}

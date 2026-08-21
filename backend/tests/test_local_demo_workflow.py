@@ -114,7 +114,7 @@ async def test_local_payment_workflow_generates_recommendation() -> None:
     assert workflow["decision"]["workflow"] == "critical-auto-remediation"
     assert workflow["decision"]["policy_version"] == "policy-v1"
     assert workflow["decision"]["policy_reason"]
-    assert workflow["context"]["deployment"] == "Deployment 2.5"
+    assert workflow["context"]["deployment"] == "payments"
     assert workflow["recommendation"]["recommended_action"] == "Rollback deployment"
     assert workflow["recommendation"]["metadata"]["policy_version"] == workflow["decision"]["policy_version"]
     assert workflow["approval"]["metadata"]["policy_version"] == workflow["decision"]["policy_version"]

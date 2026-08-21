@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -23,10 +23,13 @@ class IncidentStatus(StrEnum):
     OPEN = "open"
     INVESTIGATING = "investigating"
     AWAITING_APPROVAL = "awaiting_approval"
+    APPROVED = "approved"
     REMEDIATING = "remediating"
     VALIDATING = "validating"
+    RESOLVED = "resolved"
     CLOSED = "closed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class ApprovalDecision(StrEnum):
@@ -34,6 +37,7 @@ class ApprovalDecision(StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     MODIFIED = "modified"
+    EVIDENCE_REQUESTED = "evidence_requested"
 
 
 class RemediationStatus(StrEnum):
@@ -397,6 +401,11 @@ class Approval(BaseEvent):
     tenant_id: str = "default"
     incident_id: UUID
     recommendation_id: UUID
+    plan_id: UUID | None = None
+    plan_fingerprint: str | None = None
+    approval_expires_at: datetime | None = None
+    approver_role: str | None = None
+    authorization_scope: Literal["dry_run", "execution"] = "execution"
     decision: ApprovalDecision = ApprovalDecision.PENDING
     approver: str | None = None
     channel: str = "web"

@@ -1,4 +1,5 @@
 .ro-page .positive{color:#047857;font-weight:650}.ro-page .negative,.ro-page .ro-summary small{color:#b42332;font-weight:650}.ro-page .ro-kpis strong.amber{color:#a95b00}.ro-page .ro-spark path{stroke:#087f7c}.ro-page .ro-spark.ro-amber path{stroke:#a95b00}.ro-page .ro-spark.ro-blue path{stroke:#1d5fc4}.ro-page .ro-spark.ro-red path{stroke:#b42332}.ro-page .ro-risk-head{color:#526176;font-weight:650}.ro-page .ro-empty{color:#0f766e;font-weight:650}
+.ro-page .ro-trends select{color:#334e68;border-color:#cbd8e3;background:#fff}
 
 :root[data-ui-theme="dark"] .ro-page{color:#e7edf7}:root[data-ui-theme="dark"] .ro-heading p,:root[data-ui-theme="dark"] .ro-kpis span,:root[data-ui-theme="dark"] .ro-mttr-grid span,:root[data-ui-theme="dark"] .ro-column>span{color:#9aabc1}
 :root[data-ui-theme="dark"] .ro-tools button,:root[data-ui-theme="dark"] .ro-trends select,:root[data-ui-theme="dark"] .ro-card{color:#dce6f4;border-color:#293b55;background:#111d30;box-shadow:0 10px 24px rgba(0,0,0,.18)}

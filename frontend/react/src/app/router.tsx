@@ -4,6 +4,7 @@ import { createBrowserRouter, Navigate } from "react-router-dom";
 import { LegacyApplicationShell } from "./LegacyApplicationShell";
 import { LEGACY_REDIRECTS, NAVIGATION_ITEMS, type NavigationId } from "./navigation";
 import { resilientLazy } from "./resilientLazy";
+import { RouteErrorBoundary } from "./RouteErrorBoundary";
 
 const DashboardRoute = resilientLazy(() => import("../routes/dashboard/DashboardRoute"));
 const AlertsRoute = resilientLazy(() => import("../routes/alerts/AlertsRoute"));
@@ -48,6 +49,7 @@ const ROUTE_COMPONENTS: Readonly<Record<NavigationId, ComponentType>> = {
 export const router = createBrowserRouter([
   {
     element: <LegacyApplicationShell />,
+    errorElement: <RouteErrorBoundary />,
     children: [
       ...NAVIGATION_ITEMS.map((item) => ({ path: item.path, element: routeElement(ROUTE_COMPONENTS[item.id]) })),
       ...LEGACY_REDIRECTS.map((redirect) => ({ path: redirect.from, element: <Navigate to={redirect.to} replace /> })),

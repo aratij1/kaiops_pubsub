@@ -419,7 +419,7 @@ groups:
           description: "Agent {{ $labels.agent }} processing exceeded 60 seconds at P95."
 
       - alert: WorkflowExecutionFailure
-        expr: increase(kaiops_events_processed_total{status!="ok"}[10m]) > 2
+        expr: increase(kaiops_events_processed_total{status=~"error|failed|dispatch-failed|execution-failed|validation-failed|rollback-failed|timed-out"}[10m]) > 2
         for: 10m
         labels:
           severity: critical
@@ -437,7 +437,7 @@ groups:
           description: "No orchestrator event-processing metric is present."
 
       - alert: AutomationExecutionFailure
-        expr: increase(kaiops_events_processed_total{service="remediation-engine",status!="ok"}[10m]) > 0
+        expr: increase(kaiops_events_processed_total{service="remediation-engine",status=~"error|failed|dispatch-failed|execution-failed|validation-failed|rollback-failed|timed-out"}[10m]) > 0
         for: 10m
         labels:
           severity: critical

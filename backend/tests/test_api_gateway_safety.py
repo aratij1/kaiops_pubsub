@@ -3,6 +3,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -263,9 +264,96 @@ def test_gateway_operational_auth_policy_marks_admin_routes() -> None:
     assert route_auth_rule("POST", "/onboarding/complete") == {"Administrator"}
     assert route_auth_rule("GET", "/monitoring/integrations") == {"Administrator"}
     assert route_auth_rule("POST", "/rag/documents") == {"Administrator", "L2 Engineer", "L3 Engineer"}
-    assert route_auth_rule("POST", "/approval/approve") is None
+    assert route_auth_rule("POST", "/approval/approve") == {"Administrator", "L2 Engineer", "L3 Engineer"}
+    assert route_auth_rule("POST", "/remediation/actions/action-id/emergency-stop") == {"Administrator", "L2 Engineer", "L3 Engineer"}
+    assert route_auth_rule("GET", "/approval/capacity") == {"Administrator"}
+    assert route_auth_rule("POST", "/approval/auto-assign") == {"Administrator"}
     assert route_auth_rule("GET", "/events/operations") is None
     assert route_auth_rule("POST", "/api/v1/alerts/prometheus") is False
+
+
+@pytest.mark.asyncio
+async def test_gateway_owns_approval_identity_and_tenant(monkeypatch) -> None:
+    module = load_api_gateway_app_module()
+    captured = {}
+
+    async def guarded_proxy_stub(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(module, "guarded_proxy", guarded_proxy_stub)
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth=module.AuthContext(
+                user_id="user-1",
+                role="L2 Engineer",
+                tenant_id="tenant-a",
+                jwt_id="jwt-1",
+                session_jti="session-1",
+                token_type="access",
+                email="reviewer@example.com",
+            )
+        )
+    )
+
+    await module.approval_action(
+        "approve",
+        request,
+        payload={"tenant_id": "tenant-b", "approver": "attacker@example.com"},
+    )
+
+    assert captured["payload"]["tenant_id"] == "tenant-a"
+    assert captured["payload"]["approver"] == "reviewer@example.com"
+    assert captured["payload"]["approver_role"] == "hitl-reviewer"
+
+
+@pytest.mark.asyncio
+async def test_local_approval_resolves_auth_when_middleware_skips_it(monkeypatch) -> None:
+    module = load_api_gateway_app_module()
+    captured = {}
+    auth = module.AuthContext(
+        user_id="local-user", role="Administrator", tenant_id="default",
+        jwt_id="jwt-1", session_jti="session-1", token_type="access",
+        email="admin@local.example",
+    )
+
+    async def auth_stub(request):
+        return auth
+
+    async def guarded_proxy_stub(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(module, "_auth_context_from_request", auth_stub)
+    monkeypatch.setattr(module, "guarded_proxy", guarded_proxy_stub)
+    request = SimpleNamespace(state=SimpleNamespace())
+
+    await module.approval_action("reject", request, payload={"comment": "manual remediation required"})
+
+    assert captured["payload"]["tenant_id"] == "default"
+    assert captured["payload"]["approver"] == "admin@local.example"
+    assert captured["payload"]["approver_role"] == "admin"
+
+
+@pytest.mark.asyncio
+async def test_learning_report_uses_authenticated_tenant(monkeypatch) -> None:
+    module = load_api_gateway_app_module()
+    captured = {}
+
+    async def guarded_proxy_stub(**kwargs):
+        captured.update(kwargs)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(module, "guarded_proxy", guarded_proxy_stub)
+    auth = module.AuthContext(
+        user_id="admin-1", role="Administrator", tenant_id="tenant-a",
+        jwt_id="jwt-1", session_jti="session-1", token_type="access",
+        email="admin@example.com",
+    )
+
+    await module.knowledge_development_report(SimpleNamespace(), auth=auth)
+
+    assert captured["path"] == "/report?tenant_id=tenant-a"
 
 
 def test_gateway_accepts_json_string_for_knowledge_pack_payload() -> None:

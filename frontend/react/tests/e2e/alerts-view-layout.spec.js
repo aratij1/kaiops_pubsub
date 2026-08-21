@@ -37,6 +37,16 @@ test("all alert views render, switch, and reflow without page overflow", async (
   });
   expect(heroStyle.color).toBe("rgb(23, 32, 51)");
   expect(heroStyle.backgroundImage).toContain("rgb(255, 255, 255)");
+  const lightShell = await page.evaluate(() => ({
+    sidebar: getComputedStyle(document.querySelector(".sidebar-panel")).backgroundImage,
+    preference: getComputedStyle(document.querySelector(".sidebar-preferences")).backgroundColor,
+    activeNavigation: getComputedStyle(document.querySelector(".sidebar-section.active")).color,
+    title: getComputedStyle(document.querySelector(".content-area > .hero h1")).color,
+  }));
+  expect(lightShell.sidebar).toContain("gradient");
+  expect(lightShell.preference).not.toBe("rgba(0, 0, 0, 0)");
+  expect(lightShell.activeNavigation).not.toBe("rgba(0, 0, 0, 0)");
+  expect(lightShell.title).not.toBe("rgba(0, 0, 0, 0)");
 
   await page.evaluate(() => document.documentElement.setAttribute("data-ui-theme", "dark"));
   const darkStyle = await page.locator(".operations-feed-hero").evaluate((element) => {
@@ -51,6 +61,14 @@ test("all alert views render, switch, and reflow without page overflow", async (
   expect(darkStyle.color).toBe("rgb(231, 237, 247)");
   expect(darkStyle.backgroundImage).toContain("rgb(17, 30, 50)");
   expect(darkStyle.bodyBackground).toContain("rgb(8, 15, 27)");
+  const darkShell = await page.evaluate(() => ({
+    sidebar: getComputedStyle(document.querySelector(".sidebar-panel")).backgroundImage,
+    activeNavigation: getComputedStyle(document.querySelector(".sidebar-section.active")).color,
+    title: getComputedStyle(document.querySelector(".content-area > .hero h1")).color,
+  }));
+  expect(darkShell.sidebar).toContain("gradient");
+  expect(darkShell.activeNavigation).not.toBe("rgba(0, 0, 0, 0)");
+  expect(darkShell.title).not.toBe("rgba(0, 0, 0, 0)");
 
   for (const name of [/Unified Signal Inbox/, /Alert \+ Stream/, /Correlation Timeline/]) {
     const radio = page.getByRole("radio", { name });

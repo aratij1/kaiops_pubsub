@@ -3,6 +3,11 @@ from __future__ import annotations
 from api_gateway.modules.users.models import SystemRole
 
 ADMIN_ROLE = SystemRole.ADMINISTRATOR.value
+HITL_COMPATIBILITY_ROLES = {
+    ADMIN_ROLE,
+    SystemRole.L2_ENGINEER.value,
+    SystemRole.L3_ENGINEER.value,
+}
 DOCUMENT_PROVIDER_ROLES = {
     SystemRole.ADMINISTRATOR.value,
     SystemRole.L2_ENGINEER.value,
@@ -16,7 +21,11 @@ AUTHENTICATED_WRITE_RULES: tuple[tuple[set[str] | None, str, set[str] | None], .
     (None, "/operations/queues", {ADMIN_ROLE}),
     ({"POST", "PUT", "DELETE", "PATCH"}, "/rag", DOCUMENT_PROVIDER_ROLES),
     ({"POST", "PUT", "DELETE", "PATCH"}, "/model", {ADMIN_ROLE}),
-    ({"POST", "PUT", "DELETE", "PATCH"}, "/approval", None),
+    (None, "/approval/capacity", {ADMIN_ROLE}),
+    (None, "/approval/assignments", {ADMIN_ROLE}),
+    (None, "/approval/auto-assign", {ADMIN_ROLE}),
+    ({"POST", "PUT", "DELETE", "PATCH"}, "/approval", HITL_COMPATIBILITY_ROLES),
+    ({"POST", "PUT", "DELETE", "PATCH"}, "/remediation", HITL_COMPATIBILITY_ROLES),
     ({"POST"}, "/copilot", None),
 )
 
