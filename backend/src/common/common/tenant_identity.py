@@ -21,7 +21,7 @@ def require_tenant_id(value: Any, *, source: str) -> str:
     if tenant_id.lower() == "default" and local_runtime:
         return tenant_id
     if tenant_id.lower() in INVALID_TENANTS:
-        raise ValueError(f"verified tenant_id is required from {source}")
+        raise ValueError(f"verified tenant_id from verified identity is required from {source}")
     if len(tenant_id) > 128:
         raise ValueError("tenant_id exceeds 128 characters")
     return tenant_id

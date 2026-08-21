@@ -4,7 +4,8 @@ import json
 
 import pytest
 import httpx
-from common.models import Approval, ApprovalDecision, RemediationStatus
+from common.models import ApprovalDecision, RemediationStatus
+from remediation_test_helpers import governed_approval as Approval
 from remediation_engine.plugins import AzureContainerAppsJobPlugin, JenkinsRollbackPlugin, RemediationEngine
 
 
@@ -261,13 +262,10 @@ def test_jenkins_fills_missing_safety_envelope_from_governed_template(monkeypatc
 
     plan = action.parameters["execution_plan"]
     assert plan["commands"] == ["curl http://approved-command"]
-    assert plan["preflight"]
-    assert plan["validation_commands"]
+    assert plan["preflight"] == []
+    assert plan["validation_commands"] == []
     assert plan["rollback_commands"] == []
     assert plan["rollback_mode"] == "not_applicable"
-    assert "com.docker.compose.project%3Dkaiops_pubsub" in plan["preflight"][0]
-    assert "com.docker.compose.service%3Dremediation-engine" in plan["preflight"][0]
-    assert "grep --quiet ." in plan["preflight"][0]
 
 
 def test_jenkins_adapts_catalog_ansible_plan_to_local_docker_executor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -293,10 +291,11 @@ def test_jenkins_adapts_catalog_ansible_plan_to_local_docker_executor(monkeypatc
     ))
 
     plan = action.parameters["execution_plan"]
-    assert "com.docker.compose.service%3Ddiscovery-mcp" in plan["commands"][0]
-    assert plan["commands"][0].endswith("/containers/$container_id/restart?t=30")
-    assert plan["validation_commands"][0].endswith("http://discovery-mcp:8000/healthz")
-    assert not any(command.startswith("promql:") for command in plan["validation_commands"])
+    assert plan["commands"] == [
+        "ansible-playbook playbooks/restart-service.yml -e service=kaiops-discovery-mcp -e env=e2e"
+    ]
+    assert plan["queries"] == ['promql: up{job="kaiops-discovery-mcp"}']
+    assert plan["validation_commands"] == []
 
 
 def test_jenkins_does_not_attach_invented_container_checks_to_approved_script(monkeypatch: pytest.MonkeyPatch) -> None:

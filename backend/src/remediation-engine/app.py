@@ -123,7 +123,7 @@ async def _reconcile_stale_remediating(app: FastAPI) -> int:
                     "WHERE p.status='remediating' "
                     "AND p.updated_at < TIMESTAMPADD(MINUTE, -:timeout_minutes, UTC_TIMESTAMP()) "
                     "AND EXISTS (SELECT 1 FROM approvals ap WHERE ap.incident_id=p.incident_id "
-                    "AND ap.decision IN ('approved','modified')) "
+                    "AND ap.decision='approved') "
                     f"AND NOT EXISTS (SELECT 1 FROM actions a WHERE a.incident_id=p.incident_id AND a.status IN ({active}))"
                 ),
                 {"timeout_minutes": timeout_minutes},
@@ -931,13 +931,12 @@ async def _execute_approval(approval: Approval) -> RemediationAction:
                 status_code=409,
                 detail="Execution blocked: this plan contains diagnostics but no corrective capability. Select a cataloged, target-specific remediation with executable recovery checks.",
             )
-        if approval.metadata.get("auto_approved"):
-            try:
-                await _require_persisted_approved_runbook(approval)
-            except PolicyViolation as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-        else:
+        if not approval.metadata.get("auto_approved"):
             await _require_persisted_human_approval(approval)
+        try:
+            await _require_persisted_approved_runbook(approval)
+        except PolicyViolation as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         action = engine.build_action(approval)
         lifecycle = extract_lifecycle(approval.metadata) or create_lifecycle(
             tenant_id=approval.tenant_id, incident_id=approval.incident_id,
@@ -1580,11 +1579,20 @@ async def execution_plane_readiness() -> dict[str, Any]:
 
 
 @app.get("/executions/{incident_id}/workflow")
-async def remediation_workflow_status(incident_id: str, recommendation_id: str, action_type: str = "rollback_deployment") -> dict[str, Any]:
+async def remediation_workflow_status(
+    incident_id: str,
+    recommendation_id: str,
+    tenant_id: str,
+    action_type: str = "rollback_deployment",
+) -> dict[str, Any]:
     client = getattr(app.state, "temporal_client", None)
     if not settings.remediation_temporal_enabled or client is None:
         raise HTTPException(status_code=503, detail="Durable remediation orchestration is unavailable.")
-    approval = Approval(incident_id=UUID(incident_id), recommendation_id=UUID(recommendation_id))
+    approval = Approval(
+        tenant_id=tenant_id,
+        incident_id=UUID(incident_id),
+        recommendation_id=UUID(recommendation_id),
+    )
     workflow_key = _build_action_idempotency_key(approval, action_type)
     return await client.get_workflow_handle(f"kaiops-remediation-{workflow_key}").query("status")
 
@@ -1637,8 +1645,8 @@ async def _require_persisted_approved_runbook(approval: Approval) -> None:
     if not settings.database_enabled:
         raise PolicyViolation("automatic execution requires durable runbook governance")
     runbook_id = str(approval.metadata.get("runbook_id") or "").strip()
-    if not runbook_id and approval.metadata.get("confidence_gate_passed"):
-        return
+    if not runbook_id:
+        raise PolicyViolation("automatic execution blocked: governed runbook identity is missing")
     version = int(approval.metadata.get("runbook_version") or 1)
     async with app.state.session_factory() as session:
         governance = await IncidentRepository(session).get_runbook_governance(
@@ -1646,6 +1654,20 @@ async def _require_persisted_approved_runbook(approval: Approval) -> None:
         )
     if not governance or governance.get("status") != "approved":
         raise PolicyViolation("automatic execution blocked: runbook version is not durably approved or is suspended")
+    payload = governance.get("payload") if isinstance(governance.get("payload"), dict) else {}
+    approved_checksum = str(payload.get("checksum_sha256") or "").strip()
+    plan_checksum = str(approval.metadata.get("runbook_checksum") or "").strip()
+    if not approved_checksum or approved_checksum != plan_checksum:
+        raise PolicyViolation("automatic execution blocked: runbook checksum does not match durable approval")
+    expires_at = str(payload.get("approval_expires_at") or "").strip()
+    if not expires_at:
+        raise PolicyViolation("automatic execution blocked: runbook approval expiry is missing")
+    try:
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PolicyViolation("automatic execution blocked: runbook approval expiry is invalid") from exc
+    if expiry <= datetime.now(timezone.utc):
+        raise PolicyViolation("automatic execution blocked: runbook approval has expired")
 
 
 @app.post("/dry-run")
@@ -2153,13 +2175,22 @@ def _build_auto_approval(payload: dict[str, Any]) -> Approval | None:
         # Preserve the exact reviewed catalog contract through auto approval;
         # rebuilding it from prose loses fingerprint, rollback, and validation.
         metadata["execution_plan"] = execution_plan
-    for key in ("runbook_id", "runbook_version", "runbook_status", "runbook_match_score"):
+    for key in ("runbook_id", "runbook_slug", "runbook_version", "runbook_status", "runbook_checksum", "runbook_match_score"):
         if recommendation_metadata.get(key) is not None:
             metadata[key] = recommendation_metadata[key]
 
     return Approval(
+        tenant_id=str(
+            execution_plan.get("tenant_id")
+            or recommendation.get("tenant_id")
+            or incident.get("tenant_id")
+            or ""
+        ),
         incident_id=incident_id,
         recommendation_id=recommendation_id,
+        plan_id=execution_plan.get("plan_id"),
+        plan_fingerprint=execution_plan.get("plan_fingerprint"),
+        approval_expires_at=execution_plan.get("expiry"),
         decision=ApprovalDecision.APPROVED,
         approver="system-auto-approval",
         channel="web",
@@ -2257,7 +2288,7 @@ def _enrich_approval_from_payload(approval: Approval, payload: dict[str, Any]) -
     lifecycle = extract_lifecycle(recommendation_metadata, recommendation)
     if lifecycle:
         approval.metadata["resolution_lifecycle"] = lifecycle
-    for key in ("runbook_id", "runbook_version", "runbook_status", "runbook_match_score"):
+    for key in ("runbook_id", "runbook_slug", "runbook_version", "runbook_status", "runbook_checksum", "runbook_match_score"):
         if approval.metadata.get(key) is None and recommendation_metadata.get(key) is not None:
             approval.metadata[key] = recommendation_metadata[key]
 

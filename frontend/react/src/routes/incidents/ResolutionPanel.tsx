@@ -8,6 +8,9 @@ interface ExecutionPlan {
   riskTier?: string;
   executionMode?: string;
   action?: string;
+  target?: string;
+  expectedOutcome?: string;
+  catalogPlan?: any;
 }
 
 interface ResolutionPanelProps {
@@ -33,11 +36,35 @@ export default function ResolutionPanel({
   const confidencePercent = Math.max(0, Math.min(100, Math.round(Number(confidenceScore || 0) * 100)));
   const riskTier = executionPlan.riskTier || "Not classified";
   const action = executionPlan.action && executionPlan.action !== "-" ? executionPlan.action : analysis.action;
-  const target = alertRow?.service || alertRow?.application || workflow?.incident?.service || "Target not identified";
+  const typedAction = Array.isArray(executionPlan.catalogPlan?.actions) ? executionPlan.catalogPlan.actions[0] : null;
+  const target = executionPlan.target
+    || executionPlan.catalogPlan?.remediation_target
+    || typedAction?.target_resource_id
+    || "Target not identified";
+  const expectedOutcome = executionPlan.expectedOutcome
+    || typedAction?.expected_outcome
+    || "Independent recovery checks pass for the approved target.";
   const environment = alertRow?.environment || workflow?.incident?.environment || "Environment not identified";
   const planComplete = Boolean(analysis.rootCause && analysis.rootCause !== "-" && action && action !== "-");
-  const readinessComplete = readinessChecks.length > 0 && readinessChecks.every((check) => check.passed);
-  const readyForDecision = planComplete && confidencePercent > 0 && readinessComplete;
+  const decisionChecks: ReadinessCheck[] = [
+    ...readinessChecks,
+    {
+      id: "governed-target",
+      label: "Governed target",
+      detail: target !== "Target not identified" ? `Approved target: ${target}.` : "The approved plan has no typed target.",
+      passed: target !== "Target not identified",
+      action: "select a catalog plan with a typed target",
+    },
+    {
+      id: "decision-confidence",
+      label: "Evidence confidence",
+      detail: `${confidencePercent}% evidence-derived confidence.`,
+      passed: confidencePercent >= 85,
+      action: "continue investigation until confidence reaches 85%",
+    },
+  ];
+  const readinessComplete = decisionChecks.length > 0 && decisionChecks.every((check) => check.passed);
+  const readyForDecision = planComplete && confidencePercent >= 85 && readinessComplete && target !== "Target not identified";
 
   return (
     <section className="panel incident-workspace-section incident-resolution-section resolution-decision-brief" role="tabpanel" aria-labelledby="resolution-recommendation-title">
@@ -62,7 +89,8 @@ export default function ResolutionPanel({
             <dl>
               <div><dt>Target</dt><dd>{target}</dd></div>
               <div><dt>Environment</dt><dd>{environment}</dd></div>
-              <div><dt>Expected outcome</dt><dd>{analysis.impact}</dd></div>
+              <div><dt>Current impact</dt><dd>{analysis.impact}</dd></div>
+              <div><dt>Expected outcome</dt><dd>{expectedOutcome}</dd></div>
             </dl>
           </div>
         </article>
@@ -96,7 +124,7 @@ export default function ResolutionPanel({
 
       <DecisionReadinessPanel
         title="Approval eligibility"
-        checks={readinessChecks}
+        checks={decisionChecks}
         eligibleLabel="Eligible for guarded approval"
         onReviewEvidence={() => onNavigateTab("evidence")}
       />

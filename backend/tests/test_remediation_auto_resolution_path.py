@@ -2,7 +2,8 @@ from importlib import util
 from pathlib import Path
 
 import pytest
-from common.models import Approval, ApprovalDecision
+from common.models import ApprovalDecision
+from remediation_test_helpers import governed_approval as Approval
 
 
 def load_remediation_app_module():
@@ -312,6 +313,7 @@ def test_build_auto_approval_includes_policy_metadata() -> None:
             "policy_reason": "confidence >= threshold",
         },
         "recommendation": {
+            "tenant_id": "tenant-a",
             "id": "22222222-2222-2222-2222-222222222222",
             "incident_id": "11111111-1111-1111-1111-111111111111",
             "recommended_action": "restart pod deployment",
@@ -332,7 +334,7 @@ def test_build_auto_approval_includes_policy_metadata() -> None:
 def test_build_auto_approval_preserves_resolution_executor_profile() -> None:
     module = load_remediation_app_module()
     payload = {
-        "incident": {"service": "checkout", "environment": "prod", "application": "storefront"},
+        "incident": {"tenant_id": "tenant-a", "service": "checkout", "environment": "prod", "application": "storefront"},
         "decision": {"requires_approval": False},
         "recommendation": {
             "id": "22222222-2222-2222-2222-222222222222",
@@ -373,9 +375,10 @@ def test_build_auto_approval_preserves_catalog_execution_contract() -> None:
         "remediation_target": "checkout",
     }
     payload = {
-        "incident": {"service": "checkout", "environment": "prod"},
+        "incident": {"tenant_id": "tenant-a", "service": "checkout", "environment": "prod"},
         "decision": {"requires_approval": False},
         "recommendation": {
+            "tenant_id": "tenant-a",
             "id": "22222222-2222-2222-2222-222222222222",
             "incident_id": "11111111-1111-1111-1111-111111111111",
             "recommended_action": "restart checkout",
@@ -508,7 +511,6 @@ def test_context_score_below_configured_threshold_blocks_auto_execution() -> Non
 
 def test_dry_run_rejects_destructive_plan_even_after_generic_approval() -> None:
     module = load_remediation_app_module()
-    from common.models import Approval, ApprovalDecision
     approval = Approval(
         incident_id="11111111-1111-1111-1111-111111111111",
         recommendation_id="22222222-2222-2222-2222-222222222222",
@@ -522,7 +524,6 @@ def test_dry_run_rejects_destructive_plan_even_after_generic_approval() -> None:
 
 def test_validation_only_plan_is_detected_before_live_execution() -> None:
     module = load_remediation_app_module()
-    from common.models import Approval, ApprovalDecision
     approval = Approval(
         incident_id="11111111-1111-1111-1111-111111111111",
         recommendation_id="22222222-2222-2222-2222-222222222222",
@@ -536,7 +537,6 @@ def test_validation_only_plan_is_detected_before_live_execution() -> None:
 
 def test_live_plan_is_not_misclassified_as_validation_only() -> None:
     module = load_remediation_app_module()
-    from common.models import Approval, ApprovalDecision
     approval = Approval(
         incident_id="11111111-1111-1111-1111-111111111111",
         recommendation_id="22222222-2222-2222-2222-222222222222",
@@ -550,7 +550,6 @@ def test_live_plan_is_not_misclassified_as_validation_only() -> None:
 
 def test_generic_triage_collector_cannot_be_promoted_to_live_remediation() -> None:
     module = load_remediation_app_module()
-    from common.models import Approval, ApprovalDecision
     approval = Approval(
         incident_id="11111111-1111-1111-1111-111111111111",
         recommendation_id="22222222-2222-2222-2222-222222222222",
@@ -584,7 +583,7 @@ def test_auto_approval_preserves_diagnostic_execution_plan_for_terminal_branch()
                 }
             },
         },
-        "incident": {"service": "checkout-api", "environment": "prod"},
+        "incident": {"tenant_id": "tenant-a", "service": "checkout-api", "environment": "prod"},
     }
 
     approval = module._build_auto_approval(payload)

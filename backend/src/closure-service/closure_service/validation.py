@@ -1,40 +1,106 @@
 from __future__ import annotations
 
+import ipaddress
+from datetime import datetime, timezone
+from typing import Any
+from urllib.parse import urlsplit
+
 import httpx
 from uuid import NAMESPACE_URL, uuid5
 
 from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.models import RemediationAction, RemediationStatus, ResolutionReport
+from common.orchestration.execution_plan_contract import canonical_plan_fingerprint, verify_plan_fingerprint
 from common.resolution_lifecycle import LifecycleActor, ResolutionState, extract_lifecycle, transition_lifecycle
 
 
 def _validation_urls(plan: dict) -> tuple[list[str], int]:
-    supplied: list[str] = []
-    for key in ("validation_commands", "validation_queries", "queries"):
-        values = plan.get(key)
-        if isinstance(values, list):
-            supplied.extend(str(item).strip() for item in values if str(item).strip())
-    # Plans may expose the same governed check under both `queries` and
-    # `validation_commands` for compatibility. Count canonical checks once;
-    # otherwise a single valid health URL is incorrectly classified as only
-    # half executable and a successful remediation is projected as failed.
-    unique_supplied = list(dict.fromkeys(supplied))
-    urls: list[str] = []
-    non_executable_count = 0
-    for check in unique_supplied:
-        if check.startswith(("http://", "https://")):
-            urls.append(check)
+    accepted = _validation_endpoints(plan)
+    endpoints = plan.get("validation_endpoints")
+    endpoints = endpoints if isinstance(endpoints, list) else []
+    urls = [str(item["url"]) for item in accepted]
+    return list(dict.fromkeys(urls)), len(endpoints)
+
+
+def _validation_endpoints(plan: dict[str, Any]) -> list[dict[str, str]]:
+    endpoints = plan.get("validation_endpoints")
+    endpoints = endpoints if isinstance(endpoints, list) else []
+    accepted: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in endpoints:
+        if not isinstance(item, dict):
             continue
-        found_url = False
-        for token in check.replace('"', " ").replace("'", " ").split():
-            if token.startswith(("http://", "https://")):
-                urls.append(token)
-                found_url = True
-                break
-        if not found_url:
-            non_executable_count += 1
-    unique_urls = list(dict.fromkeys(urls))
-    return unique_urls, len(unique_urls) + non_executable_count
+        url = str(item.get("url") or "").strip()
+        kind = str(item.get("kind") or "").strip().lower()
+        method = str(item.get("method") or "GET").strip().upper()
+        key = (url, kind)
+        if (
+            item.get("onboarded") is not True
+            or item.get("authoritative") is not True
+            or method != "GET"
+            or not kind
+            or not _safe_validation_url(url)
+            or key in seen
+        ):
+            continue
+        seen.add(key)
+        accepted.append({"url": url, "kind": kind, "method": method})
+    return accepted
+
+
+def _safe_validation_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(str(url or "").strip())
+        hostname = str(parsed.hostname or "").strip().lower().rstrip(".")
+        if parsed.scheme not in {"http", "https"} or not hostname or parsed.username or parsed.password:
+            return False
+        if hostname in {"localhost", "metadata.google.internal"} or hostname.endswith(".localhost"):
+            return False
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            return True
+        return not any(
+            (
+                address.is_loopback,
+                address.is_link_local,
+                address.is_multicast,
+                address.is_unspecified,
+                address.is_reserved,
+            )
+        )
+    except ValueError:
+        return False
+
+
+def _approved_plan_integrity(action: RemediationAction, plan: dict[str, Any]) -> bool:
+    contract = action.parameters.get("execution_contract")
+    if not isinstance(contract, dict) or contract.get("schema_version") != "kaims.remediation.v3":
+        return False
+    if plan.get("schema_version") != "kaims.execution-plan.v2" or not verify_plan_fingerprint(plan):
+        return False
+    unsigned_contract = {key: value for key, value in contract.items() if key != "binding_fingerprint"}
+    fingerprint = str(plan.get("plan_fingerprint") or "")
+    return bool(
+        str(contract.get("binding_fingerprint") or "") == canonical_plan_fingerprint(unsigned_contract)
+        and contract.get("plan") == plan
+        and str(contract.get("plan_id") or "") == str(plan.get("plan_id") or "")
+        and str(contract.get("plan_fingerprint") or "") == fingerprint
+        and str(action.parameters.get("approved_plan_fingerprint") or "") == fingerprint
+        and str(contract.get("execution_id") or "") == str(action.id)
+        and str((contract.get("target") or {}).get("name") or "") == str(action.target)
+    )
+
+
+def _stability_window(action: RemediationAction, plan: dict[str, Any], *, observed_at: datetime) -> tuple[bool, float, int]:
+    required_seconds = max(60, min(int(plan.get("stability_window_seconds") or 300), 3600))
+    completed_at = action.completed_at
+    if completed_at is None:
+        return False, 0.0, required_seconds
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+    elapsed = max(0.0, (observed_at - completed_at.astimezone(timezone.utc)).total_seconds())
+    return elapsed >= required_seconds, elapsed, required_seconds
 
 
 class ClosureValidationAgent(BaseAgent):
@@ -54,7 +120,7 @@ class ClosureValidationAgent(BaseAgent):
     async def validate(self, action: RemediationAction) -> ResolutionReport:
         execution_plan = action.parameters.get("execution_plan")
         execution_plan = execution_plan if isinstance(execution_plan, dict) else {}
-        health_urls, supplied_count = _validation_urls(execution_plan)
+        _, supplied_count = _validation_urls(execution_plan)
         diagnostic_closure = bool(action.parameters.get("diagnostic_closure")) and action.status == RemediationStatus.SKIPPED
         if diagnostic_closure:
             details = action.parameters.get("diagnostic_details")
@@ -66,15 +132,9 @@ class ClosureValidationAgent(BaseAgent):
                 "execution_not_applicable": True,
             }
             lifecycle = extract_lifecycle(action.parameters, action.metadata)
-            if lifecycle:
-                lifecycle = transition_lifecycle(
-                    lifecycle,
-                    ResolutionState.CLOSED,
-                    actor=LifecycleActor.CLOSURE,
-                    reason_code="diagnostic_completed_no_corrective_action",
-                    validation={"checks": validation, "passed": True},
-                )
+            watch_only_authorized = action.parameters.get("watch_only_closure") is True
             return ResolutionReport(
+                tenant_id=action.tenant_id,
                 id=uuid5(NAMESPACE_URL, f"kaiops:closure:{action.id}:diagnostic"),
                 incident_id=action.incident_id,
                 remediation_action_id=action.id,
@@ -91,15 +151,22 @@ class ClosureValidationAgent(BaseAgent):
                 ],
                 metadata={
                     "closure_kind": "diagnostic",
+                    "watch_only_authorized": watch_only_authorized,
+                    "incident_terminal": watch_only_authorized,
                     "diagnostic_details": details,
                     **({"resolution_lifecycle": lifecycle} if lifecycle else {}),
                 },
             )
-        validation: dict[str, bool] = {"remediation_succeeded": action.status == RemediationStatus.SUCCEEDED}
+        validation: dict[str, bool] = {
+            "remediation_succeeded": action.status == RemediationStatus.SUCCEEDED,
+            "approved_plan_fingerprint_preserved": _approved_plan_integrity(action, execution_plan),
+        }
         execution_result = action.parameters.get("execution_result")
         execution_result = execution_result if isinstance(execution_result, dict) else {}
         recovery_evidence = execution_result.get("recovery_evidence")
         recovery_evidence = recovery_evidence if isinstance(recovery_evidence, dict) else {}
+        # Retain this executor assertion only as an audit signal. It is never a
+        # closure input; the validation service collects its own observations.
         executor_recovery_validated = bool(
             execution_result.get("recovery_validated") is True
             and recovery_evidence.get("recovery_validated") is True
@@ -107,39 +174,77 @@ class ClosureValidationAgent(BaseAgent):
             and str(execution_result.get("build_result") or "").upper() == "SUCCESS"
         )
         validation["executor_recovery_validated"] = executor_recovery_validated
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
-            for index, url in enumerate(health_urls, start=1):
+        governed_endpoints = _validation_endpoints(execution_plan)
+        observations: list[dict[str, Any]] = []
+        passed_kinds: set[str] = set()
+        observed_at = datetime.now(timezone.utc)
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=3.0),
+            trust_env=False,
+            follow_redirects=False,
+        ) as client:
+            for index, endpoint in enumerate(governed_endpoints, start=1):
+                url = endpoint["url"]
+                kind = endpoint["kind"]
+                passed = False
+                status_code: int | None = None
                 try:
                     response = await client.get(url)
-                    validation[f"health_check_{index}"] = 200 <= response.status_code < 300
+                    status_code = response.status_code
+                    passed = 200 <= response.status_code < 300
                 except httpx.HTTPError:
-                    validation[f"health_check_{index}"] = False
+                    passed = False
+                validation[f"health_check_{index}"] = passed
+                if passed:
+                    passed_kinds.add(kind)
+                observations.append(
+                    {
+                        "url": url,
+                        "kind": kind,
+                        "status_code": status_code,
+                        "passed": passed,
+                        "observed_at": observed_at.isoformat(),
+                    }
+                )
         validation["validation_supplied"] = supplied_count > 0
-        validation["validation_executable"] = supplied_count > 0 and len(health_urls) == supplied_count
-        independent_checks_passed = bool(health_urls) and all(
-            passed for name, passed in validation.items() if name.startswith("health_check_")
-        )
-        validation["independent_checks_passed"] = independent_checks_passed
-        # Executor success proves only that the approved command completed. It
-        # is never recovery proof. Closure requires independently collected
-        # operational and stability evidence.
-        recovery_checks = {
-            "triggering_alert_cleared": recovery_evidence.get("triggering_alert_cleared") is True,
-            "availability_recovered": recovery_evidence.get("availability_recovered") is True or independent_checks_passed,
-            "error_rate_recovered": recovery_evidence.get("error_rate_recovered") is True,
-            "latency_within_slo": recovery_evidence.get("latency_within_slo") is True,
-            "dependency_health_stable": recovery_evidence.get("dependency_health_stable") is True,
-            "no_new_critical_alerts": recovery_evidence.get("no_new_critical_alerts") is True,
-            "stability_window_completed": recovery_evidence.get("stability_window_completed") is True,
+        validation["validation_executable"] = supplied_count > 0 and len(governed_endpoints) == supplied_count
+        required_kinds = {
+            str(item).strip().lower()
+            for item in execution_plan.get(
+                "required_validation_kinds",
+                ["availability", "alert_clearance", "error_rate", "latency", "dependency_health", "critical_alerts"],
+            )
+            if str(item).strip()
         }
-        if recovery_evidence.get("business_check_available") is True:
-            recovery_checks["business_check_passed"] = recovery_evidence.get("business_check_passed") is True
+        independent_checks_passed = bool(governed_endpoints) and all(
+            passed for name, passed in validation.items() if name.startswith("health_check_")
+        ) and required_kinds.issubset(passed_kinds)
+        validation["independent_checks_passed"] = independent_checks_passed
+        stability_passed, stability_elapsed, stability_required = _stability_window(
+            action,
+            execution_plan,
+            observed_at=observed_at,
+        )
+        recovery_checks = {
+            "triggering_alert_cleared": "alert_clearance" in passed_kinds,
+            "availability_recovered": "availability" in passed_kinds,
+            "error_rate_recovered": "error_rate" in passed_kinds,
+            "latency_within_slo": "latency" in passed_kinds,
+            "dependency_health_stable": "dependency_health" in passed_kinds,
+            "no_new_critical_alerts": "critical_alerts" in passed_kinds,
+            "stability_window_completed": stability_passed,
+        }
+        if "business" in required_kinds:
+            recovery_checks["business_check_passed"] = "business" in passed_kinds
         validation.update(recovery_checks)
         validation["alerts_cleared"] = recovery_checks["triggering_alert_cleared"]
         validation["all_recovery_checks_passed"] = all(recovery_checks.values())
         restored = (
             validation["remediation_succeeded"]
             and validation["validation_supplied"]
+            and validation["validation_executable"]
+            and validation["approved_plan_fingerprint_preserved"]
+            and validation["independent_checks_passed"]
             and validation["all_recovery_checks_passed"]
         )
         lifecycle = extract_lifecycle(action.parameters, action.metadata)
@@ -164,6 +269,7 @@ class ClosureValidationAgent(BaseAgent):
             )
         action_taken = action.output or action.action_type
         return ResolutionReport(
+            tenant_id=action.tenant_id,
             id=uuid5(
                 NAMESPACE_URL,
                 f"kaiops:closure:{action.id}:{'recovered' if restored else 'validation_failed'}",
@@ -177,12 +283,20 @@ class ClosureValidationAgent(BaseAgent):
             alerts_cleared=validation["alerts_cleared"],
             health_restored=restored,
             knowledge_base_entry=(
-                f"Incident {action.incident_id} resolved via {action.action_type}. Validation: {validation}."
+                f"Incident {action.incident_id} validation after {action.action_type}: {validation}."
             ),
             lessons_learned=[
                 "Compare alert onset with deployment/change windows.",
                 "Prefer reversible remediation for high-confidence deployment regressions.",
                 "Require an explicit health endpoint or governed recovery query before closure.",
             ],
-            metadata={"resolution_lifecycle": lifecycle} if lifecycle else {},
+            metadata={
+                "independent_validation_observations": observations,
+                "stability_window": {
+                    "required_seconds": stability_required,
+                    "elapsed_seconds": round(stability_elapsed, 3),
+                    "observed_at": observed_at.isoformat(),
+                },
+                **({"resolution_lifecycle": lifecycle} if lifecycle else {}),
+            },
         )

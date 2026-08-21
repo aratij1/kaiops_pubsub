@@ -65,7 +65,8 @@ def test_approval_incident_context_resolves_nested_recommendation_id() -> None:
     assert context["flow_id"] == "flow-1"
 
 
-def test_approval_request_rejects_placeholder_tenant() -> None:
+def test_approval_request_rejects_placeholder_tenant(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
     module = load_approval_app_module()
 
     with pytest.raises(ValueError, match="verified identity"):
@@ -189,7 +190,7 @@ async def test_approval_submission_resolves_missing_recommendation_id(monkeypatc
         def __init__(self, session):
             self.session = session
 
-        async def get_latest_recommendation_for_incident(self, requested_incident_id):
+        async def get_latest_recommendation_for_incident(self, requested_incident_id, *, tenant_id=None):
             calls.append(("get_recommendation", str(requested_incident_id)))
             return {"id": recommendation_id, "incident_id": incident_id}
 
