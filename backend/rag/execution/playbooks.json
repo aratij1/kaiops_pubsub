@@ -2,19 +2,48 @@
   "version": "playbooks-v2",
   "last_reviewed": "2026-07-22",
   "matching_contract": {
-    "required_match_dimensions": ["service", "alert name or keyword"],
+    "required_match_dimensions": [
+      "service",
+      "alert name or keyword"
+    ],
     "fallback_playbook": "generic-kaiops-triage-playbook",
     "update_rule": "Every new production alert type must add or confirm a playbook, at least one diagnostic step, one validation step, and an explicit safety posture."
   },
   "playbooks": [
     {
       "id": "kaiops-service-down-playbook",
+      "governance_id": "5747665d-13ac-46b0-9d21-f45907f75a96",
+      "version": 1,
+      "status": "approved",
+      "owner": "kaiops-platform-sre",
+      "approver": "release-owner",
+      "approved_at": "2026-08-21T00:00:00Z",
+      "approval_expires_at": "2027-08-21T00:00:00Z",
+      "checksum_sha256": "sha256:a44d34783f26059077d4496073e48ad93ee45fa2f99aa2d148aea03caf6e89b1",
+      "risk_class": "high",
       "name": "KaiOps service down recovery",
       "match": {
+        "allow_unlisted_services": true,
         "alert_ids": [],
-        "services": ["kaiops-core1", "kaiops-core", "api-gateway", "kaiops-platform"],
-        "alert_types": ["availability", "service_down", "service"],
-        "alert_keywords": ["servicedown", "service down", "unreachable", "not reachable", "endpoint down", "availability"]
+        "services": [
+          "kaiops-core1",
+          "kaiops-core",
+          "api-gateway",
+          "kaiops-platform"
+        ],
+        "alert_types": [
+          "availability",
+          "service_down",
+          "service"
+        ],
+        "alert_keywords": [
+          "servicedown",
+          "service down",
+          "unreachable",
+          "not reachable",
+          "endpoint down",
+          "availability"
+        ]
       },
       "risk_tier": "high",
       "preflight_checks": [
@@ -26,34 +55,71 @@
         {
           "name": "Collect service availability diagnostics",
           "type": "diagnostic",
-          "commands": ["check_api_gateway_health", "check_prometheus_alerts", "check_prometheus_targets", "query_service_availability"]
+          "commands": [
+            "check_api_gateway_health",
+            "check_prometheus_alerts",
+            "check_prometheus_targets",
+            "query_service_availability"
+          ]
         },
         {
           "name": "Run guarded KaiOps triage script",
           "type": "diagnostic",
-          "commands": ["check_kaiops_triage_script_dry_run"]
+          "commands": [
+            "check_kaiops_triage_script_dry_run"
+          ]
         },
         {
           "name": "Restart affected runtime service if approved",
           "type": "remediation",
           "approval_gate": true,
-          "commands": ["restart_service_runtime"]
+          "commands": [
+            "restart_service_runtime"
+          ]
         },
         {
           "name": "Validate service recovery",
           "type": "validation",
-          "commands": ["validate_service_recovery", "check_prometheus_alerts"]
+          "commands": [
+            "validate_service_recovery",
+            "check_prometheus_alerts"
+          ]
         }
       ]
     },
     {
       "id": "kaiops-high-latency-playbook",
+      "governance_id": "020a0cbf-a622-4fc3-b41b-8d02126f6852",
+      "version": 1,
+      "status": "approved",
+      "owner": "kaiops-platform-sre",
+      "approver": "release-owner",
+      "approved_at": "2026-08-21T00:00:00Z",
+      "approval_expires_at": "2027-08-21T00:00:00Z",
+      "checksum_sha256": "sha256:4fbcbd8dc8f8d147bb96bba2827e1c7685dc98419e6e171b95293e21d52ed982",
+      "risk_class": "medium",
       "name": "KaiOps high latency triage and safe scaling",
       "match": {
         "alert_ids": [],
-        "services": ["api-gateway", "kaiops-core1", "kaiops-core", "kaiops-platform"],
-        "alert_types": ["latency", "performance", "slo"],
-        "alert_keywords": ["highrequestlatency", "kaiopshighlatencyp95", "latency", "p95", "slow", "slo"]
+        "services": [
+          "api-gateway",
+          "kaiops-core1",
+          "kaiops-core",
+          "kaiops-platform"
+        ],
+        "alert_types": [
+          "latency",
+          "performance",
+          "slo"
+        ],
+        "alert_keywords": [
+          "highrequestlatency",
+          "kaiopshighlatencyp95",
+          "latency",
+          "p95",
+          "slow",
+          "slo"
+        ]
       },
       "risk_tier": "medium",
       "preflight_checks": [
@@ -65,40 +131,76 @@
         {
           "name": "Collect latency and dependency diagnostics",
           "type": "diagnostic",
-          "commands": ["query_service_latency_p95", "query_service_error_rate", "query_worker_queue_lag", "query_message_bus_depth"]
+          "commands": [
+            "query_service_latency_p95",
+            "query_service_error_rate",
+            "query_worker_queue_lag",
+            "query_message_bus_depth"
+          ]
         },
         {
           "name": "Run guarded KaiOps triage script",
           "type": "diagnostic",
-          "commands": ["check_kaiops_triage_script_dry_run"]
+          "commands": [
+            "check_kaiops_triage_script_dry_run"
+          ]
         },
         {
           "name": "Scale service workers if approved",
           "type": "remediation",
           "approval_gate": true,
-          "commands": ["scale_service_workers"]
+          "commands": [
+            "scale_service_workers"
+          ]
         },
         {
           "name": "Rollback deployment if correlated with release",
           "type": "remediation",
           "approval_gate": true,
-          "commands": ["rollback_service_deployment"]
+          "commands": [
+            "rollback_service_deployment"
+          ]
         },
         {
           "name": "Validate latency SLO recovery",
           "type": "validation",
-          "commands": ["validate_service_recovery", "query_service_latency_p95"]
+          "commands": [
+            "validate_service_recovery",
+            "query_service_latency_p95"
+          ]
         }
       ]
     },
     {
       "id": "kaiops-low-throughput-playbook",
+      "governance_id": "9e19e643-3a8d-4384-9349-24b2890c6569",
+      "version": 1,
+      "status": "approved",
+      "owner": "kaiops-platform-sre",
+      "approver": "release-owner",
+      "approved_at": "2026-08-21T00:00:00Z",
+      "approval_expires_at": "2027-08-21T00:00:00Z",
+      "checksum_sha256": "sha256:7c724b07be70c4d5777dc78dce32ecc3e6a1702f8e422f8c4910603fb4f76e76",
+      "risk_class": "medium",
       "name": "KaiOps low request throughput triage",
       "match": {
         "alert_ids": [],
-        "services": ["api-gateway", "kaiops-core1", "kaiops-platform"],
-        "alert_types": ["throughput", "traffic_drop"],
-        "alert_keywords": ["lowrequestthroughput", "low request throughput", "throughput", "traffic drop", "requests low"]
+        "services": [
+          "api-gateway",
+          "kaiops-core1",
+          "kaiops-platform"
+        ],
+        "alert_types": [
+          "throughput",
+          "traffic_drop"
+        ],
+        "alert_keywords": [
+          "lowrequestthroughput",
+          "low request throughput",
+          "throughput",
+          "traffic drop",
+          "requests low"
+        ]
       },
       "risk_tier": "medium",
       "preflight_checks": [
@@ -110,29 +212,61 @@
         {
           "name": "Collect throughput and availability diagnostics",
           "type": "diagnostic",
-          "commands": ["query_request_throughput", "query_service_availability", "check_prometheus_alerts"]
+          "commands": [
+            "query_request_throughput",
+            "query_service_availability",
+            "check_prometheus_alerts"
+          ]
         },
         {
           "name": "Restart affected service if approved",
           "type": "remediation",
           "approval_gate": true,
-          "commands": ["restart_service_runtime"]
+          "commands": [
+            "restart_service_runtime"
+          ]
         },
         {
           "name": "Validate throughput recovery",
           "type": "validation",
-          "commands": ["query_request_throughput", "validate_service_recovery"]
+          "commands": [
+            "query_request_throughput",
+            "validate_service_recovery"
+          ]
         }
       ]
     },
     {
       "id": "kaiops-mysql-alert-table-growth-playbook",
+      "governance_id": "7df50cc5-42e9-4496-b201-4065a8404799",
+      "version": 1,
+      "status": "approved",
+      "owner": "data-platform-sre",
+      "approver": "release-owner",
+      "approved_at": "2026-08-21T00:00:00Z",
+      "approval_expires_at": "2027-08-21T00:00:00Z",
+      "checksum_sha256": "sha256:8a325b802afad2956d7d8a5456ab7d31acc04ab0a9d198ec4257b67a69f92ea9",
+      "risk_class": "medium",
       "name": "KaiOps MySQL alerts table growth control",
       "match": {
         "alert_ids": [],
-        "services": ["mysql"],
-        "alert_types": ["mysql", "database", "table_growth", "data_quality"],
-        "alert_keywords": ["kaiopsmysqlalertstablerowshigh", "mysql", "alerts table", "table rows high", "row count", "rejected rows"]
+        "services": [
+          "mysql"
+        ],
+        "alert_types": [
+          "mysql",
+          "database",
+          "table_growth",
+          "data_quality"
+        ],
+        "alert_keywords": [
+          "kaiopsmysqlalertstablerowshigh",
+          "mysql",
+          "alerts table",
+          "table rows high",
+          "row count",
+          "rejected rows"
+        ]
       },
       "risk_tier": "medium",
       "preflight_checks": [
@@ -144,34 +278,67 @@
         {
           "name": "Collect MySQL table diagnostics",
           "type": "diagnostic",
-          "commands": ["query_mysql_alert_rows", "query_mysql_table_size", "check_prometheus_alerts"]
+          "commands": [
+            "query_mysql_alert_rows",
+            "query_mysql_table_size",
+            "check_prometheus_alerts"
+          ]
         },
         {
           "name": "Run guarded KaiOps triage script",
           "type": "diagnostic",
-          "commands": ["check_kaiops_triage_script_dry_run"]
+          "commands": [
+            "check_kaiops_triage_script_dry_run"
+          ]
         },
         {
           "name": "Archive old alert rows if approved",
           "type": "remediation",
           "approval_gate": true,
-          "commands": ["archive_old_alert_rows"]
+          "commands": [
+            "archive_old_alert_rows"
+          ]
         },
         {
           "name": "Validate MySQL table recovery",
           "type": "validation",
-          "commands": ["validate_mysql_alert_rows", "check_prometheus_alerts"]
+          "commands": [
+            "validate_mysql_alert_rows",
+            "check_prometheus_alerts"
+          ]
         }
       ]
     },
     {
       "id": "etl-data-quality-rejected-rows-playbook",
+      "governance_id": "04b1247f-7c45-4ae7-b0d4-ff6fa80432c0",
+      "version": 1,
+      "status": "approved",
+      "owner": "data-platform-sre",
+      "approver": "release-owner",
+      "approved_at": "2026-08-21T00:00:00Z",
+      "approval_expires_at": "2027-08-21T00:00:00Z",
+      "checksum_sha256": "sha256:191bb04e31bba20fe365c663a43cefc995a7da08a7ec5d5581993da922fc8c7f",
+      "risk_class": "medium",
       "name": "ETL data quality rejected rows recovery",
       "match": {
         "alert_ids": [],
-        "services": ["etl-orders", "kaiops-platform"],
-        "alert_types": ["data_quality", "etl", "rejected_rows"],
-        "alert_keywords": ["etl", "data quality", "rejected rows", "dq", "onboarding-smoke-test"]
+        "services": [
+          "etl-orders",
+          "kaiops-platform"
+        ],
+        "alert_types": [
+          "data_quality",
+          "etl",
+          "rejected_rows"
+        ],
+        "alert_keywords": [
+          "etl",
+          "data quality",
+          "rejected rows",
+          "dq",
+          "onboarding-smoke-test"
+        ]
       },
       "risk_tier": "medium",
       "preflight_checks": [
@@ -183,29 +350,59 @@
         {
           "name": "Collect ETL data quality diagnostics",
           "type": "diagnostic",
-          "commands": ["query_etl_batch_status", "query_etl_rejected_rows"]
+          "commands": [
+            "query_etl_batch_status",
+            "query_etl_rejected_rows"
+          ]
         },
         {
           "name": "Replay ETL batch if approved",
           "type": "remediation",
           "approval_gate": true,
-          "commands": ["replay_etl_batch"]
+          "commands": [
+            "replay_etl_batch"
+          ]
         },
         {
           "name": "Validate data quality recovery",
           "type": "validation",
-          "commands": ["validate_etl_recovery"]
+          "commands": [
+            "validate_etl_recovery"
+          ]
         }
       ]
     },
     {
       "id": "policy-engine-unavailable-playbook",
+      "governance_id": "04da83e9-822b-419e-abb9-daf5f569cedd",
+      "version": 1,
+      "status": "approved",
+      "owner": "kaiops-platform-sre",
+      "approver": "release-owner",
+      "approved_at": "2026-08-21T00:00:00Z",
+      "approval_expires_at": "2027-08-21T00:00:00Z",
+      "checksum_sha256": "sha256:fc2104b337cd3e5137a64c65e00529937952ae206c997d96e116e98744723f5a",
+      "risk_class": "high",
       "name": "Policy engine unavailable recovery",
+      "execution_service": "policy-engine",
       "match": {
         "alert_ids": [],
-        "services": ["policy-engine", "kaiops-platform"],
-        "alert_types": ["policy", "availability"],
-        "alert_keywords": ["policyengineunavailable", "policy engine", "policy unavailable", "approval policy"]
+        "services": [
+          "policy-engine",
+          "orchestrator",
+          "kaiops-platform"
+        ],
+        "allow_unlisted_services": true,
+        "alert_types": [
+          "policy",
+          "availability"
+        ],
+        "alert_keywords": [
+          "policyengineunavailable",
+          "policy engine",
+          "policy unavailable",
+          "approval policy"
+        ]
       },
       "risk_tier": "high",
       "preflight_checks": [
@@ -217,29 +414,62 @@
         {
           "name": "Collect policy engine diagnostics",
           "type": "diagnostic",
-          "commands": ["check_policy_engine_health", "check_api_gateway_health"]
+          "commands": [
+            "check_policy_engine_health",
+            "check_api_gateway_health"
+          ]
         },
         {
           "name": "Restart policy engine if approved",
           "type": "remediation",
           "approval_gate": true,
-          "commands": ["restart_policy_engine"]
+          "commands": [
+            "restart_policy_engine"
+          ]
         },
         {
           "name": "Validate policy engine recovery",
           "type": "validation",
-          "commands": ["validate_policy_engine_recovery"]
+          "commands": [
+            "validate_policy_engine_recovery"
+          ]
         }
       ]
     },
     {
       "id": "workflow-execution-failure-playbook",
+      "governance_id": "076e4d2a-d0b3-4bdb-be27-67cc25d41702",
+      "version": 1,
+      "status": "approved",
+      "owner": "kaiops-platform-sre",
+      "approver": "release-owner",
+      "approved_at": "2026-08-21T00:00:00Z",
+      "approval_expires_at": "2027-08-21T00:00:00Z",
+      "checksum_sha256": "sha256:b6599bc053e5fa36975b00fdeedadc9e6e323ed510be45ce9b886145034e7cc9",
+      "risk_class": "high",
       "name": "Workflow execution failure recovery",
       "match": {
         "alert_ids": [],
-        "services": ["remediation-engine", "orchestrator", "context-agent", "resolution-agent", "approval-service", "kaiops-platform"],
-        "alert_types": ["workflow", "execution", "agent_failure"],
-        "alert_keywords": ["workflowexecutionfailure", "automationexecutionfailure", "execution failure", "workflow failed", "agent failed"]
+        "services": [
+          "remediation-engine",
+          "orchestrator",
+          "context-agent",
+          "resolution-agent",
+          "approval-service",
+          "kaiops-platform"
+        ],
+        "alert_types": [
+          "workflow",
+          "execution",
+          "agent_failure"
+        ],
+        "alert_keywords": [
+          "workflowexecutionfailure",
+          "automationexecutionfailure",
+          "execution failure",
+          "workflow failed",
+          "agent failed"
+        ]
       },
       "risk_tier": "high",
       "preflight_checks": [
@@ -251,29 +481,60 @@
         {
           "name": "Collect workflow execution diagnostics",
           "type": "diagnostic",
-          "commands": ["check_workflow_execution_status", "query_message_bus_depth", "check_api_gateway_health"]
+          "commands": [
+            "check_workflow_execution_status",
+            "query_message_bus_depth",
+            "check_api_gateway_health"
+          ]
         },
         {
           "name": "Retry failed workflow if approved",
           "type": "remediation",
           "approval_gate": true,
-          "commands": ["retry_failed_workflow"]
+          "commands": [
+            "retry_failed_workflow"
+          ]
         },
         {
           "name": "Validate workflow recovery",
           "type": "validation",
-          "commands": ["validate_workflow_recovery"]
+          "commands": [
+            "validate_workflow_recovery"
+          ]
         }
       ]
     },
     {
       "id": "onboarding-smoke-flow-playbook",
+      "governance_id": "fdfea4d0-2b66-4435-825e-dacf4b0180b5",
+      "version": 1,
+      "status": "approved",
+      "owner": "kaiops-platform-sre",
+      "approver": "release-owner",
+      "approved_at": "2026-08-21T00:00:00Z",
+      "approval_expires_at": "2027-08-21T00:00:00Z",
+      "checksum_sha256": "sha256:1b04518a327e3e00e126a5d9b6a736f369b5fe22b4776f8ddf8534627ec14daa",
+      "risk_class": "low",
       "name": "Onboarding smoke flow validation",
       "match": {
         "alert_ids": [],
-        "services": ["kaiops-platform", "api-gateway", "kaiops-core1", "mysql"],
-        "alert_types": ["onboarding", "smoke_test", "monitoring_rule_onboarding"],
-        "alert_keywords": ["onboarding-smoke-test", "smoke test", "rule onboarding", "monitoring-rule-onboarding"]
+        "services": [
+          "kaiops-platform",
+          "api-gateway",
+          "kaiops-core1",
+          "mysql"
+        ],
+        "alert_types": [
+          "onboarding",
+          "smoke_test",
+          "monitoring_rule_onboarding"
+        ],
+        "alert_keywords": [
+          "onboarding-smoke-test",
+          "smoke test",
+          "rule onboarding",
+          "monitoring-rule-onboarding"
+        ]
       },
       "risk_tier": "low",
       "preflight_checks": [
@@ -285,22 +546,39 @@
         {
           "name": "Collect onboarding smoke diagnostics",
           "type": "diagnostic",
-          "commands": ["check_api_gateway_health", "check_prometheus_alerts"]
+          "commands": [
+            "check_api_gateway_health",
+            "check_prometheus_alerts"
+          ]
         },
         {
           "name": "Validate onboarding smoke path",
           "type": "validation",
-          "commands": ["validate_onboarding_smoke_flow", "check_prometheus_alerts"]
+          "commands": [
+            "validate_onboarding_smoke_flow",
+            "check_prometheus_alerts"
+          ]
         },
         {
           "name": "Validate KaiOps triage script dry run",
           "type": "validation",
-          "commands": ["check_kaiops_triage_script_dry_run"]
+          "commands": [
+            "check_kaiops_triage_script_dry_run"
+          ]
         }
       ]
     },
     {
       "id": "generic-kaiops-triage-playbook",
+      "governance_id": "00cdb971-235d-444c-a13d-c9cd03316f9c",
+      "version": 1,
+      "status": "approved",
+      "owner": "kaiops-platform-sre",
+      "approver": "release-owner",
+      "approved_at": "2026-08-21T00:00:00Z",
+      "approval_expires_at": "2027-08-21T00:00:00Z",
+      "checksum_sha256": "sha256:6756d3456c11f72720fbe0dc5911d1d00af6ede4fa060b5c7d82ded484002d70",
+      "risk_class": "low",
       "name": "Generic KaiOps guarded triage",
       "match": {
         "alert_ids": [],
@@ -318,12 +596,18 @@
         {
           "name": "Collect generic KaiOps diagnostics",
           "type": "diagnostic",
-          "commands": ["check_api_gateway_health", "check_prometheus_alerts", "check_kaiops_triage_script_dry_run"]
+          "commands": [
+            "check_api_gateway_health",
+            "check_prometheus_alerts",
+            "check_kaiops_triage_script_dry_run"
+          ]
         },
         {
           "name": "Validate current service state",
           "type": "validation",
-          "commands": ["validate_service_recovery"]
+          "commands": [
+            "validate_service_recovery"
+          ]
         }
       ]
     }

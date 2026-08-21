@@ -98,6 +98,8 @@ class ExecutionPlanV2(BaseModel):
     connection: dict[str, Any]
     playbook: dict[str, Any]
     playbook_id: str
+    runbook_governance_id: UUID | None = None
+    runbook_checksum: str | None = None
     playbook_version: int | None = None
     runbook_status: str
     connector_id: str
@@ -110,6 +112,11 @@ class ExecutionPlanV2(BaseModel):
     preflight_commands: list[str] = Field(default_factory=list)
     commands: list[str] = Field(default_factory=list)
     validation_commands: list[str] = Field(default_factory=list)
+    validation_endpoints: list[dict[str, Any]] = Field(default_factory=list)
+    required_validation_kinds: list[str] = Field(default_factory=lambda: [
+        "availability", "alert_clearance", "error_rate", "latency", "dependency_health", "critical_alerts"
+    ])
+    stability_window_seconds: int = Field(default=300, ge=60, le=3600)
     rollback_commands: list[str] = Field(default_factory=list)
     rollback_mode: str
     queries: list[str] = Field(default_factory=list)

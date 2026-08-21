@@ -90,11 +90,25 @@ export default function RcaPanel({
   const inferredContextTimestamps = contextSourceRows.reduce((total, source) => total + source.inferredTimestamps, 0);
   const freshEvidenceCount = evidenceRows.filter((row: any) => !row.cached).length;
   const cachedEvidenceCount = evidenceRows.length - freshEvidenceCount;
+  const investigationReport = recommendationMetadata?.investigation_report
+    || recommendationMetadata?.iterative_investigation
+    || {};
+  const investigationConfidence = Number(investigationReport?.conclusion?.confidence || 0);
+  const investigationConclusive = investigationReport?.conclusive === true
+    && String(investigationReport?.status || "").toLowerCase() === "conclusive";
+  const groundingScore = Number(selectedAlertEvaluation?.groundingScore || 0);
   const confidence = Number(selectedRcaDecision?.confidence || 0);
   const confidencePercent = Math.max(0, Math.min(100, Math.round(confidence * 100)));
-  const reviewRequired = Boolean(selectedRcaDecision?.reviewRequired || missingEvidence.length || conflictingEvidence.length);
+  const reviewRequired = Boolean(
+    selectedRcaDecision?.reviewRequired
+    || missingEvidence.length
+    || conflictingEvidence.length
+    || !investigationConclusive
+    || investigationConfidence < 0.85
+    || groundingScore < 0.85
+  );
   const decisionTone = confidence >= 0.85 ? "high" : confidence >= 0.7 ? "medium" : "low";
-  const decisionStatus = reviewRequired ? "Review required" : "Grounded for review";
+  const decisionStatus = reviewRequired ? "Review required" : "Investigation conclusive";
   const analysisReused = Boolean(recommendationMetadata.analysis_reused);
   const analysisReuseScore = Number(recommendationMetadata.analysis_reuse_score || 0);
   const discoveryAnalysis = recommendationMetadata?.discovery_report?.report
@@ -124,6 +138,9 @@ export default function RcaPanel({
     { id: "freshness", label: "Current evidence", detail: freshEvidenceCount ? `${freshEvidenceCount} live record(s) are available.` : "All evidence is cached or freshness is unknown.", passed: freshEvidenceCount > 0, action: "refresh incident context" },
     { id: "conflicts", label: "Conflicts resolved", detail: conflictingEvidence.length ? `${conflictingEvidence.length} conflict(s) require operator review.` : "No conflicting evidence was declared.", passed: conflictingEvidence.length === 0, action: "resolve conflicting observations" },
     { id: "gaps", label: "Declared gaps addressed", detail: missingEvidence.length ? missingEvidence.join(", ") : "The analysis declares no missing evidence.", passed: missingEvidence.length === 0, action: "collect the declared missing evidence" },
+    { id: "investigation", label: "Iterative investigation", detail: investigationConclusive ? "The bounded investigation reached a corroborated conclusion." : "The investigation is missing or inconclusive.", passed: investigationConclusive, action: "continue the read-only investigation" },
+    { id: "confidence", label: "Evidence confidence", detail: `${formatQualityPercent(investigationConfidence)} investigation confidence.`, passed: investigationConfidence >= 0.85, action: "raise evidence-derived confidence to at least 85%" },
+    { id: "grounding", label: "Grounding coverage", detail: `${formatQualityPercent(groundingScore)} grounding coverage.`, passed: groundingScore >= 0.85, action: "raise grounding coverage to at least 85%" },
   ];
 
   useEffect(() => {
@@ -133,7 +150,12 @@ export default function RcaPanel({
     fetchJson("/resolution-agent/resolution-catalog/relevant", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ issue: selectedRcaDecision?.rootCause, service: resolutionService, recommended_action: selectedRcaDecision?.action }),
+      body: JSON.stringify({
+        tenant_id: selectedAlertWorkflow?.context?.tenant_id || selectedAlertRow?.tenant_id,
+        issue: selectedRcaDecision?.rootCause,
+        service: resolutionService,
+        recommended_action: selectedRcaDecision?.action,
+      }),
       timeoutMs: 10000,
     }).then((result: any) => {
       if (active) setResolutionOptions(Array.isArray(result?.rows) ? result.rows : []);
@@ -149,7 +171,7 @@ export default function RcaPanel({
       const result: any = await fetchJson("/resolution-agent/resolution-catalog/select", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ option_id: option.id, issue: selectedRcaDecision?.rootCause, service: resolutionService, incident_id: selectedAlertId || "" }),
+        body: JSON.stringify({ tenant_id: selectedAlertWorkflow?.context?.tenant_id || selectedAlertRow?.tenant_id, option_id: option.id, issue: selectedRcaDecision?.rootCause, service: resolutionService, incident_id: selectedAlertId || "" }),
         timeoutMs: 10000,
       });
       setSelectedResolution(result?.selected || option);

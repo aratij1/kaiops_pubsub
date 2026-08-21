@@ -26,6 +26,7 @@ _VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9_./:@,+%=-]+$")
 _MUTATING_SAFETY = {"write", "restart", "scale", "rollback", "failover", "delete"}
 _EXECUTABLE_PREFIXES = ("ansible-playbook ", "kubectl ", "curl ", "mysql ", "python ", "sh ")
+_HTTP_URL = re.compile(r"https?://[A-Za-z0-9_.:-]+(?:/[A-Za-z0-9_./?=&%+:-]*)?")
 
 
 def docker_compose_restart_plan(*, project: str, service: str) -> dict[str, list[str]]:
@@ -232,6 +233,33 @@ def _bind_command(template: str, variables: dict[str, str]) -> tuple[str, list[s
 
 def _looks_executable(command: str) -> bool:
     return command.strip().lower().startswith(_EXECUTABLE_PREFIXES)
+
+
+def _governed_validation_endpoints(commands: list[str], *, connector_id: str) -> list[dict[str, Any]]:
+    """Project approved HTTP health probes into an explicit closure allowlist."""
+    endpoints: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for command in commands:
+        for url in _HTTP_URL.findall(str(command or "")):
+            normalized = url.rstrip(".,;)")
+            path = normalized.split("?", 1)[0].lower()
+            if not any(marker in path for marker in ("/health", "/healthz", "/ready", "/readiness")):
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            endpoints.append(
+                {
+                    "url": normalized,
+                    "method": "GET",
+                    "kind": "availability",
+                    "onboarded": True,
+                    "authoritative": True,
+                    "connector_id": connector_id,
+                    "source": "approved-execution-catalog",
+                }
+            )
+    return endpoints
 
 
 def _playbook_operations(playbook: dict[str, Any], actions: dict[str, Any]) -> set[str]:
@@ -462,7 +490,11 @@ def resolve_execution_plan(
             action_id=str(command.get("id") or ""),
             connector_id=str(connector.get("connector_id") or ""),
             target_resource_id=execution_service,
-            inputs={"catalog_command": str(command.get("command") or ""), "parameters": variables},
+            inputs={
+                "catalog_command": str(command.get("command") or ""),
+                "operation": str(command.get("operation") or ""),
+                "parameters": variables,
+            },
             expected_outcome="; ".join(str(item) for item in command.get("expected_evidence", []))
             or "service health recovers and independent validation passes",
             validation=list(phase_commands["validation"]),
@@ -476,6 +508,10 @@ def resolve_execution_plan(
         if execution_ready and isinstance(command, dict) and str(command.get("command") or "").strip()
     ]
     approval_decision = "hitl_required" if mutating else "recommend_only"
+    validation_endpoints = _governed_validation_endpoints(
+        phase_commands["validation"],
+        connector_id=str(connector.get("connector_id") or ""),
+    )
     plan = {
         "version": "execution-plan-v2",
         "schema_version": "kaims.execution-plan.v2",
@@ -546,6 +582,8 @@ def resolve_execution_plan(
             "steps": resolved_steps,
         },
         "playbook_id": playbook_id,
+        "runbook_governance_id": playbook.get("governance_id"),
+        "runbook_checksum": playbook.get("checksum_sha256"),
         "playbook_version": playbook_version,
         "runbook_status": runbook_status,
         "connector_id": str(connector.get("connector_id") or ""),
@@ -558,6 +596,11 @@ def resolve_execution_plan(
         "preflight_commands": phase_commands["diagnostic"],
         "commands": phase_commands["remediation"] if execution_ready else [],
         "validation_commands": phase_commands["validation"],
+        "validation_endpoints": validation_endpoints,
+        "required_validation_kinds": [
+            "availability", "alert_clearance", "error_rate", "latency", "dependency_health", "critical_alerts"
+        ],
+        "stability_window_seconds": 300,
         "rollback_commands": phase_commands["rollback"] if execution_ready else [],
         "rollback_mode": rollback_mode,
         "queries": phase_commands["validation"],

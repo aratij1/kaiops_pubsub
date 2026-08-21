@@ -97,9 +97,14 @@ def validate_file(path: Path, rag_root: Path) -> list[ValidationIssue]:
         return issues
 
     required_keys = required_keys_for(section)
+    required_keys = ["tenant_scope", *required_keys]
     missing = [key for key in required_keys if not metadata.get(key, "").strip()]
     if missing:
         issues.append(ValidationIssue("error", path, f"missing required metadata keys: {', '.join(missing)}"))
+
+    tenant_scope = metadata.get("tenant_scope", "").strip()
+    if tenant_scope and tenant_scope.lower() != "global" and not re.match(r"^[A-Za-z0-9._-]{1,128}$", tenant_scope):
+        issues.append(ValidationIssue("error", path, "tenant_scope must be 'global' or a valid tenant identifier"))
 
     expected_kind = expected_kind_for(section)
     if expected_kind:

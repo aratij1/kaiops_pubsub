@@ -19,7 +19,13 @@ describe("ResolutionPanel", () => {
         }}
         alertRow={{ service: "payments-api", environment: "prod" }}
         confidenceScore={0.88}
-        executionPlan={{ requiresApproval: true, riskTier: "high", executionMode: "jenkins" }}
+        executionPlan={{
+          requiresApproval: true,
+          riskTier: "high",
+          executionMode: "jenkins",
+          target: "payments-api",
+          expectedOutcome: "The payments API passes independent recovery validation.",
+        }}
         readinessChecks={[
           { id: "evidence", label: "Grounded evidence", detail: "Evidence threshold met.", passed: true },
           { id: "rollback", label: "Rollback", detail: "Rollback supplied.", passed: true },
@@ -31,6 +37,8 @@ describe("ResolutionPanel", () => {
     expect(screen.getByRole("heading", { name: "Remediation recommendation" })).toBeVisible();
     expect(screen.getByText("Restart the payments API")).toBeVisible();
     expect(screen.getByText("payments-api")).toBeVisible();
+    expect(screen.getByText("Payment requests are failing")).toBeVisible();
+    expect(screen.getByText("The payments API passes independent recovery validation.")).toBeVisible();
     expect(screen.getByText("Human approval required")).toBeVisible();
     expect(screen.getByText("Eligible for guarded approval")).toBeVisible();
     expect(screen.getByRole("progressbar", { name: "Recommendation confidence" })).toHaveAttribute("aria-valuenow", "88");

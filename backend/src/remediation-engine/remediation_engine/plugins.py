@@ -14,8 +14,9 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from ai_workbench_common.agentic import AgentContext, BaseAgent
-from common.models import Approval, RemediationAction, RemediationStatus, utc_now
+from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus, utc_now
 from common.orchestration.execution_plan import docker_compose_restart_plan
+from common.orchestration.execution_plan_contract import verify_plan_fingerprint
 from common.resolution_lifecycle import ResolutionState, create_lifecycle, extract_lifecycle
 from common.resilience import CircuitBreaker, circuit_breaker
 from common.tool_registry import ToolRegistry, ToolSpec
@@ -768,40 +769,74 @@ class RemediationEngine(BaseAgent):
 
         return ""
 
-    def _infer_action_type(self, *, action_text: str, commands: list[str]) -> str:
-        text = self._normalize_text(action_text)
+    def _action_type_from_plan(self, *, plan: dict[str, Any], commands: list[str]) -> str:
+        """Select an executor only from typed plan data, never operator prose."""
+        actions = plan.get("actions") if isinstance(plan.get("actions"), list) else []
+        first = actions[0] if len(actions) == 1 and isinstance(actions[0], dict) else {}
+        inputs = first.get("inputs") if isinstance(first.get("inputs"), dict) else {}
+        permissions = first.get("required_permissions") if isinstance(first.get("required_permissions"), list) else []
+        operation = str(inputs.get("operation") or (permissions[0] if permissions else "")).strip().lower()
+        action_id = str(first.get("action_id") or "").strip().lower()
+        explicit = {
+            "restart_service": "restart_service",
+            "restart_service_runtime": "restart_service",
+            "restart_policy_engine": "restart_service",
+            "restart_pod": "restart_pod",
+            "scale_service": "scale_deployment",
+            "scale_service_workers": "scale_deployment",
+            "rollback_deployment": "rollback_deployment",
+            "rollback_service_deployment": "rollback_deployment",
+            "clear_cache": "clear_cache",
+            "failover_database": "failover_database",
+            "terraform_rollback": "terraform_rollback",
+            "script_execution": "script_execution",
+        }
+        if operation in explicit:
+            return explicit[operation]
+        if action_id in explicit:
+            return explicit[action_id]
         command_blob = " | ".join(self._normalize_text(item) for item in commands)
-        haystack = f"{text} | {command_blob}"
-
-        if "kaiops_alert_health_triage.sh" in haystack:
+        if "kaiops_alert_health_triage.sh" in command_blob:
             return "script_execution"
-        # Classify the immutable catalog commands before interpreting prose.
-        # Service-down recommendations often say "restart the <service>" and
-        # the previous generic fallback mislabeled their Docker restart as a
-        # deployment rollback, which then failed connector authorization.
+        # Legacy plans may be previewed, but command text can no longer be
+        # overridden by approval.modified_action or an operator comment.
         if "rollout undo" in command_blob:
             return "rollback_deployment"
         if "containers/" in command_blob and "/restart" in command_blob:
             return "restart_service"
-        if any(keyword in haystack for keyword in ["restart pod", "rollout restart", "crashloop", "oom"]):
+        if "rollout restart" in command_blob:
             return "restart_pod"
-        if any(keyword in haystack for keyword in ["scale", "replicas", "hpa"]):
+        if "kubectl scale" in command_blob:
             return "scale_deployment"
-        if any(keyword in haystack for keyword in ["restart service", "restart the", "systemctl restart", "ansible"]):
+        if "systemctl restart" in command_blob or "ansible-playbook" in command_blob:
             return "restart_service"
-        if any(keyword in haystack for keyword in ["cache", "redis", "flushdb"]):
+        if "flushdb" in command_blob:
             return "clear_cache"
-        if any(keyword in haystack for keyword in ["failover", "database", "replica", "mysql"]):
+        if "rds_failover" in command_blob:
             return "failover_database"
-        if any(keyword in haystack for keyword in ["terraform", "infrastructure rollback"]):
+        if "terraform apply" in command_blob:
             return "terraform_rollback"
-        return "rollback_deployment"
+        return "api_execution"
 
     def build_action(self, approval: Approval) -> RemediationAction:
         recommended_action = str(approval.metadata.get("recommended_action") or "").strip()
         recommended_commands = approval.metadata.get("recommended_commands") if isinstance(approval.metadata.get("recommended_commands"), list) else []
         approved_execution_plan = approval.metadata.get("execution_plan") if isinstance(approval.metadata.get("execution_plan"), dict) else {}
-        action_text = str(approval.modified_action or approval.comment or recommended_action or "rollback deployment").strip()
+        if approval.decision != ApprovalDecision.APPROVED:
+            raise ValueError("remediation requires an approved decision")
+        if approved_execution_plan.get("schema_version") != "kaims.execution-plan.v2":
+            raise ValueError("remediation requires the exact approved kaims.execution-plan.v2 plan")
+        if not verify_plan_fingerprint(approved_execution_plan):
+            raise ValueError("remediation requires an unmodified kaims.execution-plan.v2 plan")
+        if str(approved_execution_plan.get("tenant_id") or "") != approval.tenant_id:
+            raise ValueError("approved execution plan tenant does not match approval tenant")
+        if str(approved_execution_plan.get("plan_id") or "") != str(approval.plan_id or ""):
+            raise ValueError("approved execution plan identity does not match approval")
+        if str(approved_execution_plan.get("plan_fingerprint") or "") != str(approval.plan_fingerprint or ""):
+            raise ValueError("approved execution plan fingerprint does not match approval")
+        typed_actions = approved_execution_plan.get("actions")
+        if not isinstance(typed_actions, list) or len(typed_actions) != 1 or not isinstance(typed_actions[0], dict):
+            raise ValueError("remediation requires exactly one typed approved plan action")
         plan_commands = approved_execution_plan.get("commands") if isinstance(approved_execution_plan.get("commands"), list) else []
         plan_scripts = approved_execution_plan.get("scripts") if isinstance(approved_execution_plan.get("scripts"), list) else []
         plan_queries = approved_execution_plan.get("queries") if isinstance(approved_execution_plan.get("queries"), list) else []
@@ -813,7 +848,7 @@ class RemediationEngine(BaseAgent):
             *[f"query: {item}" for item in plan_queries],
         ])
         inferred_target = self._infer_target_from_commands(command_list)
-        action_type = self._infer_action_type(action_text=action_text, commands=command_list)
+        action_type = self._action_type_from_plan(plan=approved_execution_plan, commands=command_list)
         policy_version = str(approval.metadata.get("policy_version", "")).strip()
         policy_reason = str(approval.metadata.get("policy_reason", "")).strip()
         connection_profile = approval.metadata.get("connection_profile") if isinstance(approval.metadata.get("connection_profile"), dict) else {}
@@ -983,6 +1018,12 @@ class RemediationEngine(BaseAgent):
             "source_schema_version": str(approved_execution_plan.get("schema_version") or ""),
             "plan_fingerprint": str(approved_execution_plan.get("plan_fingerprint") or ""),
         }
+        if approved_execution_plan.get("schema_version") == "kaims.execution-plan.v2":
+            if not verify_plan_fingerprint(approved_execution_plan):
+                raise ValueError("remediation requires an unmodified kaims.execution-plan.v2 plan")
+            # Plugins consume the compatibility projections already present in
+            # v2, so preserve the exact approved object and its fingerprint.
+            execution_plan = dict(approved_execution_plan)
         supplied_profile = connection_profile
         default_executor = os.getenv("REMEDIATION_DEFAULT_EXECUTOR", "").strip().lower()
         if default_executor == "azure_container_apps_job" and (
@@ -1043,8 +1084,11 @@ class RemediationEngine(BaseAgent):
                 "runbook_id": str(approval.metadata.get("runbook_id") or ""),
                 "runbook_version": approval.metadata.get("runbook_version"),
                 "runbook_status": str(approval.metadata.get("runbook_status") or ""),
+                "runbook_checksum": str(approval.metadata.get("runbook_checksum") or ""),
                 "runbook_match_score": approval.metadata.get("runbook_match_score"),
-                "operator_modified": bool(approval.modified_action),
+                "operator_modified": False,
+                "approved_plan_id": str(approval.plan_id or ""),
+                "approved_plan_fingerprint": str(approval.plan_fingerprint or ""),
                 "recommendation_id": str(approval.recommendation_id),
                 "resolution_lifecycle": extract_lifecycle(approval.metadata) or create_lifecycle(
                     tenant_id=approval.tenant_id,

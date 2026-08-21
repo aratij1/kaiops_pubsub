@@ -97,7 +97,8 @@ def test_resolution_hints_are_matching_input_not_commands() -> None:
     assert all("rm -rf" not in command for command in rendered)
 
 
-def test_missing_tenant_fails_closed() -> None:
+def test_missing_tenant_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
     alert = _alert().model_copy(update={"tenant_id": "default"})
 
     with pytest.raises(ValueError, match="verified identity"):

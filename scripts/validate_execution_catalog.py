@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import UUID
+
+from update_execution_catalog_checksums import playbook_checksum
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -89,6 +93,38 @@ def main() -> int:
             errors.append(f"playbook {playbook_id} must define steps")
             continue
         step_types = {str(step.get("type") or "").strip().lower() for step in steps if isinstance(step, dict)}
+        mutating = "remediation" in step_types
+        if mutating:
+            required_governance = (
+                "governance_id", "version", "status", "owner", "approver", "approved_at",
+                "approval_expires_at", "checksum_sha256", "risk_class",
+            )
+            missing_governance = [key for key in required_governance if playbook.get(key) in (None, "")]
+            if missing_governance:
+                errors.append(
+                    f"executable playbook {playbook_id} missing governance: {', '.join(missing_governance)}"
+                )
+            try:
+                UUID(str(playbook.get("governance_id") or ""))
+            except ValueError:
+                errors.append(f"executable playbook {playbook_id} governance_id must be a UUID")
+            if not isinstance(playbook.get("version"), int) or int(playbook.get("version") or 0) < 1:
+                errors.append(f"executable playbook {playbook_id} version must be a positive integer")
+            if str(playbook.get("status") or "").strip().lower() != "approved":
+                errors.append(f"executable playbook {playbook_id} must have status=approved")
+            if str(playbook.get("risk_class") or "").strip().lower() != str(playbook.get("risk_tier") or "").strip().lower():
+                errors.append(f"executable playbook {playbook_id} risk_class must match risk_tier")
+            if str(playbook.get("checksum_sha256") or "") != playbook_checksum(playbook):
+                errors.append(f"executable playbook {playbook_id} checksum is stale or invalid")
+            try:
+                approved_at = datetime.fromisoformat(str(playbook.get("approved_at") or "").replace("Z", "+00:00"))
+                expires_at = datetime.fromisoformat(str(playbook.get("approval_expires_at") or "").replace("Z", "+00:00"))
+                if approved_at >= expires_at:
+                    errors.append(f"executable playbook {playbook_id} approval expiry must follow approval date")
+                if expires_at <= datetime.now(timezone.utc):
+                    errors.append(f"executable playbook {playbook_id} approval has expired")
+            except ValueError:
+                errors.append(f"executable playbook {playbook_id} approval dates must be ISO-8601 timestamps")
         if playbook_id != "generic-kaiops-triage-playbook" and "diagnostic" not in step_types:
             errors.append(f"playbook {playbook_id} missing diagnostic step")
         if "validation" not in step_types:

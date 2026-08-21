@@ -330,10 +330,12 @@ async def request_evidence(request: ApprovalRequest) -> Approval:
 
 @app.post("/modify", response_model=Approval)
 async def modify(request: ModifyRequest) -> Approval:
-    approval = await _approval_from_request(
-        request,
-        ApprovalDecision.MODIFIED,
-        modified_action=request.modified_action,
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Free-text approval modifications are disabled. Generate a new typed execution plan "
+            "with a new plan_id and plan_fingerprint, then submit a new approval."
+        ),
     )
     await _store_and_publish(approval)
     return approval
@@ -345,12 +347,21 @@ async def _approval_from_request(
     *,
     modified_action: str | None = None,
 ) -> Approval:
-    recommendation_id = request.recommendation_id or await _resolve_recommendation_id(request.incident_id)
-    pending = PENDING_INCIDENTS.get(str(request.incident_id), {})
+    pending = (
+        await _load_approval_context(request.incident_id, tenant_id=request.tenant_id)
+        if decision == ApprovalDecision.APPROVED
+        else {}
+    )
+    recommendation_id = request.recommendation_id or await _resolve_recommendation_id(
+        request.incident_id,
+        tenant_id=request.tenant_id,
+    )
     recommendation = pending.get("recommendation", {}) if isinstance(pending, dict) else {}
     metadata = recommendation.get("metadata", {}) if isinstance(recommendation, dict) else {}
     plan = metadata.get("execution_plan", {}) if isinstance(metadata, dict) else {}
-    if decision in {ApprovalDecision.APPROVED, ApprovalDecision.MODIFIED}:
+    if decision == ApprovalDecision.MODIFIED:
+        raise HTTPException(status_code=409, detail="Modified approvals cannot authorize execution.")
+    if decision == ApprovalDecision.APPROVED:
         expected_tenant = str(plan.get("tenant_id") or "").strip()
         expected_plan_id = str(plan.get("plan_id") or "").strip()
         expected_fingerprint = str(plan.get("plan_fingerprint") or "").strip()
@@ -386,12 +397,63 @@ async def _approval_from_request(
         metadata={
             "execution_confirmation_required": True,
             "authorization_scope": request.authorization_scope,
-            **({"execution_plan": plan} if decision in {ApprovalDecision.APPROVED, ApprovalDecision.MODIFIED} else {}),
+            **({"execution_plan": plan} if decision == ApprovalDecision.APPROVED else {}),
         },
     )
 
 
-async def _resolve_recommendation_id(incident_id: UUID) -> UUID:
+async def _load_approval_context(incident_id: UUID, *, tenant_id: str) -> dict[str, Any]:
+    normalized_incident_id = str(incident_id)
+    normalized_tenant = require_tenant_id(tenant_id, source="approval request identity")
+    memory_payload = PENDING_INCIDENTS.get(normalized_incident_id)
+    if isinstance(memory_payload, dict):
+        recommendation = memory_payload.get("recommendation")
+        metadata = recommendation.get("metadata") if isinstance(recommendation, dict) else {}
+        plan = metadata.get("execution_plan") if isinstance(metadata, dict) else {}
+        if isinstance(plan, dict):
+            plan_tenant = str(plan.get("tenant_id") or "").strip()
+            if plan_tenant == normalized_tenant:
+                return memory_payload
+            if plan_tenant:
+                raise HTTPException(status_code=403, detail="Approval tenant does not match the execution plan tenant.")
+
+    if not settings.database_enabled:
+        return memory_payload if isinstance(memory_payload, dict) else {}
+
+    try:
+        async with app.state.session_factory() as session:
+            repo = IncidentRepository(session)
+            incident = await repo.get_incident(normalized_incident_id, tenant_id=normalized_tenant)
+            if not isinstance(incident, dict):
+                raise HTTPException(status_code=404, detail="No tenant-scoped incident exists for this approval.")
+            recommendation = await repo.get_latest_recommendation_for_incident(
+                normalized_incident_id,
+                tenant_id=normalized_tenant,
+            )
+            pending = await repo.get_pending_workflow(normalized_incident_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "failed to restore durable approval context",
+            extra={"incident_id": normalized_incident_id, "tenant_id": normalized_tenant},
+        )
+        raise HTTPException(status_code=503, detail="Durable approval context is temporarily unavailable.") from exc
+
+    restored = _build_incident_context(
+        {
+            **incident,
+            **({"recommendation": recommendation} if isinstance(recommendation, dict) else {}),
+        },
+        pending,
+    )
+    if isinstance(recommendation, dict):
+        restored["recommendation"] = recommendation
+    PENDING_INCIDENTS[normalized_incident_id] = restored
+    return restored
+
+
+async def _resolve_recommendation_id(incident_id: UUID, *, tenant_id: str) -> UUID:
     normalized_incident_id = str(incident_id)
     memory_payload = PENDING_INCIDENTS.get(normalized_incident_id)
     token = _first_recommendation_id(memory_payload)
@@ -402,7 +464,10 @@ async def _resolve_recommendation_id(incident_id: UUID) -> UUID:
         try:
             async with app.state.session_factory() as session:
                 repo = IncidentRepository(session)
-                recommendation = await repo.get_latest_recommendation_for_incident(normalized_incident_id)
+                recommendation = await repo.get_latest_recommendation_for_incident(
+                    normalized_incident_id,
+                    tenant_id=tenant_id,
+                )
                 pending = await repo.get_pending_workflow(normalized_incident_id)
                 token = _recommendation_id_from_repository_payload(recommendation) or _first_recommendation_id(pending)
                 if token:
@@ -530,7 +595,7 @@ async def _store_and_publish(approval: Approval) -> None:
             decision = pending.get("decision", {}) if isinstance(pending.get("decision"), dict) else {}
             recommendation_id = str(approval.recommendation_id)
             status = "awaiting_approval"
-            if approval.decision == ApprovalDecision.APPROVED or approval.decision == ApprovalDecision.MODIFIED:
+            if approval.decision == ApprovalDecision.APPROVED:
                 status = "approved"
             elif approval.decision == ApprovalDecision.REJECTED:
                 status = "failed"
