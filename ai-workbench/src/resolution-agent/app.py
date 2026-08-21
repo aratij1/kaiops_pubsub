@@ -33,6 +33,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from resolution_agent import ResolutionIntelligenceAgent
 from resolution_agent.investigation import IterativeInvestigator
+from resolution_agent.contracts import ResolutionOption
 from resolution_agent.policy import ResolutionPolicyInput, evaluate_resolution_policy
 from resolution_agent.metrics import HITL_TOTAL, HOTL_TOTAL, PLAN_BLOCKED_TOTAL
 from resolution_agent.workflow import ResolutionWorkflowState, transition_idempotency_key
@@ -86,6 +87,63 @@ def _deterministic_recommendation_id(context: Context) -> UUID:
     metadata = context.metadata if isinstance(context.metadata, dict) else {}
     identity = metadata.get("context_fingerprint") or context.alert.id
     return uuid5(NAMESPACE_URL, f"kaims:recommendation:{context.incident_id}:{identity}:v2")
+
+
+def _attach_resolution_options(
+    recommendation: Recommendation,
+    context: Context,
+    investigation_report: dict[str, Any],
+) -> None:
+    """Project governed catalog matches into typed, non-executable options."""
+    if investigation_report.get("conclusive") is not True:
+        recommendation.metadata["resolution_options"] = []
+        recommendation.metadata["resolution_options_status"] = str(
+            investigation_report.get("outcome") or "INSUFFICIENT_EVIDENCE"
+        )
+        return
+    conclusion = investigation_report.get("conclusion") if isinstance(investigation_report.get("conclusion"), dict) else {}
+    evidence_ids = [str(value) for value in conclusion.get("evidence_ids") or [] if str(value).strip()]
+    confidence = max(0.0, min(float(conclusion.get("confidence") or recommendation.confidence or 0.0), 1.0))
+    matches = relevant_resolutions(
+        issue=str(recommendation.root_cause or context.alert.description or context.alert.name),
+        service=context.alert.service,
+        recommended_action=str(recommendation.recommended_action or ""),
+        limit=3,
+    )
+    options: list[dict[str, Any]] = []
+    for rank, match in enumerate(matches, start=1):
+        risk = str(match.get("risk") or "high").upper()
+        option = ResolutionOption(
+            option_id=str(match["id"]),
+            incident_id=context.incident_id,
+            correlation_id=str(context.trace_id or context.incident_id),
+            title=str(match.get("title") or match["id"]),
+            objective=str(match.get("applicability") or "Restore the affected service safely."),
+            action_type=str(match.get("strategy") or "diagnose"),
+            target={"platform": match.get("platform"), "service": context.alert.service},
+            reasoning=(
+                f"Rank {rank}: governed catalog match based on the evidence-supported RCA; "
+                f"match reasons={', '.join(str(value) for value in match.get('match_reasons') or []) or 'catalog taxonomy'}."
+            ),
+            supporting_evidence_ids=evidence_ids,
+            confidence=confidence,
+            estimated_success_probability=min(confidence, float(match.get("relevance") or 0.0)),
+            risk_level=risk,
+            estimated_recovery_time=None,
+            blast_radius={"affected_services": [context.alert.service], "verified": False},
+            preconditions=[{"description": str(value), "required": True} for value in match.get("prerequisites") or []],
+            validation_plan=[{"description": str(value), "source": "registered-validator-required"} for value in match.get("validation") or []],
+            rollback_plan={"steps": list(match.get("rollback") or [])} if match.get("rollback") else None,
+            automation_eligibility="HITL" if risk in {"LOW", "MEDIUM"} else "MANUAL_ONLY",
+        )
+        options.append(option.model_dump(mode="json"))
+    recommendation.metadata["resolution_options"] = options
+    recommendation.metadata["resolution_options_status"] = "RANKED" if options else "UNSUPPORTED_ACTION"
+    typed_investigation = recommendation.metadata.get("iterative_investigation")
+    if isinstance(typed_investigation, dict):
+        rca_result = typed_investigation.get("rca_result")
+        if isinstance(rca_result, dict):
+            rca_result["resolution_options"] = options
 
 
 async def _resolve_context(context: Context) -> Recommendation:
@@ -163,6 +221,7 @@ async def _resolve_context(context: Context) -> Recommendation:
                 )
                 recommendation.confidence = min(float(recommendation.confidence), 0.49)
                 recommendation.metadata["resolution_outcome"] = "inconclusive"
+            _attach_resolution_options(recommendation, context, investigation_report)
         recommendation.metadata = {
             **(recommendation.metadata if isinstance(recommendation.metadata, dict) else {}),
             "analysis_reused": False,

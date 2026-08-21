@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
 from common.repository import EvaluationRepository
+from common.database import AuditLogRecord
+from sqlalchemy import select
 
 
 @pytest.mark.asyncio
@@ -150,6 +153,34 @@ async def test_list_evaluations_orders_most_recent_first_and_respects_limit(sqli
 
 
 @pytest.mark.asyncio
+async def test_retention_sweeper_is_tenant_bounded_and_writes_audit(sqlite_session_factory) -> None:
+    now = datetime.now(UTC)
+    async with sqlite_session_factory() as session:
+        repo = EvaluationRepository(session)
+        expired_id = await repo.save_evaluation(report={"secret": "removed"}, agent="resolution-agent", tenant_id="tenant-a", expires_at=now - timedelta(days=1), artifact_signature="signed")
+        retained_id = await repo.save_evaluation(report={"value": "kept"}, agent="resolution-agent", tenant_id="tenant-a", expires_at=now + timedelta(days=1))
+        other_id = await repo.save_evaluation(report={"value": "other"}, agent="resolution-agent", tenant_id="tenant-b", expires_at=now - timedelta(days=1))
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        repo = EvaluationRepository(session)
+        purged = await repo.purge_expired_evaluations(tenant_id="tenant-a", now=now)
+        await session.commit()
+        audits = (await session.execute(select(AuditLogRecord).where(AuditLogRecord.resource_id == expired_id))).scalars().all()
+
+    assert purged == [expired_id]
+    assert len(audits) == 1
+    assert audits[0].tenant_id == "tenant-a"
+    assert audits[0].payload == {"expired_at": (now - timedelta(days=1)).isoformat(), "had_artifact_signature": True}
+    assert "secret" not in audits[0].payload
+    async with sqlite_session_factory() as session:
+        repo = EvaluationRepository(session)
+        assert await repo.get_evaluation(expired_id, tenant_id="tenant-a") is None
+        assert await repo.get_evaluation(retained_id, tenant_id="tenant-a") is not None
+        assert await repo.get_evaluation(other_id, tenant_id="tenant-b") is not None
+
+
+@pytest.mark.asyncio
 async def test_summarize_evaluations_empty_store(sqlite_session_factory) -> None:
     async with sqlite_session_factory() as session:
         repo = EvaluationRepository(session)
@@ -260,3 +291,17 @@ async def test_attach_feedback_by_recommendation_uses_most_recent_when_multiple_
     # "most recent" is whichever was inserted last; assert exactly one got the feedback.
     fed_back = [r for r in (first_record, second_record) if r["feedback"] is not None]
     assert len(fed_back) == 1
+@pytest.mark.asyncio
+async def test_evaluation_reads_are_tenant_scoped(sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        repo = EvaluationRepository(session)
+        tenant_a_id = await repo.save_evaluation(report={"overall_score": 0.9}, agent="resolution-agent", tenant_id="tenant-a")
+        await repo.save_evaluation(report={"overall_score": 0.1}, agent="resolution-agent", tenant_id="tenant-b")
+        await session.commit()
+
+        assert await repo.get_evaluation(tenant_a_id, tenant_id="tenant-b") is None
+        tenant_a_rows = await repo.list_evaluations(tenant_id="tenant-a")
+        tenant_b_rows = await repo.list_evaluations(tenant_id="tenant-b")
+
+    assert len(tenant_a_rows) == 1 and tenant_a_rows[0]["tenant_id"] == "tenant-a"
+    assert len(tenant_b_rows) == 1 and tenant_b_rows[0]["tenant_id"] == "tenant-b"

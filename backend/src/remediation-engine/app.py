@@ -20,6 +20,7 @@ from common.event_publishers import build_agent_event_contract, build_event_enve
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus, utc_now
 from common.orchestration.execution_plan_contract import verify_plan_fingerprint
+from common.orchestration.safe_remediation import PreflightEvidence
 from common.tenant_identity import require_tenant_id, verify_event_envelope
 from common.resolution_lifecycle import LifecycleActor, ResolutionState, create_lifecycle, decide_resolution_control, extract_lifecycle, transition_lifecycle
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
@@ -1680,7 +1681,35 @@ async def dry_run_approval(approval: Approval) -> dict[str, Any]:
     unsafe_reasons = _unsafe_plan_reasons(approval)
     connector_check = await _preflight_live_connector(action)
     passed = allowed and not unsafe_reasons and connector_check["passed"]
-    return {
+    plan = approval.metadata.get("execution_plan") if isinstance(approval.metadata.get("execution_plan"), dict) else {}
+    plan_actions = plan.get("actions") if isinstance(plan.get("actions"), list) else []
+    first_action = plan_actions[0] if plan_actions and isinstance(plan_actions[0], dict) else {}
+    binding = first_action.get("safety_binding") if isinstance(first_action.get("safety_binding"), dict) else {}
+    planned = binding.get("preflight") if isinstance(binding.get("preflight"), dict) else {}
+    evidence_id = "preflight:" + hashlib.sha256(
+        f"{approval.tenant_id}:{approval.incident_id}:{approval.plan_fingerprint}:{action.action_type}:{connector_check}".encode()
+    ).hexdigest()
+    profile = action.parameters.get("connection_profile")
+    profile = profile if isinstance(profile, dict) else {}
+    preflight_evidence = PreflightEvidence(
+        status="PASSED" if passed else "FAILED",
+        capability_id=str(planned.get("capability_id") or action.action_type),
+        target_resource_id=str(planned.get("target_resource_id") or action.target),
+        check_references=list(planned.get("check_references") or []),
+        evidence_ids=[evidence_id] if passed else [],
+        dry_run_required=True,
+        dry_run_evidence_id=evidence_id if passed else None,
+        credential_reference=str(
+            planned.get("credential_reference")
+            or profile.get("credential_ref")
+            or approval.metadata.get("credential_ref")
+            or "unavailable"
+        ),
+    ).model_dump(mode="json")
+    action.parameters["preflight_evidence"] = preflight_evidence
+    action.parameters["dry_run"] = True
+    action.output = "Dry run passed; no command was executed." if passed else "Dry run blocked."
+    result = {
         "status": "passed" if passed else "blocked",
         "dry_run": True,
         "executed": False,
@@ -2229,6 +2258,7 @@ async def _request_failure_reconsideration(
         "action_id": str(action.id),
         "action_type": action.action_type,
         "target": action.target,
+        "preflight_evidence": preflight_evidence,
         "service": str(action.parameters.get("service") or action.target),
         "environment": str(action.parameters.get("environment") or "prod"),
         "error": str(action.error or action.output or "execution failed"),
@@ -2236,6 +2266,12 @@ async def _request_failure_reconsideration(
         "previous_recommendation": previous,
         "attempt": attempt,
     }
+    session_factory = getattr(app.state, "session_factory", None)
+    if settings.database_enabled and session_factory is not None:
+        async with session_factory() as session:
+            await IncidentRepository(session).save_action_audit(action, actor="remediation-preflight")
+            await session.commit()
+    return result
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(f"{settings.resolution_agent_url.rstrip('/')}/reconsider-execution", json=request)

@@ -13,6 +13,14 @@ from uuid import uuid4
 import httpx
 
 from ai_workbench_common.models import Context
+from resolution_agent.contracts import (
+    Hypothesis as HypothesisContract,
+    HypothesisStatus,
+    InvestigationPlan,
+    InvestigationToolCall,
+    RCAResult,
+    ResolutionOutcome,
+)
 from resolution_agent.evidence import EvidenceCompiler
 from resolution_agent.confidence import ConfidenceInputs, score_confidence
 from resolution_agent.metrics import (
@@ -112,7 +120,61 @@ class IterativeInvestigator:
         self.evidence_compiler = EvidenceCompiler()
         self.max_steps = max(8, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_STEPS", "8")), 12))
         self.max_evidence = max(8, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_EVIDENCE", "40")), 100))
+        self.max_tool_calls = max(1, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_TOOL_CALLS", "12")), 100))
+        self.max_duration_seconds = max(5, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_DURATION_SECONDS", "120")), 3600))
+        self.max_cost_usd = max(0.0, min(float(os.getenv("RESOLUTION_INVESTIGATION_MAX_COST_USD", "0.25")), 1000.0))
         self.conclusive_threshold = max(0.6, min(float(os.getenv("RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD", "0.85")), 0.98))
+
+    def plan(self, context: Context, *, investigation_id: str) -> InvestigationPlan:
+        required = sorted(self._required_sources(context))
+        service = context.alert.service
+        questions = [
+            f"What changed immediately before {service} became unhealthy?",
+            f"Which direct evidence proves or disproves failure inside {service}?",
+            f"Is a dependency, data store, or infrastructure resource causing the symptom in {service}?",
+            "Which resources and dependent services are inside the blast radius?",
+            "Is there an independently corroborated causal chain rather than a temporal coincidence?",
+        ]
+        text = " ".join((context.alert.name, context.alert.description)).lower()
+        if any(token in text for token in ("deploy", "release", "exception", "traceback")):
+            questions.insert(0, "Did the failure begin after a deployment, and is only the new version affected?")
+        if any(token in text for token in ("database", "mysql", "query", "pool", "replica")):
+            questions.insert(0, "Do database saturation or data-path diagnostics align with the application failure window?")
+        calls = [
+            InvestigationToolCall(
+                tool_name=self.SOURCE_TOOL[source],
+                objective=f"Collect {source} evidence that can support or falsify a hypothesis.",
+                source_type=source,
+                arguments={"service": service},
+            )
+            for source in required
+        ]
+        return InvestigationPlan(
+            investigation_id=investigation_id,
+            incident_id=context.incident_id,
+            correlation_id=str(context.trace_id or context.incident_id),
+            objectives=[
+                "Identify a falsifiable causal explanation grounded in incident-window evidence.",
+                "Disprove plausible competing hypotheses before recommending remediation.",
+                "Return an explicit non-conclusive outcome when proof is insufficient.",
+            ],
+            questions_to_answer=questions,
+            required_evidence=required,
+            recommended_tool_calls=calls,
+            investigation_priority=required,
+            stop_conditions=[
+                f"confidence >= {self.conclusive_threshold:.2f} with two independent evidence sources",
+                "required evidence remains unavailable",
+                "contradictory evidence cannot be resolved",
+                "tool-call, duration, cost, or step budget is exhausted",
+                "policy prevents further read access",
+            ],
+            max_steps=self.max_steps,
+            max_tool_calls=self.max_tool_calls,
+            max_duration_seconds=self.max_duration_seconds,
+            max_cost_usd=self.max_cost_usd,
+            minimum_confidence=self.conclusive_threshold,
+        )
 
     def _compile_evidence(self, context: Context, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [
@@ -360,27 +422,50 @@ class IterativeInvestigator:
                 0.5 if len({str(row.get("service") or "") for row in supporting_rows if row.get("service")}) > 1 else 0.0
             )
             change_correlation = 1.0 if any(row.get("source_type") == "change" for row in supporting_rows) else 0.0
-            approved_runbook = any(
-                row.get("source_type") == "runbook" and row.get("metadata", {}).get("status") == "approved"
-                for row in evidence
-            )
-            historical_rates = [
-                float(row.get("metadata", {}).get("success_rate"))
+            historical_similarities = [
+                float(row.get("metadata", {}).get("similarity"))
                 for row in evidence
                 if row.get("source_type") == "ticket"
                 and row.get("metadata", {}).get("reviewed") is True
-                and row.get("metadata", {}).get("success_rate") is not None
+                and row.get("metadata", {}).get("similarity") is not None
             ]
+            tested_rows = [
+                row for row in supporting_rows
+                if row.get("metadata", {}).get("test_passed") is not None
+            ]
+            successful_test_ratio = (
+                sum(1 for row in tested_rows if row.get("metadata", {}).get("test_passed") is True)
+                / len(tested_rows)
+                if tested_rows else 0.0
+            )
+            evidence_quality = (
+                sum(float(row.get("reliability_score") or 0.0) for row in supporting_rows)
+                / len(supporting_rows)
+                if supporting_rows else 0.0
+            )
+            consistency = len(support) / max(1, len(support) + len(contradiction))
+            causal_strength = min(
+                1.0,
+                (0.45 * temporal_alignment)
+                + (0.30 * topology_support)
+                + (0.25 * successful_test_ratio),
+            )
+            completeness = sum(1 for source in required_sources if coverage.get(source, 0)) / max(1, len(required_sources))
             scored = score_confidence(ConfidenceInputs(
-                evidence_completeness=sum(1 for source in required_sources if coverage.get(source, 0)) / max(1, len(required_sources)),
+                evidence_quality=evidence_quality,
+                evidence_consistency=consistency,
+                causal_strength=causal_strength,
                 independent_source_corroboration=min(len(sources) / 3, 1.0),
                 temporal_alignment=temporal_alignment,
-                topology_support=topology_support,
-                change_correlation=change_correlation,
-                approved_runbook_applicability=1.0 if approved_runbook else 0.0,
-                historical_success_rate=sum(historical_rates) / len(historical_rates) if historical_rates else 0.0,
+                topology_alignment=topology_support,
+                historical_similarity=(
+                    sum(historical_similarities) / len(historical_similarities)
+                    if historical_similarities else 0.0
+                ),
+                successful_test_ratio=successful_test_ratio,
                 contradiction_penalty=min(len(set(contradiction)) * 0.1, 0.35),
                 freshness_penalty=0.15 if supporting_rows and not fresh_support else 0.0,
+                missing_data_penalty=(1.0 - completeness) * 0.2,
                 sources_unavailable=any(coverage.get(source, 0) == 0 for source in required_sources),
                 stale_evidence=bool(supporting_rows and not fresh_support),
                 model_fallback=bool(context.metadata.get("model_fallback")),
@@ -388,8 +473,12 @@ class IterativeInvestigator:
                 unresolved_contradictions=bool(contradiction),
                 ambiguous_target=not bool(str(context.alert.service or "").strip()),
             ))
-            hypothesis["supporting_evidence_ids"] = list(dict.fromkeys(support))[:20]
-            hypothesis["contradicting_evidence_ids"] = list(dict.fromkeys(contradiction))[:20]
+            contradiction_ids = list(dict.fromkeys(contradiction))[:20]
+            hypothesis["supporting_evidence_ids"] = [
+                evidence_id for evidence_id in dict.fromkeys(support)
+                if evidence_id not in set(contradiction_ids)
+            ][:20]
+            hypothesis["contradicting_evidence_ids"] = contradiction_ids
             hypothesis["independent_sources"] = sorted(sources)
             hypothesis["temporal_alignment"] = round(temporal_alignment, 4)
             hypothesis["topology_support"] = round(topology_support, 4)
@@ -415,6 +504,7 @@ class IterativeInvestigator:
     async def investigate(self, context: Context, *, persist: PersistEvent | None = None) -> dict[str, Any]:
         investigation_started = monotonic()
         investigation_id = str(uuid4())
+        investigation_plan = self.plan(context, investigation_id=investigation_id)
         evidence = self._compile_evidence(context, self._initial_evidence(context))[: self.max_evidence]
         hypotheses = self._revise_hypotheses(self._initial_hypotheses(context), evidence, context=context)
         started_at = datetime.now(UTC).isoformat()
@@ -429,11 +519,19 @@ class IterativeInvestigator:
                 "status": InvestigationStatus.RUNNING.value,
                 "step_budget": self.max_steps,
                 "evidence_count": len(evidence),
+                "correlation_id": investigation_plan.correlation_id,
+                "investigation_plan": investigation_plan.model_dump(mode="json"),
             })
 
         status = InvestigationStatus.RUNNING
         stop_reason = ""
         for sequence in range(1, self.max_steps + 1):
+            if monotonic() - investigation_started >= self.max_duration_seconds:
+                status, stop_reason = InvestigationStatus.BUDGET_EXHAUSTED, "duration_budget_exhausted"
+                break
+            if sum(tool_counts.values()) >= self.max_tool_calls:
+                status, stop_reason = InvestigationStatus.BUDGET_EXHAUSTED, "tool_call_budget_exhausted"
+                break
             leading = hypotheses[0] if hypotheses else None
             if (
                 leading
@@ -506,9 +604,64 @@ class IterativeInvestigator:
         required_sources = self._required_sources(context)
         missing = [source for source in required_sources if coverage.get(source, 0) == 0]
         leading = hypotheses[0] if hypotheses else None
+        contradictory = list(leading.get("contradicting_evidence_ids") or []) if leading else []
+        failed_steps = [step for step in steps if step.get("status") == "failed"]
+        if status == InvestigationStatus.CONCLUSIVE:
+            outcome = ResolutionOutcome.EVIDENCE_SUPPORTED
+        elif contradictory:
+            outcome = ResolutionOutcome.CONFLICTING_EVIDENCE
+        elif failed_steps and len(failed_steps) == len(steps):
+            outcome = ResolutionOutcome.CONNECTOR_FAILURE
+        elif missing or status == InvestigationStatus.BUDGET_EXHAUSTED:
+            outcome = ResolutionOutcome.INSUFFICIENT_EVIDENCE
+        else:
+            outcome = ResolutionOutcome.UNKNOWN
+        confidence_breakdown = leading.get("confidence_breakdown") if leading else {}
+        confidence_breakdown = confidence_breakdown if isinstance(confidence_breakdown, dict) else {}
+        typed_hypotheses = []
+        status_map = {
+            "confirmed": HypothesisStatus.SUPPORTED,
+            "falsified": HypothesisStatus.REJECTED,
+            "leading": HypothesisStatus.TESTING,
+            "candidate": HypothesisStatus.PROPOSED,
+            "viable": HypothesisStatus.PROPOSED,
+        }
+        for hypothesis in hypotheses:
+            claim = str(hypothesis.get("claim") or "").strip()
+            typed_hypotheses.append(HypothesisContract(
+                hypothesis_id=str(hypothesis.get("hypothesis_id") or uuid4()),
+                incident_id=context.incident_id,
+                correlation_id=investigation_plan.correlation_id,
+                title=claim[:160] or "Unresolved causal hypothesis",
+                description=claim or "No causal claim was available.",
+                suspected_component=str(context.alert.service or "unknown"),
+                suspected_change=None,
+                probability=float(hypothesis.get("confidence") or 0.0),
+                status=status_map.get(str(hypothesis.get("status") or ""), HypothesisStatus.INCONCLUSIVE),
+                supporting_evidence_ids=list(hypothesis.get("supporting_evidence_ids") or []),
+                contradicting_evidence_ids=list(hypothesis.get("contradicting_evidence_ids") or []),
+                required_tests=[str((hypothesis.get("falsification_check") or {}).get("objective") or "Collect independent causal evidence.")],
+                reasoning_summary=str(hypothesis.get("reasoning_summary") or "Probability is computed from evidence factors, not model self-assessment."),
+                confidence_factors=dict(confidence_breakdown.get("components") or {}),
+                confidence_penalties=dict(confidence_breakdown.get("penalties") or {}),
+            ).model_dump(mode="json"))
+        rca_result = RCAResult(
+            incident_id=context.incident_id,
+            correlation_id=investigation_plan.correlation_id,
+            outcome=outcome,
+            root_cause=str(leading.get("claim")) if outcome == ResolutionOutcome.EVIDENCE_SUPPORTED and leading else None,
+            leading_hypothesis_id=str(leading.get("hypothesis_id")) if outcome == ResolutionOutcome.EVIDENCE_SUPPORTED and leading else None,
+            confidence=float(leading.get("confidence") or 0.0) if leading else 0.0,
+            supporting_evidence_ids=list(leading.get("supporting_evidence_ids") or []) if leading else [],
+            contradicting_evidence_ids=contradictory,
+            factors=dict(confidence_breakdown.get("components") or {}),
+            penalties=dict(confidence_breakdown.get("penalties") or {}),
+            missing_evidence=missing,
+        )
         report = {
             "schema_version": "kaims.iterative-investigation.v1",
             "investigation_id": investigation_id,
+            "correlation_id": investigation_plan.correlation_id,
             "incident_id": str(context.incident_id),
             "alert_id": str(context.alert.id),
             "status": status.value,
@@ -522,8 +675,12 @@ class IterativeInvestigator:
             "evidence_count": len(evidence),
             "source_coverage": coverage,
             "missing_sources": missing,
+            "investigation_plan": investigation_plan.model_dump(mode="json"),
             "steps": steps,
             "hypotheses": hypotheses,
+            "typed_hypotheses": typed_hypotheses,
+            "outcome": outcome.value,
+            "rca_result": rca_result.model_dump(mode="json"),
             "conclusion": {
                 "hypothesis_id": leading.get("hypothesis_id") if leading else None,
                 "claim": leading.get("claim") if leading else None,

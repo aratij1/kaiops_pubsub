@@ -622,7 +622,38 @@
   margin-bottom: 22px !important;
 }
 
+.autonomy-decision-details { display: grid; gap: 14px; margin: 0 24px 20px; padding: 18px; border: 1px solid var(--line, #d7e2ea); border-radius: 12px; background: var(--surface-muted, #f7fafb); }
+.autonomy-decision-details > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.autonomy-decision-details h4 { margin: 4px 0 0; font-size: 1rem; }
+.autonomy-outcome { padding: 6px 10px; color: #526d82; border: 1px solid #c7d5df; border-radius: 999px; background: #fff; font-size: .72rem; font-weight: 850; text-transform: capitalize; }
+.autonomy-outcome.is-recovered, .autonomy-outcome.is-evidence-supported { color: #087251; border-color: #8bcab2; background: #ecf9f4; }
+.autonomy-outcome.is-validation-failed, .autonomy-outcome.is-integrity-failed, .autonomy-outcome.is-conflicting-evidence { color: #a12b24; border-color: #e8aaa5; background: #fff3f2; }
+.autonomy-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.autonomy-detail-grid details { overflow: hidden; border: 1px solid var(--line, #d7e2ea); border-radius: 9px; background: var(--panel, #fff); }
+.autonomy-detail-grid summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; font-size: .79rem; font-weight: 850; cursor: pointer; }
+.autonomy-detail-grid summary small { color: var(--muted, #526d82); font-size: .68rem; font-weight: 750; }
+.autonomy-detail-body { display: grid; gap: 10px; padding: 0 14px 14px; border-top: 1px solid var(--line, #d7e2ea); }
+.autonomy-detail-body > p { margin: 11px 0 0; color: var(--muted, #526d82); font-size: .76rem; line-height: 1.5; }
+.autonomy-highlight { display: grid; gap: 5px; padding: 11px; border-left: 4px solid #2563eb; border-radius: 7px; background: #f5f9ff; }
+.autonomy-highlight strong { font-size: .8rem; }
+.autonomy-highlight span { color: #526d82; font-size: .68rem; font-weight: 750; text-transform: capitalize; }
+.autonomy-highlight p { margin: 0; color: #334e68; font-size: .74rem; line-height: 1.45; }
+.autonomy-highlight small { color: #526d82; font-size: .66rem; font-weight: 750; }
+.autonomy-question-list { display: grid; gap: 5px; margin: 11px 0 0; padding-left: 18px; color: #526d82; font-size: .72rem; line-height: 1.4; }
+.autonomy-factor-list, .autonomy-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0; gap: 6px; }
+.autonomy-factor-list div, .autonomy-facts div { display: flex; justify-content: space-between; gap: 8px; padding: 7px 8px; border-radius: 6px; background: #f4f7f9; }
+.autonomy-factor-list dt, .autonomy-facts dt { color: #526d82; font-size: .67rem; text-transform: capitalize; }
+.autonomy-factor-list dd, .autonomy-facts dd { margin: 0; font-size: .69rem; font-weight: 850; text-align: right; }
+.autonomy-factor-list .is-penalty dd, .autonomy-warning { color: #a12b24; }
+.autonomy-option-list { display: grid; gap: 8px; margin: 11px 0 0; padding: 0; list-style: none; counter-reset: option; }
+.autonomy-option-list li { display: grid; gap: 4px; padding: 10px; border: 1px solid #d7e2ea; border-radius: 7px; counter-increment: option; }
+.autonomy-option-list strong::before { content: counter(option) ". "; color: #087b83; }
+.autonomy-option-list span { color: #526d82; font-size: .68rem; font-weight: 750; text-transform: capitalize; }
+.autonomy-option-list p, .autonomy-warning { margin: 0; font-size: .72rem; line-height: 1.45; }
+.autonomy-empty { font-style: italic; }
+
 @media (max-width: 1050px) {
+  .autonomy-detail-grid { grid-template-columns: 1fr; }
   .resolution-brief-layout { grid-template-columns: 1fr; }
   .resolution-change-summary { border-right: 0; border-bottom: 1px solid var(--line, #d7e2ea); }
   .execution-checklist { grid-template-columns: 1fr; }
@@ -631,6 +662,9 @@
 }
 
 @media (max-width: 760px) {
+  .autonomy-decision-details { margin: 0 19px 19px; padding: 14px; }
+  .autonomy-decision-details > header { align-items: flex-start; flex-direction: column; }
+  .autonomy-factor-list, .autonomy-facts { grid-template-columns: 1fr; }
   .resolution-brief-header { align-items: flex-start; flex-direction: column; padding: 19px; }
   .resolution-change-summary { grid-template-columns: 1fr; padding: 19px; }
   .resolution-change-summary dl { grid-template-columns: 1fr; }

@@ -1074,6 +1074,67 @@ async def get_recent_alerts(
     )
 
 
+@app.post("/evaluations")
+async def create_evaluation_record(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="POST", path="/evaluations", target_base=settings.evaluation_service_url, payload={**payload, "tenant_id": tenant_id}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.get("/evaluations")
+async def list_evaluation_records(
+    request: Request,
+    incident_id: str | None = None,
+    agent: str | None = None,
+    limit: int = 100,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    query = urlencode({key: value for key, value in {"incident_id": incident_id, "agent": agent, "limit": limit, "tenant_id": tenant_id}.items() if value is not None})
+    return await guarded_proxy(request=request, method="GET", path=f"/evaluations?{query}", target_base=settings.evaluation_service_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.get("/evaluations/{evaluation_id}")
+async def get_evaluation_record(
+    evaluation_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    query = urlencode({"tenant_id": tenant_id})
+    return await guarded_proxy(request=request, method="GET", path=f"/evaluations/{evaluation_id}?{query}", target_base=settings.evaluation_service_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.post("/evaluations/autonomy/assess")
+async def assess_autonomy_evidence(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="POST", path="/evaluations/autonomy/assess", target_base=settings.evaluation_service_url, payload={**payload, "tenant_id": tenant_id}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.post("/evaluations/retention/sweep")
+async def sweep_expired_evaluation_records(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/evaluations/retention/sweep",
+        target_base=settings.evaluation_service_url,
+        payload={**payload, "tenant_id": auth.tenant_id},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/alerts/all")
 async def get_all_alerts(
     request: Request,

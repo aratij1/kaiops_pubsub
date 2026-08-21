@@ -14,6 +14,7 @@ DOCUMENT_PROVIDER_ROLES = {
     SystemRole.L3_ENGINEER.value,
 }
 AUTHENTICATED_WRITE_RULES: tuple[tuple[set[str] | None, str, set[str] | None], ...] = (
+    (None, "/evaluations", None),
     ({"GET"}, "/events/operations", None),
     (None, "/applications", {ADMIN_ROLE}),
     (None, "/onboarding", {ADMIN_ROLE}),

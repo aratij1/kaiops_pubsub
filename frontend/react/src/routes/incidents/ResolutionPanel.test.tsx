@@ -57,4 +57,38 @@ describe("ResolutionPanel", () => {
     expect(screen.queryByText("Eligible for guarded approval")).not.toBeInTheDocument();
     expect(screen.getByText("Signed backend readiness")).toBeVisible();
   });
+
+  it("renders the typed evidence-to-recovery decision trace without exposing credentials", () => {
+    render(<ResolutionPanel
+      workflow={{
+        recommendation: { recommended_action: "Restart revision", root_cause: "Connection pool exhaustion", metadata: {
+          iterative_investigation: {
+            outcome: "EVIDENCE_SUPPORTED",
+            investigation_plan: { questions_to_answer: ["Did the pool exhaust after the deployment?"] },
+            typed_hypotheses: [{ title: "The new revision exhausted its pool", status: "SUPPORTED", probability: 0.92, reasoning_summary: "Logs and metrics corroborate the causal sequence.", confidence_factors: { causal_strength: 0.18 }, confidence_penalties: {} }],
+          },
+          resolution_options: [{ option_id: "restart-revision", title: "Restart the unhealthy revision", risk_level: "MEDIUM", automation_eligibility: "HITL", reasoning: "Governed catalog match backed by the supported RCA." }],
+        } },
+        remediation_action: { parameters: { preflight_evidence: { status: "PASSED", dry_run_evidence_id: "preflight:abc" } } },
+        resolution_report: { metadata: { outcome_validation: { outcome: "RECOVERED", closure_authorized: true, stability_window_seconds: 300, failed_checks: [], rollback: { disposition: "NOT_REQUIRED" } } } },
+        evaluation: { report: { code_patch_proposals: [{ proposal_id: "patch-1", title: "Bound connection pool growth", explanation: "Review-only code proposal.", executable: false }], preventive_recommendations: [{ recommendation_id: "prevent-1", risk_signal: "Pool pressure rising", mode: "SHADOW", execution_authorized: false, recommended_review: "Review capacity." }], evidence_council: { disposition: "SUPPORTED" }, temporal_service_graph: { edges: [{ edge_id: "edge-1" }] } } },
+      }}
+      alertRow={{ service: "payments-api", environment: "prod" }}
+      confidenceScore={0.92}
+      executionPlan={{ target: "payments-api", catalogPlan: { actions: [{ target_resource_id: "payments-api", safety_binding: { credential: { reference: "vault://tenant-a/prod/remediator" }, blast_radius: { scope: "single-service", verified: true, unknown_dependencies: false }, preflight: { status: "PLANNED" } } }] } }}
+      onNavigateTab={vi.fn()}
+    />);
+
+    expect(screen.getByRole("heading", { name: "Evidence-to-recovery controls" })).toBeVisible();
+    expect(screen.getByText("The new revision exhausted its pool")).toBeVisible();
+    expect(screen.getByText("Restart the unhealthy revision")).toBeInTheDocument();
+    expect(screen.getByText("Scoped reference present")).toBeInTheDocument();
+    expect(screen.queryByText("vault://tenant-a/prod/remediator")).not.toBeInTheDocument();
+    expect(screen.getAllByText("RECOVERED").length).toBeGreaterThan(0);
+    expect(screen.getByText("NOT REQUIRED")).toBeInTheDocument();
+    expect(screen.getByText("Bound connection pool growth")).toBeInTheDocument();
+    expect(screen.getByText("Human review required · not executable")).toBeInTheDocument();
+    expect(screen.getByText("Pool pressure rising")).toBeInTheDocument();
+    expect(screen.getByText("SHADOW · execution not authorized")).toBeInTheDocument();
+  });
 });

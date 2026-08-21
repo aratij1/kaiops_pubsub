@@ -54,6 +54,11 @@ async def test_investigation_queries_missing_sources_and_returns_inconclusive() 
     assert len(client.calls) == 2
     assert all(name in ReadOnlyDiscoveryClient.ALLOWED_TOOLS for name, _ in client.calls)
     assert report["next_evidence"]
+    assert report["outcome"] == "INSUFFICIENT_EVIDENCE"
+    assert report["rca_result"]["root_cause"] is None
+    assert report["investigation_plan"]["questions_to_answer"]
+    assert report["investigation_plan"]["recommended_tool_calls"]
+    assert report["correlation_id"]
 
 
 @pytest.mark.asyncio
@@ -84,6 +89,9 @@ async def test_keyword_overlap_alone_cannot_confirm_a_hypothesis() -> None:
     collected_ids = {row["evidence_id"] for row in report["evidence"]}
     assert {"CODE-POOL", "LOG-POOL"} <= collected_ids, (client.calls, report["steps"])
     assert tested["status"] != "confirmed"
+    assert report["rca_result"]["outcome"] == "INSUFFICIENT_EVIDENCE"
+    assert report["rca_result"]["root_cause"] is None
+    assert len(report["typed_hypotheses"]) >= 3
 
 
 @pytest.mark.asyncio
@@ -108,5 +116,6 @@ async def test_investigation_emits_durable_events_in_order() -> None:
 
     assert [event for event, _ in events] == ["started", "step", "completed"]
     assert events[0][1]["investigation_id"] == report["investigation_id"]
+    assert events[0][1]["investigation_plan"]["schema_version"] == "kaims.investigation-plan.v1"
     assert events[1][1]["sequence_no"] == 1
     assert events[-1][1]["status"] == "budget_exhausted"
