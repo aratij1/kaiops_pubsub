@@ -1778,6 +1778,168 @@ async def get_monitoring_integrations(
     )
 
 
+@app.get("/cloud-ops/connections")
+async def list_cloud_connections(
+    request: Request,
+    project_id: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params = {"tenant_id": tenant_id}
+    if project_id:
+        params["project_id"] = project_id
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/connections?{urlencode(params)}",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/cloud-ops/connections")
+async def create_cloud_connection(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path="/connections",
+        target_base=settings.cloud_operations_url,
+        payload={**payload, "tenant_id": auth.tenant_id},
+        trace_id=trace_id_from_header(x_trace_id),
+        timeout_seconds=15.0,
+    )
+
+
+@app.get("/cloud-ops/capabilities")
+async def list_cloud_capabilities(
+    request: Request,
+    provider: str = "simulator",
+    x_trace_id: str | None = Header(default=None),
+    _: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/capabilities?{urlencode({'provider': provider})}",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/cloud-ops/connections/{connection_id}/validate")
+async def validate_cloud_connection(
+    connection_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    scoped_payload = {**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"}
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/connections/{quote(connection_id, safe='')}/validate",
+        target_base=settings.cloud_operations_url,
+        payload=scoped_payload,
+        trace_id=trace_id_from_header(x_trace_id),
+        timeout_seconds=15.0,
+    )
+
+
+@app.post("/cloud-ops/connections/{connection_id}/discover")
+async def discover_cloud_resources(
+    connection_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    scoped_payload = {**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"}
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/connections/{quote(connection_id, safe='')}/discover",
+        target_base=settings.cloud_operations_url,
+        payload=scoped_payload,
+        trace_id=trace_id_from_header(x_trace_id),
+        timeout_seconds=30.0,
+    )
+
+
+@app.get("/cloud-ops/resources")
+async def list_cloud_resources(
+    request: Request,
+    project_id: str | None = None,
+    service_id: str | None = None,
+    environment: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params = {"tenant_id": tenant_id}
+    if project_id:
+        params["project_id"] = project_id
+    if service_id:
+        params["service_id"] = service_id
+    if environment:
+        params["environment"] = environment
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/resources?{urlencode(params)}",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/cloud-ops/services/{service_id}/map")
+async def map_cloud_service_resources(
+    service_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    scoped_payload = {**payload, "tenant_id": auth.tenant_id, "owner": payload.get("owner") or auth.username or "admin"}
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/services/{quote(service_id, safe='')}/map",
+        target_base=settings.cloud_operations_url,
+        payload=scoped_payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/cloud-ops/services/{service_id}/360")
+async def cloud_service_360(
+    service_id: str,
+    request: Request,
+    project_id: str,
+    environment: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params = {"tenant_id": tenant_id, "project_id": project_id}
+    if environment:
+        params["environment"] = environment
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/services/{quote(service_id, safe='')}/360?{urlencode(params)}",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.post("/monitoring/integrations")
 async def post_monitoring_integrations(
     request: Request,

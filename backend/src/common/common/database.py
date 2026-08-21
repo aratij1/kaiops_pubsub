@@ -787,6 +787,189 @@ class MonitoringConnectionAuditRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
+class ProviderConnectionRecord(Base, TimestampMixin):
+    __tablename__ = "provider_connections"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "project_id", "connection_name", name="uq_provider_connections_scope_name"),
+        Index("idx_provider_connections_scope_status", "tenant_id", "project_id", "provider_type", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    provider_type: Mapped[str] = mapped_column(String(64), index=True)
+    connection_name: Mapped[str] = mapped_column(String(255), index=True)
+    credential_ref: Mapped[str] = mapped_column(String(512), default="")
+    auth_method: Mapped[str] = mapped_column(String(64), default="credential_ref", index=True)
+    allowed_regions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    resource_filters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    discovery_scope: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    read_capability: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    write_capability: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    connection_owner: Mapped[str] = mapped_column(String(255), index=True)
+    last_health_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_discovery_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="draft", index=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class ConnectionHealthCheckRecord(Base, TimestampMixin):
+    __tablename__ = "connection_health_checks"
+    __table_args__ = (
+        Index("idx_connection_health_scope_created", "tenant_id", "project_id", "connection_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    connection_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    provider_type: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    connectivity_ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    authentication_ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    requested_permissions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    granted_permissions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    missing_permissions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class DiscoveryRunRecord(Base, TimestampMixin):
+    __tablename__ = "discovery_runs"
+    __table_args__ = (
+        Index("idx_discovery_runs_scope_started", "tenant_id", "project_id", "provider_type", "started_at"),
+        Index("idx_discovery_runs_connection_started", "connection_id", "started_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    connection_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    provider_type: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="started")
+    requested_by: Mapped[str] = mapped_column(String(255), index=True)
+    discovery_scope: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    resource_count: Mapped[int] = mapped_column(Integer, default=0)
+    relationship_count: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class DiscoveredResourceRecord(Base, TimestampMixin):
+    __tablename__ = "discovered_resources"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "project_id", "provider_resource_id", name="uq_discovered_resources_provider_id"),
+        Index("idx_discovered_resources_scope_type", "tenant_id", "project_id", "provider", "resource_type"),
+        Index("idx_discovered_resources_service_env", "tenant_id", "service_id", "environment"),
+        Index("idx_discovered_resources_status", "tenant_id", "project_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    service_id: Mapped[str] = mapped_column(String(128), index=True)
+    environment: Mapped[str] = mapped_column(String(64), index=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    provider_account_id: Mapped[str] = mapped_column(String(255), index=True)
+    region: Mapped[str] = mapped_column(String(128), index=True)
+    provider_resource_id: Mapped[str] = mapped_column(String(768))
+    resource_type: Mapped[str] = mapped_column(String(128), index=True)
+    display_name: Mapped[str] = mapped_column(String(255), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    tags: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    owner: Mapped[str | None] = mapped_column(String(255), index=True)
+    configuration: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    health: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    cost: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class ResourceRelationshipRecord(Base, TimestampMixin):
+    __tablename__ = "resource_relationships"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "project_id",
+            "source_resource_id",
+            "target_resource_id",
+            "relationship_type",
+            name="uq_resource_relationship_edge",
+        ),
+        Index("idx_resource_relationships_scope_type", "tenant_id", "project_id", "relationship_type"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    source_resource_id: Mapped[str] = mapped_column(String(128), index=True)
+    target_resource_id: Mapped[str] = mapped_column(String(128), index=True)
+    relationship_type: Mapped[str] = mapped_column(String(128), index=True)
+    source: Mapped[str] = mapped_column(String(128), index=True)
+    confidence: Mapped[float] = mapped_column(Numeric(5, 4), default=0.0)
+    owner_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class ServiceResourceMappingRecord(Base, TimestampMixin):
+    __tablename__ = "service_resource_mappings"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "project_id", "service_id", "environment", "resource_id", name="uq_service_resource_mapping"),
+        Index("idx_service_resource_mappings_service", "tenant_id", "project_id", "service_id", "environment"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    service_id: Mapped[str] = mapped_column(String(128), index=True)
+    environment: Mapped[str] = mapped_column(String(64), index=True)
+    resource_id: Mapped[str] = mapped_column(String(128), index=True)
+    owner: Mapped[str] = mapped_column(String(255), index=True)
+    mapping_source: Mapped[str] = mapped_column(String(64), default="operator", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class ServiceReadinessScoreRecord(Base, TimestampMixin):
+    __tablename__ = "service_readiness_scores"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "project_id", "service_id", "environment", name="uq_service_readiness_scope"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    service_id: Mapped[str] = mapped_column(String(128), index=True)
+    environment: Mapped[str] = mapped_column(String(64), index=True)
+    readiness_state: Mapped[str] = mapped_column(String(32), default="DRAFT", index=True)
+    overall_score: Mapped[float] = mapped_column(Numeric(5, 4), default=0.0)
+    scores: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class CloudAuditEventRecord(Base):
+    __tablename__ = "cloud_audit_events"
+    __table_args__ = (
+        Index("idx_cloud_audit_scope_created", "tenant_id", "project_id", "created_at"),
+        Index("idx_cloud_audit_resource_action", "resource_type", "resource_id", "action"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    actor: Mapped[str] = mapped_column(String(255), index=True)
+    action: Mapped[str] = mapped_column(String(128), index=True)
+    resource_type: Mapped[str] = mapped_column(String(128), index=True)
+    resource_id: Mapped[str] = mapped_column(String(255), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
 class JiraTicketLinkRecord(Base, TimestampMixin):
     """Maps an alert fingerprint to the Jira ticket currently open for it —
     the centralized dedup store: Prometheus/log/email ingestion looks this
