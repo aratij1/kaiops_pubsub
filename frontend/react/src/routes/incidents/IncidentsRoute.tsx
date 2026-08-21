@@ -13,7 +13,7 @@ const stageOrder = [
   { id: "application", cockpit: "overview", label: "Application", detail: "Original source" },
   { id: "signal", cockpit: "overview", label: "Signal", detail: "Failure observed" },
   { id: "prometheus", cockpit: "overview", label: "Prometheus", detail: "Rule fired" },
-  { id: "ingest", cockpit: "overview", label: "Alert landing", detail: "KaiOps received" },
+  { id: "ingest", cockpit: "overview", label: "Alert landing", detail: "KaiMS received" },
   { id: "normalize", cockpit: "overview", label: "Normalize", detail: "Canonical alert" },
   { id: "deduplicate", cockpit: "overview", label: "Deduplicate", detail: "Occurrence decision" },
   { id: "jira", cockpit: "overview", label: "Jira", detail: "Ticket created" },
@@ -47,8 +47,20 @@ const stageIcons = {
 } as const;
 
 function normalizedStatus(row: IncidentRow) {
+  const projection = row.projection_payload && typeof row.projection_payload === "object" ? row.projection_payload : {};
   const event = projectionEvent(row);
-  return effectiveIncidentStatus(row.status || "open", row.approval_status || event.approval_status);
+  const approval = projection.approval && typeof projection.approval === "object"
+    ? projection.approval as Record<string, unknown>
+    : {};
+  return effectiveIncidentStatus(
+    row.status || projection.status || "open",
+    row.approval_status
+      || projection.approval_status
+      || approval.status
+      || approval.decision
+      || event.approval_status
+      || event.decision,
+  );
 }
 
 function lifecycleFor(row: IncidentRow): LifecycleStage[] {
@@ -59,6 +71,7 @@ function lifecycleFor(row: IncidentRow): LifecycleStage[] {
   const decision = String(row.approval_status || event.approval_status || "").toLowerCase();
   const jiraReady = Boolean(row.ticket_id || row.jira_key);
   const contextState = contextPresentation(row);
+  const route = resolutionPath(row);
   const contextReady = !["Context pending", "Historical context unavailable"].includes(contextState.label);
   const projection = row.projection_payload && typeof row.projection_payload === "object" ? row.projection_payload : {};
   const latestEvent = String(row.latest_event_type || projection.event_type || "").toLowerCase();
@@ -106,9 +119,9 @@ function lifecycleFor(row: IncidentRow): LifecycleStage[] {
     });
   }
   if (row.recommendation_id || event.recommendation_id || latestEvent.includes("recommendation") || understood) {
-    stages.push({ ...stage("understand"), state: understood ? "complete" : "current", caption: understood ? "RCA generated" : "Generating RCA" });
+    stages.push({ ...stage("understand"), state: route.analysisReused ? "reused" : understood ? "complete" : "current", caption: route.analysisReused ? "Qualified RCA reused" : understood ? "RCA generated" : "Generating RCA" });
   }
-  if (approvalStarted) {
+  if (approvalStarted && !route.skipped.has("approval")) {
     stages.push({ ...stage("approval"), state: approvalComplete ? "complete" : "current", caption: approvalComplete ? "Decision recorded" : "Awaiting decision" });
   }
   const hasRemediation = Boolean(projection.remediation_action || projection.remediation_status || event.remediation_action || latestEvent.includes("remediation"));
@@ -128,13 +141,49 @@ function lifecycleFor(row: IncidentRow): LifecycleStage[] {
       stages.push({ ...stage("resolve"), state: "failed", caption: "Remediation failed or was blocked" });
     }
   } else if (validated) {
-    stages.push({ ...stage("resolve"), state: "complete", caption: "Remediation completed" });
-    stages.push({ ...stage("validate"), state: "complete", caption: "Verified and closed" });
+    if (route.id === "diagnostic") {
+      stages.push({ ...stage("resolve"), state: "reused", caption: "No corrective action required" });
+      stages.push({ ...stage("validate"), state: "complete", caption: "Observation recorded and closed" });
+    } else {
+      stages.push({ ...stage("resolve"), state: "complete", caption: "Remediation completed" });
+      stages.push({ ...stage("validate"), state: "complete", caption: "Verified and closed" });
+    }
   } else {
     if (hasRemediation) stages.push({ ...stage("resolve"), state: "complete", caption: "Remediation recorded" });
     if (hasValidation) stages.push({ ...stage("validate"), state: "current", caption: "Verifying recovery" });
   }
   return stages;
+}
+
+function resolutionPath(row: IncidentRow) {
+  const projection = row.projection_payload && typeof row.projection_payload === "object" ? row.projection_payload : {};
+  const event = projectionEvent(row);
+  const sourcePayload = event.source_payload && typeof event.source_payload === "object" ? event.source_payload as Record<string, any> : {};
+  const recommendation = [event.recommendation, projection.recommendation, sourcePayload.recommendation]
+    .find((candidate) => candidate && typeof candidate === "object") as Record<string, any> | undefined;
+  const metadata = recommendation?.metadata && typeof recommendation.metadata === "object" ? recommendation.metadata : {};
+  const persistedCandidate = row.orchestration_path || projection.orchestration_path || metadata.orchestration_path;
+  const persisted = persistedCandidate && typeof persistedCandidate === "object" ? persistedCandidate as Record<string, any> : {};
+  const lifecycleCandidate = row.resolution_lifecycle || projection.resolution_lifecycle || event.resolution_lifecycle;
+  const lifecycle = lifecycleCandidate && typeof lifecycleCandidate === "object" ? lifecycleCandidate as Record<string, any> : {};
+  const controlCandidate = lifecycle.control || metadata.resolution_control;
+  const control = controlCandidate && typeof controlCandidate === "object" ? controlCandidate as Record<string, any> : {};
+  const context = [projection.context_metadata, projection.context, event.context_metadata, event.context, sourcePayload.context]
+    .find((candidate) => candidate && typeof candidate === "object") as Record<string, any> | undefined;
+  const contextMetadata = context?.metadata && typeof context.metadata === "object" ? context.metadata : context || {};
+  const analysisReused = persisted.analysis_reused === true || metadata.analysis_reused === true;
+  const contextReused = persisted.context_reused === true || contextMetadata.context_reused === true;
+  const disposition = String(persisted.disposition || control.disposition || "").toLowerCase();
+  const diagnosticMode = String(row.execution_mode || event.execution_mode || "").toLowerCase().includes("diagnostic");
+  const id = String(persisted.id || (diagnosticMode || disposition === "watch_only" || disposition === "investigate" ? "diagnostic" : analysisReused ? "verified_fast_path" : row.requires_approval === false ? "autonomous" : "guided"));
+  const fallbackLabel = id === "diagnostic" ? "Diagnostic path" : analysisReused ? "Verified reuse fast path" : contextReused ? "Context reuse path" : "Fresh analysis path";
+  return {
+    id,
+    label: String(persisted.label || fallbackLabel),
+    analysisReused,
+    contextReused,
+    skipped: new Set(Array.isArray(persisted.skipped_stages) ? persisted.skipped_stages.map(String) : []),
+  };
 }
 
 function projectionEvent(row: IncidentRow) {
@@ -235,7 +284,8 @@ function incidentTitle(row: IncidentRow) {
 }
 
 function incidentStatusLabel(row: IncidentRow) {
-  return normalizedStatus(row) === "failed" ? "Action required" : String(row.status || "open").replaceAll("_", " ");
+  const status = normalizedStatus(row);
+  return status === "failed" ? "Action required" : status.replaceAll("_", " ");
 }
 
 function incidentTime(row: IncidentRow) {
@@ -278,14 +328,31 @@ function groupIncidentsByJira(rows: IncidentRow[]): GroupedIncidentRow[] {
 export default function IncidentsRoute() {
   const incidents = useRouteRuntimeSlice("incidents");
   const alerts = useRouteRuntimeSlice("alerts");
-  const [searchParams] = useSearchParams();
+  const session = useRouteRuntimeSlice("session");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const focusedIncidentId = String(searchParams.get("incident_id") || "").trim();
   const [recordType, setRecordType] = useState(searchParams.get("type") === "alerts" ? "alerts" : "incidents");
   const [presentation, setPresentation] = useState<Presentation>(() => {
     const saved = window.localStorage.getItem("kaiops.incident-presentation");
+    if (focusedIncidentId) return "details";
     return saved === "flow" || saved === "details" ? saved : "summary";
   });
   const [page, setPage] = useState(1);
   const [inspector, setInspector] = useState<{ incidentId: string; stage: string } | null>(null);
+  const [closure, setClosure] = useState({ incidentId: "", comment: "", loading: false, message: "", error: "" });
+  const closeIncident = async (row: IncidentRow) => {
+    const incidentId = String(row.incident_id || row.id || "").trim();
+    const comment = closure.comment.trim();
+    if (comment.length < 10) { setClosure((current) => ({ ...current, error: "Enter at least 10 characters explaining why this incident can be closed." })); return; }
+    setClosure((current) => ({ ...current, loading: true, error: "", message: "" }));
+    try {
+      const response = await fetch(`/api-gateway/incidents/${encodeURIComponent(incidentId)}/manual-close`, { method: "POST", headers: { "Content-Type": "application/json", ...(session.accessToken ? { Authorization: `Bearer ${session.accessToken}` } : {}) }, body: JSON.stringify({ comment, closed_by: session.username || "operator" }) });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(String(payload?.detail?.message || payload?.detail || `Closure failed (${response.status}).`));
+      setClosure({ incidentId, comment: "", loading: false, error: "", message: payload?.jira?.transitioned ? "Incident closed and Jira updated." : "Incident closed; no linked Jira ticket required an update." });
+      incidents.refresh();
+    } catch (error) { setClosure((current) => ({ ...current, loading: false, error: String((error as Error).message || error) })); }
+  };
   const groupedIncidents = useMemo(() => {
     const alertsById = new Map(alerts.rows.map((alert) => [String(alert.id || (alert as typeof alert & { alert_id?: string }).alert_id || ""), alert]));
     return groupIncidentsByJira(incidents.rows.map((row) => ({
@@ -294,10 +361,24 @@ export default function IncidentsRoute() {
     })));
   }, [incidents.rows, alerts.rows]);
   const pages = Math.max(1, Math.ceil(groupedIncidents.length / PAGE_SIZE));
+  useEffect(() => {
+    if (!focusedIncidentId) return;
+    const focusedIndex = groupedIncidents.findIndex((row) => String(row.incident_id || row.id || "") === focusedIncidentId);
+    setRecordType("incidents");
+    setPresentation("details");
+    if (focusedIndex >= 0) setPage(Math.floor(focusedIndex / PAGE_SIZE) + 1);
+  }, [focusedIncidentId, groupedIncidents]);
   useEffect(() => setPage((current) => Math.min(current, pages)), [pages]);
   useEffect(() => window.localStorage.setItem("kaiops.incident-presentation", presentation), [presentation]);
   useEffect(() => setPage(1), [incidents.filters.risk_tier, incidents.filters.execution_mode, incidents.filters.status, incidents.filters.service]);
-  const rows = useMemo(() => groupedIncidents.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE), [groupedIncidents, page]);
+  const rows = useMemo(() => {
+    if (focusedIncidentId) return groupedIncidents.filter((row) => String(row.incident_id || row.id || "") === focusedIncidentId);
+    return groupedIncidents.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  }, [focusedIncidentId, groupedIncidents, page]);
+  const changePresentation = (next: Presentation) => {
+    if (next === "summary" && focusedIncidentId) setSearchParams({}, { replace: true });
+    setPresentation(next);
+  };
   const incidentAlertIds = useMemo(() => new Set(incidents.rows.map((row) => String(row.alert_id || "")).filter(Boolean)), [incidents.rows]);
   const visibleAlerts = useMemo(() => alerts.rows.filter((alert) => {
     if (recordType === "alerts") return true;
@@ -319,9 +400,9 @@ export default function IncidentsRoute() {
     </div>
     <div className="incident-presentation" role="radiogroup" aria-label={`${showAlerts ? "Alert" : "Incident"} workspace view`}>
       <span>View</span>
-      <button type="button" role="radio" aria-checked={presentation === "summary"} className={presentation === "summary" ? "active" : ""} onClick={() => setPresentation("summary")}><List size={15} /><span><strong>Unified Inbox</strong><small>Prioritized operational queue</small></span></button>
-      <button type="button" role="radio" aria-checked={presentation === "details"} className={presentation === "details" ? "active" : ""} onClick={() => setPresentation("details")}><Rows3 size={15} /><span><strong>Split Workspace</strong><small>{showAlerts ? "Alert and evidence" : "Incident and evidence"}</small></span></button>
-      <button type="button" role="radio" aria-checked={presentation === "flow"} className={presentation === "flow" ? "active" : ""} onClick={() => setPresentation("flow")}><Workflow size={15} /><span><strong>Correlation Timeline</strong><small>{showAlerts ? "Signal processing path" : "Executed lifecycle"}</small></span></button>
+      <button type="button" role="radio" aria-checked={presentation === "summary"} className={presentation === "summary" ? "active" : ""} onClick={() => changePresentation("summary")}><List size={15} /><span><strong>{focusedIncidentId ? "Back to inbox" : "Unified Inbox"}</strong><small>Prioritized operational queue</small></span></button>
+      <button type="button" role="radio" aria-checked={presentation === "details"} className={presentation === "details" ? "active" : ""} onClick={() => changePresentation("details")}><Rows3 size={15} /><span><strong>Split Workspace</strong><small>{showAlerts ? "Alert and evidence" : "Incident and evidence"}</small></span></button>
+      <button type="button" role="radio" aria-checked={presentation === "flow"} className={presentation === "flow" ? "active" : ""} onClick={() => changePresentation("flow")}><Workflow size={15} /><span><strong>Correlation Timeline</strong><small>{showAlerts ? "Signal processing path" : "Executed lifecycle"}</small></span></button>
     </div>
     {incidents.error ? <p className="error">{incidents.error}</p> : null}
     <div className={`incident-summary-list view-${presentation}`} aria-busy={incidents.loading || alerts.loading}>
@@ -332,7 +413,7 @@ export default function IncidentsRoute() {
         const noise = ["noise", "suppressed", "ignored", "non_actionable"].includes(disposition) || noiseMetadata.classified === true;
         const duplicate = !noise && (disposition === "duplicate" || Number(alert.deduplicated_count || 1) > 1);
         const linkedIncident = String((alert as typeof alert & { incident_id?: string | number }).incident_id || "");
-        return <tr key={String(alert.id || alert.file || index)}><td><button type="button" className="incident-table-title" onClick={() => alerts.open(alert, "overview")}>{alert.name || alert.alert_name || "Unnamed alert"}</button><code>{String(alert.id || alert.file || "No alert ID")}</code></td><td><strong>{alert.service || "Unknown service"}</strong><small>{alert.origin_system || alert.source || alert.source_channel || "Unknown source"}</small></td><td>{alert.severity || "Not set"}</td><td><span className={`alert-classification ${noise ? "is-noise" : duplicate ? "is-duplicate" : "is-unique"}`}>{noise ? "Noise" : duplicate ? "Duplicate" : "Unique"}</span></td><td>{linkedIncident || alert.ticket_id || alert.jira_key || (noise ? "No incident" : "Processing")}</td><td>{formatIstTimestamp(alert.received_at || alert.created_at || alert.first_seen)}</td><td><button type="button" className="button-secondary" onClick={() => { setPresentation("details"); }}>View details</button></td></tr>;
+        return <tr key={String(alert.id || alert.file || index)}><td><button type="button" className="incident-table-title" onClick={() => alerts.open(alert, "overview")}>{alert.name || alert.alert_name || "Unnamed alert"}</button><code>{String(alert.id || alert.file || "No alert ID")}</code></td><td><strong>{alert.service || "Unknown service"}</strong><small>{alert.origin_system || alert.source || alert.source_channel || "Unknown source"}</small></td><td>{alert.severity || "Not set"}</td><td><span className={`alert-classification ${noise ? "is-noise" : duplicate ? "is-duplicate" : "is-unique"}`}>{noise ? "Noise" : duplicate ? "Duplicate" : "Unique"}</span></td><td>{linkedIncident || alert.ticket_id || alert.jira_key || (noise ? "No incident" : "Processing")}</td><td>{formatIstTimestamp(alert.received_at || alert.created_at || alert.first_seen)}</td><td><button type="button" className="button-secondary" onClick={() => alerts.open(alert, "overview")}>View details</button></td></tr>;
       })}</tbody></table></div> : null}
       {showAlerts && presentation !== "summary" ? visibleAlerts.map((alert, index) => {
         const metadata = (alert as typeof alert & { metadata?: Record<string, unknown> }).metadata || {};
@@ -358,7 +439,7 @@ export default function IncidentsRoute() {
         const jiraKey = String(row.ticket_id || row.jira_key || "Pending");
         const lifecycle = lifecycleFor(row);
         const currentStage = lifecycle.find((stage) => ["current", "failed", "stopped"].includes(stage.state)) || lifecycle[lifecycle.length - 1];
-        return <tr key={incidentId || index}><td><button type="button" className="incident-table-title" onClick={() => incidents.open(row, "overview")}>{incidentTitle(row)}</button><code>{incidentId}</code>{row.duplicateIncidents.length ? <small>{row.duplicateIncidents.length} duplicate {row.duplicateIncidents.length === 1 ? "incident" : "incidents"} grouped</small> : null}</td><td><strong>{row.service || "Unknown service"}</strong><small>{row.environment || "Environment not set"}</small></td><td><span className={`pill ${normalizedStatus(row) === "failed" ? "status-warning" : `status-${normalizedStatus(row)}`}`}>{incidentStatusLabel(row)}</span></td><td>{row.jira_url ? <a href={row.jira_url} target="_blank" rel="noreferrer">{jiraKey}<ExternalLink size={12} /></a> : jiraKey}</td><td><strong>{currentStage?.label || "Not started"}</strong><small>{currentStage?.caption || "No executed stage"}</small></td><td>{formatIstTimestamp(row.updated_at || row.created_at)}</td><td><button type="button" className="button-secondary" onClick={() => { setInspector(currentStage ? { incidentId, stage: currentStage.id } : null); setPresentation("details"); }}>View details</button></td></tr>;
+        return <tr key={incidentId || index}><td><button type="button" className="incident-table-title" onClick={() => incidents.open(row, "overview")}>{incidentTitle(row)}</button><code>{incidentId}</code>{row.duplicateIncidents.length ? <small>{row.duplicateIncidents.length} duplicate {row.duplicateIncidents.length === 1 ? "incident" : "incidents"} grouped</small> : null}</td><td><strong>{row.service || "Unknown service"}</strong><small>{row.environment || "Environment not set"}</small></td><td><span className={`pill ${normalizedStatus(row) === "failed" ? "status-warning" : `status-${normalizedStatus(row)}`}`}>{incidentStatusLabel(row)}</span><small title={row.status_reason || undefined}>{row.status_reason || `Status from ${row.status_source || "lifecycle"}`}</small></td><td>{row.jira_url ? <a href={row.jira_url} target="_blank" rel="noreferrer">{jiraKey}<ExternalLink size={12} /></a> : jiraKey}</td><td><strong>{currentStage?.label || "Not started"}</strong><small>{currentStage?.caption || "No executed stage"}</small></td><td>{formatIstTimestamp(row.updated_at || row.created_at)}</td><td><button type="button" className="button-secondary" onClick={() => incidents.open(row, currentStage?.cockpit || "overview")}>View details</button></td></tr>;
       })}</tbody></table></div> : null}
       {showIncidents && presentation !== "summary" ? rows.map((row, index) => {
         const incidentId = String(row.incident_id || row.id || "-");
@@ -391,7 +472,7 @@ export default function IncidentsRoute() {
             <div className="incident-summary-meta"><span>{row.service || "Unknown service"}</span><span>{row.environment || "Environment not set"}</span><code>{incidentId}</code>{row.jira_url ? <a href={row.jira_url} target="_blank" rel="noreferrer">{jiraKey}<ExternalLink size={12} /></a> : <strong>{jiraKey}</strong>}</div>
           </div>
           {presentation === "flow" ? <div className="incident-flow-wrap">
-            <div className="incident-flow-caption"><span>Source-to-resolution trace</span><strong>{lifecycle.length} evidenced stages</strong></div>
+            <div className="incident-flow-caption"><span>Source-to-resolution trace</span><strong>{resolutionPath(row).label} · {lifecycle.length} evidenced stages</strong></div>
             <div className="incident-lifecycle" style={{ gridTemplateColumns: `repeat(${lifecycle.length}, minmax(112px, 1fr))` }} aria-label={`Lifecycle for ${incidentTitle(row)}`}>
             {lifecycle.map((stage, stageIndex) => {
               const selectable = !["pending", "stopped"].includes(stage.state);
@@ -407,7 +488,7 @@ export default function IncidentsRoute() {
             <nav className="incident-detail-stage-nav" aria-label={`Detail stages for ${incidentTitle(row)}`}>
               {lifecycle.filter((stage) => !["pending", "stopped"].includes(stage.state)).map((stage) => <button type="button" key={stage.id} className={selectedStage === stage.id ? "active" : ""} onClick={() => setInspector({ incidentId, stage: stage.id })}><span>{stage.label}</span><small>{stage.caption}</small></button>)}
             </nav>
-            {selectedStage ? <section className="incident-stage-inspector"><header><div><small>Stage details</small><h3>{stageOrder.find((stage) => stage.id === selectedStage)?.label}</h3></div>{selectedStage === "jira" && row.jira_url ? <a className="button-secondary" href={row.jira_url} target="_blank" rel="noreferrer">Open in Jira <ExternalLink size={14} /></a> : <button type="button" className="button-secondary" onClick={() => incidents.open(row, stageOrder.find((stage) => stage.id === selectedStage)?.cockpit || "overview")}>Open workspace</button>}</header><dl>{(details[selectedStage] || []).map(([label, detail]) => <div key={label}><dt>{label}</dt><dd>{detail}</dd></div>)}</dl></section> : <p className="empty-state">No completed stage details are available.</p>}
+            {selectedStage ? <section className="incident-stage-inspector"><header><div><small>Stage details</small><h3>{stageOrder.find((stage) => stage.id === selectedStage)?.label}</h3></div>{selectedStage === "jira" && row.jira_url ? <a className="button-secondary" href={row.jira_url} target="_blank" rel="noreferrer">Open in Jira <ExternalLink size={14} /></a> : <button type="button" className="button-secondary" onClick={() => setPresentation("flow")}>Open correlation workspace</button>}</header><dl>{(details[selectedStage] || []).map(([label, detail]) => <div key={label}><dt>{label}</dt><dd>{detail}</dd></div>)}</dl></section> : <p className="empty-state">No completed stage details are available.</p>}
             <section className="incident-stage-inspector alert-source-inspector">
               <header><div><small>Original alert</small><h3>Source and complete alert</h3></div></header>
               <dl>
@@ -421,6 +502,7 @@ export default function IncidentsRoute() {
               </dl>
               <details className="full-alert-payload"><summary>View complete alert payload</summary><pre>{JSON.stringify(fullAlertPayload(row), null, 2)}</pre></details>
             </section>
+            {!['closed','resolved'].includes(normalizedStatus(row)) ? <section className="incident-stage-inspector manual-closure-panel"><header><div><small>Operator command</small><h3>Close incident with audit comment</h3></div></header><label>Closure comment<textarea rows={3} value={closure.incidentId === incidentId ? closure.comment : ""} onChange={(event) => setClosure({ incidentId, comment: event.target.value, loading: false, message: "", error: "" })} placeholder="Explain the evidence, decision, and any follow-up action." /></label><button type="button" className="button-danger" disabled={closure.loading || closure.incidentId !== incidentId || closure.comment.trim().length < 10} onClick={() => void closeIncident(row)}>{closure.loading && closure.incidentId === incidentId ? "Closing…" : "Close incident and update Jira"}</button>{closure.incidentId === incidentId && closure.error ? <p className="error">{closure.error}</p> : null}{closure.incidentId === incidentId && closure.message ? <p className="status-message">{closure.message}</p> : null}</section> : null}
             {row.duplicateIncidents.length ? <details className="duplicate-occurrences"><summary><span><small>Grouped by Jira</small><strong>{row.duplicateIncidents.length + 1} total occurrences</strong></span><span>Duplicates are merged into {jiraKey}; view history</span></summary><div className="duplicate-occurrence-summary"><span><small>First observed</small><strong>{formatIstTimestamp([...row.duplicateIncidents, row].sort((a, b) => incidentTime(a) - incidentTime(b))[0]?.created_at)}</strong></span><span><small>Latest observed</small><strong>{formatIstTimestamp([...row.duplicateIncidents, row].sort((a, b) => incidentTime(b) - incidentTime(a))[0]?.updated_at)}</strong></span><span><small>Service</small><strong>{row.service || "Unknown service"}</strong></span></div><div className="duplicate-occurrence-list">{row.duplicateIncidents.map((duplicate) => { const duplicateId = String(duplicate.incident_id || duplicate.id || "Not recorded"); return <div key={duplicateId}><code>{duplicateId}</code><span>{formatIstTimestamp(duplicate.updated_at || duplicate.created_at)}</span><span>{incidentStatusLabel(duplicate)}</span></div>; })}</div></details> : null}
           </div> : null}
         </article>;
@@ -428,6 +510,6 @@ export default function IncidentsRoute() {
       {showAlerts && !alerts.rows.length && !alerts.loading && !showIncidents ? <p className="empty-state">No alerts match this view.</p> : null}
       {showIncidents && !rows.length && !incidents.loading && !showAlerts ? <p className="empty-state">No incidents match this view.</p> : null}
     </div>
-    {showIncidents ? <footer className="table-pagination"><span>Showing {rows.length ? ((page - 1) * PAGE_SIZE) + 1 : 0}-{Math.min(page * PAGE_SIZE, groupedIncidents.length)} of {groupedIncidents.length}</span><div><button className="button-secondary" disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>Previous</button><span>{page} / {pages}</span><button className="button-secondary" disabled={page >= pages} onClick={() => setPage((value) => value + 1)}>Next</button></div></footer> : null}
+    {showIncidents && !focusedIncidentId ? <footer className="table-pagination"><span>Showing {rows.length ? ((page - 1) * PAGE_SIZE) + 1 : 0}-{Math.min(page * PAGE_SIZE, groupedIncidents.length)} of {groupedIncidents.length}</span><div><button className="button-secondary" disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>Previous</button><span>{page} / {pages}</span><button className="button-secondary" disabled={page >= pages} onClick={() => setPage((value) => value + 1)}>Next</button></div></footer> : null}
   </section>;
 }

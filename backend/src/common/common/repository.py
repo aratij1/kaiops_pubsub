@@ -1969,9 +1969,13 @@ class IncidentRepository:
         await self.session.merge(
             ApprovalRecord(
                 id=self._require("approval.id", approval.id),
-                tenant_id=approval.tenant_id or "default",
+                tenant_id=self._require("approval.tenant_id", approval.tenant_id),
                 incident_id=self._require("approval.incident_id", approval.incident_id),
                 recommendation_id=self._require("approval.recommendation_id", approval.recommendation_id),
+                plan_id=approval.plan_id,
+                plan_fingerprint=approval.plan_fingerprint,
+                approval_expires_at=approval.approval_expires_at,
+                approver_role=approval.approver_role,
                 decision=self._require("approval.decision", approval.decision.value),
                 approver=approval.approver,
                 payload=approval.model_dump(mode="json"),
@@ -2005,23 +2009,41 @@ class IncidentRepository:
         incident_id: Any,
         recommendation_id: Any,
         *,
-        tenant_id: str = "default",
+        tenant_id: str,
+        plan_id: Any,
+        plan_fingerprint: str,
     ) -> bool:
         approval_uuid = self._parse_uuid(approval_id)
         incident_uuid = self._parse_uuid(incident_id)
         recommendation_uuid = self._parse_uuid(recommendation_id)
         if approval_uuid is None or incident_uuid is None or recommendation_uuid is None:
             return False
+        normalized_tenant = str(tenant_id or "").strip()
+        if not normalized_tenant or normalized_tenant.lower() == "default" or not plan_fingerprint:
+            return False
         result = await self.session.execute(
-            select(ApprovalRecord.id)
+            select(ApprovalRecord)
             .where(ApprovalRecord.id == approval_uuid)
-            .where(ApprovalRecord.tenant_id == (str(tenant_id or "default").strip() or "default"))
+            .where(ApprovalRecord.tenant_id == normalized_tenant)
             .where(ApprovalRecord.incident_id == incident_uuid)
             .where(ApprovalRecord.recommendation_id == recommendation_uuid)
             .where(ApprovalRecord.decision.in_([ApprovalDecision.APPROVED.value, ApprovalDecision.MODIFIED.value]))
             .limit(1)
         )
-        return result.scalar_one_or_none() is not None
+        record = result.scalar_one_or_none()
+        if record is None or not isinstance(record.payload, dict):
+            return False
+        expires_at = record.approval_expires_at
+        if expires_at is not None and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        return (
+            str(record.plan_id or record.payload.get("plan_id") or "") == str(plan_id or "")
+            and str(record.plan_fingerprint or record.payload.get("plan_fingerprint") or "") == plan_fingerprint
+            and str(record.payload.get("tenant_id") or "") == normalized_tenant
+            and str(record.payload.get("authorization_scope") or "execution") == "execution"
+            and expires_at is not None
+            and expires_at > datetime.now(timezone.utc)
+        )
 
     async def update_incident_approval_status(
         self,
@@ -2235,6 +2257,17 @@ class IncidentRepository:
         record = result.scalar_one_or_none()
         return RemediationAction.model_validate(record.payload) if record is not None else None
 
+    async def find_action_by_id(self, action_id: UUID, *, tenant_id: str) -> RemediationAction | None:
+        """Return an action only inside the authenticated tenant boundary."""
+        result = await self.session.execute(
+            select(ActionRecord).where(
+                ActionRecord.id == action_id,
+                ActionRecord.tenant_id == self._require("tenant_id", tenant_id),
+            ).limit(1)
+        )
+        record = result.scalar_one_or_none()
+        return RemediationAction.model_validate(record.payload) if record is not None else None
+
     async def save_action_audit(self, action: RemediationAction, actor: str = "remediation-engine") -> None:
         payload = action.model_dump(mode="json")
         policy_version = str(action.parameters.get("policy_version", "")).strip()
@@ -2342,7 +2375,7 @@ class IncidentRepository:
             incident_id=incident_id,
             runbook_id=row.runbook_id,
             runbook_version=row.version,
-            reviewed=bool(outcome_payload.get("reviewed") or outcome_payload.get("approved_by")),
+            reviewed=bool(outcome_payload.get("outcome_reviewed") and outcome_payload.get("outcome_reviewed_by")),
             successful=successful,
             validation=outcome_payload,
         ))
@@ -2705,6 +2738,73 @@ class IncidentRepository:
             except json.JSONDecodeError:
                 return None
         return None
+
+    async def record_resolution_transition(self, payload: dict[str, Any]) -> bool:
+        """Append one idempotent lifecycle transition; duplicate events are no-ops."""
+        result = await self.session.execute(
+            text(
+                "INSERT IGNORE INTO resolution_state_transitions "
+                "(transition_id,tenant_id,incident_id,recommendation_id,execution_plan_id,previous_state,new_state,"
+                "event_id,correlation_id,causation_id,idempotency_key,actor,reason_code,evidence_ids,policy_decision,payload) "
+                "VALUES (:transition_id,:tenant_id,:incident_id,:recommendation_id,:execution_plan_id,:previous_state,"
+                ":new_state,:event_id,:correlation_id,:causation_id,:idempotency_key,:actor,:reason_code,"
+                ":evidence_ids,:policy_decision,:payload)"
+            ),
+            {
+                "transition_id": str(payload.get("transition_id") or uuid4()),
+                "tenant_id": str(payload.get("tenant_id") or "default"),
+                "incident_id": self._require("incident_id", payload.get("incident_id")),
+                "recommendation_id": str(payload.get("recommendation_id") or "") or None,
+                "execution_plan_id": str(payload.get("execution_plan_id") or "") or None,
+                "previous_state": self._require("previous_state", payload.get("previous_state")),
+                "new_state": self._require("new_state", payload.get("new_state")),
+                "event_id": self._require("event_id", payload.get("event_id")),
+                "correlation_id": str(payload.get("correlation_id") or "") or None,
+                "causation_id": str(payload.get("causation_id") or "") or None,
+                "idempotency_key": self._require("idempotency_key", payload.get("idempotency_key")),
+                "actor": self._require("actor", payload.get("actor")),
+                "reason_code": self._require("reason_code", payload.get("reason_code")),
+                "evidence_ids": json.dumps(payload.get("evidence_ids") or []),
+                "policy_decision": json.dumps(payload.get("policy_decision") or {}, default=str),
+                "payload": json.dumps(payload, default=str),
+            },
+        )
+        return bool(result.rowcount)
+
+    async def get_approved_runbook_version(
+        self, runbook_id: str, version: int, *, tenant_id: str = "default"
+    ) -> dict[str, Any] | None:
+        row = (
+            await self.session.execute(
+                text(
+                    "SELECT rv.content,rv.owner,rv.risk_level,rv.success_count,rv.failure_count,"
+                    "ra.approver,ra.approver_role,ra.approved_at "
+                    "FROM runbook_versions rv JOIN runbook_approvals ra "
+                    "ON ra.runbook_id=rv.runbook_id AND ra.version=rv.version AND ra.status='approved' "
+                    "WHERE rv.tenant_id=:tenant_id AND rv.runbook_id=:runbook_id AND rv.version=:version "
+                    "AND rv.approval_status='approved' LIMIT 1"
+                ),
+                {"tenant_id": tenant_id, "runbook_id": runbook_id, "version": int(version)},
+            )
+        ).mappings().first()
+        if row is None:
+            return None
+        content = row["content"]
+        if isinstance(content, str):
+            content = json.loads(content)
+        attempts = int(row["success_count"] or 0) + int(row["failure_count"] or 0)
+        return {
+            **(content if isinstance(content, dict) else {}),
+            "runbook_id": runbook_id,
+            "version": int(version),
+            "status": "approved",
+            "owner": row["owner"],
+            "risk": row["risk_level"],
+            "success_rate": int(row["success_count"] or 0) / attempts if attempts else 0.0,
+            "approved_by": row["approver"],
+            "approver_role": row["approver_role"],
+            "approved_at": row["approved_at"].isoformat() if row["approved_at"] else None,
+        }
 
     async def save_application(self, application: ApplicationRegistration) -> None:
         await self.session.merge(
@@ -3945,6 +4045,7 @@ class IncidentRepository:
         ticket_by_incident: dict[UUID, str] = {}
         canonical_status_by_incident: dict[UUID, str] = {}
         canonical_updated_at_by_incident: dict[UUID, datetime] = {}
+        canonical_alert_by_incident: dict[UUID, UUID] = {}
         projection_incident_ids = [row.incident_id for row in rows]
         if projection_incident_ids:
             ticket_result = await self.session.execute(
@@ -3968,6 +4069,21 @@ class IncidentRepository:
                 for incident_id, _ticket_id, _incident_status, updated_at in incident_rows
                 if updated_at is not None
             }
+            # Older projections predate the alert_id projection column, while
+            # their immutable incident events still retain the canonical alert
+            # relationship. Recover it in the read model so every incident
+            # opens the same guided cockpit without rewriting production data.
+            alert_event_result = await self.session.execute(
+                select(IncidentEventRecord.incident_id, IncidentEventRecord.alert_id)
+                .where(
+                    IncidentEventRecord.incident_id.in_(projection_incident_ids),
+                    IncidentEventRecord.alert_id.is_not(None),
+                )
+                .order_by(IncidentEventRecord.created_at.desc())
+            )
+            for incident_id, alert_id in alert_event_result.all():
+                if alert_id is not None:
+                    canonical_alert_by_incident.setdefault(incident_id, alert_id)
 
         pending_by_incident: dict[UUID, PendingWorkflowRecord] = {}
         missing_context_incidents = [
@@ -4049,10 +4165,13 @@ class IncidentRepository:
 
         response_rows: list[dict[str, Any]] = []
         for row in rows:
+            canonical_alert_id = row.alert_id or canonical_alert_by_incident.get(row.incident_id)
             pending = pending_by_incident.get(row.incident_id)
             merged_recommendation_id = row.recommendation_id or (pending.recommendation_id if pending is not None else None)
             merged_flow_id = row.flow_id or (pending.flow_id if pending is not None else None)
             projection_payload = dict(row.projection_payload or {})
+            if canonical_alert_id is not None:
+                projection_payload.setdefault("alert_id", str(canonical_alert_id))
             evaluation = evaluation_by_incident.get(row.incident_id)
             if evaluation is not None:
                 evaluation_payload = dict(evaluation.report_payload or {})
@@ -4180,7 +4299,7 @@ class IncidentRepository:
             response_rows.append(
                 {
                     "incident_id": str(row.incident_id),
-                    "alert_id": str(row.alert_id) if row.alert_id else None,
+                    "alert_id": str(canonical_alert_id) if canonical_alert_id else None,
                     "trace_id": row.trace_id,
                     "recommendation_id": str(merged_recommendation_id) if merged_recommendation_id else None,
                     "flow_id": merged_flow_id,

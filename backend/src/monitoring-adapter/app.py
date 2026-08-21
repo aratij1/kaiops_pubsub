@@ -83,6 +83,7 @@ from monitoring_adapter.state import (
     slugify,
     upsert_alert_severity_override,
 )
+from monitoring_adapter.workflow_routes import build_workflow_router
 from monitoring_adapter.onboarding_pipelines import (
     ExistingRulePipelineRequest,
     NewRuleOnboardingRequest,
@@ -518,10 +519,12 @@ def _persist_alert_to_landing_pad(
         target_dir = _date_partition_dir(base_dir, now)
         target_dir.mkdir(parents=True, exist_ok=True)
         # Preserve the title in the payload while bounding the filesystem path.
-        alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))[:50] or "alert"
+        # Keep the complete path below legacy Windows MAX_PATH even when the
+        # landing-pad root itself is deeply nested (CI workspaces commonly are).
+        alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))[:32] or "alert"
         labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
         fingerprint = str(labels.get("alert_fingerprint") or "no-fingerprint").strip() or "no-fingerprint"
-        safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:24]
+        safe_fingerprint = re.sub(r"[^a-zA-Z0-9_-]", "-", fingerprint)[:16]
         file_name = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}_{alert_name}_{safe_fingerprint}.json"
         out_path = target_dir / file_name
         payload = {
@@ -1409,6 +1412,7 @@ def _build_local_metadata_envelope(
     severity = str(incident.get("severity") or alert.get("severity") or "warning").strip().lower()
     correlation_id = str(alert.get("correlation_id") or "").strip() or None
     provider = str(transport_provider or decision.get("message_bus_provider") or "rabbitmq").strip().lower() or "rabbitmq"
+    tenant_id = str(incident.get("tenant_id") or alert.get("tenant_id") or "").strip()
 
     return build_event_envelope(
         event_type=event_type,
@@ -1421,7 +1425,7 @@ def _build_local_metadata_envelope(
             "parent_event_id": None,
         },
         scope={
-            "tenant_id": "default",
+            "tenant_id": tenant_id,
             "service": service,
             "environment": environment,
             "region": None,
@@ -1940,6 +1944,7 @@ def build_sample_alert(flow_id: str = "payment-latency", trace_id: str | None = 
     scenarios = merged_scenarios()
     scenario = scenarios.get(flow_id, scenarios["payment-latency"])
     return Alert(
+        tenant_id="local-demo",
         source=scenario["source"],
         name=str(scenario.get("alert_name") or scenario["name"]),
         service=scenario["service"],
@@ -3079,7 +3084,10 @@ async def run_local_payment_workflow(
         incident=incident.model_dump(mode="json"),
         alert=enriched_alert.model_dump(mode="json"),
         decision=decision.__dict__,
-        status="awaiting_approval" if (requires_human_approval and not auto_approve) else "remediating",
+        # Producing an RCA recommendation does not mean an executor has started.
+        # Execution state is advanced to remediating only by the remediation
+        # engine after a durable action has been dispatched.
+        status="awaiting_approval" if (requires_human_approval and not auto_approve) else "approved",
         payload={
             "recommendation_id": str(recommendation.id),
             "flow_id": str(getattr(decision, "flow_id", "") or ""),
@@ -6628,42 +6636,9 @@ async def delete_onboarding_rules_pipeline(workflow_id: str) -> dict[str, Any]:
     return {"workflow_id": workflow_id, "deleted": deleted_total}
 
 
-@app.post("/sample/payment-latency/workflow")
-async def sample_payment_latency_workflow(
-    fast_mode: bool = False,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await run_local_payment_workflow(trace_id=x_trace_id, run_comparison=not fast_mode, auto_approve=False)
-
-
-@app.post("/sample/{flow_id}/workflow")
-async def sample_flow_workflow(
-    flow_id: str,
-    fast_mode: bool = False,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await run_local_payment_workflow(
-        trace_id=x_trace_id,
-        flow_id=flow_id,
-        run_comparison=not fast_mode,
-        auto_approve=False,
+app.include_router(
+    build_workflow_router(
+        run_workflow=run_local_payment_workflow,
+        continue_workflow=continue_pending_workflow,
     )
-
-
-@app.post("/sample/{flow_id}/workflow/continue")
-async def continue_flow_workflow(
-    flow_id: str,
-    payload: dict[str, Any] = ALERT_BODY,
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    return await continue_pending_workflow(
-        flow_id=flow_id,
-        incident_id=str(payload.get("incident_id") or ""),
-        recommendation_id=str(payload.get("recommendation_id") or ""),
-        decision_token=str(payload.get("decision") or ""),
-        approver=str(payload.get("approver") or "").strip() or None,
-        channel=str(payload.get("channel") or "").strip() or None,
-        comment=str(payload.get("comment") or "").strip() or None,
-        modified_action=str(payload.get("modified_action") or "").strip() or None,
-        trace_id=x_trace_id,
-    )
+)

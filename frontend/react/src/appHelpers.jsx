@@ -1757,6 +1757,9 @@ function deriveExecutionCommands(workflow, traceRows) {
 
   explicit.forEach((item) => pushUnique(item, "cmd: "));
 
+  // Prefer the governed catalog contract when model analysis is diagnostic-only.
+  pushPlan(recommendationMetadata.execution_plan);
+
   const remediationParams = typeof remediationAction.parameters === "object" && remediationAction.parameters
     ? remediationAction.parameters
     : {};
@@ -1808,10 +1811,11 @@ function remediationOutcomeFromAction(action) {
   }
 
   let title = "Remediation status";
-  if (status === "succeeded") {
+  if (actionType === "diagnostic_completion" && status === "skipped") title = "Diagnostic assessment completed";
+  else if (status === "succeeded") {
     title = "Remediation executed successfully";
   } else if (automaticPolicyBlocked) {
-    title = "Automatic execution deferred for human approval";
+    title = "Human approval required";
   } else if (status === "skipped") {
     title = "Remediation was not executed";
   } else if (["failed", "dispatch_failed", "execution_failed", "validation_failed", "rollback_failed", "timed_out"].includes(status)) {
@@ -1827,8 +1831,9 @@ function remediationOutcomeFromAction(action) {
   }
 
   let detail = reason || `Remediation engine returned status ${status || "unknown"}.`;
+  if (actionType === "diagnostic_completion" && status === "skipped") detail = reason || "Diagnostic evidence was recorded and no corrective action was required.";
   if (automaticPolicyBlocked) {
-    detail = `${reason || "Automatic execution did not meet the policy threshold."} Complete dry run and human approval, then use Execute approved plan.`;
+    detail = `${reason || "Automatic execution did not meet the policy threshold."} Review and approve the plan, then confirm execution.`;
   }
   if (/no real .*executor is configured/i.test(detail) || /configure a connector executor/i.test(detail)) {
     detail = `${detail} Add a real remediation connector with executor settings and secret_ref, or edit the plan to use the approved local triage script.`;
@@ -6911,64 +6916,6 @@ function summarizeAlertRuleContext(row, workflow = {}) {
   };
 }
 
-function buildWorkflowFlowStages(workflow, timelineRows = []) {
-  const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
-  const safeRows = Array.isArray(timelineRows) ? timelineRows : [];
-  const findStage = (needle) => safeRows.find((row) => String(row?.stage || row?.agent || row?.detail || "").toLowerCase().includes(needle));
-  const hasParallelProcessing = safeRows.some((row) => {
-    const token = String(row?.agent || row?.service || row?.detail || "").toLowerCase();
-    return token.includes("alert intelligence") || token.includes("orchestrator") || token.includes("context") || token.includes("resolution");
-  });
-  const remediation = safeWorkflow?.remediation_action && typeof safeWorkflow.remediation_action === "object"
-    ? safeWorkflow.remediation_action
-    : {};
-  const remediationStatus = String(remediation.status || "").trim().toLowerCase();
-  const remediationPolicyBlocked = String(remediation.action_type || "").trim().toLowerCase() === "policy-blocked"
-    || remediation?.metadata?.policy_blocked === true;
-  const closureComplete = safeWorkflow?.closure_report?.health_restored === true;
-  return [
-    {
-      id: "landing-pad",
-      label: "Landing Pad",
-      detail: "Raw alerts are accepted, normalized, and added to the incident stream.",
-      status: findStage("landing") ? "done" : "active",
-    },
-    {
-      id: "parallel-processing",
-      label: "Parallel Processing",
-      detail: hasParallelProcessing
-        ? "Alert intelligence, orchestration, context, and resolution work the stream in parallel workers."
-        : "Backend workers fan out the alert stream through independent services for concurrent processing.",
-      status: hasParallelProcessing ? "done" : "active",
-    },
-    {
-      id: "approval",
-      label: "Approval Gate",
-      detail: String(safeWorkflow?.approval?.status || safeWorkflow?.decision?.status || "pending").trim(),
-      status: safeWorkflow?.approval?.status ? "done" : "active",
-    },
-    {
-      id: "remediation",
-      label: "Remediation Execution",
-      detail: remediationPolicyBlocked
-        ? String(remediation.error || remediation.metadata?.policy_reason || "Execution blocked by policy; operator review is required.")
-        : `${Array.isArray(remediation?.parameters?.execution_plan?.commands) ? remediation.parameters.execution_plan.commands.length : 0} commands captured for execution or review.`,
-      status: remediationPolicyBlocked ? "blocked" : remediationStatus ? "done" : "waiting",
-    },
-    {
-      id: "closure",
-      label: "Closure & Validation",
-      detail: String(closureComplete
-        ? "Service restored and closure completed."
-        : remediationPolicyBlocked
-          ? "Waiting for an approved remediation outcome before validation."
-          : "Validation starts after remediation completes.").trim(),
-      status: closureComplete ? "done" : "waiting",
-    },
-  ];
-}
-
-
 export {
   DEFAULT_ALERT,
   REAL_USE_CASE_SCOPE,
@@ -7109,5 +7056,4 @@ export {
   inferRuleSeverity,
   buildPrometheusRulePreview,
   summarizeAlertRuleContext,
-  buildWorkflowFlowStages,
 };

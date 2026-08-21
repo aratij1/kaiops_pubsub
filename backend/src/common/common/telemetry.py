@@ -27,6 +27,16 @@ EVENTS_PROCESSED = Counter(
     "Events processed by service and topic",
     ["service", "topic", "status"],
 )
+LIFECYCLE_TRANSITIONS = Counter(
+    "kaiops_resolution_lifecycle_transitions_total",
+    "Guarded resolution lifecycle transitions by actor and outcome",
+    ["from_state", "to_state", "actor", "outcome"],
+)
+LIFECYCLE_RECONCILIATION = Counter(
+    "kaiops_resolution_reconciliation_total",
+    "Persisted terminal action reconciliation decisions",
+    ["mode", "decision", "reason"],
+)
 REQUEST_LATENCY = Histogram(
     "kaiops_request_latency_seconds",
     "Application request latency by service and operation",
@@ -108,6 +118,22 @@ CONTEXT_KNOWLEDGE_REUSE_COUNT = Histogram(
     "kaiops_context_knowledge_reuse_count",
     "Observed reuse count for context knowledge cache hits",
     buckets=(1, 2, 3, 5, 10, 25, 50, 100, 250, 500, 1000),
+)
+CONTEXT_QUALITY_SCORE = Histogram(
+    "kaiops_context_quality_score",
+    "Context quality dimensions evaluated before reuse or resolution handoff",
+    ["dimension"],
+    buckets=(0.0, 0.25, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
+)
+CONTEXT_REUSE_DECISIONS = Counter(
+    "kaiops_context_reuse_decisions_total",
+    "Context reuse decisions by outcome and bounded reason",
+    ["decision", "reason"],
+)
+CONTEXT_SOURCE_RESULTS = Counter(
+    "kaiops_context_source_results_total",
+    "Context source collection or freshness outcomes",
+    ["source", "status"],
 )
 WORKFLOW_LATENCY = Histogram("kaiops_workflow_latency_seconds", "Workflow activity duration by workflow, stage, and outcome", ["workflow", "stage", "outcome"])
 WORKFLOW_FAILURES = Counter("kaiops_workflow_failures_total", "Workflow failures by workflow and stage", ["workflow", "stage"])

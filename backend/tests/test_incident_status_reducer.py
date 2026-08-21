@@ -1,0 +1,69 @@
+from datetime import datetime, timedelta, timezone
+
+from common.incident_status import reduce_incident_status
+
+
+NOW = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
+
+
+def test_new_approval_supersedes_an_older_policy_block() -> None:
+    result = reduce_incident_status(
+        projection_status="awaiting_approval",
+        projection_updated_at=NOW - timedelta(hours=1),
+        canonical_status="approved",
+        canonical_updated_at=NOW,
+        approval_status="approved",
+        approval_updated_at=NOW,
+        action_status="policy_blocked",
+        action_updated_at=NOW - timedelta(days=1),
+    )
+
+    assert result["status"] == "approved"
+    assert result["source"] == "approval"
+
+
+def test_failed_execution_supersedes_stale_approved_incident() -> None:
+    result = reduce_incident_status(
+        projection_status="approved",
+        projection_updated_at=NOW - timedelta(minutes=2),
+        canonical_status="approved",
+        canonical_updated_at=NOW - timedelta(minutes=2),
+        approval_status="approved",
+        approval_updated_at=NOW - timedelta(minutes=2),
+        action_status="execution_failed",
+        action_updated_at=NOW,
+    )
+
+    assert result["status"] == "failed"
+    assert result["source"] == "remediation_action"
+
+
+def test_successful_execution_enters_validation_until_closure() -> None:
+    result = reduce_incident_status(
+        projection_status="remediating",
+        projection_updated_at=NOW - timedelta(minutes=1),
+        canonical_status="remediating",
+        canonical_updated_at=NOW - timedelta(minutes=1),
+        approval_status="approved",
+        approval_updated_at=NOW - timedelta(minutes=5),
+        action_status="succeeded",
+        action_updated_at=NOW,
+    )
+
+    assert result["status"] == "validating"
+
+
+def test_verified_closure_is_monotonic_even_if_stale_action_arrives() -> None:
+    result = reduce_incident_status(
+        projection_status="closed",
+        projection_updated_at=NOW - timedelta(minutes=2),
+        canonical_status="closed",
+        canonical_updated_at=NOW - timedelta(minutes=2),
+        approval_status="approved",
+        approval_updated_at=NOW - timedelta(minutes=1),
+        action_status="running",
+        action_updated_at=NOW,
+    )
+
+    assert result["status"] == "closed"
+    assert result["source"] == "closure"

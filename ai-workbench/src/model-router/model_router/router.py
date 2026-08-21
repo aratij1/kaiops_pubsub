@@ -826,6 +826,7 @@ def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
         local_llama_provider = OllamaModelProvider(
             name="local-llama",
             endpoint=settings.local_llm_endpoint,
+            model=settings.local_llm_model,
             timeout_seconds=settings.llm_request_timeout_seconds,
         )
     else:

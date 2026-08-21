@@ -1,0 +1,120 @@
+/* KaiMS product experience layer. Loaded last so route workspaces share one
+   predictable visual language while legacy feature styles are extracted. */
+:root {
+  --kai-ink: #10243e;
+  --kai-muted: #60748b;
+  --kai-line: #d8e3ee;
+  --kai-soft: #f4f8fc;
+  --kai-blue: #1769e0;
+  --kai-cyan: #06a8c7;
+  --kai-green: #11966f;
+  --kai-shadow: 0 12px 34px rgba(20, 52, 82, .09);
+}
+
+.workspace-main-content { background: linear-gradient(180deg, #f5f8fc 0, #eef4f9 100%); }
+.workspace-main-content .panel { border-color: var(--kai-line); border-radius: 16px; box-shadow: var(--kai-shadow); }
+.workspace-main-content .panel-head h2,
+.workspace-main-content .panel-head h3 { letter-spacing: -.025em; }
+.workspace-main-content input,
+.workspace-main-content select,
+.workspace-main-content textarea { min-height: 40px; border-color: #cad8e6; border-radius: 9px; background: #fff; }
+.workspace-main-content textarea { min-height: auto; }
+.workspace-main-content input:focus,
+.workspace-main-content select:focus,
+.workspace-main-content textarea:focus { outline: 3px solid rgba(23, 105, 224, .13); border-color: var(--kai-blue); }
+.workspace-main-content .button-primary { min-height: 40px; border-radius: 9px; box-shadow: 0 6px 16px rgba(23, 105, 224, .2); }
+.workspace-main-content .button-secondary { min-height: 38px; border-radius: 9px; }
+.workspace-main-content .empty-state { padding: 34px; border: 1px dashed #bdccdb; border-radius: 14px; background: var(--kai-soft); color: var(--kai-muted); text-align: center; }
+.workspace-main-content .table-wrap { border: 1px solid var(--kai-line); border-radius: 12px; }
+.workspace-main-content table thead th { background: #eef4f9; color: #526a83; font-size: 11px; letter-spacing: .045em; text-transform: uppercase; }
+
+/* Guided incident command surface */
+.guided-cockpit-launcher { border: 0 !important; background: #fff; box-shadow: 0 20px 48px rgba(15, 52, 85, .14) !important; }
+.guided-cockpit-header { padding: 28px 30px 20px !important; color: #fff; background: radial-gradient(circle at 86% 12%, rgba(35, 211, 205, .28), transparent 30%), linear-gradient(122deg, #0d2946 0%, #124d70 62%, #087a7d 100%) !important; }
+.guided-cockpit-header h2 { color: #fff !important; font-size: clamp(1.45rem, 2.4vw, 2.15rem) !important; }
+.guided-cockpit-header p { color: #d5e7f3 !important; font-size: 14px; }
+.guided-cockpit-header .discovery-eyebrow { color: #80e8ea !important; }
+.guided-cockpit-summary { grid-template-columns: repeat(4, 1fr) !important; }
+.guided-cockpit-summary > span { padding: 16px 20px !important; }
+.guided-cockpit-summary small { font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
+.guided-cockpit-summary strong { color: var(--kai-ink); font-size: 15px; }
+.guided-cockpit-next { margin: 20px 24px !important; padding: 18px 20px !important; border-left-width: 4px !important; background: linear-gradient(110deg, #eef6ff, #f3fcfb) !important; }
+.guided-cockpit-mini-journey { grid-template-columns: repeat(4, 1fr) !important; gap: 10px !important; padding: 0 24px 22px !important; }
+.guided-cockpit-mini-journey button { grid-template-columns: 30px 1fr; align-items: center; justify-items: start; padding: 13px !important; border-radius: 12px !important; }
+.guided-cockpit-mini-journey button > span { grid-row: auto !important; width: 30px !important; height: 30px !important; }
+.guided-cockpit-mini-journey strong { font-size: 13px !important; }
+
+.alert-details-cockpit { overflow: visible !important; border: 0 !important; background: transparent !important; box-shadow: none !important; }
+.alert-details-cockpit > .incident-sticky-header { position: relative; top: auto; padding: 28px !important; color: #fff; border: 0 !important; border-radius: 18px; background: radial-gradient(circle at 92% 10%, rgba(42, 213, 196, .23), transparent 30%), linear-gradient(120deg, #0b2744, #155277) !important; box-shadow: 0 18px 42px rgba(10, 43, 72, .22); }
+.alert-details-cockpit > .incident-sticky-header h2,
+.alert-details-cockpit > .incident-sticky-header h3 { color: #fff !important; }
+.alert-details-cockpit > .incident-sticky-header p { max-width: 850px; color: #d5e6f3 !important; }
+.alert-details-cockpit > .incident-sticky-header .discovery-eyebrow { color: #76e7e0 !important; }
+.cockpit-stage-navigation { top: 10px !important; grid-template-columns: repeat(4, 1fr) !important; gap: 8px !important; margin: 14px 0 20px !important; padding: 9px !important; border-color: #ccdbe8 !important; border-radius: 16px !important; background: rgba(255,255,255,.94) !important; box-shadow: 0 14px 36px rgba(21, 52, 80, .14) !important; }
+.cockpit-stage-navigation .detail-tab { grid-template-columns: 34px 1fr !important; min-height: 64px; padding: 10px 12px !important; border: 1px solid transparent; border-radius: 11px !important; }
+.cockpit-stage-navigation .detail-tab > span { width: 32px !important; height: 32px !important; font-size: 11px !important; }
+.cockpit-stage-navigation .detail-tab strong { font-size: 13px !important; }
+.cockpit-stage-navigation .detail-tab small { font-size: 10px !important; }
+.cockpit-stage-navigation .detail-tab.active { color: #fff !important; border-color: #1769e0 !important; background: linear-gradient(135deg, #1769e0, #0955ba) !important; box-shadow: 0 8px 18px rgba(23,105,224,.25); }
+.cockpit-stage-navigation .detail-tab.active small { color: #dceaff !important; }
+.cockpit-stage-navigation .detail-tab.active > span { color: #fff !important; background: rgba(255,255,255,.18) !important; }
+.incident-workspace-hero { padding: 24px !important; border: 0 !important; border-radius: 16px !important; background: linear-gradient(120deg, #102d4b, #0c6970) !important; box-shadow: 0 14px 34px rgba(12, 56, 78, .2); }
+
+/* Human-readable remediation decision brief */
+.decision-brief { padding: 0 !important; overflow: hidden; }
+.decision-brief-heading { align-items: flex-start; padding: 22px 24px 18px; border-bottom: 1px solid var(--kai-line); background: linear-gradient(110deg, #f7fbff, #f2fbf9); }
+.decision-brief-heading h3 { margin: 3px 0 5px; font-size: 1.35rem; }
+.decision-readiness { display: inline-flex; align-items: center; gap: 7px; padding: 8px 11px; border-radius: 999px; font-size: 12px; font-weight: 750; }
+.decision-readiness.is-ready { color: #0b684e; background: #dcf8ed; }
+.decision-readiness.is-blocked { color: #9b3b1e; background: #fff0e7; }
+.decision-story { display: grid; grid-template-columns: 1fr 28px 1fr 28px 1fr; align-items: stretch; padding: 22px 24px; }
+.decision-story article { min-width: 0; padding: 18px; border: 1px solid var(--kai-line); border-radius: 14px; background: #fff; }
+.decision-story-icon { display: grid; width: 34px; height: 34px; place-items: center; color: #1769e0; border-radius: 10px; background: #e7f0ff; }
+.decision-story-icon.impact { color: #a75c00; background: #fff0d9; }
+.decision-story-icon.action { color: #08765c; background: #ddf8ef; }
+.decision-story small { display: block; margin-top: 14px; color: var(--kai-muted); font-size: 10px; font-weight: 750; letter-spacing: .06em; text-transform: uppercase; }
+.decision-story h4 { margin: 4px 0 8px; color: var(--kai-ink); font-size: 15px; }
+.decision-story p { margin: 0; color: #4d6278; line-height: 1.55; }
+.decision-story-arrow { align-self: center; justify-self: center; color: #98aabe; }
+.decision-controls { display: grid; grid-template-columns: minmax(260px, .85fr) 1.6fr; gap: 18px; padding: 0 24px 22px; }
+.decision-confidence { padding: 16px; border-radius: 13px; background: #102d4b; color: #fff; }
+.decision-confidence > div:first-child { display: flex; justify-content: space-between; }
+.decision-confidence strong { font-size: 18px; }
+.decision-confidence-track { height: 7px; margin: 12px 0 9px; overflow: hidden; border-radius: 10px; background: rgba(255,255,255,.16); }
+.decision-confidence-track span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2bd4c1, #78e4b0); }
+.decision-confidence small { color: #c8dbe9; }
+.decision-safety-facts { display: grid; grid-template-columns: repeat(3, 1fr); margin: 0; border: 1px solid var(--kai-line); border-radius: 13px; }
+.decision-safety-facts div { padding: 15px; border-left: 1px solid var(--kai-line); }
+.decision-safety-facts div:first-child { border-left: 0; }
+.decision-safety-facts dt { color: var(--kai-muted); font-size: 10px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; }
+.decision-safety-facts dd { margin: 6px 0 0; color: var(--kai-ink); font-weight: 700; }
+.decision-brief .incident-section-actions { margin: 0 !important; padding: 16px 24px; border-top: 1px solid var(--kai-line); background: #f8fafc; }
+.decision-brief .incident-section-actions .button-primary { display: inline-flex; align-items: center; gap: 5px; }
+
+:root[data-ui-theme="dark"] { --kai-ink: #edf6ff; --kai-muted: #a9bdd0; --kai-line: #2c4359; --kai-soft: #142538; }
+:root[data-ui-theme="dark"] .workspace-main-content { background: linear-gradient(180deg, #0b1521, #0d1b2a); }
+:root[data-ui-theme="dark"] .workspace-main-content .panel,
+:root[data-ui-theme="dark"] .decision-story article { background: #112235; }
+:root[data-ui-theme="dark"] .workspace-main-content input,
+:root[data-ui-theme="dark"] .workspace-main-content select,
+:root[data-ui-theme="dark"] .workspace-main-content textarea { color: #edf6ff; background: #0d1c2b; border-color: #34506a; }
+:root[data-ui-theme="dark"] .workspace-main-content table thead th,
+:root[data-ui-theme="dark"] .decision-brief .incident-section-actions { background: #14273a; }
+:root[data-ui-theme="dark"] .cockpit-stage-navigation { background: rgba(15,31,47,.95) !important; border-color: #34506a !important; }
+:root[data-ui-theme="dark"] .decision-brief-heading { background: linear-gradient(110deg, #13283c, #102e32); }
+:root[data-ui-theme="dark"] .decision-story p { color: #bbcad8; }
+
+@media (max-width: 900px) {
+  .decision-story { grid-template-columns: 1fr; gap: 10px; }
+  .decision-story-arrow { display: none; }
+  .decision-controls { grid-template-columns: 1fr; }
+  .cockpit-stage-navigation { grid-template-columns: repeat(2, 1fr) !important; position: static !important; }
+}
+@media (max-width: 620px) {
+  .guided-cockpit-summary { grid-template-columns: 1fr 1fr !important; }
+  .guided-cockpit-mini-journey { display: flex !important; overflow-x: auto; }
+  .guided-cockpit-mini-journey button { flex: 0 0 150px !important; }
+  .decision-safety-facts { grid-template-columns: 1fr; }
+  .decision-safety-facts div { border-left: 0; border-top: 1px solid var(--kai-line); }
+  .decision-safety-facts div:first-child { border-top: 0; }
+}

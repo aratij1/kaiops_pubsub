@@ -25,6 +25,9 @@ from common.service import create_app
 from common.telemetry import (
     CONTEXT_KNOWLEDGE_OPERATIONS,
     CONTEXT_KNOWLEDGE_REUSE_COUNT,
+    CONTEXT_QUALITY_SCORE,
+    CONTEXT_REUSE_DECISIONS,
+    CONTEXT_SOURCE_RESULTS,
     CONTEXT_STRATEGY_DURATION,
     CONTEXT_STRATEGY_REQUESTS,
     EVENTS_PROCESSED,
@@ -32,9 +35,16 @@ from common.telemetry import (
 from common.topics import CONTEXT_EVENTS, ORCHESTRATION_EVENTS
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import VectorDBConnector
+from context_agent.context_quality import (
+    SOURCE_POLICIES,
+    assess_context,
+    context_subject_fingerprint,
+    govern_context,
+)
 from context_agent.knowledge_graph import KnowledgeGraph
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 
 settings = get_settings()
 settings.service_name = "context-agent"
@@ -44,6 +54,7 @@ tasks: list[asyncio.Task] = []
 MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
     os.getenv("MESSAGE_BUS_DUAL_CONSUME_ENABLED", "false")
 ).strip().lower() in {"1", "true", "yes", "on"}
+_CONTEXT_COLLECTION_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 def _context_strategy(override: str | None = None) -> str:
@@ -54,19 +65,33 @@ def _context_strategy(override: str | None = None) -> str:
 
 
 def _context_completeness(context: Context) -> tuple[bool, list[str]]:
+    quality = assess_context(
+        context,
+        threshold=float(getattr(settings, "context_min_quality_score", 0.70) or 0.70),
+    )
+    return not bool(quality["missing_required"]), list(quality["missing_context"])
+
+
+def _record_context_quality(context: Context, decision: str, reason: str) -> None:
     metadata = context.metadata if isinstance(context.metadata, dict) else {}
-    discovery = metadata.get("discovery_report") if isinstance(metadata.get("discovery_report"), dict) else {}
-    evidence = discovery.get("evidence") if isinstance(discovery.get("evidence"), list) else []
-    available = {
-        "discovery_evidence": bool(evidence or metadata.get("discovery_evidence")),
-        "service_inventory": bool(context.cmdb or context.deployment),
-        "observability": bool(context.observability),
-        "dependencies": bool(context.dependency_services),
-        "runbook_or_changes": bool(context.runbook or context.recent_changes),
-    }
-    missing = [name for name, present in available.items() if not present]
-    explicitly_complete = metadata.get("context_complete") is True
-    return explicitly_complete or sum(available.values()) >= 3, missing
+    quality = metadata.get("context_quality") if isinstance(metadata.get("context_quality"), dict) else {}
+    for dimension, key in (
+        ("overall", "quality_score"),
+        ("coverage", "coverage_score"),
+        ("freshness", "freshness_score"),
+        ("provenance", "provenance_score"),
+        ("relevance", "relevance_score"),
+    ):
+        try:
+            CONTEXT_QUALITY_SCORE.labels(dimension).observe(float(quality.get(key, 0.0) or 0.0))
+        except (TypeError, ValueError):
+            continue
+    bounded_reason = re.sub(r"[^a-z0-9_]+", "_", str(reason or "unknown").lower()).strip("_")[:64] or "unknown"
+    CONTEXT_REUSE_DECISIONS.labels(decision, bounded_reason).inc()
+    sources = metadata.get("context_sources") if isinstance(metadata.get("context_sources"), dict) else {}
+    for source, status in sources.items():
+        status_value = str(status.get("status") if isinstance(status, dict) else status or "unknown").lower()
+        CONTEXT_SOURCE_RESULTS.labels(str(source)[:40], status_value[:40]).inc()
 
 
 def _has_code_evidence(context: Context) -> bool:
@@ -129,7 +154,7 @@ def _qualified_resolution_cache(payload: Any) -> bool:
     return _resolution_quality_score(payload) > max(0.0, min(threshold, 1.0))
 
 
-async def _collect_context_with_strategy(
+async def _collect_context_with_strategy_unlocked(
     app: FastAPI,
     alert: Alert,
     incident: Incident,
@@ -139,6 +164,9 @@ async def _collect_context_with_strategy(
     started = perf_counter()
     strategy = _context_strategy(strategy_override)
     tenant_id, service, environment, signature = _context_identity(alert)
+    subject_fingerprint = context_subject_fingerprint(alert, tenant_id)
+    quality_threshold = float(getattr(settings, "context_min_quality_score", 0.70) or 0.70)
+    max_evidence = int(getattr(settings, "context_max_evidence_per_source", 20) or 20)
     session_factory = getattr(app.state, "session_factory", None)
     database_available = bool(settings.database_enabled and session_factory is not None)
 
@@ -150,19 +178,31 @@ async def _collect_context_with_strategy(
         except Exception:
             logger.warning("supplied context is invalid; evaluating cache policy instead")
         else:
-            complete, missing = _context_completeness(provided)
-            if complete and strategy != "realtime":
+            provided_metadata = provided.metadata if isinstance(provided.metadata, dict) else {}
+            supplied_subject = str(provided_metadata.get("context_subject_fingerprint") or "")
+            supplied_scope_matches = not supplied_subject or supplied_subject == subject_fingerprint
+            if strategy != "realtime" and supplied_scope_matches:
                 provided.metadata = {
                     **(provided.metadata if isinstance(provided.metadata, dict) else {}),
                     "context_strategy": strategy,
                     "context_source": "ticket_payload",
                     "context_reused": True,
-                    "context_complete": True,
-                    "context_missing_sections": missing,
                     "realtime_collection_performed": False,
                 }
-                CONTEXT_STRATEGY_REQUESTS.labels(strategy, "complete_payload").inc()
-                return provided
+                provided = govern_context(
+                    provided,
+                    tenant_id=tenant_id,
+                    subject_fingerprint=subject_fingerprint,
+                    threshold=quality_threshold,
+                    max_evidence_per_source=max_evidence,
+                )
+                if bool(provided.metadata["context_quality"]["reusable"]):
+                    CONTEXT_STRATEGY_REQUESTS.labels(strategy, "complete_payload").inc()
+                    _record_context_quality(provided, "reuse", "validated_ticket_payload")
+                    return provided
+                _record_context_quality(provided, "refresh", "ticket_payload_below_quality")
+            elif not supplied_scope_matches:
+                CONTEXT_REUSE_DECISIONS.labels("refresh", "ticket_payload_scope_changed").inc()
 
     if strategy in {"auto", "historical"} and database_available:
         configured_ttl = int(getattr(settings, "context_knowledge_ttl_seconds", 0) or 0)
@@ -186,11 +226,6 @@ async def _collect_context_with_strategy(
                 )
                 CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "hit" if cached else "miss").inc()
                 if cached:
-                    cached_resolution = cached.get("resolution_payload", {})
-                    if strategy == "auto" and not _qualified_resolution_cache(cached_resolution):
-                        CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "unqualified").inc()
-                        cached = None
-                if cached:
                     try:
                         context = Context.model_validate(cached.get("payload", {})).model_copy(
                             update={"incident_id": incident.id, "alert": alert}
@@ -199,40 +234,62 @@ async def _collect_context_with_strategy(
                         CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "invalid").inc()
                         logger.exception("invalid cached context knowledge id=%s; refreshing", cached.get("id"))
                     else:
-                        complete, missing = _context_completeness(context)
-                        if strategy == "auto" and not complete:
-                            CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "incomplete").inc()
-                            continue_with_refresh = True
-                        else:
-                            continue_with_refresh = False
+                        cached_metadata = context.metadata if isinstance(context.metadata, dict) else {}
+                        cached_subject = str(cached_metadata.get("context_subject_fingerprint") or "")
+                        scope_matches = bool(cached_subject and cached_subject == subject_fingerprint)
+                        cached_resolution = cached.get("resolution_payload", {})
+                        resolution_reusable = _qualified_resolution_cache(cached_resolution)
+                        context.metadata = {
+                            **cached_metadata,
+                            "context_strategy": strategy,
+                            "context_source": "periodic_knowledge",
+                            "context_reused": True,
+                            "realtime_collection_performed": False,
+                            "context_collected_at": cached.get("collected_at"),
+                        }
+                        context = govern_context(
+                            context,
+                            tenant_id=tenant_id,
+                            subject_fingerprint=subject_fingerprint,
+                            threshold=quality_threshold,
+                            max_evidence_per_source=max_evidence,
+                        )
+                        quality = context.metadata["context_quality"]
+                        continue_with_refresh = not scope_matches or (
+                            strategy == "auto" and not bool(quality.get("reusable"))
+                        )
                         if continue_with_refresh:
-                            logger.info("cached context lacks required evidence coverage for signature=%s; refreshing", signature)
+                            reason = "subject_scope_changed" if not scope_matches else "cached_context_below_quality"
+                            CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", reason).inc()
+                            _record_context_quality(context, "refresh", reason)
+                            logger.info(
+                                "cached context rejected signature=%s reason=%s quality=%s",
+                                signature,
+                                reason,
+                                quality.get("quality_score"),
+                            )
                         else:
                             reuse_count = int(cached.get("reuse_count", 1) or 1)
                             context.metadata = {
-                                **(context.metadata if isinstance(context.metadata, dict) else {}),
-                                "context_strategy": strategy,
-                                "context_source": "periodic_knowledge",
-                                "context_reused": True,
+                                **context.metadata,
                                 "alert_type_known": True,
-                                "knowledge_route": "reuse_periodic_knowledge",
+                                "knowledge_route": "reuse_validated_context_snapshot",
                                 "knowledge_match_type": cached.get("match_type", "signature"),
-                                "context_complete": complete,
-                                "context_missing_sections": missing,
-                                "realtime_collection_performed": False,
                                 "context_knowledge_id": cached.get("id"),
                                 "context_source_alert_id": cached.get("source_alert_id"),
                                 "context_source_incident_id": cached.get("source_incident_id"),
                                 "context_collected_at": cached.get("collected_at"),
                                 "context_reuse_count": reuse_count,
                                 "context_signature": signature,
-                                "prior_resolution": cached.get("resolution_payload", {}),
+                                "prior_resolution": cached_resolution if resolution_reusable else {},
                                 "prior_resolution_score": _resolution_quality_score(cached.get("resolution_payload", {})),
+                                "prior_resolution_reusable": resolution_reusable,
                                 "resolution_reuse_threshold": float(getattr(settings, "context_resolution_reuse_min_score", 0.7) or 0.7),
                             }
                             await session.commit()
                             CONTEXT_KNOWLEDGE_REUSE_COUNT.observe(reuse_count)
                             CONTEXT_STRATEGY_REQUESTS.labels(strategy, "cache_hit").inc()
+                            _record_context_quality(context, "reuse", "quality_and_scope_passed")
                             CONTEXT_STRATEGY_DURATION.labels(strategy, "reused").observe(
                                 max(0.0, perf_counter() - started)
                             )
@@ -254,6 +311,14 @@ async def _collect_context_with_strategy(
             "context_missing_sections": ["historical_context"],
             "realtime_collection_performed": False,
         }
+        context = govern_context(
+            context,
+            tenant_id=tenant_id,
+            subject_fingerprint=subject_fingerprint,
+            threshold=quality_threshold,
+            max_evidence_per_source=max_evidence,
+        )
+        _record_context_quality(context, "miss", "historical_cache_miss")
         CONTEXT_STRATEGY_REQUESTS.labels("historical", "cache_miss").inc()
         return context
 
@@ -263,6 +328,7 @@ async def _collect_context_with_strategy(
         CONTEXT_STRATEGY_REQUESTS.labels(strategy, "discovery_error").inc()
         CONTEXT_STRATEGY_DURATION.labels(strategy, "error").observe(max(0.0, perf_counter() - started))
         raise
+    collected_at = datetime.now(timezone.utc)
     context.metadata = {
         **(context.metadata if isinstance(context.metadata, dict) else {}),
         "context_strategy": strategy,
@@ -270,12 +336,18 @@ async def _collect_context_with_strategy(
         "context_source": "realtime_collection",
         "alert_type_known": False,
         "knowledge_route": "full_context_then_learn",
-        "context_complete": _context_completeness(context)[0],
-        "context_missing_sections": _context_completeness(context)[1],
         "realtime_collection_performed": True,
         "context_signature": signature,
-        "context_collected_at": datetime.now(timezone.utc).isoformat(),
+        "context_collected_at": collected_at.isoformat(),
     }
+    context = govern_context(
+        context,
+        tenant_id=tenant_id,
+        subject_fingerprint=subject_fingerprint,
+        now=collected_at,
+        threshold=quality_threshold,
+        max_evidence_per_source=max_evidence,
+    )
     if database_available:
         try:
             async with session_factory() as session:
@@ -298,8 +370,62 @@ async def _collect_context_with_strategy(
             logger.exception("context knowledge persistence failed; returning freshly collected context")
     outcome = "fresh" if strategy == "realtime" else "cache_miss"
     CONTEXT_STRATEGY_REQUESTS.labels(strategy, outcome).inc()
+    _record_context_quality(context, "collect", "fresh_discovery")
     CONTEXT_STRATEGY_DURATION.labels(strategy, "fresh_discovery").observe(max(0.0, perf_counter() - started))
     return context
+
+
+async def _collect_context_with_strategy(
+    app: FastAPI,
+    alert: Alert,
+    incident: Incident,
+    strategy_override: str | None = None,
+    supplied_context: dict[str, Any] | None = None,
+) -> Context:
+    """Coalesce identical collection work in-process and across MySQL replicas."""
+
+    strategy = _context_strategy(strategy_override)
+    if strategy == "realtime":
+        return await _collect_context_with_strategy_unlocked(
+            app, alert, incident, strategy_override, supplied_context
+        )
+
+    tenant_id, _, _, signature = _context_identity(alert)
+    lock_digest = hashlib.sha256(f"{tenant_id}:{signature}".encode("utf-8")).hexdigest()[:40]
+    local_key = f"{tenant_id}:{signature}"
+    local_lock = _CONTEXT_COLLECTION_LOCKS.setdefault(local_key, asyncio.Lock())
+    if len(_CONTEXT_COLLECTION_LOCKS) > 2048:
+        for key, candidate in list(_CONTEXT_COLLECTION_LOCKS.items()):
+            if key != local_key and not candidate.locked():
+                _CONTEXT_COLLECTION_LOCKS.pop(key, None)
+            if len(_CONTEXT_COLLECTION_LOCKS) <= 1536:
+                break
+
+    async with local_lock:
+        engine = getattr(app.state, "db_engine", None)
+        if settings.database_enabled and engine is not None and engine.dialect.name == "mysql":
+            lock_name = f"kaiops:context:{lock_digest}"
+            wait_seconds = int(getattr(settings, "context_collection_lease_wait_seconds", 30) or 0)
+            try:
+                async with engine.connect() as connection:
+                    acquired = await connection.scalar(
+                        text("SELECT GET_LOCK(:name, :wait_seconds)"),
+                        {"name": lock_name, "wait_seconds": wait_seconds},
+                    )
+                    if int(acquired or 0) == 1:
+                        try:
+                            return await _collect_context_with_strategy_unlocked(
+                                app, alert, incident, strategy_override, supplied_context
+                            )
+                        finally:
+                            await connection.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
+                    CONTEXT_REUSE_DECISIONS.labels("collect", "distributed_lease_timeout").inc()
+            except Exception:
+                logger.exception("context collection lease failed; continuing under process-local lock")
+                CONTEXT_REUSE_DECISIONS.labels("collect", "distributed_lease_error").inc()
+        return await _collect_context_with_strategy_unlocked(
+            app, alert, incident, strategy_override, supplied_context
+        )
 
 
 def _extract_message_bus_provider(payload: dict[str, Any]) -> str:
@@ -322,6 +448,7 @@ async def _publish_context_event(
     incident: Incident,
     context: Context,
     decision: dict[str, Any] | None,
+    payload: dict[str, Any] | None = None,
 ) -> str:
     publishers: dict[str, EventPublisher] = getattr(app.state, "message_bus_publishers", {})
     selected = publishers.get(provider)
@@ -330,14 +457,22 @@ async def _publish_context_event(
         provider_used = "rabbitmq"
         selected = publishers.get("rabbitmq", app.state.producer)
 
-    payload = _build_context_event_payload(
-        alert=alert,
-        incident=incident,
-        context=context,
-        decision=decision,
-        provider_used=provider_used,
+    outgoing = payload or _build_context_event_payload(
+        alert=alert, incident=incident, context=context, decision=decision, provider_used=provider_used
     )
-    await selected.publish(CONTEXT_EVENTS, payload, key=alert.service)
+    event_id = str((outgoing.get("event_contract") or {}).get("event_id") or "")
+    try:
+        await selected.publish(CONTEXT_EVENTS, outgoing, key=alert.service)
+    except Exception as exc:
+        if event_id and settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
+            async with app.state.session_factory() as session:
+                await IncidentRepository(session).mark_resolution_event_retry(event_id, str(exc))
+                await session.commit()
+        raise
+    if event_id and settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
+        async with app.state.session_factory() as session:
+            await IncidentRepository(session).mark_resolution_event_published(event_id)
+            await session.commit()
     return provider_used
 
 
@@ -349,14 +484,34 @@ async def _persist_context_event(
     context: Context,
     decision: dict[str, Any] | None,
     provider_used: str,
-) -> None:
+    outgoing_payload: dict[str, Any],
+) -> bool:
     if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
-        return
+        return True
     decision_payload = decision if isinstance(decision, dict) else {}
+    tenant_id, _, _, alert_signature = _context_identity(alert)
+    quality = context.metadata.get("context_quality") if isinstance(context.metadata.get("context_quality"), dict) else {}
+    context_fingerprint = str(context.metadata.get("context_fingerprint") or "")
+    subject_fingerprint = str(context.metadata.get("context_subject_fingerprint") or "")
+    event_id = str((outgoing_payload.get("event_contract") or {}).get("event_id") or "")
+    collected_at_raw = str(context.metadata.get("context_collected_at") or "")
+    try:
+        collected_at = datetime.fromisoformat(collected_at_raw.replace("Z", "+00:00"))
+    except ValueError:
+        collected_at = datetime.now(timezone.utc)
+    if collected_at.tzinfo is None:
+        collected_at = collected_at.replace(tzinfo=timezone.utc)
+    assessed_at_raw = str(quality.get("assessed_at") or "")
+    try:
+        assessed_at = datetime.fromisoformat(assessed_at_raw.replace("Z", "+00:00"))
+    except ValueError:
+        assessed_at = datetime.now(timezone.utc)
+    if assessed_at.tzinfo is None:
+        assessed_at = assessed_at.replace(tzinfo=timezone.utc)
+    expires_at = assessed_at + timedelta(seconds=max(0, int(quality.get("valid_for_seconds") or 0)))
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
-        await repo.save_incident_event(
-            build_event_envelope(
+        incident_event = build_event_envelope(
                 event_type="incident.context.collected",
                 identity={
                     "incident_id": str(incident.id),
@@ -367,7 +522,7 @@ async def _persist_context_event(
                     "parent_event_id": None,
                 },
                 scope={
-                    "tenant_id": "default",
+                    "tenant_id": tenant_id,
                     "service": str(alert.service or "unknown"),
                     "environment": str(alert.environment or "prod"),
                     "region": None,
@@ -403,10 +558,46 @@ async def _persist_context_event(
                     "discovery_evidence": context.metadata.get("discovery_evidence", {}),
                     "context_sources": context.metadata.get("context_sources", {}),
                     "context_evidence": context.metadata.get("context_evidence", {}),
+                    "context_quality": quality,
+                    "context_fingerprint": context_fingerprint,
+                    "subject_fingerprint": subject_fingerprint,
                 },
             )
+        incident_event["event_id"] = str(
+            uuid5(NAMESPACE_URL, f"kaims:context-audit:{incident.id}:{context_fingerprint}")
+        )
+        await repo.save_incident_event(incident_event)
+        snapshot_id = uuid5(
+            NAMESPACE_URL,
+            f"kaims:context-snapshot:{tenant_id}:{incident.id}:{context_fingerprint}",
+        )
+        await repo.save_context_snapshot(
+            snapshot_id=snapshot_id,
+            tenant_id=tenant_id,
+            incident_id=str(incident.id),
+            source_incident_id=str(context.metadata.get("context_source_incident_id") or "") or None,
+            alert_signature=alert_signature,
+            subject_fingerprint=subject_fingerprint,
+            context_fingerprint=context_fingerprint,
+            contract_version=str(context.metadata.get("context_contract_version") or "kaiops.context.v2"),
+            quality_score=float(quality.get("quality_score") or 0.0),
+            reusable=bool(quality.get("reusable")),
+            source_manifest=context.metadata.get("context_sources", {}),
+            payload=context.model_dump(mode="json"),
+            collected_at=collected_at,
+            expires_at=expires_at,
+        )
+        enqueued = await repo.enqueue_resolution_event(
+            event_id=event_id,
+            aggregate_id=str(incident.id),
+            topic=CONTEXT_EVENTS,
+            partition_key=str(alert.service or incident.id),
+            payload=outgoing_payload,
+            tenant_id=tenant_id,
+            available_after_seconds=float(getattr(settings, "resolution_outbox_initial_delay_seconds", 60.0) or 60.0),
         )
         await session.commit()
+        return enqueued
 
 
 def _build_context_event_payload(
@@ -466,18 +657,69 @@ def _build_context_event_payload(
             "requires_approval": decision_payload.get("requires_approval"),
             "message_bus_provider": decision_payload.get("message_bus_provider"),
         },
-        confidence=0.8,
-        reasoning=str(report.get("summary") or "connector fusion across observability, tickets, code, logs, cmdb, and rag context"),
-        citations=citations or [f"rag://{alert.service}", "cmdb://dependencies"],
+        confidence=float(
+            (context.metadata.get("context_quality") or {}).get("quality_score", 0.0)
+            if isinstance(context.metadata.get("context_quality"), dict)
+            else 0.0
+        ),
+        reasoning=str(
+            report.get("summary")
+            or "Quality-scored context was assembled from the sources that returned grounded evidence; missing sources remain explicit."
+        ),
+        citations=citations or [f"alert://{alert.id}"],
         evidence_ids=evidence_ids or [f"alert:{alert.id}", f"incident:{incident.id}"],
     )
+    context_fingerprint = str(context.metadata.get("context_fingerprint") or "")
+    event_contract["event_id"] = f"context:{incident.id}:{context_fingerprint[:24]}"
     return {
-        "context": context,
-        "incident": incident,
-        "decision": decision,
+        "context": context.model_dump(mode="json"),
+        "incident": incident.model_dump(mode="json"),
+        "decision": decision if isinstance(decision, dict) else {},
         "transport": provider_used,
         "event_contract": event_contract,
     }
+
+
+async def _flush_context_outbox(app: FastAPI) -> int:
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        return 0
+    published = 0
+    async with app.state.session_factory() as session:
+        acquired = await session.scalar(text("SELECT GET_LOCK('kaiops_resolution_outbox_dispatch', 0)"))
+        if int(acquired or 0) != 1:
+            return 0
+        try:
+            repo = IncidentRepository(session)
+            rows = await repo.list_pending_resolution_events(
+                limit=int(getattr(settings, "resolution_outbox_batch_size", 100) or 100)
+            )
+            publishers: dict[str, EventPublisher] = getattr(app.state, "message_bus_publishers", {})
+            for row in rows:
+                provider = str(row.payload.get("transport") or "").strip().lower()
+                publisher = publishers.get(provider) or publishers.get("rabbitmq") or app.state.producer
+                try:
+                    await publisher.publish(row.topic, row.payload, key=row.partition_key)
+                    await repo.mark_resolution_event_published(row.event_id)
+                    published += 1
+                except Exception as exc:
+                    await repo.mark_resolution_event_retry(row.event_id, str(exc))
+                await session.commit()
+        finally:
+            await session.execute(text("SELECT RELEASE_LOCK('kaiops_resolution_outbox_dispatch')"))
+            await session.commit()
+    return published
+
+
+async def _context_outbox_dispatch_loop(app: FastAPI) -> None:
+    interval = max(1.0, float(getattr(settings, "resolution_outbox_poll_seconds", 5.0) or 5.0))
+    while True:
+        try:
+            await _flush_context_outbox(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("context event outbox dispatch failed")
+        await asyncio.sleep(interval)
 
 
 def _build_ingress_consumers() -> list[tuple[str, object, object]]:
@@ -515,6 +757,8 @@ async def startup(app: FastAPI) -> None:
     else:
         app.state.rabbitmq_publisher = None
 
+    tasks.append(asyncio.create_task(_context_outbox_dispatch_loop(app), name="context-agent-event-outbox"))
+
     async def handle(payload: dict) -> None:
         alert = Alert.model_validate(payload["alert"])
         incident = Incident.model_validate(payload["incident"])
@@ -527,25 +771,39 @@ async def startup(app: FastAPI) -> None:
         except Exception:
             logger.exception(
                 "failed to create evidence RAG draft for alert_id=%s",
-                alert.alert_id,
+                alert.id,
             )
         provider = _extract_message_bus_provider(payload)
-        provider_used = await _publish_context_event(
-            app=app,
-            provider=provider,
-            alert=alert,
-            incident=incident,
-            context=context,
-            decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
-        )
-        await _persist_context_event(
-            app=app,
+        publishers: dict[str, EventPublisher] = getattr(app.state, "message_bus_publishers", {})
+        provider_used = provider if publishers.get(provider) is not None else "rabbitmq"
+        outgoing_payload = _build_context_event_payload(
             alert=alert,
             incident=incident,
             context=context,
             decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
             provider_used=provider_used,
         )
+        enqueued = await _persist_context_event(
+            app=app,
+            alert=alert,
+            incident=incident,
+            context=context,
+            decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
+            provider_used=provider_used,
+            outgoing_payload=outgoing_payload,
+        )
+        if enqueued:
+            await _publish_context_event(
+                app=app,
+                provider=provider_used,
+                alert=alert,
+                incident=incident,
+                context=context,
+                decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
+                payload=outgoing_payload,
+            )
+        else:
+            CONTEXT_REUSE_DECISIONS.labels("publish", "duplicate_event_suppressed").inc()
         EVENTS_PROCESSED.labels(settings.service_name, f"{ORCHESTRATION_EVENTS}:{provider_used}", "ok").inc()
 
     for source, consumer, consume_forever in _build_ingress_consumers():
@@ -1277,15 +1535,35 @@ async def collect(payload: dict, publish_events: bool = True) -> Context:
         app, alert, incident, payload.get("context_strategy"), payload.get("context")
     )
     if publish_events:
-        await app.state.producer.publish(
-            CONTEXT_EVENTS,
-            {
-                "context": context,
-                "incident": incident,
-                "decision": payload.get("decision"),
-            },
-            key=alert.service,
+        provider = _extract_message_bus_provider(payload)
+        publishers: dict[str, EventPublisher] = getattr(app.state, "message_bus_publishers", {})
+        provider_used = provider if publishers.get(provider) is not None else "rabbitmq"
+        outgoing_payload = _build_context_event_payload(
+            alert=alert,
+            incident=incident,
+            context=context,
+            decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
+            provider_used=provider_used,
         )
+        enqueued = await _persist_context_event(
+            app=app,
+            alert=alert,
+            incident=incident,
+            context=context,
+            decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
+            provider_used=provider_used,
+            outgoing_payload=outgoing_payload,
+        )
+        if enqueued:
+            await _publish_context_event(
+                app=app,
+                provider=provider_used,
+                alert=alert,
+                incident=incident,
+                context=context,
+                decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
+                payload=outgoing_payload,
+            )
     return context
 
 
@@ -1296,15 +1574,35 @@ async def context_strategy_status() -> dict[str, Any]:
         "supported": ["auto", "realtime", "historical"],
         "auto": {
             "cache_aside": True,
-            "ttl_seconds": int(getattr(settings, "context_knowledge_ttl_seconds", 0) or 0) or None,
-            "refresh_policy": "new_type_or_unqualified_knowledge",
-            "match_scope": ["tenant", "service", "environment", "alert-family"],
+            "ttl_seconds": int(getattr(settings, "context_knowledge_ttl_seconds", 3600) or 3600),
+            "refresh_policy": "quality_freshness_scope_or_conflict_failure",
+            "match_scope": ["tenant", "service", "environment", "alert-family", "subject-fingerprint"],
+            "quality_threshold": float(getattr(settings, "context_min_quality_score", 0.70) or 0.70),
+            "per_source_ttl_seconds": {
+                source: int(policy["ttl_seconds"]) for source, policy in SOURCE_POLICIES.items()
+            },
+            "adaptive_connector_planning": True,
+            "single_flight": {"process": True, "mysql_replica_lease": True},
             "resolution_reuse_enabled": bool(getattr(settings, "context_resolution_reuse_enabled", True)),
             "resolution_reuse_min_score": float(getattr(settings, "context_resolution_reuse_min_score", 0.7) or 0.7),
         },
         "realtime": {"always_refresh": True},
         "historical": {"always_refresh": False, "cache_miss_collects_realtime": False},
     }
+
+
+@app.get("/context/snapshots/{incident_id}")
+async def latest_context_snapshot(incident_id: str, tenant_id: str = "default") -> dict[str, Any]:
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        raise HTTPException(status_code=503, detail="context snapshot database is unavailable")
+    async with app.state.session_factory() as session:
+        snapshot = await IncidentRepository(session).latest_context_snapshot(
+            incident_id,
+            tenant_id=tenant_id,
+        )
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="context snapshot not found")
+    return snapshot
 
 
 @app.post("/rag/documents")
@@ -1606,11 +1904,17 @@ async def sync_rag_index() -> dict[str, Any]:
 
 
 @app.get("/rag/search")
-async def search_rag(query: str, limit: int = 8, kind: str | None = None) -> dict[str, Any]:
+async def search_rag(
+    query: str,
+    limit: int = 8,
+    kind: str | None = None,
+    service: str | None = None,
+) -> dict[str, Any]:
     matches = vector_connector().search(
         query,
         limit=max(1, min(limit, 20)),
         preferred_kind=kind,
+        service=service,
     )
     return {
         "query": query,
@@ -1623,6 +1927,9 @@ async def search_rag(query: str, limit: int = 8, kind: str | None = None) -> dic
                 "deployment": match.get("deployment"),
                 "path": match.get("path"),
                 "score": match.get("_similarity", 0.0),
+                "semantic_score": match.get("_semantic_score", 0.0),
+                "metadata_match_score": match.get("_metadata_match_score", 0.0),
+                "context_relevant": vector_connector().context_match_relevant(match, service or "") if service else None,
                 "embedding_model": vector_connector().embedding_info(),
                 "vector_store": vector_connector().vector_store_info(),
                 "preview": str(match.get("content", ""))[:300],

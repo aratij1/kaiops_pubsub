@@ -35,6 +35,7 @@ if [ -z "$SERVICE" ]; then
 fi
 
 echo "KaiOps alert triage started"
+echo "KAI_OPS_EXECUTION_CLASS=diagnostic"
 echo "service=$SERVICE environment=$ENVIRONMENT dry_run=$DRY_RUN"
 echo "api_gateway_url=$API_GATEWAY_URL prometheus_url=$PROMETHEUS_URL mysql=${MYSQL_HOST}:${MYSQL_PORT}/${MYSQL_DATABASE}"
 
@@ -44,27 +45,30 @@ curl -fsS "${PROMETHEUS_URL%/}/api/v1/alerts" >/tmp/kaiops-prometheus-alerts.jso
 if command -v mysql >/dev/null 2>&1; then
   if [ -n "${MYSQL_PASSWORD:-}" ]; then
     MYSQL_ERROR_FILE="${TMPDIR:-/tmp}/kaiops-mysql-error.$$"
-    if ! MYSQL_PWD="$MYSQL_PASSWORD" mysql \
-      -h "$MYSQL_HOST" \
-      -P "$MYSQL_PORT" \
-      -u "$MYSQL_USER" \
-      "$MYSQL_DATABASE" \
-      -e "SELECT COUNT(*) AS alert_rows FROM ${ALERTS_TABLE};" 2>"$MYSQL_ERROR_FILE"; then
+    mysql_query() {
+      MYSQL_PWD="$MYSQL_PASSWORD" mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" "$MYSQL_DATABASE" -e "$1"
+    }
+    if ! mysql_query "SELECT COUNT(*) AS alert_rows, MIN(created_at) AS oldest_row, MAX(created_at) AS newest_row FROM ${ALERTS_TABLE};
+SELECT table_name, table_rows, ROUND((data_length + index_length) / 1024 / 1024, 2) AS total_mb FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = '${ALERTS_TABLE}';
+SELECT variable_name, variable_value FROM performance_schema.global_status WHERE variable_name IN ('Threads_connected','Threads_running','Slow_queries','Aborted_connects');" 2>"$MYSQL_ERROR_FILE"; then
       cat "$MYSQL_ERROR_FILE" >&2
       rm -f "$MYSQL_ERROR_FILE"
       exit 1
     fi
+    if ! mysql_query "SELECT COUNT(*) AS active_transactions FROM information_schema.innodb_trx; SELECT COUNT(*) AS lock_waits FROM performance_schema.data_lock_waits;" 2>"$MYSQL_ERROR_FILE"; then
+      echo "Optional lock/transaction evidence unavailable to the least-privilege account." >&2
+      cat "$MYSQL_ERROR_FILE" >&2
+    fi
     rm -f "$MYSQL_ERROR_FILE"
   else
-    echo "MYSQL_PASSWORD is not set; skipping MySQL row-count validation."
+    if [ "$SERVICE" = "mysql" ]; then
+      echo "MYSQL_PASSWORD is required for MySQL diagnostic evidence." >&2
+      exit 1
+    fi
+    echo "MYSQL_PASSWORD is not set; skipping optional MySQL diagnostics."
   fi
 else
   echo "mysql client is not installed; skipping MySQL row-count validation."
 fi
 
-if [ "$DRY_RUN" = "true" ]; then
-  echo "Dry run complete. No remediation mutation was executed."
-  exit 0
-fi
-
-echo "Live remediation is intentionally connector-gated. Execute service-specific restart/scale/rollback through the approved remediation connector."
+echo "Diagnostic collection complete. No remediation mutation was executed."

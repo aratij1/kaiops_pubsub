@@ -17,6 +17,9 @@ def test_production_accepts_complete_https_oidc_configuration() -> None:
         OIDC_ISSUER="https://login.example.com/tenant/v2.0",
         OIDC_AUDIENCE="api://kaiops",
         OIDC_CLIENT_ID="kaiops-spa",
+        EVENT_ENVELOPE_SIGNING_REQUIRED=True,
+        EVENT_ENVELOPE_SIGNING_KEY="x" * 32,
+        EVENT_ENVELOPE_SIGNING_ISSUER="api-gateway",
     )
     assert settings.auth_mode == "oidc"
 

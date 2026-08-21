@@ -55,7 +55,7 @@ async def test_investigation_queries_missing_sources_and_returns_inconclusive() 
 
 
 @pytest.mark.asyncio
-async def test_investigation_revises_hypothesis_and_stops_when_corroborated() -> None:
+async def test_keyword_overlap_alone_cannot_confirm_a_hypothesis() -> None:
     hypothesis = {"cause": "checkout connection pool exhaustion", "confidence": 0.6}
     client = FakeDiscoveryClient({
         "code.search": [{
@@ -74,10 +74,10 @@ async def test_investigation_revises_hypothesis_and_stops_when_corroborated() ->
 
     report = await investigator.investigate(make_context(hypotheses=[hypothesis]))
 
-    assert report["status"] == "conclusive"
-    assert report["conclusive"] is True
-    assert report["steps_used"] == 2
-    assert report["conclusion"]["confidence"] >= investigator.conclusive_threshold
+    assert report["status"] == "budget_exhausted"
+    assert report["conclusive"] is False
+    assert report["steps_used"] == 4
+    assert report["conclusion"]["confidence"] < investigator.conclusive_threshold
     assert set(report["conclusion"]["evidence_ids"]) == {"CODE-POOL", "LOG-POOL"}
 
 

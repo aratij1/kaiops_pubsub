@@ -40,3 +40,31 @@ def test_build_action_rewrites_uuid_target_to_service() -> None:
     action = RemediationEngine().build_action(approval)
 
     assert action.target == "payments-api"
+
+
+def test_catalog_docker_restart_is_not_mislabeled_as_rollback() -> None:
+    approval = Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="sre@example.com",
+        comment="execute exact reviewed plan",
+        metadata={
+            "service": "kaiops-discovery-mcp",
+            "recommended_action": "Restart the kaiops-discovery-mcp service and validate its health.",
+            "execution_plan": {
+                "commands": [
+                    "curl -X POST http://docker-socket-proxy:2375/containers/kaiops_pubsub-discovery-mcp-1/restart?t=30"
+                ],
+                "validation_commands": ["curl http://discovery-mcp:8000/healthz"],
+            },
+            "connection_profile": {
+                "executor_type": "jenkins",
+                "allowed_operations": ["restart_service"],
+            },
+        },
+    )
+
+    action = RemediationEngine().build_action(approval)
+
+    assert action.action_type == "restart_service"

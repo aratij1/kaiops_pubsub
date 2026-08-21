@@ -3,3 +3,9 @@
 .ro-mttr-grid small { display: block; color: #657287; line-height: 1.35; }
 .ro-summary small.ro-source-label { color: #657287; }
 .ro-risk-row > small { color: #718096; font-size: .48rem; text-align: center; }
+.ro-donut-wrap { min-width: 0; }
+.ro-donut-wrap ul { display: grid; gap: 7px; margin: 0; padding: 8px 12px; list-style: none; }
+.ro-donut-wrap li { display: grid; grid-template-columns: 9px minmax(0, 1fr) auto; align-items: center; gap: 8px; font-size: .67rem; }
+.ro-donut-wrap li > i { width: 8px; height: 8px; border-radius: 50%; }
+.ro-donut-wrap li > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ro-donut-wrap li > b { min-width: 2ch; text-align: right; font-variant-numeric: tabular-nums; }

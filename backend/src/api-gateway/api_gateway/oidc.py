@@ -10,6 +10,7 @@ import jwt
 from fastapi import HTTPException
 
 from common.config import Settings
+from common.tenant_identity import require_tenant_id
 
 KAIOPS_ROLES = {"Administrator", "Executive", "L3 Engineer", "L2 Engineer", "L1 Operator"}
 
@@ -88,7 +89,10 @@ class OidcTokenValidator:
                 "type": "access",
                 "external": True,
                 "role": self._role(claims),
-                "tenant_id": str(self._claim(claims, self.settings.oidc_tenant_claim) or "default"),
+                "tenant_id": require_tenant_id(
+                    self._claim(claims, self.settings.oidc_tenant_claim),
+                    source=f"OIDC claim {self.settings.oidc_tenant_claim}",
+                ),
                 "jti": str(claims.get("jti") or claims.get("oid") or claims["sub"]),
                 "sid": "",
             }

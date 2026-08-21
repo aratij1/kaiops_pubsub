@@ -60,5 +60,5 @@ test("Resolution tab treats missing routing/approval data as false, not truthy",
   await sectionNavigation.getByRole("tab", { name: "Resolve incident", exact: true }).click();
 
   await expect(page.getByRole("heading", { name: "Decision & Approval" })).toHaveCount(0);
-  await expect(page.getByRole("heading", { name: "Plan editor and guarded execution" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Resolution command center" })).toBeVisible();
 });

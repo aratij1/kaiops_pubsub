@@ -172,6 +172,37 @@ async def test_feedback_for_unknown_recommendation_returns_updated_false(eval_cl
 
 
 @pytest.mark.asyncio
+async def test_incorrect_feedback_requires_reason_category(eval_client: httpx.AsyncClient) -> None:
+    response = await eval_client.post(
+        f"/evaluations/by-recommendation/{uuid4()}/feedback",
+        json={"decision": "incorrect", "comment": "The proposed cause does not match the logs."},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_structured_feedback_is_persisted(eval_client: httpx.AsyncClient) -> None:
+    recommendation_id = str(uuid4())
+    create_response = await eval_client.post(
+        "/evaluations",
+        json={"report": {"overall_score": 0.5}, "agent": "resolution-agent", "recommendation_id": recommendation_id},
+    )
+    evaluation_id = create_response.json()["id"]
+    payload = {
+        "decision": "incomplete",
+        "approver": "reviewer@example.com",
+        "reason_category": "missing_evidence",
+        "missing_evidence": "Deployment change history",
+        "corrected_cause": "Not established",
+        "comment": "Collect change events before approving remediation.",
+    }
+    response = await eval_client.post(f"/evaluations/by-recommendation/{recommendation_id}/feedback", json=payload)
+    assert response.status_code == 200
+    record = await eval_client.get(f"/evaluations/{evaluation_id}")
+    assert record.json()["feedback"] == payload
+
+
+@pytest.mark.asyncio
 async def test_endpoints_return_503_when_database_disabled(monkeypatch) -> None:
     monkeypatch.setattr(evaluation_service_app.settings, "database_enabled", False)
     monkeypatch.setattr(evaluation_service_app.app.state, "session_factory", None, raising=False)

@@ -5,7 +5,7 @@ from time import perf_counter
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Index, JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, MetaData, Numeric, String, Text, Uuid, event, text
+from sqlalchemy import Index, JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, MetaData, Numeric, String, Text, UniqueConstraint, Uuid, event, text
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -103,6 +103,10 @@ class ApprovalRecord(Base, TimestampMixin):
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     recommendation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    plan_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True, nullable=True)
+    plan_fingerprint: Mapped[str | None] = mapped_column(String(71), index=True, nullable=True)
+    approval_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approver_role: Mapped[str | None] = mapped_column(String(64), nullable=True)
     decision: Mapped[str] = mapped_column(String(32), index=True)
     approver: Mapped[str | None] = mapped_column(String(255))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
@@ -110,10 +114,11 @@ class ApprovalRecord(Base, TimestampMixin):
 
 class ApprovalCapacityRecord(Base, TimestampMixin):
     __tablename__ = "approval_capacity"
+    __table_args__ = (UniqueConstraint("tenant_id", "username", name="uq_approval_capacity_tenant_username"),)
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
-    username: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    username: Mapped[str] = mapped_column(String(255), index=True)
     resource_names: Mapped[list[str]] = mapped_column(JSON, default=list)
     weekly_hours: Mapped[int] = mapped_column(Integer, default=0)
     timezone: Mapped[str] = mapped_column(String(64), default="UTC")
@@ -125,10 +130,11 @@ class ApprovalCapacityRecord(Base, TimestampMixin):
 
 class ApprovalAssignmentRecord(Base, TimestampMixin):
     __tablename__ = "approval_assignments"
+    __table_args__ = (UniqueConstraint("tenant_id", "incident_id", name="uq_approval_assignment_tenant_incident"),)
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
-    incident_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    incident_id: Mapped[str] = mapped_column(String(128), index=True)
     assignee: Mapped[str] = mapped_column(String(255), index=True)
     service: Mapped[str] = mapped_column(String(128), index=True)
     estimated_hours: Mapped[int] = mapped_column(Integer, default=1)

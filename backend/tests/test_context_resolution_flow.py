@@ -159,6 +159,42 @@ def test_detected_errors_exclude_unrelated_global_log_signals() -> None:
     assert [row["evidence_id"] for row in findings] == ["LOG-payment"]
 
 
+def test_discovery_routes_metric_alerts_without_unrelated_database_or_ticket_queries() -> None:
+    alert = Alert(
+        source="prometheus",
+        name="CheckoutLatencyHigh",
+        service="checkout",
+        severity=AlertSeverity.HIGH,
+        description="p95 latency is above the service objective",
+    )
+
+    selected, reasons = DiscoveryMCPConnector._plan_discovery_tools(alert)
+
+    assert selected == ["telemetry.search"]
+    assert reasons == ["metric_or_trace_signal"]
+
+
+def test_discovery_expands_route_for_change_database_and_recurring_signals() -> None:
+    alert = Alert(
+        source="logs",
+        name="MySQL regression after deployment",
+        service="orders-mysql",
+        severity=AlertSeverity.CRITICAL,
+        description="Repeated query timeout after release build 42",
+        deduplicated_count=3,
+    )
+
+    selected, reasons = DiscoveryMCPConnector._plan_discovery_tools(alert)
+
+    assert selected == [
+        "logs.search", "tickets.search", "code.search", "mysql.search",
+    ]
+    assert set(reasons) >= {
+        "log_signal", "failure_diagnostics", "change_correlation",
+        "database_diagnostics", "incident_history",
+    }
+
+
 def test_code_review_keeps_only_evidence_linked_unified_diff_patches() -> None:
     evidence = [
         {
@@ -267,6 +303,108 @@ def test_vector_db_connector_loads_rag_documents() -> None:
     assert any(doc["kind"] == "dependency" for doc in connector.documents)
 
 
+def test_context_rag_gate_rejects_weak_untagged_history() -> None:
+    connector = VectorDBConnector()
+
+    assert connector.context_match_relevant(
+        {"services": [], "match_confidence": 0.22, "_metadata_match_score": 0.09},
+        "checkout",
+    ) is False
+    assert connector.context_match_relevant(
+        {"services": ["checkout"], "match_confidence": 0.12, "_metadata_match_score": 0.0},
+        "checkout",
+    ) is True
+    assert connector.context_match_relevant(
+        {"services": ["payments"], "match_confidence": 0.95, "_metadata_match_score": 0.9},
+        "checkout",
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_resolution_does_not_treat_rag_history_as_current_observation() -> None:
+    alert = Alert(
+        source="prometheus",
+        name="CheckoutLatencyHigh",
+        service="checkout",
+        severity=AlertSeverity.HIGH,
+        description="checkout latency is elevated",
+    )
+    incident = Incident(service="checkout", severity=AlertSeverity.HIGH, title=alert.name)
+    context = Context(
+        incident_id=incident.id,
+        alert=alert,
+        metadata={
+            "context_evidence": {
+                "rag": [{
+                    "evidence_id": "RAG-HISTORY",
+                    "source": "rag",
+                    "uri": "rag://history/payments",
+                    "snippet": "Deployment 2.5 caused an older payments incident.",
+                    "epistemic_role": "historical_knowledge",
+                }]
+            }
+        },
+    )
+
+    state = await ResolutionIntelligenceAgent(model_router=static_router()).collect_context({"context": context})
+
+    assert all(row.get("evidence_id") != "RAG-HISTORY" for row in state["gathered_context"]["discovery_evidence"])
+    assert state["gathered_context"]["knowledge_evidence_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_resolution_builds_application_crawl_and_historical_hypotheses() -> None:
+    alert = Alert(
+        source="prometheus",
+        name="CheckoutTimeouts",
+        service="checkout",
+        severity=AlertSeverity.HIGH,
+        description="checkout requests time out after release",
+    )
+    incident = Incident(service="checkout", severity=AlertSeverity.HIGH, title=alert.name)
+    context = Context(
+        incident_id=incident.id,
+        alert=alert,
+        related_incidents=[{
+            "id": "INC-OLD",
+            "title": "Earlier checkout timeout",
+            "root_cause": "Connection pool exhaustion after a configuration change",
+            "resolution": "Restore the prior pool limit",
+            "outcome": "succeeded",
+            "similarity": 0.82,
+        }],
+        recent_changes=[{"id": "CHG-9", "message": "checkout release deployed"}],
+        metadata={
+            "context_evidence": {
+                "logs": [{"evidence_id": "LOG-1", "source": "log", "service": "checkout", "snippet": "pool timeout"}],
+                "code": [{"evidence_id": "CODE-1", "source": "code", "service": "checkout", "snippet": "pool_size = 2"}],
+                "telemetry": [{"evidence_id": "METRIC-1", "source": "prometheus", "service": "checkout", "snippet": "timeouts=42"}],
+                "rag": [{"evidence_id": "RAG-1", "source": "rag", "service": "checkout", "snippet": "reviewed pool runbook"}],
+            },
+            "discovery_report": {
+                "report": {
+                    "hypotheses": [{"cause": "Connection pool exhaustion", "confidence": 0.78, "evidence_ids": ["LOG-1"]}],
+                    "code_review": {"findings": [{"title": "Small pool", "explanation": "Configured pool size is two", "evidence_id": "CODE-1"}]},
+                }
+            },
+        },
+    )
+    agent = ResolutionIntelligenceAgent(model_router=static_router())
+
+    state = await agent.collect_context({"context": context})
+    state = await agent.plan_investigation(state)
+    state = await agent.rank_hypotheses(state)
+
+    report = state["investigation_report"]
+    assert report["coverage"]["logs"] == 1
+    assert report["coverage"]["code"] == 1
+    assert report["coverage"]["telemetry"] >= 1
+    assert report["coverage"]["history"] >= 2
+    assert report["application_evidence_available"] is True
+    assert report["historical_evidence_available"] is True
+    assert any(item["source"] == "historical_incident" for item in state["hypothesis_analysis"]["ranked"])
+
+
 @pytest.mark.asyncio
 async def test_context_agent_returns_requested_shape() -> None:
     alert = Alert(
@@ -281,10 +419,10 @@ async def test_context_agent_returns_requested_shape() -> None:
 
     context = await ContextIntelligenceAgent().collect(alert, incident)
 
-    assert context.deployment == "Deployment 2.5"
+    assert context.deployment == "payments-api"
     assert context.runbook
-    assert set(context.dependency_services) >= {"checkout", "ledger", "fraud"}
-    assert context.recent_changes
+    assert context.cmdb.get("dependencies", []) == []
+    assert all(str(change.get("id")) != "CHG-1024" for change in context.recent_changes)
     assert context.metadata["rag_documents"] >= 1
     assert any(match["kind"] == "runbook" for match in context.metadata["rag_matches"])
     assert context.metadata["rag_index"]["vector_store"]["provider"] == "local-hybrid-vector-index"
@@ -293,7 +431,12 @@ async def test_context_agent_returns_requested_shape() -> None:
     assert graph["enabled"] is True
     assert graph["stages"] == ["validate_event", "collect_connector_evidence", "assemble_context"]
     assert graph["connector_count"] == 9
-    assert graph["collected_count"] == 9
+    assert graph["available_connector_count"] == 9
+    assert graph["collection_plan"]["mode"] == "adaptive"
+    assert all(
+        connector["status"] not in {"failed", "timed_out"}
+        for connector in graph["connectors"].values()
+    )
     assert graph["degraded"] is False
 
 
@@ -311,11 +454,16 @@ async def test_context_agent_persists_multi_source_evidence_manifest() -> None:
 
     context = await ContextIntelligenceAgent().collect(alert, incident)
 
-    assert set(context.metadata["context_sources"]) >= {"logs", "tickets", "code", "rag"}
-    assert all(context.metadata["context_sources"][source]["attempted"] is True for source in ("logs", "tickets", "code", "rag"))
+    assert set(context.metadata["context_sources"]) >= {"logs", "tickets", "code", "telemetry", "database", "rag"}
+    assert all(context.metadata["context_sources"][source]["attempted"] is True for source in ("logs", "telemetry", "rag"))
+    assert all(context.metadata["context_sources"][source]["attempted"] is False for source in ("tickets", "code", "database"))
+    assert all(context.metadata["context_sources"][source]["status"] == "skipped" for source in ("tickets", "code", "database"))
     assert context.metadata["context_sources"]["rag"]["result_count"] == len(context.metadata["rag_matches"])
     assert set(context.metadata["context_evidence"]) >= {"logs", "tickets", "code", "rag"}
-    assert context.metadata["context_evidence"]["rag"]
+    assert all(
+        row.get("epistemic_role") == "historical_knowledge" and row.get("current_observation") is False
+        for row in context.metadata["context_evidence"]["rag"]
+    )
 
 
 @pytest.mark.asyncio

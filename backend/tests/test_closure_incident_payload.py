@@ -48,6 +48,25 @@ def _existing_incident_payload() -> dict:
     }
 
 
+def test_only_reviewed_successful_unedited_outcome_is_reusable_knowledge() -> None:
+    module = load_closure_app_module()
+    report = _report(health_restored=True)
+    action = RemediationAction(
+        incident_id=INCIDENT_ID,
+        action_type="restart_service",
+        target="payment",
+        status=RemediationStatus.SUCCEEDED,
+        parameters={"outcome_reviewed": True, "outcome_reviewed_by": "sre@example.com"},
+    )
+    assert module._eligible_for_reusable_knowledge(action, report) is True
+
+    action.parameters["operator_modified"] = True
+    assert module._eligible_for_reusable_knowledge(action, report) is False
+    action.parameters = {}
+    assert module._eligible_for_reusable_knowledge(action, report) is False
+    assert module._eligible_for_reusable_knowledge(action, _report(health_restored=False)) is False
+
+
 def _action() -> RemediationAction:
     return RemediationAction(
         incident_id=INCIDENT_ID,
@@ -68,6 +87,12 @@ def _report(*, health_restored: bool) -> ResolutionReport:
     )
 
 
+def _assert_existing_metadata_preserved(final_metadata: dict, existing_metadata: dict) -> None:
+    for key, value in existing_metadata.items():
+        assert final_metadata[key] == value
+    assert final_metadata["resolution_lifecycle"]["schema_version"] == "kaims.resolution-lifecycle.v4"
+
+
 def test_build_final_incident_payload_preserves_metadata_created_at_and_tenant() -> None:
     module = load_closure_app_module()
     incident_payload = _existing_incident_payload()
@@ -80,7 +105,7 @@ def test_build_final_incident_payload_preserves_metadata_created_at_and_tenant()
         source_contract={},
     )
 
-    assert final_payload["metadata"] == incident_payload["metadata"]
+    _assert_existing_metadata_preserved(final_payload["metadata"], incident_payload["metadata"])
     assert final_payload["metadata"]["incident_candidate"]["correlation_key"] == "2f5c4d0b1a22e52d"
     assert final_payload["metadata"]["jira"]["key"] == "KAN-9999"
     assert final_payload["metadata"]["deduplication"]["occurrence_count"] == 4
@@ -104,7 +129,7 @@ def test_build_final_incident_payload_marks_failed_when_health_not_restored() ->
 
     assert final_payload["status"] == "failed"
     # Metadata must survive a failed closure too, not just a successful one.
-    assert final_payload["metadata"] == incident_payload["metadata"]
+    _assert_existing_metadata_preserved(final_payload["metadata"], incident_payload["metadata"])
     assert final_payload["created_at"] == incident_payload["created_at"]
 
 
@@ -119,7 +144,7 @@ def test_build_final_incident_payload_defaults_metadata_when_no_prior_incident()
         source_contract={},
     )
 
-    assert final_payload["metadata"] == {}
+    assert final_payload["metadata"]["resolution_lifecycle"]["state"] == "closed"
     assert final_payload["tenant_id"] == "default"
     assert "created_at" not in final_payload
 
@@ -138,7 +163,7 @@ def test_build_final_incident_payload_validates_into_incident_model_without_erro
 
     incident = Incident.model_validate(final_payload)
 
-    assert incident.metadata == incident_payload["metadata"]
+    _assert_existing_metadata_preserved(incident.metadata, incident_payload["metadata"])
     assert incident.created_at.isoformat().replace("+00:00", "Z") == incident_payload["created_at"]
     assert incident.tenant_id == "default"
     assert incident.status.value == "closed"
@@ -212,3 +237,18 @@ async def test_jira_transitions_by_done_status_category_after_validated_recovery
     assert result["transitioned"] is True
     assert [call[0] for call in _JiraClient.calls] == ["POST", "GET", "POST"]
     assert _JiraClient.calls[-1][2] == {"transition": {"id": "91"}}
+
+
+@pytest.mark.asyncio
+async def test_manual_closure_comment_is_included_in_jira_details(monkeypatch) -> None:
+    module = load_closure_app_module()
+    _configure_jira(monkeypatch)
+    _JiraClient.transitions = [{"id": "91", "name": "Done"}]
+    report = _report(health_restored=True)
+    report.metadata = {"closure_kind": "manual", "operator_comment": "Known maintenance completed; service owner confirmed recovery."}
+
+    result = await module._sync_closure_to_jira(_existing_incident_payload(), report)
+
+    assert result["transitioned"] is True
+    assert "Operator Closure Comment" in _JiraClient.calls[0][2]["body"]
+    assert "service owner confirmed recovery" in _JiraClient.calls[0][2]["body"]

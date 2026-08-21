@@ -67,7 +67,7 @@ def test_build_event_envelope_exposes_contract_friendly_fields() -> None:
     envelope = build_event_envelope(
         event_type="incident.workflow.selected",
         identity={"incident_id": "inc-1", "trace_id": "tr-1"},
-        scope={"flow_id": "flow-1", "agent": "orchestrator"},
+        scope={"tenant_id": "tenant-a", "flow_id": "flow-1", "agent": "orchestrator"},
         state={"status": "investigating"},
         policy={"risk_tier": "high"},
         transport={"provider": "rabbitmq"},
@@ -109,13 +109,14 @@ def test_incident_contract_accepts_persisted_jira_enrichment() -> None:
 @pytest.mark.asyncio
 async def test_publish_orchestration_event_emits_event_contract() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentsLatencyHigh",
         service="payments",
         severity=AlertSeverity.CRITICAL,
         description="latency increased",
     )
-    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    incident = Incident(tenant_id="tenant-a", service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
     decision = {
         "workflow": "critical-auto-remediation",
         "next_action": "collect-context",
@@ -150,13 +151,14 @@ async def test_publish_orchestration_event_emits_event_contract() -> None:
 @pytest.mark.asyncio
 async def test_context_event_payload_includes_event_contract() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentsLatencyHigh",
         service="payments",
         severity=AlertSeverity.CRITICAL,
         description="latency increased",
     )
-    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    incident = Incident(tenant_id="tenant-a", service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
     context = await ContextIntelligenceAgent().collect(alert, incident)
 
     payload = context_agent_app._build_context_event_payload(
@@ -175,13 +177,14 @@ async def test_context_event_payload_includes_event_contract() -> None:
 @pytest.mark.asyncio
 async def test_resolution_event_payload_includes_event_contract() -> None:
     alert = Alert(
+        tenant_id="tenant-a",
         source="prometheus",
         name="PaymentsLatencyHigh",
         service="payments",
         severity=AlertSeverity.CRITICAL,
         description="latency increased",
     )
-    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    incident = Incident(tenant_id="tenant-a", service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
     context = await ContextIntelligenceAgent().collect(alert, incident)
     recommendation = Recommendation(
         incident_id=context.incident_id,
@@ -216,6 +219,7 @@ def test_approval_event_payload_includes_event_contract() -> None:
     approval = Approval(
         incident_id="11111111-1111-1111-1111-111111111111",
         recommendation_id="22222222-2222-2222-2222-222222222222",
+        tenant_id="tenant-a",
         decision=ApprovalDecision.APPROVED,
         approver="alice",
         channel="web",
@@ -263,6 +267,7 @@ def test_remediation_payload_builder_and_approval_extractor_compatibility() -> N
     assert "event_contract" in payload
     assert payload["event_contract"]["agent"] == "remediation-engine"
     assert payload["event_contract"]["incident_id"] == str(action.incident_id)
+    assert payload["event_contract"]["event_id"] == f"remediation:{action.id}:{action.status.value}"
 
 
 def test_closure_payload_builder_and_action_extractor_compatibility() -> None:
@@ -298,6 +303,7 @@ def test_closure_payload_builder_and_action_extractor_compatibility() -> None:
     assert "event_contract" in payload
     assert payload["event_contract"]["agent"] == "closure-service"
     assert payload["event_contract"]["incident_id"] == str(action.incident_id)
+    assert payload["event_contract"]["event_id"] == f"closure:{action.id}:closed"
 
 
 def test_closure_service_name_prefers_incident_service_over_action_target() -> None:

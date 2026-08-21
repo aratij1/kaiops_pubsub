@@ -142,8 +142,11 @@ def build_control_router(
 
     @router.get("/approval/capacity")
     async def get_approval_capacity(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            raise HTTPException(status_code=401, detail="Authenticated tenant identity is required")
         return await forward(
-            request, "GET", "/capacity", settings.approval_service_url, {}, x_trace_id, timeout_seconds=8.0
+            request, "GET", f"/capacity?{urlencode({'tenant_id': auth.tenant_id})}", settings.approval_service_url, {}, x_trace_id, timeout_seconds=8.0
         )
 
     @router.post("/incidents/{incident_id}/manual-close")
@@ -199,6 +202,26 @@ def build_control_router(
             settings.remediation_engine_url, {}, x_trace_id, timeout_seconds=30.0,
         )
 
+    @router.post("/remediation/actions/{action_id}/emergency-stop")
+    async def remediation_emergency_stop(
+        action_id: str,
+        request: Request,
+        payload: dict[str, Any] = REQUEST_BODY,
+        x_trace_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            raise HTTPException(status_code=401, detail="Authenticated operator identity is required")
+        stop_payload = {
+            "tenant_id": auth.tenant_id,
+            "actor": auth.username or auth.email,
+            "reason": str(payload.get("reason") or "").strip(),
+        }
+        return await forward(
+            request, "POST", f"/actions/{quote(action_id, safe='')}/emergency-stop",
+            settings.remediation_engine_url, stop_payload, x_trace_id, timeout_seconds=30.0,
+        )
+
     @router.get("/remediation/reconciliation/terminal-actions")
     async def remediation_reconciliation_preview(
         request: Request,
@@ -222,12 +245,15 @@ def build_control_router(
         payload: dict[str, Any] = REQUEST_BODY,
         x_trace_id: str | None = Header(default=None),
     ) -> dict[str, Any]:
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            raise HTTPException(status_code=401, detail="Authenticated tenant identity is required")
         return await forward(
             request,
             "PUT",
             f"/capacity/{username}",
             settings.approval_service_url,
-            payload,
+            {**payload, "tenant_id": auth.tenant_id},
             x_trace_id,
             timeout_seconds=8.0,
         )
@@ -236,16 +262,22 @@ def build_control_router(
     async def get_approval_assignments(
         request: Request, x_trace_id: str | None = Header(default=None)
     ) -> dict[str, Any]:
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            raise HTTPException(status_code=401, detail="Authenticated tenant identity is required")
         return await forward(
-            request, "GET", "/assignments", settings.approval_service_url, {}, x_trace_id, timeout_seconds=8.0
+            request, "GET", f"/assignments?{urlencode({'tenant_id': auth.tenant_id})}", settings.approval_service_url, {}, x_trace_id, timeout_seconds=8.0
         )
 
     @router.post("/approval/auto-assign")
     async def post_approval_auto_assign(
         request: Request, payload: dict[str, Any] = REQUEST_BODY, x_trace_id: str | None = Header(default=None)
     ) -> dict[str, Any]:
+        auth = getattr(request.state, "auth", None)
+        if auth is None:
+            raise HTTPException(status_code=401, detail="Authenticated tenant identity is required")
         return await forward(
-            request, "POST", "/auto-assign", settings.approval_service_url, payload, x_trace_id, timeout_seconds=12.0
+            request, "POST", "/auto-assign", settings.approval_service_url, {**payload, "tenant_id": auth.tenant_id}, x_trace_id, timeout_seconds=12.0
         )
 
     @router.post("/copilot/query")

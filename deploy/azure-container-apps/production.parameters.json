@@ -16,6 +16,7 @@
     "serviceBusConnectionSecretUri": { "value": "https://REPLACE.vault.azure.net/secrets/servicebus-connection" },
     "azureBlobConnectionSecretUri": { "value": "https://REPLACE.vault.azure.net/secrets/blob-connection" },
     "remediationInternalTokenSecretUri": { "value": "https://REPLACE.vault.azure.net/secrets/remediation-internal-token" },
+    "eventEnvelopeSigningKeySecretUri": { "value": "https://REPLACE.vault.azure.net/secrets/event-envelope-signing-key" },
     "apps": {
       "value": [
         { "name": "ui", "domain": "platform-api", "image": "REPLACE.azurecr.io/kaiops-ui-aca:latest", "ingress": true, "external": true, "targetPort": 80, "healthPath": "/", "cpu": 0.5, "memory": "1Gi", "minReplicas": 1, "maxReplicas": 3, "queueScale": false, "topic": "", "subscription": "", "env": [] },

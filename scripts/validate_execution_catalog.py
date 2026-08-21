@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,12 @@ def main() -> int:
         if isinstance(connector, dict)
         for operation in connector.get("allowed_operations", [])
     }
+    jenkins_allowlist = (
+        re.compile(r"^kubectl\s+(get|describe|logs)\b.*"),
+        re.compile(r"^kubectl\s+(rollout\s+(restart|undo|status)|scale)\b.*"),
+        re.compile(r"^ansible-playbook\s+playbooks/[A-Za-z0-9_./-]+\.ya?ml\b.*"),
+        re.compile(r'^curl --fail --silent --show-error(?: --output /dev/null)?(?: --retry \d+)?(?: --retry-all-errors)?(?: --retry-connrefused)?(?: --retry-delay \d+)?(?: -X POST)? http://[A-Za-z0-9_.:-]+/[A-Za-z0-9_./?=&-]+$'),
+    )
 
     for command_id, command in command_catalog.items():
         if not isinstance(command, dict):
@@ -57,6 +64,20 @@ def main() -> int:
                 errors.append(f"mutating command {command_id} must set approval_required=true")
             if not str(command.get("rollback") or "").strip():
                 errors.append(f"mutating command {command_id} must define rollback")
+        command_text = str(command.get("command") or "").strip()
+        if command_text.startswith("ansible-playbook "):
+            playbook_path = command_text.split()[1]
+            if not (ROOT / playbook_path).is_file():
+                errors.append(f"command {command_id} references missing Ansible playbook {playbook_path}")
+        allowlist_sample = re.sub(
+            r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}",
+            lambda match: "http://value" if match.group(1).endswith("_url") else "value",
+            command_text,
+        )
+        if command_text.startswith(("kubectl ", "ansible-playbook ", "curl ")) and not any(
+            pattern.fullmatch(allowlist_sample) for pattern in jenkins_allowlist
+        ):
+            errors.append(f"command {command_id} is rejected by the Jenkins command allowlist")
 
     for playbook in playbook_rows:
         if not isinstance(playbook, dict):
@@ -74,6 +95,7 @@ def main() -> int:
             errors.append(f"playbook {playbook_id} missing validation step")
         match = playbook.get("match") if isinstance(playbook.get("match"), dict) else {}
         matched_services = [str(item).strip().lower() for item in match.get("services", []) if str(item).strip()]
+        execution_service = str(playbook.get("execution_service") or "").strip().lower()
         playbook_operations: set[str] = set()
         for step in steps:
             if not isinstance(step, dict):
@@ -87,7 +109,8 @@ def main() -> int:
                 operation = str(command.get("operation") or "").strip()
                 if operation:
                     playbook_operations.add(operation)
-        for service in matched_services:
+        connector_services = [execution_service] if execution_service else matched_services
+        for service in connector_services:
             connector = connector_catalog.get(service) or connector_catalog.get(connectors.get("default_connector"))
             if not isinstance(connector, dict):
                 errors.append(f"playbook {playbook_id} service {service} has no connector or default connector")

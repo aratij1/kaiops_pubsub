@@ -10,7 +10,7 @@ class ShopperUser(HttpUser):
 
     @task(2)
     def view_product(self):
-        self.client.get("/api/catalogue/product/837ab141-399e-4c1f-9abc-bace40296bac")
+        self.client.get("/api/catalogue/provduct/837ab141-399e-4c1f-9abc-bace40296bac")
 
     @task(1)
     def check_cart(self):

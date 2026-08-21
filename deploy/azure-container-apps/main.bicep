@@ -25,6 +25,8 @@ param serviceBusConnectionSecretUri string
 param azureBlobConnectionSecretUri string
 @secure()
 param remediationInternalTokenSecretUri string
+@secure()
+param eventEnvelopeSigningKeySecretUri string
 
 @description('Existing KaiOps-compatible processes. Domain is metadata; it does not merge runtimes.')
 param apps array
@@ -121,6 +123,7 @@ resource containerApps 'Microsoft.App/containerApps@2024-03-01' = [for app in ap
         { name: 'servicebus-connection', keyVaultUrl: serviceBusConnectionSecretUri, identity: identity.id }
         { name: 'blob-connection', keyVaultUrl: azureBlobConnectionSecretUri, identity: identity.id }
         { name: 'remediation-internal-token', keyVaultUrl: remediationInternalTokenSecretUri, identity: identity.id }
+        { name: 'event-envelope-signing-key', keyVaultUrl: eventEnvelopeSigningKeySecretUri, identity: identity.id }
       ]
     }
     template: {
@@ -138,6 +141,9 @@ resource containerApps 'Microsoft.App/containerApps@2024-03-01' = [for app in ap
           { name: 'OIDC_ISSUER', value: oidcIssuer }
           { name: 'OIDC_AUDIENCE', value: oidcAudience }
           { name: 'OIDC_CLIENT_ID', value: oidcClientId }
+          { name: 'EVENT_ENVELOPE_SIGNING_REQUIRED', value: 'true' }
+          { name: 'EVENT_ENVELOPE_SIGNING_KEY', secretRef: 'event-envelope-signing-key' }
+          { name: 'EVENT_ENVELOPE_SIGNING_ISSUER', value: app.name }
           { name: 'DATABASE_URL', secretRef: 'database-url' }
           { name: 'DB', value: 'mysql' }
           { name: 'DB_DATABASE', value: mysqlDatabase }

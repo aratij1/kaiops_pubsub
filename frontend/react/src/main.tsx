@@ -3,11 +3,8 @@ import ReactDOM from "react-dom/client";
 
 import { App } from "./app/App";
 import "./styles/tokens.css";
-import "./datamatics-base.css";
-import "./datamatics-light.css";
-import "./datamatics-dark.css";
-// KaiMS product styles load last so legacy compatibility themes cannot
-// unpredictably override the branded component system.
+// The semantic KaiMS system supersedes the removed Datamatics compatibility
+// themes; retaining them created three competing token and surface cascades.
 import "./styles.css";
 
 const root = document.getElementById("root");
