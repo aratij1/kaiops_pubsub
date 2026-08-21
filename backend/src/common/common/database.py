@@ -952,6 +952,39 @@ class ServiceReadinessScoreRecord(Base, TimestampMixin):
     version: Mapped[int] = mapped_column(Integer, default=1)
 
 
+class ServiceOnboardingProfileRecord(Base, TimestampMixin):
+    __tablename__ = "service_onboarding_profiles"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "project_id", "service_id", "environment", name="uq_service_onboarding_scope"),
+        Index("idx_service_onboarding_state", "tenant_id", "project_id", "environment", "onboarding_state"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    service_id: Mapped[str] = mapped_column(String(128), index=True)
+    environment: Mapped[str] = mapped_column(String(64), index=True)
+    template_id: Mapped[str] = mapped_column(String(128), index=True)
+    onboarding_state: Mapped[str] = mapped_column(String(32), default="DRAFT", index=True)
+    business_criticality: Mapped[str] = mapped_column(String(32), default="medium", index=True)
+    owners: Mapped[list[str]] = mapped_column(JSON, default=list)
+    support_groups: Mapped[list[str]] = mapped_column(JSON, default=list)
+    connection_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    telemetry: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    slos: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    business_kpis: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    change_sources: Mapped[list[str]] = mapped_column(JSON, default=list)
+    knowledge_refs: Mapped[list[str]] = mapped_column(JSON, default=list)
+    diagnostic_capabilities: Mapped[list[str]] = mapped_column(JSON, default=list)
+    remediation_capabilities: Mapped[list[str]] = mapped_column(JSON, default=list)
+    validation_rules: Mapped[list[str]] = mapped_column(JSON, default=list)
+    escalation_policies: Mapped[list[str]] = mapped_column(JSON, default=list)
+    hitl_policy: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    dependencies: Mapped[list[str]] = mapped_column(JSON, default=list)
+    metadata_payload: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
 class CloudAuditEventRecord(Base):
     __tablename__ = "cloud_audit_events"
     __table_args__ = (

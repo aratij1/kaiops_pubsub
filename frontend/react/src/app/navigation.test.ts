@@ -35,6 +35,7 @@ describe("authoritative navigation", () => {
   it("uses the same permitted registry for global navigation search", () => {
     expect(searchNavigation("connectors", "administrator").map((item) => item.id)).toEqual(["applications"]);
     expect(searchNavigation("cloud topology", "administrator").map((item) => item.id)).toEqual(["cloudResources"]);
+    expect(searchNavigation("service readiness", "administrator").map((item) => item.id)).toEqual(["operationsCockpit", "services"]);
     expect(searchNavigation("connectors", "hitl_reviewer")).toEqual([]);
     expect(searchNavigation("human gate", "administrator").map((item) => item.id)).toEqual(["approvals"]);
   });

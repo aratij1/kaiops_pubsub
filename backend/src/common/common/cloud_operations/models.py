@@ -38,6 +38,14 @@ class DiscoveryStatus(StrEnum):
     FAILED = "failed"
 
 
+class ServiceOnboardingState(StrEnum):
+    DRAFT = "DRAFT"
+    DISCOVERED = "DISCOVERED"
+    OBSERVABLE = "OBSERVABLE"
+    INCIDENT_READY = "INCIDENT_READY"
+    OPERABLE = "OPERABLE"
+
+
 class ResourceStatus(StrEnum):
     ACTIVE = "active"
     CHANGED = "changed"
@@ -211,3 +219,44 @@ class ServiceResourceMappingCreate(BaseModel):
     @classmethod
     def mapping_tenant_is_verified(cls, value: str) -> str:
         return require_tenant_id(value, source="cloud operations service mapping")
+
+
+class ServiceOnboardingProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    project_id: str = Field(min_length=1, max_length=128)
+    service_id: str = Field(min_length=1, max_length=128)
+    environment: str = Field(default="prod", min_length=1, max_length=64)
+    template_id: str = Field(default="kubernetes_microservice", max_length=128)
+    business_criticality: Literal["low", "medium", "high", "critical"] = "medium"
+    owners: list[str] = Field(default_factory=list)
+    support_groups: list[str] = Field(default_factory=list)
+    connection_ids: list[str] = Field(default_factory=list)
+    monitoring_sources: list[str] = Field(default_factory=list)
+    log_sources: list[str] = Field(default_factory=list)
+    metric_sources: list[str] = Field(default_factory=list)
+    trace_sources: list[str] = Field(default_factory=list)
+    event_sources: list[str] = Field(default_factory=list)
+    slos: list[dict[str, Any]] = Field(default_factory=list)
+    business_kpis: list[dict[str, Any]] = Field(default_factory=list)
+    change_sources: list[str] = Field(default_factory=list)
+    knowledge_refs: list[str] = Field(default_factory=list)
+    diagnostic_capabilities: list[str] = Field(default_factory=list)
+    remediation_capabilities: list[str] = Field(default_factory=list)
+    validation_rules: list[str] = Field(default_factory=list)
+    escalation_policies: list[str] = Field(default_factory=list)
+    hitl_policy: dict[str, Any] = Field(default_factory=dict)
+    dependencies: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    actor: str = Field(default="system", max_length=255)
+
+    @field_validator("tenant_id")
+    @classmethod
+    def onboarding_tenant_is_verified(cls, value: str) -> str:
+        return require_tenant_id(value, source="cloud operations service onboarding")
+
+    @field_validator("owners", "support_groups", "connection_ids", "monitoring_sources", "log_sources", "metric_sources", "trace_sources", "event_sources", "change_sources", "knowledge_refs", "diagnostic_capabilities", "remediation_capabilities", "validation_rules", "escalation_policies", "dependencies")
+    @classmethod
+    def compact_string_list(cls, values: list[str]) -> list[str]:
+        return [item for item in (str(value).strip() for value in values) if item]

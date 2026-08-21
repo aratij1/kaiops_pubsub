@@ -1,7 +1,7 @@
 ﻿import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Archive, BookOpen, Bot, Boxes, ChartNoAxesCombined, CircleCheckBig, Cloud, Database, Gauge, PlugZap, RadioTower, ScrollText, Server, Settings, ShieldCheck, Siren, Workflow } from "lucide-react";
+import { Archive, BookOpen, Bot, Boxes, ChartNoAxesCombined, CircleCheckBig, ClipboardCheck, Cloud, Database, Gauge, PlugZap, RadioTower, ScrollText, Server, Settings, ShieldCheck, Siren, Workflow } from "lucide-react";
 import { alertRowsQueryOptions, landingPadRowsQueryOptions } from "./services/alerts";
 import { useOperationalEvents } from "./services/operationalEvents";
 import { beginOidcLogin, completeOidcLogin } from "./services/oidcClient";
@@ -231,8 +231,10 @@ const NAVIGATION_ICONS = {
   audit: ScrollText,
   closed: Archive,
   applications: Boxes,
+  operationsCockpit: ChartNoAxesCombined,
   cloudConnections: Cloud,
   cloudResources: Server,
+  serviceOnboarding: ClipboardCheck,
   services: Gauge,
   integrations: PlugZap,
   admin: Settings,

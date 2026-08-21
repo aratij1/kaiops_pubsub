@@ -17,6 +17,8 @@ from common.cloud_operations.models import (
     DiscoveryResult,
     DiscoveryStatus,
     ResourceRelationship,
+    ServiceOnboardingProfile,
+    ServiceOnboardingState,
 )
 from common.database import (
     CloudAuditEventRecord,
@@ -25,6 +27,7 @@ from common.database import (
     DiscoveryRunRecord,
     ProviderConnectionRecord,
     ResourceRelationshipRecord,
+    ServiceOnboardingProfileRecord,
     ServiceReadinessScoreRecord,
     ServiceResourceMappingRecord,
 )
@@ -340,6 +343,175 @@ class CloudOperationsRepository:
         await self.session.flush()
         return rows
 
+    async def upsert_service_onboarding(self, profile: ServiceOnboardingProfile) -> ServiceOnboardingProfileRecord:
+        existing = (
+            await self.session.execute(
+                select(ServiceOnboardingProfileRecord).where(
+                    ServiceOnboardingProfileRecord.tenant_id == profile.tenant_id,
+                    ServiceOnboardingProfileRecord.project_id == profile.project_id,
+                    ServiceOnboardingProfileRecord.service_id == profile.service_id,
+                    ServiceOnboardingProfileRecord.environment == profile.environment,
+                )
+            )
+        ).scalar_one_or_none()
+        telemetry = {
+            "monitoring_sources": profile.monitoring_sources,
+            "log_sources": profile.log_sources,
+            "metric_sources": profile.metric_sources,
+            "trace_sources": profile.trace_sources,
+            "event_sources": profile.event_sources,
+        }
+        if existing is None:
+            existing = ServiceOnboardingProfileRecord(
+                tenant_id=profile.tenant_id,
+                project_id=profile.project_id,
+                service_id=profile.service_id,
+                environment=profile.environment,
+                template_id=profile.template_id,
+                business_criticality=profile.business_criticality,
+                owners=profile.owners,
+                support_groups=profile.support_groups,
+                connection_ids=profile.connection_ids,
+                telemetry=telemetry,
+                slos=profile.slos,
+                business_kpis=profile.business_kpis,
+                change_sources=profile.change_sources,
+                knowledge_refs=profile.knowledge_refs,
+                diagnostic_capabilities=profile.diagnostic_capabilities,
+                remediation_capabilities=profile.remediation_capabilities,
+                validation_rules=profile.validation_rules,
+                escalation_policies=profile.escalation_policies,
+                hitl_policy=profile.hitl_policy,
+                dependencies=profile.dependencies,
+                metadata_payload=profile.metadata,
+            )
+            self.session.add(existing)
+        else:
+            existing.template_id = profile.template_id
+            existing.business_criticality = profile.business_criticality
+            existing.owners = profile.owners
+            existing.support_groups = profile.support_groups
+            existing.connection_ids = profile.connection_ids
+            existing.telemetry = telemetry
+            existing.slos = profile.slos
+            existing.business_kpis = profile.business_kpis
+            existing.change_sources = profile.change_sources
+            existing.knowledge_refs = profile.knowledge_refs
+            existing.diagnostic_capabilities = profile.diagnostic_capabilities
+            existing.remediation_capabilities = profile.remediation_capabilities
+            existing.validation_rules = profile.validation_rules
+            existing.escalation_policies = profile.escalation_policies
+            existing.hitl_policy = profile.hitl_policy
+            existing.dependencies = profile.dependencies
+            existing.metadata_payload = profile.metadata
+            existing.version = int(existing.version or 1) + 1
+        await self.audit(
+            tenant_id=profile.tenant_id,
+            project_id=profile.project_id,
+            actor=profile.actor,
+            action="service.onboarding.updated",
+            resource_type="service",
+            resource_id=profile.service_id,
+            payload=self.onboarding_payload(existing),
+        )
+        await self.session.flush()
+        return existing
+
+    async def get_service_onboarding(
+        self,
+        *,
+        tenant_id: str,
+        project_id: str,
+        service_id: str,
+        environment: str,
+    ) -> ServiceOnboardingProfileRecord | None:
+        return (
+            await self.session.execute(
+                select(ServiceOnboardingProfileRecord).where(
+                    ServiceOnboardingProfileRecord.tenant_id == tenant_id,
+                    ServiceOnboardingProfileRecord.project_id == project_id,
+                    ServiceOnboardingProfileRecord.service_id == service_id,
+                    ServiceOnboardingProfileRecord.environment == environment,
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def recalculate_readiness(
+        self,
+        *,
+        tenant_id: str,
+        project_id: str,
+        service_id: str,
+        environment: str,
+        actor: str = "system",
+    ) -> ServiceReadinessScoreRecord:
+        profile = await self.get_service_onboarding(
+            tenant_id=tenant_id,
+            project_id=project_id,
+            service_id=service_id,
+            environment=environment,
+        )
+        resources = await self.list_resources(tenant_id=tenant_id, project_id=project_id, service_id=service_id, environment=environment)
+        resource_ids = {str(row.id) for row in resources}
+        relationships = await self._relationships_for_resources(tenant_id=tenant_id, project_id=project_id, resource_ids=resource_ids)
+        telemetry = dict(profile.telemetry or {}) if profile else {}
+        scores = {
+            "ownership": _score(bool(profile and profile.owners), bool(profile and profile.support_groups)),
+            "resource_coverage": _score(bool(resources), len(resources) >= 3),
+            "telemetry": _score(
+                bool(telemetry.get("monitoring_sources")),
+                bool(telemetry.get("metric_sources")),
+                bool(telemetry.get("log_sources") or telemetry.get("trace_sources") or telemetry.get("event_sources")),
+            ),
+            "topology": _score(bool(relationships), len(relationships) >= max(1, len(resources) - 1)),
+            "knowledge": _score(bool(profile and profile.knowledge_refs), bool(profile and profile.escalation_policies)),
+            "diagnostics": _score(bool(profile and profile.diagnostic_capabilities)),
+            "automation": _score(bool(profile and profile.remediation_capabilities), bool(profile and profile.hitl_policy)),
+            "validation": _score(bool(profile and profile.validation_rules), bool(profile and profile.slos)),
+            "security": _score(bool(profile and profile.connection_ids), bool(profile and profile.hitl_policy)),
+        }
+        overall = round(sum(scores.values()) / len(scores), 4)
+        state = self._readiness_state(overall, scores, bool(resources), bool(telemetry.get("monitoring_sources")))
+        existing = (
+            await self.session.execute(
+                select(ServiceReadinessScoreRecord).where(
+                    ServiceReadinessScoreRecord.tenant_id == tenant_id,
+                    ServiceReadinessScoreRecord.project_id == project_id,
+                    ServiceReadinessScoreRecord.service_id == service_id,
+                    ServiceReadinessScoreRecord.environment == environment,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            existing = ServiceReadinessScoreRecord(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                service_id=service_id,
+                environment=environment,
+                readiness_state=state.value,
+                overall_score=overall,
+                scores=scores,
+            )
+            self.session.add(existing)
+        else:
+            existing.readiness_state = state.value
+            existing.overall_score = overall
+            existing.scores = scores
+            existing.version = int(existing.version or 1) + 1
+        if profile:
+            profile.onboarding_state = state.value
+        await self.audit(
+            tenant_id=tenant_id,
+            project_id=project_id,
+            actor=actor,
+            action="service.readiness.changed",
+            resource_type="service",
+            resource_id=service_id,
+            payload={"environment": environment, "readiness_state": state.value, "overall_score": overall, "scores": scores},
+        )
+        await self.session.flush()
+        return existing
+
     async def service_360(self, *, tenant_id: str, project_id: str, service_id: str, environment: str | None = None) -> dict[str, Any]:
         resources = await self.list_resources(
             tenant_id=tenant_id,
@@ -348,15 +520,7 @@ class CloudOperationsRepository:
             environment=environment,
         )
         resource_ids = {str(row.id) for row in resources}
-        relationship_stmt = select(ResourceRelationshipRecord).where(
-            ResourceRelationshipRecord.tenant_id == tenant_id,
-            ResourceRelationshipRecord.project_id == project_id,
-        )
-        relationships = [
-            row
-            for row in (await self.session.execute(relationship_stmt)).scalars().all()
-            if row.source_resource_id in resource_ids or row.target_resource_id in resource_ids
-        ]
+        relationships = await self._relationships_for_resources(tenant_id=tenant_id, project_id=project_id, resource_ids=resource_ids)
         health_counts: dict[str, int] = {}
         for row in resources:
             status = str((row.health or {}).get("status") or row.status or "unknown")
@@ -379,8 +543,89 @@ class CloudOperationsRepository:
             "resources": [self.resource_payload(row) for row in resources],
             "relationships": [self.relationship_payload(row) for row in relationships],
             "readiness": dict(score.scores or {}) if score else {},
+            "overall_score": float(score.overall_score or 0.0) if score else 0.0,
             "readiness_state": score.readiness_state if score else "DRAFT",
         }
+
+    async def topology(self, *, tenant_id: str, project_id: str, service_id: str, environment: str | None = None) -> dict[str, Any]:
+        resources = await self.list_resources(tenant_id=tenant_id, project_id=project_id, service_id=service_id, environment=environment)
+        resource_ids = {str(row.id) for row in resources}
+        relationships = await self._relationships_for_resources(tenant_id=tenant_id, project_id=project_id, resource_ids=resource_ids)
+        return {
+            "nodes": [self.resource_payload(row) for row in resources],
+            "edges": [self.relationship_payload(row) for row in relationships],
+        }
+
+    async def cockpit(self, *, tenant_id: str, project_id: str | None = None, environment: str | None = None) -> dict[str, Any]:
+        resources = await self.list_resources(tenant_id=tenant_id, project_id=project_id, environment=environment)
+        readiness_stmt = select(ServiceReadinessScoreRecord).where(ServiceReadinessScoreRecord.tenant_id == tenant_id)
+        if project_id:
+            readiness_stmt = readiness_stmt.where(ServiceReadinessScoreRecord.project_id == project_id)
+        if environment:
+            readiness_stmt = readiness_stmt.where(ServiceReadinessScoreRecord.environment == environment)
+        readiness_rows = list((await self.session.execute(readiness_stmt)).scalars().all())
+        health: dict[str, int] = {}
+        by_provider: dict[str, int] = {}
+        by_environment: dict[str, int] = {}
+        for row in resources:
+            health_key = str((row.health or {}).get("status") or row.status or "unknown")
+            health[health_key] = health.get(health_key, 0) + 1
+            by_provider[row.provider] = by_provider.get(row.provider, 0) + 1
+            by_environment[row.environment] = by_environment.get(row.environment, 0) + 1
+        return {
+            "resource_count": len(resources),
+            "service_count": len({(row.project_id, row.service_id, row.environment) for row in resources}),
+            "health": health,
+            "by_provider": by_provider,
+            "by_environment": by_environment,
+            "readiness": [
+                {
+                    "project_id": row.project_id,
+                    "service_id": row.service_id,
+                    "environment": row.environment,
+                    "readiness_state": row.readiness_state,
+                    "overall_score": float(row.overall_score or 0.0),
+                    "scores": row.scores or {},
+                }
+                for row in readiness_rows
+            ],
+        }
+
+    async def _relationships_for_resources(
+        self,
+        *,
+        tenant_id: str,
+        project_id: str,
+        resource_ids: set[str],
+    ) -> list[ResourceRelationshipRecord]:
+        if not resource_ids:
+            return []
+        relationship_stmt = select(ResourceRelationshipRecord).where(
+            ResourceRelationshipRecord.tenant_id == tenant_id,
+            ResourceRelationshipRecord.project_id == project_id,
+        )
+        return [
+            row
+            for row in (await self.session.execute(relationship_stmt)).scalars().all()
+            if row.source_resource_id in resource_ids or row.target_resource_id in resource_ids
+        ]
+
+    @staticmethod
+    def _readiness_state(
+        overall: float,
+        scores: dict[str, float],
+        has_resources: bool,
+        has_monitoring: bool,
+    ) -> ServiceOnboardingState:
+        if overall >= 0.82 and scores["automation"] >= 0.5 and scores["validation"] >= 0.5:
+            return ServiceOnboardingState.OPERABLE
+        if overall >= 0.68 and scores["knowledge"] >= 0.5 and scores["security"] >= 0.5:
+            return ServiceOnboardingState.INCIDENT_READY
+        if has_resources and has_monitoring and overall >= 0.45:
+            return ServiceOnboardingState.OBSERVABLE
+        if has_resources:
+            return ServiceOnboardingState.DISCOVERED
+        return ServiceOnboardingState.DRAFT
 
     async def audit(
         self,
@@ -448,3 +693,45 @@ class CloudOperationsRepository:
             "owner_confirmed": bool(row.owner_confirmed),
             "discovered_at": row.discovered_at.isoformat() if isinstance(row.discovered_at, datetime) else None,
         }
+
+    @staticmethod
+    def onboarding_payload(row: ServiceOnboardingProfileRecord) -> dict[str, Any]:
+        telemetry = dict(row.telemetry or {})
+        return {
+            "id": str(row.id),
+            "tenant_id": row.tenant_id,
+            "project_id": row.project_id,
+            "service_id": row.service_id,
+            "environment": row.environment,
+            "template_id": row.template_id,
+            "onboarding_state": row.onboarding_state,
+            "business_criticality": row.business_criticality,
+            "owners": row.owners or [],
+            "support_groups": row.support_groups or [],
+            "connection_ids": row.connection_ids or [],
+            "monitoring_sources": telemetry.get("monitoring_sources", []),
+            "log_sources": telemetry.get("log_sources", []),
+            "metric_sources": telemetry.get("metric_sources", []),
+            "trace_sources": telemetry.get("trace_sources", []),
+            "event_sources": telemetry.get("event_sources", []),
+            "slos": row.slos or [],
+            "business_kpis": row.business_kpis or [],
+            "change_sources": row.change_sources or [],
+            "knowledge_refs": row.knowledge_refs or [],
+            "diagnostic_capabilities": row.diagnostic_capabilities or [],
+            "remediation_capabilities": row.remediation_capabilities or [],
+            "validation_rules": row.validation_rules or [],
+            "escalation_policies": row.escalation_policies or [],
+            "hitl_policy": row.hitl_policy or {},
+            "dependencies": row.dependencies or [],
+            "metadata": row.metadata_payload or {},
+            "version": row.version,
+            "created_at": row.created_at.isoformat() if isinstance(row.created_at, datetime) else None,
+            "updated_at": row.updated_at.isoformat() if isinstance(row.updated_at, datetime) else None,
+        }
+
+
+def _score(*checks: bool) -> float:
+    if not checks:
+        return 0.0
+    return round(sum(1 for check in checks if check) / len(checks), 4)

@@ -1833,6 +1833,22 @@ async def list_cloud_capabilities(
     )
 
 
+@app.get("/cloud-ops/onboarding/templates")
+async def list_cloud_onboarding_templates(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    _: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/onboarding/templates",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.post("/cloud-ops/connections/{connection_id}/validate")
 async def validate_cloud_connection(
     connection_id: str,
@@ -1899,6 +1915,29 @@ async def list_cloud_resources(
     )
 
 
+@app.get("/cloud-ops/cockpit")
+async def cloud_operations_cockpit(
+    request: Request,
+    project_id: str | None = None,
+    environment: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params = {"tenant_id": tenant_id}
+    if project_id:
+        params["project_id"] = project_id
+    if environment:
+        params["environment"] = environment
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/cockpit?{urlencode(params)}",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.post("/cloud-ops/services/{service_id}/map")
 async def map_cloud_service_resources(
     service_id: str,
@@ -1936,6 +1975,66 @@ async def cloud_service_360(
         path=f"/services/{quote(service_id, safe='')}/360?{urlencode(params)}",
         target_base=settings.cloud_operations_url,
         payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/cloud-ops/services/{service_id}/topology")
+async def cloud_service_topology(
+    service_id: str,
+    request: Request,
+    project_id: str,
+    environment: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params = {"tenant_id": tenant_id, "project_id": project_id}
+    if environment:
+        params["environment"] = environment
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/services/{quote(service_id, safe='')}/topology?{urlencode(params)}",
+        target_base=settings.cloud_operations_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.put("/cloud-ops/services/{service_id}/onboarding")
+async def upsert_cloud_service_onboarding(
+    service_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    scoped_payload = {**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"}
+    return await guarded_proxy(
+        request=request,
+        method="PUT",
+        path=f"/services/{quote(service_id, safe='')}/onboarding",
+        target_base=settings.cloud_operations_url,
+        payload=scoped_payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/cloud-ops/services/{service_id}/readiness/recalculate")
+async def recalculate_cloud_service_readiness(
+    service_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+) -> dict[str, Any]:
+    scoped_payload = {**payload, "tenant_id": auth.tenant_id, "actor": auth.username or "admin"}
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/services/{quote(service_id, safe='')}/readiness/recalculate",
+        target_base=settings.cloud_operations_url,
+        payload=scoped_payload,
         trace_id=trace_id_from_header(x_trace_id),
     )
 

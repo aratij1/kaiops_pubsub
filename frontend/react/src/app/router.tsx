@@ -19,8 +19,10 @@ const ExecutiveRoute = resilientLazy(() => import("../routes/executive/Executive
 const AdminRoute = resilientLazy(() => import("../routes/admin/AdminRoute"));
 const AuditRoute = resilientLazy(() => import("../routes/audit/AuditRoute"));
 const ApplicationsRoute = resilientLazy(() => import("../routes/applications/ApplicationsRoute"));
+const OperationsCockpitRoute = resilientLazy(() => import("../routes/cloud-ops/OperationsCockpitRoute"));
 const CloudConnectionsRoute = resilientLazy(() => import("../routes/cloud-ops/CloudConnectionsRoute"));
 const CloudResourcesRoute = resilientLazy(() => import("../routes/cloud-ops/CloudResourcesRoute"));
+const ServiceOnboardingRoute = resilientLazy(() => import("../routes/cloud-ops/ServiceOnboardingRoute"));
 const Service360Route = resilientLazy(() => import("../routes/cloud-ops/Service360Route"));
 const IntegrationsRoute = resilientLazy(() => import("../routes/integrations/IntegrationsRoute"));
 
@@ -44,8 +46,10 @@ const ROUTE_COMPONENTS: Readonly<Record<NavigationId, ComponentType>> = {
   audit: AuditRoute,
   closed: ClosedIncidentsRoute,
   applications: ApplicationsRoute,
+  operationsCockpit: OperationsCockpitRoute,
   cloudConnections: CloudConnectionsRoute,
   cloudResources: CloudResourcesRoute,
+  serviceOnboarding: ServiceOnboardingRoute,
   services: Service360Route,
   integrations: IntegrationsRoute,
   admin: AdminRoute,
