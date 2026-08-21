@@ -1,0 +1,39 @@
+{
+  "draft_id": "evidence-2bbddc73-12ea-4635-977c-5dd0b685ea99",
+  "status": "draft",
+  "alert_id": "2bbddc73-12ea-4635-977c-5dd0b685ea99",
+  "incident_id": "84ae2b2c-8489-47ea-a193-9ea2d97c911c",
+  "alert_type": "TEST_KAIOPS_RUNTIME_REUSE_CHECK",
+  "severity": "critical",
+  "title": "Evidence review: TEST_KAIOPS_RUNTIME_REUSE_CHECK",
+  "content": "## Alert\nTEST_KAIOPS_RUNTIME_REUSE_CHECK on kaiops-reuse-probe (test)\n\n## Evidence-backed summary\nEvidence was retrieved; model synthesis was unavailable.\n\n## Hypotheses\n- No grounded hypothesis was produced.\n\n## Collected evidence\n- [TICKET-6bf6e1858fcec59f] ticket: KAN-1601 kaiops-reuse-probe: TEST_KAIOPS_RUNTIME_REUSE_CHECK; type=Bug; status=To Do; priority=Medium; updated=2026-08-17T13:31:17.212+0530; labels=kaiops-candidate-00b143d1c177abae3be5c69652663517,kaiops-severity-critical,managed_by_kaiops; description=AI-discovered incident Service: kaiops-reuse-probe Environment: test Category: application-error Final severity: critical Confidence: 0.8 Initial hypothesis The kaiops-reuse-probe signal is likely caused by a application-error condition. Business impact Customers may be unable to complete the affected business journey. Evidence [{\"evidence_id\": \"alert:2bbddc73-12ea-4635-977c-5dd0b685ea99\", \"source (https://kaiops-test.atlassian.net/browse/KAN-1601)\n- [MYSQL-dd8a0ab86d53095c] mysql: table=incident_projections {\"incident_id\": \"84ae2b2c848947eaa1939ea2d97c911c\", \"alert_id\": \"2bbddc7312ea4635977c5dd0b685ea99\", \"trace_id\": \"9926523b1e664c0b9c77a11482a4b194\", \"recommendation_id\": null, \"flow_id\": null, \"tenant_id\": \"default\", \"service\": \"kaiops-reuse-probe\", \"environment\": \"test\", \"severity\": \"critical\", \"status\": \"investigating\", \"owner\": null, \"risk_tier\": \"unknown\", \"execution_mode\": \"unknown\", \"requires_approval\": 0, \"policy_version\": null, \"policy_reason\": \"alert enriched and incident opened\", \"transport_provider\": \"unknown\", \"latest_event_id\": \"424dd4cb3ea84e5e850d9735731b25bd\", \"latest_event_type\": \"incident.alert.e (mysql://kaiops/incident_projections#row=2bbddc7312ea4635977c5dd0b685ea99)\n- [MYSQL-2616f1197b2dd617] mysql: table=incidents {\"id\": \"84ae2b2c848947eaa1939ea2d97c911c\", \"tenant_id\": \"default\", \"service\": \"kaiops-reuse-probe\", \"environment\": \"test\", \"severity\": \"critical\", \"status\": \"investigating\", \"title\": \"kaiops-reuse-probe: TEST_KAIOPS_RUNTIME_REUSE_CHECK\", \"ticket_id\": null, \"payload\": \"{\\\"id\\\": \\\"84ae2b2c-8489-47ea-a193-9ea2d97c911c\\\", \\\"title\\\": \\\"kaiops-reuse-probe: TEST_KAIOPS_RUNTIME_REUSE_CHECK\\\", \\\"status\\\": \\\"investigating\\\", \\\"service\\\": \\\"kaiops-reuse-probe\\\", \\\"summary\\\": \\\"Controlled local runtime verification reuse-probe: authentication failed and data loss detected in kaiops-reuse-probe\\\", \\\"jira_key\\\": null, \\\"jira_u (mysql://kaiops/incidents#row=84ae2b2c848947eaa1939ea2d97c911c)",
+  "services": [
+    "kaiops-reuse-probe"
+  ],
+  "evidence_ids": [
+    "TICKET-6bf6e1858fcec59f",
+    "MYSQL-dd8a0ab86d53095c",
+    "MYSQL-2616f1197b2dd617"
+  ],
+  "source_uris": [
+    "https://kaiops-test.atlassian.net/browse/KAN-1601",
+    "mysql://kaiops/incident_projections#row=2bbddc7312ea4635977c5dd0b685ea99",
+    "mysql://kaiops/incidents#row=84ae2b2c848947eaa1939ea2d97c911c"
+  ],
+  "created_at": "2026-08-17T08:04:51.636346+00:00",
+  "updated_at": "2026-08-17T08:04:51.636346+00:00",
+  "reviewed_by": null,
+  "review_notes": null,
+  "approved_by": null,
+  "approved_at": null,
+  "rag_document_path": null,
+  "evidence_relevance": {
+    "verified": true,
+    "identity_terms": [
+      "kaiops-reuse-probe",
+      "test_kaiops_runtime_reuse_check"
+    ],
+    "relevant_count": 3,
+    "retrieved_count": 12
+  }
+}

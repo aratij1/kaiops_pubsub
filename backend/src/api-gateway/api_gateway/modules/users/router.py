@@ -121,7 +121,7 @@ async def list_users(
     search: str | None = None,
     role_id: int | None = None,
     status: str | None = None,
-    _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
     user_service: UserService = Depends(get_user_service),
 ):
     safe_page = max(1, int(page))
@@ -134,6 +134,7 @@ async def list_users(
         status=status,
         sort_by=sort_by,
         sort_dir=sort_dir,
+        tenant_id=auth.tenant_id,
     )
     return UsersListResponse(rows=[UserRead(**row) for row in rows], count=total, page=safe_page, page_size=safe_page_size)
 
@@ -141,10 +142,10 @@ async def list_users(
 @router.get("/users/{user_id}", response_model=UserRead)
 async def get_user(
     user_id: int,
-    _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
     user_service: UserService = Depends(get_user_service),
 ):
-    return UserRead(**(await user_service.get_user(user_id)))
+    return UserRead(**(await user_service.get_user(user_id, tenant_id=auth.tenant_id)))
 
 
 @router.post("/users", response_model=UserRead)
@@ -155,7 +156,13 @@ async def create_user(
     user_service: UserService = Depends(get_user_service),
 ):
     ip_address = request.client.host if request.client else None
-    return UserRead(**(await user_service.create_user(actor=str(auth.user_id), payload=payload, ip_address=ip_address)))
+    return UserRead(
+        **(
+            await user_service.create_user(
+                actor=str(auth.user_id), tenant_id=auth.tenant_id, payload=payload, ip_address=ip_address
+            )
+        )
+    )
 
 
 @router.put("/users/{user_id}", response_model=UserRead)
@@ -168,7 +175,15 @@ async def update_user(
 ):
     ip_address = request.client.host if request.client else None
     return UserRead(
-        **(await user_service.update_user(actor=str(auth.user_id), user_id=user_id, payload=payload, ip_address=ip_address))
+        **(
+            await user_service.update_user(
+                actor=str(auth.user_id),
+                tenant_id=auth.tenant_id,
+                user_id=user_id,
+                payload=payload,
+                ip_address=ip_address,
+            )
+        )
     )
 
 
@@ -180,7 +195,9 @@ async def delete_user(
     user_service: UserService = Depends(get_user_service),
 ):
     ip_address = request.client.host if request.client else None
-    return await user_service.delete_user(actor=str(auth.user_id), user_id=user_id, ip_address=ip_address)
+    return await user_service.delete_user(
+        actor=str(auth.user_id), tenant_id=auth.tenant_id, user_id=user_id, ip_address=ip_address
+    )
 
 
 @router.patch("/users/{user_id}/status", response_model=UserRead)
@@ -196,6 +213,7 @@ async def update_user_status(
         **(
             await user_service.set_user_status(
                 actor=str(auth.user_id),
+                tenant_id=auth.tenant_id,
                 user_id=user_id,
                 status=payload.status,
                 is_active=payload.is_active,
@@ -216,6 +234,7 @@ async def reset_password(
     ip_address = request.client.host if request.client else None
     return await user_service.reset_password(
         actor=str(auth.user_id),
+        tenant_id=auth.tenant_id,
         user_id=user_id,
         new_password=payload.new_password,
         ip_address=ip_address,
@@ -230,7 +249,9 @@ async def unlock_user(
     user_service: UserService = Depends(get_user_service),
 ):
     ip_address = request.client.host if request.client else None
-    return await user_service.unlock_user(actor=str(auth.user_id), user_id=user_id, ip_address=ip_address)
+    return await user_service.unlock_user(
+        actor=str(auth.user_id), tenant_id=auth.tenant_id, user_id=user_id, ip_address=ip_address
+    )
 
 
 @router.get("/audit-logs", response_model=AuditLogsListResponse)
@@ -238,10 +259,12 @@ async def list_audit_logs(
     page: int = 1,
     page_size: int = 50,
     action: str | None = None,
-    _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
     user_service: UserService = Depends(get_user_service),
 ):
     safe_page = max(1, int(page))
     safe_page_size = max(1, min(int(page_size), 100))
-    rows, total = await user_service.list_audit_logs(page=safe_page, page_size=safe_page_size, action=action)
+    rows, total = await user_service.list_audit_logs(
+        page=safe_page, page_size=safe_page_size, action=action, tenant_id=auth.tenant_id
+    )
     return AuditLogsListResponse(rows=rows, count=total, page=safe_page, page_size=safe_page_size)

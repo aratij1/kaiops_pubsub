@@ -268,6 +268,162 @@ def test_gateway_operational_auth_policy_marks_admin_routes() -> None:
     assert route_auth_rule("POST", "/api/v1/alerts/prometheus") is False
 
 
+def test_gateway_operational_auth_policy_requires_login_for_incident_data() -> None:
+    """/incidents/* previously had no policy entry at all (route_auth_rule
+    returned False, meaning "not covered" -- enforce_operational_auth skips
+    the auth check entirely for that path). Any authenticated role is
+    required now, matching how broadly incident data is read across
+    Overview/Live Stream/Alerts & Incidents/Dashboard by every role
+    including L1 Operator -- not restricted to a specific role set.
+    """
+    assert route_auth_rule("GET", "/incidents/metadata") is None
+    assert route_auth_rule("GET", "/incidents/closed") is None
+    assert route_auth_rule("GET", "/incidents/lowest-confidence-recommendations") is None
+    assert route_auth_rule("GET", "/incidents/abc-123/stage-completeness") is None
+
+
+def test_gateway_operational_auth_policy_restricts_observability_to_engineering_roles() -> None:
+    """/observability/* previously had no policy entry at all. Gateway trace
+    and safety-decision data backs Agent Flow and Gateway Safety, which are
+    engineering-role-only in the UI navigation -- Administrator/L2/L3 only,
+    matching DOCUMENT_PROVIDER_ROLES used elsewhere in this table.
+    """
+    assert route_auth_rule("GET", "/observability/summary") == {"Administrator", "L2 Engineer", "L3 Engineer"}
+    assert route_auth_rule("GET", "/observability/recent") == {"Administrator", "L2 Engineer", "L3 Engineer"}
+
+
+class _EnforceOperationalAuthHarness:
+    """Exercises the real enforce_operational_auth middleware end-to-end
+    (HTTP status codes, not just the route_auth_rule table it reads from),
+    without booting the full app/DB. auth_mode stays "local" so token
+    decoding never calls out to an OIDC provider; external=True on the
+    encoded token skips the DB-backed active-session lookup inside
+    _auth_context_from_request, since DATABASE_ENABLED=False here.
+    """
+
+    def __init__(self) -> None:
+        module = load_api_gateway_app_module()
+        self.module = module
+        self.module.settings.environment = "staging"  # anything outside {local, demo, test}
+        self.user_service = module.UserService(
+            settings=type(module.settings)(
+                DATABASE_ENABLED=False,
+                JWT_SECRET_KEY="test-secret-key-that-is-at-least-32-bytes",
+                ADMIN_USER_PASSWORD="Admin@123456",
+                EXECUTIVE_USER_PASSWORD="Executive@123456",
+                L3_USER_PASSWORD="L3Engineer@123456",
+                L2_USER_PASSWORD="L2Engineer@123456",
+                L1_USER_PASSWORD="L1Operator@123456",
+            ),
+            session_factory=None,
+        )
+
+        class _FakeAppState:
+            pass
+
+        class _FakeApp:
+            state = _FakeAppState()
+
+        self._fake_app = _FakeApp()
+        self._fake_app.state.user_service = self.user_service
+
+    def token_for_role(self, role: str) -> str:
+        import jwt as pyjwt
+        from datetime import UTC, datetime, timedelta
+
+        payload = {
+            "sub": "external-test-user",
+            "role": role,
+            "tenant_id": "default",
+            "type": "access",
+            "external": True,
+            "jti": "test-jti",
+            "sid": "test-sid",
+            "iat": int(datetime.now(UTC).timestamp()),
+            "exp": int((datetime.now(UTC) + timedelta(minutes=5)).timestamp()),
+        }
+        return pyjwt.encode(payload, self.user_service.settings.jwt_secret_key, algorithm=self.user_service.settings.jwt_algorithm)
+
+    async def call(self, method: str, path: str, *, role: str | None = None) -> int:
+        from starlette.requests import Request as StarletteRequest
+
+        headers = []
+        if role is not None:
+            headers.append((b"authorization", f"Bearer {self.token_for_role(role)}".encode()))
+        scope = {
+            "type": "http",
+            "method": method,
+            "path": path,
+            "headers": headers,
+            "query_string": b"",
+            "app": self._fake_app,
+            "client": ("test", 0),
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        request = StarletteRequest(scope, receive)
+
+        async def call_next(_request):
+            return self.module.JSONResponse(status_code=200, content={"ok": True})
+
+        response = await self.module.enforce_operational_auth(request, call_next)
+        return response.status_code
+
+
+@pytest.mark.asyncio
+async def test_incidents_endpoint_requires_authentication_but_allows_any_role() -> None:
+    """Reproduces C2: /incidents/metadata previously had no auth requirement
+    at all (route_auth_rule returned False), so an unauthenticated request
+    reached the downstream proxy untouched. It must now require some valid
+    login, but not a specific role -- every operator role, including L1,
+    reads this endpoint from Overview/Live Stream/Alerts & Incidents.
+    """
+    harness = _EnforceOperationalAuthHarness()
+
+    unauthenticated_status = await harness.call("GET", "/incidents/metadata")
+    assert unauthenticated_status == 401
+
+    for role in ("L1 Operator", "L2 Engineer", "L3 Engineer", "Executive", "Administrator"):
+        status = await harness.call("GET", "/incidents/metadata", role=role)
+        assert status == 200, f"expected 200 for role={role!r}, got {status}"
+
+
+@pytest.mark.asyncio
+async def test_observability_endpoint_requires_engineering_role() -> None:
+    """Reproduces C2: /observability/summary and /observability/recent
+    previously had no auth requirement at all. They must now require an
+    Administrator/L2/L3 role -- matching the frontend's ENGINEERING_ROLES
+    gating on the Agent Flow and Gateway Safety pages that consume them.
+    """
+    harness = _EnforceOperationalAuthHarness()
+
+    unauthenticated_status = await harness.call("GET", "/observability/summary")
+    assert unauthenticated_status == 401
+
+    for role in ("L1 Operator", "Executive"):
+        status = await harness.call("GET", "/observability/summary", role=role)
+        assert status == 403, f"expected 403 for role={role!r}, got {status}"
+
+    for role in ("L2 Engineer", "L3 Engineer", "Administrator"):
+        status = await harness.call("GET", "/observability/recent", role=role)
+        assert status == 200, f"expected 200 for role={role!r}, got {status}"
+
+
+@pytest.mark.asyncio
+async def test_existing_administrator_only_routes_are_unaffected() -> None:
+    """Administrator-only enforcement on routes this change did not touch
+    (e.g. /monitoring/*) must behave exactly as before: Administrator
+    passes, every other role is rejected with 403.
+    """
+    harness = _EnforceOperationalAuthHarness()
+
+    assert await harness.call("GET", "/monitoring/integrations", role="Administrator") == 200
+    assert await harness.call("GET", "/monitoring/integrations", role="L3 Engineer") == 403
+    assert await harness.call("GET", "/monitoring/integrations") == 401
+
+
 def test_gateway_accepts_json_string_for_knowledge_pack_payload() -> None:
     module = load_api_gateway_app_module()
     payload = {"service": "checkout-api", "documents": [{"name": "runbook.md", "text": "Alert: latency high"}]}

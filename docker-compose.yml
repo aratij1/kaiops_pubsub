@@ -128,6 +128,10 @@ x-service-env: &service-env
   GROQ_API_KEY: ${GROQ_API_KEY:-}
   GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
   GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-6}
+  ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com/v1}
+  ANTHROPIC_VERSION: ${ANTHROPIC_VERSION:-2023-06-01}
   LOCAL_LLM_ENABLED: ${LOCAL_LLM_ENABLED:-true}
   LOCAL_LLM_ENDPOINT: ${LOCAL_LLM_ENDPOINT:-http://host.docker.internal:11434}
   LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-qwen2.5:7b}

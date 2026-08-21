@@ -15,6 +15,7 @@ export default function KnowledgeRoute() {
   const [configuration, setConfiguration] = useState(defaultConfiguration);
   const [development, setDevelopment] = useState<{ loading: boolean; running: boolean; saving: boolean; error: string; report: any }>({ loading: false, running: false, saving: false, error: "", report: null });
   const [queueManager, setQueueManager] = useState<{ loading:boolean; actionLoading:boolean; error:string; result:string; rows:any[]; summary:any; selected:any; selectedAlertId:string; selectedJobId:string; jobAction:""|"rerun"|"remove"; messages:any[]; reason:string; confirmation:string }>({ loading:false, actionLoading:false, error:"", result:"", rows:[], summary:{}, selected:null, selectedAlertId:"", selectedJobId:"", jobAction:"", messages:[], reason:"", confirmation:"" });
+  const [providerStatus, setProviderStatus] = useState<{ loading: boolean; error: string; providers: Record<string, any> }>({ loading: false, error: "", providers: {} });
   const observed = knowledge.actual.rows.filter((row) => String(row.status || "").toLowerCase() === "observed").length;
   const provider = knowledge.actual.rows.find((row) => row.provider)?.provider || "Not observed";
   const groundingActive = knowledge.actual.published.length > 0;
@@ -24,7 +25,9 @@ export default function KnowledgeRoute() {
     const headers = new Headers(init.headers);
     headers.set("Content-Type", "application/json");
     headers.set("Authorization", `Bearer ${session.accessToken}`);
-    const endpoint = path.startsWith("/operations/") ? `/api-gateway${path}` : `/api-gateway/knowledge-development${path}`;
+    const endpoint = path.startsWith("/operations/") || path.startsWith("/model/")
+      ? `/api-gateway${path}`
+      : `/api-gateway/knowledge-development${path}`;
     const response = await fetch(endpoint, { ...init, headers });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload?.detail?.data?.hint || payload?.detail || `HTTP ${response.status}`);
@@ -61,6 +64,23 @@ export default function KnowledgeRoute() {
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", refresh); };
   }, [view, knowledge.application]);
   const loadQueues = async () => { setQueueManager((current)=>({...current,loading:true,error:""})); try { const data=await request("/operations/queues"); setQueueManager((current)=>({...current,loading:false,rows:data.queues||[],summary:data.summary||{}})); } catch(error:any){setQueueManager((current)=>({...current,loading:false,error:error.message}));} };
+  const loadProviderStatus = async () => {
+    setProviderStatus((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const data = await request("/model/providers/status");
+      setProviderStatus({ loading: false, error: "", providers: data?.providers || {} });
+    } catch (error: any) {
+      setProviderStatus((current) => ({ ...current, loading: false, error: error.message }));
+    }
+  };
+  useEffect(() => {
+    if (view !== "overview") return undefined;
+    void loadProviderStatus();
+    const refresh = () => { if (document.visibilityState === "visible") void loadProviderStatus(); };
+    const timer = window.setInterval(refresh, 30000);
+    document.addEventListener("visibilitychange", refresh);
+    return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", refresh); };
+  }, [view]);
   const inspectQueue = async (row:any) => { setQueueManager((current)=>({...current,selected:row,messages:[],selectedJobId:"",jobAction:"",loading:true,error:"",result:"",reason:"",confirmation:""})); try { const data=await request(`/operations/queues/${encodeURIComponent(row.name)}/sample`,{method:"POST"}); setQueueManager((current)=>({...current,loading:false,messages:data.messages||[]})); } catch(error:any){setQueueManager((current)=>({...current,loading:false,error:error.message}));} };
   const queueAction = async (path:string, method:string, success:string) => { setQueueManager((current)=>({...current,actionLoading:true,error:"",result:""})); try { await request(`/operations/queues${path}`,{method,body:JSON.stringify({alert_id:queueManager.selectedAlertId,reason:queueManager.reason,confirmation:queueManager.confirmation})}); setQueueManager((current)=>({...current,actionLoading:false,result:success,messages:[],selectedAlertId:"",selectedJobId:"",jobAction:"",reason:"",confirmation:""})); await loadQueues(); } catch(error:any){setQueueManager((current)=>({...current,actionLoading:false,error:error.message}));} };
   useEffect(() => {
@@ -85,6 +105,24 @@ export default function KnowledgeRoute() {
         <article className="panel ai-hub-signal"><header><Activity size={18} aria-hidden="true" /><span>Agent coverage</span></header><strong>{observationRate}%</strong><p>Services exchanging events in the current workflow trace.</p></article>
         <article className="panel ai-hub-signal"><header><Network size={18} aria-hidden="true" /><span>Runtime transport</span></header><strong>{String(provider).toUpperCase()}</strong><p>Observed message transport, separate from the model provider.</p></article>
         <article className="panel ai-hub-signal"><header><Route size={18} aria-hidden="true" /><span>Primary event path</span></header><strong className="is-topic">{knowledge.primaryTopic || "Not available"}</strong><p>Principal orchestration route between KaiMS agents.</p></article>
+      </section>
+      <section className="panel ai-hub-provider-status" aria-labelledby="ai-provider-status-title">
+        <div className="ai-hub-section-head"><div><span className="discovery-eyebrow">Model providers</span><h3 id="ai-provider-status-title">AI provider health</h3></div><p>Live configuration and circuit-breaker state for every LLM provider the resolution pipeline can route to.</p></div>
+        {providerStatus.error ? <div className="error" role="alert">{providerStatus.error}</div> : null}
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Provider</th><th>Model</th><th>Configured</th><th>Health</th></tr></thead>
+            <tbody>
+              {Object.entries(providerStatus.providers).map(([name, provider]: [string, any]) => <tr key={name}>
+                <td><strong>{name}</strong></td>
+                <td>{provider?.model || "—"}</td>
+                <td><span className={`workflow-pill ${provider?.configured ? "workflow-pill-active" : "workflow-pill-idle"}`}>{provider?.configured ? "Configured" : "Not configured"}</span></td>
+                <td><span className={`workflow-pill ${provider?.configured && provider?.healthy && !provider?.circuit_open ? "workflow-pill-active" : "workflow-pill-idle"}`}>{provider?.circuit_open ? "Circuit open" : provider?.healthy ? "Healthy" : "Unhealthy"}</span>{provider?.reason ? <small>{provider.reason}</small> : null}</td>
+              </tr>)}
+              {!Object.keys(providerStatus.providers).length ? <tr><td colSpan={4}>{providerStatus.loading ? "Loading provider status…" : "No provider status was returned."}</td></tr> : null}
+            </tbody>
+          </table>
+        </div>
       </section>
       <section className="ai-hub-capabilities" aria-labelledby="ai-capabilities-title"><div className="ai-hub-section-head"><div><span className="discovery-eyebrow">Operational capabilities</span><h3 id="ai-capabilities-title">From evidence to governed action</h3></div><p>Each stage keeps operators in control while improving future resolutions.</p></div><div className="ai-hub-capability-grid"><button type="button" onClick={()=>setView('development')}><span className="ai-hub-icon is-cyan"><BookOpenCheck size={20} aria-hidden="true" /></span><span><strong>Knowledge development</strong><small>Collect evidence and prepare reviewable runbook drafts.</small></span><b aria-hidden="true">→</b></button><button type="button" onClick={()=>setView('activity')}><span className="ai-hub-icon is-violet"><Activity size={20} aria-hidden="true" /></span><span><strong>Agent observability</strong><small>Verify what every agent consumed and published.</small></span><b aria-hidden="true">→</b></button><button type="button" onClick={()=>setView('queues')}><span className="ai-hub-icon is-amber"><ShieldCheck size={20} aria-hidden="true" /></span><span><strong>Governed operations</strong><small>Inspect queues and perform explicit, audited actions.</small></span><b aria-hidden="true">→</b></button></div></section>
       <section className="control-plane-status-grid ai-hub-legacy-status" aria-hidden="true">

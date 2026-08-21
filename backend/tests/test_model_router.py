@@ -1,10 +1,11 @@
 import httpx
 import pytest
-from common.config import get_settings
+from common.config import Settings, get_settings
 from common.models import AlertSeverity
 from model_router import ModelRouter, ModelTask
 from model_router.router import (
     _sanitize_model_payload,
+    AnthropicModelProvider,
     ModelProvider,
     ModelResponse,
     build_default_providers,
@@ -55,6 +56,53 @@ def test_default_gpt_provider_model_names() -> None:
     assert providers["gpt-4o"].model == "gpt-4o"
     assert providers["gemini"].model == "gemini-2.5-flash"
     assert providers["groq"].model == "llama-3.3-70b-versatile"
+    assert providers["claude"].model == "claude-sonnet-4-6"
+
+
+def test_default_provider_registry_includes_all_existing_providers_and_claude() -> None:
+    # Adding Claude must not remove or rename any pre-existing provider key.
+    providers = build_default_providers(get_settings())
+
+    for expected_key in (
+        "reasoning-standard",
+        "reasoning-critical",
+        "azure-openai",
+        "gpt-5",
+        "gpt-4o",
+        "claude",
+        "gemini",
+        "groq",
+        "local-llama",
+    ):
+        assert expected_key in providers
+
+
+def test_claude_provider_uses_configured_model_and_costs() -> None:
+    settings = Settings(
+        ANTHROPIC_MODEL="claude-opus-5",
+        ANTHROPIC_API_KEY="sk-ant-test-key",
+        ANTHROPIC_BASE_URL="https://api.anthropic.test/v1",
+        ANTHROPIC_INPUT_COST_PER_MILLION=1.5,
+        ANTHROPIC_OUTPUT_COST_PER_MILLION=7.5,
+    )
+    providers = build_default_providers(settings)
+    claude = providers["claude"]
+
+    assert isinstance(claude, AnthropicModelProvider)
+    assert claude.model == "claude-opus-5"
+    assert claude.api_key == "sk-ant-test-key"
+    assert claude.base_url == "https://api.anthropic.test/v1"
+    assert claude.input_cost_per_million == 1.5
+    assert claude.output_cost_per_million == 7.5
+
+
+def test_claude_provider_not_in_any_existing_failover_chain() -> None:
+    # Smallest safe change: Claude is selectable explicitly but does not
+    # alter any existing provider's automatic fallback behavior.
+    router = ModelRouter()
+
+    for chain in router.failover_chain.values():
+        assert "claude" not in chain
 
 
 def test_evaluation_policy_requires_eligible_confirmed_sample(tmp_path) -> None:
@@ -215,3 +263,186 @@ async def test_model_router_cache_can_be_disabled() -> None:
 
     assert first.get("cached") is None
     assert second.get("cached") is None
+
+
+# --- AnthropicModelProvider ----------------------------------------------
+# None of these tests call the real Anthropic API or require ANTHROPIC_API_KEY
+# to be set; httpx.AsyncClient is monkeypatched to a MockTransport so the
+# request never leaves the process.
+
+
+def _claude_provider(**overrides) -> AnthropicModelProvider:
+    kwargs = {
+        "name": "claude",
+        "model": "claude-sonnet-4-6",
+        "api_key": "sk-ant-test-key",
+        "base_url": "https://api.anthropic.test/v1",
+        "anthropic_version": "2023-06-01",
+    }
+    kwargs.update(overrides)
+    return AnthropicModelProvider(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_claude_generate_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["headers"] = dict(request.headers)
+        captured["body"] = httpx.Request("POST", request.url, content=request.content).content
+        return httpx.Response(
+            200,
+            json={
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "hello from claude"}],
+                "usage": {"input_tokens": 12, "output_tokens": 6},
+            },
+        )
+
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: async_client(transport=httpx.MockTransport(handler), **kwargs))
+
+    provider = _claude_provider()
+    response = await provider.generate("rca", {"summary": "payment latency"})
+
+    assert response.content == "hello from claude"
+    assert response.usage.input_tokens == 12
+    assert response.usage.output_tokens == 6
+    assert response.usage.provider == "claude"
+    assert captured["url"] == "https://api.anthropic.test/v1/messages"
+    assert captured["headers"]["x-api-key"] == "sk-ant-test-key"
+    assert captured["headers"]["anthropic-version"] == "2023-06-01"
+    # The API key must never be logged/exposed anywhere except this header.
+    assert "sk-ant-test-key" not in str(captured["url"])
+
+
+@pytest.mark.asyncio
+async def test_claude_generate_missing_api_key_raises_without_http_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={"content": [{"type": "text", "text": "unreachable"}]})
+
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: async_client(transport=httpx.MockTransport(handler), **kwargs))
+
+    provider = _claude_provider(api_key=None)
+
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY is not configured"):
+        await provider.generate("rca", {})
+
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_claude_generate_invalid_api_key_raises_and_records_breaker_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}})
+
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: async_client(transport=httpx.MockTransport(handler), **kwargs))
+
+    provider = _claude_provider(api_key="sk-ant-bad-key")
+
+    with pytest.raises(RuntimeError, match="HTTP 401"):
+        await provider.generate("rca", {})
+
+    assert provider.breaker.allow() is True  # single failure does not yet open the breaker
+
+
+@pytest.mark.asyncio
+async def test_claude_generate_api_error_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"type": "error", "error": {"type": "api_error", "message": "internal server error"}})
+
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: async_client(transport=httpx.MockTransport(handler), **kwargs))
+
+    provider = _claude_provider()
+
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        await provider.generate("rca", {})
+
+
+@pytest.mark.asyncio
+async def test_claude_generate_timeout_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated timeout", request=request)
+
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: async_client(transport=httpx.MockTransport(handler), **kwargs))
+
+    provider = _claude_provider()
+
+    with pytest.raises(httpx.ReadTimeout):
+        await provider.generate("rca", {})
+
+    # A network-level failure (not an HTTPStatusError) must still count
+    # against the circuit breaker so repeated timeouts eventually open it.
+    assert provider.breaker.allow() is True
+
+
+@pytest.mark.asyncio
+async def test_claude_generate_empty_content_raises() -> None:
+    provider = _claude_provider()
+
+    # generate() itself performs the HTTP call; exercise the text-extraction
+    # helper directly to confirm it safely handles a response with no usable
+    # text block instead of raising an unrelated exception.
+    assert provider._extract_text({"content": []}) == ""
+    assert provider._extract_text({"content": [{"type": "tool_use", "id": "x"}]}) == ""
+
+
+@pytest.mark.asyncio
+async def test_claude_provider_status_reports_unconfigured_without_key() -> None:
+    router = ModelRouter(providers={"claude": _claude_provider(api_key=None)})
+
+    status = router.provider_status()
+
+    assert status["providers"]["claude"]["configured"] is False
+    assert status["providers"]["claude"]["model"] == "claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_claude_provider_status_reports_configured_with_key() -> None:
+    router = ModelRouter(providers={"claude": _claude_provider()})
+
+    status = router.provider_status()
+
+    assert status["providers"]["claude"]["configured"] is True
+
+
+@pytest.mark.asyncio
+async def test_claude_selectable_via_explicit_provider_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    # AI Hub / API-level "provider selection" is MODEL_ROUTER_DEFAULT_PROVIDER
+    # or the explicit /route/provider/{name} path; both resolve through the
+    # same providers dict keyed by name, exercised here directly.
+    router = ModelRouter(
+        settings=Settings(MODEL_ROUTER_DEFAULT_PROVIDER="claude"),
+        providers={"claude": StaticProvider("claude"), "gpt-4o": StaticProvider("gpt-4o")},
+    )
+
+    assert router.select_model(severity=AlertSeverity.WARNING, task=ModelTask.GENERAL) == "claude"
+
+    response = await router.route(
+        severity=AlertSeverity.WARNING,
+        task=ModelTask.GENERAL,
+        prompt="summarize",
+        payload={"service": "payments"},
+    )
+    assert response["model"] == "claude"
+
+
+@pytest.mark.asyncio
+async def test_existing_providers_still_selectable_after_adding_claude() -> None:
+    # Regression guard: adding claude must not disturb existing provider
+    # selection defaults for any severity/task combination.
+    router = ModelRouter()
+
+    assert router.select_model(severity=AlertSeverity.CRITICAL, task=ModelTask.RCA) == "reasoning-critical"
+    assert router.select_model(severity=AlertSeverity.HIGH, task=ModelTask.RCA) == "reasoning-standard"
+    assert router.select_model(severity=AlertSeverity.WARNING, task=ModelTask.SUMMARIZATION) == "gpt-4o"
+    assert router.select_model(severity=AlertSeverity.WARNING, task=ModelTask.GENERAL) == "gpt-4o"

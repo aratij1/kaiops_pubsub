@@ -4,12 +4,20 @@ Covers the core alert/incident data model (schema-level tenant_id added in
 backend/database/migrations/20260806_core_tenant_isolation.sql) and the
 alert-intelligence correlation candidate pool, which must not let a
 tenant-A alert correlate against tenant-B's history.
+
+Also covers the api-gateway user-management module (UserRepository), where
+Administrator-only endpoints (/users*, /audit-logs) previously checked role
+but not tenant_id -- an Administrator token from tenant-a could read,
+modify, or delete a user record (or read an audit-log entry) belonging to
+any other tenant. See UserRepository.get_user/list_users/list_audit_logs.
 """
 
 from __future__ import annotations
 
 import pytest
 from alert_intelligence import AlertIntelligenceAgent
+from api_gateway.modules.users.repository import UserRepository
+from common.database import RoleRecord, UserRecord
 from common.models import Alert, AlertSeverity, Incident, RemediationAction, RemediationStatus
 from common.repository import IncidentRepository
 from common.repository_interfaces import SqlAlertHistoryRepository
@@ -89,3 +97,102 @@ async def test_actions_table_tenant_id_persists_and_is_isolated(sqlite_session_f
 
     assert len(rows) == 1
     assert rows[0].tenant_id == "tenant-a"
+
+
+@pytest.mark.asyncio
+async def test_get_user_is_tenant_scoped(sqlite_session_factory) -> None:
+    """An Administrator token from tenant-a must not be able to fetch a tenant-b user by id."""
+    async with sqlite_session_factory() as session:
+        repo = UserRepository(session)
+        role = RoleRecord(id=1, name="Administrator", description="Full platform administration", is_system_role=True)
+        session.add(role)
+        await session.flush()
+        user_b = UserRecord(
+            id=1,
+            tenant_id="tenant-b",
+            username="admin-tenant-b",
+            email="admin-tenant-b@kaiops.example.com",
+            password_hash="unused-hash",
+            first_name="Admin",
+            last_name="B",
+            role_id=role.id,
+            status="active",
+            is_active=True,
+        )
+        user_b = await repo.create_user(user_b)
+        await session.commit()
+        user_b_id = user_b.id
+
+    async with sqlite_session_factory() as session:
+        repo = UserRepository(session)
+        cross_tenant_lookup = await repo.get_user(user_b_id, tenant_id="tenant-a")
+        same_tenant_lookup = await repo.get_user(user_b_id, tenant_id="tenant-b")
+
+    assert cross_tenant_lookup is None
+    assert same_tenant_lookup is not None
+    assert same_tenant_lookup.id == user_b_id
+
+
+@pytest.mark.asyncio
+async def test_list_users_is_tenant_scoped(sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        repo = UserRepository(session)
+        role = RoleRecord(id=1, name="Administrator", description="Full platform administration", is_system_role=True)
+        session.add(role)
+        await session.flush()
+        for index, tenant in enumerate(("tenant-a", "tenant-b"), start=1):
+            await repo.create_user(
+                UserRecord(
+                    id=index,
+                    tenant_id=tenant,
+                    username=f"user-{tenant}",
+                    email=f"user-{tenant}@kaiops.example.com",
+                    password_hash="unused-hash",
+                    first_name="User",
+                    last_name=tenant,
+                    role_id=role.id,
+                    status="active",
+                    is_active=True,
+                )
+            )
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        repo = UserRepository(session)
+        tenant_a_rows, tenant_a_total = await repo.list_users(
+            page=1, page_size=20, search=None, role_id=None, status=None,
+            sort_by="created_at", sort_dir="desc", tenant_id="tenant-a",
+        )
+        unscoped_rows, unscoped_total = await repo.list_users(
+            page=1, page_size=20, search=None, role_id=None, status=None,
+            sort_by="created_at", sort_dir="desc", tenant_id=None,
+        )
+
+    assert tenant_a_total == 1
+    assert all(row.tenant_id == "tenant-a" for row in tenant_a_rows)
+    # No tenant filter is an explicit opt-in for internal/trusted callers only.
+    assert unscoped_total == 2
+
+
+@pytest.mark.asyncio
+async def test_list_audit_logs_is_tenant_scoped(sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        repo = UserRepository(session)
+        await repo.add_audit(
+            actor="admin-a", action="user.created", resource_type="user", resource_id="1",
+            payload={}, tenant_id="tenant-a",
+        )
+        await repo.add_audit(
+            actor="admin-b", action="user.created", resource_type="user", resource_id="2",
+            payload={}, tenant_id="tenant-b",
+        )
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        repo = UserRepository(session)
+        tenant_a_rows, tenant_a_total = await repo.list_audit_logs(
+            page=1, page_size=50, action=None, tenant_id="tenant-a"
+        )
+
+    assert tenant_a_total == 1
+    assert all(row.tenant_id == "tenant-a" for row in tenant_a_rows)

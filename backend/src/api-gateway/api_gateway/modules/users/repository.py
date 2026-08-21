@@ -40,16 +40,25 @@ class UserRepository:
         await self.session.flush()
         return user
 
-    async def get_user(self, user_id: int) -> UserRecord | None:
-        result = await self.session.execute(select(UserRecord).where(UserRecord.id == user_id))
+    async def get_user(self, user_id: int, *, tenant_id: str | None = None) -> UserRecord | None:
+        query = select(UserRecord).where(UserRecord.id == user_id)
+        if tenant_id is not None:
+            query = query.where(UserRecord.tenant_id == tenant_id)
+        result = await self.session.execute(query)
         return result.scalar_one_or_none()
 
-    async def get_user_by_username(self, username: str) -> UserRecord | None:
-        result = await self.session.execute(select(UserRecord).where(UserRecord.username == username))
+    async def get_user_by_username(self, username: str, *, tenant_id: str | None = None) -> UserRecord | None:
+        query = select(UserRecord).where(UserRecord.username == username)
+        if tenant_id is not None:
+            query = query.where(UserRecord.tenant_id == tenant_id)
+        result = await self.session.execute(query)
         return result.scalar_one_or_none()
 
-    async def get_user_by_email(self, email: str) -> UserRecord | None:
-        result = await self.session.execute(select(UserRecord).where(UserRecord.email == email))
+    async def get_user_by_email(self, email: str, *, tenant_id: str | None = None) -> UserRecord | None:
+        query = select(UserRecord).where(UserRecord.email == email)
+        if tenant_id is not None:
+            query = query.where(UserRecord.tenant_id == tenant_id)
+        result = await self.session.execute(query)
         return result.scalar_one_or_none()
 
     async def list_users(
@@ -62,9 +71,12 @@ class UserRepository:
         status: str | None,
         sort_by: str,
         sort_dir: str,
+        tenant_id: str | None = None,
     ) -> tuple[list[UserRecord], int]:
         base: Select[tuple[UserRecord]] = select(UserRecord)
 
+        if tenant_id is not None:
+            base = base.where(UserRecord.tenant_id == tenant_id)
         if search:
             token = f"%{search.strip()}%"
             base = base.where(
@@ -153,8 +165,12 @@ class UserRepository:
             )
         )
 
-    async def list_audit_logs(self, *, page: int, page_size: int, action: str | None) -> tuple[list[AuditLogRecord], int]:
+    async def list_audit_logs(
+        self, *, page: int, page_size: int, action: str | None, tenant_id: str | None = None
+    ) -> tuple[list[AuditLogRecord], int]:
         base: Select[tuple[AuditLogRecord]] = select(AuditLogRecord).order_by(AuditLogRecord.created_at.desc())
+        if tenant_id is not None:
+            base = base.where(AuditLogRecord.tenant_id == tenant_id)
         if action:
             base = base.where(AuditLogRecord.action == action)
 

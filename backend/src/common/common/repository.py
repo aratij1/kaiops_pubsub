@@ -2706,6 +2706,43 @@ class IncidentRepository:
                 return None
         return None
 
+    async def list_lowest_confidence_recommendations(
+        self, *, limit: int = 5, tenant_id: str = "default"
+    ) -> list[dict[str, Any]]:
+        """Most recent recommendation-generated events, ranked lowest confidence first.
+
+        Backs the Copilot "explain the lowest-confidence RCA" question, which
+        doesn't come with a specific incident ID -- this is the query that
+        finds one. incident_events.confidence is populated on every
+        incident.recommendation.generated row, independent of whether the
+        incident later completes its full lifecycle.
+        """
+        safe_limit = max(1, min(int(limit), 50))
+        result = await self.session.execute(
+            select(
+                IncidentEventRecord.incident_id,
+                IncidentEventRecord.service,
+                IncidentEventRecord.confidence,
+                IncidentEventRecord.created_at,
+            )
+            .where(
+                IncidentEventRecord.event_type == "incident.recommendation.generated",
+                IncidentEventRecord.tenant_id == (tenant_id or "default"),
+                IncidentEventRecord.confidence.is_not(None),
+            )
+            .order_by(IncidentEventRecord.confidence.asc(), IncidentEventRecord.created_at.desc())
+            .limit(safe_limit)
+        )
+        return [
+            {
+                "incident_id": str(row.incident_id),
+                "service": row.service,
+                "confidence": float(row.confidence) if row.confidence is not None else None,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in result.all()
+        ]
+
     async def save_application(self, application: ApplicationRegistration) -> None:
         await self.session.merge(
             ApplicationRecord(
