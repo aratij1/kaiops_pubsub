@@ -80,6 +80,24 @@
   margin-top: 0.8rem;
 }
 
+.cloud-ops-grid label {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.cloud-ops-grid input,
+.cloud-ops-grid select {
+  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.35));
+  border-radius: 12px;
+  padding: 0.65rem 0.75rem;
+}
+
+.cloud-ops-kpi {
+  font-size: 2.4rem;
+  font-weight: 850;
+  margin-top: 0.7rem;
+}
+
 .cloud-ops-error {
   background: rgba(239, 68, 68, 0.1);
   border: 1px solid rgba(239, 68, 68, 0.25);

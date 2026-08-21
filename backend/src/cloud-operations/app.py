@@ -11,6 +11,7 @@ from common.cloud_operations.models import (
     CloudConnectionCreate,
     DiscoveryRequest,
     ProviderType,
+    ServiceOnboardingProfile,
     ServiceResourceMappingCreate,
 )
 from common.cloud_operations.repository import CloudOperationsRepository
@@ -33,6 +34,44 @@ async def shutdown(_: FastAPI) -> None:
 
 
 app = create_app(title="KaiMS Cloud Operations Service", settings=settings, startup=startup, shutdown=shutdown)
+
+SERVICE_ONBOARDING_TEMPLATES = [
+    {
+        "id": "kubernetes_microservice",
+        "label": "Kubernetes microservice",
+        "resource_types": ["application", "kubernetes_deployment", "pod", "container", "service"],
+        "recommended_telemetry": ["metrics", "logs", "traces", "events"],
+        "recommended_controls": ["SLO", "runbook", "diagnostic action", "rollback validation"],
+    },
+    {
+        "id": "vm_legacy_application",
+        "label": "VM or legacy application",
+        "resource_types": ["application", "vm", "node", "load_balancer", "database"],
+        "recommended_telemetry": ["host metrics", "application logs", "synthetic checks"],
+        "recommended_controls": ["SOP", "restart validation", "escalation policy"],
+    },
+    {
+        "id": "database_service",
+        "label": "Database service",
+        "resource_types": ["database", "database_instance", "storage_volume"],
+        "recommended_telemetry": ["replication lag", "query latency", "storage", "backups"],
+        "recommended_controls": ["backup validation", "failover runbook", "data safety policy"],
+    },
+    {
+        "id": "data_pipeline",
+        "label": "Data pipeline",
+        "resource_types": ["scheduled_job", "data_pipeline", "queue", "object_store"],
+        "recommended_telemetry": ["freshness", "volume", "quality checks", "job events"],
+        "recommended_controls": ["replay policy", "data validation", "business SLA"],
+    },
+    {
+        "id": "middleware_messaging",
+        "label": "Middleware or messaging",
+        "resource_types": ["queue", "topic", "broker", "cache"],
+        "recommended_telemetry": ["lag", "throughput", "dead letters", "consumer health"],
+        "recommended_controls": ["drain policy", "retry policy", "rollback guard"],
+    },
+]
 
 
 def _feature_enabled() -> None:
@@ -104,6 +143,12 @@ async def list_capabilities(provider: ProviderType = ProviderType.SIMULATOR) -> 
     except NotImplementedError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"capabilities": [manifest.model_dump(mode="json")]}
+
+
+@app.get("/onboarding/templates")
+async def onboarding_templates() -> dict[str, Any]:
+    _feature_enabled()
+    return {"templates": SERVICE_ONBOARDING_TEMPLATES}
 
 
 @app.post("/connections/{connection_id}/validate")
@@ -195,6 +240,17 @@ async def list_resources(
         return {"rows": [repo.resource_payload(row) for row in rows], "count": len(rows)}
 
 
+@app.get("/cockpit")
+async def operations_cockpit(
+    tenant_id: str = Query(min_length=1, max_length=128),
+    project_id: str | None = Query(default=None, max_length=128),
+    environment: str | None = Query(default=None, max_length=64),
+) -> dict[str, Any]:
+    tenant_id = require_tenant_id(tenant_id, source="cloud operations cockpit")
+    async with _repo() as repo:
+        return await repo.cockpit(tenant_id=tenant_id, project_id=project_id, environment=environment)
+
+
 @app.post("/services/{service_id}/map")
 async def map_service_resources(service_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     request = ServiceResourceMappingCreate.model_validate({**payload, "service_id": service_id})
@@ -232,3 +288,63 @@ async def service_360(
             service_id=service_id,
             environment=environment,
         )
+
+
+@app.get("/services/{service_id}/topology")
+async def service_topology(
+    service_id: str,
+    tenant_id: str = Query(min_length=1, max_length=128),
+    project_id: str = Query(min_length=1, max_length=128),
+    environment: str | None = Query(default=None, max_length=64),
+) -> dict[str, Any]:
+    tenant_id = require_tenant_id(tenant_id, source="cloud operations topology")
+    async with _repo() as repo:
+        return await repo.topology(tenant_id=tenant_id, project_id=project_id, service_id=service_id, environment=environment)
+
+
+@app.put("/services/{service_id}/onboarding")
+async def upsert_service_onboarding(service_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    profile = ServiceOnboardingProfile.model_validate({**payload, "service_id": service_id})
+    async with _repo() as repo:
+        row = await repo.upsert_service_onboarding(profile)
+        score = await repo.recalculate_readiness(
+            tenant_id=profile.tenant_id,
+            project_id=profile.project_id,
+            service_id=profile.service_id,
+            environment=profile.environment,
+            actor=profile.actor,
+        )
+        await _publish(
+            "service.readiness.changed",
+            tenant_id=profile.tenant_id,
+            project_id=profile.project_id,
+            service_id=profile.service_id,
+            payload={"environment": profile.environment, "readiness_state": score.readiness_state, "overall_score": float(score.overall_score or 0.0)},
+        )
+        return {"profile": repo.onboarding_payload(row), "readiness": {"state": score.readiness_state, "overall_score": float(score.overall_score or 0.0), "scores": score.scores or {}}}
+
+
+@app.post("/services/{service_id}/readiness/recalculate")
+async def recalculate_service_readiness(service_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    tenant_id = require_tenant_id(payload.get("tenant_id"), source="cloud operations readiness")
+    project_id = str(payload.get("project_id") or "").strip()
+    environment = str(payload.get("environment") or "prod").strip()
+    actor = str(payload.get("actor") or "system").strip() or "system"
+    if not project_id:
+        raise HTTPException(status_code=422, detail="project_id is required")
+    async with _repo() as repo:
+        score = await repo.recalculate_readiness(
+            tenant_id=tenant_id,
+            project_id=project_id,
+            service_id=service_id,
+            environment=environment,
+            actor=actor,
+        )
+        await _publish(
+            "service.readiness.changed",
+            tenant_id=tenant_id,
+            project_id=project_id,
+            service_id=service_id,
+            payload={"environment": environment, "readiness_state": score.readiness_state, "overall_score": float(score.overall_score or 0.0)},
+        )
+        return {"state": score.readiness_state, "overall_score": float(score.overall_score or 0.0), "scores": score.scores or {}}

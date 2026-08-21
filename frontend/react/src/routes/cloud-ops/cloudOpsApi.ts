@@ -45,6 +45,50 @@ export type Service360 = {
   relationships: Array<Record<string, unknown>>;
 };
 
+export type OnboardingTemplate = {
+  id: string;
+  label: string;
+  resource_types: string[];
+  recommended_telemetry: string[];
+  recommended_controls: string[];
+};
+
+export type OnboardingProfile = {
+  project_id: string;
+  service_id: string;
+  environment: string;
+  template_id: string;
+  business_criticality: string;
+  owners: string[];
+  support_groups: string[];
+  connection_ids: string[];
+  monitoring_sources: string[];
+  log_sources: string[];
+  metric_sources: string[];
+  trace_sources: string[];
+  event_sources: string[];
+  slos: Array<Record<string, unknown>>;
+  business_kpis: Array<Record<string, unknown>>;
+  change_sources: string[];
+  knowledge_refs: string[];
+  diagnostic_capabilities: string[];
+  remediation_capabilities: string[];
+  validation_rules: string[];
+  escalation_policies: string[];
+  hitl_policy: Record<string, unknown>;
+  dependencies: string[];
+  metadata: Record<string, unknown>;
+};
+
+export type CockpitSummary = {
+  resource_count: number;
+  service_count: number;
+  health: Record<string, number>;
+  by_provider: Record<string, number>;
+  by_environment: Record<string, number>;
+  readiness: Array<{ project_id: string; service_id: string; environment: string; readiness_state: string; overall_score: number; scores: Record<string, number> }>;
+};
+
 type RowsResponse<T> = { rows: T[]; count: number };
 type ConnectionResponse = { connection: CloudConnection };
 
@@ -112,4 +156,36 @@ export function service360(projectId: string, serviceId: string, environment?: s
   const params = new URLSearchParams({ project_id: projectId });
   if (environment) params.set("environment", environment);
   return requestJson<Service360>(`/cloud-ops/services/${encodeURIComponent(serviceId)}/360?${params.toString()}`);
+}
+
+export function serviceTopology(projectId: string, serviceId: string, environment?: string) {
+  const params = new URLSearchParams({ project_id: projectId });
+  if (environment) params.set("environment", environment);
+  return requestJson<{ nodes: CloudResource[]; edges: Array<Record<string, unknown>> }>(`/cloud-ops/services/${encodeURIComponent(serviceId)}/topology?${params.toString()}`);
+}
+
+export function operationsCockpit(projectId?: string, environment?: string) {
+  const params = new URLSearchParams();
+  if (projectId) params.set("project_id", projectId);
+  if (environment) params.set("environment", environment);
+  const query = params.toString();
+  return requestJson<CockpitSummary>(`/cloud-ops/cockpit${query ? `?${query}` : ""}`);
+}
+
+export function onboardingTemplates() {
+  return requestJson<{ templates: OnboardingTemplate[] }>("/cloud-ops/onboarding/templates").then((data) => data.templates);
+}
+
+export function saveOnboardingProfile(serviceId: string, profile: OnboardingProfile) {
+  return requestJson<{ profile: OnboardingProfile & { onboarding_state: string }; readiness: { state: string; overall_score: number; scores: Record<string, number> } }>(
+    `/cloud-ops/services/${encodeURIComponent(serviceId)}/onboarding`,
+    { method: "PUT", body: JSON.stringify(profile) },
+  );
+}
+
+export function recalculateReadiness(projectId: string, serviceId: string, environment = "prod") {
+  return requestJson<{ state: string; overall_score: number; scores: Record<string, number> }>(
+    `/cloud-ops/services/${encodeURIComponent(serviceId)}/readiness/recalculate`,
+    { method: "POST", body: JSON.stringify({ project_id: projectId, environment }) },
+  );
 }

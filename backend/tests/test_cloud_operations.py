@@ -6,7 +6,7 @@ import pytest
 
 from common.cloud_operations.connectors import connector_for
 from common.cloud_operations.events import SCHEMA_VERSION, build_cloud_event
-from common.cloud_operations.models import CloudConnection, CloudConnectionCreate, DiscoveryRequest, ProviderType
+from common.cloud_operations.models import CloudConnection, CloudConnectionCreate, DiscoveryRequest, ProviderType, ServiceOnboardingProfile
 from common.cloud_operations.repository import CloudOperationsRepository
 
 
@@ -109,3 +109,61 @@ async def test_repository_round_trip_discovers_and_maps_resources(sqlite_session
     async with sqlite_session_factory() as session:
         repo = CloudOperationsRepository(session)
         assert await repo.get_connection(connection_id=uuid4(), tenant_id="tenant-a") is None
+
+
+@pytest.mark.asyncio
+async def test_service_onboarding_calculates_readiness_and_cockpit(sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        repo = CloudOperationsRepository(session)
+        connection_row = await repo.create_connection(
+            CloudConnectionCreate(
+                tenant_id="tenant-a",
+                project_id="project-a",
+                connection_name="simulator",
+                provider_type=ProviderType.SIMULATOR,
+                credential_ref="simulator://local/read-only",
+                connection_owner="admin@example.com",
+                allowed_regions=["global"],
+            )
+        )
+        connection = CloudConnection.model_validate(repo.connection_payload(connection_row))
+        await repo.record_validation(connection_row, await connector_for(ProviderType.SIMULATOR).validate_connection(connection), actor="admin@example.com")
+        request = DiscoveryRequest(tenant_id="tenant-a", project_id="project-a", service_id="checkout-api", environment="prod", actor="admin@example.com")
+        run = await repo.start_discovery(connection_row, request)
+        discovery = await connector_for(ProviderType.SIMULATOR).discover_resources(connection, request)
+        await repo.complete_discovery(connection_row, run, discovery, request=request)
+
+        await repo.upsert_service_onboarding(
+            ServiceOnboardingProfile(
+                tenant_id="tenant-a",
+                project_id="project-a",
+                service_id="checkout-api",
+                environment="prod",
+                template_id="kubernetes_microservice",
+                business_criticality="high",
+                owners=["checkout-oncall@example.com"],
+                support_groups=["checkout-platform"],
+                connection_ids=[str(connection_row.id)],
+                monitoring_sources=["prometheus"],
+                log_sources=["opensearch"],
+                metric_sources=["prometheus"],
+                slos=[{"name": "availability", "target": "99.9"}],
+                knowledge_refs=["checkout-runbook"],
+                diagnostic_capabilities=["read_pod_status"],
+                remediation_capabilities=["restart_kubernetes_deployment"],
+                validation_rules=["http_health_check"],
+                escalation_policies=["primary-oncall"],
+                hitl_policy={"required_for": ["production"]},
+                actor="admin@example.com",
+            )
+        )
+        score = await repo.recalculate_readiness(tenant_id="tenant-a", project_id="project-a", service_id="checkout-api", environment="prod", actor="admin@example.com")
+        cockpit = await repo.cockpit(tenant_id="tenant-a", project_id="project-a")
+        topology = await repo.topology(tenant_id="tenant-a", project_id="project-a", service_id="checkout-api", environment="prod")
+
+        assert score.readiness_state == "OPERABLE"
+        assert float(score.overall_score) >= 0.82
+        assert cockpit["resource_count"] == 3
+        assert cockpit["readiness"][0]["service_id"] == "checkout-api"
+        assert len(topology["nodes"]) == 3
+        assert len(topology["edges"]) == 2
