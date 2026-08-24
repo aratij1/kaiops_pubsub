@@ -32,6 +32,7 @@ export function buildAlertDocumentDraft({ alertId, alert, decision, workflow, ev
 
   return [
     `# ${alert?.name || "Alert"}`,
+    ...(decision.reviewRequired ? ["", "> Verification status: RCA hypothesis — additional operator verification is required before publication."] : []),
     "",
     "## Incident record",
     `Alert ID: ${alertId}`,
@@ -42,7 +43,7 @@ export function buildAlertDocumentDraft({ alertId, alert, decision, workflow, ev
     `Environment: ${alert?.environment || "Not supplied"}`,
     `Severity: ${alert?.severity || "Not supplied"}`,
     "",
-    "## Root cause analysis",
+    decision.reviewRequired ? "## Root cause hypothesis (unverified)" : "## Root cause analysis",
     decision.rootCause,
     "",
     "## Technical and business impact",

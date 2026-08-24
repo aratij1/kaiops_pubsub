@@ -53,6 +53,7 @@ from common.database import (
     RecordingRuleRecord,
     ResolutionOutboxRecord,
     OnboardingStateRecord,
+    OnboardingControlPlaneRecord,
     ObjectStorageRecord,
     PendingWorkflowRecord,
     ValidationHistoryRecord,
@@ -3667,6 +3668,34 @@ class IncidentRepository:
             for row in rows
         ]
 
+    async def save_onboarding_control_plane(self, payload: dict[str, Any]) -> None:
+        onboarding_id = UUID(str(payload["onboarding_id"]))
+        existing = await self.session.get(OnboardingControlPlaneRecord, onboarding_id)
+        if existing is None:
+            self.session.add(OnboardingControlPlaneRecord(
+                onboarding_id=onboarding_id,
+                tenant_id=self._require("onboarding.tenant_id", payload.get("tenant_id")),
+                project_name=self._require("onboarding.project_name", payload.get("project", {}).get("name")),
+                current_step=int(payload.get("current_step") or 1),
+                status=str(payload.get("status") or "DRAFT"),
+                version=int(payload.get("version") or 1),
+                payload=payload,
+            ))
+            return
+        existing.project_name = self._require("onboarding.project_name", payload.get("project", {}).get("name"))
+        existing.current_step = int(payload.get("current_step") or 1)
+        existing.status = str(payload.get("status") or "DRAFT")
+        existing.version = int(payload.get("version") or 1)
+        existing.payload = payload
+
+    async def get_onboarding_control_plane(self, onboarding_id: UUID, tenant_id: str) -> dict[str, Any] | None:
+        result = await self.session.execute(select(OnboardingControlPlaneRecord).where(
+            OnboardingControlPlaneRecord.onboarding_id == onboarding_id,
+            OnboardingControlPlaneRecord.tenant_id == require_tenant_id(tenant_id, source="onboarding lookup"),
+        ))
+        row = result.scalar_one_or_none()
+        return dict(row.payload) if row else None
+
     async def get_onboarding_state_row(self, project_name: str, provider_name: str) -> dict[str, Any] | None:
         normalized_project = str(project_name or "").strip()
         normalized_provider = str(provider_name or "").strip().lower()
@@ -4056,6 +4085,7 @@ class IncidentRepository:
                 "AND active.status IN ('pending','dispatching','executor_accepted','running','verifying','rolling_back'))"
             )
         )
+
         return len(rebuilt_ids)
 
     async def list_incident_projections(

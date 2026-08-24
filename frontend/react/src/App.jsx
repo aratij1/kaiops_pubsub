@@ -23,6 +23,8 @@ import "./styles/product-foundation.css";
 import CopilotRoute from "./routes/copilot/CopilotRoute";
 import { breadcrumbForPath, groupedNavigationForRole, navigationItemForPath, TAB_SHORTCUT_BY_CODE, VALID_LEGACY_TABS } from "./app/navigation";
 import { allowedLegacyTabsForRole, canAccessDestination } from "./app/permissions";
+import { KAI_BRAND } from "./config/brand";
+import KaiCommandPalette from "./app/KaiCommandPalette";
 
 const LOCAL_JENKINS_ENDPOINT = "http://jenkins:8080", LOCAL_JENKINS_JOB = "kaiops-auto-remediation", LOCAL_JENKINS_CREDENTIAL_REF = "vault://kaiops/local/jenkins#api-token";
 import {
@@ -418,13 +420,13 @@ function KaiMSBrand({ compact = false, inverse = false, onActivate = null }) {
     </span>
     <span className="kaims-brand-copy">
       <strong><span className="kaims-brand-prefix">Kai</span><span className="kaims-brand-managed">MS</span></strong>
-      {!compact ? <small>Managed service intelligence</small> : null}
+      {!compact ? <small>{KAI_BRAND.category}</small> : null}
     </span>
   </>;
   return (
     onActivate
       ? <button type="button" className={`kaims-brand kaims-brand-home ${compact ? "is-compact" : ""} ${inverse ? "is-inverse" : ""}`} aria-label="Go to KaiMS home" onClick={onActivate}>{content}</button>
-      : <div className={`kaims-brand ${compact ? "is-compact" : ""} ${inverse ? "is-inverse" : ""}`} aria-label="KaiMS intelligent managed service">{content}</div>
+      : <div className={`kaims-brand ${compact ? "is-compact" : ""} ${inverse ? "is-inverse" : ""}`} aria-label={`${KAI_BRAND.productName} ${KAI_BRAND.category}`}>{content}</div>
   );
 }
 
@@ -5978,6 +5980,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       selectedAlertDocumentLinks.rows.length,
       selectedRcaDecision.rootCause,
       selectedRelevantRcaEvidence.length,
+      selectedRcaDecision.reviewRequired,
     ].join("|");
     const now = Date.now();
     if (
@@ -5991,7 +5994,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       .then(async (response) => {
         if (cancelled) return;
         let draft = (unwrap(response)?.drafts || [])[0] || null;
-        if (!draft && selectedRcaDecision.rootCause && !selectedRcaDecision.reviewRequired && selectedRelevantRcaEvidence.length) {
+        if (!draft && selectedRcaDecision.rootCause && selectedRelevantRcaEvidence.length) {
           const evidenceIds = selectedRelevantRcaEvidence.map((row) => row.id || row.evidence_id).filter(Boolean);
           const sourceUris = selectedRelevantRcaEvidence.map((row) => row.citation || row.uri).filter(Boolean);
           const content = buildRcaEvidenceDocumentDraft({ alertId, alert: selectedAlertRow, decision: selectedRcaDecision, workflow: selectedAlertWorkflow, evidence: selectedRelevantRcaEvidence });
@@ -6011,7 +6014,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           : canonicalContent;
         const alreadyContainsRca = Boolean(selectedRcaDecision.rootCause && resolvedDraftContent.toLowerCase().includes(String(selectedRcaDecision.rootCause).trim().toLowerCase()));
         const rcaAppendix = draft && selectedRcaDecision.rootCause && !selectedRcaDecision.reviewRequired && selectedRelevantRcaEvidence.length && !alreadyContainsRca ? ["", "## Completed RCA", selectedRcaDecision.rootCause, "", "## Impact", selectedRcaDecision.customerImpact, "", "## Recommended response", selectedRcaDecision.action || "No action supplied.", "", `Confidence: ${Math.round(Number(selectedRcaDecision.confidence || 0) * 100)}%`].join("\n") : "";
-        const insufficientMessage = selectedRelevantRcaEvidence.length ? "RCA requires additional verification before a document can be created." : "Relevant project evidence is missing. KaiMS will not generate or publish an RCA until real source evidence arrives.";
+        const insufficientMessage = selectedRelevantRcaEvidence.length ? "A root-cause hypothesis is not available yet. Continue investigation before creating a review draft." : "Relevant project evidence is missing. KaiMS will not generate or publish an RCA until real source evidence arrives.";
         setEvidenceDraftReview({ loading: false, draft, content: draft ? `${resolvedDraftContent}${rcaAppendix}` : "", notes: "", error: draft ? "" : insufficientMessage, message: draft ? "Draft created automatically. Review, edit, and approve it before publication." : "" });
       })
       .catch((error) => { if (!cancelled) setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) })); });
@@ -7827,6 +7830,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   async function approveEvidenceDraft() {
     const draft = evidenceDraftReview.draft;
     if (!draft?.draft_id) return;
+    if (selectedRcaDecision.reviewRequired) {
+      setEvidenceDraftReview((current) => ({ ...current, error: "Publishing remains blocked until RCA verification passes. Save the hypothesis draft and add or validate evidence first.", message: "" }));
+      return;
+    }
     setEvidenceDraftReview((current) => ({ ...current, loading: true, error: "", message: "" }));
     try {
       const reviewedBy = adminSession?.user?.username || "operator";
@@ -8474,6 +8481,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             ? `Type ${executionConfirmationPhrase} in the production confirmation field`
             : "Execution is temporarily unavailable";
   const cockpitApprovalComplete = ["approved", "rejected"].includes(selectedExecutionBreakdown.approvalStatus);
+  const manualEscalationRecorded = approvalForm.action === "reject" && (
+    ["rejected", "failed"].includes(selectedExecutionBreakdown.approvalStatus)
+    || Boolean(approvalState.result && !approvalState.error)
+  );
   const activeEmergencyStopStatuses = ["pending", "policy_checked", "approved", "dispatching", "executor_accepted", "running", "verifying"];
   const responseAction = unwrap(remediationExecutionState.result);
   const emergencyStopAction = responseAction?.id ? responseAction : selectedExecutionPlan.remediationAction;
@@ -9869,6 +9880,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             <div className="hero-actions">
               <HealthBadge ok={health.ok} label={health.message} />
               <span className="hero-user" title={`Signed in as ${adminSession?.user?.username || "-"}`}>{adminSession?.user?.username || "-"} · {adminSession?.user?.role_name || "-"}</span>
+              <KaiCommandPalette role={currentRole} onNavigate={(path) => onNavigatePath?.(path)} />
               <button className="button-primary" type="button" onClick={() => setIsCopilotOpen(!isCopilotOpen)}>
                 <Bot size={16} /> {isCopilotOpen ? "Close KAI" : "Ask KAI"}
               </button>
@@ -11037,7 +11049,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <div className="alert-document-draft-heading"><div><span className="eyebrow">Editable draft</span><h4>{evidenceDraftReview.draft.title || "Incident knowledge document"}</h4></div><span className={`workflow-pill ${evidenceDraftReview.draft.status === "reviewed" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft.status || "draft"}</span></div>
                             <div className="report-view-switch" role="tablist" aria-label="Incident report detail"><button type="button" role="tab" aria-selected={incidentReportView === "simple"} className={incidentReportView === "simple" ? "active" : ""} onClick={() => setIncidentReportView("simple")}>Simple</button><button type="button" role="tab" aria-selected={incidentReportView === "detailed"} className={incidentReportView === "detailed" ? "active" : ""} onClick={() => setIncidentReportView("detailed")}>Detailed</button></div>
                             {incidentReportView === "simple" ? <pre className="simple-incident-report">{simpleIncidentReport(evidenceDraftReview.content)}</pre> : <><label>Document content<textarea rows={18} value={evidenceDraftReview.content} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, content: event.target.value }))} disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status === "approved"} /></label><label>Reviewer notes<textarea rows={3} value={evidenceDraftReview.notes} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, notes: event.target.value }))} placeholder="Record corrections, exclusions, and evidence that still needs confirmation." disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status === "approved"} /></label></>}
-                            <div className="alert-documents-empty-actions"><button type="button" className="button-secondary" onClick={saveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20}>Save draft</button><button type="button" className="button-primary" onClick={approveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20}>Approve &amp; publish</button><button type="button" className="button-ghost" onClick={() => selectedAlertRow && openDocumentPrompt(selectedAlertRow)}>Add source document</button></div>
+                            {selectedRcaDecision.reviewRequired ? <p className="subtitle" role="status">This evidence-backed hypothesis can be reviewed and saved now. Publishing remains locked until confidence, grounding, investigation, and evidence-gap checks pass.</p> : null}
+                            <div className="alert-documents-empty-actions"><button type="button" className="button-secondary" onClick={saveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20}>Save draft</button><button type="button" className="button-primary" onClick={approveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20 || selectedRcaDecision.reviewRequired}>{selectedRcaDecision.reviewRequired ? "Publish locked — verify RCA" : "Approve & publish"}</button><button type="button" className="button-ghost" onClick={() => selectedAlertRow && openDocumentPrompt(selectedAlertRow)}>Add source document</button></div>
                           </div> : null}
                           <div className="alert-documents-empty-actions">
                             {!canProvideAlertDocuments ? (
@@ -11330,17 +11343,19 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         </details> : null}
                         </details> : null}
                         <section className="execution-guided-flow" aria-labelledby="guided-execution-heading">
-                          <div className="execution-guided-head"><div><span className="discovery-eyebrow">Guarded execution</span><h3 id="guided-execution-heading">{executionAutoCloses ? "Watch-only completion" : "Complete the current step"}</h3><p>{executionAutoCloses ? "This alert is explicitly watch-only. KaiOps is recording the observation and closing it without execution." : executionActivationMessage}</p></div><span className={`pill ${executionAllowed || (executionAutoCloses && ["closed", "resolved"].includes(selectedCanonicalIncidentStatus)) ? "pill-success" : "pill-warning"}`}>{executionAutoCloses ? (["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "Closed" : "Auto-closing") : executionAllowed ? "Ready" : !cockpitApprovalAccepted ? "Decision required" : executionSetupBlocked || executionCapabilityBlocked ? "Blocked" : "In progress"}</span></div>
+                          <div className="execution-guided-head"><div><span className="discovery-eyebrow">Guarded execution</span><h3 id="guided-execution-heading">{executionAutoCloses ? "Watch-only completion" : manualEscalationRecorded ? "Manual remediation requested" : "Complete the current step"}</h3><p>{executionAutoCloses ? "This alert is explicitly watch-only. KaiOps is recording the observation and closing it without execution." : manualEscalationRecorded ? "Automation remains safely locked while an operator handles the incident manually." : executionActivationMessage}</p></div><span className={`pill ${executionAllowed || manualEscalationRecorded || (executionAutoCloses && ["closed", "resolved"].includes(selectedCanonicalIncidentStatus)) ? "pill-success" : "pill-warning"}`}>{executionAutoCloses ? (["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "Closed" : "Auto-closing") : manualEscalationRecorded ? "Escalated" : executionAllowed ? "Ready" : !cockpitApprovalAccepted ? "Decision required" : executionSetupBlocked || executionCapabilityBlocked ? "Blocked" : "In progress"}</span></div>
                           {executionAutoCloses ? <ol className="execution-stepper" aria-label="Watch-only completion progress"><li className={["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "is-complete" : "is-current"}><span>✓</span><div><strong>Record observation and close</strong><small>{["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "Completed" : "In progress"}</small></div></li></ol> : executionIsDiagnosticOnly && !liveExecutionPlanAvailable ? <ol className="execution-stepper" aria-label="Diagnostic plan next steps"><li className="is-current"><span>1</span><div><strong>Choose next action</strong><small>Manual escalation or new plan required</small></div></li><li><span>2</span><div><strong>Review corrective plan</strong><small>Pending</small></div></li><li><span>3</span><div><strong>Execute</strong><small>Locked</small></div></li></ol> : <ol className="execution-stepper" aria-label="Execution progress">
                             <li className={cockpitApprovalAccepted ? "is-complete" : "is-current"}><span>1</span><div><strong>Approve</strong><small>{cockpitApprovalAccepted ? "Recorded" : "Pending"}</small></div></li>
                             <li className={cockpitApprovalAccepted && executionConfirmationValid ? "is-complete" : cockpitApprovalAccepted ? "is-current" : ""}><span>2</span><div><strong>Confirm</strong><small>{cockpitApprovalAccepted && executionConfirmationValid ? "Complete" : "Pending"}</small></div></li>
                             <li className={remediationExecutionState.loading || executionAllowed ? "is-current" : ""}><span>3</span><div><strong>Execute</strong><small>{remediationExecutionState.loading ? "Running" : executionAllowed ? "Ready" : executionCapabilityBlocked ? "Executor required" : "Locked"}</small></div></li>
                           </ol>}
                           <div className="execution-current-step">
+                            {manualEscalationRecorded ? <div className="execution-step-form" role="status"><div><strong>Escalation recorded</strong><p>The incident remains open for manual remediation. Automated execution stays locked because no reviewed corrective action or recovery check is available.</p></div><button type="button" className="button-secondary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Regenerating…" : "Generate a corrective plan instead"}</button></div> : <>
                             {executionAutoCloses ? <div className="execution-step-form"><div><strong>{["closed", "resolved"].includes(selectedCanonicalIncidentStatus) ? "Watch-only observation recorded — incident closed" : "Automatic watch-only closure in progress"}</strong><p>No approval or execution is required because the resolution explicitly classified this alert as watch-only.</p></div></div> : executionIsDiagnosticOnly && !liveExecutionPlanAvailable ? <div className="execution-step-form"><div><strong>This diagnostic plan cannot be approved for execution</strong><p>The analysis is complete, but no corrective action was supplied and recovery has not been verified. Keep the incident open, escalate for manual remediation, or regenerate a reviewed corrective plan.</p></div><label>Escalation reason<textarea rows={2} value={approvalForm.comment} placeholder="Why does this incident require manual remediation?" onChange={(event) => setApprovalForm((current) => ({ ...current, action: "reject", comment: event.target.value }))} /></label><div className="button-row"><button type="button" className="button-primary" onClick={() => void approveCockpitRemediationPlan("reject")} disabled={approvalState.loading}>{approvalState.loading ? "Recording escalation…" : "Escalate for manual remediation"}</button><button type="button" className="button-secondary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Regenerating…" : "Regenerate corrective plan"}</button></div></div> : !cockpitApprovalAccepted ? <div className="execution-step-form"><div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve immutable plan</option><option value="reject">Reject automation and escalate</option></select></label><label>Approver<input value={adminSession?.user?.username || "Authenticated operator"} readOnly /></label></div><label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder={approvalForm.action === "reject" ? "Why must this incident be escalated for manual remediation?" : "Why is this plan safe and appropriate?"} onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label><button type="button" className="button-primary" onClick={() => void approveCockpitRemediationPlan()} disabled={approvalState.loading}>{approvalState.loading ? (approvalWillAutoExecute ? "Approving and starting…" : "Recording decision…") : approvalForm.action === "reject" ? "Reject and escalate" : approvalWillAutoExecute ? "Approve and start remediation" : "Approve and continue"}</button><small className="execution-action-explainer">{approvalWillAutoExecute ? "This lower-risk non-production plan starts immediately after approval." : dangerousProductionAction ? "Production execution requires a separate typed confirmation after approval." : "Approval is recorded first; any missing executor setup is shown next."}</small></div> : executionSetupBlocked ? <div className="execution-step-form"><div><strong>Approval recorded — complete required setup</strong><p>{blockingPreflightFailures.map((check) => check.label).join(", ")}</p></div>{!jenkinsExecutorSelected ? <button type="button" className="button-primary" onClick={buildRequiredExecutor}>Build required process</button> : null}</div> : dangerousProductionAction && !executionConfirmationValid ? <div className="execution-step-form"><label className="typed-execution-confirmation">Approval recorded. Type <code>{executionConfirmationPhrase}</code> to confirm production execution<input value={executionConfirmationText} autoComplete="off" autoFocus onChange={(event) => setExecutionConfirmationText(event.target.value)} /></label></div> : executionCapabilityBlocked ? <div className="execution-step-form"><div><strong>Approval recorded — live execution is not configured</strong><p>This plan has no reviewed corrective capability. Regenerate it after adding a matching catalog playbook.</p></div></div> : <><div><strong>Approval and all safety gates passed</strong><p>{selectedGovernedExecutionTarget} · {selectedApplicationConnection.environment} · {selectedExecutionPlan.riskTier || "unknown risk"}</p></div><button type="button" className="button-primary execution-primary-action" onClick={confirmAndExecuteRemediationPlan} disabled={!executionAllowed}>{remediationExecutionState.loading ? "Executing…" : "Execute approved plan"}</button></>}
+                            </>}
                           </div>
                           {remediationExecutionState.error ? <p className="error">{remediationExecutionState.error}</p> : null}
-                          {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
+                          {approvalState.error ? <p className="error" role="alert">{approvalState.error}</p> : null}
                           {emergencyStopAvailable ? <section className="execution-emergency-stop" aria-labelledby="emergency-stop-title"><div><span className="eyebrow">Emergency control</span><h4 id="emergency-stop-title">Stop active remediation</h4><p>Stops the queued or running executor job, cancels durable orchestration, and records the authenticated operator and reason.</p></div><label>Required stop reason<textarea rows={2} value={emergencyStopState.reason} placeholder="Describe the unsafe condition or unexpected impact" onChange={(event) => setEmergencyStopState((current) => ({ ...current, reason: event.target.value, error: "" }))} /></label><button type="button" className="button-danger" disabled={emergencyStopState.loading || emergencyStopState.reason.trim().length < 8} onClick={() => requestEmergencyStop(emergencyStopAction.id)}>{emergencyStopState.loading ? "Stopping remediation…" : "Emergency stop"}</button></section> : null}
                           {emergencyStopState.error ? <p className="error" role="alert">{emergencyStopState.error}</p> : null}
                           {emergencyStopState.message ? <p className="status-message" role="status">{emergencyStopState.message}</p> : null}

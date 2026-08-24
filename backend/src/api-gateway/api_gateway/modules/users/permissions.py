@@ -7,6 +7,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from api_gateway.modules.users.service import UserService
 from common.tenant_identity import require_tenant_id
+from common.authorization import role_is_allowed
 
 security = HTTPBearer(auto_error=True)
 
@@ -88,7 +89,7 @@ async def current_tenant_id(
 
 def require_roles(*allowed_roles: str):
     async def _dependency(auth: AuthContext = Depends(current_auth_context)) -> AuthContext:
-        if auth.role not in allowed_roles:
+        if not role_is_allowed(auth.role, allowed_roles):
             raise HTTPException(status_code=403, detail="Insufficient role permissions")
         return auth
 

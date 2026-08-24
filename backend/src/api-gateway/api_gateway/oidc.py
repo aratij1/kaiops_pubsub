@@ -11,8 +11,12 @@ from fastapi import HTTPException
 
 from common.config import Settings
 from common.tenant_identity import require_tenant_id
+from common.authorization import OperationalRole
 
-KAIOPS_ROLES = {"Administrator", "Executive", "L3 Engineer", "L2 Engineer", "L1 Operator"}
+KAIOPS_ROLES = {
+    *(role.value for role in OperationalRole),
+    "Administrator", "Executive", "L3 Engineer", "L2 Engineer", "L1 Operator",
+}
 
 
 class OidcTokenValidator:

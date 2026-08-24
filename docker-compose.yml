@@ -622,6 +622,14 @@ services:
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
 
+  connector-hub:
+    build: *service-build
+    restart: unless-stopped
+    environment: { <<: *service-env, SERVICE_NAME: connector-hub }
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    working_dir: /app/backend/src/connector-hub
+    ports: ["8028:8000"]
+
   discovery-service:
     profiles: ["monitoring-authoring", "full"]
     build: *service-build

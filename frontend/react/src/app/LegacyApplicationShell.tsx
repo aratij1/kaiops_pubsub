@@ -3,6 +3,7 @@ import { Outlet, useLocation, useNavigate } from "react-router-dom";
 
 import { LEGACY_REDIRECTS, navigationItemForPath, PATH_BY_TAB, tabForPath, type LegacyTabId } from "./navigation";
 import { resilientLazy } from "./resilientLazy";
+import { KAI_BRAND } from "../config/brand";
 
 type LegacyApplicationProps = {
   initialTab?: string;
@@ -35,7 +36,7 @@ export function LegacyApplicationShell() {
   }, [location.pathname, navigate]);
 
   useEffect(() => {
-    document.title = `${navigationItem.pageTitle} | KaiMS`;
+    document.title = KAI_BRAND.documentTitle(navigationItem.pageTitle);
   }, [navigationItem.pageTitle]);
 
   useEffect(() => {

@@ -58,6 +58,18 @@ MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
 _CONTEXT_COLLECTION_LOCKS: dict[str, asyncio.Lock] = {}
 
 
+def _incident_from_workflow_payload(payload: dict[str, Any]) -> Incident:
+    """Hydrate the strict domain incident from an enriched read projection.
+
+    Incident projections acquire lifecycle and approval annotations after the
+    canonical event is created. Those read-model fields are useful to callers
+    but are not part of the strict Incident contract consumed by this agent.
+    """
+    return Incident.model_validate({
+        key: value for key, value in payload.items() if key in Incident.model_fields
+    })
+
+
 def _context_strategy(override: str | None = None) -> str:
     strategy = str(override or getattr(settings, "context_strategy", "auto") or "auto").strip().lower()
     aliases = {"continuous": "auto", "immediate": "realtime"}
@@ -762,7 +774,7 @@ async def startup(app: FastAPI) -> None:
 
     async def handle(payload: dict) -> None:
         alert = Alert.model_validate(payload["alert"])
-        incident = Incident.model_validate(payload["incident"])
+        incident = _incident_from_workflow_payload(payload["incident"])
         decision = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
         context = await _collect_context_with_strategy(
             app, alert, incident, decision.get("context_strategy"), payload.get("context")
@@ -1533,7 +1545,7 @@ def read_flow_catalog(connector: VectorDBConnector) -> list[dict[str, Any]]:
 @app.post("/collect", response_model=Context)
 async def collect(payload: dict, publish_events: bool = True) -> Context:
     alert = Alert.model_validate(payload["alert"])
-    incident = Incident.model_validate(payload["incident"])
+    incident = _incident_from_workflow_payload(payload["incident"])
     context = await _collect_context_with_strategy(
         app, alert, incident, payload.get("context_strategy"), payload.get("context")
     )

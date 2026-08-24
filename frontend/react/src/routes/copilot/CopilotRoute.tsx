@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { Bot, Sparkles } from "lucide-react";
 import { useRouteRuntimeSlice } from "../../app/routeRuntime";
 import { askCopilot } from "../../services/copilot";
@@ -18,7 +18,8 @@ export default function CopilotRoute() {
   const copilot = useRouteRuntimeSlice("copilot");
   const session = useRouteRuntimeSlice("session");
   const navigate = useNavigate();
-  const [question, setQuestion] = useState("");
+  const [searchParams] = useSearchParams();
+  const [question, setQuestion] = useState(() => searchParams.get("query")?.slice(0, 1000) ?? "");
   const [turns, setTurns] = useState<Turn[]>([]);
   const askMutation = useMutation({ mutationFn: (query: string) => askCopilot(session.accessToken, query), onSuccess: (answer, query) => setTurns((current) => [...current, { id: Date.now(), question: query, answer }]), onError: (_error, query) => setTurns((current) => [...current, { id: Date.now(), question: query, error: "KaiMS could not complete this request. Check platform health or try a narrower question." }]) });
   const submit = (event: React.FormEvent) => { event.preventDefault(); const value = question.trim(); if (!value || askMutation.isPending) return; setQuestion(""); askMutation.mutate(value); };

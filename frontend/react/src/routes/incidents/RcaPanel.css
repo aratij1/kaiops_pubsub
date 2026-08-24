@@ -9,6 +9,7 @@
   gap: 18px;
   width: 100%;
   max-width: 1500px;
+  min-width: 0;
   margin: 0 auto;
   color: var(--ink, #102a43);
   font-size: 14px;
@@ -120,8 +121,8 @@
 }
 
 .context-workspace-toolbar {
-  position: sticky;
-  top: 0;
+  position: static;
+  top: auto;
   z-index: 8;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -151,6 +152,7 @@
   border-radius: 8px;
   background: transparent;
   cursor: pointer;
+  min-width: 0;
 }
 
 .rca-view-tabs button strong {

@@ -48,6 +48,7 @@ from common.database import (
     ServiceResourceMappingRecord,
 )
 from common.models import utc_now
+from common.tenant_identity import require_tenant_id
 
 
 def _connection_from_record(row: ProviderConnectionRecord) -> CloudConnection:
@@ -210,6 +211,9 @@ class CloudOperationsRepository:
 
     async def upsert_resource(self, resource: DiscoveredResource) -> DiscoveredResourceRecord:
         provider_resource_key = hashlib.sha256(resource.provider_resource_id.encode("utf-8")).hexdigest()
+        canonical_resource_id = resource.canonical_resource_id or (
+            f"urn:kaims:{resource.provider.value}:{resource.provider_account_id}:{provider_resource_key}"
+        )
         existing = (
             await self.session.execute(
                 select(DiscoveredResourceRecord).where(
@@ -233,6 +237,7 @@ class CloudOperationsRepository:
                 region=resource.region,
                 provider_resource_id=resource.provider_resource_id,
                 provider_resource_key=provider_resource_key,
+                canonical_resource_id=canonical_resource_id,
                 resource_type=resource.resource_type,
                 display_name=resource.display_name,
                 status=resource.status.value,
@@ -242,6 +247,9 @@ class CloudOperationsRepository:
                 health=resource.health,
                 cost=resource.cost,
                 discovered_at=resource.discovered_at,
+                last_verified_at=resource.last_verified_at or resource.discovered_at,
+                provenance=resource.provenance,
+                evidence=resource.evidence,
             )
             self.session.add(existing)
         else:
@@ -256,6 +264,10 @@ class CloudOperationsRepository:
             existing.health = resource.health
             existing.cost = resource.cost
             existing.discovered_at = resource.discovered_at
+            existing.last_verified_at = resource.last_verified_at or resource.discovered_at
+            existing.canonical_resource_id = canonical_resource_id
+            existing.provenance = resource.provenance
+            existing.evidence = resource.evidence
             existing.version = int(existing.version or 1) + 1
         await self.audit(
             tenant_id=resource.tenant_id,
@@ -285,11 +297,63 @@ class CloudOperationsRepository:
             self.session.add(existing)
         else:
             existing.source = relationship.source
+            existing.relationship_source = relationship.relationship_source
             existing.confidence = relationship.confidence
+            existing.evidence = relationship.evidence
+            existing.last_verified_at = relationship.last_verified_at or relationship.discovered_at
             existing.owner_confirmed = relationship.owner_confirmed
             existing.discovered_at = relationship.discovered_at
             existing.version = int(existing.version or 1) + 1
         return existing
+
+    async def dependency_traversal(
+        self,
+        *,
+        tenant_id: str,
+        project_id: str,
+        resource_id: str,
+        direction: str = "outbound",
+        max_depth: int = 3,
+    ) -> dict[str, Any]:
+        """Return a bounded, tenant-scoped dependency graph for impact analysis."""
+        tenant_id = require_tenant_id(tenant_id, source="digital twin traversal")
+        if direction not in {"outbound", "inbound", "both"}:
+            raise ValueError("direction must be outbound, inbound, or both")
+        depth_limit = max(1, min(int(max_depth), 8))
+        rows = list((await self.session.execute(select(ResourceRelationshipRecord).where(
+            ResourceRelationshipRecord.tenant_id == tenant_id,
+            ResourceRelationshipRecord.project_id == str(project_id).strip(),
+        ))).scalars().all())
+        visited = {str(resource_id)}
+        frontier = {str(resource_id)}
+        selected: list[ResourceRelationshipRecord] = []
+        for _depth in range(depth_limit):
+            next_frontier: set[str] = set()
+            for row in rows:
+                outbound = row.source_resource_id in frontier
+                inbound = row.target_resource_id in frontier
+                include = (direction in {"outbound", "both"} and outbound) or (
+                    direction in {"inbound", "both"} and inbound
+                )
+                if not include or row in selected:
+                    continue
+                selected.append(row)
+                candidate = row.target_resource_id if outbound else row.source_resource_id
+                if candidate not in visited:
+                    next_frontier.add(candidate)
+            if not next_frontier:
+                break
+            visited.update(next_frontier)
+            frontier = next_frontier
+        return {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "root_resource_id": resource_id,
+            "direction": direction,
+            "max_depth": depth_limit,
+            "resource_ids": sorted(visited),
+            "relationships": [self.relationship_payload(row) for row in selected],
+        }
 
     async def list_resources(
         self,
@@ -594,6 +658,13 @@ class CloudOperationsRepository:
         if environment:
             readiness_stmt = readiness_stmt.where(ServiceReadinessScoreRecord.environment == environment)
         readiness_rows = list((await self.session.execute(readiness_stmt)).scalars().all())
+        profile_stmt = select(ServiceOnboardingProfileRecord).where(ServiceOnboardingProfileRecord.tenant_id == tenant_id)
+        if project_id:
+            profile_stmt = profile_stmt.where(ServiceOnboardingProfileRecord.project_id == project_id)
+        if environment:
+            profile_stmt = profile_stmt.where(ServiceOnboardingProfileRecord.environment == environment)
+        profiles = list((await self.session.execute(profile_stmt)).scalars().all())
+        profiles_by_scope = {(row.project_id, row.service_id, row.environment): row for row in profiles}
         health: dict[str, int] = {}
         by_provider: dict[str, int] = {}
         by_environment: dict[str, int] = {}
@@ -616,10 +687,41 @@ class CloudOperationsRepository:
                     "readiness_state": row.readiness_state,
                     "overall_score": float(row.overall_score or 0.0),
                     "scores": row.scores or {},
+                    **self._autonomy_readiness_details(
+                        profiles_by_scope.get((row.project_id, row.service_id, row.environment)), row.scores or {}
+                    ),
                 }
                 for row in readiness_rows
             ],
         }
+
+    @staticmethod
+    def _autonomy_readiness_details(profile: ServiceOnboardingProfileRecord | None, scores: dict[str, Any]) -> dict[str, Any]:
+        telemetry = dict(profile.telemetry or {}) if profile else {}
+        dimensions = {
+            "monitoring": 1.0 if telemetry.get("monitoring_sources") else 0.0,
+            "logs": 1.0 if telemetry.get("log_sources") else 0.0,
+            "traces": 1.0 if telemetry.get("trace_sources") else 0.0,
+            "topology": float(scores.get("topology") or 0.0),
+            "runbooks": 1.0 if profile and profile.knowledge_refs else 0.0,
+            "remediation": 1.0 if profile and profile.remediation_capabilities else 0.0,
+            "validation": 1.0 if profile and profile.validation_rules else 0.0,
+            "automation": float(scores.get("automation") or 0.0),
+            "slos": 1.0 if profile and profile.slos else 0.0,
+        }
+        recommendations = {
+            "monitoring": "Connect at least one monitoring source and validate signal intake.",
+            "logs": "Connect a scoped log source for diagnostic evidence.",
+            "traces": "Instrument critical service paths with distributed tracing.",
+            "topology": "Run deterministic discovery and verify resource relationships.",
+            "runbooks": "Attach an operator-owned runbook or approved SOP.",
+            "remediation": "Register a deterministic remediation capability for this service.",
+            "validation": "Define post-action health and recovery validation checks.",
+            "automation": "Configure capability autonomy and the required HITL policy.",
+            "slos": "Define measurable service-level objectives and error-budget signals.",
+        }
+        gaps = [{"dimension": key, "score": value, "recommendation": recommendations[key]} for key, value in dimensions.items() if value < 0.75]
+        return {"dimensions": dimensions, "autonomy_score": round(sum(dimensions.values()) / len(dimensions), 4), "gaps": gaps}
 
     async def compile_plan(self, request: PlanCompileRequest) -> CloudCompiledPlanRecord:
         resources = await self.list_resources(
@@ -1000,6 +1102,7 @@ class CloudOperationsRepository:
             "provider_account_id": row.provider_account_id,
             "region": row.region,
             "provider_resource_id": row.provider_resource_id,
+            "canonical_resource_id": row.canonical_resource_id,
             "resource_type": row.resource_type,
             "display_name": row.display_name,
             "status": row.status,
@@ -1009,6 +1112,9 @@ class CloudOperationsRepository:
             "health": row.health or {},
             "cost": row.cost or {},
             "discovered_at": row.discovered_at.isoformat() if isinstance(row.discovered_at, datetime) else None,
+            "last_verified_at": row.last_verified_at.isoformat() if isinstance(row.last_verified_at, datetime) else None,
+            "provenance": row.provenance or {},
+            "evidence": row.evidence or [],
             "updated_at": row.updated_at.isoformat() if isinstance(row.updated_at, datetime) else None,
             "version": row.version,
         }
@@ -1023,7 +1129,10 @@ class CloudOperationsRepository:
             "target_resource_id": row.target_resource_id,
             "relationship_type": row.relationship_type,
             "source": row.source,
+            "relationship_source": row.relationship_source,
             "confidence": float(row.confidence or 0.0),
+            "evidence": row.evidence or [],
+            "last_verified_at": row.last_verified_at.isoformat() if isinstance(row.last_verified_at, datetime) else None,
             "owner_confirmed": bool(row.owner_confirmed),
             "discovered_at": row.discovered_at.isoformat() if isinstance(row.discovered_at, datetime) else None,
         }

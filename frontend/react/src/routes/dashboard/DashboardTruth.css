@@ -9,3 +9,26 @@
 .ro-donut-wrap li > i { width: 8px; height: 8px; border-radius: 50%; }
 .ro-donut-wrap li > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ro-donut-wrap li > b { min-width: 2ch; text-align: right; font-variant-numeric: tabular-nums; }
+.ro-command-truth {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ro-command-truth article {
+  display: grid;
+  gap: 4px;
+  padding: 14px;
+  border: 1px solid var(--k-color-border);
+  border-radius: var(--k-radius-md);
+  background: var(--k-color-surface);
+}
+
+.ro-command-truth span,
+.ro-command-truth small { color: var(--k-color-text-muted); }
+.ro-command-truth span { font-size: .66rem; font-weight: 800; text-transform: uppercase; }
+.ro-command-truth strong { font: 700 1.15rem var(--kai-font-display); }
+.ro-command-truth small { font-size: .6rem; line-height: 1.35; }
+
+@media (max-width: 1100px) { .ro-command-truth { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 700px) { .ro-command-truth { grid-template-columns: 1fr 1fr; } }

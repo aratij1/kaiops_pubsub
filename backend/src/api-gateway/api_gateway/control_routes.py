@@ -17,6 +17,7 @@ from api_gateway.copilot import (
     extract_incident_id,
 )
 from api_gateway.modules.users.models import SystemRole
+from common.authorization import OperationalRole, role_is_allowed
 
 GuardedProxy = Callable[..., Awaitable[dict[str, Any]]]
 RawProxy = Callable[..., Awaitable[tuple[int, dict[str, Any]]]]
@@ -170,9 +171,9 @@ def build_control_router(
             if auth_context_from_request is None:
                 raise HTTPException(status_code=500, detail="Gateway authentication resolver is not configured")
             auth = await auth_context_from_request(request)
-        allowed_roles = {SystemRole.ADMINISTRATOR.value, SystemRole.L3_ENGINEER.value}
-        if auth.role not in allowed_roles:
-            raise HTTPException(status_code=403, detail="Manual closure requires an Administrator or L3 Engineer")
+        allowed_roles = {OperationalRole.ADMIN.value, OperationalRole.HITL_APPROVER.value}
+        if not role_is_allowed(auth.role, allowed_roles):
+            raise HTTPException(status_code=403, detail="Manual closure requires ADMIN or HITL_APPROVER")
         forbidden_identity_fields = {"closed_by", "actor_id", "actor_role", "tenant_id"}.intersection(payload)
         if forbidden_identity_fields:
             raise HTTPException(

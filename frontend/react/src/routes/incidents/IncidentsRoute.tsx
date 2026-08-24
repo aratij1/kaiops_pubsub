@@ -5,6 +5,7 @@ import { useRouteRuntimeSlice, type IncidentFilters, type IncidentRow } from "..
 import { OperationsWorkflowNav } from "../../components/operations/OperationsWorkflowNav";
 import { effectiveIncidentStatus } from "../../domain/incidentStatus";
 import { formatIstTimestamp } from "../../appHelpers.jsx";
+import IncidentDecisionWorkspace from "./IncidentDecisionWorkspace";
 import "./IncidentsRoute.css";
 
 const PAGE_SIZE = 10;
@@ -485,6 +486,7 @@ export default function IncidentsRoute() {
             </div>
           </div> : null}
           {presentation === "details" ? <div className="incident-detail-view">
+            <IncidentDecisionWorkspace row={row} />
             <nav className="incident-detail-stage-nav" aria-label={`Detail stages for ${incidentTitle(row)}`}>
               {lifecycle.filter((stage) => !["pending", "stopped"].includes(stage.state)).map((stage) => <button type="button" key={stage.id} className={selectedStage === stage.id ? "active" : ""} onClick={() => setInspector({ incidentId, stage: stage.id })}><span>{stage.label}</span><small>{stage.caption}</small></button>)}
             </nav>

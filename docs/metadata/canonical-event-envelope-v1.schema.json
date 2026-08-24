@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaims.local/schemas/canonical-event-envelope-v1.schema.json",
+  "title": "KaiMS Canonical Event Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id", "event_type", "event_version", "timestamp", "tenant_id",
+    "project_id", "application_id", "environment", "resource_id", "incident_id",
+    "trace_id", "correlation_id", "causation_id", "source", "payload", "metadata"
+  ],
+  "properties": {
+    "event_id": { "type": "string", "format": "uuid" },
+    "event_type": { "type": "string", "minLength": 1 },
+    "event_version": { "const": "1.0" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "tenant_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": ["string", "null"] },
+    "application_id": { "type": ["string", "null"] },
+    "environment": { "type": ["string", "null"] },
+    "resource_id": { "type": ["string", "null"] },
+    "incident_id": { "type": ["string", "null"] },
+    "trace_id": { "type": "string", "minLength": 1 },
+    "correlation_id": { "type": "string", "minLength": 1 },
+    "causation_id": { "type": ["string", "null"] },
+    "source": { "type": "string", "minLength": 1 },
+    "payload": { "type": "object" },
+    "metadata": { "type": "object" }
+  }
+}

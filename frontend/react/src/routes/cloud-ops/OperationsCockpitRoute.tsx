@@ -1,8 +1,18 @@
 import { useEffect, useState } from "react";
-import { Activity, Cloud, Gauge, RefreshCw } from "lucide-react";
+import { Activity, AlertTriangle, CheckCircle2, Cloud, Gauge, RefreshCw, ShieldCheck } from "lucide-react";
 
-import { approveCloudPlan, compileCloudPlan, executeCloudPlan, listCloudProviderStatus, openMaintenanceWindow, operationsCockpit, recoverExecutionLeases, rollbackCloudExecution, saveExecutionPolicy, simulateCloudPlan, type CloudPlanExecution, type CloudProviderStatus, type CockpitSummary, type CompiledPlan, type PlanSimulation } from "./cloudOpsApi";
+import { approveCloudPlan, compileCloudPlan, executeCloudPlan, listCloudProviderStatus, openMaintenanceWindow, operationsCockpit, recoverExecutionLeases, rollbackCloudExecution, saveExecutionPolicy, simulateCloudPlan, type CloudPlanExecution, type CloudProviderStatus, type CockpitSummary, type CompiledPlan, type PlanSimulation, type ReadinessRow } from "./cloudOpsApi";
 import "./CloudOpsRoute.css";
+
+const DIMENSION_LABELS: Record<string, string> = { monitoring: "Monitoring", logs: "Logs", traces: "Traces", topology: "Topology", runbooks: "Runbooks", remediation: "Remediation", validation: "Validation", automation: "Automation", slos: "SLOs" };
+const percent = (value: number | undefined) => `${Math.round(Number(value || 0) * 100)}%`;
+
+export function aggregateProjectReadiness(rows: ReadinessRow[]) {
+  if (!rows.length) return { operational: 0, autonomy: 0, dimensions: {} as Record<string, number> };
+  const keys = [...new Set(rows.flatMap((row) => Object.keys(row.dimensions || {})))];
+  const average = (values: number[]) => values.reduce((total, value) => total + value, 0) / values.length;
+  return { operational: average(rows.map((row) => Number(row.overall_score || 0))), autonomy: average(rows.map((row) => Number(row.autonomy_score || 0))), dimensions: Object.fromEntries(keys.map((key) => [key, average(rows.map((row) => Number(row.dimensions?.[key] || 0)))])) };
+}
 
 export default function OperationsCockpitRoute() {
   const [projectId, setProjectId] = useState("demo-project");
@@ -18,6 +28,7 @@ export default function OperationsCockpitRoute() {
   const [execution, setExecution] = useState<CloudPlanExecution | null>(null);
   const [governanceStatus, setGovernanceStatus] = useState("");
   const [providerStatus, setProviderStatus] = useState<CloudProviderStatus[]>([]);
+  const projectReadiness = aggregateProjectReadiness(summary?.readiness || []);
 
   async function refresh() {
     setBusy(true);
@@ -125,16 +136,10 @@ export default function OperationsCockpitRoute() {
             <article className="cloud-ops-card"><header><h3>Services</h3><Activity size={18} /></header><div className="cloud-ops-kpi">{summary.service_count}</div><p>Services with mapped inventory</p></article>
             <article className="cloud-ops-card"><header><h3>Health states</h3><Gauge size={18} /></header><div className="cloud-ops-meta">{Object.entries(summary.health).map(([key, value]) => <span key={key}>{value} {key}</span>)}</div></article>
           </div>
-          <article className="cloud-ops-panel">
-            <header><h2>Readiness board</h2><span className="cloud-ops-badge">{summary.readiness.length} services</span></header>
-            <div className="cloud-ops-grid">
-              {summary.readiness.map((row) => (
-                <article className="cloud-ops-card" key={`${row.project_id}-${row.service_id}-${row.environment}`}>
-                  <header><div><h3>{row.service_id}</h3><p>{row.project_id} · {row.environment}</p></div><span className="cloud-ops-badge">{row.readiness_state}</span></header>
-                  <div className="cloud-ops-readiness"><div className="cloud-ops-readiness-score">{Math.round(row.overall_score * 100)}</div><p>{Object.entries(row.scores).map(([key, value]) => `${key}: ${Math.round(value * 100)}`).join(" · ")}</p></div>
-                </article>
-              ))}
-            </div>
+          <article className="cloud-ops-panel autonomy-dashboard">
+            <header><div><h2>Readiness and autonomy</h2><p>Observed configuration and discovery signals only. Missing dimensions stay visible and never become fabricated coverage.</p></div><span className="cloud-ops-badge">{summary.readiness.length} services</span></header>
+            {summary.readiness.length ? <section className="project-readiness-summary" aria-label="Project readiness summary"><div className="readiness-score-ring"><strong>{percent(projectReadiness.autonomy)}</strong><span>Autonomy readiness</span></div><div><span className="resource-eyebrow">Project posture</span><h3>{projectId || "All projects"}</h3><p>Operational readiness {percent(projectReadiness.operational)} · across {summary.readiness.length} service scope(s)</p></div><div className="readiness-dimension-strip">{Object.entries(projectReadiness.dimensions).map(([key, value]) => <div key={key}><span><b>{DIMENSION_LABELS[key] || key}</b><small>{percent(value)}</small></span><progress max={1} value={value} aria-label={`${DIMENSION_LABELS[key] || key} ${percent(value)}`} /></div>)}</div></section> : null}
+            <div className="readiness-service-grid">{summary.readiness.map((row) => <article className="readiness-service-card" key={`${row.project_id}-${row.service_id}-${row.environment}`}><header><div><h3>{row.service_id}</h3><p>{row.project_id} · {row.environment}</p></div><span className="cloud-ops-badge">{row.readiness_state}</span></header><div className="readiness-score-pair"><span><strong>{percent(row.overall_score)}</strong><small>Operational</small></span><span><strong>{percent(row.autonomy_score)}</strong><small>Autonomy</small></span></div><div className="readiness-dimensions">{Object.entries(row.dimensions || row.scores).map(([key, value]) => <div key={key}><span><b>{DIMENSION_LABELS[key] || key.replaceAll("_", " ")}</b><small>{percent(value)}</small></span><progress max={1} value={value} /></div>)}</div><details className="readiness-gaps"><summary>{row.gaps?.length ? <><AlertTriangle size={15} /> {row.gaps.length} readiness gap(s)</> : <><CheckCircle2 size={15} /> Mandatory signals configured</>}</summary>{row.gaps?.length ? <ul>{row.gaps.map((gap) => <li key={gap.dimension}><ShieldCheck size={15} /><span><strong>{DIMENSION_LABELS[gap.dimension] || gap.dimension} · {percent(gap.score)}</strong><small>{gap.recommendation}</small></span></li>)}</ul> : <p>No configuration gap is reported. Runtime policy gates still apply to every action.</p>}</details></article>)}</div>
             {!summary.readiness.length ? <div className="cloud-ops-empty">No readiness scores yet. Save a service onboarding profile first.</div> : null}
           </article>
         </>

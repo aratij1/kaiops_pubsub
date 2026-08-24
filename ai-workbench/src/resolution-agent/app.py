@@ -17,6 +17,12 @@ from common.resolution_lifecycle import ResolutionState, create_lifecycle, decid
 from common.kafka import KafkaConsumer
 from common.kafka import consume_forever as consume_kafka_forever
 from common.models import Incident, Recommendation
+from common.capability_registry import default_capability_registry
+from common.remediation_plan import (
+    AutonomyRecommendation,
+    RemediationPlan,
+    assess_remediation_plan,
+)
 from common.orchestration.execution_plan import resolve_execution_plan
 from common.orchestration.execution_plan_contract import (
     ExecutionPlanV2,
@@ -433,6 +439,7 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
         "approval_expiry_seconds": 900,
     }
     plan = ExecutionPlanV2.model_validate(plan).finalized().model_dump(mode="json")
+    _attach_typed_remediation_plan(recommendation, context, plan)
     metadata["execution_plan"] = plan
     metadata["remediation_target"] = str(plan.get("remediation_target") or context.alert.service or "")
     metadata["recommended_commands"] = list(plan.get("commands") or [])
@@ -487,6 +494,109 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
     recommendation.metadata = metadata
     recommendation.commands = list(plan.get("commands") or [])
     return plan
+
+
+_CAPABILITY_BINDINGS: dict[tuple[str, str], str] = {
+    ("kubernetes", "restart_pod"): "kubernetes.restart_workload",
+    ("kubernetes", "restart_service"): "kubernetes.restart_workload",
+    ("kubernetes", "rollback_deployment"): "kubernetes.rollback_deployment",
+    ("kubernetes", "scale_workload"): "kubernetes.scale_workload",
+    ("mysql", "read_status"): "database.collect_diagnostics",
+    ("mysql", "collect_diagnostics"): "database.collect_diagnostics",
+    ("mysql", "failover_database"): "database.failover",
+}
+
+
+def _attach_typed_remediation_plan(
+    recommendation: Recommendation,
+    context: Context,
+    execution_plan: dict[str, Any],
+) -> None:
+    """Project only registered, typed catalog actions into the Resolution contract."""
+    metadata = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
+    actions = execution_plan.get("actions") if isinstance(execution_plan.get("actions"), list) else []
+    if len(actions) != 1 or not isinstance(actions[0], dict):
+        metadata["remediation_plan_status"] = {
+            "valid": False,
+            "execution_eligible": False,
+            "reason_codes": ["single_registered_capability_required"],
+        }
+        recommendation.remediation_plan = None
+        recommendation.metadata = metadata
+        return
+    action = actions[0]
+    binding = action.get("safety_binding") if isinstance(action.get("safety_binding"), dict) else {}
+    capability = binding.get("capability") if isinstance(binding.get("capability"), dict) else {}
+    operation = str(capability.get("operation") or "").strip()
+    connection = execution_plan.get("connection") if isinstance(execution_plan.get("connection"), dict) else {}
+    connector = connection.get("connector") if isinstance(connection.get("connector"), dict) else {}
+    connector_type = str(connector.get("type") or "").strip().lower()
+    capability_id = _CAPABILITY_BINDINGS.get((connector_type, operation))
+    if not capability_id:
+        metadata["remediation_plan_status"] = {
+            "valid": False,
+            "execution_eligible": False,
+            "reason_codes": ["unregistered_capability_binding"],
+            "catalog_operation": operation,
+            "connector_type": connector_type,
+        }
+        recommendation.remediation_plan = None
+        recommendation.metadata = metadata
+        return
+    blast = binding.get("blast_radius") if isinstance(binding.get("blast_radius"), dict) else {}
+    target = str(action.get("target_resource_id") or "").strip()
+    affected = [str(item) for item in blast.get("affected_resource_ids", []) if str(item).strip()]
+    stable_target_identity = target.startswith(("dt://", "urn:", "arn:", "k8s://", "/subscriptions/"))
+    evidence = [str(item) for item in execution_plan.get("evidence_references", []) if str(item).strip()]
+    registry = default_capability_registry()
+    definition = registry.get(capability_id)
+    raw_inputs = action.get("inputs") if isinstance(action.get("inputs"), dict) else {}
+    parameters = {
+        str(key): value
+        for key, value in raw_inputs.items()
+        if str(key).lower() not in {"catalog_command", "command", "commands", "script", "scripts"}
+    }
+    risk_scores = {"low": 20, "medium": 45, "high": 75, "critical": 95}
+    typed_plan = RemediationPlan(
+        incident_id=recommendation.incident_id,
+        tenant_id=recommendation.tenant_id,
+        root_cause=recommendation.root_cause,
+        root_cause_confidence=recommendation.confidence,
+        supporting_evidence=evidence,
+        affected_resources=affected or ([target] if target else []),
+        blast_radius=blast.get("scope") or "unknown",
+        business_impact=recommendation.impact,
+        recommended_capability=capability_id,
+        target_resource_id=target,
+        target_identity_verified=(
+            bool(blast.get("verified"))
+            and target in affected
+            and stable_target_identity
+        ),
+        connector_id=definition.supported_connectors[0],
+        required_parameters=parameters,
+        preconditions=list(definition.preconditions),
+        validation_plan=[str(item) for item in action.get("validation", []) if str(item).strip()],
+        rollback_capability=definition.rollback_capability,
+        risk_score=risk_scores.get(str(execution_plan.get("risk") or "medium").lower(), 45),
+        autonomy_recommendation=(
+            AutonomyRecommendation.HITL_REQUIRED
+            if definition.mutating
+            else AutonomyRecommendation.RECOMMEND
+        ),
+    )
+    assessment = assess_remediation_plan(
+        typed_plan,
+        registry,
+        environment={"prod": "production", "dev": "development"}.get(
+            str(context.alert.environment or "unknown").lower(),
+            str(context.alert.environment or "unknown").lower(),
+        ),
+    )
+    recommendation.remediation_plan = typed_plan
+    metadata["remediation_plan"] = typed_plan.model_dump(mode="json")
+    metadata["remediation_plan_status"] = assessment.model_dump(mode="json")
+    recommendation.metadata = metadata
 
 
 def _build_resolution_event_payload(

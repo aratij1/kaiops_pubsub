@@ -436,6 +436,21 @@ class OnboardingStateRecord(Base, TimestampMixin):
     last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class OnboardingControlPlaneRecord(Base, TimestampMixin):
+    __tablename__ = "onboarding_control_planes"
+    __table_args__ = (
+        Index("idx_onboarding_control_plane_tenant_status", "tenant_id", "status"),
+    )
+
+    onboarding_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_name: Mapped[str] = mapped_column(String(255), index=True)
+    current_step: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(32), default="DRAFT", index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 class ApplicationRecord(Base, TimestampMixin):
     __tablename__ = "applications"
 
@@ -923,6 +938,7 @@ class DiscoveredResourceRecord(Base, TimestampMixin):
     region: Mapped[str] = mapped_column(String(128), index=True)
     provider_resource_id: Mapped[str] = mapped_column(String(768))
     provider_resource_key: Mapped[str] = mapped_column(String(64))
+    canonical_resource_id: Mapped[str | None] = mapped_column(String(768), index=True)
     resource_type: Mapped[str] = mapped_column(String(128), index=True)
     display_name: Mapped[str] = mapped_column(String(255), index=True)
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
@@ -932,6 +948,9 @@ class DiscoveredResourceRecord(Base, TimestampMixin):
     health: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     cost: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    evidence: Mapped[list[str]] = mapped_column(JSON, default=list)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
 
@@ -957,7 +976,10 @@ class ResourceRelationshipRecord(Base, TimestampMixin):
     target_resource_id: Mapped[str] = mapped_column(String(128), index=True)
     relationship_type: Mapped[str] = mapped_column(String(128), index=True)
     source: Mapped[str] = mapped_column(String(128), index=True)
+    relationship_source: Mapped[str] = mapped_column(String(32), default="discovered", index=True)
     confidence: Mapped[float] = mapped_column(Numeric(5, 4), default=0.0)
+    evidence: Mapped[list[str]] = mapped_column(JSON, default=list)
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     owner_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     version: Mapped[int] = mapped_column(Integer, default=1)

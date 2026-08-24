@@ -10,7 +10,16 @@ from uuid import NAMESPACE_URL, uuid5
 from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.models import RemediationAction, RemediationStatus, ResolutionReport
 from common.orchestration.execution_plan_contract import ValidatorSpec, canonical_plan_fingerprint, verify_plan_fingerprint
-from common.orchestration.outcome_validation import ValidationObservation, decide_outcome_validation
+from common.orchestration.outcome_validation import (
+    ClosedLoopAction,
+    ClosedLoopDecision,
+    ClosedLoopState,
+    ValidationCheck,
+    ValidationObservation,
+    ValidationPlan,
+    decide_closed_loop,
+    decide_outcome_validation,
+)
 from common.resolution_lifecycle import LifecycleActor, ResolutionState, extract_lifecycle, transition_lifecycle
 
 
@@ -183,6 +192,7 @@ class ClosureValidationAgent(BaseAgent):
         supplied_observations = action.parameters.get("validation_observations")
         supplied_observations = supplied_observations if isinstance(supplied_observations, list) else []
         observations: list[dict[str, Any]] = []
+        validator_results: dict[str, bool] = {}
         passed_kinds: set[str] = set()
         observed_at = datetime.now(timezone.utc)
         stability_required = max(60, min(int(execution_plan.get("stability_window_seconds") or 300), 3600))
@@ -213,6 +223,7 @@ class ClosureValidationAgent(BaseAgent):
             window_complete = bool(samples) and (samples[-1][0] - samples[0][0]).total_seconds() >= required_window
             validator_windows_complete = validator_windows_complete and window_complete
             validation[f"validator_{index}"] = passed
+            validator_results[validator.validator_id] = passed
             if passed:
                 passed_kinds.add(validator.kind)
             observations.extend({**item, "kind": validator.kind} for _, item in samples)
@@ -280,7 +291,69 @@ class ClosureValidationAgent(BaseAgent):
             observation_ids=[str(item.get("result_checksum")) for item in observations],
             rollback_action=rollback_action,
         )
+        signal_by_kind = {
+            "alert_clearance": "original_alert",
+            "availability": "service_health",
+            "error_rate": "metric",
+            "latency": "slo",
+            "dependency_health": "dependency_health",
+            "critical_alerts": "original_alert",
+            "business_transaction": "synthetic_probe",
+            "data_integrity": "metric",
+            "database_replication": "dependency_health",
+            "queue_lag": "metric",
+        }
+        remediation_plan = action.parameters.get("remediation_plan")
+        remediation_plan = remediation_plan if isinstance(remediation_plan, dict) else {}
+        typed_checks = [
+                ValidationCheck(
+                    check_id=validator.validator_id,
+                    signal=signal_by_kind.get(validator.kind, "metric"),
+                    connector_id=validator.connector_id,
+                    target_resource_id=validator.target_resource_id,
+                    check_reference=validator.check_reference,
+                    expected_condition=validator.expected_condition,
+                    required=True,
+                    independent=True,
+                )
+                for validator in governed_validators
+            ]
+        maximum_attempts = max(1, min(int(action.parameters.get("maximum_autonomous_attempts") or 2), 3))
+        validation_attempt = max(1, int(action.parameters.get("validation_attempt") or 1))
+        has_original_alert_check = any(check.signal == "original_alert" for check in typed_checks)
+        validation_plan = None
+        if typed_checks and has_original_alert_check:
+            validation_plan = ValidationPlan(
+                execution_id=action.id,
+                incident_id=action.incident_id,
+                plan_fingerprint=str(execution_plan.get("plan_fingerprint") or ""),
+                target_resource_id=str(action.target),
+                checks=typed_checks,
+                stability_window_seconds=stability_required,
+                maximum_autonomous_attempts=maximum_attempts,
+                rollback_capability=str(remediation_plan.get("rollback_capability") or "") or None,
+            )
+            closed_loop_decision = decide_closed_loop(
+                validation_plan,
+                execution_succeeded=validation["remediation_succeeded"],
+                observations=validator_results,
+                stability_window_complete=stability_passed,
+                attempt=min(validation_attempt, validation_plan.maximum_autonomous_attempts),
+                rollback_attempted=bool(action.parameters.get("rollback_attempted")),
+                rollback_succeeded=bool(action.parameters.get("rollback_succeeded")),
+            )
+        else:
+            at_limit = validation_attempt >= maximum_attempts
+            closed_loop_decision = ClosedLoopDecision(
+                state=ClosedLoopState.ESCALATED if at_limit else ClosedLoopState.VALIDATION_FAILED,
+                next_action=ClosedLoopAction.ESCALATE_TO_HITL if at_limit else ClosedLoopAction.RECOLLECT_EVIDENCE,
+                closure_authorized=False,
+                attempt=min(validation_attempt, maximum_attempts),
+                reason_codes=["canonical_validation_plan_missing", "original_alert_check_missing"],
+                missing_checks=["original_alert"],
+            )
         restored = restored and outcome_decision.closure_authorized
+        restored = restored and closed_loop_decision.closure_authorized
         lifecycle = extract_lifecycle(action.parameters, action.metadata)
         # Closure never reclassifies an executor failure. The remediation
         # service owns that attempt outcome and the event handler will not
@@ -327,6 +400,8 @@ class ClosureValidationAgent(BaseAgent):
             ],
             metadata={
                 "outcome_validation": outcome_decision.model_dump(mode="json"),
+                "validation_plan": validation_plan.model_dump(mode="json") if validation_plan else None,
+                "closed_loop_validation": closed_loop_decision.model_dump(mode="json"),
                 "independent_validation_observations": observations,
                 "stability_window": {
                     "required_seconds": stability_required,

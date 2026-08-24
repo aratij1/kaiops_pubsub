@@ -79,6 +79,9 @@ class Hypothesis(BaseModel):
     reasoning_summary: str = ""
     confidence_factors: dict[str, float] = Field(default_factory=dict)
     confidence_penalties: dict[str, float] = Field(default_factory=dict)
+    affected_resource_ids: list[str] = Field(default_factory=list)
+    causal_path: list[str] = Field(default_factory=list)
+    recommended_next_diagnostic: str = ""
 
     @model_validator(mode="after")
     def evidence_is_disjoint(self) -> "Hypothesis":

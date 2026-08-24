@@ -14,6 +14,7 @@ from sqlalchemy import text
 from closure_service import ClosureValidationAgent
 from closure_service.reconciliation import ReconciliationDecision, assess_terminal_action
 from common.config import get_settings
+from common.authorization import OperationalRole, role_is_allowed
 from common.event_publishers import build_agent_event_contract, build_event_envelope, normalize_payload
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Incident, IncidentStatus, RemediationAction, RemediationStatus, ResolutionReport
@@ -844,7 +845,10 @@ async def manual_close_incident(
         raise HTTPException(status_code=503, detail="Internal service authentication is not configured")
     if not hmac.compare_digest(x_kaiops_internal_token, expected_token):
         raise HTTPException(status_code=403, detail="Internal service authentication failed")
-    if request.actor_role not in {"Administrator", "L3 Engineer"}:
+    if not role_is_allowed(
+        request.actor_role,
+        {OperationalRole.ADMIN.value, OperationalRole.HITL_APPROVER.value},
+    ):
         raise HTTPException(status_code=403, detail="Operator role is not authorized for manual closure")
     related_incidents: list[dict[str, Any]] = []
     async with app.state.session_factory() as session:
