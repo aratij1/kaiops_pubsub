@@ -1,6 +1,8 @@
+import pytest
 from common.models import ApprovalDecision
-from remediation_test_helpers import governed_approval as Approval
+from common.orchestration.execution_plan_contract import canonical_plan_fingerprint
 from remediation_engine import RemediationEngine
+from remediation_test_helpers import governed_approval as Approval
 
 
 def test_build_action_prefers_recommended_commands_for_action_type() -> None:
@@ -41,6 +43,25 @@ def test_build_action_rewrites_uuid_target_to_service() -> None:
     action = RemediationEngine().build_action(approval)
 
     assert action.target == "payments-api"
+
+
+def test_build_action_does_not_infer_action_type_from_command_text() -> None:
+    approval = Approval(
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        approver="sre@example.com",
+        comment="Proceed",
+        metadata={"recommended_commands": ["kubectl rollout undo deployment/checkout-api -n prod"]},
+    )
+    plan = dict(approval.metadata["execution_plan"])
+    plan["actions"] = [{"action_id": "descriptive-step", "inputs": {}}]
+    plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
+    approval.metadata["execution_plan"] = plan
+    approval.plan_fingerprint = plan["plan_fingerprint"]
+
+    with pytest.raises(ValueError, match="UNSUPPORTED_ACTION_PLAN"):
+        RemediationEngine().build_action(approval)
 
 
 def test_catalog_docker_restart_is_not_mislabeled_as_rollback() -> None:

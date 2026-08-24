@@ -1,5 +1,7 @@
 import { Activity, ArrowRight, Bell, Bot, CalendarDays, CheckCircle2, CircleAlert, Filter, Info, ShieldCheck } from "lucide-react";
+import { useEffect, useState } from "react";
 import { useRouteRuntime } from "../../app/routeRuntime";
+import { operationsCockpit, type CockpitSummary } from "../cloud-ops/cloudOpsApi";
 import "./DashboardRoute.css";
 import "./DashboardA11y.css";
 import "./DashboardTruth.css";
@@ -14,6 +16,8 @@ const availabilitySloTarget=99.9;
 
 export default function DashboardRoute(){
  const {dashboard,executive,incidents,alerts}=useRouteRuntime();
+ const [estateSummary,setEstateSummary]=useState<CockpitSummary|null>(null);
+ useEffect(()=>{let mounted=true;operationsCockpit().then(value=>{if(mounted)setEstateSummary(value)}).catch(()=>{if(mounted)setEstateSummary(null)});return()=>{mounted=false}},[]);
  const buckets=Array.from({length:7},(_,index)=>{const date=new Date();date.setHours(0,0,0,0);date.setDate(date.getDate()-(6-index));return{key:date.toISOString().slice(0,10),label:date.toLocaleDateString(undefined,{month:"short",day:"numeric"}),severity:[0,0,0,0]}});
  const bucketMap=new Map(buckets.map(row=>[row.key,row])),seen=new Set<string>();
  incidents.rows.forEach((row,index)=>{const id=String(row.incident_id||row.id||`${row.service}-${row.created_at}-${index}`);if(seen.has(id))return;seen.add(id);const date=parseDate(row.created_at||row.latest_event_at||row.updated_at);const bucket=date?bucketMap.get(date.toISOString().slice(0,10)):null;if(bucket)bucket.severity[severityNumber(row.severity)-1]+=1});
@@ -40,6 +44,10 @@ export default function DashboardRoute(){
  const errorBudgetRemaining=observedErrorRate===null?null:Math.max(0,100-(observedErrorRate/allowedErrorRate*100));
  const groups=new Map<string,{row:(typeof active)[number];count:number}>();active.forEach(row=>{const key=service(row.service),current=groups.get(key);groups.set(key,{row:current?.row||row,count:(current?.count||0)+1})});
  const serviceRows=[...groups.entries()].slice(0,5),severityTotals=[1,2,3,4].map(level=>incidents.rows.filter(row=>severityNumber(row.severity)===level).length);
+ const awaitingApproval=active.filter(row=>String(row.status||"").toLowerCase().includes("approval")).length;
+ const automatedResolved=closedRows.filter(row=>{const attribution=row as Record<string,unknown>;return [attribution.resolution_mode,attribution.closed_by,attribution.actor_type,attribution.remediation_status].some(value=>/auto|agent|kai/i.test(String(value||"")))}).length;
+ const readinessValues=estateSummary?.readiness.map(row=>row.overall_score).filter(value=>Number.isFinite(value))||[];
+ const readiness=readinessValues.length?Math.round(readinessValues.reduce((sum,value)=>sum+value,0)/readinessValues.length*100):null;
  const kpis=[
   {label:"Overall SLO Score",value:successRate===null?"Unavailable":`${successRate.toFixed(2)}%`,detail:successRate===null?`Target ${availabilitySloTarget}% · awaiting gateway samples`:`Target ${availabilitySloTarget}% · ${successRate>=availabilitySloTarget?"meeting objective":"objective breached"}`,tone:successRate!==null&&successRate<availabilitySloTarget?"amber":""},
   {label:"API Success Rate",value:successRate===null?"Unavailable":`${successRate.toFixed(2)}%`,detail:requests?`${requests} measured gateway requests`:"No gateway request samples",tone:""},
@@ -47,7 +55,15 @@ export default function DashboardRoute(){
   {label:"Error Budget",value:errorBudgetRemaining===null?"Unavailable":`${errorBudgetRemaining.toFixed(1)}% remaining`,detail:errorBudgetRemaining===null?`Target ${availabilitySloTarget}% · awaiting gateway samples`:`${observedErrorRate?.toFixed(3)}% observed errors · ${allowedErrorRate.toFixed(3)}% allowed`,tone:errorBudgetRemaining!==null&&errorBudgetRemaining<25?"amber":""},
  ];
  return <section className="ro-page">
-  <header className="ro-heading"><div><span className="ro-eyebrow"><i/>Live operations</span><h2>Know what is broken. Fix it safely.</h2><p>One operational picture from signal detection through verified recovery.</p></div><div className="ro-tools"><button><CalendarDays/>Last 7 days</button><button aria-label="Notifications"><Bell/></button><button><Filter/>Live scope</button></div></header>
+  <header className="ro-heading"><div><span className="ro-eyebrow"><i/>Operations Command Center</span><h2>{active.length||critical?"Production needs attention.":"Production is stable in the observed scope."}</h2><p>One operational picture from signal detection through verified recovery. Unavailable values are never estimated.</p></div><div className="ro-tools"><button><CalendarDays/>Last 7 days</button><button aria-label="Notifications"><Bell/></button><button><Filter/>Live scope</button></div></header>
+  <section className="ro-command-truth" aria-label="Operations command center summary">
+   <article><span>Estate health</span><strong>{estateSummary?`${Object.values(estateSummary.health).reduce((sum,value)=>sum+value,0)} observed`:"Unavailable"}</strong><small>{estateSummary?`${estateSummary.resource_count} discovered resources`:"Estate telemetry did not respond"}</small></article>
+   <article><span>Active incidents</span><strong>{active.length}</strong><small>{critical} critical alerts</small></article>
+   <article><span>Kai auto-resolved</span><strong>{automatedResolved}</strong><small>Explicitly attributed closures only</small></article>
+   <article><span>Human approvals</span><strong>{awaitingApproval}</strong><small>Awaiting a decision</small></article>
+   <article><span>Recent changes</span><strong>Unavailable</strong><small>No change feed is loaded in this view</small></article>
+   <article><span>Autonomy readiness</span><strong>{readiness===null?"Unavailable":`${readiness}%`}</strong><small>{readinessValues.length?`${readinessValues.length} assessed services`:"No readiness assessments"}</small></article>
+  </section>
   <section className="ro-mission-strip" aria-label="Current operational priorities">
    <button className="is-critical" onClick={()=>dashboard.openSection("summary")}><span>Needs attention</span><strong>{active.length}</strong><small>active incidents</small><ArrowRight/></button>
    <button onClick={()=>dashboard.openSection("approval")}><span>Awaiting decision</span><strong>{active.filter(row=>String(row.status||"").toLowerCase().includes("approval")).length}</strong><small>human gates</small><ArrowRight/></button>

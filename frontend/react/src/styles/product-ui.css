@@ -50,7 +50,7 @@
 .alert-details-cockpit > .incident-sticky-header h3 { color: #fff !important; }
 .alert-details-cockpit > .incident-sticky-header p { max-width: 850px; color: #d5e6f3 !important; }
 .alert-details-cockpit > .incident-sticky-header .discovery-eyebrow { color: #76e7e0 !important; }
-.cockpit-stage-navigation { top: 10px !important; grid-template-columns: repeat(4, 1fr) !important; gap: 8px !important; margin: 14px 0 20px !important; padding: 9px !important; border-color: #ccdbe8 !important; border-radius: 16px !important; background: rgba(255,255,255,.94) !important; box-shadow: 0 14px 36px rgba(21, 52, 80, .14) !important; }
+.cockpit-stage-navigation { top: 10px !important; grid-template-columns: repeat(4, minmax(0, 1fr)) !important; gap: 8px !important; width: 100%; min-width: 0; margin: 14px 0 20px !important; padding: 9px !important; overflow: hidden !important; border-color: #ccdbe8 !important; border-radius: 16px !important; background: rgba(255,255,255,.94) !important; box-shadow: 0 14px 36px rgba(21, 52, 80, .14) !important; }
 .cockpit-stage-navigation .detail-tab { grid-template-columns: 34px 1fr !important; min-height: 64px; padding: 10px 12px !important; border: 1px solid transparent; border-radius: 11px !important; }
 .cockpit-stage-navigation .detail-tab > span { width: 32px !important; height: 32px !important; font-size: 11px !important; }
 .cockpit-stage-navigation .detail-tab strong { font-size: 13px !important; }
@@ -58,6 +58,10 @@
 .cockpit-stage-navigation .detail-tab.active { color: #fff !important; border-color: #1769e0 !important; background: linear-gradient(135deg, #1769e0, #0955ba) !important; box-shadow: 0 8px 18px rgba(23,105,224,.25); }
 .cockpit-stage-navigation .detail-tab.active small { color: #dceaff !important; }
 .cockpit-stage-navigation .detail-tab.active > span { color: #fff !important; background: rgba(255,255,255,.18) !important; }
+.alert-details-cockpit,
+.alert-details-cockpit > *,
+.alert-details-cockpit .context-workspace { min-width: 0; max-width: 100%; }
+.alert-details-cockpit .context-workspace-toolbar { position: static; top: auto; }
 .incident-workspace-hero { padding: 24px !important; border: 0 !important; border-radius: 16px !important; background: linear-gradient(120deg, #102d4b, #0c6970) !important; box-shadow: 0 14px 34px rgba(12, 56, 78, .2); }
 
 /* Human-readable remediation decision brief */
@@ -104,11 +108,15 @@
 :root[data-ui-theme="dark"] .decision-brief-heading { background: linear-gradient(110deg, #13283c, #102e32); }
 :root[data-ui-theme="dark"] .decision-story p { color: #bbcad8; }
 
+@media (max-width: 1200px) {
+  .context-workspace-hero { align-items: stretch; flex-direction: column; }
+  .context-workspace-summary { width: 100%; min-width: 0; }
+  .cockpit-stage-navigation { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; position: static !important; }
+}
 @media (max-width: 900px) {
   .decision-story { grid-template-columns: 1fr; gap: 10px; }
   .decision-story-arrow { display: none; }
   .decision-controls { grid-template-columns: 1fr; }
-  .cockpit-stage-navigation { grid-template-columns: repeat(2, 1fr) !important; position: static !important; }
 }
 @media (max-width: 620px) {
   .guided-cockpit-summary { grid-template-columns: 1fr 1fr !important; }

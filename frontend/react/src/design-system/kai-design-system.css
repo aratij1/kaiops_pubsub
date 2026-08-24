@@ -1,0 +1,15 @@
+.kai-card,.kai-panel{padding:var(--k-space-4);color:var(--k-color-text);background:var(--k-color-surface);border:var(--kai-border-default);border-radius:var(--k-radius-lg)}
+.kai-panel{box-shadow:var(--kai-elevation-raised)}
+.kai-icon-button{display:inline-grid;place-items:center;min-width:2.25rem;min-height:2.25rem;color:var(--k-color-text);background:var(--k-color-surface);border:var(--kai-border-default);border-radius:var(--k-radius-md)}
+.kai-badge{display:inline-flex;padding:.2rem .55rem;border-radius:999px;color:var(--k-color-text);background:var(--k-color-surface-subtle);border:var(--kai-border-default);font-size:.75rem;font-weight:700;text-transform:capitalize}
+.kai-badge[data-risk="high"],.kai-badge[data-risk="medium"]{color:var(--k-color-warning)}.kai-badge[data-risk="critical"]{color:var(--k-color-critical)}
+.kai-metric{display:grid;gap:var(--k-space-1)}.kai-metric span{color:var(--k-color-text-muted)}.kai-metric strong{font:700 1.5rem var(--kai-font-display)}
+.kai-confidence{display:flex;align-items:center;gap:var(--k-space-2)}.kai-confidence progress{accent-color:var(--kai-intelligence)}
+.kai-search{display:flex;align-items:center;gap:var(--k-space-2);padding:0 var(--k-space-3);border:var(--kai-border-default);border-radius:var(--k-radius-md);background:var(--k-color-surface)}.kai-search input{border:0;background:transparent;color:var(--k-color-text)}
+.kai-skeleton{display:block;min-height:1rem;border-radius:var(--k-radius-sm);background:linear-gradient(90deg,var(--k-color-surface-subtle),var(--k-color-border),var(--k-color-surface-subtle));background-size:200% 100%;animation:kai-shimmer 1.2s infinite}
+.kai-incident-header{display:flex;align-items:flex-start;justify-content:space-between;gap:var(--k-space-4)}.kai-incident-header h1{font-family:var(--kai-font-display)}
+.kai-insight{border-left:3px solid var(--kai-semantic-ai-insight)}.kai-insight>span{color:var(--kai-semantic-ai-insight);font-weight:800}.kai-timeline{border-left:2px solid var(--k-color-border)}
+.kai-evidence-graph,.kai-resource-explorer,.kai-investigation-story{min-width:0}
+.kai-breadcrumb,.kai-command-bar{display:flex;align-items:center;gap:var(--k-space-2)}.kai-breadcrumb{list-style:none;padding:0}.kai-breadcrumb li+li::before{content:"/";margin-right:var(--k-space-2);color:var(--k-color-text-muted)}
+.kai-drawer{position:fixed;inset-block:0;right:0;z-index:var(--kai-z-drawer);width:min(30rem,100%);padding:var(--k-space-5);background:var(--k-color-surface);box-shadow:var(--k-shadow-lg)}.kai-toast{position:fixed;right:var(--k-space-4);bottom:var(--k-space-4);z-index:var(--kai-z-toast);padding:var(--k-space-3);background:var(--k-color-surface);border:var(--kai-border-default);border-radius:var(--k-radius-md)}
+@keyframes kai-shimmer{to{background-position:-200% 0}}@media(prefers-reduced-motion:reduce){.kai-skeleton{animation:none}}

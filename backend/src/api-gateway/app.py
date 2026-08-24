@@ -17,10 +17,11 @@ import aio_pika
 import pymysql
 from redis.asyncio import Redis
 from api_gateway import SafetyAnalyzer
-from api_gateway.auth_policy import route_auth_rule
+from api_gateway.auth_policy import canonical_route_auth_rule
 from api_gateway.control_routes import build_control_router
 from api_gateway.modules.users.models import SystemRole
 from api_gateway.modules.users.permissions import AuthContext, current_tenant_id, require_roles
+from common.authorization import OperationalRole, role_is_allowed
 from api_gateway.modules.users.router import router as user_management_router
 from api_gateway.modules.triage.router import TriageCorrectionCreate as TriageCorrectionCreate
 from api_gateway.modules.triage.router import router as triage_router
@@ -301,7 +302,7 @@ async def enforce_operational_auth(request: Request, call_next):
     if settings.environment.strip().lower() in {"local", "demo", "test"}:
         return await call_next(request)
 
-    role_rule = route_auth_rule(request.method, request.url.path)
+    role_rule = canonical_route_auth_rule(request.method, request.url.path)
     if role_rule is False:
         return await call_next(request)
 
@@ -309,7 +310,7 @@ async def enforce_operational_auth(request: Request, call_next):
         auth = await _auth_context_from_request(request)
     except HTTPException as exc:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-    if role_rule is not None and auth.role not in role_rule:
+    if role_rule is not None and not role_is_allowed(auth.role, role_rule):
         return JSONResponse(status_code=403, content={"detail": "Insufficient role permissions"})
     if settings.auth_mode == "oidc" and request.method == "POST" and request.url.path in {"/approval/approve", "/approval/modify", "/remediation/execute"}:
         accepted = {item.strip().lower() for item in settings.oidc_step_up_values.split(",") if item.strip()}
@@ -607,10 +608,10 @@ def _enterprise_contract(canonical: dict[str, Any], trace_id: str) -> dict[str, 
             "environment": canonical.get("environment") or "prod",
             "risk_tier": risk_tier,
             "action_roles": {
-                "view": ["Administrator", "L3 Engineer", "L2 Engineer", "L1 Operator", "Executive"],
-                "provide_documents": ["Administrator", "L3 Engineer", "L2 Engineer"],
-                "approve": ["Administrator", "L3 Engineer"],
-                "execute_remediation": ["Administrator", "L3 Engineer"],
+                "view": ["ADMIN", "HITL_APPROVER"],
+                "provide_documents": ["ADMIN"],
+                "approve": ["ADMIN", "HITL_APPROVER"],
+                "execute_remediation": ["ADMIN", "HITL_APPROVER"],
             },
         },
         "observability": {
@@ -2913,7 +2914,9 @@ async def approval_action(
             **payload,
             "tenant_id": auth.tenant_id,
             "approver": auth.email or auth.username or str(auth.user_id),
-            "approver_role": "admin" if auth.role == SystemRole.ADMINISTRATOR.value else "hitl-reviewer",
+            "approver_role": "admin"
+            if role_is_allowed(auth.role, {OperationalRole.ADMIN.value})
+            else "hitl-reviewer",
         }
     return await guarded_proxy(
         request=request,

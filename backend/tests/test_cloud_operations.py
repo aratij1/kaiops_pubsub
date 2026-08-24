@@ -119,6 +119,16 @@ async def test_repository_round_trip_discovers_and_maps_resources(sqlite_session
         service_view = await repo.service_360(tenant_id="tenant-a", project_id="project-a", service_id="checkout-api", environment="prod")
         assert service_view["health"] == {"healthy": 3}
         assert len(service_view["relationships"]) == 2
+        assert all(resource["canonical_resource_id"].startswith("urn:kaims:simulator:") for resource in service_view["resources"])
+        root_resource_id = service_view["relationships"][0]["source_resource_id"]
+        traversal = await repo.dependency_traversal(
+            tenant_id="tenant-a",
+            project_id="project-a",
+            resource_id=root_resource_id,
+            direction="outbound",
+        )
+        assert root_resource_id in traversal["resource_ids"]
+        assert traversal["relationships"]
         await session.commit()
 
     async with sqlite_session_factory() as session:
@@ -198,6 +208,10 @@ async def test_service_onboarding_calculates_readiness_and_cockpit(sqlite_sessio
         assert float(score.overall_score) >= 0.82
         assert cockpit["resource_count"] == 3
         assert cockpit["readiness"][0]["service_id"] == "checkout-api"
+        assert cockpit["readiness"][0]["dimensions"]["monitoring"] == 1.0
+        assert cockpit["readiness"][0]["dimensions"]["logs"] == 1.0
+        assert cockpit["readiness"][0]["dimensions"]["traces"] == 0.0
+        assert any(gap["dimension"] == "traces" for gap in cockpit["readiness"][0]["gaps"])
         assert len(topology["nodes"]) == 3
         assert len(topology["edges"]) == 2
         assert duplicate.id == plan.id

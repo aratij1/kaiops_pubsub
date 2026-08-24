@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from common.tenant_identity import require_tenant_id
+from common.remediation_plan import RemediationPlan
 
 
 def utc_now() -> datetime:
@@ -399,6 +400,7 @@ class Recommendation(BaseEvent):
     rationale: str
     commands: list[str] = Field(default_factory=list)
     risk: str = "medium"
+    remediation_plan: RemediationPlan | None = None
 
     @field_validator("tenant_id")
     @classmethod

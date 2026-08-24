@@ -70,7 +70,7 @@ try {
     }
     $leanServices = @(
         "mysql", "temporal", "redis", "rabbitmq",
-        "monitoring-adapter", "monitoring-ingestion-worker", "application-onboarding",
+        "monitoring-adapter", "monitoring-ingestion-worker", "application-onboarding", "connector-hub",
         "api-gateway", "alert-intelligence", "orchestrator", "context-agent",
         "discovery-mcp", "docker-socket-proxy", "model-router", "resolution-agent",
         "approval-service", "notification-service", "remediation-engine",

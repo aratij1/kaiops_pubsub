@@ -42,6 +42,8 @@ jobs:
         run: |
           python scripts/validate_execution_catalog.py
           python scripts/update_execution_catalog_checksums.py --check
+      - name: Validate Phase 9 production-readiness artifacts
+        run: python scripts/validate_phase9_readiness.py
       - name: Test
         run: pytest
 

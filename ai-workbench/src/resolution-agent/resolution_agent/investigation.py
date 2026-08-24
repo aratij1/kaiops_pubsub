@@ -13,6 +13,8 @@ from uuid import uuid4
 import httpx
 
 from ai_workbench_common.models import Context
+from common.change_intelligence import ChangeCorrelationContext, ChangeEvent, rank_correlated_changes
+from common.evidence_graph import build_incident_evidence_graph
 from resolution_agent.contracts import (
     Hypothesis as HypothesisContract,
     HypothesisStatus,
@@ -257,6 +259,53 @@ class IterativeInvestigator:
         return coverage
 
     @staticmethod
+    def _change_events(context: Context, evidence: list[dict[str, Any]]) -> list[ChangeEvent]:
+        source_map = {
+            "github": "git_commit", "gitlab": "git_commit", "git": "git_commit",
+            "deployment": "deployment", "jenkins": "jenkins", "argocd": "argocd",
+            "terraform": "terraform", "servicenow": "servicenow_change",
+            "feature_flag": "feature_flag", "database": "database", "config": "configuration",
+        }
+        events: list[ChangeEvent] = []
+        for row in evidence:
+            if row.get("source_type") != "change":
+                continue
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            raw_source = str(metadata.get("change_source") or row.get("source_system") or "deployment").lower()
+            source = next((value for key, value in source_map.items() if key in raw_source), "deployment")
+            occurred_at = row.get("observed_at")
+            if isinstance(occurred_at, str):
+                try:
+                    occurred_at = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+            if not isinstance(occurred_at, datetime) or occurred_at.tzinfo is None:
+                continue
+            target = str(row.get("target_resource_id") or "").strip()
+            topology_ids = metadata.get("topology_resource_ids")
+            topology_ids = topology_ids if isinstance(topology_ids, list) else []
+            try:
+                events.append(ChangeEvent(
+                    change_id=str(metadata.get("change_id") or row.get("evidence_id") or ""),
+                    tenant_id=context.tenant_id,
+                    source=source,
+                    source_event_id=str(metadata.get("source_event_id") or row.get("evidence_id") or ""),
+                    occurred_at=occurred_at,
+                    service=str(row.get("service") or context.alert.service),
+                    environment=str(row.get("environment") or context.alert.environment),
+                    resource_ids=[target] if target else [],
+                    topology_resource_ids=[str(item) for item in topology_ids],
+                    change_reference=str(row.get("source_uri") or metadata.get("uri") or row.get("evidence_id") or ""),
+                    actor_reference=str(metadata.get("actor_reference") or "") or None,
+                    version=str(metadata.get("version") or metadata.get("deployment") or "") or None,
+                    evidence_ids=[str(row.get("evidence_id"))] if row.get("evidence_id") else [],
+                    metadata={"source_system": row.get("source_system")},
+                ))
+            except ValueError:
+                continue
+        return events
+
+    @staticmethod
     def _required_sources(context: Context) -> set[str]:
         text = " ".join((context.alert.name, context.alert.description, context.alert.service)).lower()
         required = {"logs", "telemetry", "topology", "dependency", "changes", "runbooks"}
@@ -395,6 +444,7 @@ class IterativeInvestigator:
         hypotheses = hypotheses[:5]
         coverage = self._coverage(evidence)
         required_sources = self._required_sources(context)
+        change_events = self._change_events(context, evidence)
         for hypothesis in hypotheses:
             claim_tokens = self._tokens(hypothesis.get("claim"))
             support: list[str] = []
@@ -421,7 +471,38 @@ class IterativeInvestigator:
             topology_support = 1.0 if any(row.get("source_type") in {"topology", "dependency"} for row in supporting_rows) else (
                 0.5 if len({str(row.get("service") or "") for row in supporting_rows if row.get("service")}) > 1 else 0.0
             )
-            change_correlation = 1.0 if any(row.get("source_type") == "change" for row in supporting_rows) else 0.0
+            affected_resources = [str(item) for item in hypothesis.get("affected_resource_ids") or []]
+            alert_resource = str(context.alert.labels.get("resource_id") or "").strip()
+            if alert_resource and alert_resource not in affected_resources:
+                affected_resources.append(alert_resource)
+            correlated_changes = rank_correlated_changes(
+                change_events,
+                ChangeCorrelationContext(
+                    tenant_id=context.tenant_id,
+                    incident_started_at=context.alert.starts_at,
+                    service=context.alert.service,
+                    environment=context.alert.environment,
+                    affected_resource_ids=affected_resources,
+                    topology_resource_ids=[str(item) for item in context.metadata.get("topology_resource_ids", [])],
+                ),
+            ) if change_events else []
+            change_correlation = max(
+                (item.change_correlation_score for item in correlated_changes), default=0.0
+            )
+            for item in correlated_changes:
+                if item.change_correlation_score >= 0.55:
+                    support.extend(evidence_id for evidence_id in item.evidence_ids if evidence_id)
+                    sources.add("changes")
+            supporting_rows = [row for row in evidence if str(row.get("evidence_id") or "") in set(support)]
+            fresh_support = [
+                row for row in supporting_rows
+                if int(row.get("freshness_seconds") or 0) <= 900
+                and row.get("metadata", {}).get("current_operational_evidence", True)
+            ]
+            temporal_alignment = len(fresh_support) / max(1, len(supporting_rows))
+            topology_support = 1.0 if any(
+                row.get("source_type") in {"topology", "dependency"} for row in supporting_rows
+            ) else topology_support
             historical_similarities = [
                 float(row.get("metadata", {}).get("similarity"))
                 for row in evidence
@@ -446,9 +527,10 @@ class IterativeInvestigator:
             consistency = len(support) / max(1, len(support) + len(contradiction))
             causal_strength = min(
                 1.0,
-                (0.45 * temporal_alignment)
-                + (0.30 * topology_support)
-                + (0.25 * successful_test_ratio),
+                (0.35 * temporal_alignment)
+                + (0.25 * topology_support)
+                + (0.20 * successful_test_ratio)
+                + (0.20 * change_correlation),
             )
             completeness = sum(1 for source in required_sources if coverage.get(source, 0)) / max(1, len(required_sources))
             scored = score_confidence(ConfidenceInputs(
@@ -483,6 +565,7 @@ class IterativeInvestigator:
             hypothesis["temporal_alignment"] = round(temporal_alignment, 4)
             hypothesis["topology_support"] = round(topology_support, 4)
             hypothesis["change_correlation"] = round(change_correlation, 4)
+            hypothesis["correlated_changes"] = [item.model_dump(mode="json") for item in correlated_changes[:5]]
             hypothesis["independent_source_count"] = len(sources)
             hypothesis["confidence"] = scored.score
             hypothesis["confidence_breakdown"] = {
@@ -644,6 +727,12 @@ class IterativeInvestigator:
                 reasoning_summary=str(hypothesis.get("reasoning_summary") or "Probability is computed from evidence factors, not model self-assessment."),
                 confidence_factors=dict(confidence_breakdown.get("components") or {}),
                 confidence_penalties=dict(confidence_breakdown.get("penalties") or {}),
+                affected_resource_ids=list(hypothesis.get("affected_resource_ids") or []),
+                causal_path=[str(item) for item in hypothesis.get("causal_sequence") or []],
+                recommended_next_diagnostic=str(
+                    (hypothesis.get("falsification_check") or {}).get("objective")
+                    or "Collect independent causal evidence."
+                ),
             ).model_dump(mode="json"))
         rca_result = RCAResult(
             incident_id=context.incident_id,
@@ -657,6 +746,23 @@ class IterativeInvestigator:
             factors=dict(confidence_breakdown.get("components") or {}),
             penalties=dict(confidence_breakdown.get("penalties") or {}),
             missing_evidence=missing,
+        )
+        graph_gaps = [*missing]
+        if contradictory:
+            graph_gaps.append("unresolved_contradicting_evidence")
+        if not hypotheses:
+            graph_gaps.append("no_falsifiable_hypothesis")
+        evidence_graph = build_incident_evidence_graph(
+            tenant_id=context.tenant_id,
+            incident_id=context.incident_id,
+            evidence=evidence,
+            hypotheses=hypotheses,
+            conclusive_primary_id=(
+                str(leading.get("hypothesis_id"))
+                if outcome == ResolutionOutcome.EVIDENCE_SUPPORTED and leading
+                else None
+            ),
+            data_gaps=graph_gaps,
         )
         report = {
             "schema_version": "kaims.iterative-investigation.v1",
@@ -681,6 +787,12 @@ class IterativeInvestigator:
             "typed_hypotheses": typed_hypotheses,
             "outcome": outcome.value,
             "rca_result": rca_result.model_dump(mode="json"),
+            "evidence_graph": evidence_graph.model_dump(mode="json"),
+            "change_intelligence": {
+                "correlations": list(leading.get("correlated_changes") or []) if leading else [],
+                "change_correlation_score": float(leading.get("change_correlation") or 0.0) if leading else 0.0,
+                "causal_proof": False,
+            },
             "conclusion": {
                 "hypothesis_id": leading.get("hypothesis_id") if leading else None,
                 "claim": leading.get("claim") if leading else None,

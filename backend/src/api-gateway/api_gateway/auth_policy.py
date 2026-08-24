@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from api_gateway.modules.users.models import SystemRole
+from common.authorization import OperationalRole
 
 ADMIN_ROLE = SystemRole.ADMINISTRATOR.value
 HITL_COMPATIBILITY_ROLES = {
@@ -42,3 +43,20 @@ def route_auth_rule(method: str, path: str) -> set[str] | None | bool:
         if normalized_path == prefix or normalized_path.startswith(f"{prefix}/"):
             return roles
     return False
+
+
+def canonical_route_auth_rule(method: str, path: str) -> set[str] | None | bool:
+    """Return the two-role policy used for live authorization.
+
+    ``route_auth_rule`` remains the legacy projection for compatibility with
+    older policy consumers during the migration window.
+    """
+    rule = route_auth_rule(method, path)
+    if rule is False or rule is None:
+        return rule
+    canonical: set[str] = set()
+    if SystemRole.ADMINISTRATOR.value in rule:
+        canonical.add(OperationalRole.ADMIN.value)
+    if rule.intersection({SystemRole.L2_ENGINEER.value, SystemRole.L3_ENGINEER.value}):
+        canonical.add(OperationalRole.HITL_APPROVER.value)
+    return canonical

@@ -2,10 +2,13 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 
 import { App } from "./app/App";
-import "./styles/tokens.css";
+import "./design-system";
 // The semantic KaiMS system supersedes the removed Datamatics compatibility
 // themes; retaining them created three competing token and surface cascades.
 import "./styles.css";
+import { initializeKaiTheme } from "./design-system/themes";
+
+initializeKaiTheme();
 
 const root = document.getElementById("root");
 

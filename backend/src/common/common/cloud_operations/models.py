@@ -148,6 +148,7 @@ class DiscoveredResource(BaseModel):
     provider_account_id: str
     region: str
     provider_resource_id: str
+    canonical_resource_id: str | None = None
     resource_type: str
     display_name: str
     status: ResourceStatus = ResourceStatus.ACTIVE
@@ -157,6 +158,9 @@ class DiscoveredResource(BaseModel):
     health: dict[str, Any] = Field(default_factory=dict)
     cost: dict[str, Any] = Field(default_factory=dict)
     discovered_at: datetime = Field(default_factory=utc_now)
+    last_verified_at: datetime | None = None
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[str] = Field(default_factory=list)
 
     @field_validator("tenant_id")
     @classmethod
@@ -174,7 +178,10 @@ class ResourceRelationship(BaseModel):
     target_resource_id: str
     relationship_type: str
     source: str
+    relationship_source: Literal["discovered", "declared", "imported", "inferred"] = "discovered"
     confidence: float = Field(ge=0.0, le=1.0)
+    evidence: list[str] = Field(default_factory=list)
+    last_verified_at: datetime | None = None
     owner_confirmed: bool = False
     discovered_at: datetime = Field(default_factory=utc_now)
 
@@ -182,6 +189,14 @@ class ResourceRelationship(BaseModel):
     @classmethod
     def relationship_tenant_is_verified(cls, value: str) -> str:
         return require_tenant_id(value, source="cloud operations topology")
+
+    @model_validator(mode="after")
+    def inferred_relationship_requires_evidence(self) -> ResourceRelationship:
+        if self.source_resource_id == self.target_resource_id:
+            raise ValueError("relationship cannot point to the same resource")
+        if self.relationship_source == "inferred" and not self.evidence:
+            raise ValueError("inferred relationship requires evidence")
+        return self
 
 
 class DiscoveryRequest(BaseModel):

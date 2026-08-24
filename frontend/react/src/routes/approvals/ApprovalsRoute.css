@@ -74,6 +74,37 @@
   margin: 0;
 }
 
+.approval-decision-story {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 16px 0;
+}
+
+.approval-decision-story article,
+.approval-safety-plan article {
+  padding: 14px;
+  border: 1px solid var(--k-color-border);
+  border-radius: var(--k-radius-md);
+  background: var(--k-color-surface-subtle);
+}
+
+.approval-decision-story span {
+  color: var(--kai-intelligence);
+  font-size: .72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.approval-decision-story p { min-height: 2.5em; margin: 8px 0; line-height: 1.45; }
+.approval-decision-story strong { font-size: .78rem; overflow-wrap: anywhere; }
+.approval-safety-plan { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.approval-safety-plan h4 { margin: 0 0 8px; }
+.approval-safety-plan p,.approval-safety-plan ol { margin: 0; color: var(--k-color-text-muted); line-height: 1.5; }
+.approval-evidence li { margin-block: 6px; overflow-wrap: anywhere; }
+.approval-modify-plan { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.approval-modify-plan > p,.approval-modify-plan label:last-of-type,.approval-modify-plan button { grid-column: 1 / -1; }
+
 .decision-packet-list div {
   padding: 12px;
   border: 1px solid var(--border, #d7dee8);
@@ -125,6 +156,9 @@
 }
 
 @media (max-width: 720px) {
+  .approval-decision-story,
+  .approval-safety-plan,
+  .approval-modify-plan { grid-template-columns: 1fr; }
   .approval-workspace .approval-ticket {
     grid-template-columns: 1fr;
     min-height: 44px;

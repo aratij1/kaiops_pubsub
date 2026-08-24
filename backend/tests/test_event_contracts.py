@@ -106,6 +106,23 @@ def test_incident_contract_accepts_persisted_jira_enrichment() -> None:
     assert incident.jira_status == "In Progress"
 
 
+def test_context_agent_hydrates_incident_from_enriched_projection() -> None:
+    incident = context_agent_app._incident_from_workflow_payload(
+        {
+            "service": "checkout",
+            "title": "Checkout unavailable",
+            "status": "failed",
+            "state": "failed",
+            "approval_status": "failed",
+            "approval": {"id": "approval-1", "authorization_scope": "execution"},
+        }
+    )
+
+    assert incident.service == "checkout"
+    assert incident.status.value == "failed"
+    assert not hasattr(incident, "approval_status")
+
+
 @pytest.mark.asyncio
 async def test_publish_orchestration_event_emits_event_contract() -> None:
     alert = Alert(

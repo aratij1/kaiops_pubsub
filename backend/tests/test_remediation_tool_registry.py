@@ -244,7 +244,7 @@ async def test_jenkins_rollback_requires_runtime_secret_injection(monkeypatch: p
 
 
 @pytest.mark.asyncio
-async def test_jenkins_authorizes_governed_restart_intent_for_triage_script(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_jenkins_does_not_infer_restart_intent_from_triage_script(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("JENKINS_USERNAME", raising=False)
     monkeypatch.delenv("JENKINS_API_TOKEN", raising=False)
     action = RemediationEngine().build_action(Approval(
@@ -280,10 +280,9 @@ async def test_jenkins_authorizes_governed_restart_intent_for_triage_script(monk
     ]
     result = await JenkinsRollbackPlugin().execute(action)
 
-    assert result.parameters["connector_operation"] == "restart_service"
+    assert result.parameters["connector_operation"] == "script_execution"
     assert result.status == RemediationStatus.SKIPPED
-    assert "runtime secret provider" in str(result.error)
-    assert "does not allow operation" not in str(result.error)
+    assert "does not allow operation script_execution" in str(result.error)
 
 
 def test_jenkins_fills_missing_safety_envelope_from_governed_template(monkeypatch: pytest.MonkeyPatch) -> None:

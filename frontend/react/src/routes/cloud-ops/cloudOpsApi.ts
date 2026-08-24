@@ -94,8 +94,11 @@ export type CockpitSummary = {
   health: Record<string, number>;
   by_provider: Record<string, number>;
   by_environment: Record<string, number>;
-  readiness: Array<{ project_id: string; service_id: string; environment: string; readiness_state: string; overall_score: number; scores: Record<string, number> }>;
+  readiness: ReadinessRow[];
 };
+
+export type ReadinessGap = { dimension: string; score: number; recommendation: string };
+export type ReadinessRow = { project_id: string; service_id: string; environment: string; readiness_state: string; overall_score: number; autonomy_score?: number; scores: Record<string, number>; dimensions?: Record<string, number>; gaps?: ReadinessGap[] };
 
 export type CompiledPlan = {
   id: string; project_id: string; service_id: string; environment: string; intent: string;
