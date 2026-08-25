@@ -11,22 +11,12 @@ test.beforeEach(async ({ page }) => {
     const url = new URL(route.request().url());
     const path = url.pathname.replace(/^\/api-gateway/, "");
 
-    if (path === "/auth/config") {
-      await route.fulfill(json({ mode: "local", local_development_only: true }));
-      return;
-    }
-
     if (path === "/auth/login") {
       await route.fulfill(json({
         access_token: "admin-token",
         refresh_token: "refresh-token",
         user: { id: 1, username: "admin", role_name: "Administrator" },
       }));
-      return;
-    }
-
-    if (path === "/healthz") {
-      await route.fulfill(json({ status: "ok", service: "api-gateway" }));
       return;
     }
 
@@ -84,18 +74,19 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("projects and integrations exposes the managed application portfolio", async ({ page }) => {
+test("project onboarding exposes a complete monitoring integration contract", async ({ page }) => {
   test.setTimeout(120_000);
   await page.goto("/");
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill("admin-password");
   await page.getByRole("button", { name: "Sign In" }).click();
 
-  await page.getByRole("button", { name: "Projects & Integrations", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Application portfolio" })).toBeVisible();
-  await expect(page.getByRole("columnheader", { name: "Name" })).toBeVisible();
-  await expect(page.getByRole("columnheader", { name: "Environment" })).toBeVisible();
-  await expect(page.getByRole("columnheader", { name: "Owner" })).toBeVisible();
-  await expect(page.getByRole("columnheader", { name: "Registration" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Refresh portfolio" })).toBeVisible();
+  await page.getByRole("button", { name: "Integrations", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Integrations & Monitoring" })).toBeVisible();
+  await expect(page.getByLabel("tenant id")).toBeVisible();
+  await expect(page.getByLabel("owner team")).toBeVisible();
+  await expect(page.getByLabel("Metrics Endpoint")).toBeVisible();
+  await expect(page.getByLabel("Labels (comma-separated key=value)")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Register Application" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Configured Monitoring Integrations" })).toBeVisible();
 });

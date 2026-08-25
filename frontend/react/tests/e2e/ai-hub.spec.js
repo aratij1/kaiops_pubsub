@@ -26,7 +26,7 @@ async function signInToAiHub(page) {
 
 test("AI Hub presents health, capabilities, and accessible section navigation", async ({ page }) => {
   await signInToAiHub(page);
-  await expect(page.getByRole("heading", { level: 1, name: "Knowledge & Runbooks", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "Operational Knowledge", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { level: 2, name: "Operational intelligence" })).toBeVisible();
   await expect(page.getByRole("region", { name: "AI platform health" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "From evidence to governed action" })).toBeVisible();
@@ -40,6 +40,37 @@ test("AI Hub presents health, capabilities, and accessible section navigation", 
   await expect(page.getByRole("heading", { name: "Pipeline Queue Manager" })).toBeVisible();
   await page.getByRole("tab", { name: "Topology", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Advanced message topology" })).toBeVisible();
+});
+
+test("AI Hub overview shows real AI provider health data", async ({ page }) => {
+  await page.route("**/api-gateway/model/providers/status", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          providers: {
+            "azure-openai": { configured: true, healthy: true, circuit_open: false, model: "gpt-4o" },
+            "claude": { configured: false, healthy: true, circuit_open: false, model: "claude-sonnet-4-6", reason: "ANTHROPIC_API_KEY is not configured" },
+          },
+        },
+      }),
+    });
+  });
+  await signInToAiHub(page);
+  await expect(page.getByRole("heading", { name: "AI provider health" })).toBeVisible();
+  const row = page.getByRole("row", { name: /azure-openai/ });
+  await expect(row).toContainText("gpt-4o");
+  await expect(row).toContainText("Configured");
+  await expect(row).toContainText("Healthy");
+  const claudeRow = page.getByRole("row", { name: /claude/ });
+  await expect(claudeRow).toContainText("Not configured");
+});
+
+test("AI Hub overview provider health shows empty state when nothing is returned", async ({ page }) => {
+  await signInToAiHub(page);
+  await expect(page.getByRole("heading", { name: "AI provider health" })).toBeVisible();
+  await expect(page.getByText("No provider status was returned.")).toBeVisible();
 });
 
 test("AI Hub overview reflows without horizontal page overflow", async ({ page }) => {

@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { Button } from "react-aria-components";
 import { describe, expect, it, vi } from "vitest";
 
-import { ConfirmationDialog, LoadingState, SectionNavigation, StatusBadge } from ".";
+import { ConfidenceIndicator, ConfirmationDialog, EvidenceBadge, LifecycleStepper, LoadingState, SectionNavigation, StatusBadge } from ".";
 
 describe("KaiMS design system", () => {
   it("exposes meaningful status text while keeping the icon decorative", () => {
@@ -39,5 +39,13 @@ describe("KaiMS design system", () => {
     await user.click(screen.getByRole("button", { name: "Delete" }));
     expect(confirm).toHaveBeenCalledOnce();
     await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it("renders explainable confidence and evidence provenance as text", () => {
+    render(<><ConfidenceIndicator score={0.91} reasons={["Five supporting signals"]} /><EvidenceBadge provenance="INFERRED" /><LifecycleStepper stages={["Detected", "Understanding", "Recovered"]} current={1} /></>);
+    expect(screen.getAllByText("91%").length).toBeGreaterThan(0);
+    expect(screen.getByText("Why this confidence?")).toBeInTheDocument();
+    expect(screen.getByText("INFERRED")).toBeInTheDocument();
+    expect(screen.getByLabelText("Lifecycle progress")).toHaveTextContent("Understanding");
   });
 });

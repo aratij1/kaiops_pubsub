@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useRouteRuntime } from "../../app/routeRuntime";
-import { ConfirmationDialog } from "../../components/design-system";
+import { ConfirmationDialog, ReadinessScore } from "../../components/design-system";
 import {
   applicationDetailsQueryOptions,
   applicationKeys,
@@ -275,6 +275,21 @@ function OnboardingPipeline({
   const firstIncomplete = onboardingSteps.findIndex(
     (step, index) => !evidence.has(step.event) && index > currentIndex,
   );
+  const observabilityScore = evidence.has("application.metrics.validated") ? 100 : application.metrics_endpoint ? 50 : 0;
+  const topologyFields = [application.namespace, application.region, application.technology].filter(Boolean).length;
+  const topologyScore = Math.round(topologyFields / 3 * 100);
+  const validationScore = evidence.has("application.validation.completed") ? 100 : 0;
+  const knownReadiness = [observabilityScore, topologyScore, validationScore];
+  const readinessScore = Math.round(knownReadiness.reduce((sum, score) => sum + score, 0) / knownReadiness.length);
+  const readinessCapabilities = [
+    { label: "Observability", score: observabilityScore },
+    { label: "Topology", score: topologyScore },
+    { label: "Knowledge", score: null },
+    { label: "Historical incidents", score: null },
+    { label: "Resolution", score: null },
+    { label: "Validation", score: validationScore },
+    { label: "Governance", score: null },
+  ];
   return (
     <section className="project-stepper-panel">
       <div className="panel-head">
@@ -330,6 +345,8 @@ function OnboardingPipeline({
           );
         })}
       </ol>
+      <ReadinessScore score={readinessScore} capabilities={readinessCapabilities} />
+      <p className="subtitle">Overall readiness uses only capabilities supported by current application and onboarding evidence. Unavailable capabilities are not estimated.</p>
     </section>
   );
 }
