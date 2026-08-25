@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 const steps = [
   { id: "alerts", path: "/alerts", number: "01", label: "Live Alerts", description: "Detect and triage" },
   { id: "incidents", path: "/incidents", number: "02", label: "Incidents", description: "Investigate and coordinate" },
+  { id: "approvals", path: "/approvals", number: "03", label: "Approvals", description: "Review and decide" },
 ] as const;
 
 export const OperationsWorkflowNav = memo(function OperationsWorkflowNav({ active }: { active: "alerts" | "incidents" | "approvals" }) {

@@ -1,4 +1,4 @@
-﻿import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Archive, BookOpen, Bot, Boxes, ChartNoAxesCombined, CircleCheckBig, Database, PlugZap, RadioTower, ScrollText, Settings, ShieldCheck, Siren, Workflow } from "lucide-react";
@@ -14,7 +14,7 @@ import RcaPanel from "./routes/incidents/RcaPanel";
 import "./routes/incidents/ExecutionWorkspace.css";
 import "./routes/incidents/AnalysisModeSelector.css";
 import CopilotRoute from "./routes/copilot/CopilotRoute";
-import { breadcrumbForPath, groupedNavigationForRole, navigationItemForPath, TAB_SHORTCUT_BY_CODE, VALID_LEGACY_TABS } from "./app/navigation";
+import { breadcrumbForPath, groupedNavigationForRole, navigationItemForPath, TAB_SHORTCUT_BY_CODE, VALID_LEGACY_TABS, NAVIGATION_ITEMS } from "./app/navigation";
 import { allowedLegacyTabsForRole, canAccessDestination } from "./app/permissions";
 
 const LOCAL_JENKINS_ENDPOINT = "http://jenkins:8080";
@@ -94,6 +94,7 @@ import {
   onboardingSourceDocCategoryLabel,
   fallbackFetchTargets,
   fetchJson,
+  friendlyLoginErrorMessage,
   HealthBadge,
   htmlEscape,
   asDisplayValue,
@@ -514,6 +515,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const [dashboardAlertQuery, setDashboardAlertQuery] = useState("");
   const [globalOperationsView, setGlobalOperationsView] = useState("search");
   const [globalOperationsQuery, setGlobalOperationsQuery] = useState("");
+  const [globalOperationsOpen, setGlobalOperationsOpen] = useState(false);
   // The input stays bound to dashboardAlertQuery for immediate visual
   // feedback; the (currently client-side, O(rows)) filter below runs off
   // this debounced copy instead, so a fast typist doesn't re-filter the
@@ -2413,7 +2415,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       adminSessionRef.current = authenticatedSession;
       setAdminSession(authenticatedSession);
     } catch (error) {
-      setAdminSession((current) => ({ ...current, loading: false, error: error.message }));
+      setAdminSession((current) => ({ ...current, loading: false, error: friendlyLoginErrorMessage(error) }));
     }
   }
 
@@ -2422,7 +2424,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     try {
       await beginOidcLogin(authConfig);
     } catch (error) {
-      setAdminSession((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
+      setAdminSession((current) => ({ ...current, loading: false, error: friendlyLoginErrorMessage(error) }));
     }
   }
 
@@ -2528,6 +2530,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       await fetchJson(`/api-gateway/users/${adminEditUser.id}`, authenticatedOptions({
         method: "PUT",
         body: JSON.stringify({
+          username: String(adminEditUser.username || "").trim(),
           email: String(adminEditUser.email || "").trim(),
           first_name: String(adminEditUser.first_name || "").trim(),
           last_name: String(adminEditUser.last_name || "").trim(),
@@ -6575,7 +6578,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const stages = Array.isArray(discoveryMcp.retrieval_stages) ? discoveryMcp.retrieval_stages : [];
       stages.forEach((stage, index) => {
         syntheticRows.push({
-          stage: `Discovery Agent Â· ${String(stage.stage || "stage").replaceAll("_", " ")}`,
+          stage: `Discovery Agent · ${String(stage.stage || "stage").replaceAll("_", " ")}`,
           sequence: 80 + index,
           agent: "Discovery Agent",
           service: "context-agent",
@@ -6583,7 +6586,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           publishes: stage.stage === "discovery_completed" ? "context-events" : "discovery-evidence",
           timestamp: selectedAlertWorkflow?.context?.created_at || incidentCreatedAt || ingestAt,
           elapsed: elapsedSeconds(ingestAt, selectedAlertWorkflow?.context?.created_at || incidentCreatedAt || ingestAt),
-          detail: `${stage.status || "unknown"}${Number.isFinite(Number(stage.result_count)) ? ` Â· ${stage.result_count} result(s)` : ""}`,
+          detail: `${stage.status || "unknown"}${Number.isFinite(Number(stage.result_count)) ? ` · ${stage.result_count} result(s)` : ""}`,
           tables: "-",
           inputValueText: stringifyTimelineValue({ protocol: discoveryMcp.protocol, server: discoveryMcp.server }),
           outputValueText: stringifyTimelineValue(stage),
@@ -7291,14 +7294,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const assignedIncidents = monitorScopedIncidentMetadata.filter((row) => [row?.owner, row?.assignee, row?.assigned_engineer, row?.assigned_to].some((value) => String(value || "").trim().toLowerCase() === username));
     const failedActions = monitorScopedIncidentMetadata.filter((row) => ["failed", "rollback_failed", "remediation_failed"].includes(String(row?.status || row?.remediation_status || "").toLowerCase()));
     const myWork = [
-      ...assignedIncidents.map((row) => ({ kind: "Assigned incident", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} Â· ${row?.status || "-"}`, row })),
-      ...pendingApprovals.map((row) => ({ kind: "Approval", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} Â· ${row?.risk_tier || row?.severity || "unknown"} risk`, row })),
-      ...failedActions.map((row) => ({ kind: "Failed action", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} Â· ${row?.status || "failed"}`, row })),
+      ...assignedIncidents.map((row) => ({ kind: "Assigned incident", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} · ${row?.status || "-"}`, row })),
+      ...pendingApprovals.map((row) => ({ kind: "Approval", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} · ${row?.risk_tier || row?.severity || "unknown"} risk`, row })),
+      ...failedActions.map((row) => ({ kind: "Failed action", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} · ${row?.status || "failed"}`, row })),
     ];
     const notifications = [
       ...pendingApprovals.map((row) => ({ kind: "Approval reminder", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} requires review`, row })),
-      ...monitorScopedAlerts.filter((row) => ["critical", "high"].includes(String(row?.severity || "").toLowerCase())).slice(0, 8).map((row) => ({ kind: "Alert", label: row?.name || row?.id || "Alert", meta: `${row?.severity || "-"} Â· ${row?.service || "-"}`, row })),
-      ...(closedIncidents.rows || []).slice(0, 5).map((row) => ({ kind: String(row?.status || "").toLowerCase().includes("reopen") ? "Reopened" : "Resolved", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} Â· ${row?.status || "closed"}`, row })),
+      ...monitorScopedAlerts.filter((row) => ["critical", "high"].includes(String(row?.severity || "").toLowerCase())).slice(0, 8).map((row) => ({ kind: "Alert", label: row?.name || row?.id || "Alert", meta: `${row?.severity || "-"} · ${row?.service || "-"}`, row })),
+      ...(closedIncidents.rows || []).slice(0, 5).map((row) => ({ kind: String(row?.status || "").toLowerCase().includes("reopen") ? "Reopened" : "Resolved", label: row?.incident_id || row?.id || "Incident", meta: `${row?.service || "-"} · ${row?.status || "closed"}`, row })),
     ];
     return { results: results.slice(0, 12), myWork, notifications };
   }, [adminSession?.user?.username, closedIncidents.rows, globalOperationsQuery, monitorScopedAlerts, monitorScopedIncidentMetadata, monitoringApps.rows, pendingApprovals]);
@@ -8454,7 +8457,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     && executionConfirmationValid
     && !liveExecutionPlanAvailable;
   const executionActivationMessage = remediationExecutionState.loading
-    ? "Execution submitted â€” waiting for the terminal run status"
+    ? "Execution submitted — waiting for the terminal run status"
     : executionAllowed
       ? "Ready for guarded execution"
     : blockingPreflightFailures.length
@@ -9086,7 +9089,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }, [isAuthenticated, allowedTabs, activeTab]);
 
   function openSection(tabId) {
+    if (tabId === "notifications") {
+      setGlobalOperationsView("notifications");
+      setGlobalOperationsOpen(true);
+      return;
+    }
     if (!allowedTabs.includes(tabId)) {
+      console.warn("[kaiops-navigation]", { deniedTab: tabId, role: currentRole });
       return;
     }
     setActiveTab(tabId);
@@ -9407,7 +9416,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     if (currentRole === "administrator") {
       return { ...shared, kind: "Administrator", title: `${selectedMonitorScopeLabel} operations`, description: "Application health and activity, with platform-wide infrastructure clearly identified.", cards: [
         { label: "Application Connector", value: isManagedPlatformScope && !connectorRows.length ? "Managed" : !connectorRows.length ? "Not configured" : unhealthyConnectors ? "Attention" : "Healthy", detail: isManagedPlatformScope && !connectorRows.length ? `${selectedMonitorScopeLabel} uses KaiMS-managed platform monitoring; no separate onboarding record is required.` : !connectorRows.length ? `${selectedMonitorScopeLabel} has no registered monitoring connector.` : `${connectorRows.length} connector record(s) scoped to ${selectedMonitorScopeLabel}; ${unhealthyConnectors} unhealthy.`, tone: isManagedPlatformScope && !connectorRows.length ? "info" : !connectorRows.length || unhealthyConnectors ? "attention" : "clear", tab: "admin" },
-        { label: "Queue Health", value: queueHealth.loading ? "Checking" : queueHealth.healthy ? "Healthy" : queueHealth.status === "attention" ? "Attention" : "Unavailable", detail: queueHealth.loading ? "Reading live broker telemetry." : `${String(queueHealth.provider || "rabbitmq").toUpperCase()} Â· ${queueHealth.queues || 0} queues Â· ${queueHealth.ready || 0} ready Â· ${queueHealth.unacknowledged || 0} in flight.`, tone: queueHealth.healthy ? "clear" : "attention", tab: "rag" },
+        { label: "Queue Health", value: queueHealth.loading ? "Checking" : queueHealth.healthy ? "Healthy" : queueHealth.status === "attention" ? "Attention" : "Unavailable", detail: queueHealth.loading ? "Reading live broker telemetry." : `${String(queueHealth.provider || "rabbitmq").toUpperCase()} · ${queueHealth.queues || 0} queues · ${queueHealth.ready || 0} ready · ${queueHealth.unacknowledged || 0} in flight.`, tone: queueHealth.healthy ? "clear" : "attention", tab: "rag" },
         { label: "Selected Incident Activity", value: hasScopedAlertSelection ? selectedAlertEventsDisplay.length : "No selection", detail: hasScopedAlertSelection ? `Persisted agent or trace events for the selected ${selectedMonitorScopeLabel} incident.` : `Open a ${selectedMonitorScopeLabel} alert to inspect agent activity.`, tone: hasScopedAlertSelection && selectedAlertEventsDisplay.length ? "clear" : "info", tab: "trace" },
         { label: "Selected Workflow", value: !hasScopedAlertSelection ? "No selection" : failedAutomation ? `${failedAutomation} failed` : "No failures", detail: hasScopedAlertSelection ? "Failure state for the selected in-scope incident workflow." : "Workflow status is shown only after an in-scope alert is selected.", tone: failedAutomation ? "attention" : "info", tab: "trace" },
         { label: "Telemetry", value: gatewayRecent.rows.length, detail: "API gateway telemetry events in the current loaded window.", tone: gatewayRecent.rows.length ? "info" : "attention", tab: "safety" },
@@ -9809,13 +9818,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             {currentNavigationItem.related?.length ? <nav className="contextual-navigation" aria-label="Related workflow destinations">
               <span>Continue workflow:</span>
               {currentNavigationItem.related.map((relatedId) => {
-                const item = navigationGroups.flatMap((group) => group.items).find((candidate) => candidate.id === relatedId);
+                const item = NAVIGATION_ITEMS.find((candidate) => candidate.id === relatedId && candidate.allowedRoles.includes(currentRole));
                 return item ? <button className="button-secondary" type="button" key={item.id} onClick={() => openNavigationItem(item)}>{item.label}</button> : null;
               })}
             </nav> : null}
           </header>
 
-          <details className="global-operations-bar panel" aria-label="Global operational capabilities">
+          <details className="global-operations-bar panel" open={globalOperationsOpen} onToggle={(event) => setGlobalOperationsOpen(event.currentTarget.open)} aria-label="Global operational capabilities">
             <summary className="global-operations-summary"><span>Search &amp; personal work</span><small>Find records, assignments, and notifications</small></summary>
             <div className="global-operations-body">
             <div className="global-operations-tabs" role="tablist" aria-label="Global operations">
@@ -10657,7 +10666,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
                   {homeDetailTab === "evidence" ? (
                     <>
-                    {false && !selectedAlertRagDocuments.length ? <section className="panel knowledge-review-gate"><div className="panel-head"><div><span className="eyebrow">Knowledge completion required</span><h3>Review RCA-derived alert knowledge</h3><p>No approved alert document is linked. KaiMS prepared a draft from discovery evidence and the completed RCA; an operator must approve it before future use.</p></div><span className={`workflow-pill ${evidenceDraftReview.draft?.status === "approved" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft?.status || "draft"}</span></div>{evidenceDraftReview.loading?<p>Loading evidence draftâ€¦</p>:null}{evidenceDraftReview.draft?<><label>Knowledge document<textarea rows={12} value={evidenceDraftReview.content} onChange={(e)=>setEvidenceDraftReview((current)=>({...current,content:e.target.value}))}/></label><label>Reviewer notes<textarea rows={3} placeholder="Confirm corrections, exclusions, and why this is safe for future grounding." value={evidenceDraftReview.notes} onChange={(e)=>setEvidenceDraftReview((current)=>({...current,notes:e.target.value}))}/></label><button type="button" className="button-primary" onClick={approveEvidenceDraft} disabled={evidenceDraftReview.loading||evidenceDraftReview.content.trim().length<20||evidenceDraftReview.draft?.status==="approved"}>{evidenceDraftReview.loading?"Approvingâ€¦":evidenceDraftReview.draft?.status==="approved"?"Approved":"Approve and publish knowledge"}</button></>:null}{evidenceDraftReview.error?<p className="error">{evidenceDraftReview.error}</p>:null}{evidenceDraftReview.message?<p className="status-message">{evidenceDraftReview.message}</p>:null}</section>:null}
+                    {false && !selectedAlertRagDocuments.length ? <section className="panel knowledge-review-gate"><div className="panel-head"><div><span className="eyebrow">Knowledge completion required</span><h3>Review RCA-derived alert knowledge</h3><p>No approved alert document is linked. KaiMS prepared a draft from discovery evidence and the completed RCA; an operator must approve it before future use.</p></div><span className={`workflow-pill ${evidenceDraftReview.draft?.status === "approved" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft?.status || "draft"}</span></div>{evidenceDraftReview.loading?<p>Loading evidence draft...</p>:null}{evidenceDraftReview.draft?<><label>Knowledge document<textarea rows={12} value={evidenceDraftReview.content} onChange={(e)=>setEvidenceDraftReview((current)=>({...current,content:e.target.value}))}/></label><label>Reviewer notes<textarea rows={3} placeholder="Confirm corrections, exclusions, and why this is safe for future grounding." value={evidenceDraftReview.notes} onChange={(e)=>setEvidenceDraftReview((current)=>({...current,notes:e.target.value}))}/></label><button type="button" className="button-primary" onClick={approveEvidenceDraft} disabled={evidenceDraftReview.loading||evidenceDraftReview.content.trim().length<20||evidenceDraftReview.draft?.status==="approved"}>{evidenceDraftReview.loading?"Approving...":evidenceDraftReview.draft?.status==="approved"?"Approved":"Approve and publish knowledge"}</button></>:null}{evidenceDraftReview.error?<p className="error">{evidenceDraftReview.error}</p>:null}{evidenceDraftReview.message?<p className="status-message">{evidenceDraftReview.message}</p>:null}</section>:null}
                     <RcaPanel
                       rcaDetailView={rcaDetailView}
                       onSetRcaDetailView={setRcaDetailView}
@@ -10695,7 +10704,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <span><strong>{selectedCanonicalIncidentStatus}</strong> lifecycle</span>
                           <span><strong>{selectedAlertTimelineRows.length}</strong> events</span>
                           <span><strong>{selectedAlertRagDocuments.length}</strong> documents</span>
-                          <span className={Number(selectedAlertEvaluation.groundingScore || 0) < 0.5 ? "is-quality-warning" : ""}><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong>{Number(selectedAlertEvaluation.groundingScore || 0) < 0.5 ? "grounding Â· review required" : "grounded"}</span>
+                          <span className={Number(selectedAlertEvaluation.groundingScore || 0) < 0.5 ? "is-quality-warning" : ""}><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong>{Number(selectedAlertEvaluation.groundingScore || 0) < 0.5 ? "grounding · review required" : "grounded"}</span>
                         </div>
                       </header>
                       <details className="panel incident-workspace-section workspace-collapsible" open>
@@ -10853,7 +10862,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                                 <tr key={`stage-${row.stage || index}`}>
                                   <td>{row.label || row.stage || "-"}</td>
                                   <td><span className={`stage-state stage-state-${row.state || (row.persisted ? "complete" : "waiting")}`}>{row.state === "in_progress" ? "In progress" : row.persisted ? "Complete" : "Waiting"}</span></td>
-                                  <td>{Array.isArray(row.evidence_sources) && row.evidence_sources.length ? row.evidence_sources.join(" Â· ") : Array.isArray(row.matched_event_types) && row.matched_event_types.length ? row.matched_event_types.join(" Â· ") : "No durable evidence yet"}</td>
+                                  <td>{Array.isArray(row.evidence_sources) && row.evidence_sources.length ? row.evidence_sources.join(" · ") : Array.isArray(row.matched_event_types) && row.matched_event_types.length ? row.matched_event_types.join(" · ") : "No durable evidence yet"}</td>
                                   <td>{row.next_action || (row.persisted ? "Completed." : "Complete the preceding workflow stage.")}</td>
                                 </tr>
                               ))}
@@ -11054,7 +11063,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                               <span key={`empty-doc-kind-${kind}`}>{kind === "jira" ? "Jira ticket" : kind}</span>
                             ))}
                           </div>
-                          {evidenceDraftReview.loading && !evidenceDraftReview.draft ? <div className="alert-document-generation-state"><span className="spinner" aria-hidden="true" /><span>Completing the RCA-derived document draftâ€¦</span></div> : null}
+                          {evidenceDraftReview.loading && !evidenceDraftReview.draft ? <div className="alert-document-generation-state"><span className="spinner" aria-hidden="true" /><span>Completing the RCA-derived document draft...</span></div> : null}
                           {canProvideAlertDocuments && evidenceDraftReview.draft ? <div className="alert-document-draft-editor">
                             <div className="alert-document-draft-heading"><div><span className="eyebrow">Editable draft</span><h4>{evidenceDraftReview.draft.title || "Incident knowledge document"}</h4></div><span className={`workflow-pill ${evidenceDraftReview.draft.status === "reviewed" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft.status || "draft"}</span></div>
                             <div className="report-view-switch" role="tablist" aria-label="Incident report detail"><button type="button" role="tab" aria-selected={incidentReportView === "simple"} className={incidentReportView === "simple" ? "active" : ""} onClick={() => setIncidentReportView("simple")}>Simple</button><button type="button" role="tab" aria-selected={incidentReportView === "detailed"} className={incidentReportView === "detailed" ? "active" : ""} onClick={() => setIncidentReportView("detailed")}>Detailed</button></div>
@@ -11250,21 +11259,21 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                   {homeDetailTab === "execution" ? (
                     <>
                       {false ? <section className="panel agentic-action-brief" aria-labelledby="agentic-action-title">
-                        <header className="panel-head"><div><span className="eyebrow">CONTEXT-GROUNDED ACTION</span><h3 id="agentic-action-title">Recommended response</h3><p>Prepared from the persisted RCA, impact, incident evidence, runbooks, and configured discovery sources.</p></div><button type="button" className="button-secondary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Refreshing planâ€¦" : "Refresh with agent"}</button></header>
+                        <header className="panel-head"><div><span className="eyebrow">CONTEXT-GROUNDED ACTION</span><h3 id="agentic-action-title">Recommended response</h3><p>Prepared from the persisted RCA, impact, incident evidence, runbooks, and configured discovery sources.</p></div><button type="button" className="button-secondary" onClick={regenerateSelectedAlertAnalysis} disabled={selectedAlertRegeneration.loading}>{selectedAlertRegeneration.loading ? "Refreshing plan..." : "Refresh with agent"}</button></header>
                         <div className="agentic-action-grid">
                           <article><span>Why this action</span><strong>{selectedRcaDecision.rootCause}</strong><p>{selectedRcaDecision.customerImpact}</p></article>
                           <article><span>What to do</span><strong>{selectedExecutionPlan.action === "-" ? selectedRcaDecision.action : selectedExecutionPlan.action}</strong><p>Target: {selectedApplicationConnection.service} · {selectedApplicationConnection.environment}</p></article>
                           <article><span>Safety and recovery</span><strong>{executionRollbackPlan || "Rollback plan must be supplied before execution."}</strong><p>{editedExecutionPlan.queries[0] || "Add a recovery validation check."}</p></article>
                         </div>
                         <section className="execution-approval-panel" aria-labelledby="script-approval-heading">
-                          <div className="execution-credential-heading"><div><span className="discovery-eyebrow">3 Â· Human decision</span><h4 id="script-approval-heading">Approve the reviewed script</h4><p>Approval applies to the plan editor below. Editing it afterward invalidates dry-run readiness.</p></div><span className={["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "credential-ready" : "credential-required"}>{["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Approved" : "Review required"}</span></div>
+                          <div className="execution-credential-heading"><div><span className="discovery-eyebrow">3 · Human decision</span><h4 id="script-approval-heading">Approve the reviewed script</h4><p>Approval applies to the plan editor below. Editing it afterward invalidates dry-run readiness.</p></div><span className={["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "credential-ready" : "credential-required"}>{["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Approved" : "Review required"}</span></div>
                           <div className="credential-method-grid"><label>Decision<select value={approvalForm.action} onChange={(event) => setApprovalForm((current) => ({ ...current, action: event.target.value }))}><option value="approve">Approve as shown</option><option value="modify">Approve edited plan</option></select></label><label>Approver<input value={approvalForm.approver || adminSession?.user?.username || ""} onChange={(event) => setApprovalForm((current) => ({ ...current, approver: event.target.value }))} /></label></div>
                           <label>Decision reason<textarea rows={2} value={approvalForm.comment} placeholder="Why is this script safe and appropriate for this incident?" onChange={(event) => setApprovalForm((current) => ({ ...current, comment: event.target.value }))} /></label>
-                          <div className="incident-section-actions"><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading || ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus)}>{approvalState.loading ? "Recording approvalâ€¦" : ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Script approved" : "Approve reviewed script"}</button></div>
+                          <div className="incident-section-actions"><button type="button" className="button-primary" onClick={approveCockpitRemediationPlan} disabled={approvalState.loading || ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus)}>{approvalState.loading ? "Recording approval..." : ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus) ? "Script approved" : "Approve reviewed script"}</button></div>
                           {approvalState.error ? <p className="error">{approvalState.error}</p> : null}
                         </section>
                         <div className="agentic-source-strip"><span>Source authenticity: {selectedAlertAuthenticity}</span><span>Relevant evidence: {selectedRelevantRcaEvidence.length}</span><span>Internal knowledge: {selectedAlertRagDocuments.length ? `${selectedAlertRagDocuments.length} linked source(s)` : "persisted incident context"}</span><span>External knowledge: {selectedRcaDecision.externalKnowledgeStatus}</span><span>Credential: {executionRequiresCredential ? remediationPlanEditor.credential_ref ? "reference configured" : "required" : "not required for read-only plan"}</span></div>
-                        {executionRequiresCredential ? <section className="execution-credential-panel"><div className="execution-credential-heading"><div><span className="discovery-eyebrow">1 Â· Execution identity</span><h4>Choose the credential reference</h4><p>This is required before KaiMS can validate the connector and target in a dry run.</p></div><span className={credentialReferenceValid ? "credential-ready" : "credential-required"}>{credentialReferenceValid ? "Valid URI" : "Required"}</span></div><div className="credential-method-grid"><label>Secret manager<select value={remediationPlanEditor.credential_store} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_store: e.target.value, credential_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select></label><label>Secret reference URI<input className={remediationPlanEditor.credential_ref && !credentialReferenceValid ? "input-invalid" : ""} aria-invalid={Boolean(remediationPlanEditor.credential_ref && !credentialReferenceValid)} autoComplete="off" spellCheck="false" value={remediationPlanEditor.credential_ref} placeholder={remediationPlanEditor.credential_store === "hashicorp_vault" ? `vault://kv/data/kaims/${selectedApplicationConnection.service}#token` : remediationPlanEditor.credential_store === "aws_secrets_manager" ? `arn:aws:secretsmanager:REGION:ACCOUNT:secret:kaims/${selectedApplicationConnection.service}` : remediationPlanEditor.credential_store === "kubernetes_secret" ? `k8s-secret://kaims/${selectedApplicationConnection.service}-credentials#token` : `https://VAULT_NAME.vault.azure.net/secrets/${selectedApplicationConnection.service}-token/VERSION`} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_ref: e.target.value }))} /><span className="field-hint">{remediationPlanEditor.credential_ref && !credentialReferenceValid ? "This is not a supported enterprise secret reference. Use the selected managerâ€™s URI format." : "Enter the URI onlyâ€”never the token, password, or secret value."}</span></label></div></section> : null}
+                        {executionRequiresCredential ? <section className="execution-credential-panel"><div className="execution-credential-heading"><div><span className="discovery-eyebrow">1 · Execution identity</span><h4>Choose the credential reference</h4><p>This is required before KaiMS can validate the connector and target in a dry run.</p></div><span className={credentialReferenceValid ? "credential-ready" : "credential-required"}>{credentialReferenceValid ? "Valid URI" : "Required"}</span></div><div className="credential-method-grid"><label>Secret manager<select value={remediationPlanEditor.credential_store} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_store: e.target.value, credential_ref: "" }))}><option value="azure_key_vault">Azure Key Vault</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="aws_secrets_manager">AWS Secrets Manager</option><option value="kubernetes_secret">Kubernetes Secret</option></select></label><label>Secret reference URI<input className={remediationPlanEditor.credential_ref && !credentialReferenceValid ? "input-invalid" : ""} aria-invalid={Boolean(remediationPlanEditor.credential_ref && !credentialReferenceValid)} autoComplete="off" spellCheck="false" value={remediationPlanEditor.credential_ref} placeholder={remediationPlanEditor.credential_store === "hashicorp_vault" ? `vault://kv/data/kaims/${selectedApplicationConnection.service}#token` : remediationPlanEditor.credential_store === "aws_secrets_manager" ? `arn:aws:secretsmanager:REGION:ACCOUNT:secret:kaims/${selectedApplicationConnection.service}` : remediationPlanEditor.credential_store === "kubernetes_secret" ? `k8s-secret://kaims/${selectedApplicationConnection.service}-credentials#token` : `https://VAULT_NAME.vault.azure.net/secrets/${selectedApplicationConnection.service}-token/VERSION`} onChange={(e) => setRemediationPlanEditor((current) => ({ ...current, credential_ref: e.target.value }))} /><span className="field-hint">{remediationPlanEditor.credential_ref && !credentialReferenceValid ? "This is not a supported enterprise secret reference. Use the selected manager's URI format." : "Enter the URI only—never the token, password, or secret value."}</span></label></div></section> : null}
                       </section> : null}
                       <details className="panel remediation-workspace incident-workspace-section workspace-collapsible" open>
                         <summary className="panel-head">
@@ -11389,7 +11398,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <p>{selectedRemediationOutcome.detail}</p>
                             <dl><dt>Action</dt><dd>{selectedRemediationOutcome.actionType}</dd><dt>Target</dt><dd>{selectedRemediationOutcome.target}</dd></dl>
                             <details className="k-technical-details"><summary>Technical response</summary><pre className="result">{JSON.stringify(selectedExecutionTechnicalResponse, null, 2)}</pre></details>
-                            {selectedRemediationOutcome.status === "succeeded" ? <section className="execution-outcome-review"><span className="eyebrow">Required human review</span><h4>Was this remediation effective?</h4><div className="outcome-choice" role="group" aria-label="Execution outcome">{[['successful','Successful'],['partial','Partially successful'],['failed','Failed']] .map(([value,label])=><button type="button" key={value} className={executionOutcomeReview.outcome===value?'active':''} onClick={()=>setExecutionOutcomeReview((current)=>({...current,outcome:value}))}>{label}</button>)}</div><label>Operator findings<textarea rows={3} value={executionOutcomeReview.notes} placeholder="What changed, what was validated, and any side effects." onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,notes:e.target.value}))}/></label><label className="checkbox-row"><input type="checkbox" checked={executionOutcomeReview.reusable} onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,reusable:e.target.checked}))}/>Approve this reviewed script for future matching incidents</label><button type="button" className="button-primary" onClick={approveExecutionOutcomeForReuse} disabled={executionOutcomeReview.loading||!executionOutcomeReview.notes.trim()}>{executionOutcomeReview.loading?'Saving reviewâ€¦':'Submit review and learning'}</button>{executionOutcomeReview.error?<p className="error">{executionOutcomeReview.error}</p>:null}{executionOutcomeReview.message?<p className="status-message">{executionOutcomeReview.message}</p>:null}</section> : null}
+                            {selectedRemediationOutcome.status === "succeeded" ? <section className="execution-outcome-review"><span className="eyebrow">Required human review</span><h4>Was this remediation effective?</h4><div className="outcome-choice" role="group" aria-label="Execution outcome">{[['successful','Successful'],['partial','Partially successful'],['failed','Failed']] .map(([value,label])=><button type="button" key={value} className={executionOutcomeReview.outcome===value?'active':''} onClick={()=>setExecutionOutcomeReview((current)=>({...current,outcome:value}))}>{label}</button>)}</div><label>Operator findings<textarea rows={3} value={executionOutcomeReview.notes} placeholder="What changed, what was validated, and any side effects." onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,notes:e.target.value}))}/></label><label className="checkbox-row"><input type="checkbox" checked={executionOutcomeReview.reusable} onChange={(e)=>setExecutionOutcomeReview((current)=>({...current,reusable:e.target.checked}))}/>Approve this reviewed script for future matching incidents</label><button type="button" className="button-primary" onClick={approveExecutionOutcomeForReuse} disabled={executionOutcomeReview.loading||!executionOutcomeReview.notes.trim()}>{executionOutcomeReview.loading?'Saving review...':'Submit review and learning'}</button>{executionOutcomeReview.error?<p className="error">{executionOutcomeReview.error}</p>:null}{executionOutcomeReview.message?<p className="status-message">{executionOutcomeReview.message}</p>:null}</section> : null}
                           </section>
                         ) : null}
                         <details className="k-technical-details execution-technical-details">
@@ -11568,7 +11577,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         <form className="form" onSubmit={updateAdminUser}>
                           <div className="filter-grid">
                             <label>User ID<input value={adminEditUser.id || ""} readOnly /></label>
-                            <label>Username<input value={adminEditUser.username} readOnly /></label>
+                            <label>Username<input value={adminEditUser.username} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, username: e.target.value }))} /></label>
                             <label>Email<input value={adminEditUser.email} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, email: e.target.value }))} /></label>
                             <label>Role
                               <select value={adminEditUser.role_id} onChange={(e) => setAdminEditUser((curr) => ({ ...curr, role_id: Number(e.target.value) }))}>
@@ -11628,7 +11637,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <header><span>01</span><div><small>Immediate</small><h3>Real-time Response</h3></div></header>
                           <ol><li><strong>Process the alert</strong><span>Start as soon as an alert reaches the landing pad.</span></li><li><strong>Reuse known context</strong><span>Apply the latest validated knowledge before discovering missing evidence.</span></li><li><strong>Control the action</strong><span>Review, approve, remediate, validate, and close with a full audit trail.</span></li></ol>
                         </article>
-                        <div className="operating-mode-loop" aria-label="AI learning feedback loop"><span>AI</span><strong>Context in</strong><i>â†”</i><strong>Outcome back</strong></div>
+                        <div className="operating-mode-loop" aria-label="AI learning feedback loop"><span>AI</span><strong>Context in</strong><i>↔</i><strong>Outcome back</strong></div>
                         <article className="operating-mode-card is-continuous">
                           <header><span>02</span><div><small>Continuous</small><h3>Proactive & Knowledge</h3></div></header>
                           <ol><li><strong>Monitor all alert sources</strong><span>Aggregate new alert families and schedule recurring analysis.</span></li><li><strong>Curate understanding</strong><span>Persist context, RCA, impact, dependencies, and resolution guidance.</span></li><li><strong>Learn from outcomes</strong><span>Feed validated incident results back into the repository for future response.</span></li></ol>
@@ -12601,7 +12610,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                       <section className="onboarding-activation-summary" aria-label="Application configuration review">
                         <div><span>Application</span><strong>{onboardingForm.name || "Not supplied"}</strong><small>{onboardingForm.business_service || onboardingForm.description || "Business context not supplied"}</small></div>
                         <div><span>Ownership</span><strong>{onboardingForm.owner_team || "Not supplied"}</strong><small>{onboardingForm.owner_email || "Owner email not supplied"}</small></div>
-                        <div><span>Runtime</span><strong>{onboardingForm.environment} Â· {onboardingForm.region}</strong><small>{onboardingForm.network_zone || onboardingForm.deployment_mode}</small></div>
+                        <div><span>Runtime</span><strong>{onboardingForm.environment} · {onboardingForm.region}</strong><small>{onboardingForm.network_zone || onboardingForm.deployment_mode}</small></div>
                         <div><span>Monitoring</span><strong>{onboardingForm.monitoring_tool}</strong><small>{[onboardingForm.logs_url && "logs", onboardingForm.traces_url && "traces", onboardingForm.telemetry_url && "telemetry", onboardingForm.ticketing_url && "ITSM/Jira", onboardingForm.email_url && "email"].filter(Boolean).join(", ") || "primary source only"}</small></div>
                         <div><span>Context policy</span><strong>{onboardingForm.context_strategy}</strong><small>{onboardingForm.context_strategy === "realtime" ? "Collect fresh context for every alert" : onboardingForm.context_strategy === "historical" ? "Use periodic historical snapshots only" : "Reuse complete context; refresh only when needed"}</small></div>
                         <div><span>Credentials</span><strong>{onboardingForm.connection_auth_type}</strong><small>{onboardingForm.connection_secret_ref || "No secret reference required"}</small></div>
