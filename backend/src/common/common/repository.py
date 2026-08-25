@@ -4127,6 +4127,7 @@ class IncidentRepository:
         transport_provider: str | None = None,
         status: str | None = None,
         service: str | None = None,
+        incident_id: str | None = None,
     ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 1000))
         # Apply ordering and the limit to narrow scalar columns before loading
@@ -4136,6 +4137,11 @@ class IncidentRepository:
             IncidentProjectionRecord.incident_id.label("incident_id"),
             IncidentProjectionRecord.updated_at.label("updated_at"),
         )
+        if incident_id:
+            parsed_incident_id = self._parse_uuid(incident_id)
+            if parsed_incident_id is None:
+                return []
+            latest_stmt = latest_stmt.where(IncidentProjectionRecord.incident_id == parsed_incident_id)
         if risk_tier:
             latest_stmt = latest_stmt.where(
                 IncidentProjectionRecord.risk_tier == str(risk_tier).strip().lower()

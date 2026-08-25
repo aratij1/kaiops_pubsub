@@ -1650,6 +1650,7 @@ async def get_incident_metadata(
     transport_provider: str | None = None,
     status: str | None = None,
     service: str | None = None,
+    incident_id: str | None = None,
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
     params: dict[str, str] = {
@@ -1666,6 +1667,8 @@ async def get_incident_metadata(
         params["status"] = str(status)
     if service:
         params["service"] = str(service)
+    if incident_id:
+        params["incident_id"] = str(incident_id)
     path = f"/incidents/metadata?{urlencode(params)}"
     return await guarded_proxy(
         request=request,
