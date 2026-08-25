@@ -4167,6 +4167,37 @@ class IncidentRepository:
             .join(latest, IncidentProjectionRecord.incident_id == latest.c.incident_id)
             .order_by(latest.c.updated_at.desc())
         )
+        if not include_enrichment:
+            # Inbox/dashboard reads must never hydrate multi-megabyte context
+            # JSON for every row. The opened incident performs a separate,
+            # exact enriched read.
+            stmt = stmt.options(
+                load_only(
+                    IncidentProjectionRecord.incident_id,
+                    IncidentProjectionRecord.alert_id,
+                    IncidentProjectionRecord.trace_id,
+                    IncidentProjectionRecord.recommendation_id,
+                    IncidentProjectionRecord.flow_id,
+                    IncidentProjectionRecord.tenant_id,
+                    IncidentProjectionRecord.service,
+                    IncidentProjectionRecord.environment,
+                    IncidentProjectionRecord.severity,
+                    IncidentProjectionRecord.status,
+                    IncidentProjectionRecord.owner,
+                    IncidentProjectionRecord.risk_tier,
+                    IncidentProjectionRecord.execution_mode,
+                    IncidentProjectionRecord.requires_approval,
+                    IncidentProjectionRecord.policy_version,
+                    IncidentProjectionRecord.policy_reason,
+                    IncidentProjectionRecord.transport_provider,
+                    IncidentProjectionRecord.latest_event_id,
+                    IncidentProjectionRecord.latest_event_type,
+                    IncidentProjectionRecord.latest_event_at,
+                    IncidentProjectionRecord.first_seen_at,
+                    IncidentProjectionRecord.document_available,
+                    IncidentProjectionRecord.updated_at,
+                )
+            )
         result = await self.session.execute(stmt)
         rows = result.scalars().all()
 
@@ -4287,6 +4318,50 @@ class IncidentRepository:
             for snapshot in context_snapshot_result.scalars().all():
                 context_snapshot_by_incident.setdefault(str(snapshot.incident_id), snapshot)
 
+        source_alert_by_id: dict[UUID, dict[str, Any]] = {}
+        if incident_ids:
+            source_alert_ids = {
+                row.alert_id or canonical_alert_by_incident.get(row.incident_id)
+                for row in rows
+                if row.alert_id is not None or canonical_alert_by_incident.get(row.incident_id) is not None
+            }
+            if source_alert_ids:
+                source_alert_result = await self.session.execute(
+                    select(AlertRecord).where(AlertRecord.id.in_(source_alert_ids))
+                )
+                for alert_record in source_alert_result.scalars().all():
+                    alert_payload = (
+                        dict(alert_record.payload)
+                        if isinstance(alert_record.payload, dict)
+                        else {}
+                    )
+                    alert_payload.setdefault("id", str(alert_record.id))
+                    alert_payload.setdefault("source", alert_record.source)
+                    alert_payload.setdefault("name", alert_record.name)
+                    alert_payload.setdefault("service", alert_record.service)
+                    alert_payload.setdefault("environment", alert_record.environment)
+                    alert_payload.setdefault("severity", alert_record.severity)
+                    alert_payload.setdefault("fingerprint", alert_record.fingerprint)
+                    alert_payload.setdefault("correlation_id", alert_record.correlation_id)
+                    source_alert_by_id[alert_record.id] = alert_payload
+
+        historical_context_event_by_incident: dict[UUID, dict[str, Any]] = {}
+        if include_enrichment and incident_ids:
+            historical_context_result = await self.session.execute(
+                select(IncidentEventRecord.incident_id, IncidentEventRecord.payload)
+                .where(
+                    IncidentEventRecord.incident_id.in_(incident_ids),
+                    IncidentEventRecord.event_type == "incident.context.collected",
+                )
+                .order_by(IncidentEventRecord.created_at.desc())
+            )
+            for historical_incident_id, historical_payload in historical_context_result.all():
+                if isinstance(historical_payload, dict):
+                    historical_context_event_by_incident.setdefault(
+                        historical_incident_id,
+                        dict(historical_payload),
+                    )
+
         recommendation_by_id: dict[UUID, dict[str, Any]] = {}
         recommendation_ids = [row.recommendation_id for row in rows if row.recommendation_id is not None]
         if include_enrichment and recommendation_ids:
@@ -4307,9 +4382,53 @@ class IncidentRepository:
             pending = pending_by_incident.get(row.incident_id)
             merged_recommendation_id = row.recommendation_id or (pending.recommendation_id if pending is not None else None)
             merged_flow_id = row.flow_id or (pending.flow_id if pending is not None else None)
-            projection_payload = dict(row.projection_payload or {})
+            projection_payload = dict(row.projection_payload or {}) if include_enrichment else {}
             if canonical_alert_id is not None:
                 projection_payload.setdefault("alert_id", str(canonical_alert_id))
+            event_payload = (
+                projection_payload.get("event_payload")
+                if isinstance(projection_payload.get("event_payload"), dict)
+                else {}
+            )
+            historical_context_event = historical_context_event_by_incident.get(row.incident_id, {})
+            event_context = (
+                event_payload.get("context")
+                if isinstance(event_payload.get("context"), dict)
+                else historical_context_event.get("context")
+                if isinstance(historical_context_event.get("context"), dict)
+                else {}
+            )
+            if event_context:
+                projection_payload.setdefault("context", event_context)
+            historical_context_metadata = historical_context_event.get("context_metadata")
+            if isinstance(historical_context_metadata, dict) and historical_context_metadata:
+                projection_payload.setdefault("context_metadata", historical_context_metadata)
+            historical_context_snapshot = historical_context_event.get("context_snapshot")
+            if isinstance(historical_context_snapshot, dict) and historical_context_snapshot:
+                projection_payload.setdefault("context_snapshot", historical_context_snapshot)
+            event_context_alert = (
+                event_context.get("alert")
+                if isinstance(event_context.get("alert"), dict)
+                else {}
+            )
+            durable_source_alert = source_alert_by_id.get(canonical_alert_id, {}) if canonical_alert_id else {}
+            if durable_source_alert:
+                projection_payload["source_alert"] = durable_source_alert
+                if not isinstance(projection_payload.get("context"), dict) or not projection_payload.get("context"):
+                    # Legacy incidents may predate durable context snapshots,
+                    # but their source alert and recommendation remain
+                    # authoritative evidence. Expose that retained record as
+                    # recovered context and label its provenance explicitly.
+                    projection_payload["context"] = {
+                        "alert": durable_source_alert,
+                        "metadata": {
+                            "contract_version": "kaiops.context.read-model.v1",
+                            "recovered": True,
+                            "recovered_from": ["alerts", "recommendation_audit"],
+                        },
+                    }
+            elif event_context_alert:
+                projection_payload.setdefault("source_alert", event_context_alert)
             context_snapshot = context_snapshot_by_incident.get(str(row.incident_id))
             if context_snapshot is not None:
                 snapshot_context = (
@@ -4361,7 +4480,6 @@ class IncidentRepository:
                     projection_payload["remediation_action"] = action.payload or {}
                 projection_payload["remediation_status"] = action_status
 
-            event_payload = projection_payload.get("event_payload") if isinstance(projection_payload.get("event_payload"), dict) else {}
             action_payload = action.payload if include_enrichment and action is not None and isinstance(action.payload, dict) else {}
             lifecycle_candidates = (
                 event_payload.get("resolution_lifecycle"),
@@ -4375,6 +4493,27 @@ class IncidentRepository:
                 projection_payload["resolution_lifecycle"] = resolution_lifecycle
 
             recommendation_payload = recommendation_by_id.get(merged_recommendation_id, {})
+            if recommendation_payload:
+                # The projection stores the latest lifecycle event, while the
+                # full RCA/recommendation is durably stored in the audit log.
+                # Rejoin it into the read model so UI consumers do not have to
+                # reconstruct a report from whichever event happened last.
+                projection_payload["recommendation"] = recommendation_payload
+            elif any(
+                event_payload.get(key) is not None
+                for key in ("recommended_action", "root_cause", "impact", "risk")
+            ):
+                projection_payload.setdefault(
+                    "recommendation",
+                    {
+                        "id": event_payload.get("recommendation_id"),
+                        "recommended_action": event_payload.get("recommended_action"),
+                        "root_cause": event_payload.get("root_cause"),
+                        "impact": event_payload.get("impact"),
+                        "risk": event_payload.get("risk"),
+                        "confidence": event_payload.get("confidence"),
+                    },
+                )
             recommendation_metadata = (
                 recommendation_payload.get("metadata")
                 if isinstance(recommendation_payload.get("metadata"), dict)
@@ -4464,6 +4603,190 @@ class IncidentRepository:
             projection_payload["jira_key"] = ticket_id or None
             projection_payload["jira_url"] = jira_link
 
+            normalized_context = (
+                projection_payload.get("context")
+                if isinstance(projection_payload.get("context"), dict)
+                else {}
+            )
+            normalized_source_alert = (
+                projection_payload.get("source_alert")
+                if isinstance(projection_payload.get("source_alert"), dict)
+                else {}
+            )
+            normalized_recommendation = (
+                projection_payload.get("recommendation")
+                if isinstance(projection_payload.get("recommendation"), dict)
+                else {}
+            )
+            source_labels = (
+                normalized_source_alert.get("labels")
+                if isinstance(normalized_source_alert.get("labels"), dict)
+                else {}
+            )
+            source_annotations = (
+                normalized_source_alert.get("annotations")
+                if isinstance(normalized_source_alert.get("annotations"), dict)
+                else {}
+            )
+            source_metadata = (
+                normalized_source_alert.get("metadata")
+                if isinstance(normalized_source_alert.get("metadata"), dict)
+                else {}
+            )
+            deduplication = (
+                source_metadata.get("deduplication")
+                if isinstance(source_metadata.get("deduplication"), dict)
+                else {}
+            )
+            root_cause = next(
+                (
+                    str(value).strip()
+                    for value in (
+                        normalized_recommendation.get("root_cause"),
+                        event_payload.get("root_cause"),
+                        projection_payload.get("root_cause"),
+                        source_annotations.get("root_cause"),
+                    )
+                    if str(value or "").strip()
+                ),
+                None,
+            )
+            customer_impact = next(
+                (
+                    str(value).strip()
+                    for value in (
+                        normalized_recommendation.get("impact"),
+                        event_payload.get("impact"),
+                        projection_payload.get("customer_impact"),
+                        projection_payload.get("business_impact"),
+                        source_annotations.get("business_impact"),
+                        source_annotations.get("summary"),
+                        normalized_source_alert.get("description"),
+                    )
+                    if str(value or "").strip()
+                ),
+                None,
+            )
+            confidence = next(
+                (
+                    value
+                    for value in (
+                        normalized_recommendation.get("confidence"),
+                        event_payload.get("confidence"),
+                        projection_payload.get("confidence"),
+                    )
+                    if value is not None
+                ),
+                None,
+            )
+            deduplicated_count = next(
+                (
+                    value
+                    for value in (
+                        normalized_source_alert.get("deduplicated_count"),
+                        normalized_source_alert.get("occurrence_count"),
+                        event_context_alert.get("deduplicated_count"),
+                        event_context_alert.get("occurrence_count"),
+                    )
+                    if value is not None
+                ),
+                None,
+            )
+            deduplication_reason = (
+                deduplication.get("reason")
+                or deduplication.get("disposition")
+                or deduplication.get("match_type")
+            )
+            if not deduplication_reason:
+                try:
+                    if int(deduplicated_count or 0) > 1:
+                        deduplication_reason = "Correlated monitoring occurrences"
+                except (TypeError, ValueError):
+                    pass
+            source_name = next(
+                (
+                    str(value).strip()
+                    for value in (
+                        normalized_source_alert.get("source"),
+                        source_labels.get("origin_system"),
+                        source_labels.get("transport"),
+                    )
+                    if str(value or "").strip()
+                ),
+                None,
+            )
+            origin_system = next(
+                (
+                    str(value).strip()
+                    for value in (
+                        source_labels.get("origin_system"),
+                        normalized_source_alert.get("origin_system"),
+                        source_name,
+                    )
+                    if str(value or "").strip()
+                ),
+                None,
+            )
+            summary = next(
+                (
+                    str(value).strip()
+                    for value in (
+                        source_annotations.get("summary"),
+                        normalized_source_alert.get("summary"),
+                        normalized_source_alert.get("description"),
+                        customer_impact,
+                    )
+                    if str(value or "").strip()
+                ),
+                None,
+            )
+            if include_enrichment:
+                response_projection_payload = projection_payload
+                response_context = normalized_context
+                response_context_snapshot = projection_payload.get("context_snapshot")
+                response_source_alert = normalized_source_alert
+                response_recommendation = normalized_recommendation
+            else:
+                compact_projection_keys = {
+                    "alert_id",
+                    "approval_status",
+                    "event_stage",
+                    "event_type",
+                    "flow_id",
+                    "jira_key",
+                    "jira_link",
+                    "jira_status",
+                    "jira_url",
+                    "orchestration_path",
+                    "remediation_status",
+                    "resolution_lifecycle",
+                    "status",
+                    "status_reason",
+                    "status_source",
+                    "ticket_id",
+                    "transport_channel",
+                }
+                response_projection_payload = {
+                    key: value
+                    for key, value in projection_payload.items()
+                    if key in compact_projection_keys
+                }
+                if normalized_context:
+                    compact_context_metadata = (
+                        normalized_context.get("metadata")
+                        if isinstance(normalized_context.get("metadata"), dict)
+                        else {}
+                    )
+                    response_projection_payload["context_metadata"] = {
+                        "available": True,
+                        "contract_version": compact_context_metadata.get("contract_version"),
+                        "recovered": compact_context_metadata.get("recovered") is True,
+                    }
+                response_context = {}
+                response_context_snapshot = None
+                response_source_alert = {}
+                response_recommendation = {}
+
             response_rows.append(
                 {
                     "incident_id": str(row.incident_id),
@@ -4498,7 +4821,20 @@ class IncidentRepository:
                     "jira_status": jira_status,
                     "jira_key": ticket_id or None,
                     "jira_url": jira_link,
-                    "projection_payload": projection_payload,
+                    "title": normalized_source_alert.get("name") or source_labels.get("alertname") or summary,
+                    "summary": summary,
+                    "source": source_name,
+                    "origin_system": origin_system,
+                    "deduplicated_count": deduplicated_count,
+                    "deduplication_reason": deduplication_reason,
+                    "customer_impact": customer_impact,
+                    "root_cause": root_cause,
+                    "confidence": confidence,
+                    "context": response_context,
+                    "context_snapshot": response_context_snapshot,
+                    "source_alert": response_source_alert,
+                    "recommendation": response_recommendation,
+                    "projection_payload": response_projection_payload,
                 }
             )
 

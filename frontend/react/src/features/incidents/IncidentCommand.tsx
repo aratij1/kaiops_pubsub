@@ -39,6 +39,10 @@ function record(value: unknown): UnknownRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? value as UnknownRecord : {};
 }
 
+function firstRecord(...values: unknown[]): UnknownRecord {
+  return values.map(record).find((candidate) => Object.keys(candidate).length > 0) || {};
+}
+
 function text(...values: unknown[]): string {
   const value = values.find((candidate) => typeof candidate === "string" || typeof candidate === "number");
   return value === undefined || value === null ? "" : String(value).trim();
@@ -54,9 +58,12 @@ function normalizedStatus(row: IncidentRow) {
 
 function titleFor(row: IncidentRow) {
   const projection = record(row.projection_payload);
-  const source = record(row.source_alert);
+  const eventPayload = record(projection.event_payload);
+  const context = firstRecord(row.context, projection.context, eventPayload.context);
+  const source = firstRecord(row.source_alert, projection.source_alert, record(context.alert), eventPayload.alert);
   const labels = record(source.labels);
-  return text(row.title, row.summary, projection.title, projection.summary, source.title, source.name, labels.alertname, `${row.service || "Service"} incident`);
+  const annotations = record(source.annotations);
+  return text(row.title, row.summary, projection.title, projection.summary, source.title, source.name, labels.alertname, annotations.summary, `${row.service || "Service"} incident`);
 }
 
 function dateLabel(value: unknown) {
@@ -120,8 +127,17 @@ export default function IncidentCommand() {
 
   const requestedIncidentId = useMemo(() => decodeURIComponent(routeIncidentId).trim(), [routeIncidentId]);
   const scopedRow = useMemo(() => incidents.rows.find((candidate) => incidentId(candidate).toLowerCase() === requestedIncidentId.toLowerCase()), [incidents.rows, requestedIncidentId]);
+  const scopedProjection = record(scopedRow?.projection_payload);
+  const scopedHasEnrichment = Boolean(scopedRow) && [
+    scopedRow?.source_alert,
+    scopedRow?.recommendation,
+    scopedRow?.context,
+    scopedProjection.source_alert,
+    scopedProjection.recommendation,
+    scopedProjection.context,
+  ].some((candidate) => Object.keys(record(candidate)).length > 0);
   useEffect(() => {
-    if (scopedRow) return undefined;
+    if (scopedHasEnrichment) return undefined;
     if (!requestedIncidentId) {
       setDirectIncident({ loading: false, loaded: true, row: null, error: "" });
       return undefined;
@@ -130,7 +146,7 @@ export default function IncidentCommand() {
     const loadRequestedIncident = async () => {
       setDirectIncident((current) => ({ ...current, loading: true, loaded: false, error: "" }));
       try {
-        const params = new URLSearchParams({ limit: "1", incident_id: requestedIncidentId });
+        const params = new URLSearchParams({ limit: "1", incident_id: requestedIncidentId, include_enrichment: "true" });
         const response = await fetch(`/api-gateway/incidents/metadata?${params.toString()}`, {
           headers: session.accessToken ? { Authorization: `Bearer ${session.accessToken}`, Accept: "application/json" } : { Accept: "application/json" },
           signal: controller.signal,
@@ -150,9 +166,12 @@ export default function IncidentCommand() {
     };
     void loadRequestedIncident();
     return () => controller.abort();
-  }, [directRequestVersion, requestedIncidentId, scopedRow, session.accessToken]);
+  }, [directRequestVersion, requestedIncidentId, scopedHasEnrichment, session.accessToken]);
 
-  const row = scopedRow || directIncident.row || undefined;
+  const directRow = directIncident.row && incidentId(directIncident.row).toLowerCase() === requestedIncidentId.toLowerCase()
+    ? directIncident.row
+    : null;
+  const row = directRow || (scopedHasEnrichment ? scopedRow : undefined);
   const approval = useMemo(() => row ? approvals.rows.find((candidate) => incidentId(candidate).toLowerCase() === incidentId(row).toLowerCase()) : undefined, [approvals.rows, row]);
 
   if (!row && ((incidents.loading && !incidents.rows.length) || directIncident.loading || !directIncident.loaded)) return <LoadingState label="Loading incident command" />;
@@ -161,18 +180,27 @@ export default function IncidentCommand() {
   if (!row) return <EmptyState title="Incident not found" description={`No role-authorized incident record matches ${requestedIncidentId}.`} action={<button type="button" className="button-primary" onClick={() => navigate("/incidents")}>Return to incident inbox</button>} />;
 
   const projection = record(row.projection_payload);
-  const source = record(row.source_alert);
+  const eventPayload = record(projection.event_payload);
+  const context = firstRecord(row.context, projection.context, eventPayload.context);
+  const contextAlert = record(context.alert);
+  const source = firstRecord(row.source_alert, projection.source_alert, contextAlert, eventPayload.alert);
   const sourceLabels = record(source.labels);
-  const recommendation = record(projection.recommendation || projection.remediation_recommendation || projection.resolution_plan || source.recommendation);
+  const sourceAnnotations = record(source.annotations);
+  const sourceMetadata = record(source.metadata);
+  const deduplication = record(sourceMetadata.deduplication);
+  const contextMetadata = record(context.metadata);
+  const contextSnapshot = firstRecord(row.context_snapshot, projection.context_snapshot);
+  const contextSourceManifest = record(contextSnapshot.source_manifest);
+  const recommendation = firstRecord(row.recommendation, projection.recommendation, projection.remediation_recommendation, projection.resolution_plan, eventPayload.recommendation, source.recommendation);
   const recommendationMetadata = record(recommendation.metadata);
   const executionPlan = record(recommendation.execution_plan || projection.execution_plan);
   const safety = record(executionPlan.safety_envelope || recommendation.safety_envelope || projection.safety_envelope);
   const validation = record(projection.validation || projection.validation_result || projection.recovery_validation);
   const before = record(validation.before || validation.pre_state);
   const after = record(validation.after || validation.post_state);
-  const analysis = record(projection.analysis || projection.rca || source.analysis);
-  const rootCause = text(projection.root_cause, analysis.root_cause, analysis.leading_hypothesis, recommendationMetadata.root_cause);
-  const confidence = confidenceValue(projection.confidence, analysis.confidence, recommendation.confidence, recommendationMetadata.confidence);
+  const analysis = firstRecord(projection.analysis, projection.rca, eventPayload.analysis, eventPayload.rca, recommendation.analysis, recommendation.rca, source.analysis);
+  const rootCause = text(row.root_cause, projection.root_cause, eventPayload.root_cause, analysis.root_cause, analysis.leading_hypothesis, recommendation.root_cause, recommendationMetadata.root_cause, sourceAnnotations.root_cause);
+  const confidence = confidenceValue(row.confidence, projection.confidence, eventPayload.confidence, analysis.confidence, recommendation.confidence, recommendationMetadata.confidence);
   const supportingReasons = [
     ...arrayOfText(analysis.supporting_signals),
     ...arrayOfText(analysis.evidence),
@@ -183,11 +211,20 @@ export default function IncidentCommand() {
   const inFailure = FAILED.some((value) => status.includes(value));
   const isTerminal = TERMINAL.some((value) => status.includes(value));
   const currentJourneyIndex = isTerminal ? 6 : status.includes("validat") || status.includes("verif") ? 5 : status.includes("execut") || status.includes("remediat") || status.includes("rollback") ? 4 : status.includes("approval") || recommendation.action || recommendation.title ? 3 : rootCause ? 2 : status.includes("investigat") || status.includes("analy") ? 1 : 0;
-  const action = text(recommendation.title, recommendation.action, recommendation.recommended_action, projection.recommended_action);
+  const action = text(recommendation.title, recommendation.action, recommendation.recommended_action, eventPayload.recommended_action, projection.recommended_action);
   const approvalPending = Boolean(approval) && !["approved", "rejected", "completed"].includes(text(approval?.approval_status, approval?.status).toLowerCase());
   const sourceTimestamp = text(source.received_at, source.created_at, row.created_at);
   const updatedTimestamp = text(row.latest_event_at, row.updated_at, row.created_at);
-  const impact = text(projection.customer_impact, projection.business_impact, projection.impact, source.summary, row.summary);
+  const impact = text(row.customer_impact, row.business_impact, projection.customer_impact, projection.business_impact, projection.impact, eventPayload.impact, recommendation.impact, sourceAnnotations.business_impact, sourceAnnotations.summary, source.summary, source.description, row.summary);
+  const sourceName = text(row.origin_system, row.source, source.origin_system, source.source, sourceLabels.origin_system, sourceLabels.transport);
+  const signalCount = text(row.deduplicated_count, source.deduplicated_count, source.occurrence_count, contextAlert.deduplicated_count, contextAlert.occurrence_count);
+  const correlationDetail = text(row.deduplication_reason, deduplication.reason, deduplication.disposition, deduplication.match_type) || "Correlation detail unavailable";
+  const contextEvidenceCount = Object.values(contextSourceManifest).reduce<number>((total, entry) => {
+    const resultCount = Number(record(entry).result_count || record(entry).fresh_count || 0);
+    return total + (Number.isFinite(resultCount) ? resultCount : 0);
+  }, 0);
+  const contextCollectedAt = text(contextSnapshot.collected_at, contextMetadata.context_collected_at);
+  const contextQuality = confidenceValue(contextSnapshot.quality_score);
   const resolutionAvailable = Boolean(action || Object.keys(executionPlan).length);
   const validationAvailable = Object.keys(validation).length > 0;
   const timeline = [
@@ -224,7 +261,7 @@ export default function IncidentCommand() {
       <main className="ic-primary">
         <section className="ic-section ic-impact">
           <header><div><span>What happened</span><h3>Impact and service context</h3></div><Target aria-hidden="true" /></header>
-          <div className="ic-impact-grid"><Metric label="Customer impact" value={impact || "Unavailable"} /><Metric label="Affected service" value={valueOrUnavailable(row.service)} /><Metric label="Source" value={valueOrUnavailable(text(row.origin_system, row.source, source.source))} /><Metric label="Signal count" value={valueOrUnavailable(text(row.deduplicated_count, source.occurrence_count))} detail={row.deduplication_reason || "Correlation detail unavailable"} /></div>
+          <div className="ic-impact-grid"><Metric label="Customer impact" value={impact || "Unavailable"} /><Metric label="Affected service" value={valueOrUnavailable(row.service)} /><Metric label="Source" value={valueOrUnavailable(sourceName)} /><Metric label="Signal count" value={valueOrUnavailable(signalCount)} detail={correlationDetail} /></div>
         </section>
 
         <section className="ic-section ic-rca">
@@ -275,7 +312,7 @@ export default function IncidentCommand() {
       <aside className="ic-intelligence">
         <section className="ic-kai-panel"><header><span><Bot aria-hidden="true" />Kai intelligence</span><i>{inFailure ? "Attention" : isTerminal ? "Recovered" : "Live context"}</i></header><div className="ic-kai-state"><Sparkles aria-hidden="true" /><span><small>Current state</small><strong>{isTerminal ? "Recovery recorded" : status.replaceAll("_", " ")}</strong></span></div><button type="button" onClick={() => incidents.openTechnical(row, "overview")}><SearchCheck aria-hidden="true" /> Open full investigation</button></section>
         <section className="ic-narrative"><header><span>Live narrative</span><h3>What Kai knows so far</h3></header>{timeline.length ? <ol>{timeline.map((event, index) => <li key={`${event.title}-${index}`}><time>{dateLabel(event.at)}</time><i /><div><strong>{event.title}</strong><p>{event.detail}</p></div></li>)}</ol> : <p>No timestamped lifecycle events are available.</p>}<small>Only recorded lifecycle events are shown; internal agent activity is not fabricated.</small></section>
-        <section className="ic-evidence"><header><span>Evidence provenance</span><h3>Sources supporting this view</h3></header><article><div><strong>{text(row.origin_system, row.source, source.source, "Incident service")}</strong><em>{sourceTimestamp && Date.now() - new Date(sourceTimestamp).getTime() < 300_000 ? "LIVE" : "RECENT"}</em></div><p>Collected {ageLabel(sourceTimestamp)}</p><small>Evidence ID: {text(row.alert_id, source.id, row.fingerprint, "Unavailable")}</small></article>{rootCause ? <article><div><strong>Kai analysis</strong><em className="is-inferred">INFERRED</em></div><p>Updated {ageLabel(updatedTimestamp)}</p><small>Inference is visually separated from telemetry.</small></article> : null}<button type="button" onClick={() => incidents.openTechnical(row, "evidence")}><History aria-hidden="true" /> Inspect all technical evidence</button></section>
+        <section className="ic-evidence"><header><span>Evidence provenance</span><h3>Sources supporting this view</h3></header><article><div><strong>{sourceName || "Incident service"}</strong><em>{sourceTimestamp && Date.now() - new Date(sourceTimestamp).getTime() < 300_000 ? "LIVE" : "RECENT"}</em></div><p>Collected {ageLabel(sourceTimestamp)}</p><small>Evidence ID: {text(row.alert_id, source.id, row.fingerprint, "Unavailable")}</small></article>{Object.keys(context).length || Object.keys(contextSnapshot).length ? <article><div><strong>Kai context record</strong><em>RECORDED</em></div><p>{contextEvidenceCount ? `${contextEvidenceCount} evidence records` : "Context evidence retained"}{contextQuality !== null ? ` · ${contextQuality}% quality` : ""}</p><small>{contextCollectedAt ? `Collected ${ageLabel(contextCollectedAt)}` : contextMetadata.recovered ? "Recovered from durable alert and recommendation records" : `Snapshot: ${text(contextSnapshot.snapshot_id, contextMetadata.context_fingerprint, "persisted")}`}</small></article> : null}{rootCause ? <article><div><strong>Kai analysis</strong><em className="is-inferred">INFERRED</em></div><p>Updated {ageLabel(updatedTimestamp)}</p><small>Inference is visually separated from telemetry.</small></article> : null}<button type="button" onClick={() => incidents.openTechnical(row, "evidence")}><History aria-hidden="true" /> Inspect all technical evidence</button></section>
         <section className="ic-control"><header><PauseCircle aria-hidden="true" /><div><span>Human control</span><h3>Stay in command</h3></div></header><p>Holding, taking control, or rolling back requires an authoritative execution capability.</p><button type="button" onClick={() => incidents.openTechnical(row, "resolution")}><Gauge aria-hidden="true" /> Take control in governed workspace</button><button type="button" disabled title="Available only when the backend reports an active, controllable execution"><RotateCcw aria-hidden="true" /> Rollback unavailable</button></section>
       </aside>
     </div>
