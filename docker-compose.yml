@@ -1131,7 +1131,7 @@ services:
       dockerfile: deploy/docker/Dockerfile.ui
     # Docker Desktop's IPv6 localhost forwarder can accept connections without
     # forwarding them. Bind IPv4 explicitly so Windows falls back from ::1.
-    ports: ["${UI_BIND_ADDRESS:-127.0.0.1}:8501:80"]
+    ports: ["${UI_BIND_ADDRESS:-127.0.0.1}:${UI_HOST_PORT:-80}:80"]
     restart: unless-stopped
     # The static UI must remain available while backend services recover. Its
     # nginx proxy reports backend failures without preventing the UI/login page
