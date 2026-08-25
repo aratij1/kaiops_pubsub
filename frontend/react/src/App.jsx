@@ -2225,9 +2225,32 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         workflowAlert = hydrated?.alert && typeof hydrated.alert === "object" ? hydrated.alert : workflowAlert;
         incident = hydrated?.incident && typeof hydrated.incident === "object" ? hydrated.incident : incident;
       }
+      if (!workflowAlert?.id && ALERT_UUID_PATTERN.test(alertId)) {
+        workflowAlert = { ...selectedAlertRow, id: alertId };
+      }
+      if (!ALERT_UUID_PATTERN.test(String(incident?.id || incident?.incident_id || ""))) {
+        const incidentMetadataMatch = [
+          ...monitorScopedIncidentMetadata,
+          ...incidentMetadata.rows,
+        ].find((row) => String(row?.alert_id || row?.projection_payload?.alert_id || "").trim() === alertId);
+        const recoveredIncidentId = String(incidentMetadataMatch?.incident_id || "").trim();
+        if (ALERT_UUID_PATTERN.test(recoveredIncidentId)) {
+          incident = {
+            ...(incidentMetadataMatch?.projection_payload && typeof incidentMetadataMatch.projection_payload === "object"
+              ? incidentMetadataMatch.projection_payload
+              : {}),
+            ...incident,
+            id: recoveredIncidentId,
+            incident_id: recoveredIncidentId,
+            service: incident?.service || incidentMetadataMatch?.service,
+            environment: incident?.environment || incidentMetadataMatch?.environment,
+            severity: incident?.severity || incidentMetadataMatch?.severity,
+          };
+        }
+      }
       const persistedIncidentId = String(incident?.id || incident?.incident_id || selectedAlertRow?.incident_id || "").trim();
       if (!ALERT_UUID_PATTERN.test(persistedIncidentId) || !workflowAlert?.id) {
-        throw new Error("This alert has not completed incident persistence yet. RCA regeneration will be available when processing finishes.");
+        throw new Error("This signal has no standalone incident yet. It may still be processing, or it may have been correlated as noise or a duplicate. Refresh the inbox before regenerating RCA.");
       }
       incident = { ...incident, id: persistedIncidentId };
       const contextStrategy = rcaAnalysisMode === "fresh" ? "realtime" : rcaAnalysisMode === "cache" ? "historical" : "auto";
@@ -2665,10 +2688,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   async function loadModelProviderStatus() {
     setModelProviderStatus((curr) => ({ ...curr, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/model/providers/status");
+      const payload = await fetchJson("/api-gateway/model/providers/status", { timeoutMs: 15000, maxAttempts: 3 });
       setModelProviderStatus({ loading: false, data: unwrap(payload), error: "" });
     } catch (error) {
-      setModelProviderStatus({ loading: false, data: null, error: error.message });
+      // Preserve last-known health during a rolling restart. The recurring
+      // status refresh replaces stale data when the route is available again.
+      setModelProviderStatus((current) => ({ ...current, loading: false, error: error.message }));
     }
   }
 
@@ -4838,6 +4863,20 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }, []);
 
   useEffect(() => {
+    if (!String(adminSession.accessToken || "").trim()) {
+      return undefined;
+    }
+    // Recover from api-gateway/model-router startup races instead of pinning a
+    // transient provider-status error in the global shell for the whole login.
+    const initialRetry = window.setTimeout(() => { void loadModelProviderStatus(); }, 1_500);
+    const interval = window.setInterval(() => { void loadModelProviderStatus(); }, 30_000);
+    return () => {
+      window.clearTimeout(initialRetry);
+      window.clearInterval(interval);
+    };
+  }, [adminSession.accessToken]);
+
+  useEffect(() => {
     if (VALID_LEGACY_TABS.has(initialTab) && initialTab !== activeTab) {
       // The router is authoritative for top-level navigation. Without this
       // guard, the following effect can publish the previous local tab during
@@ -5725,14 +5764,15 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const explicitStatus = String(modelProviderStatus?.data?.status || modelProviderStatus?.data?.overall_status || "").trim().toLowerCase();
     const configuredProviders = selectedModelProviderRows.filter((provider) => provider.configured);
     const unhealthyProviders = configuredProviders.filter((provider) => !provider.healthy || provider.circuitOpen);
-    const degraded = Boolean(modelProviderStatus.error)
+    const statusUnavailable = Boolean(modelProviderStatus.error) && !modelProviderStatus.data;
+    const degraded = statusUnavailable
       || ["degraded", "unavailable", "error", "failed", "unhealthy"].includes(explicitStatus)
       || unhealthyProviders.length > 0;
     const affectedProviders = unhealthyProviders.map((provider) => provider.name).join(", ");
     return {
       degraded,
       loading: Boolean(modelProviderStatus.loading),
-      message: modelProviderStatus.error
+      message: statusUnavailable
         ? "Provider status is unavailable. AI investigation may be delayed; deterministic monitoring remains active and execution stays governed by backend policy."
         : affectedProviders
           ? `${affectedProviders} reported an unhealthy or open-circuit state. Deterministic monitoring remains active and execution stays governed by backend policy.`

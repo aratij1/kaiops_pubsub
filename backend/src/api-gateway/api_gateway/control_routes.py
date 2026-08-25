@@ -154,7 +154,12 @@ def build_control_router(
     async def get_approval_capacity(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
         auth = getattr(request.state, "auth", None)
         if auth is None:
-            raise HTTPException(status_code=401, detail="Authenticated tenant identity is required")
+            # Local/demo middleware intentionally skips global auth state, but
+            # tenant-scoped reads still require and can validate the bearer
+            # token here just like approval incident reads and mutations do.
+            if auth_context_from_request is None:
+                raise HTTPException(status_code=500, detail="Gateway authentication resolver is not configured")
+            auth = await auth_context_from_request(request)
         return await forward(
             request, "GET", f"/capacity?{urlencode({'tenant_id': auth.tenant_id})}", settings.approval_service_url, {}, x_trace_id, timeout_seconds=8.0
         )
@@ -282,7 +287,9 @@ def build_control_router(
     ) -> dict[str, Any]:
         auth = getattr(request.state, "auth", None)
         if auth is None:
-            raise HTTPException(status_code=401, detail="Authenticated tenant identity is required")
+            if auth_context_from_request is None:
+                raise HTTPException(status_code=500, detail="Gateway authentication resolver is not configured")
+            auth = await auth_context_from_request(request)
         return await forward(
             request,
             "PUT",
