@@ -1275,6 +1275,36 @@ function HealthBadge({ ok, label }) {
   );
 }
 
+function friendlyLoginErrorMessage(error) {
+  const hasMessage = typeof error?.message === "string";
+  const rawMessage = String(hasMessage ? error.message : error || "").trim();
+  if (!rawMessage) {
+    return "Sign in failed. Please try again.";
+  }
+  const httpMatch = rawMessage.match(/^HTTP (\d+):\s*([\s\S]*)$/);
+  if (!httpMatch) {
+    return rawMessage;
+  }
+  const status = httpMatch[1];
+  const body = httpMatch[2] || "";
+  let detail = "";
+  let backendUnavailable = false;
+  try {
+    const parsed = JSON.parse(body);
+    detail = String(parsed?.detail || "").trim();
+    backendUnavailable = parsed?.status === "backend_unavailable";
+  } catch (_parseError) {
+    detail = body.trim();
+  }
+  if (status === "503" || backendUnavailable) {
+    return "The service is starting up. Please wait a moment and try again.";
+  }
+  // The backend's `detail` text for auth failures ("Invalid credentials",
+  // "Account is locked", ...) is already written for end users -- only the
+  // "HTTP 401: {...}" wrapper needs stripping, not the message itself.
+  return detail || `Sign in failed (HTTP ${status}).`;
+}
+
 function htmlEscape(value) {
   return String(value)
     .replace(/&/g, "&amp;")
@@ -7024,6 +7054,7 @@ export {
   fallbackFetchTargets,
   fetchJson,
   HealthBadge,
+  friendlyLoginErrorMessage,
   htmlEscape,
   asDisplayValue,
   parseUtcTimestamp,

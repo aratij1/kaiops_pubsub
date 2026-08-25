@@ -123,6 +123,16 @@ class UserService:
 
         await run_in_session(self.session_factory, op)
 
+    def _json_safe_audit_value(self, user_dict: dict) -> dict:
+        """`_user_to_dict()` carries raw datetime objects (created_at,
+        updated_at, last_login, locked_until) for API response models that
+        expect them typed -- but AuditLogRecord.payload is a JSON column,
+        and json.dumps cannot serialize a bare datetime. Only used for the
+        audit-log copy; the original dict (returned to the caller/API
+        response) is left untouched.
+        """
+        return {key: value.isoformat() if isinstance(value, datetime) else value for key, value in user_dict.items()}
+
     def _user_to_dict(self, user: UserRecord, role_name: str) -> dict:
         normalized_email = self._normalize_local_email(user.username, user.email)
         return {
@@ -525,6 +535,11 @@ class UserService:
                 raise HTTPException(status_code=404, detail="User not found")
             old = self._user_to_dict(user, (await repo.get_role(user.role_id)).name if await repo.get_role(user.role_id) else "Unknown")
 
+            if payload.username is not None and payload.username != user.username:
+                existing_username = await repo.get_user_by_username(payload.username)
+                if existing_username and existing_username.id != user.id:
+                    raise HTTPException(status_code=409, detail="Username already exists")
+                user.username = payload.username
             if payload.email is not None and str(payload.email) != user.email:
                 existing = await repo.get_user_by_email(str(payload.email))
                 if existing and existing.id != user.id:
@@ -552,7 +567,11 @@ class UserService:
                 action="user.updated",
                 resource_type="user",
                 resource_id=str(user.id),
-                payload={"old_value": old, "new_value": updated, "ip_address": ip_address},
+                payload={
+                    "old_value": self._json_safe_audit_value(old),
+                    "new_value": self._json_safe_audit_value(updated),
+                    "ip_address": ip_address,
+                },
             )
             return updated
 

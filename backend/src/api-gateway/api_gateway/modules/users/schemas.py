@@ -51,6 +51,7 @@ class UserCreate(BaseModel):
 class UserUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    username: str | None = Field(default=None, min_length=3, max_length=64)
     email: EmailStr | None = None
     first_name: str | None = Field(default=None, min_length=1, max_length=80)
     last_name: str | None = Field(default=None, min_length=1, max_length=80)
