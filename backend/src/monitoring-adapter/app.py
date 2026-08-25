@@ -6370,6 +6370,7 @@ async def get_incident_metadata(
     transport_provider: str | None = None,
     status: str | None = None,
     service: str | None = None,
+    incident_id: str | None = None,
 ) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 1000))
     session_factory = getattr(app.state, "session_factory", None)
@@ -6384,6 +6385,7 @@ async def get_incident_metadata(
                 transport_provider=transport_provider,
                 status=status,
                 service=service,
+                incident_id=incident_id,
             )
         return {"rows": rows, "count": len(rows)}
 
@@ -6404,6 +6406,13 @@ async def get_incident_metadata(
         ]
     if status:
         rows = [row for row in rows if str(row.get("status") or "").strip().lower() == str(status).strip().lower()]
+    if incident_id:
+        rows = [
+            row
+            for row in rows
+            if str(row.get("incident_id") or row.get("id") or "").strip().lower()
+            == str(incident_id).strip().lower()
+        ]
     if service:
         rows = [row for row in rows if str(row.get("service") or "").strip() == str(service).strip()]
     rows = rows[:safe_limit]

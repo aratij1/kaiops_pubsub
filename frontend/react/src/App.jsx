@@ -5765,16 +5765,16 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const configuredProviders = selectedModelProviderRows.filter((provider) => provider.configured);
     const unhealthyProviders = configuredProviders.filter((provider) => !provider.healthy || provider.circuitOpen);
     const statusUnavailable = Boolean(modelProviderStatus.error) && !modelProviderStatus.data;
-    const degraded = statusUnavailable
-      || ["degraded", "unavailable", "error", "failed", "unhealthy"].includes(explicitStatus)
+    // A failed health lookup is not evidence that AI itself is degraded. Keep
+    // that transient condition in the control-plane diagnostics and reserve
+    // the global warning for a confirmed unhealthy configured provider.
+    const degraded = ["degraded", "unavailable", "error", "failed", "unhealthy"].includes(explicitStatus)
       || unhealthyProviders.length > 0;
     const affectedProviders = unhealthyProviders.map((provider) => provider.name).join(", ");
     return {
       degraded,
-      loading: Boolean(modelProviderStatus.loading),
-      message: statusUnavailable
-        ? "Provider status is unavailable. AI investigation may be delayed; deterministic monitoring remains active and execution stays governed by backend policy."
-        : affectedProviders
+      loading: Boolean(modelProviderStatus.loading) || statusUnavailable,
+      message: affectedProviders
           ? `${affectedProviders} reported an unhealthy or open-circuit state. Deterministic monitoring remains active and execution stays governed by backend policy.`
           : "",
     };

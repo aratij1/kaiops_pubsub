@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   AlertTriangle,
@@ -108,14 +108,57 @@ export default function IncidentCommand() {
   const navigate = useNavigate();
   const incidents = useRouteRuntimeSlice("incidents");
   const approvals = useRouteRuntimeSlice("approvals");
+  const session = useRouteRuntimeSlice("session");
   const [approvalExpanded, setApprovalExpanded] = useState(false);
+  const [directRequestVersion, setDirectRequestVersion] = useState(0);
+  const [directIncident, setDirectIncident] = useState<{
+    loading: boolean;
+    loaded: boolean;
+    row: IncidentRow | null;
+    error: string;
+  }>({ loading: false, loaded: false, row: null, error: "" });
 
-  const row = useMemo(() => incidents.rows.find((candidate) => incidentId(candidate).toLowerCase() === decodeURIComponent(routeIncidentId).toLowerCase()), [incidents.rows, routeIncidentId]);
+  const requestedIncidentId = useMemo(() => decodeURIComponent(routeIncidentId).trim(), [routeIncidentId]);
+  const scopedRow = useMemo(() => incidents.rows.find((candidate) => incidentId(candidate).toLowerCase() === requestedIncidentId.toLowerCase()), [incidents.rows, requestedIncidentId]);
+  useEffect(() => {
+    if (scopedRow) return undefined;
+    if (!requestedIncidentId) {
+      setDirectIncident({ loading: false, loaded: true, row: null, error: "" });
+      return undefined;
+    }
+    const controller = new AbortController();
+    const loadRequestedIncident = async () => {
+      setDirectIncident((current) => ({ ...current, loading: true, loaded: false, error: "" }));
+      try {
+        const params = new URLSearchParams({ limit: "1", incident_id: requestedIncidentId });
+        const response = await fetch(`/api-gateway/incidents/metadata?${params.toString()}`, {
+          headers: session.accessToken ? { Authorization: `Bearer ${session.accessToken}`, Accept: "application/json" } : { Accept: "application/json" },
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`Incident service returned HTTP ${response.status}`);
+        const payload = record(await response.json() as unknown);
+        const data = Object.keys(record(payload.data)).length ? record(payload.data) : payload;
+        const responseRows = Array.isArray(data.rows) ? data.rows : [];
+        const match = responseRows
+          .map((candidate) => record(candidate) as IncidentRow)
+          .find((candidate) => incidentId(candidate).toLowerCase() === requestedIncidentId.toLowerCase()) || null;
+        setDirectIncident({ loading: false, loaded: true, row: match, error: "" });
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setDirectIncident({ loading: false, loaded: true, row: null, error: String((error as Error).message || error) });
+      }
+    };
+    void loadRequestedIncident();
+    return () => controller.abort();
+  }, [directRequestVersion, requestedIncidentId, scopedRow, session.accessToken]);
+
+  const row = scopedRow || directIncident.row || undefined;
   const approval = useMemo(() => row ? approvals.rows.find((candidate) => incidentId(candidate).toLowerCase() === incidentId(row).toLowerCase()) : undefined, [approvals.rows, row]);
 
-  if (incidents.loading && !incidents.rows.length) return <LoadingState label="Loading incident command" />;
+  if (!row && ((incidents.loading && !incidents.rows.length) || directIncident.loading || !directIncident.loaded)) return <LoadingState label="Loading incident command" />;
   if (incidents.error && !incidents.rows.length) return <ErrorState title="Incident data is temporarily unavailable" description="Kai cannot assemble the command workspace until the incident service responds." retry={incidents.refresh} />;
-  if (!row) return <EmptyState title="Incident not found in the loaded scope" description={`No role-authorized incident record matches ${decodeURIComponent(routeIncidentId)}.`} action={<button type="button" className="button-primary" onClick={() => navigate("/incidents")}>Return to incident inbox</button>} />;
+  if (!row && directIncident.error) return <ErrorState title="Incident data is temporarily unavailable" description={directIncident.error} retry={() => setDirectRequestVersion((version) => version + 1)} />;
+  if (!row) return <EmptyState title="Incident not found" description={`No role-authorized incident record matches ${requestedIncidentId}.`} action={<button type="button" className="button-primary" onClick={() => navigate("/incidents")}>Return to incident inbox</button>} />;
 
   const projection = record(row.projection_payload);
   const source = record(row.source_alert);
