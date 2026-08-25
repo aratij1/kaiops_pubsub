@@ -19,6 +19,11 @@ build/
 data/
 logs/local/*.log
 node_modules/
+.tmp/
+storybook-static/
+test-results/
+playwright-report/
+artifacts/
 
 # Generated UI and runtime artifacts
 .tmp-ui-bundle.js

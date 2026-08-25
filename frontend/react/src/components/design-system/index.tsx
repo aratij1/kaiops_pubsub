@@ -172,3 +172,97 @@ export function VirtualizedList<Row>({ rows, rowKey, renderRow, height = 360, es
   const virtualizer = useVirtualizer({ count: rows.length, getScrollElement: () => parentRef.current, estimateSize: () => estimateSize, getItemKey: (index) => rowKey(rows[index]) });
   return <div ref={parentRef} className="k-virtual-list" style={{ height }} role="list" aria-label={label}><div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>{virtualizer.getVirtualItems().map((item) => <div role="listitem" key={item.key} style={{ position: "absolute", insetInline: 0, transform: `translateY(${item.start}px)`, height: item.size }}>{renderRow(rows[item.index])}</div>)}</div></div>;
 }
+
+export type SemanticState = "critical" | "warning" | "success" | "info" | "inactive";
+
+export function KaiState({ state, detail }: { state: string; detail?: string }) {
+  return <span className="k-semantic-state k-kai-state"><span className="k-live-dot" aria-hidden="true" /><span><small>Kai</small><strong>{state}</strong>{detail ? <em>{detail}</em> : null}</span></span>;
+}
+
+export function IncidentState({ state, tone = "info" }: { state: string; tone?: SemanticState }) {
+  return <StatusBadge tone={tone}>{state.replaceAll("_", " ")}</StatusBadge>;
+}
+
+export function AutonomyBadge({ mode }: { mode: string }) {
+  const normalized = mode.toLowerCase();
+  const tone: StatusTone = normalized.includes("emergency") ? "critical" : normalized.includes("autonomous") ? "success" : normalized.includes("guided") ? "info" : "inactive";
+  return <StatusBadge tone={tone}>Autonomy: {mode || "Unavailable"}</StatusBadge>;
+}
+
+export function TrustIndicator({ label, status, detail }: { label: string; status: string; detail?: string }) {
+  return <span className="k-trust-indicator"><CheckCircle2 aria-hidden="true" /><span><small>{label}</small><strong>{status}</strong>{detail ? <em>{detail}</em> : null}</span></span>;
+}
+
+export function ConfidenceIndicator({ score, reasons = [] }: { score?: number | null; reasons?: readonly string[] }) {
+  if (score === null || score === undefined) return <StatusBadge tone="inactive">Confidence unavailable</StatusBadge>;
+  const normalized = Math.max(0, Math.min(100, score <= 1 ? score * 100 : score));
+  return <div className="k-confidence-indicator"><span><small>{normalized >= 80 ? "High" : normalized >= 60 ? "Medium" : "Low"} confidence</small><strong>{Math.round(normalized)}%</strong></span><meter min="0" max="100" value={normalized}>{normalized}%</meter>{reasons.length ? <details><summary>Why this confidence?</summary><ul>{reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></details> : null}</div>;
+}
+
+export function RiskIndicator({ risk }: { risk: string }) {
+  const normalized = risk.toLowerCase();
+  return <StatusBadge tone={normalized.includes("high") || normalized.includes("critical") ? "critical" : normalized.includes("medium") ? "warning" : normalized.includes("low") ? "success" : "inactive"}>Risk: {risk || "Unavailable"}</StatusBadge>;
+}
+
+export function BlastRadiusIndicator({ value }: { value?: string }) {
+  return <span className="k-fact-indicator"><small>Blast radius</small><strong>{value || "Not provided"}</strong></span>;
+}
+
+export function EvidenceBadge({ provenance }: { provenance: "LIVE" | "RECENT" | "HISTORICAL" | "INFERRED" | "SIMULATED" | "UNAVAILABLE" }) {
+  return <span className={`k-evidence-badge is-${provenance.toLowerCase()}`}>{provenance}</span>;
+}
+
+export function FreshnessBadge({ timestamp }: { timestamp?: string }) {
+  if (!timestamp) return <EvidenceBadge provenance="UNAVAILABLE" />;
+  const age = Date.now() - new Date(timestamp).getTime();
+  return <EvidenceBadge provenance={Number.isFinite(age) && age < 300_000 ? "LIVE" : "RECENT"} />;
+}
+
+export function RecoveryIndicator({ recovered, label }: { recovered: boolean; label?: string }) {
+  return <StatusBadge tone={recovered ? "success" : "warning"}>{label || (recovered ? "Recovery verified" : "Recovery not verified")}</StatusBadge>;
+}
+
+export function LifecycleStepper({ stages, current }: { stages: readonly string[]; current: number }) {
+  return <ol className="k-lifecycle-stepper" aria-label="Lifecycle progress">{stages.map((stage, index) => <li key={stage} className={index < current ? "is-complete" : index === current ? "is-current" : ""}><span>{index < current ? "✓" : index + 1}</span><strong>{stage}</strong></li>)}</ol>;
+}
+
+export function CausalPath({ nodes }: { nodes: readonly { label: string; kind?: string }[] }) {
+  return <ol className="k-causal-path" aria-label="Causal path">{nodes.map((node) => <li key={`${node.kind}-${node.label}`}><small>{node.kind || "Evidence"}</small><strong>{node.label}</strong></li>)}</ol>;
+}
+
+export function ResolutionCard({ title, rationale, facts, actions }: { title: string; rationale?: string; facts?: readonly { label: string; value: ReactNode }[]; actions?: ReactNode }) {
+  return <article className="k-resolution-card"><header><p>Recommended resolution</p><h3>{title}</h3></header>{rationale ? <p>{rationale}</p> : null}{facts?.length ? <dl>{facts.map((fact) => <div key={fact.label}><dt>{fact.label}</dt><dd>{fact.value}</dd></div>)}</dl> : null}{actions ? <footer>{actions}</footer> : null}</article>;
+}
+
+export function SafetyEnvelope({ controls }: { controls: readonly { label: string; value?: ReactNode }[] }) {
+  return <section className="k-safety-envelope"><header><StatusBadge tone="info">Execution safety envelope</StatusBadge><small>Backend policy is authoritative</small></header><dl>{controls.map((control) => <div key={control.label}><dt>{control.label}</dt><dd>{control.value || "Not provided"}</dd></div>)}</dl></section>;
+}
+
+export function ApprovalCard({ title, reason, children, actions }: { title: string; reason?: string; children?: ReactNode; actions?: ReactNode }) {
+  return <article className="k-approval-card"><header><FileCheckIcon /><span><small>Kai needs your decision</small><strong>{title}</strong></span></header>{reason ? <p>{reason}</p> : null}{children}{actions ? <footer>{actions}</footer> : null}</article>;
+}
+
+function FileCheckIcon() {
+  return <CheckCircle2 aria-hidden="true" />;
+}
+
+export function ExecutionTimeline({ events }: { events: readonly { time?: string; title: string; detail?: string; state?: string }[] }) {
+  return <ol className="k-execution-timeline">{events.map((event, index) => <li key={`${event.title}-${index}`}><time>{event.time || "Time unavailable"}</time><span><strong>{event.title}</strong>{event.detail ? <small>{event.detail}</small> : null}</span>{event.state ? <em>{event.state}</em> : null}</li>)}</ol>;
+}
+
+export function ValidationComparison({ rows }: { rows: readonly { signal: string; before?: ReactNode; after?: ReactNode; target?: ReactNode }[] }) {
+  return <div className="k-validation-comparison" role="table" aria-label="Recovery validation"><div role="row"><strong>Signal</strong><strong>Before</strong><strong>After</strong><strong>Target</strong></div>{rows.map((row) => <div role="row" key={row.signal}><span>{row.signal}</span><span>{row.before || "Unavailable"}</span><span>{row.after || "Unavailable"}</span><span>{row.target || "Unavailable"}</span></div>)}</div>;
+}
+
+export function AttentionCard({ title, count, tone = "info", children, action }: { title: string; count?: number; tone?: SemanticState; children?: ReactNode; action?: ReactNode }) {
+  return <article className={`k-attention-card is-${tone}`}><header><strong>{title}</strong>{count !== undefined ? <span>{count}</span> : null}</header>{children}{action ? <footer>{action}</footer> : null}</article>;
+}
+
+export function ServiceHealth({ service, status, detail }: { service: string; status: string; detail?: string }) {
+  const healthy = ["healthy", "available", "up", "ok"].includes(status.toLowerCase());
+  return <span className="k-service-health"><span className={healthy ? "is-healthy" : "is-unhealthy"} aria-hidden="true" /><span><strong>{service}</strong><small>{status}{detail ? ` · ${detail}` : ""}</small></span></span>;
+}
+
+export function ReadinessScore({ score, capabilities = [] }: { score?: number | null; capabilities?: readonly { label: string; score?: number | null }[] }) {
+  return <section className="k-readiness"><header><span><small>Operational readiness</small><strong>{score === null || score === undefined ? "Unavailable" : `${Math.round(score)}%`}</strong></span>{score !== null && score !== undefined ? <meter min="0" max="100" value={score}>{score}%</meter> : null}</header>{capabilities.length ? <ul>{capabilities.map((capability) => <li key={capability.label}><span>{capability.label}</span><strong>{capability.score === null || capability.score === undefined ? "—" : `${Math.round(capability.score)}%`}</strong></li>)}</ul> : null}</section>;
+}
