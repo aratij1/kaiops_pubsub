@@ -1604,6 +1604,42 @@ async def get_closed_incidents(
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
+
+
+@app.post("/incidents/{incident_id}/manual-remediation/assign")
+async def assign_incident_manual_remediation(
+    incident_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/incidents/{incident_id}/manual-remediation/assign",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/incidents/{incident_id}/manual-remediation/complete")
+async def complete_incident_manual_remediation(
+    incident_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/incidents/{incident_id}/manual-remediation/complete",
+        target_base=settings.monitoring_adapter_url,
+        payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/incidents/metadata")
 async def get_incident_metadata(
     request: Request,
