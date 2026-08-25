@@ -140,7 +140,8 @@ async function installScenario(page, options = {}) {
       currentIncident = incident({ status: "recovered", approval_status: "approved", execution_mode: "human-approved", latest_event_type: "validation_completed" });
       return route.fulfill(json({ data: { status: "succeeded", incident_id: INCIDENT_ID } }));
     }
-    if (path.startsWith("/alerts/all") || path.startsWith("/landing-pad/recent") || path.startsWith("/alerts/applications")) return route.fulfill(json({ data: { rows: [] } }));
+    if (path.startsWith("/alerts/all")) return route.fulfill(json({ data: { rows: options.alerts || [] } }));
+    if (path.startsWith("/landing-pad/recent") || path.startsWith("/alerts/applications")) return route.fulfill(json({ data: { rows: [] } }));
     if (path.startsWith("/operations/queue-health")) return route.fulfill(json({ status: "healthy", healthy: true }));
     return route.fulfill(json({ data: { rows: [] }, rows: [], summary: {}, items: [] }));
   });
@@ -155,6 +156,46 @@ async function signIn(page, path) {
   await page.getByRole("button", { name: /sign in/i }).click();
   await expect(page.locator(".kai-shell")).toBeVisible({ timeout: 30_000 });
 }
+
+test("unified inbox combines incidents and unlinked signals without losing source-specific triage", async ({ page }) => {
+  test.setTimeout(90_000);
+  const now = new Date().toISOString();
+  await installScenario(page, { alerts: [{
+    id: "ALERT-UNLINKED-2",
+    alert_id: "ALERT-UNLINKED-2",
+    name: "Payment gateway error-rate spike",
+    description: "The payment gateway crossed its error-rate threshold.",
+    service: "payments-api",
+    application: "KaiOps",
+    project_name: "KaiOps",
+    environment: "production",
+    severity: "high",
+    status: "active",
+    origin_system: "prometheus",
+    incident_disposition: "unique",
+    created_at: now,
+    received_at: now,
+  }] });
+  await signIn(page, "/incidents");
+
+  await expect(page.locator(".incident-list-heading").getByRole("heading", { name: "Unified Inbox" })).toBeVisible();
+  const sourceTabs = page.getByRole("tablist", { name: "Inbox source" });
+  await expect(sourceTabs.getByRole("tab", { name: /All activity/ })).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator(".unified-inbox-card")).toHaveCount(2);
+  await expect(page.locator(".unified-inbox-card").first()).toContainText("Checkout latency affecting payments");
+  await expect(page.locator(".unified-inbox-card.is-signal")).toContainText("Payment gateway error-rate spike");
+  await expect(page.locator(".unified-inbox-card.is-signal")).toContainText("Awaiting correlation");
+
+  await sourceTabs.getByRole("tab", { name: /Signals/ }).click();
+  await expect(page.getByRole("table")).toContainText("Payment gateway error-rate spike");
+  await expect(page.getByRole("table")).not.toContainText("Checkout latency affecting payments");
+  await sourceTabs.getByRole("tab", { name: /^Incidents\b/ }).click();
+  await expect(page.getByRole("table")).toContainText("Checkout latency affecting payments");
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
+});
 
 test("signal to RCA to approval to canary validation and closure remains evidence-backed", async ({ page }) => {
   await installScenario(page);

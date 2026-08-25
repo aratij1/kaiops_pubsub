@@ -107,10 +107,10 @@ test("incident service search converges when changed during initial loading", as
   test.setTimeout(120_000);
   await signIn(page, "/incidents");
   await expect(page.getByRole("navigation", { name: "Operations workflow" })
-    .getByRole("button").filter({ hasText: "Incidents" })).toHaveAttribute("aria-current", "page");
-  await expect(page.locator(".incident-list-heading").getByRole("heading", { name: "Incident Inbox" })).toBeVisible({ timeout: 30_000 });
+    .getByRole("button").filter({ hasText: "Unified Inbox" })).toHaveAttribute("aria-current", "page");
+  await expect(page.locator(".incident-list-heading").getByRole("heading", { name: "Unified Inbox" })).toBeVisible({ timeout: 30_000 });
   await page.getByRole("textbox", { name: "Service" }).fill("kaiops-core1");
-  await expect(page.getByRole("row", { name: /kaiops-core1/ }).first()).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(".unified-inbox-card").filter({ hasText: "kaiops-core1" }).first()).toBeVisible({ timeout: 30_000 });
 });
 
 test("administrator dashboard uses the application workspace selected at sign-in", async ({ page }) => {

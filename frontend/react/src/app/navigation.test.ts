@@ -44,4 +44,9 @@ describe("authoritative navigation", () => {
     expect(breadcrumbForPath("/approvals").map((item) => item.label)).toEqual(["Automation", "Approvals"]);
     expect(NAVIGATION_ITEMS.find((item) => item.id === "incidents")?.related).toEqual(["alerts", "approvals"]);
   });
+
+  it("keeps the unified inbox active for an incident detail URL", () => {
+    expect(tabForPath("/incidents/INC-3481")).toBe("summary");
+    expect(breadcrumbForPath("/incidents/INC-3481").map((item) => item.label)).toEqual(["Operations", "Unified Inbox"]);
+  });
 });
