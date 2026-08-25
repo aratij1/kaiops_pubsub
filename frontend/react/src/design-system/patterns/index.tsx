@@ -18,7 +18,7 @@ export function ApprovalDecision({ state, children }: { state: "pending" | "appr
   return <Card><StatusBadge tone={tone}>{state}</StatusBadge>{children}</Card>;
 }
 
-export function ExecutionTimeline({ children }: { children: ReactNode }) { return <ol className="kai-timeline">{children}</ol>; }
+export function ExecutionTimelinePattern({ children }: { children: ReactNode }) { return <ol className="kai-timeline">{children}</ol>; }
 export function InvestigationStory({ children }: { children: ReactNode }) { return <section className="kai-investigation-story">{children}</section>; }
 export function EvidenceGraph({ children }: { children: ReactNode }) { return <section className="kai-evidence-graph" aria-label="Evidence graph">{children}</section>; }
 export function ResourceExplorer({ children }: { children: ReactNode }) { return <section className="kai-resource-explorer">{children}</section>; }

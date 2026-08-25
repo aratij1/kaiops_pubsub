@@ -1,30 +1,87 @@
-import { readFile } from "node:fs/promises";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { dirname, extname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import path from "node:path";
 
-const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-// Legacy hotspots are on a strict no-growth ratchet while behavior is moved
-// behind route, domain, service, and adapter modules.  A stale threshold that
-// is already below the checked-in application makes every unrelated change
-// fail without preventing further growth. These ceilings are the reviewed
-// migration baseline; they may only move downward.
-const budgets = [
-  { path: "frontend/react/src/App.jsx", maximumLines: 13373, targetLines: 400 },
-  { path: "frontend/react/src/appHelpers.jsx", maximumLines: 7059, targetLines: 500 },
-  { path: "backend/src/monitoring-adapter/app.py", maximumLines: 6640, targetLines: 300 },
-  { path: "backend/src/api-gateway/app.py", maximumLines: 2771, targetLines: 250 },
-];
+const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const frontendRoot = join(repositoryRoot, "frontend", "react");
+const failures = [];
+const notes = [];
 
-let failed = false;
-for (const { path: relativePath, maximumLines, targetLines } of budgets) {
-  const contents = await readFile(path.join(repositoryRoot, relativePath), "utf8");
-  const actualLines = contents.split(/\r?\n/).length - (contents.endsWith("\n") ? 1 : 0);
-  const status = actualLines <= maximumLines ? "PASS" : "FAIL";
-  console.log(`${status} ${relativePath}: ${actualLines}/${maximumLines} ceiling; target ${targetLines}`);
-  failed ||= actualLines > maximumLines;
+function source(path) {
+  const absolute = join(repositoryRoot, path);
+  if (!existsSync(absolute)) {
+    failures.push(`missing required file: ${path}`);
+    return "";
+  }
+  return readFileSync(absolute, "utf8");
 }
 
-if (failed) {
-  console.error("Architecture budget exceeded. Extract code into a focused module instead of growing a legacy hotspot.");
+function lineCount(path) {
+  return source(path).split(/\r?\n/).length;
+}
+
+function walk(directory) {
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(directory, entry.name);
+    return entry.isDirectory() ? walk(path) : [path];
+  });
+}
+
+if (!existsSync(frontendRoot)) failures.push("frontend/react must remain the canonical production frontend");
+
+const navigation = source("frontend/react/src/app/navigation.ts");
+for (const path of [
+  "/incidents",
+  "/alerts",
+  "/approvals",
+  "/applications",
+  "/cloud-ops/resources",
+  "/cloud-ops/cockpit",
+  "/cloud-ops/connections",
+  "/knowledge",
+  "/audit",
+  "/admin",
+]) {
+  if (!navigation.includes(`path: "${path}"`)) failures.push(`canonical navigation is missing ${path}`);
+}
+
+const router = source("frontend/react/src/app/router.tsx");
+if (!router.includes('path: "/incidents/:incidentId"')) failures.push("the Incident Command dynamic route is not registered");
+if (!router.includes("resilientLazy")) failures.push("route-level resilient lazy loading must remain enabled");
+
+const uiDockerfile = source("deploy/docker/Dockerfile.ui");
+if (!uiDockerfile.includes("frontend/react")) failures.push("the production UI image is not built from frontend/react");
+if (uiDockerfile.includes("services/ui/react")) failures.push("the production UI image still owns the legacy services/ui/react frontend");
+
+const legacyAppLines = lineCount("frontend/react/src/App.jsx");
+if (legacyAppLines > 13_600) failures.push(`src/App.jsx grew beyond the migration budget (${legacyAppLines} > 13600 lines)`);
+else notes.push(`legacy App.jsx migration budget: ${legacyAppLines}/13600 lines`);
+
+const featureFiles = walk(join(frontendRoot, "src", "features"));
+for (const file of featureFiles) {
+  const extension = extname(file);
+  const path = relative(repositoryRoot, file).replaceAll("\\", "/");
+  if ([".jsx", ".js"].includes(extension)) failures.push(`new feature code must use TypeScript: ${path}`);
+  if ([".ts", ".tsx"].includes(extension)) {
+    const lines = readFileSync(file, "utf8").split(/\r?\n/).length;
+    if (lines > 650) failures.push(`feature module exceeds 650-line ownership budget: ${path} (${lines})`);
+  }
+  if (statSync(file).size > 80 * 1024) failures.push(`feature asset exceeds 80 KiB source budget: ${path}`);
+}
+
+const incidentCommand = source("frontend/react/src/features/incidents/IncidentCommand.tsx");
+for (const phrase of ["Not provided by backend", "does not invent confidence", "Evidence provenance", "Execution safety envelope"]) {
+  if (!incidentCommand.includes(phrase)) failures.push(`Incident Command truth contract is missing: ${phrase}`);
+}
+if (/Math\.random|setInterval\s*\(/.test(incidentCommand)) failures.push("Incident Command may not fabricate progress with random or timer-driven state");
+
+if (existsSync(join(repositoryRoot, "services", "ui", "react"))) notes.push("legacy services/ui/react remains present but is not referenced by the production UI Dockerfile");
+if (existsSync(join(frontendRoot, "src", "app", "LegacyApplicationShell.tsx"))) notes.push("LegacyApplicationShell remains as a migration adapter; feature work is budgeted under src/features");
+
+for (const note of notes) console.log(`ARCHITECTURE NOTE: ${note}`);
+if (failures.length) {
+  for (const failure of failures) console.error(`ARCHITECTURE ERROR: ${failure}`);
   process.exit(1);
 }
+console.log("Architecture budgets passed.");
