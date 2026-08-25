@@ -297,8 +297,8 @@ services:
 
   ui:
     build:
-      context: ./services/ui/react
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: deploy/docker/Dockerfile.ui
     ports: ["80:80"]
     depends_on:
       api-gateway: { condition: service_healthy }

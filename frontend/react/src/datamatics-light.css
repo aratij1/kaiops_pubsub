@@ -1,0 +1,38 @@
+:root,
+:root.dm-theme-light,
+:root[data-ui-theme="light"] {
+  color-scheme: light;
+}
+
+:root.dm-theme-light body,
+:root[data-ui-theme="light"] body {
+  background:
+    radial-gradient(circle at 10% 2%, rgba(37, 99, 235, 0.1) 0, rgba(37, 99, 235, 0) 34%),
+    radial-gradient(circle at 94% 0%, rgba(6, 182, 212, 0.1) 0, rgba(6, 182, 212, 0) 32%),
+    linear-gradient(180deg, #f8fbff 0%, #edf4fb 100%);
+
+}
+
+:root.dm-theme-light .sidebar-group,
+:root.dm-theme-light .panel,
+:root.dm-theme-light .report-banner,
+:root[data-ui-theme="light"] .sidebar-group,
+:root[data-ui-theme="light"] .panel,
+:root[data-ui-theme="light"] .report-banner {
+  background: linear-gradient(180deg, #ffffff 0%, #f6faff 100%);
+}
+
+@media (prefers-color-scheme: light) {
+  :root[data-ui-theme="auto"] body {
+    background:
+      radial-gradient(circle at 10% 2%, rgba(37, 99, 235, 0.1) 0, rgba(37, 99, 235, 0) 34%),
+      radial-gradient(circle at 94% 0%, rgba(6, 182, 212, 0.1) 0, rgba(6, 182, 212, 0) 32%),
+      linear-gradient(180deg, #f8fbff 0%, #edf4fb 100%);
+  }
+
+  :root[data-ui-theme="auto"] .sidebar-group,
+  :root[data-ui-theme="auto"] .panel,
+  :root[data-ui-theme="auto"] .report-banner {
+    background: linear-gradient(180deg, #ffffff 0%, #f6faff 100%);
+  }
+}

@@ -1,0 +1,20 @@
+.compact-plan-editor { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+.compact-plan-editor label:first-child { grid-column: 1 / -1; }
+.compact-plan-editor label { display: grid; grid-template-columns: 1fr auto; gap: 5px 10px; min-width: 0; color: var(--ink); font-size: .7rem; font-weight: 800; }
+.compact-plan-editor label > small { color: var(--muted); font-size: .61rem; font-weight: 700; }
+.compact-plan-editor textarea { grid-column: 1 / -1; min-height: 86px; max-height: 180px; padding: 10px; resize: vertical; overflow: auto; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .7rem; line-height: 1.45; white-space: pre; }
+.execution-guided-flow { gap: 12px; margin: 12px 0; padding: 14px 16px; border-radius: 7px; background: var(--card); box-shadow: none; }
+.execution-guided-head { align-items: center; }
+.execution-guided-head h3 { font-size: 1rem; }
+.execution-guided-head p { font-size: .72rem; }
+.execution-stepper { position: relative; gap: 7px; }
+.execution-stepper::before { content: ""; position: absolute; top: 23px; left: 9%; right: 9%; height: 2px; background: var(--line); }
+.execution-stepper li { position: relative; z-index: 1; min-height: 58px; padding: 8px 10px; border-radius: 6px; }
+.execution-stepper li > span { width: 26px; height: 26px; flex-basis: 26px; font-size: .72rem; }
+.execution-stepper li strong { font-size: .72rem; }
+.execution-stepper li small { font-size: .61rem; }
+.execution-current-step { min-height: 64px; padding: 11px 14px; border: 1px solid var(--line); border-radius: 6px; background: #f7fafc; }
+.execution-current-step strong { font-size: .8rem; }
+.execution-current-step p { font-size: .7rem; }
+.execution-current-step > button { min-width: 150px; }
+@media (max-width: 900px) { .compact-plan-editor { grid-template-columns: 1fr; } .compact-plan-editor label:first-child { grid-column: auto; } .execution-stepper::before { display: none; } }

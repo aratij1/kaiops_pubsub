@@ -1,0 +1,788 @@
+:root.dm-theme-dark,
+:root[data-ui-theme="dark"] {
+  color-scheme: dark;
+  --bg: #102840;
+  --bg-soft: #17314f;
+  --ink: #eaf3ff;
+  --muted: #bfd4ea;
+  --card: #17314f;
+  --panel: var(--card);
+  --text: var(--ink);
+  --line: rgba(180, 207, 236, 0.28);
+  --line-strong: rgba(180, 207, 236, 0.45);
+  --glow: 0 16px 34px rgba(3, 12, 24, 0.42);
+}
+
+/* Explicit dark mode selection */
+:root.dm-theme-dark body,
+:root[data-ui-theme="dark"] body {
+  background:
+    radial-gradient(circle at 8% 0%, rgba(37, 99, 235, 0.24) 0, rgba(37, 99, 235, 0) 35%),
+    radial-gradient(circle at 94% 4%, rgba(6, 182, 212, 0.16), transparent 30%),
+    linear-gradient(180deg, #07111f 0%, #102840 100%);
+  color: var(--ink);
+}
+
+:root.dm-theme-dark .panel,
+:root.dm-theme-dark .sidebar-group,
+:root.dm-theme-dark .report-banner,
+:root[data-ui-theme="dark"] .panel,
+:root[data-ui-theme="dark"] .sidebar-group,
+:root[data-ui-theme="dark"] .report-banner {
+  background: linear-gradient(180deg, #16324f 0%, #1d3d61 100%);
+  border-color: var(--line);
+}
+
+:root.dm-theme-dark .hero,
+:root[data-ui-theme="dark"] .hero {
+  background:
+    radial-gradient(circle at 92% 12%, rgba(34, 211, 238, 0.22), transparent 34%),
+    linear-gradient(122deg, #07111f 0%, #132f58 68%, #312e81 100%);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-ui-theme="auto"] .rca-confidence,
+  :root[data-ui-theme="auto"] .rca-decision-card,
+  :root[data-ui-theme="auto"] .rca-quality-strip span,
+  :root[data-ui-theme="auto"] .rca-reasoning-chain article,
+  :root[data-ui-theme="auto"] .processing-flow-node,
+  :root[data-ui-theme="auto"] .processing-flow-detail-card,
+  :root[data-ui-theme="auto"] .processing-flow-match {
+    background: var(--card);
+    border-color: var(--line);
+    color: var(--ink);
+  }
+}
+
+/* Final explicit-theme guard: legacy compatibility rules above predate the
+   neutral palette and must not reintroduce blue surfaces. */
+:root.dm-theme-dark .panel,
+:root.dm-theme-dark .sidebar-group,
+:root.dm-theme-dark .report-banner,
+:root[data-ui-theme="dark"] .panel,
+:root[data-ui-theme="dark"] .sidebar-group,
+:root[data-ui-theme="dark"] .report-banner { background: #101317; border-color: #2a3038; }
+
+:root.dm-theme-dark .density-option,
+:root.dm-theme-dark .tab,
+:root.dm-theme-dark .detail-tab,
+:root.dm-theme-dark .report-metric,
+:root.dm-theme-dark .flow-card,
+:root.dm-theme-dark .stat-card,
+:root.dm-theme-dark .table-wrap,
+:root.dm-theme-dark .approval-step,
+:root.dm-theme-dark .sticky-controls,
+:root.dm-theme-dark .topic-flow-pill,
+:root.dm-theme-dark .bus-summary-strip > div,
+:root.dm-theme-dark .bus-stage,
+:root.dm-theme-dark .bus-parallel-section,
+:root.dm-theme-dark .bus-observed-rail,
+:root.dm-theme-dark .bus-worker-node,
+:root[data-ui-theme="dark"] .density-option,
+:root[data-ui-theme="dark"] .tab,
+:root[data-ui-theme="dark"] .detail-tab,
+:root[data-ui-theme="dark"] .report-metric,
+:root[data-ui-theme="dark"] .flow-card,
+:root[data-ui-theme="dark"] .stat-card,
+:root[data-ui-theme="dark"] .table-wrap,
+:root[data-ui-theme="dark"] .approval-step,
+:root[data-ui-theme="dark"] .sticky-controls,
+:root[data-ui-theme="dark"] .topic-flow-pill,
+:root[data-ui-theme="dark"] .bus-summary-strip > div,
+:root[data-ui-theme="dark"] .bus-stage,
+:root[data-ui-theme="dark"] .bus-parallel-section,
+:root[data-ui-theme="dark"] .bus-observed-rail,
+:root[data-ui-theme="dark"] .bus-worker-node { background: #14181d; border-color: #303741; color: #f4f6f8; }
+
+/* Incident cockpit contains intentionally edge-to-edge surfaces, so it needs
+   explicit theme treatment instead of inheriting its former light strips. */
+:root.dm-theme-dark .alert-details-cockpit > .incident-sticky-header,
+:root[data-ui-theme="dark"] .alert-details-cockpit > .incident-sticky-header {
+  color: #f4f6f8;
+  border-bottom-color: #2a3038;
+  background: linear-gradient(180deg, #111418, #0d1013);
+  box-shadow: 0 10px 24px rgba(0,0,0,.28);
+}
+
+:root.dm-theme-dark .alert-details-cockpit > .incident-sticky-header h2,
+:root.dm-theme-dark .alert-details-cockpit > .incident-sticky-header h3,
+:root[data-ui-theme="dark"] .alert-details-cockpit > .incident-sticky-header h2,
+:root[data-ui-theme="dark"] .alert-details-cockpit > .incident-sticky-header h3 { color: #f4f6f8; }
+
+:root.dm-theme-dark .alert-details-cockpit > .incident-sticky-header p,
+:root[data-ui-theme="dark"] .alert-details-cockpit > .incident-sticky-header p { color: #a8b0bb; }
+
+:root.dm-theme-dark .alert-details-cockpit > .detail-context,
+:root[data-ui-theme="dark"] .alert-details-cockpit > .detail-context {
+  color: #aeb6c0;
+  border-block-color: #2a3038;
+  background: #0b0e11;
+}
+
+:root.dm-theme-dark .alert-details-cockpit > .detail-context strong,
+:root[data-ui-theme="dark"] .alert-details-cockpit > .detail-context strong { color: #eef1f4; }
+
+:root.dm-theme-dark .incident-record-navigation .button-secondary:disabled,
+:root[data-ui-theme="dark"] .incident-record-navigation .button-secondary:disabled {
+  color: #77808b;
+  border-color: #2d343c;
+  background: #14181c;
+  opacity: .72;
+}
+
+/* Neutral-black product theme. Keep colour for meaning and interaction, not
+   as the base canvas, so dense operational screens remain calm and legible. */
+:root.dm-theme-dark,
+:root[data-ui-theme="dark"] {
+  --bg: #050607;
+  --bg-soft: #0b0e11;
+  --ink: #f4f6f8;
+  --muted: #a8b0bb;
+  --card: #101317;
+  --panel: #101317;
+  --surface: #101317;
+  --surface-soft: #0b0e11;
+  --panel-muted: #15191e;
+  --line: #2a3038;
+  --line-strong: #414954;
+  --accent: #20b8aa;
+  --accent-2: #139487;
+  --k-canvas: #050607;
+  --k-surface: #101317;
+  --k-surface-subtle: #0b0e11;
+  --k-text: #f4f6f8;
+  --k-text-muted: #a8b0bb;
+  --k-border: #2a3038;
+  --k-border-strong: #414954;
+  --k-navy-950: #050607;
+  --k-navy-900: #090b0e;
+  --k-navy-800: #11161b;
+  --k-blue-600: #20b8aa;
+  --k-focus: #39d0c1;
+  --glow: 0 14px 34px rgba(0, 0, 0, 0.42);
+}
+
+:root.dm-theme-dark body,
+:root[data-ui-theme="dark"] body {
+  background: radial-gradient(circle at 82% -12%, rgba(32,184,170,.09), transparent 30rem), #050607;
+}
+
+:root.dm-theme-dark .panel,
+:root.dm-theme-dark .sidebar-panel,
+:root.dm-theme-dark .sidebar-group,
+:root.dm-theme-dark .report-banner,
+:root[data-ui-theme="dark"] .panel,
+:root[data-ui-theme="dark"] .sidebar-panel,
+:root[data-ui-theme="dark"] .sidebar-group,
+:root[data-ui-theme="dark"] .report-banner {
+  color: var(--ink);
+  border-color: #2a3038;
+  background: #101317;
+  box-shadow: 0 10px 28px rgba(0,0,0,.28);
+}
+
+:root.dm-theme-dark .panel.ai-hub-hero,
+:root.dm-theme-dark .panel.settings-hero,
+:root[data-ui-theme="dark"] .panel.ai-hub-hero,
+:root[data-ui-theme="dark"] .panel.settings-hero {
+  background: linear-gradient(120deg, #090b0d, #11161a 68%, #102522) !important;
+  border: 1px solid #29343a;
+}
+
+:root.dm-theme-dark .hero,
+:root[data-ui-theme="dark"] .hero {
+  background: radial-gradient(circle at 88% 0%, rgba(32,184,170,.13), transparent 28%), linear-gradient(135deg,#070809,#101317 70%,#10211f);
+  border-color: #29343a;
+  box-shadow: 0 16px 38px rgba(0,0,0,.36);
+}
+
+:root.dm-theme-dark .sidebar-navigation-group-administration,
+:root[data-ui-theme="dark"] .sidebar-navigation-group-administration {
+  border-color: #2a3038;
+  background: #0b0e11;
+}
+
+:root.dm-theme-dark .sidebar-navigation-group-administration h3,
+:root[data-ui-theme="dark"] .sidebar-navigation-group-administration h3 {
+  color: #65d9cd;
+}
+
+:root.dm-theme-dark .sidebar-section,
+:root[data-ui-theme="dark"] .sidebar-section {
+  color: #c9ced5;
+  border-color: transparent;
+  background: transparent;
+}
+
+:root.dm-theme-dark .sidebar-section:hover,
+:root[data-ui-theme="dark"] .sidebar-section:hover {
+  color: #fff;
+  border-color: #343b44;
+  background: #171b20;
+}
+
+:root.dm-theme-dark .sidebar-section.active,
+:root[data-ui-theme="dark"] .sidebar-section.active {
+  color: #fff;
+  border-color: #277d75;
+  background: linear-gradient(135deg,#151a1f,#123a36);
+  box-shadow: inset 3px 0 #34cabb;
+}
+
+:root.dm-theme-dark .settings-tabs,
+:root[data-ui-theme="dark"] .settings-tabs {
+  border-color: #2a3038;
+  background: #0b0e11;
+}
+
+:root.dm-theme-dark .settings-tabs button,
+:root[data-ui-theme="dark"] .settings-tabs button { color: #aeb5bf; }
+
+:root.dm-theme-dark .settings-tabs button.active,
+:root[data-ui-theme="dark"] .settings-tabs button.active {
+  color: #f8fffe;
+  background: #176e66;
+  box-shadow: none;
+}
+
+:root.dm-theme-dark .density-option,
+:root.dm-theme-dark .sidebar-section,
+:root.dm-theme-dark .tab,
+:root.dm-theme-dark .detail-tab,
+:root.dm-theme-dark .report-metric,
+:root.dm-theme-dark .flow-card,
+:root.dm-theme-dark .stat-card,
+:root.dm-theme-dark .table-wrap,
+:root.dm-theme-dark .approval-step,
+:root.dm-theme-dark .sticky-controls,
+:root.dm-theme-dark .topic-flow-pill,
+:root.dm-theme-dark .bus-summary-strip > div,
+:root.dm-theme-dark .bus-stage,
+:root.dm-theme-dark .bus-parallel-section,
+:root.dm-theme-dark .bus-observed-rail,
+:root.dm-theme-dark .bus-worker-node,
+:root[data-ui-theme="dark"] .density-option,
+:root[data-ui-theme="dark"] .sidebar-section,
+:root[data-ui-theme="dark"] .tab,
+:root[data-ui-theme="dark"] .detail-tab,
+:root[data-ui-theme="dark"] .report-metric,
+:root[data-ui-theme="dark"] .flow-card,
+:root[data-ui-theme="dark"] .stat-card,
+:root[data-ui-theme="dark"] .table-wrap,
+:root[data-ui-theme="dark"] .approval-step,
+:root[data-ui-theme="dark"] .sticky-controls,
+:root[data-ui-theme="dark"] .topic-flow-pill,
+:root[data-ui-theme="dark"] .bus-summary-strip > div,
+:root[data-ui-theme="dark"] .bus-stage,
+:root[data-ui-theme="dark"] .bus-parallel-section,
+:root[data-ui-theme="dark"] .bus-observed-rail,
+:root[data-ui-theme="dark"] .bus-worker-node {
+  color: var(--ink);
+  border-color: #303741;
+  background: #14181d;
+}
+
+:root.dm-theme-dark .bus-endpoint-box,
+:root.dm-theme-dark .bus-master-node,
+:root.dm-theme-dark .bus-topic-create-row,
+:root.dm-theme-dark .bus-observed-rail span,
+:root[data-ui-theme="dark"] .bus-endpoint-box,
+:root[data-ui-theme="dark"] .bus-master-node,
+:root[data-ui-theme="dark"] .bus-topic-create-row,
+:root[data-ui-theme="dark"] .bus-observed-rail span {
+  color: #edf2f5;
+  border-color: #343c46;
+  background: #0b0e11;
+}
+
+:root.dm-theme-dark input,
+:root.dm-theme-dark select,
+:root.dm-theme-dark textarea,
+:root[data-ui-theme="dark"] input,
+:root[data-ui-theme="dark"] select,
+:root[data-ui-theme="dark"] textarea {
+  color: #f4f6f8;
+  border-color: #363e48;
+  background: #0b0e11;
+}
+
+:root.dm-theme-dark .button-secondary,
+:root[data-ui-theme="dark"] .button-secondary {
+  color: #e7ebef;
+  border-color: #3a424c;
+  background: #181d22;
+}
+
+:root.dm-theme-dark .button-secondary:hover,
+:root[data-ui-theme="dark"] .button-secondary:hover {
+  color: #fff;
+  border-color: #56616d;
+  background: #22282f;
+}
+
+:root.dm-theme-dark .panel-head,
+:root[data-ui-theme="dark"] .panel-head { border-color: #2a3038; }
+
+:root.dm-theme-dark .panel-head h2,
+:root.dm-theme-dark .panel-head h3,
+:root.dm-theme-dark td,
+:root[data-ui-theme="dark"] .panel-head h2,
+:root[data-ui-theme="dark"] .panel-head h3,
+:root[data-ui-theme="dark"] td { color: #e9edf1; }
+
+:root.dm-theme-dark th,
+:root[data-ui-theme="dark"] th {
+  color: #b2bac4;
+  border-color: #2a3038;
+  background: #171b20;
+}
+
+:root.dm-theme-dark .hero h1,
+:root.dm-theme-dark .hero .subtitle,
+:root.dm-theme-dark .hero .scope-note,
+:root.dm-theme-dark .hero .eyebrow,
+:root[data-ui-theme="dark"] .hero h1,
+:root[data-ui-theme="dark"] .hero .subtitle,
+:root[data-ui-theme="dark"] .hero .scope-note,
+:root[data-ui-theme="dark"] .hero .eyebrow {
+  color: #f4f9ff;
+}
+
+:root.dm-theme-dark .hero .scope-note,
+:root[data-ui-theme="dark"] .hero .scope-note,
+:root.dm-theme-dark .scope-note,
+:root[data-ui-theme="dark"] .scope-note {
+  color: #ffd99b;
+}
+
+:root.dm-theme-dark .workflow-guide-panel,
+:root[data-ui-theme="dark"] .workflow-guide-panel,
+:root.dm-theme-dark .workflow-guide-card,
+:root[data-ui-theme="dark"] .workflow-guide-card,
+:root.dm-theme-dark .role-attention-card,
+:root[data-ui-theme="dark"] .role-attention-card {
+  background: #17314f;
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+:root.dm-theme-dark .workflow-guide-card,
+:root[data-ui-theme="dark"] .workflow-guide-card,
+:root.dm-theme-dark .role-attention-card,
+:root[data-ui-theme="dark"] .role-attention-card {
+  box-shadow: 0 8px 20px rgba(2, 10, 20, 0.22);
+}
+
+/* Shared workspaces that previously embedded light-only surfaces. */
+:root.dm-theme-dark .rca-confidence,
+:root.dm-theme-dark .rca-decision-card,
+:root.dm-theme-dark .rca-quality-strip span,
+:root.dm-theme-dark .rca-reasoning-chain article,
+:root.dm-theme-dark .processing-flow-node,
+:root.dm-theme-dark .processing-flow-detail-card,
+:root.dm-theme-dark .processing-flow-match,
+:root[data-ui-theme="dark"] .rca-confidence,
+:root[data-ui-theme="dark"] .rca-decision-card,
+:root[data-ui-theme="dark"] .rca-quality-strip span,
+:root[data-ui-theme="dark"] .rca-reasoning-chain article,
+:root[data-ui-theme="dark"] .processing-flow-node,
+:root[data-ui-theme="dark"] .processing-flow-detail-card,
+:root[data-ui-theme="dark"] .processing-flow-match {
+  background: var(--card);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+:root.dm-theme-dark .alert-stream-wrap,
+:root[data-ui-theme="dark"] .alert-stream-wrap {
+  scrollbar-color: #66809e #102840;
+}
+
+:root.dm-theme-dark .table-wrap table,
+:root.dm-theme-dark .table-wrap th,
+:root.dm-theme-dark .table-wrap td,
+:root[data-ui-theme="dark"] .table-wrap table,
+:root[data-ui-theme="dark"] .table-wrap th,
+:root[data-ui-theme="dark"] .table-wrap td {
+  color: var(--ink);
+  border-color: var(--line);
+}
+
+:root.dm-theme-dark .table-wrap th,
+:root[data-ui-theme="dark"] .table-wrap th {
+  background: rgba(191, 212, 234, 0.09);
+}
+
+:root.dm-theme-dark .density-option,
+:root.dm-theme-dark .sidebar-section,
+:root.dm-theme-dark .tab,
+:root.dm-theme-dark .detail-tab,
+:root.dm-theme-dark .report-metric,
+:root.dm-theme-dark .flow-card,
+:root.dm-theme-dark .stat-card,
+:root.dm-theme-dark .table-wrap,
+:root.dm-theme-dark .approval-step,
+:root.dm-theme-dark .sticky-controls,
+:root.dm-theme-dark .topic-flow-pill,
+:root.dm-theme-dark .bus-summary-strip > div,
+:root.dm-theme-dark .bus-stage,
+:root.dm-theme-dark .bus-parallel-section,
+:root.dm-theme-dark .bus-observed-rail,
+:root.dm-theme-dark .bus-worker-node,
+:root.dm-theme-dark .alert-document-download-card,
+:root.dm-theme-dark .alert-documents-empty,
+:root.dm-theme-dark .timeline-body,
+:root.dm-theme-dark .agent-event-card,
+:root.dm-theme-dark .execution-card,
+:root[data-ui-theme="dark"] .density-option,
+:root[data-ui-theme="dark"] .sidebar-section,
+:root[data-ui-theme="dark"] .tab,
+:root[data-ui-theme="dark"] .detail-tab,
+:root[data-ui-theme="dark"] .report-metric,
+:root[data-ui-theme="dark"] .flow-card,
+:root[data-ui-theme="dark"] .stat-card,
+:root[data-ui-theme="dark"] .table-wrap,
+:root[data-ui-theme="dark"] .approval-step,
+:root[data-ui-theme="dark"] .sticky-controls,
+:root[data-ui-theme="dark"] .topic-flow-pill,
+:root[data-ui-theme="dark"] .bus-summary-strip > div,
+:root[data-ui-theme="dark"] .bus-stage,
+:root[data-ui-theme="dark"] .bus-parallel-section,
+:root[data-ui-theme="dark"] .bus-observed-rail,
+:root[data-ui-theme="dark"] .bus-worker-node,
+:root[data-ui-theme="dark"] .alert-document-download-card,
+:root[data-ui-theme="dark"] .alert-documents-empty,
+:root[data-ui-theme="dark"] .timeline-body,
+:root[data-ui-theme="dark"] .agent-event-card,
+:root[data-ui-theme="dark"] .execution-card {
+  background: linear-gradient(180deg, #1a3757 0%, #1f446b 100%);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+:root.dm-theme-dark .alert-documents-empty,
+:root[data-ui-theme="dark"] .alert-documents-empty {
+  border-style: dashed;
+}
+
+:root.dm-theme-dark .bus-endpoint-box,
+:root.dm-theme-dark .bus-master-node,
+:root.dm-theme-dark .bus-topic-create-row,
+:root.dm-theme-dark .bus-observed-rail span,
+:root.dm-theme-dark .alert-documents-kind-row span,
+:root[data-ui-theme="dark"] .bus-endpoint-box,
+:root[data-ui-theme="dark"] .bus-master-node,
+:root[data-ui-theme="dark"] .bus-topic-create-row,
+:root[data-ui-theme="dark"] .bus-observed-rail span,
+:root[data-ui-theme="dark"] .alert-documents-kind-row span {
+  background: rgba(9, 24, 41, 0.36);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+:root.dm-theme-dark .bus-topic-pill,
+:root[data-ui-theme="dark"] .bus-topic-pill {
+  background: rgba(226, 168, 79, 0.16);
+  border-color: rgba(226, 168, 79, 0.52);
+  color: #ffe4b5;
+}
+
+:root.dm-theme-dark .bus-topic-pill.active,
+:root[data-ui-theme="dark"] .bus-topic-pill.active {
+  background: rgba(115, 196, 141, 0.16);
+  border-color: rgba(115, 196, 141, 0.55);
+  color: #c9f7d4;
+}
+
+:root.dm-theme-dark .bus-topic-create-row small,
+:root[data-ui-theme="dark"] .bus-topic-create-row small {
+  color: var(--muted);
+}
+
+:root.dm-theme-dark .table-wrap th,
+:root[data-ui-theme="dark"] .table-wrap th {
+  background: rgba(191, 212, 234, 0.16);
+  color: #e9f3ff;
+}
+
+:root.dm-theme-dark .table-wrap tbody tr.alert-row:hover,
+:root[data-ui-theme="dark"] .table-wrap tbody tr.alert-row:hover {
+  background: rgba(92, 145, 207, 0.22);
+}
+
+:root.dm-theme-dark .table-wrap tbody tr.row-selected,
+:root[data-ui-theme="dark"] .table-wrap tbody tr.row-selected {
+  background: rgba(26, 122, 103, 0.26);
+}
+
+:root.dm-theme-dark input,
+:root.dm-theme-dark select,
+:root.dm-theme-dark textarea,
+:root[data-ui-theme="dark"] input,
+:root[data-ui-theme="dark"] select,
+:root[data-ui-theme="dark"] textarea {
+  background: #15314d;
+  color: var(--ink);
+  border-color: var(--line);
+}
+
+:root.dm-theme-dark .button-secondary,
+:root[data-ui-theme="dark"] .button-secondary {
+  background: #244b73;
+  color: #eaf3ff;
+  border-color: #3e6d9f;
+}
+
+:root.dm-theme-dark .pill.severity-critical,
+:root[data-ui-theme="dark"] .pill.severity-critical {
+  background: rgba(255, 107, 107, 0.2);
+  border-color: #ff8f8f;
+  color: #ffd6d6;
+}
+
+:root.dm-theme-dark .pill.severity-high,
+:root[data-ui-theme="dark"] .pill.severity-high {
+  background: rgba(255, 180, 70, 0.2);
+  border-color: #ffc36d;
+  color: #ffe4b6;
+}
+
+:root.dm-theme-dark .pill.severity-medium,
+:root[data-ui-theme="dark"] .pill.severity-medium {
+  background: rgba(255, 223, 130, 0.22);
+  border-color: #ffe08f;
+  color: #fff2c9;
+}
+
+:root.dm-theme-dark .pill.severity-low,
+:root[data-ui-theme="dark"] .pill.severity-low {
+  background: rgba(94, 214, 136, 0.18);
+  border-color: #95e9b5;
+  color: #d2ffe2;
+}
+
+:root.dm-theme-dark .pill.status-awaiting_approval,
+:root.dm-theme-dark .pill.status-investigating,
+:root.dm-theme-dark .pill.status-open,
+:root.dm-theme-dark .pill.status-pending,
+:root[data-ui-theme="dark"] .pill.status-awaiting_approval,
+:root[data-ui-theme="dark"] .pill.status-investigating,
+:root[data-ui-theme="dark"] .pill.status-open,
+:root[data-ui-theme="dark"] .pill.status-pending {
+  background: rgba(137, 171, 255, 0.22);
+  border-color: #9fb8ff;
+  color: #e2ebff;
+}
+
+/* Auto mode follows OS preference when user selected Auto */
+@media (prefers-color-scheme: dark) {
+  :root[data-ui-theme="auto"] {
+    --bg: #102840;
+    --bg-soft: #17314f;
+    --ink: #eaf3ff;
+    --muted: #bfd4ea;
+    --card: #17314f;
+    --panel: var(--card);
+    --text: var(--ink);
+    --line: rgba(180, 207, 236, 0.28);
+    --line-strong: rgba(180, 207, 236, 0.45);
+    --glow: 0 16px 34px rgba(3, 12, 24, 0.42);
+  }
+
+  :root[data-ui-theme="auto"] body {
+    background:
+      radial-gradient(circle at 8% 0%, rgba(211, 47, 47, 0.16) 0, rgba(211, 47, 47, 0) 35%),
+      linear-gradient(180deg, #102840 0%, #1a3a5d 100%);
+    color: var(--ink);
+  }
+
+  :root[data-ui-theme="auto"] .panel,
+  :root[data-ui-theme="auto"] .sidebar-group,
+  :root[data-ui-theme="auto"] .report-banner {
+    background: linear-gradient(180deg, #16324f 0%, #1d3d61 100%);
+    border-color: var(--line);
+  }
+
+  :root[data-ui-theme="auto"] .scope-note {
+    color: #ffd99b;
+  }
+
+  :root[data-ui-theme="auto"] .workflow-guide-panel,
+  :root[data-ui-theme="auto"] .workflow-guide-card,
+  :root[data-ui-theme="auto"] .role-attention-card {
+    background: #17314f;
+    border-color: var(--line);
+    color: var(--ink);
+  }
+
+  :root[data-ui-theme="auto"] .hero {
+    background: linear-gradient(122deg, #2a0a0a 0%, #7f1010 50%, #d32f2f 100%);
+  }
+
+  :root[data-ui-theme="auto"] .hero h1,
+  :root[data-ui-theme="auto"] .hero .subtitle,
+  :root[data-ui-theme="auto"] .hero .scope-note,
+  :root[data-ui-theme="auto"] .hero .eyebrow {
+    color: #f4f9ff;
+  }
+
+  :root[data-ui-theme="auto"] .table-wrap table,
+  :root[data-ui-theme="auto"] .table-wrap th,
+  :root[data-ui-theme="auto"] .table-wrap td {
+    color: var(--ink);
+    border-color: var(--line);
+  }
+
+  :root[data-ui-theme="auto"] .table-wrap th {
+    background: rgba(191, 212, 234, 0.09);
+  }
+
+  :root[data-ui-theme="auto"] .density-option,
+  :root[data-ui-theme="auto"] .sidebar-section,
+  :root[data-ui-theme="auto"] .tab,
+  :root[data-ui-theme="auto"] .detail-tab,
+  :root[data-ui-theme="auto"] .report-metric,
+  :root[data-ui-theme="auto"] .flow-card,
+  :root[data-ui-theme="auto"] .stat-card,
+  :root[data-ui-theme="auto"] .table-wrap,
+  :root[data-ui-theme="auto"] .approval-step,
+  :root[data-ui-theme="auto"] .sticky-controls,
+  :root[data-ui-theme="auto"] .topic-flow-pill,
+  :root[data-ui-theme="auto"] .bus-summary-strip > div,
+  :root[data-ui-theme="auto"] .bus-stage,
+  :root[data-ui-theme="auto"] .bus-parallel-section,
+  :root[data-ui-theme="auto"] .bus-observed-rail,
+  :root[data-ui-theme="auto"] .bus-worker-node,
+  :root[data-ui-theme="auto"] .alert-document-download-card,
+  :root[data-ui-theme="auto"] .timeline-body,
+  :root[data-ui-theme="auto"] .agent-event-card,
+  :root[data-ui-theme="auto"] .execution-card {
+    background: linear-gradient(180deg, #1a3757 0%, #1f446b 100%);
+    border-color: var(--line);
+    color: var(--ink);
+  }
+
+  :root[data-ui-theme="auto"] .bus-endpoint-box,
+  :root[data-ui-theme="auto"] .bus-master-node,
+  :root[data-ui-theme="auto"] .bus-topic-create-row,
+  :root[data-ui-theme="auto"] .bus-observed-rail span {
+    background: rgba(9, 24, 41, 0.36);
+    border-color: var(--line);
+    color: var(--ink);
+  }
+
+  :root[data-ui-theme="auto"] .bus-topic-pill {
+    background: rgba(226, 168, 79, 0.16);
+    border-color: rgba(226, 168, 79, 0.52);
+    color: #ffe4b5;
+  }
+
+  :root[data-ui-theme="auto"] .bus-topic-pill.active {
+    background: rgba(115, 196, 141, 0.16);
+    border-color: rgba(115, 196, 141, 0.55);
+    color: #c9f7d4;
+  }
+
+  :root[data-ui-theme="auto"] .bus-topic-create-row small {
+    color: var(--muted);
+  }
+
+  :root[data-ui-theme="auto"] .table-wrap th {
+    background: rgba(191, 212, 234, 0.16);
+    color: #e9f3ff;
+  }
+
+  :root[data-ui-theme="auto"] .table-wrap tbody tr.alert-row:hover {
+    background: rgba(92, 145, 207, 0.22);
+  }
+
+  :root[data-ui-theme="auto"] .table-wrap tbody tr.row-selected {
+    background: rgba(26, 122, 103, 0.26);
+  }
+
+  :root[data-ui-theme="auto"] input,
+  :root[data-ui-theme="auto"] select,
+  :root[data-ui-theme="auto"] textarea {
+    background: #15314d;
+    color: var(--ink);
+    border-color: var(--line);
+  }
+
+  :root[data-ui-theme="auto"] .button-secondary {
+    background: #244b73;
+    color: #eaf3ff;
+    border-color: #3e6d9f;
+  }
+
+  :root[data-ui-theme="auto"] .pill.severity-critical {
+    background: rgba(255, 107, 107, 0.2);
+    border-color: #ff8f8f;
+    color: #ffd6d6;
+  }
+
+  :root[data-ui-theme="auto"] .pill.severity-high {
+    background: rgba(255, 180, 70, 0.2);
+    border-color: #ffc36d;
+    color: #ffe4b6;
+  }
+
+  :root[data-ui-theme="auto"] .pill.severity-medium {
+    background: rgba(255, 223, 130, 0.22);
+    border-color: #ffe08f;
+    color: #fff2c9;
+  }
+
+  :root[data-ui-theme="auto"] .pill.severity-low {
+    background: rgba(94, 214, 136, 0.18);
+    border-color: #95e9b5;
+    color: #d2ffe2;
+  }
+
+  :root[data-ui-theme="auto"] .pill.status-awaiting_approval,
+  :root[data-ui-theme="auto"] .pill.status-investigating,
+  :root[data-ui-theme="auto"] .pill.status-open,
+  :root[data-ui-theme="auto"] .pill.status-pending {
+    background: rgba(137, 171, 255, 0.22);
+    border-color: #9fb8ff;
+    color: #e2ebff;
+  }
+}
+
+/* Explicit dark mode wins over the older blue compatibility declarations. */
+:root.dm-theme-dark .panel,
+:root.dm-theme-dark .sidebar-group,
+:root.dm-theme-dark .report-banner,
+:root[data-ui-theme="dark"] .panel,
+:root[data-ui-theme="dark"] .sidebar-group,
+:root[data-ui-theme="dark"] .report-banner { background: #101317; border-color: #2a3038; }
+
+:root.dm-theme-dark .density-option,
+:root.dm-theme-dark .tab,
+:root.dm-theme-dark .detail-tab,
+:root.dm-theme-dark .report-metric,
+:root.dm-theme-dark .flow-card,
+:root.dm-theme-dark .stat-card,
+:root.dm-theme-dark .table-wrap,
+:root.dm-theme-dark .approval-step,
+:root.dm-theme-dark .sticky-controls,
+:root.dm-theme-dark .topic-flow-pill,
+:root.dm-theme-dark .bus-summary-strip > div,
+:root.dm-theme-dark .bus-stage,
+:root.dm-theme-dark .bus-parallel-section,
+:root.dm-theme-dark .bus-observed-rail,
+:root.dm-theme-dark .bus-worker-node,
+:root[data-ui-theme="dark"] .density-option,
+:root[data-ui-theme="dark"] .tab,
+:root[data-ui-theme="dark"] .detail-tab,
+:root[data-ui-theme="dark"] .report-metric,
+:root[data-ui-theme="dark"] .flow-card,
+:root[data-ui-theme="dark"] .stat-card,
+:root[data-ui-theme="dark"] .table-wrap,
+:root[data-ui-theme="dark"] .approval-step,
+:root[data-ui-theme="dark"] .sticky-controls,
+:root[data-ui-theme="dark"] .topic-flow-pill,
+:root[data-ui-theme="dark"] .bus-summary-strip > div,
+:root[data-ui-theme="dark"] .bus-stage,
+:root[data-ui-theme="dark"] .bus-parallel-section,
+:root[data-ui-theme="dark"] .bus-observed-rail,
+:root[data-ui-theme="dark"] .bus-worker-node { background: #14181d; border-color: #303741; color: #f4f6f8; }
