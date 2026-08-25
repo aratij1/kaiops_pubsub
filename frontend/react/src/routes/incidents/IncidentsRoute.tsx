@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Activity, Bell, BrainCircuit, Check, CircleSlash2, ClipboardCheck, Copy, ExternalLink, FileCheck2, Filter, Gauge, GitMerge, List, RefreshCw, Rows3, ScanSearch, Server, ShieldCheck, TicketCheck, Workflow, Wrench } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
-import { useRouteRuntimeSlice, type IncidentFilters, type IncidentRow } from "../../app/routeRuntime";
+import { useRouteRuntimeSlice, type AlertStreamRow, type IncidentFilters, type IncidentRow } from "../../app/routeRuntime";
 import { OperationsWorkflowNav } from "../../components/operations/OperationsWorkflowNav";
 import { effectiveIncidentStatus } from "../../domain/incidentStatus";
 import { formatIstTimestamp } from "../../appHelpers.jsx";
@@ -9,6 +9,7 @@ import "./IncidentsRoute.css";
 
 const PAGE_SIZE = 10;
 type InboxView = "needs_me" | "kai_handling" | "critical" | "watching" | "resolved" | "all";
+type RecordType = "all" | "incidents" | "alerts";
 
 function attentionScore(row: IncidentRow) {
   const severity = String(row.severity || "").toLowerCase();
@@ -33,6 +34,43 @@ function belongsToInboxView(row: IncidentRow, view: InboxView) {
   if (view === "critical") return !terminal && ["critical", "sev1", "p1"].includes(severity);
   if (view === "watching") return !terminal && ["medium", "warning", "low", "info"].includes(severity);
   if (view === "resolved") return terminal;
+  return true;
+}
+
+function alertDisposition(row: AlertStreamRow) {
+  const metadata = (row as AlertStreamRow & { metadata?: Record<string, unknown> }).metadata || {};
+  const noiseMetadata = metadata.noise && typeof metadata.noise === "object" ? metadata.noise as Record<string, unknown> : {};
+  const disposition = String(row.incident_disposition || "").toLowerCase();
+  const noise = ["noise", "suppressed", "ignored", "non_actionable"].includes(disposition) || noiseMetadata.classified === true;
+  const duplicate = !noise && (disposition === "duplicate" || Number(row.deduplicated_count || 1) > 1);
+  return { noise, duplicate, noiseReason: String(noiseMetadata.reason || row.suppression_reason || "Non-actionable monitoring noise") };
+}
+
+function alertLinkedIncidentId(row: AlertStreamRow) {
+  const candidate = String((row as AlertStreamRow & { incident_id?: string | number }).incident_id || "").trim();
+  const alertId = String((row as AlertStreamRow & { alert_id?: string | number }).alert_id || row.id || "").trim();
+  // Some source adapters reuse the alert identifier in incident_id before an
+  // incident exists. Only a distinct identifier is an evidence-backed link.
+  return candidate && candidate !== alertId ? candidate : "";
+}
+
+function alertAttentionScore(row: AlertStreamRow) {
+  const severity = String(row.severity || row.priority || "").toLowerCase();
+  const disposition = alertDisposition(row);
+  const ageHours = Math.max(0, (Date.now() - new Date(String(row.received_at || row.created_at || row.first_seen || Date.now())).getTime()) / 3_600_000);
+  return (["critical", "p1", "sev1"].includes(severity) ? 95 : ["high", "p2", "sev2"].includes(severity) ? 55 : severity === "medium" || severity === "warning" ? 25 : 8)
+    + (disposition.noise ? -100 : disposition.duplicate ? -35 : 35)
+    + Math.min(24, ageHours);
+}
+
+function alertBelongsToInboxView(row: AlertStreamRow, view: InboxView) {
+  const severity = String(row.severity || row.priority || "").toLowerCase();
+  const disposition = alertDisposition(row);
+  if (view === "needs_me") return !disposition.noise && !disposition.duplicate && ["critical", "high", "p1", "p2", "sev1", "sev2"].includes(severity);
+  if (view === "kai_handling") return !disposition.noise && !disposition.duplicate;
+  if (view === "critical") return !disposition.noise && ["critical", "p1", "sev1"].includes(severity);
+  if (view === "watching") return disposition.noise || disposition.duplicate || ["medium", "warning", "low", "info"].includes(severity);
+  if (view === "resolved") return false;
   return true;
 }
 
@@ -306,7 +344,10 @@ export default function IncidentsRoute() {
   const incidents = useRouteRuntimeSlice("incidents");
   const alerts = useRouteRuntimeSlice("alerts");
   const [searchParams] = useSearchParams();
-  const [recordType, setRecordType] = useState(searchParams.get("type") === "alerts" ? "alerts" : "incidents");
+  const [recordType, setRecordType] = useState<RecordType>(() => {
+    const requested = searchParams.get("type");
+    return requested === "alerts" || requested === "incidents" ? requested : "all";
+  });
   const [presentation, setPresentation] = useState<Presentation>(() => {
     const saved = window.localStorage.getItem("kaiops.incident-presentation");
     return saved === "flow" || saved === "details" ? saved : "summary";
@@ -322,48 +363,128 @@ export default function IncidentsRoute() {
     }))).sort((left, right) => attentionScore(right) - attentionScore(left));
   }, [incidents.rows, alerts.rows]);
   const filteredIncidents = useMemo(() => groupedIncidents.filter((row) => belongsToInboxView(row, inboxView)), [groupedIncidents, inboxView]);
-  const pages = Math.max(1, Math.ceil(filteredIncidents.length / PAGE_SIZE));
-  useEffect(() => setPage((current) => Math.min(current, pages)), [pages]);
   useEffect(() => window.localStorage.setItem("kaiops.incident-presentation", presentation), [presentation]);
-  useEffect(() => setPage(1), [incidents.filters.risk_tier, incidents.filters.execution_mode, incidents.filters.status, incidents.filters.service]);
-  const rows = useMemo(() => filteredIncidents.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE), [filteredIncidents, page]);
+  useEffect(() => setPage(1), [incidents.filters.risk_tier, incidents.filters.execution_mode, incidents.filters.status, incidents.filters.service, inboxView, recordType]);
   const incidentAlertIds = useMemo(() => new Set(incidents.rows.map((row) => String(row.alert_id || "")).filter(Boolean)), [incidents.rows]);
-  const visibleAlerts = useMemo(() => alerts.rows.filter((alert) => {
-    if (recordType === "alerts") return true;
+  const unlinkedAlerts = useMemo(() => alerts.rows.filter((alert) => {
     const alertId = String((alert as typeof alert & { alert_id?: string | number }).alert_id || alert.id || "");
-    return !alertId || !incidentAlertIds.has(alertId);
-  }), [alerts.rows, incidentAlertIds, recordType]);
+    return !alertLinkedIncidentId(alert) && (!alertId || !incidentAlertIds.has(alertId));
+  }), [alerts.rows, incidentAlertIds]);
+  const filteredAlerts = useMemo(() => {
+    const candidates = recordType === "alerts" ? alerts.rows : unlinkedAlerts;
+    const serviceQuery = incidents.filters.service.trim().toLowerCase();
+    return candidates.filter((alert) => {
+      if (!alertBelongsToInboxView(alert, inboxView)) return false;
+      if (!serviceQuery) return true;
+      return [alert.service, alert.application, alert.project_name, alert.name, alert.alert_name]
+        .some((value) => String(value || "").toLowerCase().includes(serviceQuery));
+    });
+  }, [alerts.rows, incidents.filters.service, inboxView, recordType, unlinkedAlerts]);
+  const unifiedRecords = useMemo(() => [
+    ...filteredIncidents.map((row) => ({ kind: "incident" as const, score: attentionScore(row), row })),
+    ...filteredAlerts.map((row) => ({ kind: "alert" as const, score: alertAttentionScore(row), row })),
+  ].sort((left, right) => right.score - left.score), [filteredAlerts, filteredIncidents]);
+  const totalRecords = recordType === "all" ? unifiedRecords.length : recordType === "alerts" ? filteredAlerts.length : filteredIncidents.length;
+  const pages = Math.max(1, Math.ceil(totalRecords / PAGE_SIZE));
+  useEffect(() => setPage((current) => Math.min(current, pages)), [pages]);
+  const rows = useMemo(() => filteredIncidents.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE), [filteredIncidents, page]);
+  const visibleAlerts = useMemo(() => filteredAlerts.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE), [filteredAlerts, page]);
+  const visibleUnifiedRecords = useMemo(() => unifiedRecords.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE), [page, unifiedRecords]);
   const select = (label: string, name: keyof IncidentFilters, options: string[]) => <label>{label}<select value={incidents.filters[name]} onChange={(event) => incidents.updateFilter(name, event.target.value)}>{options.map((option) => <option value={option} key={option}>{option}</option>)}</select></label>;
-  const active = groupedIncidents.filter((row) => !["closed", "resolved"].includes(normalizedStatus(row))).length;
+  const active = groupedIncidents.filter((row) => !["closed", "resolved", "recovered", "cancelled"].includes(normalizedStatus(row))).length;
+  const needsAttention = groupedIncidents.filter((row) => belongsToInboxView(row, "needs_me")).length + unlinkedAlerts.filter((row) => alertBelongsToInboxView(row, "needs_me")).length;
+  const viewCount = (view: InboxView) => {
+    const incidentCount = groupedIncidents.filter((row) => belongsToInboxView(row, view)).length;
+    const alertCount = unlinkedAlerts.filter((row) => alertBelongsToInboxView(row, view)).length;
+    return recordType === "incidents" ? incidentCount : recordType === "alerts" ? alerts.rows.filter((row) => alertBelongsToInboxView(row, view)).length : incidentCount + alertCount;
+  };
+  const showUnified = recordType === "all";
   const showAlerts = recordType === "alerts";
   const showIncidents = recordType === "incidents";
 
   return <section className="grid single-col operations-center">
     <OperationsWorkflowNav active="incidents" />
-    <div className="incident-list-heading"><div><h2>Incident Inbox</h2><p>Problems ranked by human attention, business risk, and blocked automation.</p></div><div className="operations-kpis" aria-label="Operational totals"><span><strong>{alerts.rows.length}</strong> signals</span><span><strong>{active}</strong> active</span><span><strong>{groupedIncidents.length}</strong> incidents</span></div></div>
+    <header className="incident-list-heading unified-inbox-heading">
+      <div><span className="inbox-eyebrow"><Activity size={14} /> Operations command queue</span><h2>Unified Inbox</h2><p>One prioritized workspace for signals, incidents, and decisions that need attention.</p></div>
+      <div className="operations-kpis" aria-label="Operational totals"><span className={needsAttention ? "is-urgent" : ""}><small>Needs attention</small><strong>{needsAttention}</strong></span><span><small>Active incidents</small><strong>{active}</strong></span><span><small>Unlinked signals</small><strong>{unlinkedAlerts.length}</strong></span><span><small>Total incidents</small><strong>{groupedIncidents.length}</strong></span></div>
+    </header>
     <nav className="incident-inbox-views" aria-label="Incident inbox views">{([
       ["needs_me", "Needs me"], ["kai_handling", "Kai handling"], ["critical", "Critical"], ["watching", "Watching"], ["resolved", "Resolved recently"], ["all", "All"],
-    ] as const).map(([id, label]) => <button type="button" key={id} className={inboxView === id ? "active" : ""} aria-pressed={inboxView === id} onClick={() => { setInboxView(id); setPage(1); }}>{label}<span>{groupedIncidents.filter((row) => belongsToInboxView(row, id)).length}</span></button>)}</nav>
-    <div className="compact-filter-bar">
-      <label>View<select value={recordType} onChange={(event) => setRecordType(event.target.value)}><option value="incidents">Incidents</option><option value="alerts">Alerts</option></select></label>
-      {showIncidents ? <>{select("Risk", "risk_tier", ["all", "high", "medium", "low"])}{select("Status", "status", ["all", "open", "investigating", "awaiting_approval", "remediating", "validating", "closed", "failed"])}<label className="filter-grow">Service<input value={incidents.filters.service} placeholder="Search service" onChange={(event) => incidents.updateFilter("service", event.target.value)} /></label></> : <div className="alert-view-note">Showing alert intake and classification outcomes</div>}
+    ] as const).map(([id, label]) => <button type="button" key={id} className={inboxView === id ? "active" : ""} aria-pressed={inboxView === id} onClick={() => { setInboxView(id); setPage(1); }}>{label}<span>{viewCount(id)}</span></button>)}</nav>
+    <div className="inbox-source-tabs" role="tablist" aria-label="Inbox source">
+      <button type="button" role="tab" aria-selected={showUnified} className={showUnified ? "active" : ""} onClick={() => { setRecordType("all"); setPresentation("summary"); setPage(1); }}><span>All activity</span><strong>{groupedIncidents.length + unlinkedAlerts.length}</strong><small>Incidents + unlinked signals</small></button>
+      <button type="button" role="tab" aria-selected={showIncidents} className={showIncidents ? "active" : ""} onClick={() => { setRecordType("incidents"); setPage(1); }}><span>Incidents</span><strong>{groupedIncidents.length}</strong><small>Correlated operational work</small></button>
+      <button type="button" role="tab" aria-selected={showAlerts} className={showAlerts ? "active" : ""} onClick={() => { setRecordType("alerts"); setPage(1); }}><span>Signals</span><strong>{alerts.rows.length}</strong><small>Raw intake and outcomes</small></button>
+    </div>
+    <div className={`compact-filter-bar inbox-filter-bar ${showUnified ? "is-unified" : showAlerts ? "is-signals" : ""}`}>
+      {showIncidents ? <>{select("Risk", "risk_tier", ["all", "high", "medium", "low"])}{select("Status", "status", ["all", "open", "investigating", "awaiting_approval", "remediating", "validating", "closed", "failed"])}</> : null}
+      <label className="filter-grow">Service<input value={incidents.filters.service} placeholder="Search service, application, or signal" onChange={(event) => incidents.updateFilter("service", event.target.value)} /></label>
+      {showAlerts ? <div className="alert-view-note"><ScanSearch size={15} /> Raw intake with deduplication and noise outcomes</div> : null}
       <button className="icon-button" type="button" onClick={() => { incidents.refresh(); alerts.refresh(); }} title="Refresh queue" aria-label="Refresh queue"><RefreshCw size={17} /></button>
     </div>
-    <div className="incident-presentation" role="radiogroup" aria-label={`${showAlerts ? "Alert" : "Incident"} workspace view`}>
+    {!showUnified ? <div className="incident-presentation" role="radiogroup" aria-label={`${showAlerts ? "Signal" : "Incident"} workspace view`}>
       <span>View</span>
-      <button type="button" role="radio" aria-checked={presentation === "summary"} className={presentation === "summary" ? "active" : ""} onClick={() => setPresentation("summary")}><List size={15} /><span><strong>Unified Inbox</strong><small>Prioritized operational queue</small></span></button>
+      <button type="button" role="radio" aria-checked={presentation === "summary"} className={presentation === "summary" ? "active" : ""} onClick={() => setPresentation("summary")}><List size={15} /><span><strong>Triage queue</strong><small>Compact prioritized list</small></span></button>
       <button type="button" role="radio" aria-checked={presentation === "details"} className={presentation === "details" ? "active" : ""} onClick={() => setPresentation("details")}><Rows3 size={15} /><span><strong>Split Workspace</strong><small>{showAlerts ? "Alert and evidence" : "Incident and evidence"}</small></span></button>
       <button type="button" role="radio" aria-checked={presentation === "flow"} className={presentation === "flow" ? "active" : ""} onClick={() => setPresentation("flow")}><Workflow size={15} /><span><strong>Correlation Timeline</strong><small>{showAlerts ? "Signal processing path" : "Executed lifecycle"}</small></span></button>
-    </div>
+    </div> : null}
     {incidents.error ? <p className="error">{incidents.error}</p> : null}
     <div className={`incident-summary-list view-${presentation}`} aria-busy={incidents.loading || alerts.loading}>
+      {showUnified ? <div className="unified-inbox-stack" aria-label="Prioritized operational activity">{visibleUnifiedRecords.map((record, index) => {
+        if (record.kind === "incident") {
+          const row = record.row;
+          const incidentId = String(row.incident_id || row.id || index);
+          const lifecycle = lifecycleFor(row);
+          const currentStage = lifecycle.find((stage) => ["current", "failed", "stopped"].includes(stage.state)) || lifecycle[lifecycle.length - 1];
+          const event = projectionEvent(row);
+          const needsHuman = belongsToInboxView(row, "needs_me");
+          const severity = String(row.severity || row.risk_tier || "not-set").toLowerCase();
+          return <article className={`unified-inbox-card is-incident severity-${severity}`} key={`incident-${incidentId}`}>
+            <span className="unified-card-rail" aria-hidden="true" />
+            <div className={`unified-card-icon ${needsHuman ? "is-urgent" : ""}`}>{needsHuman ? <FileCheck2 size={20} /> : <BrainCircuit size={20} />}</div>
+            <div className="unified-card-body">
+              <div className="unified-card-kicker"><span>Incident</span><code>{incidentId}</code>{row.duplicateIncidents.length ? <em>{row.duplicateIncidents.length + 1} occurrences</em> : null}</div>
+              <button type="button" className="unified-card-title" onClick={() => incidents.open(row, "overview")}>{incidentTitle(row)}</button>
+              <div className="unified-card-context"><span><Server size={13} /> {row.service || "Unknown service"}</span><span>{row.environment || "Environment not set"}</span><span>{formatIstTimestamp(row.updated_at || row.created_at)}</span></div>
+              <p className="unified-card-summary">{value(event.customer_impact, event.business_impact, event.impact, row.summary, "Kai is coordinating diagnosis and resolution.")}</p>
+              <div className="unified-card-progress"><span className="unified-progress-node"><Workflow size={14} /></span><div><small>Current stage</small><strong>{currentStage?.label || "Awaiting intake"}</strong><span>{currentStage?.caption || "No executed stage recorded"}</span></div></div>
+            </div>
+            <aside className="unified-card-aside">
+              <span className={`pill ${normalizedStatus(row) === "failed" ? "status-warning" : `status-${normalizedStatus(row)}`}`}>{incidentStatusLabel(row)}</span>
+              <span className={`unified-attention-label ${needsHuman ? "is-urgent" : ""}`}>{needsHuman ? <><FileCheck2 size={13} /> Human decision</> : <><BrainCircuit size={13} /> Kai handling</>}</span>
+              <button type="button" className="button-primary" onClick={() => incidents.open(row, "overview")}>Open incident</button>
+            </aside>
+          </article>;
+        }
+        const alert = record.row;
+        const alertId = String(alert.id || alert.file || index);
+        const disposition = alertDisposition(alert);
+        const linkedIncident = alertLinkedIncidentId(alert);
+        const severity = String(alert.severity || alert.priority || "not-set").toLowerCase();
+        return <article className={`unified-inbox-card is-signal severity-${severity} ${disposition.noise ? "is-muted" : ""}`} key={`signal-${alertId}`}>
+          <span className="unified-card-rail" aria-hidden="true" />
+          <div className={`unified-card-icon ${disposition.noise ? "is-muted" : disposition.duplicate ? "is-duplicate" : "is-signal"}`}>{disposition.noise ? <CircleSlash2 size={20} /> : disposition.duplicate ? <Copy size={20} /> : <Bell size={20} />}</div>
+          <div className="unified-card-body">
+            <div className="unified-card-kicker"><span>Signal</span><code>{alertId}</code></div>
+            <button type="button" className="unified-card-title" onClick={() => alerts.open(alert, "overview")}>{alert.name || alert.alert_name || "Unnamed signal"}</button>
+            <div className="unified-card-context"><span><Activity size={13} /> {alert.service || "Unknown service"}</span><span>{alert.origin_system || alert.source || alert.source_channel || "Unknown source"}</span><span>{formatIstTimestamp(alert.received_at || alert.created_at || alert.first_seen)}</span></div>
+            <p className="unified-card-summary">{value(alert.description, alert.annotations?.description, alert.summary, alert.message, disposition.noise ? disposition.noiseReason : "A new operational signal is awaiting correlation.")}</p>
+            <div className="unified-card-progress"><span className="unified-progress-node"><GitMerge size={14} /></span><div><small>Correlation outcome</small><strong>{disposition.noise ? "No incident required" : disposition.duplicate ? "Duplicate signal" : linkedIncident ? "Incident linked" : "Awaiting correlation"}</strong><span>{disposition.noise ? disposition.noiseReason : disposition.duplicate ? "Matched to an existing operational record" : linkedIncident ? linkedIncident : "Kai is evaluating impact and related activity"}</span></div></div>
+          </div>
+          <aside className="unified-card-aside">
+            <span className="pill status-open">{String(alert.severity || alert.priority || "Severity not set")}</span>
+            <span className={`alert-classification ${disposition.noise ? "is-noise" : disposition.duplicate ? "is-duplicate" : "is-unique"}`}>{disposition.noise ? "Noise" : disposition.duplicate ? "Duplicate" : "Unique signal"}</span>
+            <button type="button" className="button-secondary" onClick={() => alerts.open(alert, "overview")}>Review signal</button>
+          </aside>
+        </article>;
+      })}</div> : null}
       {showAlerts && presentation === "summary" ? <div className="incident-table-wrap"><table className="incident-summary-table alert-summary-table"><thead><tr><th>Alert</th><th>Source</th><th>Severity</th><th>Classification</th><th>Linked record</th><th>Received</th><th><span className="sr-only">Action</span></th></tr></thead><tbody>{visibleAlerts.map((alert, index) => {
         const metadata = (alert as typeof alert & { metadata?: Record<string, unknown> }).metadata || {};
         const noiseMetadata = metadata.noise && typeof metadata.noise === "object" ? metadata.noise as Record<string, unknown> : {};
         const disposition = String(alert.incident_disposition || "").toLowerCase();
         const noise = ["noise", "suppressed", "ignored", "non_actionable"].includes(disposition) || noiseMetadata.classified === true;
         const duplicate = !noise && (disposition === "duplicate" || Number(alert.deduplicated_count || 1) > 1);
-        const linkedIncident = String((alert as typeof alert & { incident_id?: string | number }).incident_id || "");
+        const linkedIncident = alertLinkedIncidentId(alert);
         return <tr key={String(alert.id || alert.file || index)}><td><button type="button" className="incident-table-title" onClick={() => alerts.open(alert, "overview")}>{alert.name || alert.alert_name || "Unnamed alert"}</button><code>{String(alert.id || alert.file || "No alert ID")}</code></td><td><strong>{alert.service || "Unknown service"}</strong><small>{alert.origin_system || alert.source || alert.source_channel || "Unknown source"}</small></td><td>{alert.severity || "Not set"}</td><td><span className={`alert-classification ${noise ? "is-noise" : duplicate ? "is-duplicate" : "is-unique"}`}>{noise ? "Noise" : duplicate ? "Duplicate" : "Unique"}</span></td><td>{linkedIncident || alert.ticket_id || alert.jira_key || (noise ? "No incident" : "Processing")}</td><td>{formatIstTimestamp(alert.received_at || alert.created_at || alert.first_seen)}</td><td><button type="button" className="button-secondary" onClick={() => { setPresentation("details"); }}>View details</button></td></tr>;
       })}</tbody></table></div> : null}
       {showAlerts && presentation !== "summary" ? visibleAlerts.map((alert, index) => {
@@ -373,7 +494,7 @@ export default function IncidentsRoute() {
         const noise = ["noise", "suppressed", "ignored", "non_actionable"].includes(disposition) || noiseMetadata.classified === true;
         const duplicate = !noise && (disposition === "duplicate" || Number(alert.deduplicated_count || 1) > 1);
         const noiseReason = String(noiseMetadata.reason || alert.suppression_reason || "Non-actionable monitoring noise");
-        const linkedIncident = String((alert as typeof alert & { incident_id?: string | number }).incident_id || "");
+        const linkedIncident = alertLinkedIncidentId(alert);
         const alertId = String(alert.id || alert.file || index);
         return <article className={`unified-alert-row ${presentation === "details" ? "is-detail" : ""}`} key={alertId}>
           <span className={`unified-record-icon ${noise ? "is-noise" : duplicate ? "is-duplicate" : ""}`}>{noise ? <CircleSlash2 size={16} /> : duplicate ? <Copy size={16} /> : <Bell size={16} />}</span>
@@ -457,9 +578,10 @@ export default function IncidentsRoute() {
           </div> : null}
         </article>;
       }) : null}
-      {showAlerts && !alerts.rows.length && !alerts.loading && !showIncidents ? <p className="empty-state">No alerts match this view.</p> : null}
-      {showIncidents && !rows.length && !incidents.loading && !showAlerts ? <p className="empty-state">No incidents match this view.</p> : null}
+      {showUnified && !visibleUnifiedRecords.length && !incidents.loading && !alerts.loading ? <p className="empty-state unified-empty-state"><ScanSearch size={22} />No unified inbox records match this view.<small>Try another attention view or clear the service search.</small></p> : null}
+      {showAlerts && !visibleAlerts.length && !alerts.loading ? <p className="empty-state">No signals match this view.</p> : null}
+      {showIncidents && !rows.length && !incidents.loading ? <p className="empty-state">No incidents match this view.</p> : null}
     </div>
-    {showIncidents ? <footer className="table-pagination"><span>Showing {rows.length ? ((page - 1) * PAGE_SIZE) + 1 : 0}-{Math.min(page * PAGE_SIZE, filteredIncidents.length)} of {filteredIncidents.length}</span><div><button className="button-secondary" disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>Previous</button><span>{page} / {pages}</span><button className="button-secondary" disabled={page >= pages} onClick={() => setPage((value) => value + 1)}>Next</button></div></footer> : null}
+    <footer className="table-pagination"><span>Showing {totalRecords ? ((page - 1) * PAGE_SIZE) + 1 : 0}-{Math.min(page * PAGE_SIZE, totalRecords)} of {totalRecords}</span><div><button className="button-secondary" disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>Previous</button><span>{page} / {pages}</span><button className="button-secondary" disabled={page >= pages} onClick={() => setPage((value) => value + 1)}>Next</button></div></footer>
   </section>;
 }

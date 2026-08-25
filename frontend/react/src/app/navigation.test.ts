@@ -47,6 +47,6 @@ describe("authoritative navigation", () => {
 
   it("keeps the incident destination active for a command-center URL", () => {
     expect(tabForPath("/incidents/INC-3481")).toBe("summary");
-    expect(breadcrumbForPath("/incidents/INC-3481").map((item) => item.label)).toEqual(["Operations", "Incidents"]);
+    expect(breadcrumbForPath("/incidents/INC-3481").map((item) => item.label)).toEqual(["Operations", "Unified Inbox"]);
   });
 });
