@@ -1,0 +1,7 @@
+services:
+  ui:
+    # Keep the documented/legacy KaiMS address working while port 80 remains
+    # the primary local endpoint. Both ports terminate on the same Wave 9
+    # nginx container, so an old bookmark cannot open a stale UI deployment.
+    ports:
+      - "${UI_BIND_ADDRESS:-127.0.0.1}:${UI_COMPAT_HOST_PORT:-8501}:80"
