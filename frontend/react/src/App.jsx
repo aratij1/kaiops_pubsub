@@ -583,6 +583,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const [form, setForm] = useState(DEFAULT_ALERT);
   const [adminWorkspace, setAdminWorkspace] = useState("users");
   const [adminAuthForm, setAdminAuthForm] = useState({ username: "admin", password: "", device: "react-ui" });
+  const [loginPasswordVisible, setLoginPasswordVisible] = useState(false);
   const [adminSession, setAdminSession] = useState({ loading: false, accessToken: "", refreshToken: "", user: null, error: "" });
   const [authConfig, setAuthConfig] = useState({ loading: true, mode: "local", local_development_only: true, issuer: null, client_id: null, audience: null, pkce_required: false, error: "" });
   const liveEvents = useOperationalEvents({
@@ -9704,15 +9705,22 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           <aside className="auth-brand-story">
             <KaiMSBrand inverse />
             <div className="auth-story-copy">
-              <span className="auth-kicker">Managed reliability operations</span>
-              <h1>Your reliability team, always on.</h1>
-              <p>KaiMS continuously investigates operational signals, coordinates safe resolution, and keeps your team in control of every production decision.</p>
-              <div className="auth-live-assurance"><i aria-hidden="true" /><span><strong>Managed Service ready</strong><small>Evidence, approvals, and recovery validation connected</small></span></div>
+              <span className="auth-kicker auth-kicker-live"><i aria-hidden="true" /> Autonomous operations workspace</span>
+              <h1>From first signal to <em>verified recovery.</em></h1>
+              <p>KaiMS connects evidence, human judgment, and guarded action in one accountable incident workflow.</p>
+              <div className="auth-signal-chain" aria-label="KaiMS operating model">
+                <span><b>01</b><strong>Observe</strong><small>Unify operational signals</small></span>
+                <i aria-hidden="true">→</i>
+                <span><b>02</b><strong>Understand</strong><small>Explain cause and impact</small></span>
+                <i aria-hidden="true">→</i>
+                <span><b>03</b><strong>Resolve</strong><small>Act safely and verify</small></span>
+              </div>
+              <div className="auth-live-assurance"><i aria-hidden="true" /><span><strong>Operations fabric online</strong><small>Evidence, approvals, and recovery controls connected</small></span></div>
             </div>
             <div className="auth-proof-grid" aria-label="KaiMS platform capabilities">
-              <span><strong>Traceable decisions</strong><small>Evidence attached to every conclusion</small></span>
-              <span><strong>Governed action</strong><small>Human and policy controls stay active</small></span>
-              <span><strong>Verified recovery</strong><small>Health is proven before closure</small></span>
+              <span><strong>Evidence first</strong><small>Every conclusion retains its source</small></span>
+              <span><strong>Human governed</strong><small>Operators stay in control of action</small></span>
+              <span><strong>Recovery verified</strong><small>Closure follows measured health</small></span>
             </div>
           </aside>
           <article className="panel auth-card">
@@ -9738,31 +9746,30 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             </div>
             <div className="panel-head">
               <div>
-                <span className="auth-kicker">Secure workspace</span>
+                <span className="auth-kicker">Protected access</span>
                 <h2>Welcome back</h2>
-                <p>Sign in to continue managed operations.</p>
+                <p>Sign in to your operational command center.</p>
               </div>
             </div>
-            <label className="auth-application-select">Application workspace<select aria-label="Application workspace" value={applicationToMonitor} onChange={(event) => setApplicationToMonitor(event.target.value)}>{monitorApplications.map((name) => <option key={name} value={name}>{name}</option>)}</select><small>The workspace opens already scoped to this managed application.</small></label>
+            <label className="auth-application-select"><span>Application workspace</span><select aria-label="Application workspace" value={applicationToMonitor} onChange={(event) => setApplicationToMonitor(event.target.value)}>{monitorApplications.map((name) => <option key={name} value={name}>{name}</option>)}</select><small>Your session opens scoped to this application.</small></label>
             {authConfig.mode === "oidc" ? (
-              <div className="form">
-                <p>Enterprise single sign-on is required. Your identity-provider role controls KaiMS access.</p>
-                <button className="button-primary" type="button" onClick={oidcLogin} disabled={adminSession.loading || authConfig.loading}>{adminSession.loading ? "Redirecting..." : "Continue with SSO"}</button>
+              <div className="form auth-login-form">
+                <p className="auth-sso-note">Enterprise single sign-on is required. Your identity-provider role controls KaiMS access.</p>
+                <button className="button-primary auth-submit" type="button" onClick={oidcLogin} disabled={adminSession.loading || authConfig.loading}>{adminSession.loading ? "Redirecting..." : <><span>Continue with SSO</span><b aria-hidden="true">→</b></>}</button>
               </div>
             ) : (
-              <details className="auth-development-access" open>
-                <summary><span>Development access</span><small>Local environments only</small></summary>
-                <form className="form" onSubmit={adminLogin}>
-                  <label>Username<input autoComplete="username" value={adminAuthForm.username} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, username: e.target.value }))} /></label>
-                  <label>Password<input type="password" autoComplete="current-password" value={adminAuthForm.password} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, password: e.target.value }))} /></label>
-                  <button className="button-primary" type="submit" disabled={adminSession.loading}>{adminSession.loading ? "Signing in..." : "Sign in securely"}</button>
-                </form>
-              </details>
+              <form className="form auth-login-form" onSubmit={adminLogin}>
+                <div className="auth-access-mode"><span><i aria-hidden="true" /> Secure local access</span><small>Development environment</small></div>
+                <label className="auth-field"><span>Username</span><div className="auth-input-frame"><b aria-hidden="true">@</b><input autoComplete="username" value={adminAuthForm.username} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, username: e.target.value }))} /></div></label>
+                <label className="auth-field"><span>Password</span><div className="auth-input-frame"><b className="auth-lock-mark" aria-hidden="true" /><input type={loginPasswordVisible ? "text" : "password"} autoComplete="current-password" value={adminAuthForm.password} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, password: e.target.value }))} /><button type="button" className="auth-password-toggle" aria-label={loginPasswordVisible ? "Conceal entered value" : "Reveal entered value"} aria-pressed={loginPasswordVisible} onClick={() => setLoginPasswordVisible((visible) => !visible)}>{loginPasswordVisible ? "Hide" : "Show"}</button></div></label>
+                <div className="auth-session-meta"><span><i aria-hidden="true" /> Encrypted session</span><span>Role-scoped access</span></div>
+                <button className="button-primary auth-submit" type="submit" disabled={adminSession.loading}>{adminSession.loading ? <><i className="auth-submit-spinner" aria-hidden="true" /> Signing in...</> : <><span>Sign in securely</span><b aria-hidden="true">→</b></>}</button>
+              </form>
             )}
-            {adminSession.error ? <p className="error">{adminSession.error}</p> : null}
-            {authConfig.error ? <p className="error">{authConfig.error}</p> : null}
-            <div className="auth-security-note"><span aria-hidden="true">✓</span><div><strong>Protected operational access</strong><small>{authConfig.mode === "local" ? "Local credentials are enabled for this development environment." : "Session tokens remain in memory and are never written to local storage."}</small></div></div>
-            <p className="auth-role-note">Workspace permissions are automatically scoped to your assigned operational role.</p>
+            {adminSession.error ? <p className="error auth-login-error" role="alert">{adminSession.error}</p> : null}
+            {authConfig.error ? <p className="error auth-login-error" role="alert">{authConfig.error}</p> : null}
+            <div className="auth-security-note"><span aria-hidden="true">✓</span><div><strong>Accountable by design</strong><small>{authConfig.mode === "local" ? "Local access is enabled for this development environment." : "Session tokens remain in memory and are never written to local storage."}</small></div></div>
+            <p className="auth-role-note">Your navigation, decisions, and available actions adapt automatically to your assigned role.</p>
           </article>
         </section>
       </main>
