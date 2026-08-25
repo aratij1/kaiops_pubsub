@@ -13,7 +13,7 @@ export type LegacyTabId =
 
 export type NavigationGroup = "operations" | "intelligence" | "automation" | "platform";
 export type NavigationRole = "admin" | "hitl_reviewer";
-export type NavigationIcon = "dashboard" | "alerts" | "incidents" | "approvals" | "copilot" | "agentFlow" | "knowledge" | "safety" | "audit" | "closed" | "applications" | "operationsCockpit" | "cloudConnections" | "cloudResources" | "serviceOnboarding" | "services" | "integrations" | "admin" | "executive";
+export type NavigationIcon = "dashboard" | "alerts" | "incidents" | "approvals" | "copilot" | "agentFlow" | "knowledge" | "safety" | "audit" | "closed" | "applications" | "operationsCockpit" | "cloudConnections" | "cloudResources" | "serviceOnboarding" | "services" | "integrations" | "admin" | "settings" | "executive";
 export type NavigationId = NavigationIcon;
 
 export interface NavigationItem {
@@ -86,7 +86,11 @@ export const PATH_BY_TAB: Readonly<Record<LegacyTabId, string>> = Object.freeze(
 );
 
 export function navigationItemForPath(pathname: string): NavigationItem {
-  return NAVIGATION_ITEMS.find((item) => item.path === pathname) ?? NAVIGATION_ITEMS[0];
+  const normalized = pathname.length > 1 ? pathname.replace(/\/$/, "") : pathname;
+  const candidates = NAVIGATION_ITEMS
+    .filter((item) => item.path === "/" ? normalized === "/" : normalized === item.path || normalized.startsWith(`${item.path}/`))
+    .sort((left, right) => right.path.length - left.path.length);
+  return candidates[0] ?? NAVIGATION_ITEMS[0];
 }
 
 /** Compatibility mapping while stored users are migrated to the two-role model. */
