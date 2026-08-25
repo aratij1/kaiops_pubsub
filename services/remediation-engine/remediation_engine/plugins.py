@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from common.agentic import AgentContext, BaseAgent
+from common.execution_safety import ExecutionSafetyDecision, assess_execution_safety
 from common.models import Approval, RemediationAction, RemediationStatus, utc_now
 from common.resilience import CircuitBreaker, circuit_breaker
 from common.tool_registry import ToolRegistry, ToolSpec
@@ -100,6 +101,7 @@ class RemediationEngine(BaseAgent):
             return completed.model_dump(mode="json")
 
         for action_type, plugin in self.plugins.items():
+
             async def handler(payload: dict[str, Any], _plugin: RemediationPlugin = plugin) -> dict[str, Any]:
                 return await _build_tool_handler(_plugin, payload)
 
@@ -155,7 +157,27 @@ class RemediationEngine(BaseAgent):
         )
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
-        action_type = action.action_type if action.action_type in self.tool_registry.tools else "api_execution"
+        allowed_actions = set(self.plugins.keys())
+        assessment = assess_execution_safety(action, allowlisted_actions=allowed_actions)
+        action.parameters["pre_execution_snapshot"] = assessment.snapshot
+        action.parameters["pre_execution_snapshot_hash"] = assessment.snapshot_hash
+        action.parameters["execution_idempotency_key"] = assessment.idempotency_key
+
+        if assessment.decision == ExecutionSafetyDecision.BLOCK:
+            action.status = RemediationStatus.SKIPPED
+            action.error = assessment.reason
+            action.output = "remediation blocked by execution safety controller"
+            action.completed_at = utc_now()
+            return action
+
+        action_type = str(action.action_type or "").strip().lower()
+        if action_type not in self.tool_registry.tools:
+            action.status = RemediationStatus.SKIPPED
+            action.error = "ACTION_TYPE_NOT_REGISTERED"
+            action.output = "remediation blocked by tool registry"
+            action.completed_at = utc_now()
+            return action
+
         try:
             payload = await self.tool_registry.execute(
                 action_type,
