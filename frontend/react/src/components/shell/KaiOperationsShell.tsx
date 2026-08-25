@@ -50,6 +50,7 @@ const ICONS: Record<NavigationIcon, typeof Activity> = {
   serviceOnboarding: Settings,
   services: Activity,
   integrations: PlugZap,
+  platformOverview: Gauge,
   admin: Users,
   settings: Settings,
   executive: Gauge,

@@ -23,8 +23,17 @@ export default function AdminRoute() {
   async function loadCapacity() {
     setCapacity((current) => ({ ...current, loading: true, error: "" }));
     try {
-      const response = await fetch("/api-gateway/approval/capacity", { headers });
-      if (!response.ok) throw new Error(`Capacity service returned HTTP ${response.status}`);
+      let response: Response | null = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          response = await fetch("/api-gateway/approval/capacity", { headers });
+          if (response.ok || ![404, 408, 425, 429, 502, 503, 504].includes(response.status)) break;
+        } catch (error) {
+          if (attempt === 2) throw error;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 600 * (2 ** attempt)));
+      }
+      if (!response?.ok) throw new Error(`Reviewer capacity is temporarily unavailable${response ? ` (HTTP ${response.status})` : ""}. Retry after the services finish starting.`);
       const payload = await response.json();
       const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
       setCapacity({ rows: Array.isArray(data?.rows) ? data.rows : [], loading: false, error: "" });

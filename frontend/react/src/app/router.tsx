@@ -54,6 +54,7 @@ const ROUTE_COMPONENTS: Readonly<Record<NavigationId, ComponentType>> = {
   serviceOnboarding: ServiceOnboardingRoute,
   services: Service360Route,
   integrations: IntegrationsRoute,
+  platformOverview: PlatformSettingsRoute,
   admin: AdminRoute,
   settings: PlatformSettingsRoute,
   executive: ExecutiveRoute,

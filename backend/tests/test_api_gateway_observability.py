@@ -161,3 +161,53 @@ def test_manual_closure_rejects_unauthorized_role() -> None:
 
     assert response.status_code == 403
     assert captured == {}
+
+
+def test_capacity_routes_resolve_tenant_when_local_middleware_has_no_auth_state() -> None:
+    captured: list[dict[str, object]] = []
+
+    async def guarded_proxy(**kwargs):
+        captured.append(kwargs)
+        return {"rows": []}
+
+    async def auth_context(_request):
+        return AuthContext(
+            user_id="admin-1",
+            role="Administrator",
+            tenant_id="tenant-a",
+            jwt_id="jwt-1",
+            session_jti="session-1",
+            token_type="access",
+            email="admin@example.com",
+        )
+
+    async def unused_proxy(**_kwargs):
+        raise AssertionError("raw proxy should not be called")
+
+    async def load_summary() -> dict[str, int]:
+        return {}
+
+    app = FastAPI()
+    app.include_router(build_control_router(
+        settings=SimpleNamespace(approval_service_url="http://approval-service:8000"),
+        guarded_proxy=guarded_proxy,
+        raw_proxy=unused_proxy,
+        trace_id_from_header=lambda value: value or "test-trace",
+        analyzer=SimpleNamespace(),
+        load_recent_events=lambda _limit: [],
+        build_audit_contract=lambda _event: {},
+        load_audit_summary=load_summary,
+        auth_context_from_request=auth_context,
+    ))
+
+    read_response = TestClient(app).get("/approval/capacity")
+    write_response = TestClient(app).put(
+        "/approval/capacity/reviewer%40example.com",
+        json={"tenant_id": "spoofed", "weekly_hours": 20},
+    )
+
+    assert read_response.status_code == 200
+    assert captured[0]["path"] == "/capacity?tenant_id=tenant-a"
+    assert write_response.status_code == 200
+    assert captured[1]["path"] == "/capacity/reviewer@example.com"
+    assert captured[1]["payload"]["tenant_id"] == "tenant-a"

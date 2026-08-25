@@ -1336,6 +1336,52 @@ async def create_schema(engine: AsyncEngine) -> None:
                     if int(has_index or 0) == 0:
                         await connection.execute(text(f"CREATE INDEX {index_name} ON {table_name} ({columns})"))
 
+                # Wave 9 added immutable plan binding and evaluation-retention
+                # metadata. Existing Docker volumes are upgraded explicitly:
+                # SQLAlchemy's create_all() only creates missing tables and
+                # never adds columns or indexes to an existing table.
+                wave9_columns = (
+                    ("approvals", "plan_id", "CHAR(32) NULL"),
+                    ("approvals", "plan_fingerprint", "VARCHAR(71) NULL"),
+                    ("approvals", "approval_expires_at", "DATETIME NULL"),
+                    ("approvals", "approver_role", "VARCHAR(64) NULL"),
+                    ("evaluation_records", "tenant_id", "VARCHAR(128) NOT NULL DEFAULT 'default'"),
+                    ("evaluation_records", "expires_at", "DATETIME NULL"),
+                    ("evaluation_records", "artifact_signature", "VARCHAR(255) NULL"),
+                )
+                for table_name, column_name, definition in wave9_columns:
+                    has_column = await connection.scalar(
+                        text(
+                            "SELECT COUNT(*) FROM information_schema.columns "
+                            "WHERE table_schema = DATABASE() "
+                            "AND table_name = :table_name AND column_name = :column_name"
+                        ),
+                        {"table_name": table_name, "column_name": column_name},
+                    )
+                    if int(has_column or 0) == 0:
+                        await connection.execute(
+                            text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+                        )
+
+                wave9_indexes = (
+                    ("approvals", "ix_approvals_plan_id", "plan_id"),
+                    ("approvals", "ix_approvals_plan_fingerprint", "plan_fingerprint"),
+                    ("evaluation_records", "ix_evaluation_records_tenant_id", "tenant_id"),
+                    ("evaluation_records", "ix_evaluation_records_expires_at", "expires_at"),
+                    ("evaluation_records", "ix_evaluation_records_artifact_signature", "artifact_signature"),
+                )
+                for table_name, index_name, columns in wave9_indexes:
+                    has_index = await connection.scalar(
+                        text(
+                            "SELECT COUNT(*) FROM information_schema.statistics "
+                            "WHERE table_schema = DATABASE() "
+                            "AND table_name = :table_name AND index_name = :index_name"
+                        ),
+                        {"table_name": table_name, "index_name": index_name},
+                    )
+                    if int(has_index or 0) == 0:
+                        await connection.execute(text(f"CREATE INDEX {index_name} ON {table_name} ({columns})"))
+
                 knowledge_content_type = await connection.scalar(
                     text(
                         "SELECT DATA_TYPE FROM information_schema.columns "

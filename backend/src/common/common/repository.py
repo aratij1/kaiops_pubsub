@@ -1353,7 +1353,16 @@ class IncidentRepository:
             else {}
         )
 
-        context_payload: dict[str, Any] = {}
+        durable_context_snapshot = await self.latest_context_snapshot(
+            incident_id_str,
+            tenant_id=str(incident_record.tenant_id or "default"),
+        )
+        context_payload: dict[str, Any] = (
+            dict(durable_context_snapshot.get("context") or {})
+            if isinstance(durable_context_snapshot, dict)
+            and isinstance(durable_context_snapshot.get("context"), dict)
+            else {}
+        )
         context_event_payload = next(
             (
                 item.get("payload")
@@ -1367,14 +1376,12 @@ class IncidentRepository:
         if isinstance(context_event_payload, dict):
             nested_context = context_event_payload.get("context")
             if isinstance(nested_context, dict):
-                context_payload = dict(nested_context)
+                for key, value in nested_context.items():
+                    context_payload.setdefault(key, value)
             else:
-                context_payload = {
-                    "deployment": context_event_payload.get("deployment"),
-                    "related_incidents": context_event_payload.get("related_incidents"),
-                    "dependency_services": context_event_payload.get("dependency_services"),
-                    "document_available": context_event_payload.get("document_available"),
-                }
+                for key in ("deployment", "related_incidents", "dependency_services", "document_available"):
+                    if context_event_payload.get(key) is not None:
+                        context_payload.setdefault(key, context_event_payload.get(key))
 
         context_metadata = context_payload.get("metadata") if isinstance(context_payload.get("metadata"), dict) else {}
         if recommendation_metadata.get("rag_documents") is not None:
@@ -1399,6 +1406,23 @@ class IncidentRepository:
             context_metadata.setdefault("context_sources", context_event_payload.get("context_sources"))
         if isinstance(context_event_payload.get("context_evidence"), dict):
             context_metadata.setdefault("context_evidence", context_event_payload.get("context_evidence"))
+        if durable_context_snapshot:
+            snapshot_provenance = {
+                key: durable_context_snapshot.get(key)
+                for key in (
+                    "snapshot_id",
+                    "source_incident_id",
+                    "context_fingerprint",
+                    "contract_version",
+                    "quality_score",
+                    "reusable",
+                    "source_manifest",
+                    "collected_at",
+                    "expires_at",
+                )
+            }
+            context_metadata.setdefault("snapshot", snapshot_provenance)
+            context_payload.setdefault("snapshot", snapshot_provenance)
 
         has_discovery_report = isinstance(context_metadata.get("discovery_report"), dict) and bool(context_metadata.get("discovery_report"))
         has_discovery_evidence = isinstance(context_metadata.get("discovery_evidence"), dict) and bool(context_metadata.get("discovery_evidence"))
@@ -4247,6 +4271,16 @@ class IncidentRepository:
             for evaluation in evaluation_result.scalars().all():
                 evaluation_by_incident.setdefault(evaluation.incident_id, evaluation)
 
+        context_snapshot_by_incident: dict[str, ContextSnapshotRecord] = {}
+        if include_enrichment and incident_ids:
+            context_snapshot_result = await self.session.execute(
+                select(ContextSnapshotRecord)
+                .where(ContextSnapshotRecord.incident_id.in_([str(incident_id) for incident_id in incident_ids]))
+                .order_by(ContextSnapshotRecord.collected_at.desc())
+            )
+            for snapshot in context_snapshot_result.scalars().all():
+                context_snapshot_by_incident.setdefault(str(snapshot.incident_id), snapshot)
+
         recommendation_by_id: dict[UUID, dict[str, Any]] = {}
         recommendation_ids = [row.recommendation_id for row in rows if row.recommendation_id is not None]
         if include_enrichment and recommendation_ids:
@@ -4270,6 +4304,36 @@ class IncidentRepository:
             projection_payload = dict(row.projection_payload or {})
             if canonical_alert_id is not None:
                 projection_payload.setdefault("alert_id", str(canonical_alert_id))
+            context_snapshot = context_snapshot_by_incident.get(str(row.incident_id))
+            if context_snapshot is not None:
+                snapshot_context = (
+                    dict(context_snapshot.payload)
+                    if isinstance(context_snapshot.payload, dict)
+                    else {}
+                )
+                if snapshot_context:
+                    projection_payload.setdefault("context", snapshot_context)
+                    snapshot_metadata = (
+                        snapshot_context.get("metadata")
+                        if isinstance(snapshot_context.get("metadata"), dict)
+                        else {}
+                    )
+                    if snapshot_metadata:
+                        projection_payload.setdefault("context_metadata", snapshot_metadata)
+                projection_payload.setdefault(
+                    "context_snapshot",
+                    {
+                        "snapshot_id": str(context_snapshot.snapshot_id),
+                        "source_incident_id": context_snapshot.source_incident_id,
+                        "context_fingerprint": context_snapshot.context_fingerprint,
+                        "contract_version": context_snapshot.contract_version,
+                        "quality_score": float(context_snapshot.quality_score or 0.0),
+                        "reusable": bool(context_snapshot.reusable),
+                        "source_manifest": context_snapshot.source_manifest or {},
+                        "collected_at": context_snapshot.collected_at,
+                        "expires_at": context_snapshot.expires_at,
+                    },
+                )
             evaluation = evaluation_by_incident.get(row.incident_id)
             if evaluation is not None:
                 evaluation_payload = dict(evaluation.report_payload or {})
