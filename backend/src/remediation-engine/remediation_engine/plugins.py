@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from ai_workbench_common.agentic import AgentContext, BaseAgent
+from common.execution_safety import ExecutionSafetyDecision, assess_execution_safety
 from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus, utc_now
 from common.orchestration.execution_plan import docker_compose_restart_plan
 from common.orchestration.execution_plan_contract import verify_plan_fingerprint
@@ -1391,11 +1392,28 @@ class RemediationEngine(BaseAgent):
         }
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
+        assessment = assess_execution_safety(action, allowlisted_actions=set(self.plugins))
+        action.parameters["pre_execution_snapshot"] = assessment.snapshot
+        action.parameters["pre_execution_snapshot_hash"] = assessment.snapshot_hash
+        action.parameters["execution_idempotency_key"] = assessment.idempotency_key
+        if assessment.decision == ExecutionSafetyDecision.BLOCK:
+            action.status = RemediationStatus.SKIPPED
+            action.error = assessment.reason
+            action.output = "remediation blocked by execution safety controller"
+            action.completed_at = utc_now()
+            return action
+
         profile = action.parameters.get("connection_profile")
         profile = profile if isinstance(profile, dict) else {}
         executor_type = str(profile.get("executor_type") or profile.get("connection_type") or "").strip().lower()
         action_type = executor_type if executor_type in {"jenkins", "azure_container_apps_job"} else action.action_type
-        action_type = action_type if action_type in self.tool_registry.tools else "api_execution"
+        action_type = str(action_type or "").strip().lower()
+        if action_type not in self.tool_registry.tools:
+            action.status = RemediationStatus.SKIPPED
+            action.error = "ACTION_TYPE_NOT_REGISTERED"
+            action.output = "remediation blocked by tool registry"
+            action.completed_at = utc_now()
+            return action
         try:
             payload = await self.tool_registry.execute(
                 action_type,

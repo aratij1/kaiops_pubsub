@@ -31,6 +31,22 @@ async def test_alert_intelligence_deduplicates_and_classifies() -> None:
 
 
 @pytest.mark.asyncio
+async def test_same_alert_from_replaced_pod_is_an_exact_duplicate() -> None:
+    agent = AlertIntelligenceAgent(deduplication_window_minutes=60)
+    first = make_alert()
+    first.labels["pod"] = "payments-api-7f44b7d6dd-abc12"
+    first, _ = await agent.process(first)
+
+    replacement = make_alert()
+    replacement.labels["pod"] = "payments-api-7f44b7d6dd-xyz89"
+    replacement, _ = await agent.process(replacement)
+
+    assert replacement.fingerprint == first.fingerprint
+    assert replacement.metadata["deduplication"]["disposition"] == "duplicate"
+    assert replacement.metadata["deduplication"]["match_type"] == "exact"
+
+
+@pytest.mark.asyncio
 async def test_alert_intelligence_uses_embedding_correlation() -> None:
     agent = AlertIntelligenceAgent(correlation_threshold=0.2)
     first, _ = await agent.process(make_alert("checkout payment latency high"))

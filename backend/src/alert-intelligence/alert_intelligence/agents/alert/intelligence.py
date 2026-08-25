@@ -261,11 +261,10 @@ class AlertIntelligenceAgent(BaseAgent):
         )
         stable = "|".join(
             [
-                alert.source,
+                self._norm(alert.source),
                 alert_identity,
                 self._norm(alert.service),
                 environment_family(alert.environment),
-                alert.labels.get("pod", ""),
             ]
         )
         return hashlib.sha256(stable.encode("utf-8")).hexdigest()

@@ -1877,13 +1877,18 @@ class IncidentRepository:
     async def find_open_incident_by_correlation_key(
         self, correlation_key: str, *, tenant_id: str = "default"
     ) -> dict[str, Any] | None:
-        """Resolve the canonical open incident that owns a correlated alert group."""
+        """Resolve the canonical open incident that owns a correlated alert group.
+
+        Canonical incident identity is independent of Jira. Requiring a ticket
+        here caused every duplicate received before Jira creation (or during a
+        Jira outage) to create a second incident instead of merging into the
+        already-open incident.
+        """
         normalized = str(correlation_key or "").strip()
         if not normalized:
             return None
         result = await self.session.execute(
             select(IncidentRecord)
-            .where(IncidentRecord.ticket_id.is_not(None))
             .where(IncidentRecord.tenant_id == tenant_id)
             .where(IncidentRecord.status.not_in(("closed", "resolved", "cancelled", "canceled")))
             .order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc())
