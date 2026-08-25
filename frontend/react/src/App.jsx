@@ -16,6 +16,7 @@ import "./routes/incidents/AnalysisModeSelector.css";
 import CopilotRoute from "./routes/copilot/CopilotRoute";
 import { breadcrumbForPath, groupedNavigationForRole, navigationItemForPath, TAB_SHORTCUT_BY_CODE, VALID_LEGACY_TABS, NAVIGATION_ITEMS } from "./app/navigation";
 import { allowedLegacyTabsForRole, canAccessDestination } from "./app/permissions";
+import { KaiOperationsShell } from "./components/shell/KaiOperationsShell";
 
 const LOCAL_JENKINS_ENDPOINT = "http://jenkins:8080";
 const LOCAL_JENKINS_JOB = "kaiops-auto-remediation";
@@ -225,6 +226,7 @@ const NAVIGATION_ICONS = {
   applications: Boxes,
   integrations: PlugZap,
   admin: Settings,
+  settings: Settings,
   executive: ChartNoAxesCombined,
 };
 
@@ -4871,7 +4873,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     window.setTimeout(() => {
       if (activeTab === "stream") void loadLandingPadRecent({ background: true });
       if (activeTab === "summary") void Promise.allSettled([loadGatewaySummary(), loadIncidentMetadata({ background: true })]);
-      if (activeTab === "ai-hub") void loadModelProviderStatus();
+      void loadModelProviderStatus();
       if (activeTab === "admin" && adminWorkspace === "alerts") void loadAlertSeverityOverrides();
     }, 250);
   }
@@ -5068,6 +5070,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
     loadRecentAlerts();
   }, [adminSession.accessToken, alertsLimit]);
+
+  useEffect(() => {
+    if (!Boolean(String(adminSession.accessToken || "").trim()) || activeTab !== "safety") {
+      return;
+    }
+    void Promise.allSettled([loadGatewaySummary(), loadGatewayRecent(), loadLandingPadRecent({ force: true })]);
+  }, [adminSession.accessToken, activeTab]);
 
   useEffect(() => {
     if (!Boolean(String(adminSession.accessToken || "").trim())) {
@@ -5788,6 +5797,25 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       reason: String(value?.reason || ""),
     }));
   }, [modelProviderStatus]);
+
+  const aiCapabilityStatus = useMemo(() => {
+    const explicitStatus = String(modelProviderStatus?.data?.status || modelProviderStatus?.data?.overall_status || "").trim().toLowerCase();
+    const configuredProviders = selectedModelProviderRows.filter((provider) => provider.configured);
+    const unhealthyProviders = configuredProviders.filter((provider) => !provider.healthy || provider.circuitOpen);
+    const degraded = Boolean(modelProviderStatus.error)
+      || ["degraded", "unavailable", "error", "failed", "unhealthy"].includes(explicitStatus)
+      || unhealthyProviders.length > 0;
+    const affectedProviders = unhealthyProviders.map((provider) => provider.name).join(", ");
+    return {
+      degraded,
+      loading: Boolean(modelProviderStatus.loading),
+      message: modelProviderStatus.error
+        ? "Provider status is unavailable. AI investigation may be delayed; deterministic monitoring remains active and execution stays governed by backend policy."
+        : affectedProviders
+          ? `${affectedProviders} reported an unhealthy or open-circuit state. Deterministic monitoring remains active and execution stays governed by backend policy.`
+          : "",
+    };
+  }, [modelProviderStatus, selectedModelProviderRows]);
 
   const selectedAlertRouting = useMemo(() => extractObservedRoutingMetrics(selectedAlertWorkflow), [selectedAlertWorkflow]);
 
@@ -8249,6 +8277,22 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const currentNavigationItem = useMemo(() => navigationItemForPath(currentPath), [currentPath]);
   const currentBreadcrumb = useMemo(() => breadcrumbForPath(currentPath), [currentPath]);
   const restrictedDestination = useMemo(() => new URLSearchParams(currentSearch).get("destination") || "", [currentSearch]);
+  const kaiStateSummary = useMemo(() => {
+    const rows = monitorScopedIncidentMetadata || [];
+    const statusIncludes = (row, values) => values.some((value) => String(row?.status || row?.state || row?.remediation_status || "").toLowerCase().includes(value));
+    const terminal = (row) => statusIncludes(row, ["closed", "resolved", "cancelled"]);
+    const resolving = rows.filter((row) => statusIncludes(row, ["execut", "remediat", "rollback"])).length;
+    const validating = rows.filter((row) => statusIncludes(row, ["validat", "verif"])).length;
+    const blocked = rows.filter((row) => statusIncludes(row, ["blocked", "failed", "manual_intervention"])).length;
+    const investigating = rows.filter((row) => !terminal(row) && !statusIncludes(row, ["approval", "execut", "remediat", "rollback", "validat", "verif", "blocked", "failed"])).length;
+    return [
+      { label: "Investigating", value: investigating, tone: "active" },
+      { label: "Resolving", value: resolving, tone: "active" },
+      { label: "Waiting approval", value: pendingApprovals.length, tone: pendingApprovals.length ? "attention" : "calm" },
+      { label: "Validating", value: validating, tone: "active" },
+      { label: "Blocked", value: blocked, tone: blocked ? "attention" : "calm" },
+    ];
+  }, [monitorScopedIncidentMetadata, pendingApprovals]);
   const projectOnboardingRows = useMemo(
     () => (onboardingState.rows || []).filter((row) => String(row?.provider_name || "").trim().toLowerCase() === "project"),
     [onboardingState.rows],
@@ -9700,7 +9744,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }
 
   return (
-    <main className={`app-shell density-${uiDensity}`}>
+    <div className={`app-shell density-${uiDensity}`}>
       <a className="skip-link" href="#workspace-content">Skip to workspace content</a>
       {!isBrowserOnline ? (
         <aside className="connectivity-banner" role="alert" aria-live="assertive">
@@ -9708,7 +9752,38 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           <button type="button" className="button-secondary" onClick={() => { if (navigator.onLine) { setIsBrowserOnline(true); refreshAll(); } }}>Retry connection</button>
         </aside>
       ) : null}
-      <div className="app-layout">
+      <KaiOperationsShell
+        navigationGroups={navigationGroups}
+        currentItem={currentNavigationItem}
+        currentPath={currentPath}
+        role={currentRole}
+        onNavigate={openNavigationItem}
+        projects={monitorApplications}
+        project={applicationToMonitor}
+        onProjectChange={setApplicationToMonitor}
+        environment={selectedApplicationConnection.environment}
+        health={health}
+        aiCapability={aiCapabilityStatus}
+        autonomyMode={selectedAlertRouting?.execution_mode || observedRouting?.execution_mode || ""}
+        approvalCount={pendingApprovals.length}
+        notificationCount={globalOperationalData.notifications.length}
+        operationalQuery={globalOperationsQuery}
+        onOperationalQueryChange={setGlobalOperationsQuery}
+        operationalResults={globalOperationalData.results}
+        notifications={globalOperationalData.notifications}
+        onOpenOperationalItem={openGlobalOperationalItem}
+        onOpenNotifications={() => { setGlobalOperationsView("notifications"); setGlobalOperationsOpen(true); }}
+        onAskKai={() => setIsCopilotOpen(true)}
+        user={adminSession?.user}
+        density={uiDensity}
+        theme={uiTheme}
+        onDensityChange={setUiDensity}
+        onThemeChange={setUiTheme}
+        onLogout={adminLogout}
+        kaiStates={kaiStateSummary}
+        restrictedDestination={restrictedDestination}
+      >
+      <div className="app-layout kai-legacy-frame">
         <aside className="sidebar panel sidebar-panel">
           <div className="sidebar-head">
             <KaiMSBrand onActivate={() => onNavigatePath?.("/")} />
@@ -9788,7 +9863,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
         </aside>
 
-        <section className="content-area" id="workspace-content" tabIndex={-1}>
+        <section className="content-area" id="legacy-workspace-content" tabIndex={-1}>
           <header className="hero">
             <nav className="route-breadcrumbs" aria-label="Breadcrumb">
               {currentBreadcrumb.map((item, index) => <span key={`${item.label}-${index}`}>
@@ -9972,7 +10047,15 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               filters: metadataFilters,
               refresh: loadIncidentMetadata,
               updateFilter: (name, value) => setMetadataFilters((current) => ({ ...current, [name]: value })),
-              open: (row, stage = "overview") => openAlertDetailsFromIncident(row, stage),
+              open: (row) => {
+                const incidentId = String(row?.incident_id || row?.id || "").trim();
+                if (incidentId && typeof onNavigatePath === "function") {
+                  onNavigatePath(`/incidents/${encodeURIComponent(incidentId)}`);
+                  return;
+                }
+                openAlertDetailsFromIncident(row, "overview");
+              },
+              openTechnical: (row, stage = "overview") => openAlertDetailsFromIncident(row, stage),
             },
             alerts: {
               loading: landingPadRecent.loading,
@@ -13489,6 +13572,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
         </section>
       </div>
-    </main>
+      </KaiOperationsShell>
+    </div>
   );
 }

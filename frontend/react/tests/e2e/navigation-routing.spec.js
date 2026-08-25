@@ -23,30 +23,27 @@ test("legacy bookmarks, canonical navigation and scroll state survive route chan
   await page.getByRole("button", { name: "Sign In" }).click();
 
   await expect(page).toHaveTitle("Approvals | KaiMS");
-  await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText("Operations");
-  await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText("Approvals");
+  await expect(page.getByRole("heading", { level: 1, name: "Approvals" })).toBeVisible();
   await page.getByRole("button", { name: "Overview", exact: true }).click();
   await expect(page).toHaveURL(/\/$/);
-  await expect(page.getByRole("heading", { level: 1, name: "Incident Summary" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "Operations Overview" })).toBeVisible();
   await page.evaluate(() => window.scrollTo(0, 500));
   const savedDashboardScroll = await page.evaluate(() => window.scrollY);
   expect(savedDashboardScroll).toBeGreaterThan(0);
 
-  await page.getByRole("button", { name: "Live Stream", exact: true }).click();
+  await page.getByRole("button", { name: "Alerts", exact: true }).click();
   await expect(page).toHaveURL(/\/alerts$/);
-  await expect(page).toHaveTitle("Live Stream | KaiMS");
+  await expect(page).toHaveTitle("Alert Signals | KaiMS");
   await page.getByRole("button", { name: "Overview", exact: true }).click();
-  await expect(page.getByRole("heading", { level: 1, name: "Incident Summary" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "Operations Overview" })).toBeVisible();
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThanOrEqual(savedDashboardScroll - 24);
 
   await page.setViewportSize({ width: 390, height: 844 });
-  const mobileNavigation = page.getByLabel("Navigate to");
-  await expect(mobileNavigation).toBeVisible();
-  await mobileNavigation.selectOption("/applications");
+  await page.getByRole("button", { name: "Open navigation" }).click();
+  await page.getByRole("button", { name: "Applications", exact: true }).click();
   await expect(page).toHaveURL(/\/applications$/);
-  await expect(page).toHaveTitle("Project Management | KaiMS");
-  await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText("Administration");
-  await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText("Project Management");
+  await expect(page).toHaveTitle("Application Portfolio | KaiMS");
+  await expect(page.getByRole("heading", { level: 1, name: "Application Portfolio" })).toBeVisible();
 });
 
 test("a restricted deep link redirects with a clear role explanation", async ({ page }) => {
@@ -66,7 +63,7 @@ test("a restricted deep link redirects with a clear role explanation", async ({ 
   await page.getByLabel("Username").fill("operator");
   await page.getByLabel("Password").fill("Operator@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
-  await expect(page).toHaveURL(/\/\?access=restricted&destination=User%20Management/);
-  await expect(page.getByRole("status")).toContainText("User Management is not available to your current role");
+  await expect(page).toHaveURL(/\/\?access=restricted&destination=Users%20%26%20Access/);
+  await expect(page.getByRole("status")).toContainText("Users & Access is not available to your role");
   await expect(page.getByRole("navigation", { name: "Primary navigation" })).not.toContainText("Administration");
 });

@@ -1,107 +1,81 @@
-import { Activity, ArrowRight, Bell, Bot, CalendarDays, CheckCircle2, CircleAlert, Filter, Info, ShieldCheck } from "lucide-react";
-import { useRouteRuntime } from "../../app/routeRuntime";
+import { Activity, ArrowRight, Bot, Check, CheckCircle2, CircleAlert, Clock3, FileCheck2, RefreshCw, RotateCcw, ShieldCheck, Siren, Sparkles } from "lucide-react";
+
+import { useRouteRuntime, type IncidentRow } from "../../app/routeRuntime";
 import "./DashboardRoute.css";
-import "./DashboardA11y.css";
-import "./DashboardTruth.css";
 
-const service=(v?:string)=>String(v||"Unassigned").replace(/[-_]/g," ");
-const parseDate=(value:unknown)=>{const date=new Date(String(value||""));return Number.isFinite(date.getTime())?date:null};
-const severityNumber=(value:unknown)=>{const severity=String(value||"").toLowerCase();if(["critical","sev1","p1"].includes(severity))return 1;if(["high","sev2","p2"].includes(severity))return 2;if(["medium","warning","sev3","p3"].includes(severity))return 3;return 4};
-const numeric=(value:unknown)=>{const number=Number(String(value??"").replace(/[^0-9.-]/g,""));return Number.isFinite(number)?number:null};
-const formatDuration=(milliseconds:number|null)=>{if(milliseconds===null)return"Unavailable";const minutes=Math.max(0,Math.round(milliseconds/60000)),days=Math.floor(minutes/1440),hours=Math.floor((minutes%1440)/60),mins=minutes%60;return days?`${days}d ${hours}h`:hours?`${hours}h ${mins}m`:`${mins}m`};
+const terminal = (row: IncidentRow) => ["closed", "resolved", "recovered", "cancelled"].some((value) => String(row.status || "").toLowerCase().includes(value));
+const incidentId = (row: IncidentRow) => String(row.incident_id || row.id || "Incident");
+const title = (row: IncidentRow) => String(row.title || row.summary || `${row.service || "Service"} incident`);
+const status = (row: IncidentRow) => String(row.status || "investigating").replaceAll("_", " ");
+const isCritical = (row: IncidentRow) => ["critical", "sev1", "p1"].includes(String(row.severity || "").toLowerCase());
+const isFailed = (row: IncidentRow) => ["failed", "validation_failed", "rollback_failed", "manual_intervention_required"].some((value) => String(row.status || "").toLowerCase().includes(value));
+const needsApproval = (row: IncidentRow) => String(row.status || "").toLowerCase().includes("approval") || String(row.approval_status || "").toLowerCase().includes("pending");
 
-export default function DashboardRoute(){
- const {dashboard,executive,incidents,alerts}=useRouteRuntime();
- const canAccessExecutive = dashboard.allowedTabs.includes("executive");
- const canAccessRag = dashboard.allowedTabs.includes("rag");
- const buckets=Array.from({length:7},(_,index)=>{const date=new Date();date.setHours(0,0,0,0);date.setDate(date.getDate()-(6-index));return{key:date.toISOString().slice(0,10),label:date.toLocaleDateString(undefined,{month:"short",day:"numeric"}),severity:[0,0,0,0]}});
- const bucketMap=new Map(buckets.map(row=>[row.key,row])),seen=new Set<string>();
- incidents.rows.forEach((row,index)=>{const id=String(row.incident_id||row.id||`${row.service}-${row.created_at}-${index}`);if(seen.has(id))return;seen.add(id);const date=parseDate(row.created_at||row.latest_event_at||row.updated_at);const bucket=date?bucketMap.get(date.toISOString().slice(0,10)):null;if(bucket)bucket.severity[severityNumber(row.severity)-1]+=1});
- const trend=buckets.map(row=>({...row,value:row.severity.reduce((sum,value)=>sum+value,0)})),total=trend.reduce((sum,row)=>sum+row.value,0),max=Math.max(1,...trend.map(row=>row.value));
- const active=incidents.rows.filter(row=>!["closed","resolved","cancelled"].includes(String(row.status||"").toLowerCase()));
- const critical=alerts.rows.filter(row=>severityNumber(row.severity||row.labels?.severity)===1).length;
- const closedRows=executive.recentlyClosed;
- const durationsFor=(level?:number)=>closedRows.filter(row=>!level||severityNumber(row.severity)===level).map(row=>{const start=parseDate(row.created_at),end=parseDate(row.closed_at||row.updated_at);return start&&end&&end>=start?end.getTime()-start.getTime():null}).filter((value):value is number=>value!==null);
- const averageDuration=(level?:number)=>{const values=durationsFor(level);return values.length?values.reduce((sum,value)=>sum+value,0)/values.length:null};
- const p95=executive.latencyChart.length?numeric(executive.statCards.find(card=>card.label==="P95 Latency")?.value):null,requests=numeric(executive.statCards.find(card=>card.label==="Total Requests")?.value)||0,failed=numeric(executive.statCards.find(card=>card.label==="Failures")?.value)||0;
- const successRate=requests>0?Math.max(0,(requests-failed)/requests*100):null;
- const groups=new Map<string,{row:(typeof active)[number];count:number}>();active.forEach(row=>{const key=service(row.service),current=groups.get(key);groups.set(key,{row:current?.row||row,count:(current?.count||0)+1})});
- const serviceRows=[...groups.entries()].slice(0,5),severityTotals=[1,2,3,4].map(level=>incidents.rows.filter(row=>severityNumber(row.severity)===level).length);
- const kpis=[
-  {label:"Overall SLO Score",value:"Not configured",detail:"No authoritative SLO objective/query is registered",tone:"muted"},
-  {label:"API Success Rate",value:successRate===null?"Unavailable":`${successRate.toFixed(2)}%`,detail:requests?`${requests} measured gateway requests`:"No gateway request samples",tone:""},
-  {label:"API Latency (P95)",value:p95===null?"Unavailable":`${p95.toFixed(1)} ms`,detail:p95===null?"No measured latency samples":"Measured from gateway audit events",tone:p95!==null&&p95>1000?"amber":""},
-  {label:"Error Budget",value:"Not configured",detail:"Requires an SLO target and burn-rate query",tone:"muted"},
- ];
- return <section className="ro-page">
-  <header className="ro-heading"><div><h2>Reliability Overview</h2><p>Observed operational data only · no synthetic fallback values</p></div><div className="ro-tools">
-   <div style={{ display: "flex", alignItems: "center", position: "relative" }}>
-    <CalendarDays style={{ position: "absolute", left: "10px", width: "14px", pointerEvents: "none", color: "#5c687d" }} />
-    <select
-      aria-label="Time range"
-      disabled
-      title="Data range is locked to 7 days based on telemetry retention limits"
-      style={{
-        height: "34px",
-        paddingLeft: "28px",
-        paddingRight: "10px",
-        border: "1px solid #dbe2ea",
-        borderRadius: "7px",
-        background: "#f4f6f9",
-        color: "#5c687d",
-        fontSize: ".65rem",
-        cursor: "not-allowed",
-        appearance: "none",
-        fontWeight: 500,
-      }}
-    >
-      <option>Last 7 days</option>
-    </select>
-   </div>
-   <button aria-label="Notifications" onClick={()=>dashboard.openSection("notifications")}><Bell/></button>
-   <div style={{ display: "flex", alignItems: "center", position: "relative" }}>
-    <Filter style={{ position: "absolute", left: "10px", width: "14px", pointerEvents: "none", color: "#27344b" }} />
-    <select
-      value={dashboard.selectedProject}
-      onChange={(e)=>dashboard.selectProject(e.target.value)}
-      aria-label="Filter live scope"
-      style={{
-        height: "34px",
-        paddingLeft: "28px",
-        paddingRight: "18px",
-        border: "1px solid #dbe2ea",
-        borderRadius: "7px",
-        background: "#fff",
-        color: "#27344b",
-        fontSize: ".65rem",
-        cursor: "pointer",
-        appearance: "none",
-        fontWeight: 500,
-      }}
-    >
-      {dashboard.observedProjects.map((name)=><option key={name} value={name}>{name}</option>)}
-    </select>
-   </div>
-  </div></header>
-  <div className="ro-layout"><main className="ro-main">
-   <article className="ro-card"><header><h3>Observed Reliability Signals <span title="KPIs derived from service health probes, MTTA, MTTR, and automation rate in the current window."><Info tabIndex={0} role="img" aria-label="KPIs derived from service health probes, MTTA, MTTR, and automation rate in the current window." style={{ cursor: "help", width: "13px", height: "13px", marginLeft: "4px", color: "#8c98aa" }} /></span></h3>
-   {canAccessExecutive ? (
-    <button onClick={()=>dashboard.openSection("executive")}>View source metrics <ArrowRight/></button>
-   ) : (
-    <button disabled title="This destination is not available to your role" style={{ display: "flex", alignItems: "center", gap: "4px", padding: "0", border: "0", background: "none", color: "#8c98aa", fontSize: ".61rem", fontWeight: 700, cursor: "not-allowed" }}>View source metrics <ArrowRight/></button>
-   )}
-   </header><div className="ro-kpis">{kpis.map(item=><div key={item.label}><span>{item.label}</span><strong className={item.tone}>{item.value}</strong><small>{item.detail}</small></div>)}</div></article>
-   <article className="ro-card ro-trends"><header><h3>Incident Trends <span title="Count of newly created incidents bucketed by severity level over a 7-day rolling window."><Info tabIndex={0} role="img" aria-label="Count of newly created incidents bucketed by severity level over a 7-day rolling window." style={{ cursor: "help", width: "13px", height: "13px", marginLeft: "4px", color: "#8c98aa" }} /></span></h3><select aria-label="Incident trend interval" disabled title="Trends are calculated on a daily rolling basis" style={{ cursor: "not-allowed", opacity: 0.85 }}><option>Daily</option></select></header><div className="ro-summary"><div><span>Created incidents</span><strong>{total}</strong><small className="ro-source-label">Incident store · last 7 days</small></div><div className="ro-legend">{[1,2,3,4].map(level=><span key={level}><i className={`sev${level}`}/>Sev {level}</span>)}</div></div><div className="ro-bars">{trend.map(row=><div className="ro-column" key={row.key}><div className="ro-bar" style={{height:row.value?`${Math.max(8,row.value/max*100)}%`:"0"}} aria-label={`${row.label}: ${row.value} incidents`}>{row.severity.map((count,index)=>count?<i key={index} style={{flexGrow:count}} title={`Sev ${index+1}: ${count}`}/>:null)}</div><span>{row.label}</span></div>)}</div></article>
-   <article className="ro-card ro-mttr"><header><h3>Mean-Time-to-Resolution (MTTR) <span title="Calculated from timestamped incident closure durations."><Info tabIndex={0} role="img" aria-label="Calculated from timestamped incident closure durations." style={{ cursor: "help", width: "13px", height: "13px", marginLeft: "4px", color: "#8c98aa" }} /></span></h3></header><div className="ro-mttr-grid">{[["MTTR (All Incidents)",averageDuration(),durationsFor().length],["MTTR (Sev 1)",averageDuration(1),durationsFor(1).length],["MTTR (Sev 2)",averageDuration(2),durationsFor(2).length]].map(([label,value,count])=><div key={String(label)}><span>{String(label)}</span><strong>{formatDuration(value as number|null)}</strong><small>{Number(count)?`Calculated from ${count} timestamped closure(s)`:"Insufficient lifecycle timestamps"}</small></div>)}<div className="ro-donut-wrap"><ul>{severityTotals.map((count,index)=><li key={index}><i className={`sev${index+1}`}/>Sev {index+1}<b>{count}</b></li>)}</ul></div></div></article>
-  </main><aside className="ro-side">
-   <article className="ro-card ro-briefing"><header><Bot/><div><h3>Operational Briefing</h3><p>Derived from the currently loaded API records</p></div></header><div className="ro-brief-list"><div><CheckCircle2/><p><strong>{requests} gateway requests observed</strong><span>{successRate===null?"Success rate unavailable until request samples arrive.":`${successRate.toFixed(2)}% completed without recorded failure.`}</span></p></div><div><CircleAlert/><p><strong>{active.length} open incidents</strong><span>Counted from incident records not in a terminal state.</span></p></div><div><ShieldCheck/><p><strong>{critical} critical alerts in scope</strong><span>Counted from the current alert API response.</span></p></div><div><Activity/><p><strong>{closedRows.length} recent closures available</strong><span>{durationsFor().length?`${durationsFor().length} contain timestamps usable for MTTR.`:"No closures contain a complete start/end timestamp pair."}</span></p></div></div>
-   {canAccessRag ? (
-    <button className="ro-primary" onClick={()=>dashboard.openSection("rag")}>Open AI Hub <ArrowRight/></button>
-   ) : (
-    <button className="ro-primary" disabled title="This destination is not available to your role" style={{ opacity: 0.5, cursor: "not-allowed" }}>Open AI Hub <ArrowRight/></button>
-   )}
-   </article>
-   <article className="ro-card ro-risk"><header><h3>Service Risk <span title="Open incidents classified by severity level and impact per active managed application connector."><Info tabIndex={0} role="img" aria-label="Open incidents classified by severity level and impact per active managed application connector." style={{ cursor: "help", width: "13px", height: "13px", marginLeft: "4px", color: "#8c98aa" }} /></span></h3><button onClick={()=>dashboard.openSection("summary")}>View all services <ArrowRight/></button></header><div className="ro-risk-head"><span>Service</span><span>Risk Level</span><span>Open</span><span>Source</span></div>{serviceRows.length?serviceRows.map(([name,item])=><button className="ro-risk-row" key={name} onClick={()=>incidents.open(item.row)}><span>{name}</span><em>{String(item.row.severity||"unknown")}</em><b>{item.count}</b><small>Incidents</small></button>):<div className="ro-empty"><ShieldCheck/>No open incidents returned by the API</div>}</article>
-  </aside></div>
- </section>;
+function timeAgo(value: unknown) {
+  const date = new Date(String(value || ""));
+  if (!Number.isFinite(date.getTime())) return "Time unavailable";
+  const minutes = Math.max(0, Math.round((Date.now() - date.getTime()) / 60_000));
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  return hours < 48 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
+}
+
+function WorkItem({ row, onOpen, action }: { row: IncidentRow; onOpen: () => void; action: string }) {
+  return <button type="button" className="oh-work-item" onClick={onOpen}>
+    <span className={`oh-severity is-${String(row.severity || "unknown").toLowerCase()}`}>{row.severity || "Unrated"}</span>
+    <span><strong>{title(row)}</strong><small>{incidentId(row)} · {row.service || "Service unavailable"} · {timeAgo(row.updated_at || row.created_at)}</small></span>
+    <span className="oh-work-action">{action}<ArrowRight aria-hidden="true" /></span>
+  </button>;
+}
+
+export default function DashboardRoute() {
+  const { dashboard, incidents, approvals, executive } = useRouteRuntime();
+  const active = incidents.rows.filter((row) => !terminal(row));
+  const critical = active.filter(isCritical);
+  const failed = active.filter(isFailed);
+  const pending = approvals.rows.filter((row) => needsApproval(row) || !["approved", "rejected", "completed"].includes(String(row.approval_status || row.status || "").toLowerCase()));
+  const pendingIds = new Set(pending.map((row) => incidentId(row)));
+  const kaiHandling = active.filter((row) => !pendingIds.has(incidentId(row)) && !isFailed(row));
+  const recentlyResolved = [...executive.recentlyClosed].sort((left, right) => new Date(String(right.closed_at || right.updated_at || 0)).getTime() - new Date(String(left.closed_at || left.updated_at || 0)).getTime()).slice(0, 4);
+  const autoResolved = recentlyResolved.filter((row) => String(row.execution_mode || "").toLowerCase().includes("auto")).length;
+  const rollbackCount = incidents.rows.filter((row) => String(row.status || "").toLowerCase().includes("rollback")).length;
+  const customerImpact = active.filter((row) => {
+    const payload = row.projection_payload || {};
+    return Boolean(payload.customer_impact || payload.business_impact || payload.impact);
+  }).length;
+  const closureDurations = executive.recentlyClosed.map((row) => {
+    const start = new Date(String(row.created_at || "")).getTime();
+    const end = new Date(String(row.closed_at || row.updated_at || "")).getTime();
+    return Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : null;
+  }).filter((value): value is number => value !== null);
+  const mttrMinutes = closureDurations.length ? Math.round(closureDurations.reduce((sum, value) => sum + value, 0) / closureDurations.length / 60_000) : null;
+  const attentionCount = pending.length + failed.length + critical.length;
+  const pulse = [
+    { label: "Active incidents", value: active.length, icon: Activity, open: () => dashboard.openSection("summary") },
+    { label: "Critical", value: critical.length, icon: Siren, open: () => dashboard.openSection("summary") },
+    { label: "Customer impact", value: customerImpact, icon: CircleAlert, open: () => dashboard.openSection("summary") },
+    { label: "Pending decisions", value: pending.length, icon: FileCheck2, open: () => dashboard.openSection("approval") },
+    { label: "Auto-resolved", value: autoResolved, icon: Sparkles, open: () => dashboard.openSection("closed") },
+    { label: "MTTR", value: mttrMinutes === null ? "—" : `${mttrMinutes}m`, icon: Clock3, open: () => dashboard.openSection("executive") },
+    { label: "Rollback rate", value: incidents.rows.length ? `${Math.round(rollbackCount / incidents.rows.length * 100)}%` : "—", icon: RotateCcw, open: () => dashboard.openSection("executive") },
+  ];
+
+  return <section className="operations-home">
+    <header className={`oh-status ${attentionCount ? "needs-attention" : "is-clear"}`}>
+      <div className="oh-status-icon">{attentionCount ? <CircleAlert aria-hidden="true" /> : <ShieldCheck aria-hidden="true" />}</div>
+      <div><span>Production status · observed records</span><h2>{attentionCount ? `${attentionCount} item${attentionCount === 1 ? "" : "s"} need attention` : "No active attention items"}</h2><p>{attentionCount ? "Kai has ranked the decisions and exceptions that may need human judgment." : `Kai is monitoring the loaded ${dashboard.selectedProject || "project"} scope.`}</p></div>
+      <div className="oh-scope"><label>Project<select value={dashboard.selectedProject} onChange={(event) => dashboard.selectProject(event.target.value)}>{dashboard.observedProjects.map((project) => <option value={project} key={project}>{project}</option>)}</select></label><button type="button" onClick={dashboard.refreshProjects}><RefreshCw aria-hidden="true" /> Refresh</button></div>
+    </header>
+
+    <section className="oh-pulse" aria-label="Operations pulse"><header><span>Operations pulse</span><small>Every metric opens its operational source</small></header><div>{pulse.map((metric) => { const Icon = metric.icon; return <button type="button" key={metric.label} onClick={metric.open}><Icon aria-hidden="true" /><span>{metric.label}</span><strong>{metric.value}</strong></button>; })}</div></section>
+
+    <div className="oh-attention-grid">
+      <section className="oh-lane needs-you"><header><div><FileCheck2 aria-hidden="true" /><span><small>Needs you</small><strong>Judgment, risk, and exceptions</strong></span></div><em>{pending.length + failed.length}</em></header><div>{pending.slice(0, 4).map((row) => <WorkItem key={`approval-${incidentId(row)}`} row={row} action="Review decision" onOpen={() => incidents.open(row)} />)}{failed.filter((row) => !pendingIds.has(incidentId(row))).slice(0, 3).map((row) => <WorkItem key={`failed-${incidentId(row)}`} row={row} action="Inspect failure" onOpen={() => incidents.open(row)} />)}{!pending.length && !failed.length ? <div className="oh-empty"><CheckCircle2 aria-hidden="true" /><span><strong>Nothing needs your decision</strong><small>Kai has no pending approvals or failed actions in the loaded scope.</small></span></div> : null}</div>{pending.length ? <button type="button" className="oh-lane-link" onClick={() => dashboard.openSection("approval")}>Open approval inbox <ArrowRight aria-hidden="true" /></button> : null}</section>
+      <section className="oh-lane kai-handling"><header><div><Bot aria-hidden="true" /><span><small>Kai is handling</small><strong>Investigations and governed action</strong></span></div><em>{kaiHandling.length}</em></header><div>{kaiHandling.slice(0, 6).map((row) => <WorkItem key={`kai-${incidentId(row)}`} row={row} action={status(row)} onOpen={() => incidents.open(row)} />)}{!kaiHandling.length ? <div className="oh-empty"><Bot aria-hidden="true" /><span><strong>No in-progress Kai work</strong><small>New investigations will appear from backend incident state.</small></span></div> : null}</div>{active.length ? <button type="button" className="oh-lane-link" onClick={() => dashboard.openSection("summary")}>Open incident inbox <ArrowRight aria-hidden="true" /></button> : null}</section>
+    </div>
+
+    <section className="oh-resolved"><header><div><CheckCircle2 aria-hidden="true" /><span><small>Recently resolved</small><h3>Verified outcomes from incident history</h3></span></div><button type="button" onClick={() => dashboard.openSection("closed")}>View history <ArrowRight aria-hidden="true" /></button></header>{recentlyResolved.length ? <div>{recentlyResolved.map((row) => <button type="button" key={`resolved-${incidentId(row)}`} onClick={() => incidents.open(row)}><span className="oh-resolved-check"><Check aria-hidden="true" /></span><span><strong>{title(row)}</strong><small>{incidentId(row)} · {row.service || "Service unavailable"}</small></span><span><strong>{String(row.execution_mode || "Resolution recorded").replaceAll("_", " ")}</strong><small>{timeAgo(row.closed_at || row.updated_at)}</small></span><ArrowRight aria-hidden="true" /></button>)}</div> : <div className="oh-empty"><CheckCircle2 aria-hidden="true" /><span><strong>No recent closures returned</strong><small>Resolved incidents will appear when the backend provides closure records.</small></span></div>}</section>
+
+    <footer className="oh-truth"><ShieldCheck aria-hidden="true" /><span><strong>Observed data only.</strong> Counts and states come from the current API responses; unavailable KPIs are shown as unavailable.</span></footer>
+  </section>;
 }

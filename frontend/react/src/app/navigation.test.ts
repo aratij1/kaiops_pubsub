@@ -7,7 +7,7 @@ describe("authoritative navigation", () => {
   it("has unique canonical paths and destination identifiers", () => {
     expect(new Set(NAVIGATION_ITEMS.map((item) => item.path)).size).toBe(NAVIGATION_ITEMS.length);
     expect(new Set(NAVIGATION_ITEMS.map((item) => item.id)).size).toBe(NAVIGATION_ITEMS.length);
-    expect(NAVIGATION_GROUPS.map((group) => group.label)).toEqual(["Operations", "Intelligence", "Governance", "Platform", "Administration"]);
+    expect(NAVIGATION_GROUPS.map((group) => group.label)).toEqual(["Operations", "Platform", "Governance", "Administration"]);
   });
 
   it("maps every route through its legacy compatibility tab", () => {
@@ -21,13 +21,15 @@ describe("authoritative navigation", () => {
     expect(LEGACY_REDIRECTS).toContainEqual({ from: "/approval", to: "/approvals" });
     expect(LEGACY_REDIRECTS).toContainEqual({ from: "/approval-queue-legacy", to: "/approvals" });
     expect(LEGACY_REDIRECTS).toContainEqual({ from: "/stream", to: "/alerts" });
+    expect(LEGACY_REDIRECTS).toContainEqual({ from: "/gateway-safety", to: "/automation" });
+    expect(LEGACY_REDIRECTS).toContainEqual({ from: "/admin", to: "/admin/users" });
   });
 
   it("keeps restricted destinations out of role navigation and explains why", () => {
     expect(canAccessTab("l1_operator", "home")).toBe(true);
     expect(canAccessDestination("l1_operator", "alerts")).toBe(true);
     expect(canAccessDestination("l1_operator", "admin")).toBe(false);
-    expect(allowedLegacyTabsForRole("l1_operator")).toEqual(["home", "stream", "summary"]);
+    expect(allowedLegacyTabsForRole("l1_operator")).toEqual(["home", "summary", "stream"]);
     expect(allowedLegacyTabsForRole("administrator")).toContain("executive");
     expect(permissionExplanation("l1_operator", "admin")).toMatch(/not available.*l1 operator/i);
   });
@@ -41,5 +43,10 @@ describe("authoritative navigation", () => {
   it("derives breadcrumbs and contextual workflow relationships", () => {
     expect(breadcrumbForPath("/approvals").map((item) => item.label)).toEqual(["Operations", "Approvals"]);
     expect(NAVIGATION_ITEMS.find((item) => item.id === "incidents")?.related).toEqual(["alerts", "approvals"]);
+  });
+
+  it("keeps the incident destination active for a command-center URL", () => {
+    expect(tabForPath("/incidents/INC-3481")).toBe("summary");
+    expect(breadcrumbForPath("/incidents/INC-3481").map((item) => item.label)).toEqual(["Operations", "Incidents"]);
   });
 });

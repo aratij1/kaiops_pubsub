@@ -11,9 +11,9 @@ export type LegacyTabId =
   | "summary"
   | "approval";
 
-export type NavigationGroup = "operations" | "intelligence" | "governance" | "platform" | "administration";
+export type NavigationGroup = "operations" | "governance" | "platform" | "administration";
 export type NavigationRole = "administrator" | "l1_operator" | "l2_engineer" | "l3_engineer" | "executive";
-export type NavigationIcon = "dashboard" | "alerts" | "incidents" | "approvals" | "copilot" | "agentFlow" | "knowledge" | "safety" | "audit" | "closed" | "applications" | "integrations" | "admin" | "executive";
+export type NavigationIcon = "dashboard" | "alerts" | "incidents" | "approvals" | "copilot" | "agentFlow" | "knowledge" | "safety" | "audit" | "closed" | "applications" | "integrations" | "admin" | "settings" | "executive";
 export type NavigationId = NavigationIcon;
 
 export interface NavigationItem {
@@ -37,26 +37,26 @@ const INCIDENT_ROLES = ["administrator", "l2_engineer", "l3_engineer", "executiv
 
 export const NAVIGATION_GROUPS = [
   { id: "operations", label: "Operations" },
-  { id: "intelligence", label: "Intelligence" },
-  { id: "governance", label: "Governance" },
   { id: "platform", label: "Platform" },
+  { id: "governance", label: "Governance" },
   { id: "administration", label: "Administration" },
 ] as const satisfies readonly { id: NavigationGroup; label: string }[];
 
 export const NAVIGATION_ITEMS: readonly NavigationItem[] = [
-  { id: "dashboard", legacyTab: "home", path: "/", label: "Overview", pageTitle: "Incident Summary", group: "operations", routeModule: "dashboard", icon: "dashboard", keywords: ["reliability", "overview", "incident", "summary"], allowedRoles: ALL_ROLES },
-  { id: "alerts", legacyTab: "stream", path: "/alerts", label: "Live Stream", pageTitle: "Live Stream", group: "operations", routeModule: "alerts", icon: "alerts", keywords: ["live", "ingestion", "stream", "alerts", "events"], allowedRoles: ALL_ROLES, related: ["incidents"] },
-  { id: "incidents", legacyTab: "summary", path: "/incidents", label: "Alerts & Incidents", pageTitle: "Alerts & Incidents", group: "operations", routeModule: "incidents", icon: "incidents", keywords: ["alerts", "case", "investigation", "metadata"], allowedRoles: ALL_ROLES, related: ["alerts", "approvals"] },
+  { id: "dashboard", legacyTab: "home", path: "/", label: "Overview", pageTitle: "Operations Overview", group: "operations", routeModule: "dashboard", icon: "dashboard", keywords: ["attention", "reliability", "overview", "incident", "summary"], allowedRoles: ALL_ROLES },
+  { id: "incidents", legacyTab: "summary", path: "/incidents", label: "Incidents", pageTitle: "Incident Inbox", group: "operations", routeModule: "incidents", icon: "incidents", keywords: ["problems", "case", "investigation", "resolution"], allowedRoles: ALL_ROLES, related: ["alerts", "approvals"] },
+  { id: "alerts", legacyTab: "stream", path: "/alerts", label: "Alerts", pageTitle: "Alert Signals", group: "operations", routeModule: "alerts", icon: "alerts", keywords: ["signals", "live", "ingestion", "stream", "events"], allowedRoles: ALL_ROLES, related: ["incidents"] },
   { id: "approvals", legacyTab: "approval", path: "/approvals", label: "Approvals", pageTitle: "Approvals", group: "operations", routeModule: "approvals", icon: "approvals", keywords: ["review", "decision", "human gate"], allowedRoles: INCIDENT_ROLES, related: ["incidents", "closed"], showInNavigation: true },
-  { id: "copilot", legacyTab: "copilot", path: "/copilot", label: "KAI Assistant", pageTitle: "KAI Assistant", group: "intelligence", routeModule: "copilot", icon: "copilot", keywords: ["assistant", "analysis", "ai"], allowedRoles: INCIDENT_ROLES, showInNavigation: false },
-  { id: "agentFlow", legacyTab: "trace", path: "/agent-flow", label: "Agent Flow", pageTitle: "Agent Flow", group: "intelligence", routeModule: "agent-flow", icon: "agentFlow", keywords: ["trace", "workflow", "agents"], allowedRoles: ENGINEERING_ROLES, showInNavigation: false },
-  { id: "knowledge", legacyTab: "rag", path: "/knowledge", label: "AI Hub", pageTitle: "AI Hub", group: "intelligence", routeModule: "knowledge", icon: "knowledge", keywords: ["rag", "documents", "evidence"], allowedRoles: ENGINEERING_ROLES },
-  { id: "safety", legacyTab: "safety", path: "/gateway-safety", label: "Gateway Safety", pageTitle: "Gateway Safety", group: "governance", routeModule: "gateway-safety", icon: "safety", keywords: ["policy", "risk", "guardrail"], allowedRoles: ENGINEERING_ROLES, showInNavigation: false },
-  { id: "audit", legacyTab: "safety", path: "/audit", label: "Audit", pageTitle: "Audit", group: "governance", routeModule: "audit", icon: "audit", keywords: ["history", "compliance", "events"], allowedRoles: ENGINEERING_ROLES, showInNavigation: false },
+  { id: "copilot", legacyTab: "copilot", path: "/copilot", label: "Kai Assistant", pageTitle: "Kai Assistant", group: "operations", routeModule: "copilot", icon: "copilot", keywords: ["ask", "assistant", "analysis", "ai"], allowedRoles: INCIDENT_ROLES, showInNavigation: false },
+  { id: "agentFlow", legacyTab: "trace", path: "/agent-flow", label: "Agent Flow", pageTitle: "Agent Flow", group: "governance", routeModule: "agent-flow", icon: "agentFlow", keywords: ["trace", "workflow", "agents"], allowedRoles: ENGINEERING_ROLES, showInNavigation: false },
+  { id: "applications", legacyTab: "admin", path: "/applications", label: "Applications", pageTitle: "Application Portfolio", group: "platform", routeModule: "applications", icon: "applications", keywords: ["projects", "services", "inventory", "readiness"], allowedRoles: ENGINEERING_ROLES },
+  { id: "integrations", legacyTab: "admin", path: "/integrations", label: "Integrations", pageTitle: "Integration Launchpad", group: "platform", routeModule: "integrations", icon: "integrations", keywords: ["connectors", "monitoring", "providers", "onboarding"], allowedRoles: ENGINEERING_ROLES },
+  { id: "knowledge", legacyTab: "rag", path: "/knowledge", label: "Knowledge", pageTitle: "Operational Knowledge", group: "platform", routeModule: "knowledge", icon: "knowledge", keywords: ["runbooks", "rag", "documents", "evidence"], allowedRoles: ENGINEERING_ROLES },
+  { id: "safety", legacyTab: "safety", path: "/automation", label: "Automation", pageTitle: "AI Trust & Automation", group: "governance", routeModule: "gateway-safety", icon: "safety", keywords: ["autonomy", "policy", "risk", "guardrail", "trust"], allowedRoles: ENGINEERING_ROLES },
+  { id: "audit", legacyTab: "safety", path: "/audit", label: "Audit", pageTitle: "Audit Trail", group: "governance", routeModule: "audit", icon: "audit", keywords: ["history", "compliance", "events"], allowedRoles: ENGINEERING_ROLES },
   { id: "closed", legacyTab: "closed", path: "/closed-incidents", label: "Closed Incidents", pageTitle: "Closed Incidents", group: "governance", routeModule: "closed-incidents", icon: "closed", keywords: ["resolved", "historical", "tickets"], allowedRoles: INCIDENT_ROLES, related: ["incidents"], showInNavigation: false },
-  { id: "applications", legacyTab: "admin", path: "/applications", label: "Project Management", pageTitle: "Project Management", group: "administration", routeModule: "applications", icon: "applications", keywords: ["projects", "services", "inventory"], allowedRoles: ENGINEERING_ROLES },
-  { id: "integrations", legacyTab: "admin", path: "/integrations", label: "Project Onboarding", pageTitle: "Project Onboarding", group: "administration", routeModule: "integrations", icon: "integrations", keywords: ["connectors", "monitoring", "providers", "onboarding"], allowedRoles: ENGINEERING_ROLES },
-  { id: "admin", legacyTab: "admin", path: "/admin", label: "User Management", pageTitle: "User Management", group: "administration", routeModule: "admin", icon: "admin", keywords: ["users", "roles", "access", "configuration"], allowedRoles: ["administrator"] },
+  { id: "admin", legacyTab: "admin", path: "/admin/users", label: "Users & Access", pageTitle: "Users & Access", group: "administration", routeModule: "admin", icon: "admin", keywords: ["users", "roles", "access", "identity"], allowedRoles: ["administrator"] },
+  { id: "settings", legacyTab: "admin", path: "/admin/settings", label: "Platform Settings", pageTitle: "Platform Settings", group: "administration", routeModule: "admin", icon: "settings", keywords: ["platform", "configuration", "preferences"], allowedRoles: ["administrator"] },
   { id: "executive", legacyTab: "executive", path: "/executive", label: "Executive Dashboard", pageTitle: "Executive Dashboard", group: "governance", routeModule: "executive", icon: "executive", keywords: ["leadership", "business", "metrics"], allowedRoles: ["administrator", "l3_engineer", "executive"], showInNavigation: false },
 ];
 
@@ -65,6 +65,8 @@ export const LEGACY_REDIRECTS = [
   { from: "/approval-queue-legacy", to: "/approvals" },
   { from: "/stream", to: "/alerts" },
   { from: "/summary", to: "/incidents" },
+  { from: "/gateway-safety", to: "/automation" },
+  { from: "/admin", to: "/admin/users" },
 ] as const;
 
 export const TAB_SHORTCUT_BY_CODE: Readonly<Record<string, LegacyTabId>> = Object.freeze({
@@ -82,7 +84,11 @@ export const PATH_BY_TAB: Readonly<Record<LegacyTabId, string>> = Object.freeze(
 );
 
 export function navigationItemForPath(pathname: string): NavigationItem {
-  return NAVIGATION_ITEMS.find((item) => item.path === pathname) ?? NAVIGATION_ITEMS[0];
+  const normalized = pathname.length > 1 ? pathname.replace(/\/$/, "") : pathname;
+  const candidates = NAVIGATION_ITEMS
+    .filter((item) => item.path === "/" ? normalized === "/" : normalized === item.path || normalized.startsWith(`${item.path}/`))
+    .sort((left, right) => right.path.length - left.path.length);
+  return candidates[0] ?? NAVIGATION_ITEMS[0];
 }
 
 export function tabForPath(pathname: string): LegacyTabId {

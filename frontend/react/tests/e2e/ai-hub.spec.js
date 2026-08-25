@@ -26,7 +26,7 @@ async function signInToAiHub(page) {
 
 test("AI Hub presents health, capabilities, and accessible section navigation", async ({ page }) => {
   await signInToAiHub(page);
-  await expect(page.getByRole("heading", { level: 1, name: "AI Hub", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "Operational Knowledge", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { level: 2, name: "Operational intelligence" })).toBeVisible();
   await expect(page.getByRole("region", { name: "AI platform health" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "From evidence to governed action" })).toBeVisible();

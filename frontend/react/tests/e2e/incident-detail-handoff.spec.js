@@ -24,13 +24,12 @@ test("incident detail preserves nested alert identity while details load", async
   await expect(page.getByRole("button", { name: "Context agent incident", exact: true })).toBeVisible();
   await expect(page.getByText(incidentId, { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Context agent incident", exact: true }).click();
-  await expect(page).toHaveURL(new RegExp(`alert_id=${alertId}`));
-  await expect(page.getByRole("heading", { name: "Incident Response" })).toBeVisible();
-  await expect(page.getByText("Select an alert in Alert Stream to open the detail tabs workspace.")).toHaveCount(0);
-  await expect(page.getByRole("heading", { name: "kaiops-context-agent: ContextAgentFailure" })).toBeVisible({ timeout: 5000 });
+  await expect(page).toHaveURL(new RegExp(`/incidents/${incidentId}$`));
+  await expect(page.getByRole("heading", { name: "Context agent incident" })).toBeVisible();
+  await expect(page.getByText("From signal to verified recovery")).toBeVisible();
   await expect(page.getByText(incidentId, { exact: true })).toBeVisible();
-  await expect(page.locator(".detail-context")).toContainText("Severity: HIGH");
-  await expect(page.locator(".detail-context")).toContainText("Status: investigating");
+  await expect(page.locator(".ic-command-header")).toContainText("prod");
+  await expect(page.locator(".ic-command-header")).toContainText("investigating");
 });
 
 test("detail URL reconstructs the selected alert after a page refresh", async ({ page }) => {

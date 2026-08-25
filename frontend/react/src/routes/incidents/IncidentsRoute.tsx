@@ -8,6 +8,33 @@ import { formatIstTimestamp } from "../../appHelpers.jsx";
 import "./IncidentsRoute.css";
 
 const PAGE_SIZE = 10;
+type InboxView = "needs_me" | "kai_handling" | "critical" | "watching" | "resolved" | "all";
+
+function attentionScore(row: IncidentRow) {
+  const severity = String(row.severity || "").toLowerCase();
+  const status = String(row.status || "").toLowerCase();
+  const payload = row.projection_payload && typeof row.projection_payload === "object" ? row.projection_payload : {};
+  const ageHours = Math.max(0, (Date.now() - new Date(String(row.created_at || row.updated_at || Date.now())).getTime()) / 3_600_000);
+  return (["critical", "sev1", "p1"].includes(severity) ? 100 : ["high", "sev2", "p2"].includes(severity) ? 60 : severity === "medium" ? 30 : 10)
+    + (status.includes("approval") ? 120 : 0)
+    + (["failed", "blocked", "manual_intervention_required", "validation_failed", "rollback_failed"].some((value) => status.includes(value)) ? 140 : 0)
+    + (payload.customer_impact || payload.business_impact || payload.impact ? 50 : 0)
+    + (String(row.risk_tier || "").toLowerCase() === "high" ? 35 : 0)
+    + Math.min(48, ageHours);
+}
+
+function belongsToInboxView(row: IncidentRow, view: InboxView) {
+  const status = String(row.status || "").toLowerCase();
+  const severity = String(row.severity || "").toLowerCase();
+  const terminal = ["closed", "resolved", "recovered", "cancelled"].some((value) => status.includes(value));
+  const needsHuman = status.includes("approval") || ["failed", "blocked", "manual_intervention_required", "validation_failed", "rollback_failed"].some((value) => status.includes(value));
+  if (view === "needs_me") return !terminal && needsHuman;
+  if (view === "kai_handling") return !terminal && !needsHuman;
+  if (view === "critical") return !terminal && ["critical", "sev1", "p1"].includes(severity);
+  if (view === "watching") return !terminal && ["medium", "warning", "low", "info"].includes(severity);
+  if (view === "resolved") return terminal;
+  return true;
+}
 
 const stageOrder = [
   { id: "application", cockpit: "overview", label: "Application", detail: "Original source" },
@@ -285,19 +312,21 @@ export default function IncidentsRoute() {
     return saved === "flow" || saved === "details" ? saved : "summary";
   });
   const [page, setPage] = useState(1);
+  const [inboxView, setInboxView] = useState<InboxView>("all");
   const [inspector, setInspector] = useState<{ incidentId: string; stage: string } | null>(null);
   const groupedIncidents = useMemo(() => {
     const alertsById = new Map(alerts.rows.map((alert) => [String(alert.id || (alert as typeof alert & { alert_id?: string }).alert_id || ""), alert]));
     return groupIncidentsByJira(incidents.rows.map((row) => ({
       ...row,
       source_alert: row.source_alert || alertsById.get(String(row.alert_id || "")),
-    })));
+    }))).sort((left, right) => attentionScore(right) - attentionScore(left));
   }, [incidents.rows, alerts.rows]);
-  const pages = Math.max(1, Math.ceil(groupedIncidents.length / PAGE_SIZE));
+  const filteredIncidents = useMemo(() => groupedIncidents.filter((row) => belongsToInboxView(row, inboxView)), [groupedIncidents, inboxView]);
+  const pages = Math.max(1, Math.ceil(filteredIncidents.length / PAGE_SIZE));
   useEffect(() => setPage((current) => Math.min(current, pages)), [pages]);
   useEffect(() => window.localStorage.setItem("kaiops.incident-presentation", presentation), [presentation]);
   useEffect(() => setPage(1), [incidents.filters.risk_tier, incidents.filters.execution_mode, incidents.filters.status, incidents.filters.service]);
-  const rows = useMemo(() => groupedIncidents.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE), [groupedIncidents, page]);
+  const rows = useMemo(() => filteredIncidents.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE), [filteredIncidents, page]);
   const incidentAlertIds = useMemo(() => new Set(incidents.rows.map((row) => String(row.alert_id || "")).filter(Boolean)), [incidents.rows]);
   const visibleAlerts = useMemo(() => alerts.rows.filter((alert) => {
     if (recordType === "alerts") return true;
@@ -311,7 +340,10 @@ export default function IncidentsRoute() {
 
   return <section className="grid single-col operations-center">
     <OperationsWorkflowNav active="incidents" />
-    <div className="incident-list-heading"><div><h2>Alerts &amp; Incidents</h2><p>One operational queue from signal arrival through verified closure.</p></div><div className="operations-kpis" aria-label="Operational totals"><span><strong>{alerts.rows.length}</strong> alerts</span><span><strong>{active}</strong> active</span><span><strong>{groupedIncidents.length}</strong> incidents</span></div></div>
+    <div className="incident-list-heading"><div><h2>Incident Inbox</h2><p>Problems ranked by human attention, business risk, and blocked automation.</p></div><div className="operations-kpis" aria-label="Operational totals"><span><strong>{alerts.rows.length}</strong> signals</span><span><strong>{active}</strong> active</span><span><strong>{groupedIncidents.length}</strong> incidents</span></div></div>
+    <nav className="incident-inbox-views" aria-label="Incident inbox views">{([
+      ["needs_me", "Needs me"], ["kai_handling", "Kai handling"], ["critical", "Critical"], ["watching", "Watching"], ["resolved", "Resolved recently"], ["all", "All"],
+    ] as const).map(([id, label]) => <button type="button" key={id} className={inboxView === id ? "active" : ""} aria-pressed={inboxView === id} onClick={() => { setInboxView(id); setPage(1); }}>{label}<span>{groupedIncidents.filter((row) => belongsToInboxView(row, id)).length}</span></button>)}</nav>
     <div className="compact-filter-bar">
       <label>View<select value={recordType} onChange={(event) => setRecordType(event.target.value)}><option value="incidents">Incidents</option><option value="alerts">Alerts</option></select></label>
       {showIncidents ? <>{select("Risk", "risk_tier", ["all", "high", "medium", "low"])}{select("Status", "status", ["all", "open", "investigating", "awaiting_approval", "remediating", "validating", "closed", "failed"])}<label className="filter-grow">Service<input value={incidents.filters.service} placeholder="Search service" onChange={(event) => incidents.updateFilter("service", event.target.value)} /></label></> : <div className="alert-view-note">Showing alert intake and classification outcomes</div>}
@@ -428,6 +460,6 @@ export default function IncidentsRoute() {
       {showAlerts && !alerts.rows.length && !alerts.loading && !showIncidents ? <p className="empty-state">No alerts match this view.</p> : null}
       {showIncidents && !rows.length && !incidents.loading && !showAlerts ? <p className="empty-state">No incidents match this view.</p> : null}
     </div>
-    {showIncidents ? <footer className="table-pagination"><span>Showing {rows.length ? ((page - 1) * PAGE_SIZE) + 1 : 0}-{Math.min(page * PAGE_SIZE, groupedIncidents.length)} of {groupedIncidents.length}</span><div><button className="button-secondary" disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>Previous</button><span>{page} / {pages}</span><button className="button-secondary" disabled={page >= pages} onClick={() => setPage((value) => value + 1)}>Next</button></div></footer> : null}
+    {showIncidents ? <footer className="table-pagination"><span>Showing {rows.length ? ((page - 1) * PAGE_SIZE) + 1 : 0}-{Math.min(page * PAGE_SIZE, filteredIncidents.length)} of {filteredIncidents.length}</span><div><button className="button-secondary" disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>Previous</button><span>{page} / {pages}</span><button className="button-secondary" disabled={page >= pages} onClick={() => setPage((value) => value + 1)}>Next</button></div></footer> : null}
   </section>;
 }

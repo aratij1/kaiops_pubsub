@@ -16,12 +16,12 @@ test("connectivity loss is explicit and preserves the workspace", async ({ page,
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill("admin-password");
   await page.getByRole("button", { name: "Sign In" }).click();
-  await expect(page.getByRole("heading", { name: "Reliability Overview" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Operations Overview" })).toBeVisible();
 
   await context.setOffline(true);
   await page.evaluate(() => window.dispatchEvent(new Event("offline")));
   await expect(page.getByRole("alert")).toContainText("Connection lost");
-  await expect(page.getByRole("heading", { name: "Reliability Overview" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Operations Overview" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Retry connection" })).toBeVisible();
   await context.setOffline(false);
 });

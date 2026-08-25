@@ -37,7 +37,7 @@ test("login and primary workspace have no serious or critical accessibility viol
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill("admin-password");
   await page.getByRole("button", { name: "Sign In" }).click();
-  await expect(page.getByRole("heading", { level: 1, name: "Incident Summary" })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole("heading", { level: 1, name: "Operations Overview" })).toBeVisible({ timeout: 30_000 });
 
   const workspaceResults = await new AxeBuilder({ page }).analyze();
   const severeWorkspaceViolations = workspaceResults.violations.filter((row) => ["serious", "critical"].includes(row.impact));
@@ -50,7 +50,7 @@ test("keyboard users can bypass navigation and the workspace reflows at mobile w
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill("admin-password");
   await page.getByRole("button", { name: "Sign In" }).click();
-  await expect(page.getByRole("heading", { level: 1, name: "Incident Summary" })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole("heading", { level: 1, name: "Operations Overview" })).toBeVisible({ timeout: 30_000 });
 
   await page.keyboard.press("Tab");
   const skipLink = page.getByRole("link", { name: "Skip to workspace content" });
@@ -63,5 +63,5 @@ test("keyboard users can bypass navigation and the workspace reflows at mobile w
     () => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
   );
   expect(pageOverflows).toBeFalsy();
-  await expect(page.getByLabel("Navigate to")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Open navigation" })).toBeVisible();
 });

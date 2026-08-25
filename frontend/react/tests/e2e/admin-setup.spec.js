@@ -81,7 +81,7 @@ test("project onboarding exposes a complete monitoring integration contract", as
   await page.getByLabel("Password").fill("admin-password");
   await page.getByRole("button", { name: "Sign In" }).click();
 
-  await page.getByRole("button", { name: "Project Onboarding", exact: true }).click();
+  await page.getByRole("button", { name: "Integrations", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Integrations & Monitoring" })).toBeVisible();
   await expect(page.getByLabel("tenant id")).toBeVisible();
   await expect(page.getByLabel("owner team")).toBeVisible();

@@ -3,6 +3,13 @@
 .pytest_cache
 .ruff_cache
 .venv
+**/node_modules
+**/dist
+**/storybook-static
+.tmp
+**/test-results
+**/playwright-report
+**/artifacts
 __pycache__
 *.pyc
 data
