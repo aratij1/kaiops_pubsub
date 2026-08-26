@@ -89,6 +89,7 @@ class SqlAlertHistoryRepository:
             await session.merge(
                 AlertRecord(
                     id=alert.id,
+                    tenant_id=alert.tenant_id,
                     source=alert.source,
                     name=alert.name,
                     service=alert.service,

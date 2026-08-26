@@ -932,17 +932,28 @@ class IncidentRepository:
         await self.session.merge(projection)
         return True
 
-    async def get_processed_result_by_alert_id(self, alert_id: str) -> dict[str, Any] | None:
+    async def get_processed_result_by_alert_id(
+        self,
+        alert_id: str,
+        *,
+        tenant_id: str,
+    ) -> dict[str, Any] | None:
         normalized_alert_id = str(alert_id or "").strip()
         if not normalized_alert_id:
             return None
+        normalized_tenant_id = self._require("tenant_id", tenant_id)
 
         try:
             alert_uuid = UUID(normalized_alert_id)
         except ValueError:
             return None
 
-        alert_result = await self.session.execute(select(AlertRecord).where(AlertRecord.id == alert_uuid))
+        alert_result = await self.session.execute(
+            select(AlertRecord).where(
+                AlertRecord.id == alert_uuid,
+                AlertRecord.tenant_id == normalized_tenant_id,
+            )
+        )
         alert_record = alert_result.scalar_one_or_none()
         if alert_record is None:
             return None
@@ -959,7 +970,10 @@ class IncidentRepository:
         explicit_incident_uuid = self._parse_uuid(explicit_incident_id)
         if explicit_incident_uuid is not None:
             explicit_result = await self.session.execute(
-                select(IncidentRecord).where(IncidentRecord.id == explicit_incident_uuid)
+                select(IncidentRecord).where(
+                    IncidentRecord.id == explicit_incident_uuid,
+                    IncidentRecord.tenant_id == normalized_tenant_id,
+                )
             )
             incident_record = explicit_result.scalar_one_or_none()
 
@@ -970,7 +984,10 @@ class IncidentRepository:
             # a newer, still-investigating incident and hide its persisted RCA.
             projection_result = await self.session.execute(
                 select(IncidentProjectionRecord)
-                .where(IncidentProjectionRecord.alert_id == alert_uuid)
+                .where(
+                    IncidentProjectionRecord.alert_id == alert_uuid,
+                    IncidentProjectionRecord.tenant_id == normalized_tenant_id,
+                )
                 .order_by(
                     IncidentProjectionRecord.latest_event_at.desc(),
                     IncidentProjectionRecord.updated_at.desc(),
@@ -983,13 +1000,19 @@ class IncidentRepository:
             )
             if projection_incident_uuid is not None:
                 projection_incident_result = await self.session.execute(
-                    select(IncidentRecord).where(IncidentRecord.id == projection_incident_uuid)
+                    select(IncidentRecord).where(
+                        IncidentRecord.id == projection_incident_uuid,
+                        IncidentRecord.tenant_id == normalized_tenant_id,
+                    )
                 )
                 incident_record = projection_incident_result.scalar_one_or_none()
 
         if incident_record is None:
             incident_rows = await self.session.execute(
-                select(IncidentRecord).order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc()).limit(300)
+                select(IncidentRecord)
+                .where(IncidentRecord.tenant_id == normalized_tenant_id)
+                .order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc())
+                .limit(300)
             )
             for record in incident_rows.scalars().all():
                 payload = record.payload if isinstance(record.payload, dict) else {}
@@ -1004,7 +1027,10 @@ class IncidentRepository:
             service = str(alert_payload.get("service") or "").strip()
             severity = str(alert_payload.get("severity") or "").strip()
             if service:
-                fallback_stmt = select(IncidentRecord).where(IncidentRecord.service == service)
+                fallback_stmt = select(IncidentRecord).where(
+                    IncidentRecord.service == service,
+                    IncidentRecord.tenant_id == normalized_tenant_id,
+                )
                 if severity:
                     fallback_stmt = fallback_stmt.where(IncidentRecord.severity == severity)
                 fallback_result = await self.session.execute(
@@ -1016,7 +1042,10 @@ class IncidentRepository:
             alert_tokens = {_normalize_match_token(item) for item in _collect_alert_application_tokens(alert_payload)}
 
             app_result = await self.session.execute(
-                select(ApplicationRecord).order_by(ApplicationRecord.updated_at.desc()).limit(500)
+                select(ApplicationRecord)
+                .where(ApplicationRecord.tenant_id == normalized_tenant_id)
+                .order_by(ApplicationRecord.updated_at.desc())
+                .limit(500)
             )
             matched_application_payload: dict[str, Any] = {}
             for app_row in app_result.scalars().all():
@@ -1029,7 +1058,10 @@ class IncidentRepository:
                 break
 
             onboarding_result = await self.session.execute(
-                select(OnboardingStateRecord).order_by(OnboardingStateRecord.updated_at.desc()).limit(500)
+                select(OnboardingStateRecord)
+                .where(OnboardingStateRecord.tenant_id == normalized_tenant_id)
+                .order_by(OnboardingStateRecord.updated_at.desc())
+                .limit(500)
             )
             matched_onboarding_rows: list[OnboardingStateRecord] = []
             for onboarding_row in onboarding_result.scalars().all():
@@ -1201,6 +1233,7 @@ class IncidentRepository:
             .where(AuditLogRecord.resource_type == "incident")
             .where(AuditLogRecord.resource_id == incident_id_str)
             .where(AuditLogRecord.action == "recommendation.generated")
+            .where(AuditLogRecord.tenant_id == normalized_tenant_id)
             .order_by(AuditLogRecord.updated_at.desc(), AuditLogRecord.created_at.desc())
             .limit(1)
         )
@@ -1212,7 +1245,10 @@ class IncidentRepository:
         approval = {}
         approval_result = await self.session.execute(
             select(ApprovalRecord)
-            .where(ApprovalRecord.incident_id == UUID(incident_id_str))
+            .where(
+                ApprovalRecord.incident_id == UUID(incident_id_str),
+                ApprovalRecord.tenant_id == normalized_tenant_id,
+            )
             .order_by(ApprovalRecord.updated_at.desc(), ApprovalRecord.created_at.desc())
             .limit(1)
         )
@@ -1223,7 +1259,10 @@ class IncidentRepository:
         remediation_action = {}
         action_result = await self.session.execute(
             select(ActionRecord)
-            .where(ActionRecord.incident_id == UUID(incident_id_str))
+            .where(
+                ActionRecord.incident_id == UUID(incident_id_str),
+                ActionRecord.tenant_id == normalized_tenant_id,
+            )
             .order_by(ActionRecord.updated_at.desc(), ActionRecord.created_at.desc())
             .limit(1)
         )
@@ -1234,7 +1273,10 @@ class IncidentRepository:
         closure_report = {}
         report_result = await self.session.execute(
             select(RcaReportRecord)
-            .where(RcaReportRecord.incident_id == UUID(incident_id_str))
+            .where(
+                RcaReportRecord.incident_id == UUID(incident_id_str),
+                RcaReportRecord.tenant_id == normalized_tenant_id,
+            )
             .order_by(RcaReportRecord.updated_at.desc(), RcaReportRecord.created_at.desc())
             .limit(1)
         )
@@ -1269,7 +1311,10 @@ class IncidentRepository:
 
         incident_event_result = await self.session.execute(
             select(IncidentEventRecord)
-            .where(IncidentEventRecord.incident_id == UUID(incident_id_str))
+            .where(
+                IncidentEventRecord.incident_id == UUID(incident_id_str),
+                IncidentEventRecord.tenant_id == normalized_tenant_id,
+            )
             .order_by(IncidentEventRecord.created_at.asc())
         )
         incident_event_rows = incident_event_result.scalars().all()
@@ -1433,7 +1478,10 @@ class IncidentRepository:
             alert_tokens = {_normalize_match_token(item) for item in _collect_alert_application_tokens(alert_payload)}
 
             app_result = await self.session.execute(
-                select(ApplicationRecord).order_by(ApplicationRecord.updated_at.desc()).limit(500)
+                select(ApplicationRecord)
+                .where(ApplicationRecord.tenant_id == normalized_tenant_id)
+                .order_by(ApplicationRecord.updated_at.desc())
+                .limit(500)
             )
             matched_application_payload: dict[str, Any] = {}
             for app_row in app_result.scalars().all():
@@ -1446,7 +1494,10 @@ class IncidentRepository:
                 break
 
             onboarding_result = await self.session.execute(
-                select(OnboardingStateRecord).order_by(OnboardingStateRecord.updated_at.desc()).limit(500)
+                select(OnboardingStateRecord)
+                .where(OnboardingStateRecord.tenant_id == normalized_tenant_id)
+                .order_by(OnboardingStateRecord.updated_at.desc())
+                .limit(500)
             )
             matched_onboarding_rows: list[OnboardingStateRecord] = []
             for onboarding_row in onboarding_result.scalars().all():
@@ -1606,13 +1657,22 @@ class IncidentRepository:
             "next_step": "Loaded processed incident summary from database.",
         }
 
-    async def get_incident_stage_completeness(self, incident_id: str) -> dict[str, Any] | None:
+    async def get_incident_stage_completeness(
+        self,
+        incident_id: str,
+        *,
+        tenant_id: str,
+    ) -> dict[str, Any] | None:
         incident_uuid = self._parse_uuid(incident_id)
         if incident_uuid is None:
             return None
+        normalized_tenant_id = self._require("tenant_id", tenant_id)
 
         incident_result = await self.session.execute(
-            select(IncidentRecord).where(IncidentRecord.id == incident_uuid)
+            select(IncidentRecord).where(
+                IncidentRecord.id == incident_uuid,
+                IncidentRecord.tenant_id == normalized_tenant_id,
+            )
         )
         incident_record = incident_result.scalar_one_or_none()
         if incident_record is None:
@@ -1624,7 +1684,10 @@ class IncidentRepository:
                 IncidentEventRecord.status,
                 IncidentEventRecord.created_at,
             )
-            .where(IncidentEventRecord.incident_id == incident_uuid)
+            .where(
+                IncidentEventRecord.incident_id == incident_uuid,
+                IncidentEventRecord.tenant_id == normalized_tenant_id,
+            )
             .order_by(IncidentEventRecord.created_at.asc())
         )
         event_rows = events_result.all()
@@ -1646,23 +1709,56 @@ class IncidentRepository:
 
         approval_result = await self.session.execute(
             select(ApprovalRecord)
-            .where(ApprovalRecord.incident_id == incident_uuid)
+            .where(
+                ApprovalRecord.incident_id == incident_uuid,
+                ApprovalRecord.tenant_id == normalized_tenant_id,
+            )
             .order_by(ApprovalRecord.updated_at.desc(), ApprovalRecord.created_at.desc())
         )
         approval_rows = approval_result.scalars().all()
 
         action_result = await self.session.execute(
             select(ActionRecord)
-            .where(ActionRecord.incident_id == incident_uuid)
+            .where(
+                ActionRecord.incident_id == incident_uuid,
+                ActionRecord.tenant_id == normalized_tenant_id,
+            )
             .order_by(ActionRecord.updated_at.desc(), ActionRecord.created_at.desc())
         )
         action_rows = action_result.scalars().all()
 
         report_result = await self.session.execute(
-            select(RcaReportRecord).where(RcaReportRecord.incident_id == incident_uuid)
+            select(RcaReportRecord).where(
+                RcaReportRecord.incident_id == incident_uuid,
+                RcaReportRecord.tenant_id == normalized_tenant_id,
+            )
         )
         report_rows = report_result.scalars().all()
-        projection_record = await self.session.get(IncidentProjectionRecord, incident_uuid)
+        report_closure_kinds = {
+            str(
+                (
+                    (report.payload or {}).get("metadata")
+                    if isinstance((report.payload or {}).get("metadata"), dict)
+                    else {}
+                ).get("closure_kind")
+                or ""
+            ).strip().lower()
+            for report in report_rows
+        }
+        closure_kind = (
+            "manual"
+            if "manual" in report_closure_kinds
+            else "diagnostic"
+            if "diagnostic" in report_closure_kinds
+            else ""
+        )
+        projection_result = await self.session.execute(
+            select(IncidentProjectionRecord).where(
+                IncidentProjectionRecord.incident_id == incident_uuid,
+                IncidentProjectionRecord.tenant_id == normalized_tenant_id,
+            )
+        )
+        projection_record = projection_result.scalar_one_or_none()
         latest_approval = approval_rows[0] if approval_rows else None
         latest_action = action_rows[0] if action_rows else None
         lifecycle_status = reduce_incident_status(
@@ -1674,6 +1770,7 @@ class IncidentRepository:
             approval_updated_at=latest_approval.updated_at if latest_approval is not None else None,
             action_status=latest_action.status if latest_action is not None else None,
             action_updated_at=latest_action.updated_at if latest_action is not None else None,
+            closure_kind=closure_kind,
         )
         incident_status = lifecycle_status["status"]
 
@@ -1727,11 +1824,21 @@ class IncidentRepository:
             and bool(((action.payload or {}).get("parameters") or {}).get("diagnostic_closure"))
             for action in action_rows
         )
+        manual_closure = closure_kind == "manual"
         if diagnostic_completion:
             # Approval is not part of a non-mutating diagnostic branch. Count
             # the lifecycle that actually ran instead of reporting a permanent
             # missing approval after the incident was correctly auto-closed.
             stage_matrix = [row for row in stage_matrix if row["stage"] != "approval_recorded"]
+        elif manual_closure:
+            # Administrative closure is a separate governed terminal branch.
+            # Approval and remediation were never required or executed, so do
+            # not report those inapplicable phases as missing work.
+            stage_matrix = [
+                row
+                for row in stage_matrix
+                if row["stage"] not in {"approval_recorded", "remediation_executed"}
+            ]
 
         stages = []
         for row in stage_matrix:
@@ -2864,6 +2971,7 @@ class IncidentRepository:
     async def get_approved_runbook_version(
         self, runbook_id: str, version: int, *, tenant_id: str = "default"
     ) -> dict[str, Any] | None:
+        normalized_runbook_id = self._parse_uuid(runbook_id).hex
         row = (
             await self.session.execute(
                 text(
@@ -2874,7 +2982,7 @@ class IncidentRepository:
                     "WHERE rv.tenant_id=:tenant_id AND rv.runbook_id=:runbook_id AND rv.version=:version "
                     "AND rv.approval_status='approved' LIMIT 1"
                 ),
-                {"tenant_id": tenant_id, "runbook_id": runbook_id, "version": int(version)},
+                {"tenant_id": tenant_id, "runbook_id": normalized_runbook_id, "version": int(version)},
             )
         ).mappings().first()
         if row is None:
@@ -2885,7 +2993,7 @@ class IncidentRepository:
         attempts = int(row["success_count"] or 0) + int(row["failure_count"] or 0)
         return {
             **(content if isinstance(content, dict) else {}),
-            "runbook_id": runbook_id,
+            "runbook_id": str(UUID(normalized_runbook_id)),
             "version": int(version),
             "status": "approved",
             "owner": row["owner"],
@@ -4121,6 +4229,7 @@ class IncidentRepository:
         self,
         *,
         limit: int = 100,
+        tenant_id: str | None = None,
         include_enrichment: bool = True,
         risk_tier: str | None = None,
         execution_mode: str | None = None,
@@ -4137,6 +4246,10 @@ class IncidentRepository:
             IncidentProjectionRecord.incident_id.label("incident_id"),
             IncidentProjectionRecord.updated_at.label("updated_at"),
         )
+        if tenant_id is not None:
+            latest_stmt = latest_stmt.where(
+                IncidentProjectionRecord.tenant_id == self._require("tenant_id", tenant_id)
+            )
         if incident_id:
             parsed_incident_id = self._parse_uuid(incident_id)
             if parsed_incident_id is None:
@@ -4568,6 +4681,23 @@ class IncidentRepository:
                 or approval_event_decision
                 or ""
             ).strip().lower().replace("-", "_").replace(" ", "_")
+            closure_report = event_payload.get("report") if isinstance(event_payload.get("report"), dict) else {}
+            closure_metadata = (
+                closure_report.get("metadata")
+                if isinstance(closure_report.get("metadata"), dict)
+                else {}
+            )
+            lifecycle_validation = (
+                resolution_lifecycle.get("validation")
+                if isinstance(resolution_lifecycle, dict)
+                and isinstance(resolution_lifecycle.get("validation"), dict)
+                else {}
+            )
+            closure_kind = str(closure_metadata.get("closure_kind") or "").strip().lower()
+            if not closure_kind and lifecycle_validation.get("administrative_disposition") is True:
+                closure_kind = "manual"
+            if not closure_kind and str((resolution_lifecycle or {}).get("reason_code") or "").strip().lower() == "watch_only_policy_completed":
+                closure_kind = "diagnostic"
             lifecycle_status = reduce_incident_status(
                 projection_status=row.status,
                 projection_updated_at=row.updated_at,
@@ -4577,6 +4707,7 @@ class IncidentRepository:
                 approval_updated_at=approval_record.updated_at if approval_record is not None else None,
                 action_status=action.status if action is not None else None,
                 action_updated_at=action.updated_at if action is not None else None,
+                closure_kind=closure_kind,
             )
             projected_status = lifecycle_status["status"]
             projection_payload["status"] = projected_status
@@ -4848,8 +4979,14 @@ class IncidentRepository:
             ]
         return response_rows[:safe_limit]
 
-    async def list_closed_incidents(self, *, limit: int = 100) -> list[dict[str, Any]]:
+    async def list_closed_incidents(
+        self,
+        *,
+        limit: int = 100,
+        tenant_id: str,
+    ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 1000))
+        normalized_tenant_id = self._require("tenant_id", tenant_id)
         stmt = (
             select(
                 IncidentProjectionRecord.incident_id,
@@ -4871,7 +5008,10 @@ class IncidentRepository:
             )
             # This endpoint feeds closure/MTTR reporting. Failed incidents are
             # unresolved terminal attempts and must not be counted as closures.
-            .where(IncidentProjectionRecord.status.in_(["closed", "resolved"]))
+            .where(
+                IncidentProjectionRecord.status.in_(["closed", "resolved"]),
+                IncidentProjectionRecord.tenant_id == normalized_tenant_id,
+            )
             .order_by(IncidentProjectionRecord.latest_event_at.desc())
             .limit(safe_limit)
         )
@@ -4883,7 +5023,10 @@ class IncidentRepository:
         if incident_ids:
             ticket_result = await self.session.execute(
                 select(IncidentRecord.id, IncidentRecord.ticket_id)
-                .where(IncidentRecord.id.in_(incident_ids))
+                .where(
+                    IncidentRecord.id.in_(incident_ids),
+                    IncidentRecord.tenant_id == normalized_tenant_id,
+                )
             )
             for inc_id, t_id in ticket_result.all():
                 if t_id:

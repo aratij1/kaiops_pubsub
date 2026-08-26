@@ -120,7 +120,7 @@ class IterativeInvestigator:
     def __init__(self, client: ReadOnlyDiscoveryClient | None = None) -> None:
         self.client = client or ReadOnlyDiscoveryClient()
         self.evidence_compiler = EvidenceCompiler()
-        self.max_steps = max(8, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_STEPS", "8")), 12))
+        self.max_steps = max(1, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_STEPS", "8")), 12))
         self.max_evidence = max(8, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_EVIDENCE", "40")), 100))
         self.max_tool_calls = max(1, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_TOOL_CALLS", "12")), 100))
         self.max_duration_seconds = max(5, min(int(os.getenv("RESOLUTION_INVESTIGATION_MAX_DURATION_SECONDS", "120")), 3600))

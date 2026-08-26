@@ -1167,8 +1167,9 @@ async def get_alert_processed_result(
     alert_id: str,
     request: Request,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    path = f"/alerts/{alert_id}/processed-result"
+    path = f"/alerts/{quote(alert_id, safe='')}/processed-result?{urlencode({'tenant_id': tenant_id})}"
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -1594,8 +1595,9 @@ async def get_closed_incidents(
     request: Request,
     limit: int = 100,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    path = f"/incidents/closed?{urlencode({'limit': str(limit)})}"
+    path = f"/incidents/closed?{urlencode({'limit': str(limit), 'tenant_id': tenant_id})}"
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -1652,10 +1654,12 @@ async def get_incident_metadata(
     service: str | None = None,
     incident_id: str | None = None,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
     params: dict[str, str] = {
         "limit": str(limit),
         "include_enrichment": "true" if include_enrichment else "false",
+        "tenant_id": tenant_id,
     }
     if risk_tier:
         params["risk_tier"] = str(risk_tier)
@@ -1685,8 +1689,12 @@ async def get_incident_stage_completeness(
     incident_id: str,
     request: Request,
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    path = f"/incidents/{incident_id}/stage-completeness"
+    path = (
+        f"/incidents/{quote(incident_id, safe='')}/stage-completeness?"
+        f"{urlencode({'tenant_id': tenant_id})}"
+    )
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -1701,8 +1709,8 @@ async def get_incident_stage_completeness(
 async def get_resolution_investigation(
     incident_id: str,
     request: Request,
-    tenant_id: str = "default",
     x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
     """Return the latest durable iterative investigation for an incident."""
     path = f"/investigations/{quote(incident_id, safe='')}?{urlencode({'tenant_id': tenant_id})}"

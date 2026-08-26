@@ -5904,14 +5904,14 @@ async def suppress_observed_alert_application(project_name: str, tenant_id: str 
 
 
 @app.get("/alerts/{alert_id}/processed-result")
-async def get_processed_result(alert_id: str) -> dict[str, Any]:
+async def get_processed_result(alert_id: str, tenant_id: str) -> dict[str, Any]:
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
         raise HTTPException(status_code=503, detail="Database is not enabled for processed results")
 
     async with session_factory() as session:
         repo = IncidentRepository(session)
-        result = await repo.get_processed_result_by_alert_id(alert_id)
+        result = await repo.get_processed_result_by_alert_id(alert_id, tenant_id=tenant_id)
 
     if not result:
         raise HTTPException(status_code=404, detail="No processed result found for alert")
@@ -6348,13 +6348,13 @@ async def get_agent_work_items(limit: int = 100) -> dict[str, Any]:
 
 
 @app.get("/incidents/closed")
-async def get_closed_incidents(limit: int = 100) -> dict[str, Any]:
+async def get_closed_incidents(tenant_id: str, limit: int = 100) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 500))
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
             repo = IncidentRepository(session)
-            rows = await repo.list_closed_incidents(limit=safe_limit)
+            rows = await repo.list_closed_incidents(limit=safe_limit, tenant_id=tenant_id)
         return {"rows": rows, "count": len(rows)}
 
     rows = list(CLOSED_INCIDENTS)[:safe_limit]
@@ -6363,6 +6363,7 @@ async def get_closed_incidents(limit: int = 100) -> dict[str, Any]:
 
 @app.get("/incidents/metadata")
 async def get_incident_metadata(
+    tenant_id: str,
     limit: int = 100,
     include_enrichment: bool = True,
     risk_tier: str | None = None,
@@ -6386,6 +6387,7 @@ async def get_incident_metadata(
                 status=status,
                 service=service,
                 incident_id=incident_id,
+                tenant_id=tenant_id,
             )
         return {"rows": rows, "count": len(rows)}
 
@@ -6420,14 +6422,14 @@ async def get_incident_metadata(
 
 
 @app.get("/incidents/{incident_id}/stage-completeness")
-async def get_incident_stage_completeness(incident_id: str) -> dict[str, Any]:
+async def get_incident_stage_completeness(incident_id: str, tenant_id: str) -> dict[str, Any]:
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
         raise HTTPException(status_code=503, detail="Database is not enabled for incident stage completeness")
 
     async with session_factory() as session:
         repo = IncidentRepository(session)
-        result = await repo.get_incident_stage_completeness(incident_id)
+        result = await repo.get_incident_stage_completeness(incident_id, tenant_id=tenant_id)
 
     if not result:
         raise HTTPException(status_code=404, detail="No incident stage completeness found for incident")

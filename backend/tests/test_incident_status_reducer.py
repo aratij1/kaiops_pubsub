@@ -67,3 +67,28 @@ def test_verified_closure_is_monotonic_even_if_stale_action_arrives() -> None:
 
     assert result["status"] == "closed"
     assert result["source"] == "closure"
+
+
+def test_manual_closure_does_not_claim_validated_recovery() -> None:
+    result = reduce_incident_status(
+        projection_status="closed",
+        canonical_status="closed",
+        closure_kind="manual",
+    )
+
+    assert result["status"] == "closed"
+    assert result["source"] == "closure"
+    assert "administratively closed" in result["reason"]
+    assert "without a technical recovery claim" in result["reason"]
+
+
+def test_diagnostic_closure_does_not_claim_validated_recovery() -> None:
+    result = reduce_incident_status(
+        projection_status="closed",
+        canonical_status="closed",
+        closure_kind="diagnostic",
+    )
+
+    assert result["status"] == "closed"
+    assert "Diagnostic work was completed" in result["reason"]
+    assert "without a technical recovery claim" in result["reason"]

@@ -64,8 +64,39 @@ def test_illegal_transition_is_rejected():
         tenant_id="acme", incident_id="incident-1", recommendation_id="recommendation-1",
         plan={"commands": ["restart"]}, state=ResolutionState.AWAITING_APPROVAL,
     )
-    with pytest.raises(LifecycleTransitionError, match="illegal"):
+    with pytest.raises(LifecycleTransitionError, match="actor closure"):
         transition_lifecycle(lifecycle, ResolutionState.CLOSED, actor=LifecycleActor.CLOSURE)
+
+
+def test_only_operator_can_administratively_close_quiescent_failure():
+    lifecycle = create_lifecycle(
+        tenant_id="acme", incident_id="incident-1", recommendation_id="recommendation-1",
+        plan={"commands": ["restart"]}, state=ResolutionState.FAILED_RETRYABLE,
+    )
+
+    with pytest.raises(LifecycleTransitionError, match="actor closure"):
+        transition_lifecycle(lifecycle, ResolutionState.CLOSED, actor=LifecycleActor.CLOSURE)
+
+    closed = transition_lifecycle(
+        lifecycle,
+        ResolutionState.CLOSED,
+        actor=LifecycleActor.OPERATOR,
+        reason_code="operator_administrative_closure",
+        validation={"passed": False, "administrative_disposition": True},
+    )
+    assert closed["state"] == "closed"
+    assert closed["last_transition_actor"] == "operator"
+    assert closed["validation"]["passed"] is False
+    assert closed["validation"]["administrative_disposition"] is True
+
+
+def test_operator_cannot_close_an_active_execution():
+    lifecycle = create_lifecycle(
+        tenant_id="acme", incident_id="incident-1", recommendation_id="recommendation-1",
+        plan={"commands": ["restart"]}, state=ResolutionState.EXECUTING,
+    )
+    with pytest.raises(LifecycleTransitionError, match="illegal"):
+        transition_lifecycle(lifecycle, ResolutionState.CLOSED, actor=LifecycleActor.OPERATOR)
 
 
 def test_only_closure_can_declare_recovery():

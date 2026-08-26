@@ -70,6 +70,7 @@ def reduce_incident_status(
     approval_updated_at: Any = None,
     action_status: Any = None,
     action_updated_at: Any = None,
+    closure_kind: Any = None,
 ) -> dict[str, str]:
     """Return one lifecycle status from the latest durable incident facts.
 
@@ -83,10 +84,17 @@ def reduce_incident_status(
     canonical = _status(canonical_status)
     approval = _status(approval_status)
     action = _status(action_status)
+    closure = _status(closure_kind)
 
     if canonical in SUCCESS_TERMINAL_STATUSES or projection in SUCCESS_TERMINAL_STATUSES:
         status = "closed" if "closed" in {canonical, projection} else "resolved"
-        return {"status": status, "source": "closure", "reason": "Recovery validation closed the incident."}
+        if closure == "manual":
+            reason = "An authorized operator administratively closed the incident without a technical recovery claim."
+        elif closure == "diagnostic":
+            reason = "Diagnostic work was completed and closed without a technical recovery claim."
+        else:
+            reason = "Recovery validation closed the incident."
+        return {"status": status, "source": "closure", "reason": reason}
     if canonical in {"cancelled", "canceled"} or projection in {"cancelled", "canceled"}:
         return {"status": "cancelled", "source": "incident", "reason": "The incident was explicitly cancelled."}
 
