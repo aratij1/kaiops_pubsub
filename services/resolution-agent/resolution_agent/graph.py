@@ -159,9 +159,29 @@ class ResolutionIntelligenceAgent(BaseAgent):
             payload=payload,
             fallback_content=f"Likely service degradation in {context.alert.service}",
         )
-        deployment = context.deployment or "unknown change"
-        state["root_cause"] = deployment if "Deployment" in deployment else response["content"]
-        state["rationale"] = f"Model {response['model']} linked symptoms to {state['root_cause']}"
+        deployment = context.deployment or ""
+        direct_evidence = bool(
+            deployment
+            or context.runbook
+            or context.related_incidents
+            or context.recent_changes
+            or context.observability
+        )
+        state["direct_evidence"] = direct_evidence
+        state["root_cause"] = (
+            deployment
+            if deployment
+            else response["content"]
+            if direct_evidence
+            else "Root cause not established: no direct service telemetry, change record, or service-matched evidence is linked."
+        )
+        state["rationale"] = (
+            "Analysis withheld because no direct, service-matched evidence is linked to this incident."
+            if not direct_evidence
+            else f"Fallback hypothesis pending direct evidence: {state['root_cause']}"
+            if response["model"] == "fallback"
+            else f"Model {response['model']} linked symptoms to {state['root_cause']}"
+        )
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
             {
@@ -194,7 +214,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
             payload=payload,
             fallback_content=f"{context.alert.service.title()} service impact requires immediate triage",
         )
-        if "latency" in context.alert.description.lower():
+        if not context.observability:
+            state["impact"] = (
+                f"Observed alert: {context.alert.description.strip()} "
+                "The affected request volume and customer scope are not yet measured."
+            )
+        elif "latency" in context.alert.description.lower():
             state["impact"] = f"{context.alert.service.title()} latency"
         else:
             state["impact"] = response["content"]
@@ -222,7 +247,13 @@ class ResolutionIntelligenceAgent(BaseAgent):
     async def generate_fix(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
         root_cause = state["root_cause"].lower()
-        if "deployment" in root_cause:
+        if not state.get("direct_evidence", False):
+            action = (
+                "Do not execute a remediation yet. Collect the gateway status-code breakdown, "
+                "correlated logs/traces, dependency health, and recent changes for kaiops-platform."
+            )
+            commands = []
+        elif "deployment" in root_cause:
             action = "Rollback deployment"
             commands = [f"rollback:{context.kubernetes.get('deployment', context.alert.service)}"]
         elif "pod" in context.alert.description.lower():
@@ -274,30 +305,66 @@ class ResolutionIntelligenceAgent(BaseAgent):
             score += 0.06
         if context.alert.severity in {AlertSeverity.HIGH, AlertSeverity.CRITICAL}:
             score += 0.05
+        if not state.get("direct_evidence", False):
+            score = min(score, 0.35)
+        model_usage = state.get("model_usage", [])
+        if any(
+            str(item.get("provider") or item.get("model") or "").lower() in {"fallback", "heuristic-fallback", "provider-error"}
+            or bool(item.get("error"))
+            for item in model_usage
+            if isinstance(item, dict)
+        ):
+            score = min(score, 0.35)
         state["confidence"] = min(score, 0.99)
         return state
 
     async def resolve(self, context: Context) -> Recommendation:
         state = await self.graph.ainvoke({"context": context})
         runbook_present = bool((context.runbook or "").strip())
-        evidence = [
-            Evidence(
+        evidence: list[Evidence] = []
+        if context.observability:
+            evidence.append(Evidence(
+                id=f"telemetry:{context.incident_id}",
+                type="telemetry",
+                source="observability",
+                confidence=0.9,
+                metadata={"service": context.alert.service, "present": True},
+                content=context.observability,
+            ))
+        if context.deployment or context.recent_changes:
+            evidence.append(Evidence(
+                id=f"changes:{context.incident_id}",
+                type="change",
+                source="change-intelligence",
+                confidence=0.85,
+                metadata={"service": context.alert.service, "present": True},
+                content={"deployment": context.deployment, "recent_changes": context.recent_changes[:5]},
+            ))
+        if context.related_incidents:
+            evidence.append(Evidence(
                 id=f"ctx:{context.incident_id}",
                 type="context",
                 source="context-agent",
-                confidence=0.9,
-                metadata={"service": context.alert.service},
+                confidence=0.8,
+                metadata={"service": context.alert.service, "present": True},
                 content={"related_incidents": len(context.related_incidents)},
-            ),
-            Evidence(
+            ))
+        if runbook_present:
+            evidence.append(Evidence(
                 id=f"runbook:{context.incident_id}",
                 type="runbook",
                 source="knowledge-router",
-                confidence=0.85 if runbook_present else 0.25,
-                metadata={"present": runbook_present},
+                confidence=0.85,
+                metadata={"service": context.alert.service, "present": True},
                 content={"preview": (context.runbook or "")[:180]},
-            ),
-        ]
+            ))
+        missing_evidence = []
+        if not context.observability:
+            missing_evidence.append("service telemetry")
+        if not (context.deployment or context.recent_changes):
+            missing_evidence.append("recent changes")
+        if not (runbook_present or context.related_incidents):
+            missing_evidence.append("service-matched knowledge")
         recommendation = Recommendation(
             incident_id=context.incident_id,
             root_cause=state["root_cause"],
@@ -313,11 +380,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
         recommendation.metadata["model_calls"] = state.get("model_calls", [])
         recommendation.metadata["evidence"] = [item.model_dump(mode="json") for item in evidence]
         recommendation.metadata["evidence_ids"] = [item.id for item in evidence]
+        recommendation.metadata["missing_evidence"] = missing_evidence
+        recommendation.metadata["evidence_status"] = "grounded" if evidence else "insufficient-evidence"
         recommendation.metadata["reasoning"] = state.get("rationale", "")
-        recommendation.metadata["citations"] = [
-            f"runbook://{context.alert.service}",
-            f"incident://{context.incident_id}",
-        ]
+        recommendation.metadata["citations"] = [f"incident://{context.incident_id}"]
+        if runbook_present:
+            recommendation.metadata["citations"].insert(0, f"runbook://{context.alert.service}")
         return recommendation
 
     async def resolve_with_runtime(self, context: Context) -> Recommendation:
@@ -368,11 +436,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
     async def validate(self, result: Any) -> bool:
         if not isinstance(result, Recommendation):
             return False
-        if result.confidence <= 0:
-            raise ValidationError("confidence must be greater than zero")
         evidence_ids = result.metadata.get("evidence_ids", [])
-        if not isinstance(evidence_ids, list) or not evidence_ids:
-            raise ValidationError("recommendation must include evidence_ids")
+        if not isinstance(evidence_ids, list):
+            raise ValidationError("recommendation evidence_ids must be a list")
+        if not evidence_ids:
+            if "root cause not established" not in result.root_cause.lower() or result.confidence > 0.35:
+                raise ValidationError("ungrounded recommendations must abstain with low confidence")
+            return True
+        if result.confidence <= 0:
+            raise ValidationError("grounded recommendations must have positive confidence")
         return True
 
     async def reflect(
@@ -384,6 +456,8 @@ class ResolutionIntelligenceAgent(BaseAgent):
         error: Exception | None,
     ) -> dict[str, Any]:
         confidence = float(result.confidence) if isinstance(result, Recommendation) else 0.0
+        evidence_ids = result.metadata.get("evidence_ids", []) if isinstance(result, Recommendation) else []
+        missing_evidence = result.metadata.get("missing_evidence", []) if isinstance(result, Recommendation) else ["service telemetry", "recent changes", "service-matched knowledge"]
         quality = "high" if confidence >= 0.85 else "medium" if confidence >= 0.65 else "low"
         return {
             "agent": self.name,
@@ -393,7 +467,8 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "Escalate to approval path when confidence is below policy threshold.",
             ],
             "failed_tool_calls": [],
-            "missing_evidence": [] if confidence >= 0.5 else ["runbook", "related_incidents"],
+            "missing_evidence": list(missing_evidence) if isinstance(missing_evidence, list) else [str(missing_evidence)],
+            "evidence_count": len(evidence_ids) if isinstance(evidence_ids, list) else 0,
             "confidence_adjustment": 0.0,
             "error": str(error) if error else None,
         }

@@ -1,6 +1,6 @@
 import pytest
 from common.memory_store import InMemoryStore
-from common.models import Alert, AlertSeverity, Incident
+from common.models import Alert, AlertSeverity, Context, Incident
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import VectorDBConnector
 from model_router import ModelRouter
@@ -86,6 +86,34 @@ async def test_resolution_agent_generates_recommendation() -> None:
     assert recommendation.confidence >= 0.9
     assert recommendation.impact == "Payments latency"
     assert recommendation.recommended_action == "Rollback deployment"
+
+
+@pytest.mark.asyncio
+async def test_resolution_agent_abstains_and_reports_gaps_without_evidence() -> None:
+    alert = Alert(
+        source="prometheus",
+        name="HighErrorRate",
+        service="kaiops-platform",
+        severity=AlertSeverity.CRITICAL,
+        description="Gateway non-ok status ratio is above threshold.",
+    )
+    incident = Incident(service="kaiops-platform", severity=AlertSeverity.CRITICAL, title="gateway errors")
+    context = Context(incident_id=incident.id, alert=alert)
+    agent = ResolutionIntelligenceAgent(model_router=static_router())
+
+    recommendation = await agent.resolve(context)
+
+    assert recommendation.root_cause.startswith("Root cause not established")
+    assert recommendation.confidence <= 0.35
+    assert recommendation.metadata["evidence"] == []
+    assert recommendation.metadata["evidence_ids"] == []
+    assert recommendation.metadata["evidence_status"] == "insufficient-evidence"
+    assert set(recommendation.metadata["missing_evidence"]) == {
+        "service telemetry",
+        "recent changes",
+        "service-matched knowledge",
+    }
+    assert await agent.validate(recommendation) is True
 
 
 @pytest.mark.asyncio

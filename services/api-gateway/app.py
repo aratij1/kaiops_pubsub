@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from datetime import datetime, timezone
 import logging
 from time import perf_counter
 from typing import Any
@@ -32,6 +33,20 @@ settings.service_name = "api-gateway"
 analyzer = SafetyAnalyzer()
 AUDIT_EVENTS: deque[GatewayAuditEvent] = deque(maxlen=200)
 logger = logging.getLogger("api-gateway")
+
+PLATFORM_SERVICES: tuple[tuple[str, str, str], ...] = (
+    ("monitoring-adapter", settings.monitoring_adapter_url, "Signal ingestion"),
+    ("alert-intelligence", "http://alert-intelligence:8000", "Alert intelligence"),
+    ("orchestrator", "http://orchestrator:8000", "Workflow orchestration"),
+    ("context-agent", settings.context_agent_url, "Evidence collection"),
+    ("model-router", settings.model_router_url, "Model routing"),
+    ("resolution-agent", "http://resolution-agent:8000", "RCA and impact"),
+    ("approval-service", settings.approval_service_url, "Human approval"),
+    ("remediation-engine", "http://remediation-engine:8000", "Governed execution"),
+    ("closure-service", "http://closure-service:8000", "Recovery validation"),
+    ("application-onboarding", "http://application-onboarding:8000", "Application onboarding"),
+    ("cloud-operations", "http://cloud-operations:8000", "Cloud operations"),
+)
 
 
 async def _persist_gateway_audit_event(app: FastAPI, event: GatewayAuditEvent) -> None:
@@ -181,6 +196,33 @@ ALERTS_TABLE_ROWS = Gauge(
     "Current number of records in MySQL alerts table",
     ["database", "table"],
 )
+
+
+@app.get("/operations/service-health")
+async def platform_service_health() -> dict[str, Any]:
+    """Return an observed snapshot of every KaiMS application service."""
+
+    async def probe(client: httpx.AsyncClient, name: str, base_url: str, capability: str) -> dict[str, Any]:
+        started = perf_counter()
+        try:
+            response = await client.get(f"{base_url.rstrip('/')}/healthz")
+            latency_ms = round((perf_counter() - started) * 1000, 2)
+            payload = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+            healthy = response.status_code == 200 and payload.get("status") == "ok"
+            return {"service": name, "capability": capability, "status": "healthy" if healthy else "degraded", "status_code": response.status_code, "latency_ms": latency_ms, "detail": payload.get("status") or "Unexpected health response"}
+        except (httpx.HTTPError, ValueError) as exc:
+            return {"service": name, "capability": capability, "status": "unavailable", "status_code": None, "latency_ms": round((perf_counter() - started) * 1000, 2), "detail": str(exc)}
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as client:
+        downstream = await asyncio.gather(*(probe(client, *service) for service in PLATFORM_SERVICES))
+    services = [{"service": "api-gateway", "capability": "API and policy gateway", "status": "healthy", "status_code": 200, "latency_ms": 0.0, "detail": "ok"}, *downstream]
+    healthy = sum(1 for row in services if row["status"] == "healthy")
+    return {
+        "status": "healthy" if healthy == len(services) else "degraded",
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "summary": {"healthy": healthy, "degraded": sum(1 for row in services if row["status"] == "degraded"), "unavailable": sum(1 for row in services if row["status"] == "unavailable"), "total": len(services)},
+        "services": services,
+    }
 
 
 def trace_id_from_header(value: str | None) -> str:
@@ -820,6 +862,12 @@ async def approval_action(
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    if action == "auto-assign":
+        return await guarded_proxy(
+            request=request, method="POST", path="/auto-assign",
+            target_base=settings.approval_service_url, payload=payload,
+            trace_id=trace_id_from_header(x_trace_id),
+        )
     if action not in {"approve", "reject", "modify"}:
         raise HTTPException(status_code=404, detail="unknown approval action")
     return await guarded_proxy(
@@ -830,6 +878,26 @@ async def approval_action(
         payload=payload,
         trace_id=trace_id_from_header(x_trace_id),
     )
+
+
+@app.get("/approval/capacity")
+async def approval_capacity(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path="/capacity", target_base=settings.approval_service_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.put("/approval/capacity/{username}")
+async def update_approval_capacity(username: str, request: Request, payload: dict[str, Any] = REQUEST_BODY, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="PUT", path=f"/capacity/{username}", target_base=settings.approval_service_url, payload=payload, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.get("/approval/assignments")
+async def approval_assignments(request: Request, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="GET", path="/assignments", target_base=settings.approval_service_url, payload={}, trace_id=trace_id_from_header(x_trace_id))
+
+
+@app.post("/approval/auto-assign")
+async def approval_auto_assign(request: Request, payload: dict[str, Any] = REQUEST_BODY, x_trace_id: str | None = Header(default=None)) -> dict[str, Any]:
+    return await guarded_proxy(request=request, method="POST", path="/auto-assign", target_base=settings.approval_service_url, payload=payload, trace_id=trace_id_from_header(x_trace_id))
 
 
 @app.post("/rag/documents")

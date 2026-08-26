@@ -26,7 +26,7 @@ class ServiceNowConnector(BaseConnector):
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
-        return {"ticket": incident.ticket_id, "change_records": [{"id": "CHG-1024", "service": alert.service}]}
+        return {"ticket": incident.ticket_id, "change_records": []}
 
 
 class PrometheusConnector(BaseConnector):
@@ -34,7 +34,9 @@ class PrometheusConnector(BaseConnector):
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
-        return {"latency_p95_ms": 1250, "cpu_percent": 71, "error_rate": 0.08, "alerts_cleared": False}
+        # The alert itself is evidence; do not manufacture point-in-time telemetry
+        # when no Prometheus query has been executed by this connector.
+        return {}
 
 
 class KubernetesConnector(BaseConnector):
@@ -50,7 +52,8 @@ class JenkinsConnector(BaseConnector):
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
-        return {"recent_deployments": [{"version": "Deployment 2.5", "status": "success"}]}
+        deployment = str(alert.labels.get("deployment") or alert.metadata.get("deployment") or "").strip()
+        return {"recent_deployments": [{"version": deployment, "status": "observed"}]} if deployment else {"recent_deployments": []}
 
 
 class GitHubConnector(BaseConnector):
@@ -58,7 +61,7 @@ class GitHubConnector(BaseConnector):
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
-        return {"recent_commits": [{"sha": "abc1234", "message": "Tune payment timeout"}]}
+        return {"recent_commits": []}
 
 
 class CMDBConnector(BaseConnector):
@@ -338,9 +341,9 @@ class VectorDBConnector(BaseConnector):
             for doc in self.documents
             if self._kind_matches(doc, preferred_kinds) and self._service_matches(doc, service)
         ]
-        if not candidates and preferred_kinds:
+        if not candidates and preferred_kinds and not str(service or "").strip():
             candidates = [doc for doc in self.documents if self._service_matches(doc, service)]
-        if not candidates:
+        if not candidates and not str(service or "").strip():
             candidates = list(self.documents)
 
         shortlist_size = min(max(limit * 4, 12), len(candidates))
@@ -421,13 +424,22 @@ class ContextIntelligenceAgent(BaseAgent):
         )
         by_name = {connector.name: result for connector, result in zip(self.connectors, results, strict=True)}
         vector_matches = by_name["vector-db"]["matches"]
-        runbook = next((doc["content"] for doc in vector_matches if doc["kind"] == "runbook"), "")
-        related = [doc for doc in vector_matches if doc["kind"] == "incident"]
-        deployment_doc = next((doc for doc in vector_matches if doc["kind"] == "deployment"), {})
-        dependency_docs = [doc for doc in vector_matches if doc["kind"] == "dependency"]
-        change_docs = [doc for doc in vector_matches if doc["kind"] == "change"]
+
+        def service_evidence(doc: dict[str, Any]) -> bool:
+            services = doc.get("services", [])
+            if isinstance(services, str):
+                services = [services]
+            normalized = {str(item).strip().lower() for item in services if str(item).strip()}
+            target = str(alert.service or "").strip().lower()
+            return bool(target and normalized and (target in normalized or any(target in item or item in target for item in normalized)))
+
+        runbook = next((doc["content"] for doc in vector_matches if doc["kind"] == "runbook" and service_evidence(doc)), "")
+        related = [doc for doc in vector_matches if doc["kind"] == "incident" and service_evidence(doc)]
+        deployment_doc = next((doc for doc in vector_matches if doc["kind"] == "deployment" and service_evidence(doc)), {})
+        dependency_docs = [doc for doc in vector_matches if doc["kind"] == "dependency" and service_evidence(doc)]
+        change_docs = [doc for doc in vector_matches if doc["kind"] == "change" and service_evidence(doc)]
         deployment = (
-            by_name["jenkins"].get("recent_deployments", [{}])[0].get("version")
+            next((item.get("version") for item in by_name["jenkins"].get("recent_deployments", []) if item.get("version")), None)
             or alert.labels.get("deployment")
             or deployment_doc.get("deployment")
         )

@@ -1270,6 +1270,8 @@ class IncidentRepository:
         self,
         *,
         limit: int = 100,
+        tenant_id: str | None = None,
+        incident_id: str | None = None,
         risk_tier: str | None = None,
         execution_mode: str | None = None,
         transport_provider: str | None = None,
@@ -1278,6 +1280,13 @@ class IncidentRepository:
     ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 1000))
         stmt = select(IncidentProjectionRecord)
+        if tenant_id:
+            stmt = stmt.where(IncidentProjectionRecord.tenant_id == str(tenant_id).strip())
+        if incident_id:
+            incident_uuid = self._parse_uuid(incident_id)
+            if incident_uuid is None:
+                return []
+            stmt = stmt.where(IncidentProjectionRecord.incident_id == incident_uuid)
         if risk_tier:
             stmt = stmt.where(IncidentProjectionRecord.risk_tier == str(risk_tier).strip().lower())
         if execution_mode:

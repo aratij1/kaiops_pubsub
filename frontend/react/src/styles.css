@@ -8777,10 +8777,31 @@ tbody tr:hover { background: #f5fafc; }
   height: clamp(380px, 52vh, 600px);
   min-height: 0;
   max-height: none;
+  grid-auto-rows: minmax(68px, auto);
   align-content: start;
   overflow-y: auto;
   scrollbar-gutter: stable;
   overscroll-behavior: contain;
+}
+
+/* Decision rows contain a primary and secondary line. Keep their intrinsic
+   height when the queue is placed inside its fixed scrolling viewport. */
+.approval-workspace .approval-ticket {
+  height: auto !important;
+  min-height: 68px !important;
+  overflow: visible;
+  line-height: 1.35;
+}
+
+.approval-workspace .approval-ticket > span {
+  min-width: 0;
+}
+
+.approval-workspace .approval-ticket span > b,
+.approval-workspace .approval-ticket span > small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @media (max-width: 760px) {

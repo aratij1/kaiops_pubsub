@@ -237,6 +237,7 @@ function AlertFlowSummary({ row, workflow, selected, onInspect }: { row: AlertSt
 
 export default function AlertsRoute() {
   const alerts = useRouteRuntimeSlice("alerts");
+  const session = useRouteRuntimeSlice("session");
   const [dedupWindow, setDedupWindow] = useState(60);
   const [liveView, setLiveView] = useState<"inbox" | "split" | "timeline">(() => {
     const saved = window.localStorage.getItem("kaiops.live-alert-view");
@@ -288,13 +289,13 @@ export default function AlertsRoute() {
       setTraceWorkflow({ loading: true, data: null, error: "", alertId, state: "loading" });
       try {
         if (!alertId && activeTraceAlert) {
-          const response = await fetchJson("/api-gateway/alerts/all?limit=150&tenant_id=default&compact=true", { timeoutMs: 12000, maxAttempts: 1 }) as any;
+          const response = await fetchJson("/api-gateway/alerts/all?limit=150&tenant_id=default&compact=true", { headers: { Authorization: `Bearer ${session.accessToken}` }, timeoutMs: 12000, maxAttempts: 1 }) as any;
           const rows = response?.data?.rows || response?.rows || response?.data || [];
           const match = canonicalMatch(activeTraceAlert, Array.isArray(rows) ? rows : []);
           alertId = processedAlertId(match);
         }
         if (!alertId) throw new Error("Canonical alert is still being persisted; processed context is not available yet.");
-        const data = await fetchJson(`/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`, { timeoutMs: 12000, maxAttempts: 1 });
+        const data = await fetchJson(`/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`, { headers: { Authorization: `Bearer ${session.accessToken}` }, timeoutMs: 12000, maxAttempts: 1 });
         if (active) setTraceWorkflow({ loading: false, data, error: "", alertId, state: "ready" });
       } catch (error) {
         const message = error instanceof Error ? error.message : "Processed result unavailable";
@@ -304,7 +305,7 @@ export default function AlertsRoute() {
     };
     load();
     return () => { active = false; };
-  }, [activeTraceAlert && alertRowKey(activeTraceAlert)]);
+  }, [activeTraceAlert && alertRowKey(activeTraceAlert), session.accessToken]);
   useEffect(() => {
     let active = true;
     const loadRows = async () => {
@@ -322,7 +323,7 @@ export default function AlertsRoute() {
             continue;
           }
           try {
-            const payload = await fetchJson(`/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`, { timeoutMs: 8000, maxAttempts: 1 });
+            const payload = await fetchJson(`/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`, { headers: { Authorization: `Bearer ${session.accessToken}` }, timeoutMs: 8000, maxAttempts: 1 });
             resolved[index] = [alertRowKey(row), payload] as const;
           } catch {
             resolved[index] = [alertRowKey(row), null] as const;
@@ -337,7 +338,7 @@ export default function AlertsRoute() {
     };
     loadRows();
     return () => { active = false; };
-  }, [alerts.rows.map(alertRowKey).join("|")]);
+  }, [alerts.rows.map(alertRowKey).join("|"), session.accessToken]);
   useEffect(() => {
     let active = true;
     fetchJson("/alert-intelligence/deduplication/config", { timeoutMs: 8000 })

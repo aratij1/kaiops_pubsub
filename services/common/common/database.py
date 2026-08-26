@@ -101,7 +101,10 @@ class KnowledgeBaseRecord(Base, TimestampMixin):
 
 class AuditLogRecord(Base, TimestampMixin):
     __tablename__ = "audit_logs"
-    __table_args__ = (Index("idx_audit_logs_resource_action_created", "resource_type", "action", "created_at"),)
+    __table_args__ = (
+        Index("idx_audit_logs_created_at", "created_at"),
+        Index("idx_audit_logs_resource_action_created", "resource_type", "action", "created_at"),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     actor: Mapped[str] = mapped_column(String(255), index=True)

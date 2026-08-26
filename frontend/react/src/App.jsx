@@ -1283,6 +1283,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const payload = await queryClient.fetchQuery({
         queryKey: ["alert-processed-result", normalized],
         queryFn: () => fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, {
+          ...authenticatedOptions(),
           timeoutMs: 12000,
           maxAttempts: 1,
         }),
@@ -1389,7 +1390,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       incidentId: normalized,
     }));
     try {
-      const payload = await fetchJson(`/api-gateway/incidents/${normalized}/stage-completeness`);
+      const payload = await fetchJson(`/api-gateway/incidents/${normalized}/stage-completeness`, authenticatedOptions());
       const stageData = payload?.data || payload;
       setSelectedStageCompleteness((prev) => {
         if (String(prev.incidentId || "") !== normalized) {
@@ -1901,7 +1902,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           await refreshApprovalDrivenViews(normalizedIncidentId);
           return;
         }
-        const payload = await fetchJson(`/api-gateway/incidents/${encodeURIComponent(normalizedIncidentId)}/stage-completeness`);
+        const payload = await fetchJson(`/api-gateway/incidents/${encodeURIComponent(normalizedIncidentId)}/stage-completeness`, authenticatedOptions());
         const data = unwrap(payload) || {};
         const status = String(data.status || "").trim().toLowerCase();
         if (["closed", "resolved", "failed"].includes(status)) {
@@ -2190,6 +2191,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     for (let index = 0; index < attempts; index += 1) {
       try {
         const payload = await fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, {
+          ...authenticatedOptions(),
           timeoutMs: 25000,
           maxAttempts: 1,
         });
@@ -5961,18 +5963,31 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       : {};
     const metadata = recommendation?.metadata && typeof recommendation.metadata === "object" ? recommendation.metadata : {};
     const analysis = metadata?.rca_analysis && typeof metadata.rca_analysis === "object" ? metadata.rca_analysis : {};
-    const missing = Array.isArray(analysis.missing_evidence)
-      ? analysis.missing_evidence
-      : analysis.missing_evidence ? [analysis.missing_evidence] : [];
+    const reflectedMissing = metadata?.runtime?.reflection?.missing_evidence;
+    const missingSource = analysis.missing_evidence || metadata.missing_evidence || reflectedMissing;
+    const declaredMissing = Array.isArray(missingSource)
+      ? missingSource
+      : missingSource ? [missingSource] : [];
     const conflicting = Array.isArray(analysis.conflicting_evidence)
       ? analysis.conflicting_evidence
       : Array.isArray(metadata.conflicting_evidence) ? metadata.conflicting_evidence : [];
     const providerRow = selectedAlertUsage.find((row) => row.provider !== "-" || row.model !== "-");
     const fallbackUsed = selectedAlertUsage.some((row) => row.fallback);
     const discoveryEvidence = selectedAlertWorkflow?.context?.metadata?.discovery_report?.evidence;
+    const recommendationEvidence = Array.isArray(metadata?.evidence)
+      ? metadata.evidence.filter((row) => row?.metadata?.present !== false)
+      : [];
+    const recommendationCitations = Array.isArray(metadata?.citations) ? metadata.citations : [];
     const evidenceInputs = [
       ...selectedAlertRagDocuments.map((row) => ({ ...row, context_source: row?.context_source || "cached" })),
       ...(Array.isArray(discoveryEvidence) ? discoveryEvidence.map((row) => ({ ...row, context_source: row?.context_source || "fresh" })) : []),
+      ...recommendationEvidence.map((row, index) => ({
+        ...row,
+        evidence_id: row?.evidence_id || row?.id,
+        citation: row?.citation || recommendationCitations[index] || recommendationCitations[0] || "",
+        summary: row?.summary || row?.content?.preview || row?.content?.description || "Persisted recommendation evidence",
+        context_source: row?.context_source || "cached",
+      })),
     ];
     const now = Date.now();
     const evidence = evidenceInputs.map((doc, index) => {
@@ -5994,14 +6009,18 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         cached,
       };
     }).filter((row, index, rows) => rows.findIndex((candidate) => candidate.id === row.id) === index);
+    const hasEvidence = evidence.length > 0;
+    const missing = declaredMissing.length
+      ? declaredMissing
+      : hasEvidence ? [] : ["Diagnostic evidence has not been collected"];
     const confidenceReasons = [
       `${evidence.length} linked evidence source(s)`,
       `${formatQualityPercent(selectedAlertEvaluation.citationCoverage)} citation coverage`,
       `${formatQualityPercent(selectedAlertEvaluation.groundingScore)} grounding`,
       missing.length ? `${missing.length} evidence gap(s)` : "No declared evidence gaps",
     ];
-    return { analysis, missing, conflicting, evidence, providerRow, fallbackUsed, confidenceReasons };
-  }, [selectedAlertWorkflow, selectedAlertUsage, selectedAlertRagDocuments, selectedAlertEvaluation]);
+    return { analysis, missing, conflicting, evidence, hasEvidence, providerRow, fallbackUsed, confidenceReasons };
+  }, [selectedAlertWorkflow, selectedAlertRow, selectedAlertId, selectedAlertUsage, selectedAlertRagDocuments, selectedAlertEvaluation]);
 
   const selectedRcaDecision = useMemo(() => {
     const analysis = canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow);
@@ -6014,8 +6033,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       analysis.rca?.causal_chain || analysis.rca?.mechanism || analysis.rca?.reasoning || analysis.rca?.contributing_factors,
       "The causal mechanism was not supplied by the current analysis.",
     );
-    const confidence = Number(selectedAlertEvaluation.confidenceScore || analysis.confidence || 0);
+    const confidenceAvailable = selectedAiTrust.hasEvidence;
+    const confidence = confidenceAvailable ? Number(selectedAlertEvaluation.confidenceScore || analysis.confidence || 0) : 0;
     const reviewRequired = Boolean(
+      !selectedAiTrust.hasEvidence
+      ||
       selectedAlertEvaluation.requiresReview
       || confidence < 0.7
       || selectedAiTrust.missing.length
@@ -6023,9 +6045,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     );
     return {
       ...analysis,
+      status: selectedAiTrust.hasEvidence ? analysis.status : "insufficient-evidence",
       confidence,
+      confidenceAvailable,
       reviewRequired,
-      confidenceLabel: confidence >= 0.85 ? "High confidence" : confidence >= 0.7 ? "Moderate confidence" : "Low confidence",
+      confidenceLabel: !confidenceAvailable ? "Ungrounded" : confidence >= 0.85 ? "High confidence" : confidence >= 0.7 ? "Moderate confidence" : "Low confidence",
       impactedServices,
       causalDetails,
       impactEvidence: evidenceUsed,
@@ -6042,7 +6066,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       dependencyImpact: readableImpactText(impact.dependency_impact, "Dependency impact was not established by the collected evidence."),
       urgency: cleanRecommendationText(impact.severity_rationale || impact.urgency, selectedAlertRow?.severity ? `${selectedAlertRow.severity} alert priority; business urgency requires operator validation.` : "Operational urgency was not established."),
     };
-  }, [selectedAlertWorkflow, selectedAlertRow, selectedAlertEvaluation, selectedAiTrust.missing.length]);
+  }, [selectedAlertWorkflow, selectedAlertRow, selectedAlertEvaluation, selectedAiTrust.hasEvidence, selectedAiTrust.missing.length]);
 
   const selectedRelevantRcaEvidence = useMemo(() => {
     // These sources already come from the selected alert's linked-document
@@ -8472,6 +8496,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   });
   const credentialReferenceValid = !executionRequiresCredential || /^(?:vault:\/\/|arn:aws:secretsmanager:|gcp-secret:\/\/|k8s-secret:\/\/)/.test(effectiveCredentialRef) || /^https:\/\/[^/]+\.vault\.azure\.net\/secrets\/[^/]+(?:\/[^/]+)?$/i.test(effectiveCredentialRef);
   const executionPreflightChecks = [
+    { id: "evidence", label: "Diagnostic evidence", detail: selectedAiTrust.hasEvidence ? `${selectedAiTrust.evidence.length} linked record(s) support analysis.` : "No linked diagnostic evidence; collect evidence before planning execution.", passed: selectedAiTrust.hasEvidence, blocking: true },
     { id: "incident", label: "Incident identity", detail: "A durable incident ID is attached.", passed: looksLikeUuid(String(approvalForm.incident_id || selectedIncidentId || selectedApprovalIncidentId || "")), blocking: true },
     { id: "approval", label: "Approval state", detail: "Approval is recorded only after this dry run passes.", passed: ["approved", "modified"].includes(selectedExecutionBreakdown.approvalStatus), blocking: false },
     { id: "role", label: "Operator permission", detail: "The signed-in role can approve and execute remediation.", passed: canUseApprovalActions, blocking: true },
@@ -8518,7 +8543,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const cockpitApprovalComplete = ["approved", "modified", "rejected"].includes(selectedExecutionBreakdown.approvalStatus);
   const recordedExecutionStatus = String(selectedExecutionPlan.remediationAction?.status || "").trim().toLowerCase();
   const executionPolicyBlocked = String(selectedExecutionPlan.remediationAction?.action_type || "").trim().toLowerCase() === "policy-blocked"
-    || selectedExecutionPlan.remediationAction?.metadata?.policy_blocked === true;
+    || selectedExecutionPlan.remediationAction?.metadata?.policy_blocked === true
+    || !selectedAiTrust.hasEvidence;
   const terminalIncidentStatus = String(selectedExecutionBreakdown.incidentStatus || "").trim().toLowerCase();
   const cockpitExecutionStatus = effectiveExecutionStatus(
     terminalIncidentStatus,
@@ -8530,7 +8556,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     || selectedAlertRagDocuments.some((document) => String(document?.source_system || document?.metadata?.source_system || "").toLowerCase() === "kaims-execution-review");
   const incidentCockpitStages = [
     { id: "overview", short: "01", label: "Orient", accessibleLabel: "Overview", description: "Identity and lifecycle", complete: Boolean(selectedAlertId) },
-    { id: "evidence", short: "02", label: "Evidence & Understanding", accessibleLabel: "Evidence, RCA, and impact", description: `${selectedAlertRagDocuments.length} linked record(s) · RCA and impact`, complete: selectedAlertRagDocuments.length > 0 && Boolean(cockpitAnalysis.rootCause && cockpitAnalysis.rootCause !== "-") },
+    { id: "evidence", short: "02", label: "Evidence & Understanding", accessibleLabel: "Evidence, RCA, and impact", description: `${selectedAiTrust.evidence.length} linked record(s) · RCA and impact`, complete: selectedAiTrust.hasEvidence && Boolean(cockpitAnalysis.rootCause && cockpitAnalysis.rootCause !== "-") },
     { id: "execution", short: "03", label: "Resolve", accessibleLabel: "Resolve incident", description: executionPolicyBlocked ? "execution blocked — review required" : cockpitExecutionStatus || selectedExecutionBreakdown.approvalStatus || "plan, approve, execute", complete: !executionPolicyBlocked && ["succeeded", "skipped", "failed", "policy_blocked", "dispatch_failed", "execution_failed", "validation_failed", "rolled_back", "rollback_failed", "timed_out", "cancelled", "manual_intervention_required"].includes(cockpitExecutionStatus) },
     { id: "audit", short: "04", label: "Validate", accessibleLabel: "Audit Trail", description: selectedCanonicalIncidentStatus === "closed" ? "closed" : executionOutcomeReviewed ? "outcome reviewed" : "audit and recovery", complete: selectedCanonicalIncidentStatus === "closed" || executionOutcomeReviewed },
   ];
@@ -10047,15 +10073,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               filters: metadataFilters,
               refresh: loadIncidentMetadata,
               updateFilter: (name, value) => setMetadataFilters((current) => ({ ...current, [name]: value })),
-              open: (row) => {
-                const incidentId = String(row?.incident_id || row?.id || "").trim();
-                if (incidentId && typeof onNavigatePath === "function") {
-                  onNavigatePath(`/incidents/${encodeURIComponent(incidentId)}`);
-                  return;
-                }
-                openAlertDetailsFromIncident(row, "overview");
+              open: (row, stage = "overview") => {
+                openAlertDetailsFromIncident(row, stage);
               },
-              openTechnical: (row, stage = "overview") => openAlertDetailsFromIncident(row, stage),
+              openTechnical: (row, stage = "overview") => {
+                openAlertDetailsFromIncident(row, stage);
+              },
             },
             alerts: {
               loading: landingPadRecent.loading,
@@ -10338,15 +10361,15 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                   <div className="guided-cockpit-summary">
                     <span><small>Service</small><strong>{selectedAlertRow?.service || "-"}</strong></span>
                     <span><small>Environment</small><strong>{selectedAlertRow?.environment || "-"}</strong></span>
-                    <span><small>Evidence</small><strong>{selectedAlertRagDocuments.length} linked</strong></span>
-                    <span><small>Grounding</small><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong></span>
+                    <span><small>Evidence</small><strong>{selectedAiTrust.evidence.length} linked</strong></span>
+                    <span><small>Grounding</small><strong>{selectedAiTrust.hasEvidence ? formatQualityPercent(selectedAlertEvaluation.groundingScore) : "Unavailable"}</strong></span>
                   </div>
                   <section className="guided-cockpit-next" aria-labelledby="guided-next-action">
                     <div><span className="eyebrow">Recommended next step</span><h3 id="guided-next-action">{cockpitRecommended.label}</h3><p>{cockpitRecommended.description}. KaiMS will keep your selected incident and context in view.</p></div>
                     <button type="button" className="button-primary" onClick={() => { openAlertDetails(selectedAlertRow); setHomeDetailTab(cockpitRecommendedStage); }}>Continue to {cockpitRecommended.label}</button>
                   </section>
                   <nav className="guided-cockpit-mini-journey" aria-label="Incident progress">
-                    {incidentCockpitStages.map((stage) => <button key={`launcher-${stage.id}`} type="button" className={stage.complete ? "is-complete" : stage.id === cockpitRecommendedStage ? "is-current" : ""} onClick={() => { openAlertDetails(selectedAlertRow); setHomeDetailTab(stage.id); }}><span>{stage.complete ? <CircleCheckBig size={14} strokeWidth={2.5} aria-hidden="true" /> : stage.short}</span><strong>{stage.label}</strong></button>)}
+                    {incidentCockpitStages.map((stage) => <button key={`launcher-${stage.id}`} type="button" disabled={stage.id === "execution" && !selectedAiTrust.hasEvidence} title={stage.id === "execution" && !selectedAiTrust.hasEvidence ? "Collect diagnostic evidence before opening Resolve." : undefined} className={stage.complete ? "is-complete" : stage.id === cockpitRecommendedStage ? "is-current" : ""} onClick={() => { openAlertDetails(selectedAlertRow); setHomeDetailTab(stage.id); }}><span>{stage.complete ? <CircleCheckBig size={14} strokeWidth={2.5} aria-hidden="true" /> : stage.short}</span><strong>{stage.label}</strong></button>)}
                   </nav>
                   <details className="k-technical-details guided-cockpit-context">
                     <summary>Rule context and severity controls</summary>
@@ -10697,6 +10720,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         role="tab"
                         aria-selected={homeDetailTab === stage.id}
                         aria-label={stage.accessibleLabel || stage.label}
+                        disabled={stage.id === "execution" && !selectedAiTrust.hasEvidence}
+                        title={stage.id === "execution" && !selectedAiTrust.hasEvidence ? "Collect diagnostic evidence before opening Resolve." : undefined}
                       >
                         <span>{stage.complete ? <CircleCheckBig size={14} strokeWidth={2.5} aria-hidden="true" /> : stage.short}</span>
                         <strong>{stage.label}</strong>

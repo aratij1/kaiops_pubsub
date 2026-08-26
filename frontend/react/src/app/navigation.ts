@@ -56,7 +56,7 @@ export const NAVIGATION_ITEMS: readonly NavigationItem[] = [
   { id: "audit", legacyTab: "safety", path: "/audit", label: "Audit", pageTitle: "Audit Trail", group: "governance", routeModule: "audit", icon: "audit", keywords: ["history", "compliance", "events"], allowedRoles: ENGINEERING_ROLES },
   { id: "closed", legacyTab: "closed", path: "/closed-incidents", label: "Closed Incidents", pageTitle: "Closed Incidents", group: "governance", routeModule: "closed-incidents", icon: "closed", keywords: ["resolved", "historical", "tickets"], allowedRoles: INCIDENT_ROLES, related: ["incidents"], showInNavigation: false },
   { id: "admin", legacyTab: "admin", path: "/admin/users", label: "Users & Access", pageTitle: "Users & Access", group: "administration", routeModule: "admin", icon: "admin", keywords: ["users", "roles", "access", "identity"], allowedRoles: ["administrator"] },
-  { id: "settings", legacyTab: "admin", path: "/admin/settings", label: "Platform Settings", pageTitle: "Platform Settings", group: "administration", routeModule: "admin", icon: "settings", keywords: ["platform", "configuration", "preferences"], allowedRoles: ["administrator"] },
+  { id: "settings", legacyTab: "admin", path: "/service-control", label: "Service Control", pageTitle: "Service Control Panel", group: "platform", routeModule: "admin", icon: "settings", keywords: ["platform", "services", "health", "status", "control panel"], allowedRoles: ENGINEERING_ROLES },
   { id: "executive", legacyTab: "executive", path: "/executive", label: "Executive Dashboard", pageTitle: "Executive Dashboard", group: "governance", routeModule: "executive", icon: "executive", keywords: ["leadership", "business", "metrics"], allowedRoles: ["administrator", "l3_engineer", "executive"], showInNavigation: false },
 ];
 
@@ -67,6 +67,7 @@ export const LEGACY_REDIRECTS = [
   { from: "/summary", to: "/incidents" },
   { from: "/gateway-safety", to: "/automation" },
   { from: "/admin", to: "/admin/users" },
+  { from: "/admin/settings", to: "/service-control" },
 ] as const;
 
 export const TAB_SHORTCUT_BY_CODE: Readonly<Record<string, LegacyTabId>> = Object.freeze({

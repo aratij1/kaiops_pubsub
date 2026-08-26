@@ -205,11 +205,17 @@ class OpenAIModelProvider(ModelProvider):
                 },
             ],
         }
+        base_url = self.base_url.rstrip("/")
+        is_azure_openai = ".openai.azure.com" in base_url.lower()
+        if is_azure_openai and not base_url.lower().endswith("/openai/v1"):
+            base_url = f"{base_url}/openai/v1"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        if is_azure_openai:
+            headers["api-key"] = self.api_key
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 response = await client.post(
-                    f"{self.base_url.rstrip('/')}/responses",
+                    f"{base_url}/responses",
                     headers=headers,
                     json=request_payload,
                 )

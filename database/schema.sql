@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     KEY idx_audit_logs_actor (actor),
     KEY idx_audit_logs_action (action),
+    KEY idx_audit_logs_created_at (created_at),
     KEY idx_audit_logs_resource (resource_type, resource_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

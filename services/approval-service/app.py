@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
 import logging
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -24,6 +25,8 @@ tasks: list[asyncio.Task] = []
 ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any, Any, None]]
 
 PENDING_INCIDENTS: dict[str, dict] = {}
+CAPACITY_PROFILES: dict[str, dict[str, Any]] = {}
+ASSIGNMENTS: dict[str, dict[str, Any]] = {}
 _HIGH_RISK_SEVERITIES = {"high", "critical"}
 _NON_HUMAN_APPROVERS = {"", "system", "rca-agent", "automation-agent", "orchestrator"}
 logger = logging.getLogger("kaiops.approval_service")
@@ -70,6 +73,93 @@ class ApprovalRequest(BaseModel):
 
 class ModifyRequest(ApprovalRequest):
     modified_action: str
+
+
+class CapacityProfileRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    resource_names: list[str] = Field(default_factory=list)
+    weekly_hours: float = Field(default=8, gt=0, le=168)
+    timezone: str = "Asia/Kolkata"
+    working_days: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4])
+    work_start: str = Field(default="09:00", pattern=r"^\d{2}:\d{2}$")
+    work_end: str = Field(default="17:00", pattern=r"^\d{2}:\d{2}$")
+    active: bool = True
+
+
+class AssignmentTicket(BaseModel):
+    incident_id: str = Field(min_length=1)
+    service: str = "unknown"
+    severity: str = "medium"
+    resource_names: list[str] = Field(default_factory=list)
+
+
+class AutoAssignRequest(BaseModel):
+    tickets: list[AssignmentTicket] = Field(default_factory=list)
+
+
+def _capacity_rows() -> list[dict[str, Any]]:
+    allocated: dict[str, float] = {}
+    for assignment in ASSIGNMENTS.values():
+        if assignment.get("status") in {"assigned", "in_progress"}:
+            username = str(assignment.get("assignee") or "")
+            allocated[username] = allocated.get(username, 0.0) + float(assignment.get("estimated_hours") or 0)
+    rows = []
+    for username, profile in sorted(CAPACITY_PROFILES.items()):
+        used = allocated.get(username, 0.0)
+        weekly = float(profile["weekly_hours"])
+        rows.append({**profile, "allocated_hours": used, "remaining_hours": max(0.0, weekly - used)})
+    return rows
+
+
+@app.get("/capacity")
+async def list_capacity() -> dict[str, Any]:
+    return {"rows": _capacity_rows()}
+
+
+@app.put("/capacity/{username}")
+async def put_capacity(username: str, request: CapacityProfileRequest) -> dict[str, Any]:
+    normalized = username.strip()
+    if not normalized or normalized != request.username.strip():
+        raise HTTPException(status_code=400, detail="username in path and payload must match")
+    days = sorted(set(request.working_days))
+    if any(day < 0 or day > 6 for day in days):
+        raise HTTPException(status_code=422, detail="working_days must contain values from 0 through 6")
+    profile = request.model_dump()
+    profile.update(username=normalized, resource_names=sorted(set(filter(None, (name.strip() for name in request.resource_names)))), working_days=days)
+    CAPACITY_PROFILES[normalized] = profile
+    return {**profile, "allocated_hours": 0.0, "remaining_hours": profile["weekly_hours"]}
+
+
+@app.get("/assignments")
+async def list_assignments() -> dict[str, Any]:
+    return {"rows": sorted(ASSIGNMENTS.values(), key=lambda row: row.get("created_at", ""), reverse=True)}
+
+
+@app.post("/auto-assign")
+async def auto_assign(request: AutoAssignRequest) -> dict[str, Any]:
+    available = _capacity_rows()
+    assigned = 0
+    unmatched: list[str] = []
+    severity_hours = {"critical": 4.0, "high": 3.0, "medium": 2.0, "low": 1.0}
+    for ticket in request.tickets:
+        if ticket.incident_id in ASSIGNMENTS:
+            continue
+        required = {name.lower() for name in [ticket.service, *ticket.resource_names] if name}
+        candidates = [row for row in available if row["active"] and row["remaining_hours"] > 0 and ({name.lower() for name in row["resource_names"]} & required or "all" in {name.lower() for name in row["resource_names"]})]
+        if not candidates:
+            unmatched.append(ticket.incident_id)
+            continue
+        candidate = max(candidates, key=lambda row: row["remaining_hours"])
+        hours = min(candidate["remaining_hours"], severity_hours.get(ticket.severity.lower(), 2.0))
+        ASSIGNMENTS[ticket.incident_id] = {
+            "incident_id": ticket.incident_id, "assignee": candidate["username"], "service": ticket.service,
+            "estimated_hours": hours, "status": "assigned",
+            "assignment_reason": f"Matched {ticket.service} to available responder capacity.",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        candidate["remaining_hours"] -= hours
+        assigned += 1
+    return {"assigned": assigned, "unmatched": unmatched, "rows": list(ASSIGNMENTS.values())}
 
 
 @app.post("/approve", response_model=Approval)

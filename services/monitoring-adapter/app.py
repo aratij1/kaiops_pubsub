@@ -2673,6 +2673,8 @@ async def get_closed_incidents(limit: int = 100) -> dict[str, Any]:
 @app.get("/incidents/metadata")
 async def get_incident_metadata(
     limit: int = 100,
+    tenant_id: str = "default",
+    incident_id: str | None = None,
     risk_tier: str | None = None,
     execution_mode: str | None = None,
     transport_provider: str | None = None,
@@ -2686,6 +2688,8 @@ async def get_incident_metadata(
             repo = IncidentRepository(session)
             rows = await repo.list_incident_projections(
                 limit=safe_limit,
+                tenant_id=tenant_id,
+                incident_id=incident_id,
                 risk_tier=risk_tier,
                 execution_mode=execution_mode,
                 transport_provider=transport_provider,
@@ -2695,6 +2699,9 @@ async def get_incident_metadata(
         return {"rows": rows, "count": len(rows)}
 
     rows = list(CLOSED_INCIDENTS)
+    if incident_id:
+        normalized_incident_id = str(incident_id).strip().lower()
+        rows = [row for row in rows if str(row.get("incident_id") or row.get("id") or "").strip().lower() == normalized_incident_id]
     if risk_tier:
         rows = [row for row in rows if str(row.get("risk") or "").strip().lower() == str(risk_tier).strip().lower()]
     if execution_mode:

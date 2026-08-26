@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   AlertTriangle,
@@ -108,13 +108,48 @@ export default function IncidentCommand() {
   const navigate = useNavigate();
   const incidents = useRouteRuntimeSlice("incidents");
   const approvals = useRouteRuntimeSlice("approvals");
+  const session = useRouteRuntimeSlice("session");
   const [approvalExpanded, setApprovalExpanded] = useState(false);
+  const [targetedIncident, setTargetedIncident] = useState<IncidentRow | null>(null);
+  const [targetedLookup, setTargetedLookup] = useState({ loading: false, complete: false, error: "" });
 
-  const row = useMemo(() => incidents.rows.find((candidate) => incidentId(candidate).toLowerCase() === decodeURIComponent(routeIncidentId).toLowerCase()), [incidents.rows, routeIncidentId]);
+  const normalizedRouteIncidentId = decodeURIComponent(routeIncidentId).trim().toLowerCase();
+  const loadedRow = useMemo(() => incidents.rows.find((candidate) => incidentId(candidate).toLowerCase() === normalizedRouteIncidentId), [incidents.rows, normalizedRouteIncidentId]);
+  const row = loadedRow || (targetedIncident && incidentId(targetedIncident).toLowerCase() === normalizedRouteIncidentId ? targetedIncident : undefined);
   const approval = useMemo(() => row ? approvals.rows.find((candidate) => incidentId(candidate).toLowerCase() === incidentId(row).toLowerCase()) : undefined, [approvals.rows, row]);
 
-  if (incidents.loading && !incidents.rows.length) return <LoadingState label="Loading incident command" />;
+  useEffect(() => {
+    setTargetedIncident(null);
+    setTargetedLookup({ loading: false, complete: false, error: "" });
+  }, [normalizedRouteIncidentId]);
+
+  useEffect(() => {
+    if (!normalizedRouteIncidentId || !session.accessToken || loadedRow || incidents.loading) return;
+    const controller = new AbortController();
+    setTargetedLookup({ loading: true, complete: false, error: "" });
+    void fetch(`/api-gateway/incidents/metadata?limit=1&incident_id=${encodeURIComponent(normalizedRouteIncidentId)}`, {
+      headers: {
+        Accept: "application/json",
+        ...(session.accessToken ? { Authorization: `Bearer ${session.accessToken}` } : {}),
+      },
+      cache: "no-store",
+      signal: controller.signal,
+    }).then(async (response) => {
+      if (!response.ok) throw new Error(`Incident lookup failed (${response.status})`);
+      const payload = await response.json() as { data?: { rows?: IncidentRow[] }; rows?: IncidentRow[] };
+      const rows = payload.data?.rows || payload.rows || [];
+      setTargetedIncident(rows.find((candidate) => incidentId(candidate).toLowerCase() === normalizedRouteIncidentId) || null);
+      setTargetedLookup({ loading: false, complete: true, error: "" });
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted) return;
+      setTargetedLookup({ loading: false, complete: true, error: error instanceof Error ? error.message : String(error) });
+    });
+    return () => controller.abort();
+  }, [incidents.loading, loadedRow, normalizedRouteIncidentId, session.accessToken]);
+
+  if ((incidents.loading && !incidents.rows.length) || (!loadedRow && !targetedLookup.complete)) return <LoadingState label="Loading incident command" />;
   if (incidents.error && !incidents.rows.length) return <ErrorState title="Incident data is temporarily unavailable" description="Kai cannot assemble the command workspace until the incident service responds." retry={incidents.refresh} />;
+  if (!row && targetedLookup.error) return <ErrorState title="Incident lookup is temporarily unavailable" description={targetedLookup.error} retry={() => setTargetedLookup({ loading: false, complete: false, error: "" })} />;
   if (!row) return <EmptyState title="Incident not found in the loaded scope" description={`No role-authorized incident record matches ${decodeURIComponent(routeIncidentId)}.`} action={<button type="button" className="button-primary" onClick={() => navigate("/incidents")}>Return to incident inbox</button>} />;
 
   const projection = record(row.projection_payload);

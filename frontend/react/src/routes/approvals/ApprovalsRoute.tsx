@@ -35,8 +35,8 @@ export default function ApprovalsRoute() {
       if (!capacityLoadPromise) {
         capacityLoadPromise = (async () => {
           const [capacityResponse, assignmentResponse] = await Promise.all([
-            fetch("/api-gateway/approval/capacity", { headers: authHeaders() }),
-            fetch("/api-gateway/approval/assignments", { headers: authHeaders() }),
+            fetch("/approval-service/capacity", { headers: authHeaders() }),
+            fetch("/approval-service/assignments", { headers: authHeaders() }),
           ]);
           if (!capacityResponse.ok || !assignmentResponse.ok) throw new Error("Capacity service is unavailable.");
           const capacityData = unwrap(await capacityResponse.json());
@@ -63,7 +63,7 @@ export default function ApprovalsRoute() {
     setCapacityStatus("Saving capacity…");
     const payload = { ...capacityForm, weekly_hours: Number(capacityForm.weekly_hours), resource_names: capacityForm.resource_names.split(",").map((value) => value.trim()).filter(Boolean) };
     try {
-      const response = await fetch(`/api-gateway/approval/capacity/${encodeURIComponent(capacityForm.username.trim())}`, { method: "PUT", headers: authHeaders(), body: JSON.stringify(payload) });
+      const response = await fetch(`/approval-service/capacity/${encodeURIComponent(capacityForm.username.trim())}`, { method: "PUT", headers: authHeaders(), body: JSON.stringify(payload) });
       if (!response.ok) throw new Error(`Capacity was not saved (${response.status}).`);
       setCapacityStatus("Capacity saved and available for assignment.");
       await loadCapacity(true);
@@ -75,7 +75,7 @@ export default function ApprovalsRoute() {
     if (!tickets.length) { setCapacityStatus("There are no pending tickets to assign."); return; }
     setCapacityStatus("Matching tickets to current on-duty capacity…");
     try {
-      const response = await fetch("/api-gateway/approval/auto-assign", { method: "POST", headers: authHeaders(), body: JSON.stringify({ tickets }) });
+      const response = await fetch("/approval-service/auto-assign", { method: "POST", headers: authHeaders(), body: JSON.stringify({ tickets }) });
       if (!response.ok) throw new Error(`Auto-assignment failed (${response.status}).`);
       const result = unwrap(await response.json());
       setCapacityStatus(`${Number(result?.assigned || 0)} ticket(s) assigned. Unmatched tickets remain visible for manual routing.`);
