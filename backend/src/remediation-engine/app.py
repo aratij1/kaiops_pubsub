@@ -1226,7 +1226,10 @@ async def rollback_execution_direct(payload: dict[str, Any], x_kaiops_internal_t
         or str(original_contract.get("incident_id") or "") != str(approval.incident_id)
         or str(original_contract.get("plan_fingerprint") or "") != str(approval.plan_fingerprint or "")
     ):
-        raise HTTPException(status_code=409, detail="Rollback blocked: original execution is bound to another approval.")
+        raise HTTPException(
+            status_code=409,
+            detail="Rollback blocked: original execution is bound to another approval.",
+        )
 
     if not rollback_commands:
         action = original or preview
@@ -1840,7 +1843,9 @@ def _unsafe_plan_reasons(approval: Approval) -> list[str]:
         for name, expected in expected_bindings.items():
             actual = str(plan.get(name) or "").strip()
             if not actual or (expected is not None and actual != str(expected)):
-                reasons.append(f"Execution blocked: immutable {name.replace('_', ' ')} binding is missing or mismatched.")
+                reasons.append(
+                    f"Execution blocked: immutable {name.replace('_', ' ')} binding is missing or mismatched."
+                )
         expected_target = str(approval.metadata.get("target_resource_id") or "").strip()
         plan_target = str(plan.get("target_resource_id") or plan.get("remediation_target") or "").strip()
         if not expected_target or expected_target != plan_target:
@@ -2305,7 +2310,7 @@ async def _request_failure_reconsideration(
         "action_id": str(action.id),
         "action_type": action.action_type,
         "target": action.target,
-        "preflight_evidence": preflight_evidence,
+        "preflight_evidence": action.parameters.get("preflight_evidence", {}),
         "service": str(action.parameters.get("service") or action.target),
         "environment": str(action.parameters.get("environment") or "prod"),
         "error": str(action.error or action.output or "execution failed"),
@@ -2313,12 +2318,6 @@ async def _request_failure_reconsideration(
         "previous_recommendation": previous,
         "attempt": attempt,
     }
-    session_factory = getattr(app.state, "session_factory", None)
-    if settings.database_enabled and session_factory is not None:
-        async with session_factory() as session:
-            await IncidentRepository(session).save_action_audit(action, actor="remediation-preflight")
-            await session.commit()
-    return result
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(f"{settings.resolution_agent_url.rstrip('/')}/reconsider-execution", json=request)

@@ -2,7 +2,7 @@ from importlib import util
 from pathlib import Path
 
 import pytest
-from common.models import ApprovalDecision
+from common.models import ApprovalDecision, RemediationAction, RemediationStatus
 from remediation_test_helpers import governed_approval as Approval
 
 
@@ -245,6 +245,65 @@ def test_confidence_alone_cannot_skip_required_approval() -> None:
     }
 
     assert module._resolution_requires_approval(payload) is True
+
+
+@pytest.mark.asyncio
+async def test_failed_execution_requests_a_fresh_approval_gated_plan(monkeypatch) -> None:
+    module = load_remediation_app_module()
+    captured: dict = {}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"recommendation": {"id": "reconsidered-v2"}}
+
+    class Client:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json):
+            captured["url"] = url
+            captured["request"] = json
+            return Response()
+
+    class Producer:
+        async def publish(self, topic, payload, key=None) -> None:
+            captured["published"] = (topic, payload, key)
+
+    async def persist(_app, action) -> None:
+        captured["persisted"] = action.metadata["failure_reconsideration"]
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(module, "_persist_action", persist)
+    monkeypatch.setattr(module.app.state, "producer", Producer(), raising=False)
+    action = RemediationAction(
+        tenant_id="tenant-a",
+        incident_id="11111111-1111-1111-1111-111111111111",
+        approval_id="22222222-2222-2222-2222-222222222222",
+        action_type="restart_service",
+        target="checkout-api",
+        status=RemediationStatus.FAILED,
+        error="health check failed",
+        parameters={"preflight_evidence": {"status": "PASSED"}},
+    )
+
+    await module._request_failure_reconsideration(
+        action=action,
+        source_payload={"recommendation": {"id": "recommendation-v1", "metadata": {}}},
+    )
+
+    assert captured["request"]["preflight_evidence"] == {"status": "PASSED"}
+    assert captured["url"].endswith("/reconsider-execution")
+    assert captured["published"][1]["recommendation"]["id"] == "reconsidered-v2"
+    assert captured["persisted"]["status"] == "awaiting_approval"
 
 
 def test_resolution_requires_approval_keeps_existing_flow_when_resolution_confidence_below_threshold() -> None:

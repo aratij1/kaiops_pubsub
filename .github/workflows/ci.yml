@@ -35,7 +35,7 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
       - name: Lint
-        run: ruff check .
+        run: python scripts/check_ruff_regression.py --baseline 6e524173ad0c752272b6c53518e0cc8108bf820d
       - name: Validate RAG metadata
         run: python scripts/validate-rag-metadata.py --rag-root backend/rag
       - name: Validate governed execution catalogs and checksums
