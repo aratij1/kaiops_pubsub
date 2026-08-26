@@ -10230,13 +10230,12 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               ]),
             },
             incidents: {
-              // Alerts & Incidents is the global operations queue. The monitor
-              // selected for dashboard drill-down must not hide incidents from
-              // other sources (for example Docker/application log ingestion).
-              rows: incidentMetadata.rows,
+              // Keep the inbox aligned with the same production/test and
+              // application scope used by Live Alerts.
+              rows: monitorScopedIncidentMetadata,
               loading: incidentMetadata.loading,
               error: incidentMetadata.error || "",
-              application: "all",
+              application: applicationToMonitor,
               filters: metadataFilters,
               refresh: loadIncidentMetadata,
               updateFilter: (name, value) => setMetadataFilters((current) => ({ ...current, [name]: value })),
@@ -10271,6 +10270,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               query: ingestionStreamQuery,
               refresh: () => { loadRecentAlerts({ background: true }); loadLandingPadRecent(); },
               open: openAlertDetails,
+              openIncident: (row) => {
+                const incidentId = String(row?.incident_id || row?.incident_projection?.incident_id || row?.incident_projection?.id || "").trim();
+                incidentId && typeof onNavigatePath === "function" ? onNavigatePath(`/incidents/${encodeURIComponent(incidentId)}`) : openAlertDetails(row);
+              },
               togglePaused: () => setIngestionStreamPaused((current) => !current),
               setSection: setIngestionStreamSection,
               setView: setIngestionStreamView,
