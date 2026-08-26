@@ -7,6 +7,24 @@ export interface AuthConfig {
   pkce_required: boolean;
 }
 
+import { clearStoredSession, readStoredSession, storeSessionTokens } from "./sessionBootstrap";
+export { clearStoredSession, storeSessionTokens };
+
+export async function restoreStoredSession(config: AuthConfig, request: (path: string, options?: Record<string, unknown>) => Promise<any>) {
+  const stored = readStoredSession();
+  if (config.mode === "local" && stored.refreshToken) {
+    const renewed = await request("/api-gateway/auth/refresh", { method: "POST", maxAttempts: 1, body: JSON.stringify({ refresh_token: stored.refreshToken }) });
+    if (!renewed.access_token || !renewed.refresh_token || !renewed.user) throw new Error("Stored session is no longer valid");
+    return { loading: false, accessToken: renewed.access_token, refreshToken: renewed.refresh_token, user: renewed.user, error: "" };
+  }
+  if (config.mode === "oidc" && stored.accessToken) {
+    const me = await request("/api-gateway/auth/me", { headers: { Authorization: `Bearer ${stored.accessToken}` }, maxAttempts: 1 });
+    if (!me.user) throw new Error("Stored session is no longer valid");
+    return { loading: false, accessToken: stored.accessToken, refreshToken: "", user: me.user, error: "" };
+  }
+  return null;
+}
+
 interface Discovery {
   authorization_endpoint: string;
   token_endpoint: string;

@@ -4,7 +4,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { Archive, BookOpen, Bot, Boxes, ChartNoAxesCombined, CircleCheckBig, ClipboardCheck, Cloud, Database, Gauge, PlugZap, RadioTower, ScrollText, Server, Settings, ShieldCheck, Siren, Workflow } from "lucide-react";
 import { alertRowsQueryOptions, landingPadRowsQueryOptions } from "./services/alerts";
 import { useOperationalEvents } from "./services/operationalEvents";
-import { beginOidcLogin, completeOidcLogin } from "./services/oidcClient";
+import { beginOidcLogin, clearStoredSession, completeOidcLogin, restoreStoredSession, storeSessionTokens } from "./services/oidcClient";
 import { RouteRuntimeProvider } from "./app/routeRuntime";
 import { projectIdentityFromAlert } from "./domain/projectIdentity";
 import { durableIncidentPath, effectiveExecutionStatus, effectiveIncidentStatus, executionProcessPresentation, incidentStatusLabel } from "./domain/incidentStatus";
@@ -586,7 +586,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const [adminWorkspace, setAdminWorkspace] = useState("users");
   const [adminAuthForm, setAdminAuthForm] = useState({ username: "admin", password: "", device: "react-ui" });
   const [loginPasswordVisible, setLoginPasswordVisible] = useState(false);
-  const [adminSession, setAdminSession] = useState({ loading: false, accessToken: "", refreshToken: "", user: null, error: "" });
+  const [adminSession, setAdminSession] = useState({ loading: true, accessToken: "", refreshToken: "", user: null, error: "" });
   const [authConfig, setAuthConfig] = useState({ loading: true, mode: "local", local_development_only: true, issuer: null, client_id: null, audience: null, pkce_required: false, error: "" });
   const liveEvents = useOperationalEvents({
     accessToken: String(adminSession?.accessToken || ""),
@@ -2333,7 +2333,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }
 
   function expireAdminSession() {
-    const expired = {
+    clearStoredSession(); const expired = {
       loading: false,
       accessToken: "",
       refreshToken: "",
@@ -2372,7 +2372,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         if (!renewed.accessToken || !renewed.refreshToken) {
           throw new Error("Token refresh returned an incomplete session.");
         }
-        adminSessionRef.current = renewed;
+        adminSessionRef.current = renewed; storeSessionTokens(renewed);
         setAdminSession(renewed);
         return { Authorization: `Bearer ${renewed.accessToken}` };
       } catch (_error) {
@@ -2417,7 +2417,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         user: response?.user || null,
         error: "",
       };
-      adminSessionRef.current = authenticatedSession;
+      adminSessionRef.current = authenticatedSession; storeSessionTokens(authenticatedSession);
       setAdminSession(authenticatedSession);
     } catch (error) {
       setAdminSession((current) => ({ ...current, loading: false, error: error.message }));
@@ -2434,7 +2434,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }
 
   async function adminLogout() {
-    const headers = adminHeaders();
+    clearStoredSession(); const headers = adminHeaders();
     try {
       if (headers.Authorization) {
         await fetchJson("/api-gateway/auth/logout", { method: "POST", headers, body: JSON.stringify({}) });
@@ -4837,12 +4837,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           if (!accessToken) throw new Error("Identity provider did not return an access token");
           const me = await fetchJson("/api-gateway/auth/me", { headers: { Authorization: `Bearer ${accessToken}` }, maxAttempts: 1 });
           const session = { loading: false, accessToken, refreshToken: "", user: me.user || null, error: "" };
-          adminSessionRef.current = session;
+          adminSessionRef.current = session; storeSessionTokens(session);
           setAdminSession(session);
-        }
+        } else { const session = await restoreStoredSession(config, fetchJson); if (session) { adminSessionRef.current = session; storeSessionTokens(session); setAdminSession(session); } else setAdminSession((current) => ({ ...current, loading: false })); }
       } catch (error) {
-        if (!cancelled) {
-          setAuthConfig((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
+        if (!cancelled) { clearStoredSession(); setAuthConfig((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
           setAdminSession((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
         }
       }
@@ -9853,6 +9852,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     URL.revokeObjectURL(objectUrl);
   }
 
+  if (adminSession.loading || authConfig.loading) return <main className="app-route-loading" aria-busy="true">Restoring authenticated session…</main>;
   if (!isAuthenticated) {
     return (
       <main className={`app-shell auth-shell density-${uiDensity}`}>
