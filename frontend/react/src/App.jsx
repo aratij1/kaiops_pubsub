@@ -9889,7 +9889,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }
 
   return (
-    <div className={`app-shell density-${uiDensity}`}>
+    <div className={`app-shell density-${uiDensity} ${routeOutlet ? "app-shell-routed" : ""}`}>
       <a className="skip-link" href="#workspace-content">Skip to workspace content</a>
       {!isBrowserOnline ? (
         <aside className="connectivity-banner" role="alert" aria-live="assertive">
@@ -9928,7 +9928,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         kaiStates={kaiStateSummary}
         restrictedDestination={restrictedDestination}
       >
-      <div className="app-layout kai-legacy-frame">
+      <div className={`app-layout kai-legacy-frame ${routeOutlet ? "kai-routed-frame" : ""}`}>
         {!routeOutlet ? <aside className="sidebar panel sidebar-panel">
           <div className="sidebar-head">
             <KaiMSBrand onActivate={() => onNavigatePath?.("/")} />
