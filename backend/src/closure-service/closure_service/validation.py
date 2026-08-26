@@ -94,8 +94,13 @@ def _approved_plan_integrity(action: RemediationAction, plan: dict[str, Any]) ->
         return False
     unsigned_contract = {key: value for key, value in contract.items() if key != "binding_fingerprint"}
     fingerprint = str(plan.get("plan_fingerprint") or "")
+    governance_bound = all(
+        str(plan.get(key) or "").strip()
+        for key in ("rca_version", "evidence_snapshot_id", "recommendation_version")
+    )
     return bool(
-        str(contract.get("binding_fingerprint") or "") == canonical_plan_fingerprint(unsigned_contract)
+        governance_bound
+        and str(contract.get("binding_fingerprint") or "") == canonical_plan_fingerprint(unsigned_contract)
         and contract.get("plan") == plan
         and str(contract.get("plan_id") or "") == str(plan.get("plan_id") or "")
         and str(contract.get("plan_fingerprint") or "") == fingerprint

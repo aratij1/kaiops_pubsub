@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from common.database import ActionRecord
+from common.models import Approval as ApprovalModel
 from common.models import ApprovalDecision, RemediationAction, RemediationStatus
 from remediation_test_helpers import governed_approval as Approval
 from common.orchestration.execution_plan_contract import canonical_plan_fingerprint
@@ -303,3 +304,99 @@ async def test_execute_rejects_different_id_for_same_approved_recommendation(sql
         await module.execute_approval(forged)
 
     assert getattr(exc_info.value, "status_code", None) == 409
+
+
+def test_execution_readiness_fails_closed_without_governance_bindings() -> None:
+    module = load_remediation_app_module()
+    plan = {
+        "schema_version": "kaims.execution-plan.v2",
+        "tenant_id": "tenant-a",
+        "incident_id": "11111111-1111-1111-1111-111111111111",
+        "plan_id": "33333333-3333-3333-3333-333333333333",
+        "execution_ready": True,
+        "commands": ["approved-connector-action"],
+        "validation_commands": ["approved-validator"],
+        "rollback_commands": ["approved-rollback"],
+        "remediation_target": "payments-api",
+        "connector_id": "kubernetes-prod",
+    }
+    plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
+    approval = ApprovalModel(
+        tenant_id="tenant-a",
+        incident_id=plan["incident_id"],
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        metadata={"execution_plan": plan},
+    )
+
+    reasons = module._unsafe_plan_reasons(approval)
+
+    assert any("rca version binding" in reason for reason in reasons)
+    assert any("evidence snapshot id binding" in reason for reason in reasons)
+    assert any("approved target resource binding" in reason for reason in reasons)
+
+
+def test_execution_rejects_target_or_connector_different_from_approved_receipt() -> None:
+    module = load_remediation_app_module()
+    approval = Approval(
+        tenant_id="tenant-a",
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        metadata={
+            "recommended_commands": ["approved-connector-action"],
+            "execution_plan": {
+                "commands": ["approved-connector-action"],
+                "validation_commands": ["approved-validator"],
+                "rollback_commands": ["approved-rollback"],
+                "remediation_target": "payments-api",
+                "execution_ready": True,
+            },
+        },
+    )
+    approval.metadata["target_resource_id"] = "inventory-api"
+    approval.metadata["connector_id"] = "different-connector"
+
+    reasons = module._unsafe_plan_reasons(approval)
+
+    assert any("approved target resource binding" in reason for reason in reasons)
+    assert any("approved connector binding" in reason for reason in reasons)
+
+
+@pytest.mark.asyncio
+async def test_rollback_requires_governed_original_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_remediation_app_module()
+    module.settings.remediation_internal_token = "internal-remediation-token"
+    approval = Approval(
+        tenant_id="tenant-a",
+        incident_id="11111111-1111-1111-1111-111111111111",
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        decision=ApprovalDecision.APPROVED,
+        metadata={
+            "recommended_commands": ["approved-connector-action"],
+            "execution_plan": {
+                "commands": ["approved-connector-action"],
+                "validation_commands": ["approved-validator"],
+                "rollback_commands": ["approved-rollback"],
+                "remediation_target": "payments-api",
+                "execution_ready": True,
+            },
+        },
+    )
+
+    async def persisted(_approval):
+        return None
+
+    async def missing_original(_app, _key):
+        return None
+
+    monkeypatch.setattr(module, "_require_persisted_human_approval", persisted)
+    monkeypatch.setattr(module, "_find_existing_action", missing_original)
+
+    with pytest.raises(module.HTTPException, match="no governed original execution") as exc_info:
+        await module.rollback_execution_direct(
+            {"approval": approval.model_dump(mode="json")},
+            x_kaiops_internal_token="internal-remediation-token",
+        )
+
+    assert exc_info.value.status_code == 409

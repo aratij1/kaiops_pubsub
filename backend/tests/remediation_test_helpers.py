@@ -13,6 +13,7 @@ def governed_approval(**kwargs: Any) -> ApprovalModel:
     tenant_id = str(kwargs.get("tenant_id") or "tenant-a")
     incident_id = str(kwargs["incident_id"])
     metadata = dict(kwargs.get("metadata") or {})
+    recommendation_id = str(kwargs.get("recommendation_id") or "")
     supplied_plan = metadata.get("execution_plan")
     supplied_plan = dict(supplied_plan) if isinstance(supplied_plan, dict) else {}
     if (
@@ -81,7 +82,33 @@ def governed_approval(**kwargs: Any) -> ApprovalModel:
             "remediation_target": target,
         }
         plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
-    metadata["execution_plan"] = plan
+    target = str(
+        plan.get("target_resource_id")
+        or plan.get("remediation_target")
+        or metadata.get("remediation_target")
+        or metadata.get("service")
+        or incident_id
+    )
+    connector_id = str(plan.get("connector_id") or "test-connector")
+    plan = {
+        **plan,
+        "rca_version": str(plan.get("rca_version") or recommendation_id or "rca-test-v1"),
+        "evidence_snapshot_id": str(plan.get("evidence_snapshot_id") or "snapshot-test-v1"),
+        "recommendation_version": str(plan.get("recommendation_version") or recommendation_id),
+        "remediation_target": target,
+        "connector_id": connector_id,
+    }
+    plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
+    rollback = plan.get("rollback") or plan.get("rollback_commands")
+    metadata.update({
+        "execution_plan": plan,
+        "rca_version": plan["rca_version"],
+        "evidence_snapshot_id": plan["evidence_snapshot_id"],
+        "recommendation_version": plan["recommendation_version"],
+        "target_resource_id": target,
+        "connector_id": connector_id,
+        "rollback_plan": rollback,
+    })
     kwargs["metadata"] = metadata
     kwargs["tenant_id"] = tenant_id
     kwargs["plan_id"] = plan["plan_id"]

@@ -19,7 +19,7 @@ from common.continuous_learning import validate_automatic_runbook_use
 from common.event_publishers import build_agent_event_contract, build_event_envelope, normalize_payload
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus, utc_now
-from common.orchestration.execution_plan_contract import verify_plan_fingerprint
+from common.orchestration.execution_plan_contract import canonical_plan_fingerprint, verify_plan_fingerprint
 from common.orchestration.safe_remediation import PreflightEvidence
 from common.tenant_identity import require_tenant_id, verify_event_envelope
 from common.resolution_lifecycle import LifecycleActor, ResolutionState, create_lifecycle, decide_resolution_control, extract_lifecycle, transition_lifecycle
@@ -1201,6 +1201,7 @@ async def rollback_execution_direct(payload: dict[str, Any], x_kaiops_internal_t
     if not expected or x_kaiops_internal_token != expected:
         raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
     approval = Approval.model_validate(payload.get("approval") or {})
+    await _require_persisted_human_approval(approval)
     plan = approval.metadata.get("execution_plan") if isinstance(approval.metadata.get("execution_plan"), dict) else {}
     rollback_commands = [
         str(item).strip() for item in plan.get("rollback_commands", [])
@@ -1208,6 +1209,24 @@ async def rollback_execution_direct(payload: dict[str, Any], x_kaiops_internal_t
     ] if isinstance(plan.get("rollback_commands"), list) else []
     preview = engine.build_action(approval)
     original = await _find_existing_action(app, _build_action_idempotency_key(approval, preview.action_type))
+
+    if original is None:
+        raise HTTPException(status_code=409, detail="Rollback blocked: no governed original execution exists.")
+    try:
+        verify_execution_contract(original)
+    except (PolicyViolation, ValueError) as exc:
+        raise HTTPException(status_code=409, detail="Rollback blocked: original execution integrity failed.") from exc
+    original_contract = (
+        original.parameters.get("execution_contract")
+        if isinstance(original.parameters.get("execution_contract"), dict)
+        else {}
+    )
+    if (
+        str(original_contract.get("approval_id") or "") != str(approval.id)
+        or str(original_contract.get("incident_id") or "") != str(approval.incident_id)
+        or str(original_contract.get("plan_fingerprint") or "") != str(approval.plan_fingerprint or "")
+    ):
+        raise HTTPException(status_code=409, detail="Rollback blocked: original execution is bound to another approval.")
 
     if not rollback_commands:
         action = original or preview
@@ -1230,6 +1249,8 @@ async def rollback_execution_direct(payload: dict[str, Any], x_kaiops_internal_t
         "rollback_mode": "not_applicable",
         "validation_commands": plan.get("validation_commands", []),
     }
+    rollback_plan["plan_fingerprint"] = canonical_plan_fingerprint(rollback_plan)
+    rollback_plan["idempotency_key"] = rollback_plan["plan_fingerprint"]
     rollback_metadata = {
         **approval.metadata,
         "execution_plan": rollback_plan,
@@ -1237,7 +1258,10 @@ async def rollback_execution_direct(payload: dict[str, Any], x_kaiops_internal_t
         "recommended_commands": rollback_commands,
         "rollback_of_action_id": str(original.id) if original else "",
     }
-    rollback_approval = approval.model_copy(update={"metadata": rollback_metadata})
+    rollback_approval = approval.model_copy(update={
+        "plan_fingerprint": rollback_plan["plan_fingerprint"],
+        "metadata": rollback_metadata,
+    })
     action = engine.build_action(rollback_approval)
     action.action_type = preview.action_type
     action.idempotency_key = _rollback_idempotency_key(approval, preview.action_type)
@@ -1250,7 +1274,10 @@ async def rollback_execution_direct(payload: dict[str, Any], x_kaiops_internal_t
     if existing is not None:
         action.id = existing.id
     action.parameters["rollback_of_action_id"] = str(original.id) if original else ""
+    action.parameters["original_approved_plan_fingerprint"] = str(approval.plan_fingerprint or "")
     action.parameters["execution_plan"] = rollback_plan
+    bind_execution_contract(action, rollback_approval)
+    verify_execution_contract(action)
     action.status = RemediationStatus.DISPATCHING
     await _reserve_target_execution(app, action)
     result = await engine.dispatch(action)
@@ -1805,6 +1832,26 @@ def _unsafe_plan_reasons(approval: Approval) -> list[str]:
     }
     reasons = [f"Execution blocked: {label} requires a separately reviewed, policy-authorized plan." for label, tokens in markers.items() if any(token in text for token in tokens)]
     if str(plan.get("schema_version") or "").startswith("kaims.execution-plan."):
+        expected_bindings = {
+            "rca_version": approval.metadata.get("rca_version"),
+            "evidence_snapshot_id": approval.metadata.get("evidence_snapshot_id"),
+            "recommendation_version": str(approval.recommendation_id),
+        }
+        for name, expected in expected_bindings.items():
+            actual = str(plan.get(name) or "").strip()
+            if not actual or (expected is not None and actual != str(expected)):
+                reasons.append(f"Execution blocked: immutable {name.replace('_', ' ')} binding is missing or mismatched.")
+        expected_target = str(approval.metadata.get("target_resource_id") or "").strip()
+        plan_target = str(plan.get("target_resource_id") or plan.get("remediation_target") or "").strip()
+        if not expected_target or expected_target != plan_target:
+            reasons.append("Execution blocked: approved target resource binding is missing or mismatched.")
+        expected_connector = str(approval.metadata.get("connector_id") or "").strip()
+        if not expected_connector or expected_connector != str(plan.get("connector_id") or "").strip():
+            reasons.append("Execution blocked: approved connector binding is missing or mismatched.")
+        approved_rollback = approval.metadata.get("rollback_plan")
+        plan_rollback = plan.get("rollback") or plan.get("rollback_commands")
+        if approved_rollback != plan_rollback:
+            reasons.append("Execution blocked: approved rollback binding is missing or mismatched.")
         if plan.get("execution_ready") is not True:
             blocks = plan.get("readiness_blocks") if isinstance(plan.get("readiness_blocks"), list) else []
             detail = "; ".join(str(value) for value in blocks[:3] if str(value).strip())
@@ -1812,8 +1859,8 @@ def _unsafe_plan_reasons(approval: Approval) -> list[str]:
                 "Execution blocked: the catalog plan is not execution-ready"
                 + (f" ({detail})." if detail else ".")
             )
-        if not str(plan.get("plan_fingerprint") or "").startswith("sha256:"):
-            reasons.append("Execution blocked: the catalog plan has no immutable fingerprint.")
+        if not verify_plan_fingerprint(plan):
+            reasons.append("Execution blocked: the catalog plan fingerprint is missing or invalid.")
         if not plan.get("commands"):
             reasons.append("Execution blocked: the catalog plan contains no approved corrective command.")
         if not plan.get("validation_commands"):
