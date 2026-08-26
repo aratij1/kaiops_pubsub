@@ -57,6 +57,8 @@ test("detail URL reconstructs the selected alert after a page refresh", async ({
   await page.getByLabel("Password").fill("Admin@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
   await expect(page.getByRole("heading", { name: "kaiops-api-gateway: ReloadedAlert" })).toBeVisible();
+  await expect(page.locator(".kai-navigation")).toHaveCount(1);
+  await expect(page.locator(".sidebar-panel")).toHaveCount(0);
   await expect(page.getByText("Select an alert in Alert Stream to open the detail tabs workspace.")).toHaveCount(0);
 });
 
