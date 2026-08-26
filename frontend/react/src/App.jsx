@@ -10073,8 +10073,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               filters: metadataFilters,
               refresh: loadIncidentMetadata,
               updateFilter: (name, value) => setMetadataFilters((current) => ({ ...current, [name]: value })),
-              open: (row, stage = "overview") => {
-                openAlertDetailsFromIncident(row, stage);
+              open: (row) => {
+                const incidentId = String(row?.incident_id || row?.id || "").trim();
+                if (!incidentId) return;
+                // Summary-card navigation belongs to the durable incident
+                // command route. The legacy alert cockpit is reserved for the
+                // explicit technical-workspace action below.
+                onNavigatePath?.(`/incidents/${encodeURIComponent(incidentId)}`);
               },
               openTechnical: (row, stage = "overview") => {
                 openAlertDetailsFromIncident(row, stage);
