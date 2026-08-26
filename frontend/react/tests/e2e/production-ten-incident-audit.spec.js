@@ -31,20 +31,24 @@ test("ten production incident cockpits are read-only and status-consistent", asy
   const results = [];
   for (const row of incidents) {
     const alertId = String(row.alert_id);
+    const incidentId = String(row.incident_id || row.id || "");
+    expect(incidentId, `persisted incident identity for ${alertId}`).not.toBe("");
     const beforeResponse = await request.get(`/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`, { headers });
     expect(beforeResponse.ok(), `processed-result before opening ${alertId}`).toBeTruthy();
     const before = unwrap(await beforeResponse.json());
     const beforeStatus = String(before.incident?.status || row.status || "unknown").toLowerCase();
 
-    await page.goto(`/?workspace=alert&alert_id=${encodeURIComponent(alertId)}`);
+    // Audit the current incident command surface. The legacy alert cockpit
+    // depends on a second processed-result read and can legitimately show its
+    // bounded timeout state without saying anything about the incident route.
+    await page.goto(`/incidents/${encodeURIComponent(incidentId)}`);
     await page.getByLabel("Username").fill(username);
     await page.getByLabel("Password").fill(password);
     await page.getByRole("button", { name: /sign in/i }).click();
-    const cockpit = page.locator(".alert-details-cockpit");
+    const cockpit = page.locator(".incident-command");
     await expect(cockpit).toBeVisible({ timeout: 45_000 });
-    const tabs = page.getByRole("tablist", { name: "Incident workspace sections" });
-    await tabs.getByRole("tab", { name: "Resolve incident" }).click();
-    await expect(page.getByRole("heading", { name: "Resolution command center" })).toBeVisible({ timeout: 30_000 });
+    await expect(cockpit.locator(".ic-resolution")).toBeVisible({ timeout: 30_000 });
+    await expect(cockpit.getByText("Recommended resolution", { exact: true })).toBeVisible();
     const cockpitText = await cockpit.innerText();
     const terminal = ["closed", "resolved"].includes(beforeStatus);
     if (!terminal) {
@@ -57,7 +61,7 @@ test("ten production incident cockpits are read-only and status-consistent", asy
     const after = unwrap(await afterResponse.json());
     const afterStatus = String(after.incident?.status || "unknown").toLowerCase();
     expect(afterStatus, `${alertId} status changed merely by viewing`).toBe(beforeStatus);
-    results.push({ incident_id: row.incident_id, alert_id: alertId, before_status: beforeStatus, after_status: afterStatus, terminal });
+    results.push({ incident_id: incidentId, alert_id: alertId, before_status: beforeStatus, after_status: afterStatus, terminal });
   }
 
   expect(forbiddenMutations).toEqual([]);

@@ -72,10 +72,15 @@ export default function KnowledgeRoute() {
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", refresh); };
   }, [view]);
 
+  const refreshHub = () => {
+    knowledge.refresh();
+    knowledge.refreshProviders();
+  };
+
   return <section className="grid single-col ai-hub">
     <article className="panel ai-hub-hero">
-      <div className="ai-hub-hero-copy"><span className="discovery-eyebrow"><Sparkles size={14} aria-hidden="true" /> KaiMS intelligence control plane</span><h2>Operational intelligence</h2><p>Govern the knowledge, agents, and delivery pipelines that power trusted incident resolution.</p><div className="ai-hub-hero-meta"><span><i className={groundingActive ? "is-online" : "is-idle"} />{groundingActive ? "Grounding online" : "Awaiting workflow data"}</span><span>{knowledge.application || "KaiMS"} workspace</span></div></div>
-      <button className="button-secondary ai-hub-refresh" onClick={knowledge.refresh}><RefreshCw size={15} aria-hidden="true" /> Refresh status</button>
+      <div className="ai-hub-hero-copy"><span className="discovery-eyebrow"><Sparkles size={14} aria-hidden="true" /> KaiMS intelligence control plane</span><h1>Operational Knowledge</h1><h2>Operational intelligence</h2><p>Govern the knowledge, agents, and delivery pipelines that power trusted incident resolution.</p><div className="ai-hub-hero-meta"><span><i className={groundingActive ? "is-online" : "is-idle"} />{groundingActive ? "Grounding online" : "Awaiting workflow data"}</span><span>{knowledge.application || "KaiMS"} workspace</span></div></div>
+      <button className="button-secondary ai-hub-refresh" onClick={refreshHub}><RefreshCw size={15} aria-hidden="true" /> Refresh status</button>
     </article>
     <nav className="settings-tabs ai-hub-tabs" aria-label="AI Hub sections" role="tablist">{hubTabs.map(([id,label]) => <button type="button" role="tab" aria-selected={view===id} aria-controls={`ai-hub-panel-${id}`} id={`ai-hub-tab-${id}`} key={id} className={view===id?'active':''} onClick={()=>setView(id)}>{label}</button>)}</nav>
 
@@ -87,6 +92,14 @@ export default function KnowledgeRoute() {
         <article className="panel ai-hub-signal"><header><Route size={18} aria-hidden="true" /><span>Primary event path</span></header><strong className="is-topic">{knowledge.primaryTopic || "Not available"}</strong><p>Principal orchestration route between KaiMS agents.</p></article>
       </section>
       <section className="ai-hub-capabilities" aria-labelledby="ai-capabilities-title"><div className="ai-hub-section-head"><div><span className="discovery-eyebrow">Operational capabilities</span><h3 id="ai-capabilities-title">From evidence to governed action</h3></div><p>Each stage keeps operators in control while improving future resolutions.</p></div><div className="ai-hub-capability-grid"><button type="button" onClick={()=>setView('development')}><span className="ai-hub-icon is-cyan"><BookOpenCheck size={20} aria-hidden="true" /></span><span><strong>Knowledge development</strong><small>Collect evidence and prepare reviewable runbook drafts.</small></span><b aria-hidden="true">→</b></button><button type="button" onClick={()=>setView('activity')}><span className="ai-hub-icon is-violet"><Activity size={20} aria-hidden="true" /></span><span><strong>Agent observability</strong><small>Verify what every agent consumed and published.</small></span><b aria-hidden="true">→</b></button><button type="button" onClick={()=>setView('queues')}><span className="ai-hub-icon is-amber"><ShieldCheck size={20} aria-hidden="true" /></span><span><strong>Governed operations</strong><small>Inspect queues and perform explicit, audited actions.</small></span><b aria-hidden="true">→</b></button></div></section>
+      <article className="panel ai-provider-health" aria-labelledby="ai-provider-health-title" aria-busy={knowledge.providersLoading}>
+        <div className="panel-head"><div><span className="discovery-eyebrow">Model runtime</span><h3 id="ai-provider-health-title">AI provider health</h3><p>Live configuration, model selection, circuit state, and availability reported by the backend.</p></div><span className="ai-hub-count">{knowledge.providers.length} provider{knowledge.providers.length === 1 ? "" : "s"}</span></div>
+        {knowledge.providersError ? <p className="error" role="alert">Provider health could not be refreshed. Last-known status remains visible.</p> : null}
+        <div className="table-wrap"><table><thead><tr><th>Provider</th><th>Model</th><th>Configuration</th><th>Health</th><th>Circuit</th></tr></thead><tbody>
+          {knowledge.providers.map((provider) => <tr key={provider.name}><td><strong>{provider.name}</strong>{provider.reason ? <small>{provider.reason}</small> : null}</td><td>{provider.model || "Not reported"}</td><td><span className={`workflow-pill ${provider.configured ? "workflow-pill-active" : "workflow-pill-idle"}`}>{provider.configured ? "Configured" : "Not configured"}</span></td><td>{provider.configured ? (provider.healthy ? "Healthy" : "Unhealthy") : "Not active"}</td><td>{provider.circuitOpen ? "Open" : "Closed"}</td></tr>)}
+          {!knowledge.providers.length ? <tr><td colSpan={5}><div className="ai-hub-empty"><BrainCircuit size={24} aria-hidden="true" /><strong>No provider status was returned.</strong><span>Deterministic monitoring remains available while provider health is unknown.</span></div></td></tr> : null}
+        </tbody></table></div>
+      </article>
       <section className="control-plane-status-grid ai-hub-legacy-status" aria-hidden="true">
         <article><span>Knowledge grounding</span><strong>{knowledge.actual.published.length ? "Active" : "Waiting for activity"}</strong><p>Runbooks, evidence, and incident context supplied to resolution workflows.</p></article>
         <article><span>Agent communication</span><strong>{observed}/{knowledge.actual.rows.length || 0} observed</strong><p>Services seen exchanging workflow events in the currently loaded trace.</p></article>

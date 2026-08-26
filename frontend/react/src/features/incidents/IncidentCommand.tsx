@@ -171,7 +171,10 @@ export default function IncidentCommand() {
   const directRow = directIncident.row && incidentId(directIncident.row).toLowerCase() === requestedIncidentId.toLowerCase()
     ? directIncident.row
     : null;
-  const row = directRow || (scopedHasEnrichment ? scopedRow : undefined);
+  // The shared incident feed is refreshed after every operator command. Once it
+  // contains enrichment, it is the freshest projection and must supersede a
+  // detail response fetched before that command.
+  const row = scopedHasEnrichment ? scopedRow : directRow || undefined;
   const approval = useMemo(() => row ? approvals.rows.find((candidate) => incidentId(candidate).toLowerCase() === incidentId(row).toLowerCase()) : undefined, [approvals.rows, row]);
 
   if (!row && ((incidents.loading && !incidents.rows.length) || directIncident.loading || !directIncident.loaded)) return <LoadingState label="Loading incident command" />;

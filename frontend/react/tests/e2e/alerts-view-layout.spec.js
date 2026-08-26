@@ -38,13 +38,13 @@ test("all alert views render, switch, and reflow without page overflow", async (
   expect(heroStyle.color).toBe("rgb(23, 32, 51)");
   expect(heroStyle.backgroundImage).toContain("rgb(255, 255, 255)");
   const lightShell = await page.evaluate(() => ({
-    sidebar: getComputedStyle(document.querySelector(".sidebar-panel")).backgroundImage,
-    preference: getComputedStyle(document.querySelector(".sidebar-preferences")).backgroundColor,
-    activeNavigation: getComputedStyle(document.querySelector(".sidebar-section.active")).color,
-    title: getComputedStyle(document.querySelector(".content-area > .hero h1")).color,
+    sidebar: getComputedStyle(document.querySelector(".kai-navigation")).backgroundColor,
+    operationsBar: getComputedStyle(document.querySelector(".kai-operations-bar")).backgroundColor,
+    activeNavigation: getComputedStyle(document.querySelector(".kai-navigation-groups button")).color,
+    title: getComputedStyle(document.querySelector(".kai-route-context h1")).color,
   }));
-  expect(lightShell.sidebar).toContain("gradient");
-  expect(lightShell.preference).not.toBe("rgba(0, 0, 0, 0)");
+  expect(lightShell.sidebar).toBe("rgb(11, 31, 52)");
+  expect(lightShell.operationsBar).not.toBe("rgba(0, 0, 0, 0)");
   expect(lightShell.activeNavigation).not.toBe("rgba(0, 0, 0, 0)");
   expect(lightShell.title).not.toBe("rgba(0, 0, 0, 0)");
 
@@ -62,11 +62,11 @@ test("all alert views render, switch, and reflow without page overflow", async (
   expect(darkStyle.backgroundImage).toContain("rgb(17, 30, 50)");
   expect(darkStyle.bodyBackground).toContain("rgb(8, 15, 27)");
   const darkShell = await page.evaluate(() => ({
-    sidebar: getComputedStyle(document.querySelector(".sidebar-panel")).backgroundImage,
-    activeNavigation: getComputedStyle(document.querySelector(".sidebar-section.active")).color,
-    title: getComputedStyle(document.querySelector(".content-area > .hero h1")).color,
+    sidebar: getComputedStyle(document.querySelector(".kai-navigation")).backgroundColor,
+    activeNavigation: getComputedStyle(document.querySelector(".kai-navigation-groups button")).color,
+    title: getComputedStyle(document.querySelector(".kai-route-context h1")).color,
   }));
-  expect(darkShell.sidebar).toContain("gradient");
+  expect(darkShell.sidebar).toBe("rgb(11, 31, 52)");
   expect(darkShell.activeNavigation).not.toBe("rgba(0, 0, 0, 0)");
   expect(darkShell.title).not.toBe("rgba(0, 0, 0, 0)");
 

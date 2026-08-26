@@ -76,17 +76,16 @@ test.beforeEach(async ({ page }) => {
 
 test("project onboarding exposes a complete monitoring integration contract", async ({ page }) => {
   test.setTimeout(120_000);
-  await page.goto("/");
+  await page.goto("/integrations");
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill("admin-password");
   await page.getByRole("button", { name: "Sign In" }).click();
 
-  await page.getByRole("button", { name: "Integrations", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Integrations & Monitoring" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Connect an application" })).toBeVisible();
   await expect(page.getByLabel("tenant id")).toBeVisible();
   await expect(page.getByLabel("owner team")).toBeVisible();
-  await expect(page.getByLabel("Metrics Endpoint")).toBeVisible();
-  await expect(page.getByLabel("Labels (comma-separated key=value)")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Register Application" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Configured Monitoring Integrations" })).toBeVisible();
+  await expect(page.getByLabel("Metrics endpoint")).toBeVisible();
+  await expect(page.getByLabel("Operational labels")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Save and start onboarding" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Configured monitoring integrations" })).toBeVisible();
 });

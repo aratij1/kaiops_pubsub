@@ -3,6 +3,19 @@ import { isRouteErrorResponse, useRouteError } from "react-router-dom";
 
 import { ApiRequestError, ApiValidationError } from "../services/apiClient";
 
+function errorReference() {
+  try {
+    if (typeof globalThis.crypto?.randomUUID === "function") {
+      return globalThis.crypto.randomUUID().slice(0, 8);
+    }
+  } catch {
+    // randomUUID is unavailable in some non-secure browser contexts. A support
+    // reference is diagnostic rather than security-sensitive, so keep the
+    // fallback boundary renderable instead of throwing a second error.
+  }
+  return Math.random().toString(36).slice(2, 10).padEnd(8, "0");
+}
+
 function errorPresentation(error: unknown) {
   if (error instanceof ApiValidationError) {
     return { title: "Unexpected service response", message: "KaiMS protected this view because the returned data did not match its contract.", traceId: undefined };
@@ -14,7 +27,7 @@ function errorPresentation(error: unknown) {
     return { title: `Workspace error ${error.status}`, message: error.statusText || "The requested workspace could not be loaded.", traceId: undefined };
   }
   if (error instanceof Error) {
-    const reference = crypto.randomUUID().slice(0, 8);
+    const reference = errorReference();
     console.error(`[workspace-error:${reference}]`, error);
     return {
       title: "Workspace could not be displayed",

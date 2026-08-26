@@ -290,7 +290,9 @@ test("onboarding evidence drives readiness and activation without estimated capa
   await expect(readiness.getByText("Knowledge").locator("..")).toContainText("—");
 
   await page.getByRole("button", { name: "Integrations", exact: true }).click();
-  await expect(page.getByRole("heading", { level: 2, name: "Integration Launchpad" })).toBeVisible();
-  await expect(page.locator(".integration-launchpad .execution-stepper li.is-complete")).toHaveCount(4);
-  await expect(page.locator(".integration-launchpad .execution-stepper")).toContainText("Activate");
+  await expect(page.getByRole("heading", { level: 1, name: "Integrations" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 2, name: "Provider connections" })).toBeVisible();
+  await expect(page.getByLabel("Project ID")).toHaveValue("demo-project");
+  await expect(page.getByRole("button", { name: "Add simulator connection" })).toBeEnabled();
+  await expect(page.locator("body")).not.toContainText(/estimated/i);
 });

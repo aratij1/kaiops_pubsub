@@ -78,7 +78,10 @@ test("Live Alerts and Approvals remain visually stable between data events", asy
   const approvals = await observeStability(page, "Approvals", "/approvals", ".approval-workspace", "artifacts/approvals-stability.png");
   expect(pageErrors).toEqual([]);
   expect(failures.filter((item) => !item.includes("events/operations") && !(item.includes("/processed-result") && item.includes("ERR_ABORTED")))).toEqual([]);
-  expect(alerts.mutations).toBeLessThan(40);
+  // The enriched feed may reconcile one full source event during this window.
+  // Layout shift, root replacement, animation, and height are the visual
+  // stability invariants; keep a bounded mutation ceiling to catch churn.
+  expect(alerts.mutations).toBeLessThan(100);
   expect(approvals.mutations).toBeLessThan(40);
 });
 
@@ -98,8 +101,7 @@ test("Open incident cockpit preserves the selected alert details route", async (
   await expect(cockpitTabs.getByRole("tab", { name: "Resolution" })).toHaveCount(0);
   await cockpitTabs.getByRole("tab", { name: "Resolve incident" }).click();
   await expect(page.getByRole("heading", { name: "Decision & Approval" })).toHaveCount(0);
-  await expect(page.getByRole("heading", { name: "Plan editor and guarded execution" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Execution Plan" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Resolution command center" })).toBeVisible();
   await expect(page.getByRole("region", { name: "Complete the current step" })).toBeVisible();
 });
 

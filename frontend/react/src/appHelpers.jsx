@@ -1077,7 +1077,9 @@ function mapLandingPadRowToAlertStreamRow(row, index = 0) {
     ...payload,
     id: incidentId,
     alert_id: String(payload.alert_id || incidentId).trim(),
-    incident_id: String(payload.incident_id || incidentId).trim(),
+    // Alert identity is not incident identity. Keep this empty until the
+    // backend returns a persisted incident projection for the alert.
+    incident_id: String(payload.incident_id || "").trim(),
     name: alertName,
     alert_name: alertName,
     application: String(payload.application || payload.project_name || payload.project || labels.application || labels.project || labels.project_name || "").trim(),
