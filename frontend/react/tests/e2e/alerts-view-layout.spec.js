@@ -15,8 +15,10 @@ const rows = Array.from({ length: 12 }, (_, index) => ({
 
 test("all alert views render, switch, and reflow without page overflow", async ({ page }) => {
   test.setTimeout(90_000);
+  const processedResultRequests = [];
   await page.route("**/api-gateway/**", async (route) => {
     const path = new URL(route.request().url()).pathname.replace(/^\/api-gateway/, "");
+    if (path.endsWith("/processed-result")) processedResultRequests.push(path);
     const body = path === "/auth/login"
       ? { access_token: "alerts-token", refresh_token: "refresh", user: { id: 1, username: "admin", role_name: "Administrator" } }
       : path === "/healthz" ? { status: "ok" }
@@ -31,6 +33,8 @@ test("all alert views render, switch, and reflow without page overflow", async (
   await page.getByLabel("Password").fill("Admin@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
   await expect(page.getByRole("heading", { name: "Operations Feed" })).toBeVisible();
+  await expect.poll(() => processedResultRequests.length).toBeGreaterThan(0);
+  expect(new Set(processedResultRequests).size).toBe(1);
   const heroStyle = await page.locator(".operations-feed-hero").evaluate((element) => {
     const style = getComputedStyle(element);
     return { color: style.color, backgroundImage: style.backgroundImage };

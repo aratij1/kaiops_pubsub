@@ -284,17 +284,16 @@ export default function AlertsRoute() {
   const [traceStage, setTraceStage] = useState("alert");
   const flowInspectorRef = useRef<HTMLElement | null>(null);
   const [traceWorkflow, setTraceWorkflow] = useState<{ loading: boolean; data: any; error: string; alertId: string; state: "idle" | "loading" | "ready" | "pending" | "error" }>({ loading: false, data: null, error: "", alertId: "", state: "idle" });
-  const [rowWorkflows, setRowWorkflows] = useState<Record<string, any>>({});
   const [priorityFilter, setPriorityFilter] = useState<"all" | AlertPriority>("all");
   const [expandedSourceKey, setExpandedSourceKey] = useState("");
   const prioritizedRows = useMemo(() => alerts.rows
-    .map((row, index) => ({ row, index, priority: classifyAlert(row, rowWorkflows[alertRowKey(row)]) }))
+    .map((row, index) => ({ row, index, priority: classifyAlert(row, null) }))
     .filter(({ priority }) => priorityFilter === "all" || priority.kind === priorityFilter)
-    .sort((left, right) => left.priority.rank - right.priority.rank || left.index - right.index), [alerts.rows, rowWorkflows, priorityFilter]);
+    .sort((left, right) => left.priority.rank - right.priority.rank || left.index - right.index), [alerts.rows, priorityFilter]);
   const priorityCounts = useMemo(() => alerts.rows.reduce((counts, row) => {
-    counts[classifyAlert(row, rowWorkflows[alertRowKey(row)]).kind] += 1;
+    counts[classifyAlert(row, null).kind] += 1;
     return counts;
-  }, { action: 0, watch: 0, duplicate: 0, noise: 0 }), [alerts.rows, rowWorkflows]);
+  }, { action: 0, watch: 0, duplicate: 0, noise: 0 }), [alerts.rows]);
   const activeTraceAlert = traceAlert && alerts.rows.some((row) => alertRowKey(row) === alertRowKey(traceAlert)) ? traceAlert : prometheusRows[0] || null;
   const trace = metricTrace(activeTraceAlert);
   const traceSource = (activeTraceAlert || {}) as AlertStreamRow & Record<string, any>;
@@ -338,39 +337,6 @@ export default function AlertsRoute() {
     load();
     return () => { active = false; };
   }, [activeTraceAlert && alertRowKey(activeTraceAlert), session.accessToken]);
-  useEffect(() => {
-    let active = true;
-    const loadRows = async () => {
-      const rows = alerts.rows.slice();
-      const resolved: Array<readonly [string, any]> = new Array(rows.length);
-      let nextIndex = 0;
-      const loadNext = async () => {
-        while (active) {
-          const index = nextIndex++;
-          if (index >= rows.length) return;
-          const row = rows[index];
-          const alertId = processedAlertId(row);
-          if (!alertId) {
-            resolved[index] = [alertRowKey(row), null] as const;
-            continue;
-          }
-          try {
-            const payload = await fetchJson(`/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`, { ...authenticatedRequest, timeoutMs: 8000, maxAttempts: 1 });
-            resolved[index] = [alertRowKey(row), payload] as const;
-          } catch {
-            resolved[index] = [alertRowKey(row), null] as const;
-          }
-        }
-      };
-      // Enrichment is secondary to rendering the live alert list. Keep only
-      // four requests in flight so a 150-row page cannot exhaust the API/DB
-      // connection pools and prevent /alerts/all from loading.
-      await Promise.all(Array.from({ length: Math.min(4, rows.length) }, loadNext));
-      if (active) setRowWorkflows(Object.fromEntries(resolved));
-    };
-    loadRows();
-    return () => { active = false; };
-  }, [alerts.rows.map(alertRowKey).join("|"), session.accessToken]);
   useEffect(() => {
     let active = true;
     fetchJson("/alert-intelligence/deduplication/config", { timeoutMs: 8000 })
@@ -465,7 +431,7 @@ export default function AlertsRoute() {
     </div>
 
     {liveView === "timeline" ? <div className="live-alert-flow-list">
-      {prioritizedRows.map(({ row }) => <AlertFlowSummary key={alertRowKey(row)} row={row} workflow={rowWorkflows[alertRowKey(row)]} selected={Boolean(activeTraceAlert && alertRowKey(activeTraceAlert) === alertRowKey(row))} onInspect={() => inspectFlow(row)} />)}
+      {prioritizedRows.map(({ row }) => <AlertFlowSummary key={alertRowKey(row)} row={row} workflow={activeTraceAlert && alertRowKey(activeTraceAlert) === alertRowKey(row) ? traceWorkflow.data : null} selected={Boolean(activeTraceAlert && alertRowKey(activeTraceAlert) === alertRowKey(row))} onInspect={() => inspectFlow(row)} />)}
       {alerts.loading && !alerts.rows.length ? <div className="ingestion-stream-loading" role="status"><LoaderCircle size={22} aria-hidden="true" /><strong>Loading live alerts</strong><p>Connecting to the durable alert stream…</p></div> : null}
       {!alerts.rows.length && !alerts.loading ? <div className="ingestion-stream-empty"><Search size={24} aria-hidden="true" /><strong>No alerts match this view</strong><p>Clear the active filters or verify that the selected project connector is delivering events.</p>{hasActiveFilters ? <button type="button" className="button-secondary" onClick={clearAlertFilters}>Clear all filters</button> : null}</div> : null}
     </div> : null}
@@ -496,7 +462,7 @@ export default function AlertsRoute() {
 
     {liveView === "split" ? <section className="alert-split-workspace">
       <article className="panel alert-split-queue"><header><div><span className="discovery-eyebrow">Action queue</span><h3>Alerts</h3></div><strong>{prioritizedRows.length}</strong></header><div>{prioritizedRows.map(({ row, priority }) => { const item=displayAlert(row); const selected=Boolean(activeTraceAlert&&alertRowKey(activeTraceAlert)===alertRowKey(row)); return <button type="button" className={`${selected?"is-selected":""} priority-${priority.kind}`} key={alertRowKey(row)} onClick={()=>setTraceAlert(row)}><i/><span><strong>{item.title}</strong><small>{item.service} · {item.severity} · {item.lastSeen}</small></span><em>{priority.label}</em></button> })}</div></article>
-      <article className="panel alert-split-evidence">{activeTraceAlert ? (()=>{const item=displayAlert(activeTraceAlert);const source=sourceEvidence(activeTraceAlert);const priority=classifyAlert(activeTraceAlert,rowWorkflows[alertRowKey(activeTraceAlert)]);return <><header><div><span className={`source-badge source-${item.channel}`}>{sourceChannelLabel(item.channel)}</span><h3>{item.title}</h3><p>{item.summary}</p></div><span className={`alert-priority-badge is-${priority.kind}`}>{priority.label}</span></header><dl><div><dt>Service</dt><dd>{item.service}</dd></div><div><dt>Severity</dt><dd>{item.severity}</dd></div><div><dt>Owner</dt><dd>{item.owner}</dd></div><div><dt>Occurrences</dt><dd>{item.occurrences}</dd></div><div><dt>Source</dt><dd>{source.origin}</dd></div><div><dt>Received</dt><dd>{source.received}</dd></div></dl><section><h4>Source message</h4><p>{source.message}</p><details><summary>Labels and annotations</summary><pre>{JSON.stringify({labels:source.labels,annotations:source.annotations},null,2)}</pre></details></section><footer><button className="button-secondary" onClick={()=>setLiveView("timeline")}>Open correlation timeline</button><button className="button-primary" onClick={()=>alerts.open(activeTraceAlert)}>Open incident</button></footer></>} )() : <div className="alert-split-empty"><Activity/><strong>Select an alert</strong><p>Choose a signal from the queue to inspect its evidence.</p></div>}</article>
+      <article className="panel alert-split-evidence">{activeTraceAlert ? (()=>{const item=displayAlert(activeTraceAlert);const source=sourceEvidence(activeTraceAlert);const priority=classifyAlert(activeTraceAlert,traceWorkflow.data);return <><header><div><span className={`source-badge source-${item.channel}`}>{sourceChannelLabel(item.channel)}</span><h3>{item.title}</h3><p>{item.summary}</p></div><span className={`alert-priority-badge is-${priority.kind}`}>{priority.label}</span></header><dl><div><dt>Service</dt><dd>{item.service}</dd></div><div><dt>Severity</dt><dd>{item.severity}</dd></div><div><dt>Owner</dt><dd>{item.owner}</dd></div><div><dt>Occurrences</dt><dd>{item.occurrences}</dd></div><div><dt>Source</dt><dd>{source.origin}</dd></div><div><dt>Received</dt><dd>{source.received}</dd></div></dl><section><h4>Source message</h4><p>{source.message}</p><details><summary>Labels and annotations</summary><pre>{JSON.stringify({labels:source.labels,annotations:source.annotations},null,2)}</pre></details></section><footer><button className="button-secondary" onClick={()=>setLiveView("timeline")}>Open correlation timeline</button><button className="button-primary" onClick={()=>alerts.open(activeTraceAlert)}>Open incident</button></footer></>} )() : <div className="alert-split-empty"><Activity/><strong>Select an alert</strong><p>Choose a signal from the queue to inspect its evidence.</p></div>}</article>
     </section> : null}
 
     {liveView === "inbox" ? <article className="panel ingestion-stream-panel">
