@@ -112,3 +112,7 @@ gh pr checks --watch
 ```
 
 After required checks and staging evidence pass, merge through the repository's protected pull-request workflow. Do not use `git push --force`, reset `main`, or bypass required reviews.
+
+## Release-candidate validation
+
+Local release-candidate validation at `b113a385` passed frontend ESLint with zero warnings, the 13,598/13,600 architecture budget, TypeScript, 105/105 unit tests, production build, bundle budget, Compose model resolution, and reproducible production service/UI image builds. Strict offline Kubernetes validation passed all 38 resources across seven manifest files with zero invalid, errored, or skipped resources. The Kubernetes CI gate uses pinned kubeconform schemas because `kubectl apply --dry-run=client` still performs API discovery/OpenAPI download and therefore cannot run truthfully on an unconfigured hosted runner. Frontend audit reported zero vulnerabilities. Python audit reported zero known third-party vulnerabilities after upgrading the audit environment's vulnerable base pip; the editable first-party `kaiops` distribution is intentionally excluded because it is local source rather than a PyPI dependency.
