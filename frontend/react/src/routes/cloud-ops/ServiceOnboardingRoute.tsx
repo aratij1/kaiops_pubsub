@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ClipboardCheck, Save } from "lucide-react";
 
+import { useRouteRuntimeSlice } from "../../app/routeRuntime";
 import { onboardingTemplates, saveOnboardingProfile, type OnboardingTemplate } from "./cloudOpsApi";
 import "./CloudOpsRoute.css";
 
@@ -9,6 +10,7 @@ function csv(value: string) {
 }
 
 export default function ServiceOnboardingRoute() {
+  const { accessToken } = useRouteRuntimeSlice("session");
   const [templates, setTemplates] = useState<OnboardingTemplate[]>([]);
   const [projectId, setProjectId] = useState("demo-project");
   const [serviceId, setServiceId] = useState("checkout-api");
@@ -30,8 +32,8 @@ export default function ServiceOnboardingRoute() {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    onboardingTemplates().then(setTemplates).catch(() => setTemplates([]));
-  }, []);
+    onboardingTemplates(accessToken).then(setTemplates).catch(() => setTemplates([]));
+  }, [accessToken]);
 
   const selectedTemplate = useMemo(() => templates.find((template) => template.id === templateId), [templates, templateId]);
 
@@ -39,7 +41,7 @@ export default function ServiceOnboardingRoute() {
     setBusy(true);
     setMessage("");
     try {
-      const result = await saveOnboardingProfile(serviceId, {
+      const result = await saveOnboardingProfile(accessToken, serviceId, {
         project_id: projectId,
         service_id: serviceId,
         environment,

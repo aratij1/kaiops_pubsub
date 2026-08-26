@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Activity, Boxes, ChevronRight, GitBranch, Layers3, Network, RefreshCw, Search, Server, Workflow, X } from "lucide-react";
 
+import { useRouteRuntimeSlice } from "../../app/routeRuntime";
 import { listResources, serviceTopology, type CloudResource } from "./cloudOpsApi";
 import "./CloudOpsRoute.css";
 
@@ -30,6 +31,7 @@ function readableTime(value?: string) {
 }
 
 export default function CloudResourcesRoute() {
+  const { accessToken } = useRouteRuntimeSlice("session");
   const [projectId, setProjectId] = useState("demo-project");
   const [serviceId, setServiceId] = useState("");
   const [environment, setEnvironment] = useState("");
@@ -45,7 +47,7 @@ export default function CloudResourcesRoute() {
   async function refresh() {
     setBusy(true); setError("");
     try {
-      const rows = await listResources(projectId || undefined, serviceId || undefined, environment || undefined);
+      const rows = await listResources(accessToken, projectId || undefined, serviceId || undefined, environment || undefined);
       setResources(rows);
       setSelectedId((current) => rows.some((item) => item.id === current) ? current : (rows[0]?.id ?? ""));
     } catch (err) { setError(err instanceof Error ? err.message : "Unable to load resource inventory"); }
@@ -61,9 +63,9 @@ export default function CloudResourcesRoute() {
   useEffect(() => {
     let active = true;
     if (!selected?.service_id || !selected.project_id) { setRelationships([]); return undefined; }
-    void serviceTopology(selected.project_id, selected.service_id, selected.environment || undefined).then((result) => { if (active) setRelationships(result.edges); }).catch(() => { if (active) setRelationships([]); });
+    void serviceTopology(accessToken, selected.project_id, selected.service_id, selected.environment || undefined).then((result) => { if (active) setRelationships(result.edges); }).catch(() => { if (active) setRelationships([]); });
     return () => { active = false; };
-  }, [selected?.id]);
+  }, [accessToken, selected?.id]);
 
   return <section className="cloud-ops-route resource-explorer" aria-labelledby="cloud-resources-title">
     <article className="cloud-ops-panel resource-explorer-header"><header><div><span className="resource-eyebrow">Operational Digital Twin</span><h2 id="cloud-resources-title">Resource Explorer</h2><p>Search the operational estate, inspect health and provenance, and follow deterministic topology relationships.</p></div><button type="button" className="button-secondary" onClick={refresh} disabled={busy}><RefreshCw className={busy ? "spin" : ""} size={16} /> {busy ? "Refreshing…" : "Refresh"}</button></header>

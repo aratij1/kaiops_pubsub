@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useLocation, useNavigate } from "react-router-dom";
+import { useLocation } from "react-router-dom";
 import { useRouteRuntime } from "../../app/routeRuntime";
 import { ConfirmationDialog, ReadinessScore } from "../../components/design-system";
 import {
   applicationDetailsQueryOptions,
   applicationKeys,
   applicationsQueryOptions,
+  createApplication,
   deleteApplication,
   suppressObservedApplication,
   updateApplication,
@@ -14,6 +15,7 @@ import {
 import type {
   Application,
   ApplicationUpdate,
+  NewApplication,
 } from "../../schemas/applications";
 
 const editableFields = [
@@ -25,6 +27,22 @@ const editableFields = [
   "technology",
   "metrics_endpoint",
 ] as const;
+
+function newApplication(name = ""): NewApplication {
+  return {
+    tenant_id: "default",
+    name,
+    owner_team: "platform-ops",
+    owner_email: null,
+    environment: "prod",
+    namespace: "default",
+    region: "global",
+    technology: "unknown",
+    metrics_endpoint: "http://api-gateway:8000/metrics",
+    monitoring_platform: "prometheus",
+    labels: {},
+  };
+}
 
 function updateInput(row: Application): ApplicationUpdate {
   const payload =
@@ -354,11 +372,14 @@ function OnboardingPipeline({
 export default function ApplicationsRoute() {
   const { session, dashboard, copilot } = useRouteRuntime();
   const location = useLocation();
-  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const detailRef = useRef<HTMLElement>(null);
+  const registrationRef = useRef<HTMLElement>(null);
+  const search = new URLSearchParams(location.search);
   const legacyKnowledgeWorkspace =
-    new URLSearchParams(location.search).get("workspace") === "knowledge";
+    search.get("workspace") === "knowledge";
+  const requestedRegistration = search.get("workspace") === "onboarding";
+  const requestedApplicationName = search.get("application") || "";
   const applications = useQuery(applicationsQueryOptions(session.accessToken));
   const [selectedId, setSelectedId] = useState("");
   const [editing, setEditing] = useState(false);
@@ -367,6 +388,11 @@ export default function ApplicationsRoute() {
     Array<{ name: string; ok: boolean; message: string }>
   >([]);
   const [form, setForm] = useState<ApplicationUpdate | null>(null);
+  const [showRegistration, setShowRegistration] = useState(requestedRegistration);
+  const [registrationForm, setRegistrationForm] = useState<NewApplication>(() =>
+    newApplication(requestedApplicationName),
+  );
+  const [registrationMessage, setRegistrationMessage] = useState("");
   const rows = useMemo(() => {
     const registered = applications.data || [];
     const names = new Set(
@@ -508,9 +534,35 @@ export default function ApplicationsRoute() {
       await dashboard.refreshProjects();
     },
   });
+  const createMutation = useMutation({
+    mutationFn: (input: NewApplication) =>
+      createApplication(session.accessToken, input),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: applicationKeys.all });
+      await dashboard.refreshProjects();
+      setRegistrationMessage(
+        `${registrationForm.name} was registered and queued for onboarding.`,
+      );
+      setShowRegistration(false);
+      setRegistrationForm(newApplication());
+    },
+  });
   const submitEdit = (event: FormEvent) => {
     event.preventDefault();
     if (form) saveMutation.mutate(form);
+  };
+  const openRegistration = (name = "") => {
+    setRegistrationMessage("");
+    setRegistrationForm(newApplication(name));
+    setShowRegistration(true);
+    window.setTimeout(
+      () => registrationRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }),
+      0,
+    );
+  };
+  const submitRegistration = (event: FormEvent) => {
+    event.preventDefault();
+    createMutation.mutate(registrationForm);
   };
   const remove = () => {
     if (
@@ -561,6 +613,15 @@ export default function ApplicationsRoute() {
           </div>
           <div className="button-row">
             {copilot.isAdministrator ? (
+              <button
+                className="button-primary"
+                type="button"
+                onClick={() => openRegistration()}
+              >
+                Register application
+              </button>
+            ) : null}
+            {copilot.isAdministrator ? (
               <ConfirmationDialog
                 trigger={
                   <button
@@ -604,6 +665,9 @@ export default function ApplicationsRoute() {
               ))}
             </ul>
           </div>
+        ) : null}
+        {registrationMessage ? (
+          <p className="success" role="status">{registrationMessage}</p>
         ) : null}
         {applications.error ? (
           <p className="error">{applications.error.message}</p>
@@ -668,7 +732,7 @@ export default function ApplicationsRoute() {
                         <button
                           className="button-secondary"
                           type="button"
-                          onClick={() => navigate("/integrations")}
+                          onClick={() => openRegistration(String(row.name))}
                         >
                           Onboard
                         </button>
@@ -696,6 +760,38 @@ export default function ApplicationsRoute() {
           </table>
         </div>
       </article>
+      {showRegistration ? (
+        <article className="panel" ref={registrationRef} aria-labelledby="application-registration-title">
+          <div className="panel-head">
+            <div>
+              <h2 id="application-registration-title">Register application</h2>
+              <p>Create the managed application record that starts the onboarding pipeline.</p>
+            </div>
+            <button className="button-secondary" type="button" onClick={() => setShowRegistration(false)}>
+              Cancel
+            </button>
+          </div>
+          {createMutation.error ? <p className="error" role="alert">{createMutation.error.message}</p> : null}
+          <form className="form" onSubmit={submitRegistration}>
+            <div className="filter-grid">
+              <label>Application name<input aria-label="Application name" value={registrationForm.name} onChange={(event) => setRegistrationForm((current) => ({ ...current, name: event.target.value }))} required /></label>
+              <label>Environment<select aria-label="Application environment" value={registrationForm.environment} onChange={(event) => setRegistrationForm((current) => ({ ...current, environment: event.target.value as NewApplication["environment"] }))}><option value="dev">Development</option><option value="staging">Staging</option><option value="prod">Production</option></select></label>
+              <label>Owner team<input aria-label="Owner team" value={registrationForm.owner_team} onChange={(event) => setRegistrationForm((current) => ({ ...current, owner_team: event.target.value }))} required /></label>
+              <label>Owner email<input aria-label="Owner email" type="email" value={registrationForm.owner_email || ""} onChange={(event) => setRegistrationForm((current) => ({ ...current, owner_email: event.target.value || null }))} /></label>
+              <label>Namespace<input aria-label="Application namespace" value={registrationForm.namespace} onChange={(event) => setRegistrationForm((current) => ({ ...current, namespace: event.target.value }))} required /></label>
+              <label>Region<input aria-label="Application region" value={registrationForm.region} onChange={(event) => setRegistrationForm((current) => ({ ...current, region: event.target.value }))} required /></label>
+              <label>Technology<input aria-label="Application technology" value={registrationForm.technology} onChange={(event) => setRegistrationForm((current) => ({ ...current, technology: event.target.value }))} required /></label>
+              <label>Metrics endpoint<input aria-label="Metrics endpoint" type="url" value={registrationForm.metrics_endpoint} onChange={(event) => setRegistrationForm((current) => ({ ...current, metrics_endpoint: event.target.value }))} required /></label>
+              <label>Monitoring platform<input aria-label="Monitoring platform" value={registrationForm.monitoring_platform} onChange={(event) => setRegistrationForm((current) => ({ ...current, monitoring_platform: event.target.value }))} required /></label>
+            </div>
+            <div className="button-row">
+              <button className="button-primary" type="submit" disabled={createMutation.isPending}>
+                {createMutation.isPending ? "Registering..." : "Register and start onboarding"}
+              </button>
+            </div>
+          </form>
+        </article>
+      ) : null}
       {selected && form ? (
         <article className="panel" ref={detailRef}>
           <div className="panel-head">
