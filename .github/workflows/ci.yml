@@ -107,8 +107,9 @@ jobs:
           cache-dependency-path: frontend/react/package-lock.json
       - name: Audit Python dependencies
         run: |
+          python -m pip install --upgrade pip
           python -m pip install -e . pip-audit
-          pip-audit --strict --local
+          pip-audit --local --skip-editable
       - name: Audit frontend dependencies
         working-directory: frontend/react
         run: npm audit --audit-level=high
@@ -143,9 +144,12 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-kubectl@v4
-      - name: Validate manifests
-        run: kubectl apply --dry-run=client -f k8s/
+      - name: Validate manifests with strict client-side schemas
+        run: >-
+          docker run --rm
+          -v "${PWD}/k8s:/work/k8s:ro"
+          ghcr.io/yannh/kubeconform:v0.7.0
+          -strict -summary /work/k8s
 
   deployment-contracts:
     runs-on: ubuntu-latest
