@@ -3,6 +3,8 @@ import { expect, test } from "@playwright/test";
 const INCIDENT_ID = "11111111-1111-4111-8111-111111111111";
 const RECOMMENDATION_ID = "22222222-2222-4222-8222-222222222222";
 const APPLICATION_ID = "33333333-3333-4333-8333-333333333333";
+const PLAN_ID = "44444444-4444-4444-8444-444444444444";
+const PLAN_FINGERPRINT = `sha256:${"a".repeat(64)}`;
 
 const json = (payload, status = 200) => ({
   status,
@@ -81,6 +83,12 @@ function incident(overrides = {}) {
 
 async function installScenario(page, options = {}) {
   let currentIncident = options.incident || incident();
+  const approvalReadiness = options.approvalReadiness || {
+    state: "execution_eligible",
+    missing: [],
+    decision_id: "readiness-decision-1",
+    signature: "hmac-sha256:signed-readiness",
+  };
   const application = {
     id: APPLICATION_ID,
     name: "Checkout Platform",
@@ -134,10 +142,30 @@ async function installScenario(page, options = {}) {
     if (path === `/incidents/${INCIDENT_ID}/manual-close` && method === "POST") {
       return route.fulfill(json({ data: { status: "closed", closure_kind: "manual", technical_recovery_verified: false, jira: { transitioned: false } } }));
     }
-    if (path === `/approval/incident/${INCIDENT_ID}`) return route.fulfill(json({ data: { incident_id: INCIDENT_ID, recommendation_id: RECOMMENDATION_ID, status: currentIncident.status } }));
+    if (path === `/approval/incident/${INCIDENT_ID}`) return route.fulfill(json({ data: {
+      incident_id: INCIDENT_ID,
+      recommendation_id: RECOMMENDATION_ID,
+      status: currentIncident.status,
+      recommendation: {
+        id: RECOMMENDATION_ID,
+        metadata: {
+          execution_plan: {
+            tenant_id: "default",
+            incident_id: INCIDENT_ID,
+            plan_id: PLAN_ID,
+            plan_fingerprint: PLAN_FINGERPRINT,
+          },
+        },
+      },
+      approval_readiness: approvalReadiness,
+    } }));
     if (path === "/approval/approve" && method === "POST") {
+      const body = route.request().postDataJSON();
+      if (body.plan_id !== PLAN_ID || body.plan_fingerprint !== PLAN_FINGERPRINT) {
+        return route.fulfill(json({ detail: "Approval is not bound to the current execution plan fingerprint." }, 409));
+      }
       currentIncident = incident({ status: "executing", approval_status: "approved", execution_mode: "human-approved" });
-      return route.fulfill(json({ data: { id: "44444444-4444-4444-8444-444444444444", incident_id: INCIDENT_ID, recommendation_id: RECOMMENDATION_ID, decision: "approved" } }));
+      return route.fulfill(json({ data: { id: "55555555-5555-4555-8555-555555555555", incident_id: INCIDENT_ID, recommendation_id: RECOMMENDATION_ID, decision: "approved" } }));
     }
     if (path === "/remediation/execute" && method === "POST") {
       currentIncident = incident({ status: "recovered", approval_status: "approved", execution_mode: "human-approved", latest_event_type: "validation_completed" });
@@ -218,6 +246,20 @@ test("signal to RCA to approval to canary validation and closure remains evidenc
   await expect(page.locator(".ic-validation")).toContainText("Recovery verified");
   await expect(page.locator(".ic-validation")).toContainText("12.4%");
   await expect(page.locator(".ic-validation")).toContainText("0.8%");
+});
+
+test("signed backend readiness blocks diagnostic plans from approval", async ({ page }) => {
+  await installScenario(page, {
+    approvalReadiness: {
+      state: "blocked",
+      missing: ["current_credentials", "rollback_readiness", "policy_acceptance", "evidence_threshold"],
+      decision_id: "readiness-decision-blocked",
+      signature: "hmac-sha256:signed-blocked-readiness",
+    },
+  });
+  await signIn(page, `/incidents/${INCIDENT_ID}`);
+
+  await expect(page.getByRole("button", { name: "Approve & let Kai resolve" })).toBeDisabled();
 });
 
 test("autonomous resolution exposes the active execution state without a false approval", async ({ page }) => {

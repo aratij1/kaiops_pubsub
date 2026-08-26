@@ -7645,15 +7645,30 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
   const approvalReady = useMemo(() => {
     const cockpitIncidentId = activeTab === "home" && ["approval", "execution"].includes(homeDetailTab) ? selectedIncidentId : "";
-    const hasBase = String(cockpitIncidentId || approvalForm.incident_id || selectedApprovalIncidentId || "").trim() && String(approvalForm.approver || "").trim();
+    const approvalIncidentId = String(cockpitIncidentId || approvalForm.incident_id || selectedApprovalIncidentId || "").trim();
+    const hasBase = approvalIncidentId && String(approvalForm.approver || "").trim();
     if (!hasBase) {
       return false;
     }
-    if (approvalForm.action !== "modify") {
+    if (approvalForm.action !== "approve") {
+      if (approvalForm.action === "modify") {
+        return String(approvalForm.modified_action || "").trim().length > 0;
+      }
       return true;
     }
-    return String(approvalForm.modified_action || "").trim().length > 0;
-  }, [activeTab, approvalForm, homeDetailTab, selectedApprovalIncidentId, selectedIncidentId]);
+    if (approvalIncidentContext.incident_id !== approvalIncidentId) {
+      return false;
+    }
+    const contextRoot = unwrap(approvalIncidentContext.payload) || {};
+    const readiness = contextRoot?.approval_readiness && typeof contextRoot.approval_readiness === "object"
+      ? contextRoot.approval_readiness
+      : {};
+    return Boolean(
+      readiness.decision_id
+      && readiness.signature
+      && String(readiness.state || "").toLowerCase() === "execution_eligible"
+    );
+  }, [activeTab, approvalForm, approvalIncidentContext, homeDetailTab, selectedApprovalIncidentId, selectedIncidentId]);
 
   async function executeApprovalAction({
     incidentId,
@@ -7676,7 +7691,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       throw new Error("Free-text approval modifications are disabled. Generate and approve a new typed plan.");
     }
 
-    const contextRoot = unwrap(approvalIncidentContext.payload) || {};
+    let contextRoot = unwrap(approvalIncidentContext.payload) || {};
     const contextRecommendation = contextRoot?.recommendation && typeof contextRoot.recommendation === "object"
       ? contextRoot.recommendation
       : {};
@@ -7684,9 +7699,71 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       && typeof contextRecommendation.metadata.execution_plan === "object"
       ? contextRecommendation.metadata.execution_plan
       : {};
-    const selectedPlan = normalizedIncidentId === String(selectedIncidentId || "")
+    let selectedPlan = normalizedIncidentId === String(selectedIncidentId || "")
       ? selectedExecutionPlan.catalogPlan || {}
       : contextPlan;
+    let boundRecommendationId = normalizedRecommendationId;
+
+    if (normalizedAction === "approve") {
+      // Approval must bind to the context returned by this request, not a
+      // previous React render. State updates from queue selection are async
+      // and previously caused plan_id/fingerprint to be omitted from the POST.
+      const liveResponse = await fetchJson(
+        `/api-gateway/approval/incident/${encodeURIComponent(normalizedIncidentId)}`,
+        authenticatedOptions({ timeoutMs: 30000, maxAttempts: 1 }),
+      );
+      const liveRoot = unwrap(liveResponse) || {};
+      const liveRecommendation = liveRoot?.recommendation && typeof liveRoot.recommendation === "object"
+        ? liveRoot.recommendation
+        : {};
+      const livePlan = liveRecommendation?.metadata?.execution_plan
+        && typeof liveRecommendation.metadata.execution_plan === "object"
+        ? liveRecommendation.metadata.execution_plan
+        : {};
+      const liveRecommendationId = String(
+        liveRecommendation?.id
+        || liveRecommendation?.recommendation_id
+        || liveRoot?.recommendation_id
+        || "",
+      ).trim();
+      setApprovalIncidentContext({
+        loading: false,
+        incident_id: normalizedIncidentId,
+        payload: liveRoot,
+        error: "",
+      });
+      if (boundRecommendationId && liveRecommendationId && boundRecommendationId !== liveRecommendationId) {
+        throw new Error("The approval queue changed while this incident was open. Review the latest recommendation before approving.");
+      }
+      boundRecommendationId = liveRecommendationId || boundRecommendationId;
+      contextRoot = liveRoot;
+      selectedPlan = livePlan;
+
+      const planId = String(selectedPlan?.plan_id || "").trim();
+      const planFingerprint = String(selectedPlan?.plan_fingerprint || "").trim();
+      if (!planId || !/^sha256:[0-9a-f]{64}$/.test(planFingerprint)) {
+        throw new Error(
+          "Approval unavailable: this recommendation has no current governed execution plan. Open the incident, run fresh analysis, then review the new plan.",
+        );
+      }
+      const readiness = liveRoot?.approval_readiness && typeof liveRoot.approval_readiness === "object"
+        ? liveRoot.approval_readiness
+        : {};
+      const missingControls = Array.isArray(readiness.missing)
+        ? readiness.missing.map((item) => String(item || "").replaceAll("_", " ")).filter(Boolean)
+        : [];
+      const backendEligibilityProven = Boolean(
+        readiness.decision_id
+        && readiness.signature
+        && String(readiness.state || "").toLowerCase() === "execution_eligible"
+      );
+      if (!backendEligibilityProven) {
+        const missingDetail = missingControls.length ? ` Missing controls: ${missingControls.join(", ")}.` : "";
+        throw new Error(
+          `Approval unavailable: the backend has not marked this plan execution-eligible.${missingDetail} Refresh evidence or regenerate analysis before approval.`,
+        );
+      }
+    }
     const tenantId = String(
       adminSession?.user?.tenant_id
       || selectedPlan?.tenant_id
@@ -7709,8 +7786,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       comment: String(comment || "").trim() || null,
       authorization_scope: authorizationScope,
     };
-    if (looksLikeUuid(normalizedRecommendationId)) {
-      payload.recommendation_id = normalizedRecommendationId;
+    if (looksLikeUuid(boundRecommendationId)) {
+      payload.recommendation_id = boundRecommendationId;
     }
 
     if (normalizedAction === "approve") {
@@ -10253,6 +10330,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               latestIncidentId,
               contextLoading: approvalIncidentContext.loading,
               contextError: approvalIncidentContext.error || "",
+              contextPayload: approvalIncidentContext.incident_id === selectedApprovalIncidentId
+                ? approvalIncidentContext.payload
+                : null,
               showAdvanced: showAdvancedApprovalForm,
               form: approvalForm,
               ready: approvalReady,

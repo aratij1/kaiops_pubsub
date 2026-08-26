@@ -18,10 +18,20 @@ _SPEC.loader.exec_module(approval_service_app)
 
 
 def _set_pending_plan(incident_id, recommendation_id) -> dict:
+    approval_service_app.settings.service_internal_token = "internal-test-token"
     plan = {
         "tenant_id": "tenant-a",
         "incident_id": str(incident_id),
         "plan_id": "33333333-3333-3333-3333-333333333333",
+        "execution_ready": True,
+        "diagnostic_only": False,
+        "plan_kind": "remediation",
+        "target_resource_id": "k8s:/clusters/prod/namespaces/payments/deployments/api",
+        "connector_id": "kubernetes-prod",
+        "validators": [{"validator_id": "availability-1"}],
+        "rollback_commands": ["governed:rollback-deployment"],
+        "rollback_mode": "automatic",
+        "policy_decision": {"decision": "allow"},
         "expiry": "2099-01-01T00:00:00+00:00",
     }
     plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
@@ -29,7 +39,17 @@ def _set_pending_plan(incident_id, recommendation_id) -> dict:
         "recommendation": {
             "id": str(recommendation_id),
             "incident_id": str(incident_id),
-            "metadata": {"execution_plan": plan},
+            "metadata": {
+                "execution_plan": plan,
+                "runbook_status": "approved",
+                "connection_profile": {"credential_ref": "vault://tenant-a/prod-remediator"},
+                "evidence_quality": {
+                    "evidence_coverage": 0.9,
+                    "citation_coverage": 0.8,
+                    "evidence_fresh": True,
+                    "conflict_count": 0,
+                },
+            },
         }
     }
     return plan
