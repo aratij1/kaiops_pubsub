@@ -7,7 +7,7 @@ import { useOperationalEvents } from "./services/operationalEvents";
 import { beginOidcLogin, completeOidcLogin } from "./services/oidcClient";
 import { RouteRuntimeProvider } from "./app/routeRuntime";
 import { projectIdentityFromAlert } from "./domain/projectIdentity";
-import { effectiveExecutionStatus, effectiveIncidentStatus, executionProcessPresentation, incidentStatusLabel } from "./domain/incidentStatus";
+import { durableIncidentPath, effectiveExecutionStatus, effectiveIncidentStatus, executionProcessPresentation, incidentStatusLabel } from "./domain/incidentStatus";
 import { resolveResolutionControl } from "./domain/resolutionControl";
 import { incidentDraftHasSubstantiveContent, simpleIncidentReport } from "./domain/incidentReport";
 import { approvalFlowFromPayload, approvalFlowId, approvalIncidentId, approvalRecommendationFromPayload, approvalRecommendationId, approvalTraceId } from "./domain/approvalContext";
@@ -10240,12 +10240,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               refresh: loadIncidentMetadata,
               updateFilter: (name, value) => setMetadataFilters((current) => ({ ...current, [name]: value })),
               open: (row) => {
-                const incidentId = String(row?.incident_id || row?.id || "").trim();
-                if (incidentId && typeof onNavigatePath === "function") {
-                  onNavigatePath(`/incidents/${encodeURIComponent(incidentId)}`);
+                const path = durableIncidentPath(row);
+                if (path && typeof onNavigatePath === "function") {
+                  onNavigatePath(path);
                   return;
                 }
-                openAlertDetailsFromIncident(row, "overview");
               },
               openTechnical: (row, stage = "overview") => openAlertDetailsFromIncident(row, stage),
             },
@@ -10271,8 +10270,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               refresh: () => { loadRecentAlerts({ background: true }); loadLandingPadRecent(); },
               open: openAlertDetails,
               openIncident: (row) => {
-                const incidentId = String(row?.incident_id || row?.incident_projection?.incident_id || row?.incident_projection?.id || "").trim();
-                incidentId && typeof onNavigatePath === "function" ? onNavigatePath(`/incidents/${encodeURIComponent(incidentId)}`) : openAlertDetails(row);
+                const path = durableIncidentPath(row);
+                if (path && typeof onNavigatePath === "function") onNavigatePath(path);
               },
               togglePaused: () => setIngestionStreamPaused((current) => !current),
               setSection: setIngestionStreamSection,
@@ -10316,7 +10315,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               incidents: monitorScopedIncidentMetadata,
               recentlyClosed: executiveClosedSummary.recentRows,
               application: applicationToMonitor,
-              openIncident: openAlertDetailsFromIncident,
+              openIncident: (row) => { const path = durableIncidentPath(row); if (path && typeof onNavigatePath === "function") onNavigatePath(path); },
             },
             approvals: {
               guidanceQuery,
