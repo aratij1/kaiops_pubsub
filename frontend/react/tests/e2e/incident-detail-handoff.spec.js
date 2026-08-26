@@ -62,6 +62,139 @@ test("detail URL reconstructs the selected alert after a page refresh", async ({
   await expect(page.getByText("Select an alert in Alert Stream to open the detail tabs workspace.")).toHaveCount(0);
 });
 
+test("fresh RCA analysis stays authenticated and renders the persisted resolution", async ({ page }) => {
+  const alertId = "77777777-7777-4777-8777-777777777777";
+  const incidentId = "88888888-8888-4888-8888-888888888888";
+  const protectedRequests = [];
+  let analysisComplete = false;
+
+  const alert = {
+    id: alertId,
+    alert_id: alertId,
+    name: "HighRequestLatency",
+    service: "api-gateway",
+    application: "KaiMS",
+    environment: "prod",
+    severity: "critical",
+    status: "active",
+  };
+  const incident = {
+    id: incidentId,
+    incident_id: incidentId,
+    alert_id: alertId,
+    service: "api-gateway",
+    environment: "prod",
+    status: "investigating",
+  };
+  const evidence = [{
+    evidence_id: "metric-latency-1",
+    source: "prometheus-metrics",
+    summary: "Request latency rose immediately after the connection-pool saturation event.",
+    citation: "prometheus://api-gateway/http_request_duration_seconds",
+    timestamp: "2026-08-26T05:30:00Z",
+    cached: false,
+  }];
+  const analyzedWorkflow = () => ({
+    alert,
+    incident,
+    context: {
+      tenant_id: "default",
+      incident_id: incidentId,
+      alert,
+      metadata: {
+        context_quality: { contract_version: "kaiops.context-quality.v1", quality_score: 0.94, coverage_score: 0.92, freshness_score: 0.98, provenance_score: 0.93, evidence_count: 1, reusable: true },
+        discovery_report: { evidence },
+      },
+    },
+    recommendation: {
+      id: analysisComplete ? "88888888-8888-5888-8888-888888888888" : "recommendation-previous-1",
+      tenant_id: "default",
+      incident_id: incidentId,
+      root_cause: analysisComplete ? "API connection-pool saturation caused request queueing." : "Previous cached hypothesis.",
+      confidence: 0.94,
+      impact: "API requests exceeded the latency SLO.",
+      recommended_action: "Increase the API connection pool and recycle saturated workers through the governed rollout.",
+      severity: "critical",
+      rationale: "Request latency and queue depth rose together after connection-pool exhaustion.",
+      metadata: {
+        rca_analysis: { root_cause: analysisComplete ? "API connection-pool saturation caused request queueing." : "Previous cached hypothesis.", causal_chain: "Pool exhaustion increased queue depth and request latency.", confidence_score: 0.94, evidence_used: ["metric-latency-1"] },
+        impact_analysis: { impact_summary: "API requests exceeded the latency SLO.", customer_impact: "Customers experienced delayed API responses.", impacted_services: ["api-gateway"], evidence_used: ["metric-latency-1"] },
+        remediation_analysis: { recommended_action: "Increase the API connection pool and recycle saturated workers through the governed rollout." },
+        investigation_report: { status: "conclusive", conclusive: true, conclusion: { confidence: 0.94 } },
+      },
+    },
+    timeline: [],
+  });
+
+  await page.route("**/api-gateway/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname.replace(/^\/api-gateway/, "");
+    const isProtected = path.startsWith(`/alerts/${alertId}/processed-result`)
+      || path.startsWith(`/alerts/${alertId}/linked-documents`)
+      || path.startsWith("/analysis/");
+    if (isProtected) {
+      protectedRequests.push({ path, authorization: request.headers().authorization || "" });
+    }
+
+    let body = { data: [], rows: [], summary: {}, items: [] };
+    if (path === "/auth/config") body = { mode: "local", local_development_only: true };
+    else if (path === "/auth/login") body = { access_token: "admin-token", refresh_token: "refresh-token", user: { id: 1, username: "admin", role_name: "Administrator" } };
+    else if (path === "/healthz") body = { status: "ok" };
+    else if (path.startsWith(`/alerts/${alertId}/processed-result`)) body = { data: analyzedWorkflow() };
+    else if (path.startsWith(`/alerts/${alertId}/linked-documents`)) body = { data: { canonical_alert: alert, linked_documents: analysisComplete ? evidence : [] } };
+    else if (path === `/analysis/alerts/${alertId}/regenerate`) {
+      analysisComplete = true;
+      return route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({
+        request_id: "99999999-9999-4999-8999-999999999999",
+        status: "accepted",
+        delivery: "published",
+        alert_id: alertId,
+        incident_id: incidentId,
+        previous_recommendation_id: "recommendation-previous-1",
+        expected_recommendation_id: "88888888-8888-5888-8888-888888888888",
+        analysis_mode: "fresh",
+        context_strategy: "realtime",
+        poll_after_ms: 10,
+      }) });
+    } else if (path.startsWith("/analysis/requests/99999999-9999-4999-8999-999999999999/status")) {
+      body = {
+        request_id: "99999999-9999-4999-8999-999999999999",
+        incident_id: incidentId,
+        recommendation_id: "88888888-8888-5888-8888-888888888888",
+        status: "complete",
+        ready: true,
+      };
+    } else if (path === "/analysis/resolution-catalog/relevant") body = { data: { rows: [] } };
+    else if (path.startsWith("/incidents/metadata")) body = { rows: [{ ...incident, title: "api-gateway: HighRequestLatency", projection_payload: { alert_id: alertId } }] };
+    else if (path.startsWith("/alerts/all")) body = { data: { rows: [alert] } };
+    else if (path.startsWith("/landing-pad/recent") || path === "/applications") body = { data: { rows: [] } };
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  });
+
+  await page.goto(`/?workspace=alert&alert_id=${alertId}`);
+  await page.getByLabel("Username").fill("admin");
+  await page.getByLabel("Password").fill("Admin@123456");
+  await page.getByRole("button", { name: "Sign In" }).click();
+  await expect(page.getByRole("heading", { name: "api-gateway: HighRequestLatency" })).toBeVisible();
+
+  const tabs = page.getByRole("tablist", { name: "Incident workspace sections" });
+  await tabs.getByRole("tab", { name: "Evidence, RCA, and impact" }).click();
+  await page.getByRole("button", { name: /Fresh context/ }).click();
+  await page.getByRole("button", { name: "Run fresh analysis" }).click();
+
+  await expect(page.getByText(`Fresh context and RCA analysis completed for alert ${alertId}.`)).toBeVisible();
+  await expect(page.getByText("API connection-pool saturation caused request queueing.").first()).toBeVisible();
+  await expect(page.getByText("Increase the API connection pool and recycle saturated workers through the governed rollout.").first()).toBeVisible();
+  await expect(page.getByText(/HTTP 401|Not authenticated/)).toHaveCount(0);
+  expect(protectedRequests.some(({ path }) => path === `/analysis/alerts/${alertId}/regenerate`)).toBeTruthy();
+  const orchestrationRequests = protectedRequests.filter(({ path }) => path === `/analysis/alerts/${alertId}/regenerate`
+    || path === "/analysis/context/collect"
+    || path === "/analysis/resolution/resolve");
+  expect(orchestrationRequests).toHaveLength(1);
+  expect(protectedRequests.filter(({ path }) => path.includes("processed-result")).length).toBeGreaterThanOrEqual(2);
+  expect(protectedRequests.every(({ authorization }) => authorization === "Bearer admin-token")).toBeTruthy();
+});
+
 test("incident summary connects source application and Prometheus to KaiOps processing", async ({ page }) => {
   const alertId = "55555555-5555-4555-8555-555555555555";
   const incidentId = "66666666-6666-4666-8666-666666666666";

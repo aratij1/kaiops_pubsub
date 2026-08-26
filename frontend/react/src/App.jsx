@@ -522,7 +522,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const [selectedAlertData, setSelectedAlertData] = useState({ loading: false, payload: null, error: "", alertId: "" });
   const [selectedAlertRegeneration, setSelectedAlertRegeneration] = useState({ loading: false, message: "", error: "" });
   const [rcaAnalysisMode, setRcaAnalysisMode] = useState("smart");
-  const automaticRcaAttemptsRef = useRef(new Set());
   const [aiFeedbackState, setAiFeedbackState] = useState({ loading: false, decision: "", message: "", error: "" });
   const [selectedAlertDocumentLinks, setSelectedAlertDocumentLinks] = useState({
     loading: false,
@@ -1235,10 +1234,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     try {
       const payload = await queryClient.fetchQuery({
         queryKey: ["alert-processed-result", normalized],
-        queryFn: () => fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, {
+        queryFn: () => fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, authenticatedOptions({
           timeoutMs: 12000,
           maxAttempts: 1,
-        }),
+        })),
         // Background hydration must bypass the query cache. Incident stages
         // can complete between polls, and returning a 15-second-old partial
         // payload makes the cockpit appear permanently stuck.
@@ -1295,7 +1294,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       error: "",
     }));
     try {
-      const payload = await fetchJson(`/api-gateway/alerts/${encodeURIComponent(normalized)}/linked-documents?limit=${alertsLimit}`);
+      const payload = await fetchJson(
+        `/api-gateway/alerts/${encodeURIComponent(normalized)}/linked-documents?limit=${alertsLimit}`,
+        authenticatedOptions(),
+      );
       const data = unwrap(payload);
       const rows = Array.isArray(data?.linked_documents) ? data.linked_documents : [];
       setSelectedAlertDocumentLinks((current) => {
@@ -2182,16 +2184,37 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
     const attempts = Number(options.attempts || 40);
     const intervalMs = Number(options.intervalMs || 3000);
+    const requestId = String(options.requestId || "").trim();
+    const incidentId = String(options.incidentId || "").trim();
+    const expectedRecommendationId = String(options.expectedRecommendationId || "").trim();
+    if (!requestId || !incidentId || !expectedRecommendationId) {
+      return { ready: false, payload: null, attempts: 0 };
+    }
     let latestPayload = null;
+    let statusReady = false;
     for (let index = 0; index < attempts; index += 1) {
       try {
-        const payload = await fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, {
-          timeoutMs: 25000,
-          maxAttempts: 1,
-        });
-        latestPayload = payload;
-        if (alertAnalysisReady(payload)) {
-          return { ready: true, payload, attempts: index + 1 };
+        if (!statusReady) {
+          const status = await fetchJson(
+            `/api-gateway/analysis/requests/${encodeURIComponent(requestId)}/status?incident_id=${encodeURIComponent(incidentId)}`,
+            authenticatedOptions({ timeoutMs: 10000, maxAttempts: 1 }),
+          );
+          statusReady = status?.ready === true
+            && String(status?.recommendation_id || "").trim() === expectedRecommendationId;
+        }
+        if (statusReady) {
+          // Hydrate the full cockpit once, after the indexed completion signal.
+          const payload = await fetchJson(`/api-gateway/alerts/${normalized}/processed-result`, authenticatedOptions({
+            timeoutMs: 120000,
+            maxAttempts: 1,
+          }));
+          latestPayload = payload;
+          const data = unwrap(payload) || {};
+          const workflow = data?.workflow && typeof data.workflow === "object" ? data.workflow : data;
+          const recommendationId = String(workflow?.recommendation?.id || data?.recommendation?.id || "").trim();
+          if (alertAnalysisReady(payload) && recommendationId === expectedRecommendationId) {
+            return { ready: true, payload, attempts: index + 1 };
+          }
         }
       } catch (_error) {
         // Regenerated alerts can race backend indexing; retry until timeout.
@@ -2212,101 +2235,49 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const alertId = String(selectedAlertRow?.id || selectedAlertRow?.alert_id || selectedAlertId || "").trim();
     setSelectedAlertRegeneration({ loading: true, message: "", error: "" });
     try {
-      // The list row is intentionally lightweight and can be selected before
-      // the workflow object is hydrated. Resolve canonical alert+incident
-      // identities from processed-result rather than rejecting that normal race.
-      const currentPayload = unwrap(selectedAlertData.payload) || {};
-      let workflowAlert = selectedAlertWorkflow?.alert && typeof selectedAlertWorkflow.alert === "object"
-        ? selectedAlertWorkflow.alert
-        : currentPayload?.alert && typeof currentPayload.alert === "object"
-          ? currentPayload.alert
-          : {};
-      let incident = selectedAlertWorkflow?.incident && typeof selectedAlertWorkflow.incident === "object"
-        ? selectedAlertWorkflow.incident
-        : currentPayload?.incident && typeof currentPayload.incident === "object"
-          ? currentPayload.incident
-          : null;
-      if (!workflowAlert?.id || !incident?.id) {
-        if (!ALERT_UUID_PATTERN.test(alertId)) {
-          throw new Error("The alert is still being persisted. Wait for its canonical alert ID, then retry RCA.");
-        }
-        const hydratedResponse = await fetchJson(`/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`, {
-          timeoutMs: 30000,
-          maxAttempts: 2,
-        });
-        const hydrated = unwrap(hydratedResponse) || {};
-        workflowAlert = hydrated?.alert && typeof hydrated.alert === "object" ? hydrated.alert : workflowAlert;
-        incident = hydrated?.incident && typeof hydrated.incident === "object" ? hydrated.incident : incident;
+      if (!ALERT_UUID_PATTERN.test(alertId)) {
+        throw new Error("The alert is still being persisted. Wait for its canonical alert ID, then retry RCA.");
       }
-      if (!workflowAlert?.id && ALERT_UUID_PATTERN.test(alertId)) {
-        workflowAlert = { ...selectedAlertRow, id: alertId };
-      }
-      if (!ALERT_UUID_PATTERN.test(String(incident?.id || incident?.incident_id || ""))) {
-        const incidentMetadataMatch = [
-          ...monitorScopedIncidentMetadata,
-          ...incidentMetadata.rows,
-        ].find((row) => String(row?.alert_id || row?.projection_payload?.alert_id || "").trim() === alertId);
-        const recoveredIncidentId = String(incidentMetadataMatch?.incident_id || "").trim();
-        if (ALERT_UUID_PATTERN.test(recoveredIncidentId)) {
-          incident = {
-            ...(incidentMetadataMatch?.projection_payload && typeof incidentMetadataMatch.projection_payload === "object"
-              ? incidentMetadataMatch.projection_payload
-              : {}),
-            ...incident,
-            id: recoveredIncidentId,
-            incident_id: recoveredIncidentId,
-            service: incident?.service || incidentMetadataMatch?.service,
-            environment: incident?.environment || incidentMetadataMatch?.environment,
-            severity: incident?.severity || incidentMetadataMatch?.severity,
-          };
-        }
-      }
-      const persistedIncidentId = String(incident?.id || incident?.incident_id || selectedAlertRow?.incident_id || "").trim();
-      if (!ALERT_UUID_PATTERN.test(persistedIncidentId) || !workflowAlert?.id) {
-        throw new Error("This signal has no standalone incident yet. It may still be processing, or it may have been correlated as noise or a duplicate. Refresh the inbox before regenerating RCA.");
-      }
-      incident = { ...incident, id: persistedIncidentId };
-      const contextStrategy = rcaAnalysisMode === "fresh" ? "realtime" : rcaAnalysisMode === "cache" ? "historical" : "auto";
-      const freshContextResponse = await fetchJson("/context-agent/collect?publish_events=false", {
+      const command = await fetchJson(`/api-gateway/analysis/alerts/${encodeURIComponent(alertId)}/regenerate`, authenticatedOptions({
         method: "POST",
-        body: JSON.stringify({ alert: workflowAlert, incident, context_strategy: contextStrategy }),
-        timeoutMs: 180000,
+        body: JSON.stringify({ mode: rcaAnalysisMode }),
+        timeoutMs: 30000,
         maxAttempts: 1,
+      }));
+      const acceptedRequestId = String(command?.request_id || "").trim();
+      const acceptedIncidentId = String(command?.incident_id || selectedAlertWorkflow?.incident?.id || "").trim();
+      const expectedRecommendationId = String(command?.expected_recommendation_id || "").trim();
+      setSelectedAlertRegeneration({
+        loading: true,
+        message: acceptedRequestId
+          ? `Analysis request ${acceptedRequestId.slice(0, 8)} accepted. Collecting evidence and generating RCA in the governed backend workflow…`
+          : "Analysis request accepted. Collecting evidence and generating RCA in the governed backend workflow…",
+        error: "",
       });
-      const freshContext = unwrap(freshContextResponse);
-      const priorScore = Number(freshContext?.metadata?.prior_resolution_score || 0);
-      const reuseThreshold = Number(freshContext?.metadata?.resolution_reuse_threshold || 0.7);
-      if (rcaAnalysisMode === "cache" && (!freshContext?.metadata?.context_reused || priorScore <= reuseThreshold)) {
-        throw new Error("No verified cached analysis is available above the configured quality threshold. Choose Smart reuse or Fresh context.");
+      const persistedAnalysis = await waitForAlertAnalysis(alertId, {
+        attempts: 100,
+        intervalMs: Number(command?.poll_after_ms || 3000),
+        requestId: acceptedRequestId,
+        incidentId: acceptedIncidentId,
+        expectedRecommendationId,
+      });
+      if (persistedAnalysis.payload) {
+        setSelectedAlertData((current) => String(current.alertId || "") === alertId
+          ? { loading: false, payload: persistedAnalysis.payload, error: "", alertId }
+          : current);
+      } else {
+        await loadAlertDetails(alertId);
       }
-      const payload = {
-        ...freshContext,
-        incident_id: persistedIncidentId,
-        alert: workflowAlert,
-        metadata: {
-          ...(freshContext?.metadata && typeof freshContext.metadata === "object" ? freshContext.metadata : {}),
-          force_full_analysis: rcaAnalysisMode === "fresh",
-          analysis_mode: rcaAnalysisMode,
-          regeneration_requested: true,
-          regenerated_from_alert_id: alertId,
-          regenerate_requested_at: new Date().toISOString(),
-        },
-      };
-      await fetchJson("/resolution-agent/resolve?publish_events=true", {
-        method: "POST",
-        body: JSON.stringify(payload),
-        timeoutMs: 180000,
-        maxAttempts: 1,
-      });
-      await loadAlertDetails(alertId);
       await loadSelectedAlertDocumentLinks(alertId);
       setSelectedAlertRegeneration({
         loading: false,
-        message: rcaAnalysisMode === "fresh"
-          ? `Fresh context and RCA analysis completed for alert ${alertId}.`
-          : rcaAnalysisMode === "cache"
-            ? `Verified cached context and RCA loaded for alert ${alertId}.`
-            : `Smart analysis completed for alert ${alertId}; verified context was reused when eligible.`,
+        message: persistedAnalysis.ready
+          ? rcaAnalysisMode === "fresh"
+            ? `Fresh context and RCA analysis completed for alert ${alertId}.`
+            : rcaAnalysisMode === "cache"
+              ? `Verified cached context and RCA loaded for alert ${alertId}.`
+              : `Smart analysis completed for alert ${alertId}; verified context was reused when eligible.`
+          : `Analysis for alert ${alertId} is still running in the backend. You can leave this page and refresh the incident later.`,
         error: "",
       });
       void Promise.all([loadRecentAlerts(), loadLandingPadRecent(), loadGatewayRecent(), loadGatewaySummary()])
@@ -4132,7 +4103,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       workflowPayload = selectedAlertData.payload?.data || selectedAlertData.payload;
     } else if (alertId) {
       try {
-        const payload = await fetchJson(`/monitoring-adapter/alerts/${alertId}/processed-result`);
+        const payload = await fetchJson(
+          `/api-gateway/alerts/${encodeURIComponent(alertId)}/processed-result`,
+          authenticatedOptions({ timeoutMs: 12000, maxAttempts: 1 }),
+        );
         workflowPayload = payload?.data || payload;
       } catch (_error) {
         workflowPayload = {};
@@ -5453,24 +5427,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }, [visibleAlerts, selectedAlertId, selectedAlertSnapshot, selectedAlertData.payload, applicationToMonitor]);
 
   const evidenceDraftLoadRef = useRef({ key: "", loadedAt: 0 });
-  useEffect(() => {
-    const alertId = String(selectedAlertId || "").trim();
-    const payload = selectedAlertData.payload;
-    const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
-    const canonicalAlertId = String(data?.alert?.id || data?.alert?.alert_id || "").trim();
-    const canonicalIncidentId = String(data?.incident?.id || data?.incident?.incident_id || "").trim();
-    const historicalIncidentWithoutRca = data?.mode === "db-processed"
-      && ALERT_UUID_PATTERN.test(canonicalAlertId)
-      && ALERT_UUID_PATTERN.test(canonicalIncidentId)
-      && !alertAnalysisReady(payload);
-    if (!ALERT_UUID_PATTERN.test(alertId) || selectedAlertData.loading || selectedAlertRegeneration.loading
-      || !selectedAlertRow || !historicalIncidentWithoutRca || automaticRcaAttemptsRef.current.has(alertId)) {
-      return undefined;
-    }
-    automaticRcaAttemptsRef.current.add(alertId);
-    const timer = window.setTimeout(() => { void regenerateSelectedAlertAnalysis(); }, 400);
-    return () => window.clearTimeout(timer);
-  }, [selectedAlertData.loading, selectedAlertData.payload, selectedAlertId, selectedAlertRegeneration.loading, selectedAlertRow]);
 
   // A landing-pad filename can be selected briefly while the backend promotes
   // it to a canonical alert. Never carry an RCA error from that transient

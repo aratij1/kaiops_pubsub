@@ -1012,7 +1012,6 @@ services:
       mysql: { condition: service_healthy }
 
   evaluation-service:
-    profiles: ["evaluation", "full"]
     build: *service-build
     restart: unless-stopped
     environment: { <<: *service-env, SERVICE_NAME: evaluation-service }

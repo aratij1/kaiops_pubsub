@@ -52,6 +52,28 @@ const ResolutionRecommendation = z.object({
   risk: z.string().optional(),
 }).passthrough();
 const ObjectResponse = z.object({}).passthrough();
+const GatewayCollectedContext = z.object({ data: CollectedContext }).passthrough();
+const GatewayResolutionRecommendation = z.object({ data: ResolutionRecommendation }).passthrough();
+const GatewayObjectResponse = z.object({ data: ObjectResponse }).passthrough();
+const AnalysisRegenerationAccepted = z.object({
+  request_id: z.string().uuid(),
+  status: z.literal("accepted"),
+  delivery: z.enum(["published", "queued"]),
+  alert_id: z.string().uuid(),
+  incident_id: z.string().uuid(),
+  previous_recommendation_id: z.string().nullable().optional(),
+  expected_recommendation_id: z.string().uuid(),
+  analysis_mode: z.enum(["smart", "fresh", "cache"]),
+  context_strategy: z.enum(["auto", "realtime", "historical"]),
+  poll_after_ms: z.number().int().positive(),
+}).passthrough();
+const AnalysisRegenerationStatus = z.object({
+  request_id: z.string().uuid(),
+  incident_id: z.string().uuid(),
+  recommendation_id: z.string().uuid(),
+  status: z.enum(["running", "complete"]),
+  ready: z.boolean(),
+}).passthrough();
 const ObjectOrList = z.union([ObjectResponse, RecordList]);
 const RowsEnvelope = z.union([
   z.object({ rows: z.array(z.unknown()) }).passthrough(),
@@ -72,6 +94,11 @@ const contracts: readonly Contract[] = [
   { method: "POST", path: /^\/api-gateway\/evaluations\/by-recommendation\/[0-9a-f-]+\/feedback$/i, schema: EvaluationFeedback, name: "evaluation-feedback" },
   { method: "POST", path: /^\/context-agent\/collect$/, schema: CollectedContext, name: "collected-context" },
   { method: "POST", path: /^\/resolution-agent\/resolve$/, schema: ResolutionRecommendation, name: "resolution-recommendation" },
+  { method: "POST", path: /^\/api-gateway\/analysis\/alerts\/[0-9a-f-]+\/regenerate$/i, schema: AnalysisRegenerationAccepted, name: "analysis-regeneration-accepted" },
+  { method: "GET", path: /^\/api-gateway\/analysis\/requests\/[0-9a-f-]+\/status$/i, schema: AnalysisRegenerationStatus, name: "analysis-regeneration-status" },
+  { method: "POST", path: /^\/api-gateway\/analysis\/context\/collect$/, schema: GatewayCollectedContext, name: "gateway-collected-context" },
+  { method: "POST", path: /^\/api-gateway\/analysis\/resolution\/resolve$/, schema: GatewayResolutionRecommendation, name: "gateway-resolution-recommendation" },
+  { method: "POST", path: /^\/api-gateway\/analysis\/resolution-catalog\/(?:relevant|select)$/, schema: GatewayObjectResponse, name: "gateway-resolution-catalog" },
   { path: /^\/(?:api-gateway|monitoring-adapter)\/alerts(?:\/|$)/, schema: ObjectOrList, name: "alerts" },
   { path: /^\/api-gateway\/landing-pad(?:\/|$)/, schema: RowsEnvelope, name: "landing-pad" },
   { path: /^\/api-gateway\/incidents(?:\/|$)/, schema: ObjectOrList, name: "incidents" },

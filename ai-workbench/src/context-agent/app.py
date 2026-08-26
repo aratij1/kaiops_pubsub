@@ -576,8 +576,10 @@ async def _persist_context_event(
                     "subject_fingerprint": subject_fingerprint,
                 },
             )
+        analysis_request_id = str(context.metadata.get("analysis_request_id") or "").strip()
+        audit_identity = analysis_request_id or context_fingerprint
         incident_event["event_id"] = str(
-            uuid5(NAMESPACE_URL, f"kaims:context-audit:{incident.id}:{context_fingerprint}")
+            uuid5(NAMESPACE_URL, f"kaims:context-audit:{incident.id}:{audit_identity}")
         )
         await repo.save_incident_event(incident_event)
         snapshot_id = uuid5(
@@ -683,7 +685,9 @@ def _build_context_event_payload(
         evidence_ids=evidence_ids or [f"alert:{alert.id}", f"incident:{incident.id}"],
     )
     context_fingerprint = str(context.metadata.get("context_fingerprint") or "")
-    event_contract["event_id"] = f"context:{incident.id}:{context_fingerprint[:24]}"
+    analysis_request_id = str(context.metadata.get("analysis_request_id") or "").strip()
+    event_identity = analysis_request_id or context_fingerprint[:24]
+    event_contract["event_id"] = f"context:{incident.id}:{event_identity}"
     return {
         "context": context.model_dump(mode="json"),
         "incident": incident.model_dump(mode="json"),
@@ -691,6 +695,33 @@ def _build_context_event_payload(
         "transport": provider_used,
         "event_contract": event_contract,
     }
+
+
+def _attach_analysis_request_metadata(
+    context: Context,
+    *,
+    decision: dict[str, Any] | None = None,
+    analysis_request: dict[str, Any] | None = None,
+) -> Context:
+    """Carry regeneration identity through the asynchronous RCA pipeline."""
+    routing = decision if isinstance(decision, dict) else {}
+    request_payload = analysis_request if isinstance(analysis_request, dict) else {}
+    request_id = str(routing.get("analysis_request_id") or request_payload.get("id") or "").strip()
+    if not request_id:
+        return context
+    mode = str(routing.get("analysis_mode") or request_payload.get("mode") or "smart").strip().lower()
+    metadata = context.metadata if isinstance(context.metadata, dict) else {}
+    return context.model_copy(update={
+        "metadata": {
+            **metadata,
+            "analysis_request_id": request_id,
+            "analysis_mode": mode,
+            "force_full_analysis": bool(routing.get("force_full_analysis")) or mode == "fresh",
+            "regeneration_requested": True,
+            "regenerated_from_alert_id": str(context.alert.id),
+            "regenerate_requested_at": str(request_payload.get("requested_at") or ""),
+        }
+    })
 
 
 async def _flush_context_outbox(app: FastAPI) -> int:
@@ -778,6 +809,11 @@ async def startup(app: FastAPI) -> None:
         decision = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
         context = await _collect_context_with_strategy(
             app, alert, incident, decision.get("context_strategy"), payload.get("context")
+        )
+        context = _attach_analysis_request_metadata(
+            context,
+            decision=decision,
+            analysis_request=payload.get("analysis_request"),
         )
         try:
             create_evidence_rag_draft(alert=alert, incident=incident, context=context)
@@ -1548,6 +1584,11 @@ async def collect(payload: dict, publish_events: bool = True) -> Context:
     incident = _incident_from_workflow_payload(payload["incident"])
     context = await _collect_context_with_strategy(
         app, alert, incident, payload.get("context_strategy"), payload.get("context")
+    )
+    context = _attach_analysis_request_metadata(
+        context,
+        decision=payload.get("decision"),
+        analysis_request=payload.get("analysis_request"),
     )
     if publish_events:
         provider = _extract_message_bus_provider(payload)
