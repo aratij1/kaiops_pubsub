@@ -192,6 +192,55 @@ async def test_context_event_payload_includes_event_contract() -> None:
 
 
 @pytest.mark.asyncio
+async def test_analysis_request_identity_flows_from_context_to_recommendation() -> None:
+    alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus",
+        name="PaymentsLatencyHigh",
+        service="payments",
+        severity=AlertSeverity.CRITICAL,
+        description="latency increased",
+    )
+    incident = Incident(
+        tenant_id="tenant-a",
+        service="payments",
+        severity=AlertSeverity.CRITICAL,
+        title="payments latency",
+    )
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+    first_request_id = "11111111-1111-4111-8111-111111111111"
+    second_request_id = "22222222-2222-4222-8222-222222222222"
+    first = context_agent_app._attach_analysis_request_metadata(
+        context,
+        decision={"analysis_request_id": first_request_id, "analysis_mode": "fresh", "force_full_analysis": True},
+    )
+    second = context_agent_app._attach_analysis_request_metadata(
+        context,
+        decision={"analysis_request_id": second_request_id, "analysis_mode": "fresh", "force_full_analysis": True},
+    )
+
+    first_payload = context_agent_app._build_context_event_payload(
+        alert=alert,
+        incident=incident,
+        context=first,
+        decision={},
+        provider_used="rabbitmq",
+    )
+    second_payload = context_agent_app._build_context_event_payload(
+        alert=alert,
+        incident=incident,
+        context=second,
+        decision={},
+        provider_used="rabbitmq",
+    )
+
+    assert first.metadata["force_full_analysis"] is True
+    assert first_payload["event_contract"]["event_id"].endswith(first_request_id)
+    assert second_payload["event_contract"]["event_id"].endswith(second_request_id)
+    assert resolution_agent_app._deterministic_recommendation_id(first) != resolution_agent_app._deterministic_recommendation_id(second)
+
+
+@pytest.mark.asyncio
 async def test_resolution_event_payload_includes_event_contract() -> None:
     alert = Alert(
         tenant_id="tenant-a",

@@ -10,6 +10,7 @@ import {
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore - appHelpers.jsx is untyped legacy JS, no .d.ts yet.
 } from "../../appHelpers.jsx";
+import { useRouteRuntimeSlice } from "../../app/routeRuntime";
 import EvidenceDraftReview from "./EvidenceDraftReview";
 import DecisionReadinessPanel from "./DecisionReadinessPanel";
 import "./RcaPanel.css";
@@ -67,6 +68,7 @@ export default function RcaPanel({
   onRerunRca, onDownloadRagDocument, onLoadRagDocumentContent,
   onSubmitAiRecommendationFeedback,
 }: RcaPanelProps) {
+  const { accessToken } = useRouteRuntimeSlice("session");
   const [resolutionOptions, setResolutionOptions] = useState<any[]>([]);
   const [selectedResolution, setSelectedResolution] = useState<any>(null);
   const [resolutionStatus, setResolutionStatus] = useState("");
@@ -147,9 +149,9 @@ export default function RcaPanel({
     let active = true;
     setSelectedResolution(null);
     setResolutionStatus("");
-    fetchJson("/resolution-agent/resolution-catalog/relevant", {
+    fetchJson("/api-gateway/analysis/resolution-catalog/relevant", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
       body: JSON.stringify({
         tenant_id: selectedAlertWorkflow?.context?.tenant_id || selectedAlertRow?.tenant_id,
         issue: selectedRcaDecision?.rootCause,
@@ -157,23 +159,25 @@ export default function RcaPanel({
         recommended_action: selectedRcaDecision?.action,
       }),
       timeoutMs: 10000,
-    }).then((result: any) => {
+    }).then((response: any) => {
+      const result = response?.data || response || {};
       if (active) setResolutionOptions(Array.isArray(result?.rows) ? result.rows : []);
     }).catch(() => {
       if (active) setResolutionStatus("Resolution options are temporarily unavailable.");
     });
     return () => { active = false; };
-  }, [selectedAlertId, selectedRcaDecision?.rootCause, selectedRcaDecision?.action, resolutionService]);
+  }, [accessToken, selectedAlertId, selectedRcaDecision?.rootCause, selectedRcaDecision?.action, resolutionService]);
 
   async function chooseResolution(option: any) {
     setResolutionStatus("Preparing the selected resolution...");
     try {
-      const result: any = await fetchJson("/resolution-agent/resolution-catalog/select", {
+      const response: any = await fetchJson("/api-gateway/analysis/resolution-catalog/select", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
         body: JSON.stringify({ tenant_id: selectedAlertWorkflow?.context?.tenant_id || selectedAlertRow?.tenant_id, option_id: option.id, issue: selectedRcaDecision?.rootCause, service: resolutionService, incident_id: selectedAlertId || "" }),
         timeoutMs: 10000,
       });
+      const result = response?.data || response || {};
       setSelectedResolution(result?.selected || option);
       setResolutionStatus("Resolution plan prepared for operator review.");
     } catch (error: any) {

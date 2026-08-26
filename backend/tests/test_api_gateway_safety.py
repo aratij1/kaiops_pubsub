@@ -1,4 +1,4 @@
-from api_gateway import SafetyAnalyzer
+import asyncio
 import importlib.util
 import json
 import sys
@@ -7,8 +7,9 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from api_gateway import SafetyAnalyzer
 from common.models import SafetyDecision
-from common.database import AuditLogRecord, HumanCorrectionRecord
+from common.database import AlertRecord, AuditLogRecord, HumanCorrectionRecord, IncidentProjectionRecord, IncidentRecord
 from ai_workbench_common.model_evaluation import build_quality_evaluation
 from api_gateway.auth_policy import route_auth_rule
 from pydantic import ValidationError
@@ -53,6 +54,29 @@ def test_gateway_exposes_guarded_evaluation_artifact_routes() -> None:
     assert ("GET", "/evaluations") in routes
     assert ("GET", "/evaluations/{evaluation_id}") in routes
     assert ("POST", "/evaluations/autonomy/assess") in routes
+
+
+@pytest.mark.asyncio
+async def test_gateway_audit_worker_persists_queued_telemetry(monkeypatch) -> None:
+    module = load_api_gateway_app_module()
+    persisted = []
+
+    async def persist_stub(_app, event):
+        persisted.append(event)
+
+    monkeypatch.setattr(module, "_persist_gateway_audit_event", persist_stub)
+    module.app.state.gateway_audit_queue = asyncio.Queue(maxsize=2)
+    event = SimpleNamespace(trace_id="trace-audit")
+    task = asyncio.create_task(module._gateway_audit_worker(module.app))
+    try:
+        module._queue_gateway_audit_event(module.app, event)
+        await asyncio.wait_for(module.app.state.gateway_audit_queue.join(), timeout=1)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert persisted == [event]
 
 
 @pytest.mark.asyncio
@@ -278,8 +302,186 @@ def test_gateway_operational_auth_policy_marks_admin_routes() -> None:
     assert route_auth_rule("GET", "/approval/capacity") == {"Administrator"}
     assert route_auth_rule("POST", "/approval/auto-assign") == {"Administrator"}
     assert route_auth_rule("POST", "/incidents/incident-1/manual-close") == {"Administrator", "L3 Engineer"}
+    assert route_auth_rule("POST", "/analysis/context/collect") is None
+    assert route_auth_rule("POST", "/analysis/resolution/resolve") is None
+    assert route_auth_rule("POST", "/analysis/alerts/alert-1/regenerate") is None
     assert route_auth_rule("GET", "/events/operations") is None
     assert route_auth_rule("POST", "/api/v1/alerts/prometheus") is False
+
+
+@pytest.mark.asyncio
+async def test_analysis_context_proxy_owns_tenant_identity(monkeypatch) -> None:
+    module = load_api_gateway_app_module()
+    captured = {}
+
+    async def guarded_proxy_stub(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(module, "guarded_proxy", guarded_proxy_stub)
+    await module.collect_analysis_context(
+        SimpleNamespace(),
+        payload={
+            "tenant_id": "tenant-b",
+            "alert": {"id": "alert-1", "tenant_id": "tenant-b"},
+            "incident": {"id": "incident-1", "tenant_id": "tenant-b"},
+        },
+        publish_events=False,
+        x_trace_id=None,
+        tenant_id="tenant-a",
+    )
+
+    assert captured["path"] == "/collect"
+    assert captured["params"] == {"publish_events": "false"}
+    assert captured["payload"]["tenant_id"] == "tenant-a"
+    assert captured["payload"]["alert"]["tenant_id"] == "tenant-a"
+    assert captured["payload"]["incident"]["tenant_id"] == "tenant-a"
+    assert captured["timeout_seconds"] == 190.0
+
+
+@pytest.mark.asyncio
+async def test_analysis_resolution_proxy_owns_context_tenant(monkeypatch) -> None:
+    module = load_api_gateway_app_module()
+    captured = {}
+
+    async def guarded_proxy_stub(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(module, "guarded_proxy", guarded_proxy_stub)
+    await module.resolve_analysis_context(
+        SimpleNamespace(),
+        payload={"tenant_id": "tenant-b", "alert": {"tenant_id": "tenant-b"}},
+        publish_events=True,
+        x_trace_id=None,
+        tenant_id="tenant-a",
+    )
+
+    assert captured["path"] == "/resolve"
+    assert captured["params"] == {"publish_events": "true"}
+    assert captured["payload"]["tenant_id"] == "tenant-a"
+    assert captured["payload"]["alert"]["tenant_id"] == "tenant-a"
+
+
+@pytest.mark.asyncio
+async def test_analysis_regeneration_queues_one_tenant_scoped_command(monkeypatch, sqlite_session_factory) -> None:
+    module = load_api_gateway_app_module()
+    alert_uuid = uuid4()
+    incident_uuid = uuid4()
+    previous_recommendation_uuid = uuid4()
+    alert_id = str(alert_uuid)
+    incident_id = str(incident_uuid)
+    previous_recommendation_id = str(previous_recommendation_uuid)
+    captured: dict = {}
+
+    async with sqlite_session_factory() as session:
+        session.add(AlertRecord(
+            id=alert_uuid, tenant_id="tenant-a", source="prometheus", name="HighRequestLatency",
+            service="api-gateway", environment="prod", severity="critical",
+            payload={"description": "p95 request latency exceeded the SLO"},
+        ))
+        session.add(IncidentRecord(
+            id=incident_uuid, tenant_id="tenant-a", service="api-gateway", environment="prod",
+            severity="critical", status="investigating", title="API latency incident", payload={},
+        ))
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_uuid, alert_id=alert_uuid, recommendation_id=previous_recommendation_uuid,
+            tenant_id="tenant-a", service="api-gateway", environment="prod", severity="critical",
+            status="investigating", requires_approval=True, policy_version="policy-v9",
+            projection_payload={"decision": {"requires_approval": True, "policy_version": "policy-v9"}},
+        ))
+        await session.commit()
+
+    async def publish_stub(**kwargs):
+        captured["command"] = kwargs
+        return "published"
+
+    monkeypatch.setattr(module, "_publish_analysis_regeneration_command", publish_stub)
+    monkeypatch.setattr(module.app.state, "session_factory", sqlite_session_factory, raising=False)
+
+    result = await module.regenerate_alert_analysis(
+        alert_id,
+        SimpleNamespace(app=module.app),
+        payload={"mode": "fresh"},
+        x_trace_id="trace-regenerate",
+        tenant_id="tenant-a",
+    )
+
+    assert captured["command"]["tenant_id"] == "tenant-a"
+    assert captured["command"]["alert"].tenant_id == "tenant-a"
+    assert captured["command"]["incident"].tenant_id == "tenant-a"
+    assert captured["command"]["decision"]["context_strategy"] == "realtime"
+    assert captured["command"]["decision"]["force_full_analysis"] is True
+    assert result["status"] == "accepted"
+    assert result["previous_recommendation_id"] == previous_recommendation_id
+    assert result["expected_recommendation_id"] == str(module._analysis_recommendation_id(
+        incident_id=incident_uuid, request_id=module.UUID(result["request_id"]),
+    ))
+
+
+@pytest.mark.asyncio
+async def test_analysis_regeneration_rejects_alert_without_persisted_incident(monkeypatch, sqlite_session_factory) -> None:
+    module = load_api_gateway_app_module()
+    alert_uuid = uuid4()
+    async with sqlite_session_factory() as session:
+        session.add(AlertRecord(
+            id=alert_uuid, tenant_id="tenant-a", source="prometheus", name="UnlinkedAlert",
+            service="api-gateway", environment="prod", severity="warning",
+            payload={"description": "not correlated yet"},
+        ))
+        await session.commit()
+    monkeypatch.setattr(module.app.state, "session_factory", sqlite_session_factory, raising=False)
+    with pytest.raises(module.HTTPException) as exc_info:
+        await module.regenerate_alert_analysis(
+            str(alert_uuid),
+            SimpleNamespace(app=module.app),
+            payload={"mode": "smart"},
+            x_trace_id=None,
+            tenant_id="tenant-a",
+        )
+
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_analysis_request_status_is_lightweight_and_tenant_scoped(monkeypatch, sqlite_session_factory) -> None:
+    module = load_api_gateway_app_module()
+    request_uuid = uuid4()
+    incident_uuid = uuid4()
+    recommendation_uuid = module._analysis_recommendation_id(
+        incident_id=incident_uuid,
+        request_id=request_uuid,
+    )
+    monkeypatch.setattr(module.app.state, "session_factory", sqlite_session_factory, raising=False)
+    request = SimpleNamespace(app=module.app)
+
+    running = await module.get_analysis_request_status(
+        str(request_uuid), str(incident_uuid), request, tenant_id="tenant-a",
+    )
+    assert running == {
+        "request_id": str(request_uuid),
+        "incident_id": str(incident_uuid),
+        "recommendation_id": str(recommendation_uuid),
+        "status": "running",
+        "ready": False,
+    }
+
+    async with sqlite_session_factory() as session:
+        session.add(AuditLogRecord(
+            id=recommendation_uuid, tenant_id="tenant-a", actor="resolution-agent",
+            action="recommendation.generated", resource_type="incident",
+            resource_id=str(incident_uuid), payload={},
+        ))
+        await session.commit()
+
+    complete = await module.get_analysis_request_status(
+        str(request_uuid), str(incident_uuid), request, tenant_id="tenant-a",
+    )
+    hidden = await module.get_analysis_request_status(
+        str(request_uuid), str(incident_uuid), request, tenant_id="tenant-b",
+    )
+    assert complete["status"] == "complete" and complete["ready"] is True
+    assert hidden["status"] == "running" and hidden["ready"] is False
 
 
 @pytest.mark.asyncio

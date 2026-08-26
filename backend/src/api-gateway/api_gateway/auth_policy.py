@@ -28,6 +28,7 @@ AUTHENTICATED_WRITE_RULES: tuple[tuple[set[str] | None, str, set[str] | None], .
     (None, "/approval/auto-assign", {ADMIN_ROLE}),
     ({"GET"}, "/approval/incident", None),
     ({"POST"}, "/incidents", {ADMIN_ROLE, SystemRole.L3_ENGINEER.value}),
+    ({"POST"}, "/analysis", None),
     ({"POST", "PUT", "DELETE", "PATCH"}, "/approval", HITL_COMPATIBILITY_ROLES),
     ({"POST", "PUT", "DELETE", "PATCH"}, "/remediation", HITL_COMPATIBILITY_ROLES),
     ({"POST"}, "/copilot", None),

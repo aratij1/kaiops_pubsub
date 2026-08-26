@@ -91,7 +91,11 @@ def _resolution_reuse_threshold() -> float:
 
 def _deterministic_recommendation_id(context: Context) -> UUID:
     metadata = context.metadata if isinstance(context.metadata, dict) else {}
-    identity = metadata.get("context_fingerprint") or context.alert.id
+    # A manual regeneration is a distinct governed analysis generation even
+    # when the underlying evidence fingerprint is unchanged. Without this
+    # request identity, polling cannot distinguish the new result from the
+    # recommendation that existed before the operator clicked regenerate.
+    identity = metadata.get("analysis_request_id") or metadata.get("context_fingerprint") or context.alert.id
     return uuid5(NAMESPACE_URL, f"kaims:recommendation:{context.incident_id}:{identity}:v2")
 
 
