@@ -5,6 +5,7 @@ import { useRouteRuntime } from "../../app/routeRuntime";
 import { OperationsWorkflowNav } from "../../components/operations/OperationsWorkflowNav";
 import { decisionReadiness } from "../../domain/incidentStatus";
 import { approvalDecisionFields } from "../../domain/approvalDecisionPacket";
+import { fetchJson } from "../../appHelpers.jsx";
 import "./ApprovalsRoute.css";
 
 type Packet = Record<string, any>;
@@ -24,13 +25,14 @@ export default function ApprovalsRoute() {
   const [evidenceRequest, setEvidenceRequest] = useState("");
   const [showEvidenceRequest, setShowEvidenceRequest] = useState(false);
   const [modifyPlan, setModifyPlan] = useState({ open: false, capability: "", target: "", reason: "" });
+  const [analysis, setAnalysis] = useState({ loading: false, message: "", error: "" });
   const selected = approvals.rows.find((row) => approvals.incidentId(row) === approvals.selectedIncidentId);
   const packet = useMemo(() => {
     const context = objectValue(approvals.contextPayload);
     const row = ({ ...(selected || {}), ...context }) as Packet;
     const projection = objectValue(row.projection_payload);
     const event = objectValue(projection.event_payload);
-    const recommendation = objectValue(projection.recommendation, event.recommendation, row.recommendation);
+    const recommendation = objectValue(row.recommendation, projection.recommendation, event.recommendation);
     const metadata = objectValue(recommendation.metadata);
     const plan = objectValue(metadata.execution_plan, projection.execution_plan, event.execution_plan);
     const quality = objectValue(metadata.evidence_quality, metadata.readiness, projection.evidence_quality);
@@ -54,7 +56,33 @@ export default function ApprovalsRoute() {
     });
     return { row, recommendation, plan, quality, policy, readiness, readinessReceipt, backendEligibilityProven, decision: approvalDecisionFields(row) };
   }, [selected, approvals.contextPayload]);
+  const governedPlanAvailable = Boolean(String(packet.plan.plan_id || "").trim() && /^sha256:[0-9a-f]{64}$/i.test(String(packet.plan.plan_fingerprint || "").trim()));
   const approvalDisabled = !approvals.selectedRecommendationId || approvals.actionLoading || !packet.readiness.eligible || !packet.backendEligibilityProven;
+
+  async function generateGovernedPlan() {
+    const alertId = String(selected?.alert_id || packet.row.alert_id || "").trim();
+    if (!alertId || analysis.loading) return;
+    setAnalysis({ loading: true, message: "Collecting fresh evidence and compiling a governed execution plan…", error: "" });
+    try {
+      const requestOptions = { headers: { "Content-Type": "application/json", ...(session.accessToken ? { Authorization: `Bearer ${session.accessToken}` } : {}) }, timeoutMs: 30000, maxAttempts: 1 };
+      const command = await fetchJson(`/api-gateway/analysis/alerts/${encodeURIComponent(alertId)}/regenerate`, { ...requestOptions, method: "POST", body: JSON.stringify({ mode: "fresh" }) }) as Packet;
+      const requestId = String(command?.request_id || "").trim();
+      const incidentId = String(command?.incident_id || approvals.selectedIncidentId || "").trim();
+      const expectedRecommendationId = String(command?.expected_recommendation_id || "").trim();
+      let ready = false;
+      for (let attempt = 0; attempt < 100 && requestId && incidentId; attempt += 1) {
+        const status = await fetchJson(`/api-gateway/analysis/requests/${encodeURIComponent(requestId)}/status?incident_id=${encodeURIComponent(incidentId)}`, requestOptions).catch(() => null) as Packet | null;
+        ready = status?.ready === true && (!expectedRecommendationId || String(status?.recommendation_id || "").trim() === expectedRecommendationId);
+        if (ready) break;
+        await new Promise((resolve) => window.setTimeout(resolve, Number(command?.poll_after_ms || 3000)));
+      }
+      approvals.refresh();
+      approvals.sync();
+      setAnalysis({ loading: false, message: ready ? "Fresh analysis completed. The signed decision packet is being refreshed." : "Analysis is still running. You can leave this page and refresh the packet later.", error: "" });
+    } catch (error) {
+      setAnalysis({ loading: false, message: "", error: String((error as Error)?.message || "Unable to generate a governed execution plan.") });
+    }
+  }
 
   function review(row: any) {
     approvals.select(row);
@@ -71,7 +99,9 @@ export default function ApprovalsRoute() {
       <div className="approval-card-list">{approvals.rows.map((row, index) => { const incidentId = approvals.incidentId(row); return <button type="button" className="approval-ticket" key={incidentId || index} onClick={() => review(row)}><span><b>{row.service || "Service not recorded"}</b><small>{row.environment || "Environment not recorded"}</small></span><span className={`pill status-${String(row.status || "awaiting_approval").toLowerCase()}`}>{String(row.status || "Awaiting approval").replaceAll("_", " ")}</span><span><small>Risk</small><b>{row.risk_tier || row.severity || "Not assessed"}</b></span><span><small>Incident</small><b>{incidentId || "Identifier unavailable"}</b></span><strong>Review packet →</strong></button>; })}{!approvals.rows.length && !approvals.contextLoading ? <div className="empty-state"><CheckCircle2 aria-hidden="true" /><strong>No approvals need your decision</strong><p>Refresh the queue or return to Incident Queue.</p></div> : null}</div>
     </article> : <article className="panel approval-review">
       <div className="panel-head"><div><span className="eyebrow">IMMUTABLE DECISION PACKET</span><h3>{textValue(packet.row.title, packet.row.service, "Incident review")}</h3><p>{textValue(packet.row.service)} · {textValue(packet.row.environment)} · {textValue(packet.row.severity, packet.row.risk_tier)} risk</p></div><button className="button-secondary" type="button" onClick={() => setView("queue")}>Back to queue</button></div>
-      <section className={`approval-readiness status-${packet.backendEligibilityProven ? packet.readiness.state : "blocked"}`} aria-live="polite">{packet.backendEligibilityProven ? <ShieldCheck aria-hidden="true" /> : <AlertTriangle aria-hidden="true" />}<div><strong>{packet.backendEligibilityProven ? packet.readiness.label : "Signed backend readiness required"}</strong>{packet.readiness.missing.length ? <p>Missing: {packet.readiness.missing.join(", ")}.</p> : packet.backendEligibilityProven ? <p>Backend decision {String(packet.readinessReceipt.decision_id)} proves the required controls are present.</p> : <p>Local UI fields are advisory and cannot authorize execution.</p>}</div></section>
+      <section className={`approval-readiness status-${packet.backendEligibilityProven ? packet.readiness.state : "blocked"}`} aria-live="polite">{packet.backendEligibilityProven ? <ShieldCheck aria-hidden="true" /> : <AlertTriangle aria-hidden="true" />}<div><strong>{!governedPlanAvailable ? "Fresh governed plan required" : packet.backendEligibilityProven ? packet.readiness.label : "Signed backend readiness required"}</strong>{!governedPlanAvailable ? <p>This legacy recommendation has no current immutable plan identity and cannot be approved safely.</p> : packet.readiness.missing.length ? <p>Missing: {packet.readiness.missing.join(", ")}.</p> : packet.backendEligibilityProven ? <p>Backend decision {String(packet.readinessReceipt.decision_id)} proves the required controls are present.</p> : <p>Local UI fields are advisory and cannot authorize execution.</p>}</div>{!governedPlanAvailable ? <button className="button-primary" type="button" onClick={generateGovernedPlan} disabled={analysis.loading || !String(selected?.alert_id || packet.row.alert_id || "").trim()}>{analysis.loading ? "Generating plan…" : "Generate governed plan"}</button> : null}</section>
+      {analysis.message ? <p className="status-message" role="status">{analysis.message}</p> : null}
+      {analysis.error ? <p className="error" role="alert">{analysis.error}</p> : null}
       <div className="approval-review-summary"><div><small>Incident</small><strong>{approvals.selectedIncidentId || "Unavailable"}</strong></div><div><small>Recommendation</small><strong>{approvals.selectedRecommendationId || "Unavailable"}</strong></div><div><small>Reviewer</small><strong>{session.username}</strong></div><div><small>Plan</small><strong>{textValue(packet.plan.plan_id)}</strong></div><div><small>Plan expiry</small><strong>{textValue(packet.plan.expiry)}</strong></div><div><small>Fingerprint</small><strong>{textValue(packet.plan.plan_fingerprint)}</strong></div></div>
       <section className="approval-decision-story" aria-label="Approval decision context">
         <article><span>What happened</span><p>{packet.decision.whatHappened}</p></article>

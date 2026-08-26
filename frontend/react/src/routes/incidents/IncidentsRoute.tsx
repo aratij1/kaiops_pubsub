@@ -417,6 +417,7 @@ export default function IncidentsRoute() {
   const [inboxView, setInboxView] = useState<InboxView>("all");
   const [inspector, setInspector] = useState<{ incidentId: string; stage: string } | null>(null);
   const [closure, setClosure] = useState({ incidentId: "", comment: "", loading: false, message: "", error: "" });
+  const inboxAlertRows = alerts.inboxRows || alerts.rows;
   const closeIncident = async (row: IncidentRow) => {
     const incidentId = String(row.incident_id || row.id || "").trim();
     const comment = closure.comment.trim();
@@ -432,22 +433,22 @@ export default function IncidentsRoute() {
     } catch (error) { setClosure((current) => ({ ...current, loading: false, error: String((error as Error).message || error) })); }
   };
   const groupedIncidents = useMemo(() => {
-    const alertsById = new Map(alerts.rows.map((alert) => [String(alert.id || (alert as typeof alert & { alert_id?: string }).alert_id || ""), alert]));
+    const alertsById = new Map(inboxAlertRows.map((alert) => [String(alert.id || (alert as typeof alert & { alert_id?: string }).alert_id || ""), alert]));
     return groupIncidentsByJira(incidents.rows.map((row) => ({
       ...row,
       source_alert: row.source_alert || alertsById.get(String(row.alert_id || "")),
     }))).sort((left, right) => attentionScore(right) - attentionScore(left));
-  }, [incidents.rows, alerts.rows]);
+  }, [incidents.rows, inboxAlertRows]);
   const filteredIncidents = useMemo(() => groupedIncidents.filter((row) => belongsToInboxView(row, inboxView)), [groupedIncidents, inboxView]);
   useEffect(() => window.localStorage.setItem("kaiops.incident-presentation", presentation), [presentation]);
   useEffect(() => setPage(1), [incidents.filters.risk_tier, incidents.filters.execution_mode, incidents.filters.status, incidents.filters.service, inboxView, recordType]);
   const incidentAlertIds = useMemo(() => new Set(incidents.rows.map((row) => String(row.alert_id || "")).filter(Boolean)), [incidents.rows]);
-  const unlinkedAlerts = useMemo(() => alerts.rows.filter((alert) => {
+  const unlinkedAlerts = useMemo(() => inboxAlertRows.filter((alert) => {
     const alertId = String((alert as typeof alert & { alert_id?: string | number }).alert_id || alert.id || "");
     return !alertLinkedIncidentId(alert) && (!alertId || !incidentAlertIds.has(alertId));
-  }), [alerts.rows, incidentAlertIds]);
+  }), [inboxAlertRows, incidentAlertIds]);
   const filteredAlerts = useMemo(() => {
-    const candidates = recordType === "alerts" ? alerts.rows : unlinkedAlerts;
+    const candidates = recordType === "alerts" ? inboxAlertRows : unlinkedAlerts;
     const serviceQuery = incidents.filters.service.trim().toLowerCase();
     return candidates.filter((alert) => {
       if (!alertBelongsToInboxView(alert, inboxView)) return false;
@@ -455,7 +456,7 @@ export default function IncidentsRoute() {
       return [alert.service, alert.application, alert.project_name, alert.name, alert.alert_name]
         .some((value) => String(value || "").toLowerCase().includes(serviceQuery));
     });
-  }, [alerts.rows, incidents.filters.service, inboxView, recordType, unlinkedAlerts]);
+  }, [inboxAlertRows, incidents.filters.service, inboxView, recordType, unlinkedAlerts]);
   const unifiedRecords = useMemo(() => [
     ...filteredIncidents.map((row) => ({ kind: "incident" as const, score: attentionScore(row), row })),
     ...filteredAlerts.map((row) => ({ kind: "alert" as const, score: alertAttentionScore(row), row })),
@@ -487,7 +488,7 @@ export default function IncidentsRoute() {
   const viewCount = (view: InboxView) => {
     const incidentCount = groupedIncidents.filter((row) => belongsToInboxView(row, view)).length;
     const alertCount = unlinkedAlerts.filter((row) => alertBelongsToInboxView(row, view)).length;
-    return recordType === "incidents" ? incidentCount : recordType === "alerts" ? alerts.rows.filter((row) => alertBelongsToInboxView(row, view)).length : incidentCount + alertCount;
+    return recordType === "incidents" ? incidentCount : recordType === "alerts" ? inboxAlertRows.filter((row) => alertBelongsToInboxView(row, view)).length : incidentCount + alertCount;
   };
   const showUnified = recordType === "all";
   const showAlerts = recordType === "alerts";
@@ -505,7 +506,7 @@ export default function IncidentsRoute() {
     <div className="inbox-source-tabs" role="tablist" aria-label="Inbox source">
       <button type="button" role="tab" aria-selected={showUnified} className={showUnified ? "active" : ""} onClick={() => { setRecordType("all"); setPresentation("summary"); setPage(1); }}><span>All activity</span><strong>{groupedIncidents.length + unlinkedAlerts.length}</strong><small>Incidents + unlinked signals</small></button>
       <button type="button" role="tab" aria-selected={showIncidents} className={showIncidents ? "active" : ""} onClick={() => { setRecordType("incidents"); setPage(1); }}><span>Incidents</span><strong>{groupedIncidents.length}</strong><small>Correlated operational work</small></button>
-      <button type="button" role="tab" aria-selected={showAlerts} className={showAlerts ? "active" : ""} onClick={() => { setRecordType("alerts"); setPage(1); }}><span>Signals</span><strong>{alerts.rows.length}</strong><small>Raw intake and outcomes</small></button>
+      <button type="button" role="tab" aria-selected={showAlerts} className={showAlerts ? "active" : ""} onClick={() => { setRecordType("alerts"); setPage(1); }}><span>Signals</span><strong>{inboxAlertRows.length}</strong><small>Raw intake and outcomes</small></button>
     </div>
     <div className={`compact-filter-bar inbox-filter-bar ${showUnified ? "is-unified" : showAlerts ? "is-signals" : ""}`}>
       {showIncidents ? <>{select("Risk", "risk_tier", ["all", "high", "medium", "low"])}{select("Status", "status", ["all", "open", "investigating", "awaiting_approval", "remediating", "validating", "closed", "failed"])}</> : null}

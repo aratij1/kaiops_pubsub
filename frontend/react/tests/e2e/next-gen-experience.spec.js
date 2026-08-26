@@ -6,6 +6,7 @@ const RECOMMENDATION_ID = "22222222-2222-4222-8222-222222222222";
 const APPLICATION_ID = "33333333-3333-4333-8333-333333333333";
 const PLAN_ID = "44444444-4444-4444-8444-444444444444";
 const PLAN_FINGERPRINT = `sha256:${"a".repeat(64)}`;
+const ANALYSIS_REQUEST_ID = "88888888-8888-4888-8888-888888888888";
 
 const json = (payload, status = 200) => ({
   status,
@@ -84,6 +85,7 @@ function incident(overrides = {}) {
 
 async function installScenario(page, options = {}) {
   let currentIncident = options.incident || incident();
+  let governedPlanReady = options.approvalPlan !== false;
   const approvalReadiness = options.approvalReadiness || {
     state: "execution_eligible",
     missing: [],
@@ -149,17 +151,22 @@ async function installScenario(page, options = {}) {
       status: currentIncident.status,
       recommendation: {
         id: RECOMMENDATION_ID,
-        metadata: {
+        metadata: governedPlanReady ? {
           execution_plan: {
             tenant_id: "default",
             incident_id: INCIDENT_ID,
             plan_id: PLAN_ID,
             plan_fingerprint: PLAN_FINGERPRINT,
           },
-        },
+        } : {},
       },
       approval_readiness: approvalReadiness,
     } }));
+    if (path === `/analysis/alerts/${ALERT_ID}/regenerate` && method === "POST") {
+      governedPlanReady = true;
+      return route.fulfill(json({ request_id: ANALYSIS_REQUEST_ID, status: "accepted", delivery: "published", alert_id: ALERT_ID, incident_id: INCIDENT_ID, expected_recommendation_id: RECOMMENDATION_ID, analysis_mode: "fresh", context_strategy: "realtime", poll_after_ms: 1 }));
+    }
+    if (path === `/analysis/requests/${ANALYSIS_REQUEST_ID}/status`) return route.fulfill(json({ request_id: ANALYSIS_REQUEST_ID, incident_id: INCIDENT_ID, recommendation_id: RECOMMENDATION_ID, status: "complete", ready: true }));
     if (path === "/approval/approve" && method === "POST") {
       const body = route.request().postDataJSON();
       if (body.plan_id !== PLAN_ID || body.plan_fingerprint !== PLAN_FINGERPRINT) {
@@ -248,6 +255,37 @@ test("signal to RCA to approval to canary validation and closure remains evidenc
   await expect(page.locator(".ic-validation")).toContainText("Recovery verified");
   await expect(page.locator(".ic-validation")).toContainText("12.4%");
   await expect(page.locator(".ic-validation")).toContainText("0.8%");
+});
+
+test("unified inbox retains KaiMS signals hidden by Live Alerts presentation filters", async ({ page }) => {
+  const now = new Date().toISOString();
+  await page.addInitScript(() => window.localStorage.setItem("kaiops.ui.preferences.v1", JSON.stringify({
+    applicationToMonitor: "KaiOps",
+    ingestionStreamSection: "active",
+    ingestionStreamFilters: { timeRange: "all", severity: "info", application: "selected", environment: "all" },
+  })));
+  await installScenario(page, { alerts: [{
+    id: "77777777-7777-4777-8777-777777777777", alert_id: "77777777-7777-4777-8777-777777777777",
+    name: "KaiMSFreshSignal", service: "kaims-api", application: "KaiOps", project_name: "KaiOps",
+    environment: "production", severity: "critical", status: "active", incident_disposition: "unique",
+    created_at: now, received_at: now,
+  }] });
+  await signIn(page, "/alerts");
+  await expect(page.getByText("No alerts match this view")).toBeVisible();
+  await page.locator(".operations-workflow-nav button").filter({ hasText: "Unified Inbox" }).click();
+  await expect(page.locator(".unified-inbox-card.is-signal")).toContainText("KaiMSFreshSignal");
+});
+
+test("legacy approval can generate a fresh governed plan before approval", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.addInitScript(() => window.localStorage.setItem("kaiops.ui.preferences.v1", JSON.stringify({ applicationToMonitor: "KaiOps" })));
+  await installScenario(page, { approvalPlan: false, approvalReadiness: { state: "blocked", missing: ["valid_plan"], decision_id: "legacy-plan", signature: "hmac-sha256:legacy" } });
+  await signIn(page, "/approvals");
+  await page.locator(".approval-ticket").click();
+  await expect(page.getByText("Fresh governed plan required")).toBeVisible();
+  await page.getByRole("button", { name: "Generate governed plan" }).click();
+  await expect(page.getByText(PLAN_ID, { exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator("body")).not.toContainText("Approval unavailable");
 });
 
 test("a newer live occurrence retains its canonical incident link into Unified Inbox", async ({ page }) => {
