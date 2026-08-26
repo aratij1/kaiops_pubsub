@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from common.models import Incident, RemediationAction, RemediationStatus, ResolutionReport
+from common.resolution_lifecycle import ResolutionState, create_lifecycle
 
 
 def load_closure_app_module():
@@ -149,6 +150,66 @@ def test_build_final_incident_payload_marks_failed_when_health_not_restored() ->
     # Metadata must survive a failed closure too, not just a successful one.
     _assert_existing_metadata_preserved(final_payload["metadata"], incident_payload["metadata"])
     assert final_payload["created_at"] == incident_payload["created_at"]
+
+
+def test_manual_closure_records_operator_disposition_without_recovery_claim() -> None:
+    module = load_closure_app_module()
+    incident_payload = _existing_incident_payload()
+    incident_payload["tenant_id"] = "tenant-a"
+    lifecycle = create_lifecycle(
+        tenant_id="tenant-a",
+        incident_id=INCIDENT_ID,
+        recommendation_id="22222222-2222-2222-2222-222222222222",
+        plan={"commands": ["restart"]},
+        state=ResolutionState.FAILED_RETRYABLE,
+    )
+    incident_payload["metadata"]["resolution_lifecycle"] = lifecycle
+    action = RemediationAction(
+        tenant_id="tenant-a",
+        incident_id=INCIDENT_ID,
+        action_type="manual_closure",
+        target="robot-shop-payment",
+        status=RemediationStatus.SKIPPED,
+        parameters={"manual_closure": True},
+    )
+    report = ResolutionReport(
+        tenant_id="tenant-a",
+        incident_id=INCIDENT_ID,
+        root_cause="Operator-directed closure",
+        impact="Evidence remained inconclusive.",
+        action_taken="Administrative closure without a recovery claim.",
+        validation={"operator_attested": True, "technical_recovery_verified": False},
+        alerts_cleared=False,
+        health_restored=False,
+        metadata={
+            "closure_kind": "manual",
+            "actor_id": "admin@example.com",
+            "actor_role": "Administrator",
+            "auth_jti": "jwt-123",
+            "technical_recovery_verified": False,
+        },
+    )
+
+    final_payload = module._build_final_incident_payload(
+        action=action,
+        report=report,
+        incident_payload=incident_payload,
+        recommendation={},
+        source_contract={},
+    )
+
+    final_lifecycle = final_payload["metadata"]["resolution_lifecycle"]
+    assert final_payload["status"] == "closed"
+    assert final_lifecycle["state"] == "closed"
+    assert final_lifecycle["last_transition_actor"] == "operator"
+    assert final_lifecycle["reason_code"] == "operator_administrative_closure"
+    assert final_lifecycle["validation"]["passed"] is False
+    assert final_lifecycle["validation"]["administrative_disposition"] is True
+    assert final_lifecycle["validation"]["operator_identity"] == {
+        "actor_id": "admin@example.com",
+        "actor_role": "Administrator",
+        "auth_jti": "jwt-123",
+    }
 
 
 def test_build_final_incident_payload_defaults_metadata_when_no_prior_incident() -> None:

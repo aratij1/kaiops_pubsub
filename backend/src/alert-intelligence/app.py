@@ -272,7 +272,10 @@ async def _reuse_correlated_jira(incident: Any) -> str | None:
     if not correlation_key:
         return None
     async with app.state.session_factory() as session:
-        jira_key = await IncidentRepository(session).find_open_jira_by_correlation_key(correlation_key)
+        jira_key = await IncidentRepository(session).find_open_jira_by_correlation_key(
+            correlation_key,
+            tenant_id=str(incident.tenant_id or "default"),
+        )
     if jira_key:
         incident.ticket_id = jira_key
         candidate["jira_key"] = jira_key
@@ -304,7 +307,10 @@ async def _merge_duplicate_into_canonical(alert: Alert, incident: Any) -> Any | 
     correlation_key = str(candidate.get("correlation_key") or alert.correlation_id or "").strip()
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
-        payload = await repo.find_open_incident_by_correlation_key(correlation_key)
+        payload = await repo.find_open_incident_by_correlation_key(
+            correlation_key,
+            tenant_id=str(alert.tenant_id or "default"),
+        )
         if not payload:
             return None
         # Persistence payloads intentionally include read-model annotations
@@ -372,7 +378,7 @@ def _build_alert_enriched_envelope(alert: Alert, incident: Any) -> dict[str, Any
             "parent_event_id": None,
         },
         scope={
-            "tenant_id": "default",
+            "tenant_id": str(alert.tenant_id or "default"),
             "service": str(alert.service or "unknown"),
             "environment": str(alert.environment or "prod"),
             "region": None,

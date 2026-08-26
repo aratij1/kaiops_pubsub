@@ -140,6 +140,10 @@ function lifecycleFor(row: IncidentRow): LifecycleStage[] {
   const route = resolutionPath(row);
   const contextReady = !["Context pending", "Historical context unavailable"].includes(contextState.label);
   const projection = row.projection_payload && typeof row.projection_payload === "object" ? row.projection_payload : {};
+  const lifecycleCandidate = row.resolution_lifecycle || projection.resolution_lifecycle || event.resolution_lifecycle;
+  const lifecycle = lifecycleCandidate && typeof lifecycleCandidate === "object" ? lifecycleCandidate as Record<string, any> : {};
+  const lifecycleValidation = lifecycle.validation && typeof lifecycle.validation === "object" ? lifecycle.validation as Record<string, any> : {};
+  const manualClosure = lifecycleValidation.administrative_disposition === true || String(row.status_reason || "").toLowerCase().includes("administratively closed");
   const latestEvent = String(row.latest_event_type || projection.event_type || "").toLowerCase();
   const noise = incidentNoise(row).noise;
   const deduplication = event.deduplication && typeof event.deduplication === "object" ? event.deduplication as Record<string, unknown> : {};
@@ -207,7 +211,10 @@ function lifecycleFor(row: IncidentRow): LifecycleStage[] {
       stages.push({ ...stage("resolve"), state: "failed", caption: "Remediation failed or was blocked" });
     }
   } else if (validated) {
-    if (route.id === "diagnostic") {
+    if (manualClosure) {
+      stages.push({ ...stage("resolve"), state: "stopped", caption: "Corrective execution not performed" });
+      stages.push({ ...stage("validate"), state: "complete", caption: "Administrative closure recorded" });
+    } else if (route.id === "diagnostic") {
       stages.push({ ...stage("resolve"), state: "reused", caption: "No corrective action required" });
       stages.push({ ...stage("validate"), state: "complete", caption: "Observation recorded and closed" });
     } else {
@@ -416,10 +423,11 @@ export default function IncidentsRoute() {
     if (comment.length < 10) { setClosure((current) => ({ ...current, error: "Enter at least 10 characters explaining why this incident can be closed." })); return; }
     setClosure((current) => ({ ...current, loading: true, error: "", message: "" }));
     try {
-      const response = await fetch(`/api-gateway/incidents/${encodeURIComponent(incidentId)}/manual-close`, { method: "POST", headers: { "Content-Type": "application/json", ...(session.accessToken ? { Authorization: `Bearer ${session.accessToken}` } : {}) }, body: JSON.stringify({ comment, closed_by: session.username || "operator" }) });
+      const response = await fetch(`/api-gateway/incidents/${encodeURIComponent(incidentId)}/manual-close`, { method: "POST", headers: { "Content-Type": "application/json", ...(session.accessToken ? { Authorization: `Bearer ${session.accessToken}` } : {}) }, body: JSON.stringify({ comment }) });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(String(payload?.detail?.message || payload?.detail || `Closure failed (${response.status}).`));
-      setClosure({ incidentId, comment: "", loading: false, error: "", message: payload?.jira?.transitioned ? "Incident closed and Jira updated." : "Incident closed; no linked Jira ticket required an update." });
+      const result = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+      setClosure({ incidentId, comment: "", loading: false, error: "", message: result?.jira?.transitioned ? "Incident closed and Jira updated." : "Incident closed; no linked Jira ticket required an update." });
       incidents.refresh();
     } catch (error) { setClosure((current) => ({ ...current, loading: false, error: String((error as Error).message || error) })); }
   };

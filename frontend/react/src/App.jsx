@@ -1342,7 +1342,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       incidentId: normalized,
     }));
     try {
-      const payload = await fetchJson(`/api-gateway/incidents/${normalized}/stage-completeness`);
+      const payload = await fetchJson(
+        `/api-gateway/incidents/${normalized}/stage-completeness`,
+        authenticatedOptions(),
+      );
       const stageData = payload?.data || payload;
       setSelectedStageCompleteness((prev) => {
         if (String(prev.incidentId || "") !== normalized) {
@@ -1772,7 +1775,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       if (String(currentFilters.service || "").trim()) {
         params.set("service", String(currentFilters.service).trim());
       }
-      const payload = await fetchJson(`/api-gateway/incidents/metadata?${params.toString()}`);
+      const payload = await fetchJson(
+        `/api-gateway/incidents/metadata?${params.toString()}`,
+        authenticatedOptions(),
+      );
       const data = unwrap(payload);
       const rows = data?.rows || [];
       const nextRows = Array.isArray(rows) ? rows : [];
@@ -1801,7 +1807,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     closedIncidentsRequestRef.current = true;
     setClosedIncidents((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/incidents/closed?limit=120", { timeoutMs: 12000 });
+      const payload = await fetchJson(
+        "/api-gateway/incidents/closed?limit=120",
+        authenticatedOptions({ timeoutMs: 12000 }),
+      );
       const data = unwrap(payload);
       const rows = Array.isArray(data?.rows) ? data.rows : [];
       if (rows.length) {
@@ -1810,9 +1819,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       }
 
       const [closedPayload, resolvedPayload, failedPayload] = await Promise.all([
-        fetchJson("/api-gateway/incidents/metadata?limit=120&status=closed", { timeoutMs: 10000, maxAttempts: 2 }),
-        fetchJson("/api-gateway/incidents/metadata?limit=120&status=resolved", { timeoutMs: 10000, maxAttempts: 2 }),
-        fetchJson("/api-gateway/incidents/metadata?limit=120&status=failed", { timeoutMs: 10000, maxAttempts: 2 }),
+        fetchJson("/api-gateway/incidents/metadata?limit=120&status=closed", authenticatedOptions({ timeoutMs: 10000, maxAttempts: 2 })),
+        fetchJson("/api-gateway/incidents/metadata?limit=120&status=resolved", authenticatedOptions({ timeoutMs: 10000, maxAttempts: 2 })),
+        fetchJson("/api-gateway/incidents/metadata?limit=120&status=failed", authenticatedOptions({ timeoutMs: 10000, maxAttempts: 2 })),
       ]);
       const closedRows = Array.isArray(unwrap(closedPayload)?.rows) ? unwrap(closedPayload).rows : [];
       const resolvedRows = Array.isArray(unwrap(resolvedPayload)?.rows) ? unwrap(resolvedPayload).rows : [];
@@ -1886,7 +1895,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         // Preserve the latest durable phase (dispatching, accepted, running,
         // verifying) so the UI reflects progress rather than a stale submit response.
         setRemediationExecutionState({ loading: true, result: actionPayload, error: "" });
-        const payload = await fetchJson(`/api-gateway/incidents/${encodeURIComponent(normalizedIncidentId)}/stage-completeness`);
+        const payload = await fetchJson(
+          `/api-gateway/incidents/${encodeURIComponent(normalizedIncidentId)}/stage-completeness`,
+          authenticatedOptions(),
+        );
         const data = unwrap(payload) || {};
         const status = String(data.status || "").trim().toLowerCase();
         if (["closed", "resolved", "failed"].includes(status)) {

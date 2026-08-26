@@ -955,13 +955,20 @@ services:
       CONTEXT_RESOLUTION_REUSE_ENABLED: ${CONTEXT_RESOLUTION_REUSE_ENABLED:-true}
       CONTEXT_RESOLUTION_REUSE_MIN_SCORE: ${CONTEXT_RESOLUTION_REUSE_MIN_SCORE:-0.70}
       RESOLUTION_MODEL_PAYLOAD_MAX_BYTES: ${RESOLUTION_MODEL_PAYLOAD_MAX_BYTES:-48000}
+      # Keep the model attempt inside the message-handler budget. The global
+      # defaults are intentionally broader for other services, but an RCA
+      # worker must still have time to persist deterministic fallback output
+      # and acknowledge the event after a provider timeout.
+      LLM_REQUEST_TIMEOUT_SECONDS: ${RESOLUTION_LLM_REQUEST_TIMEOUT_SECONDS:-45}
+      RABBITMQ_HANDLER_TIMEOUT_SECONDS: ${RESOLUTION_HANDLER_TIMEOUT_SECONDS:-180}
       MESSAGE_BUS_WORKER_COUNT: ${RESOLUTION_AGENT_WORKER_COUNT:-2}
       # RCA is the synchronous model call. Impact and remediation use the
       # evidence-aware deterministic path by default, avoiding two serialized
       # provider round trips; opt in only for investigations that need them.
-      RESOLUTION_DEEP_ANALYSIS_ENABLED: ${RESOLUTION_DEEP_ANALYSIS_ENABLED:-true}
+      RESOLUTION_DEEP_ANALYSIS_ENABLED: ${RESOLUTION_DEEP_ANALYSIS_ENABLED:-false}
       RESOLUTION_ITERATIVE_INVESTIGATION_ENABLED: ${RESOLUTION_ITERATIVE_INVESTIGATION_ENABLED:-true}
       RESOLUTION_INVESTIGATION_MAX_STEPS: ${RESOLUTION_INVESTIGATION_MAX_STEPS:-5}
+      RESOLUTION_INVESTIGATION_MAX_DURATION_SECONDS: ${RESOLUTION_INVESTIGATION_MAX_DURATION_SECONDS:-90}
       RESOLUTION_INVESTIGATION_MAX_EVIDENCE: ${RESOLUTION_INVESTIGATION_MAX_EVIDENCE:-40}
       RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD: ${RESOLUTION_INVESTIGATION_CONCLUSIVE_THRESHOLD:-0.85}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

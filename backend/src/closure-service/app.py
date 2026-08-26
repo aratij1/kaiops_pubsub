@@ -346,7 +346,7 @@ def _build_final_incident_payload(
         else transition_lifecycle(
             lifecycle,
             ResolutionState.CLOSED if closure_complete else ResolutionState.FAILED_RETRYABLE,
-            actor=LifecycleActor.CLOSURE,
+            actor=LifecycleActor.OPERATOR if manual_closure else LifecycleActor.CLOSURE,
             reason_code=(
                 "watch_only_policy_completed"
                 if diagnostic_closure
@@ -360,6 +360,15 @@ def _build_final_incident_payload(
                 "checks": report.validation,
                 "passed": bool(report.health_restored or diagnostic_closure),
                 "administrative_disposition": manual_closure,
+                "operator_identity": (
+                    {
+                        "actor_id": report.metadata.get("actor_id"),
+                        "actor_role": report.metadata.get("actor_role"),
+                        "auth_jti": report.metadata.get("auth_jti"),
+                    }
+                    if manual_closure
+                    else None
+                ),
             },
         )
     )

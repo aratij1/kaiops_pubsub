@@ -131,6 +131,9 @@ async function installScenario(page, options = {}) {
       return route.fulfill(json({ data: { rows: include ? [currentIncident] : [] } }));
     }
     if (path.startsWith("/incidents/closed")) return route.fulfill(json({ data: { rows: String(currentIncident.status).toLowerCase() === "recovered" ? [currentIncident] : [] } }));
+    if (path === `/incidents/${INCIDENT_ID}/manual-close` && method === "POST") {
+      return route.fulfill(json({ data: { status: "closed", closure_kind: "manual", technical_recovery_verified: false, jira: { transitioned: false } } }));
+    }
     if (path === `/approval/incident/${INCIDENT_ID}`) return route.fulfill(json({ data: { incident_id: INCIDENT_ID, recommendation_id: RECOMMENDATION_ID, status: currentIncident.status } }));
     if (path === "/approval/approve" && method === "POST") {
       currentIncident = incident({ status: "executing", approval_status: "approved", execution_mode: "human-approved" });
@@ -295,4 +298,23 @@ test("onboarding evidence drives readiness and activation without estimated capa
   await expect(page.getByLabel("Project ID")).toHaveValue("demo-project");
   await expect(page.getByRole("button", { name: "Add simulator connection" })).toBeEnabled();
   await expect(page.locator("body")).not.toContainText(/estimated/i);
+});
+
+test("manual closure sends only operator intent while identity remains server-derived", async ({ page }) => {
+  await installScenario(page);
+  await signIn(page, `/incidents?incident_id=${INCIDENT_ID}`);
+
+  await expect(page.getByRole("heading", { name: "Close incident with audit comment" })).toBeVisible();
+  const comment = "Evidence remains inconclusive; close administratively without a recovery claim.";
+  await page.getByLabel("Closure comment").fill(comment);
+  const requestPromise = page.waitForRequest((request) => (
+    request.method() === "POST"
+    && new URL(request.url()).pathname.endsWith(`/incidents/${INCIDENT_ID}/manual-close`)
+  ));
+  await page.getByRole("button", { name: "Close incident and update Jira" }).click();
+  const request = await requestPromise;
+
+  expect(request.postDataJSON()).toEqual({ comment });
+  expect(request.headers().authorization).toBe("Bearer admin-token");
+  await expect(page.getByText("Incident closed; no linked Jira ticket required an update.")).toBeVisible();
 });

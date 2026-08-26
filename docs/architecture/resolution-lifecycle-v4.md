@@ -23,10 +23,10 @@ Approval is valid only for that identity. Every execution attempt and closure re
 | `validating` | closure-service | Post-checks are running against the executed plan and target. | `recovered`, `failed_retryable`, `rolled_back` |
 | `recovered` | closure-service | Required recovery checks passed. | `closed` |
 | `rolled_back` | remediation-engine/closure-service | Compensation completed and must be validated. | `validating`, `failed_terminal` |
-| `failed_retryable` | owning service | Attempt failed without exhausting governed retry/rollback. | `ready_to_execute`, `executing`, `rolled_back`, `analyzing` |
-| `failed_terminal` | owning service | Manual intervention or escalation is required. | `analyzing` only through an explicit operator reopen action |
-| `rejected` | approval-service | The current plan was rejected. | `analyzing` |
-| `closed` | closure-service | The workflow is terminal and closure evidence is durable. `closure_kind=recovery` requires validated recovery; `closure_kind=diagnostic` records completed analysis without a recovery claim. | none |
+| `failed_retryable` | owning service | Attempt failed without exhausting governed retry/rollback. | `ready_to_execute`, `executing`, `rolled_back`, `analyzing`, or an operator-authorized administrative `closed` disposition |
+| `failed_terminal` | owning service | Manual intervention or escalation is required. | `analyzing` through an explicit operator reopen action, or an operator-authorized administrative `closed` disposition |
+| `rejected` | approval-service | The current plan was rejected. | `analyzing`, or an operator-authorized administrative `closed` disposition |
+| `closed` | closure-service | The workflow is terminal and closure evidence is durable. `closure_kind=recovery` requires validated recovery; `closure_kind=diagnostic` records completed analysis without a recovery claim; `closure_kind=manual` records an authorized administrative disposition without a recovery claim. | none |
 
 `policy-blocked` is an outcome reason, not a lifecycle state. It maps to `blocked_retryable` when human review or replanning is permitted, otherwise `failed_terminal`.
 
@@ -89,6 +89,13 @@ Mutating commands can supply both `expected_version` and the approved
 - A diagnostic closure may transition `diagnostic_only -> closed`, but must set
   `closure_kind=diagnostic`, `health_restored=false`, and
   `alerts_cleared=false`. It must never be counted as validated recovery.
+- An authenticated administrator or HITL approver may administratively close a
+  quiescent workflow. The transition actor must be `operator`, the report must
+  set `closure_kind=manual`, `health_restored=false`, and
+  `technical_recovery_verified=false`, and the actor ID, role, and auth token ID
+  must remain in the durable validation/audit envelope. Active `executing`,
+  `validating`, and `pending_stability` workflows cannot be administratively
+  closed until their in-flight work reaches a quiescent state.
 - On failed validation, emit `failed_retryable` or request rollback. Never close based only on executor exit code.
 - Persist the incident projection and broker event in one transaction through
   the resolution outbox. Broker delivery is retried with the same event ID.

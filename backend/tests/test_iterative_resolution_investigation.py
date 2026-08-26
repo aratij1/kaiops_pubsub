@@ -19,6 +19,12 @@ class FakeDiscoveryClient:
         return {"tool": tool_name, "evidence": self.results.get(tool_name, [])}
 
 
+def test_investigation_honors_configured_step_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESOLUTION_INVESTIGATION_MAX_STEPS", "5")
+
+    assert IterativeInvestigator(client=FakeDiscoveryClient({})).max_steps == 5
+
+
 def make_context(*, hypotheses: list[dict[str, Any]] | None = None) -> Context:
     alert = Alert(
         tenant_id="tenant-a",
