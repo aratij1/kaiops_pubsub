@@ -213,6 +213,7 @@ const NAVIGATION_ICONS = {
   closed: Archive,
   applications: Boxes,
   operationsCockpit: ChartNoAxesCombined,
+  platformOverview: Workflow,
   cloudConnections: Cloud,
   cloudResources: Server,
   serviceOnboarding: ClipboardCheck,
@@ -5091,7 +5092,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       }
       landingPadStreamRefreshInFlight.current = true;
       try {
-        await loadLandingPadRecent({ background: true });
+        await Promise.allSettled([
+          loadLandingPadRecent({ background: true }),
+          loadIncidentMetadata({ background: true, ignoreFilters: true }),
+        ]);
       } finally {
         landingPadStreamRefreshInFlight.current = false;
       }
@@ -5765,18 +5769,18 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const configuredProviders = selectedModelProviderRows.filter((provider) => provider.configured);
     const unhealthyProviders = configuredProviders.filter((provider) => !provider.healthy || provider.circuitOpen);
     const statusUnavailable = Boolean(modelProviderStatus.error) && !modelProviderStatus.data;
-    // A failed health lookup is not evidence that AI itself is degraded. Keep
-    // that transient condition in the control-plane diagnostics and reserve
-    // the global warning for a confirmed unhealthy configured provider.
     const degraded = ["degraded", "unavailable", "error", "failed", "unhealthy"].includes(explicitStatus)
-      || unhealthyProviders.length > 0;
+      || unhealthyProviders.length > 0
+      || statusUnavailable;
     const affectedProviders = unhealthyProviders.map((provider) => provider.name).join(", ");
     return {
       degraded,
-      loading: Boolean(modelProviderStatus.loading) || statusUnavailable,
+      loading: Boolean(modelProviderStatus.loading),
       message: affectedProviders
           ? `${affectedProviders} reported an unhealthy or open-circuit state. Deterministic monitoring remains active and execution stays governed by backend policy.`
-          : "",
+          : statusUnavailable
+            ? "Provider status is unavailable. AI investigation may be delayed; deterministic monitoring remains active and execution stays governed by backend policy."
+            : "",
     };
   }, [modelProviderStatus, selectedModelProviderRows]);
 
@@ -7722,6 +7726,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       || contextRoot?.incident?.tenant_id
       || selectedAlertWorkflow?.context?.tenant_id
       || selectedAlertRow?.tenant_id
+      || (authConfig.mode === "local" && authConfig.local_development_only ? "default" : "")
       || ""
     ).trim();
     if (!tenantId) {
@@ -8406,10 +8411,32 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         channels: ALERT_SOURCE_CHANNELS,
         preferLatestState: true,
       });
+    const incidentByAlertId = new Map();
+    (Array.isArray(incidentMetadata.rows) ? incidentMetadata.rows : []).forEach((incident) => {
+      const projection = incident?.projection_payload && typeof incident.projection_payload === "object" ? incident.projection_payload : {};
+      const eventPayload = projection?.event_payload && typeof projection.event_payload === "object" ? projection.event_payload : {};
+      [incident?.alert_id, projection?.alert_id, eventPayload?.alert_id]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+        .forEach((alertId) => incidentByAlertId.set(alertId, incident));
+    });
+    const enrichedRows = consolidatedRows.map((row) => {
+      const alertId = String(row?.alert_id || row?.id || "").trim();
+      const incident = incidentByAlertId.get(alertId);
+      if (!incident) return row;
+      return {
+        ...row,
+        incident_id: incident?.incident_id || incident?.id || row?.incident_id,
+        ticket_id: incident?.ticket_id || incident?.jira_key || row?.ticket_id,
+        jira_key: incident?.jira_key || incident?.ticket_id || row?.jira_key,
+        jira_url: incident?.jira_url || row?.jira_url,
+        incident_projection: incident,
+      };
+    });
     return capLatestAlertsPerSource(
-      ensureMinimumAlertsBySource(consolidatedRows, allStreamRows)
+      ensureMinimumAlertsBySource(enrichedRows, allStreamRows)
     );
-  }, [landingPadRecent.rows, alerts.rows]);
+  }, [landingPadRecent.rows, alerts.rows, incidentMetadata.rows]);
   // Live Stream is a project workspace: rows and all derived counts must stay
   // within the project selected in the global monitor selector.
   const scopedIngestionStreamRows = ingestionStreamRows;
@@ -8664,6 +8691,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     if (!isAuthenticated || canAccessDestination(currentRole, currentNavigationItem.id)) {
       return;
     }
+    skipNextActiveTabNavigationRef.current = true;
     setActiveTab("home");
     if (typeof onNavigatePath === "function") {
       onNavigatePath(`/?access=restricted&destination=${encodeURIComponent(currentNavigationItem.label)}`);
@@ -9959,7 +9987,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                   <h3>{group.label}</h3>
                   <div className="sidebar-sections">
                     {group.items.map((item) => {
-                      const SidebarIcon = NAVIGATION_ICONS[item.icon];
+                      const SidebarIcon = NAVIGATION_ICONS[item.icon] || Database;
                       return <button
                         key={`sidebar-${item.id}`}
                         type="button"
@@ -10147,6 +10175,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               routing: observedRouting,
               primaryTopic: onboardingForm.azure_service_bus_topic,
               application: applicationToMonitor,
+              providers: selectedModelProviderRows,
+              providersLoading: modelProviderStatus.loading,
+              providersError: modelProviderStatus.error || "",
+              refreshProviders: loadModelProviderStatus,
               refresh: () => Promise.allSettled([
                 loadGatewayRecent(),
                 selectedAlertId

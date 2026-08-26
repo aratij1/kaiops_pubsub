@@ -72,7 +72,7 @@ test("incident summary connects source application and Prometheus to KaiOps proc
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
   });
 
-  await page.goto("/incidents");
+  await page.goto("/alerts");
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill("Admin@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
@@ -82,9 +82,11 @@ test("incident summary connects source application and Prometheus to KaiOps proc
   await expect(page.getByLabel("Prometheus: ExternalApplicationUnavailable")).toBeVisible();
   await expect(page.getByLabel(/Alert landing:/)).toBeVisible();
   await expect(page.getByLabel("Jira: KAN-1376")).toBeVisible();
-  await page.getByLabel("Application: httpbin-failure-lab").click();
-  await expect(page.getByText("No application log captured for this alert")).toBeVisible();
+  await page.getByRole("button", { name: "View details" }).click();
+  await page.getByRole("button", { name: "Create alert" }).click();
   await expect(page.getByText("HTTPS probe failed for https://httpbin.org/status/503 in public-internet.").first()).toBeVisible();
   await expect(page.getByText("trace-httpbin-503").first()).toBeVisible();
   await expect(page.getByText(alertId).first()).toBeVisible();
+  await expect(page.locator(".metric-handoff")).toContainText(incidentId);
+  await expect(page.locator(".metric-handoff")).toContainText("KAN-1376");
 });

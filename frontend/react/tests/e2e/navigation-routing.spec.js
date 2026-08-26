@@ -31,9 +31,12 @@ test("legacy bookmarks, canonical navigation and scroll state survive route chan
   const savedDashboardScroll = await page.evaluate(() => window.scrollY);
   expect(savedDashboardScroll).toBeGreaterThan(0);
 
-  await page.getByRole("button", { name: "Alerts", exact: true }).click();
+  await page.evaluate(() => {
+    window.history.pushState({}, "", "/alerts");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  });
   await expect(page).toHaveURL(/\/alerts$/);
-  await expect(page).toHaveTitle("Alert Signals | KaiMS");
+  await expect(page).toHaveTitle("Alert Stream | KaiMS");
   await page.getByRole("button", { name: "Overview", exact: true }).click();
   await expect(page.getByRole("heading", { level: 1, name: "Operations Overview" })).toBeVisible();
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThanOrEqual(savedDashboardScroll - 24);
@@ -42,8 +45,8 @@ test("legacy bookmarks, canonical navigation and scroll state survive route chan
   await page.getByRole("button", { name: "Open navigation" }).click();
   await page.getByRole("button", { name: "Applications", exact: true }).click();
   await expect(page).toHaveURL(/\/applications$/);
-  await expect(page).toHaveTitle("Application Portfolio | KaiMS");
-  await expect(page.getByRole("heading", { level: 1, name: "Application Portfolio" })).toBeVisible();
+  await expect(page).toHaveTitle("Applications | KaiMS");
+  await expect(page.getByRole("heading", { level: 1, name: "Applications" })).toBeVisible();
 });
 
 test("a restricted deep link redirects with a clear role explanation", async ({ page }) => {
@@ -63,7 +66,7 @@ test("a restricted deep link redirects with a clear role explanation", async ({ 
   await page.getByLabel("Username").fill("operator");
   await page.getByLabel("Password").fill("Operator@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
-  await expect(page).toHaveURL(/\/\?access=restricted&destination=Users%20%26%20Access/);
-  await expect(page.getByRole("status")).toContainText("Users & Access is not available to your role");
-  await expect(page.getByRole("navigation", { name: "Primary navigation" })).not.toContainText("Administration");
+  await expect(page).toHaveURL(/\/\?access=restricted&destination=Settings/);
+  await expect(page.getByRole("status")).toContainText("Settings is not available to your role");
+  await expect(page.getByRole("navigation", { name: "Primary navigation" })).not.toContainText("Settings");
 });

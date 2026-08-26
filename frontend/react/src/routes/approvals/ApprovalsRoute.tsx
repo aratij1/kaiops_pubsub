@@ -62,7 +62,7 @@ export default function ApprovalsRoute() {
 
   return <section className="grid single-col approval-workspace">
     <OperationsWorkflowNav active="approvals" />
-    <article className="panel approval-hero"><div><span className="eyebrow">DECIDE</span><h2>Kai needs your decision</h2><p>Review evidence, risk, target, rollback, and immutable plan identity before authorizing change.</p></div><div className="approval-summary" aria-label="Approval queue summary"><div><strong>{approvals.rows.length}</strong><span>Awaiting review</span></div><div><strong>{session.username}</strong><span>Signed-in reviewer</span></div></div></article>
+    <article className="panel approval-hero"><div><span className="eyebrow">DECIDE</span><h2>My Approvals</h2><p>Kai needs your decision. Review evidence, risk, target, rollback, and immutable plan identity before authorizing change.</p></div><div className="approval-summary" aria-label="Approval queue summary"><div><strong>{approvals.rows.length}</strong><span>Awaiting review</span></div><div><strong>{session.username}</strong><span>Signed-in reviewer</span></div></div></article>
 
     {view === "queue" ? <article className="panel">
       <div className="panel-head"><div><h3>Assigned decision queue</h3><p>Choose one incident to open its complete decision packet.</p></div><button className="button-secondary" type="button" onClick={approvals.refresh}><RefreshCw size={16} aria-hidden="true" /> Refresh</button></div>

@@ -156,11 +156,36 @@ function workflowFacts(payload: any) {
   return { root, alert, incident, context, recommendation, metadata, report, evidence, timeline, ticket, duplicate };
 }
 
+function workflowWithIncidentProjection(row: AlertStreamRow | null, payload: any) {
+  if (!row) return payload;
+  const record = row as AlertStreamRow & Record<string, any>;
+  const existing = workflowFacts(payload);
+  const projection: Record<string, any> = record.incident_projection && typeof record.incident_projection === "object" ? record.incident_projection : {};
+  const projectionPayload: Record<string, any> = projection.projection_payload && typeof projection.projection_payload === "object" ? projection.projection_payload : {};
+  const eventPayload: Record<string, any> = projectionPayload.event_payload && typeof projectionPayload.event_payload === "object" ? projectionPayload.event_payload : {};
+  return {
+    data: {
+      ...existing.root,
+      alert: { ...record, ...existing.alert },
+      incident: {
+        ...projection,
+        ...existing.incident,
+        id: existing.incident.id || existing.incident.incident_id || record.incident_id || projection.incident_id || projection.id,
+        ticket_id: existing.ticket || record.ticket_id || record.jira_key || projection.ticket_id || projection.jira_key,
+      },
+      context: Object.keys(existing.context).length ? existing.context : projectionPayload.context || eventPayload.context || {},
+      recommendation: Object.keys(existing.recommendation).length ? existing.recommendation : projectionPayload.recommendation || {},
+      metadata: { ...projectionPayload, ...existing.metadata },
+      timeline: existing.timeline,
+    },
+  };
+}
+
 type AlertPriority = "action" | "watch" | "duplicate" | "noise";
 
 function classifyAlert(row: AlertStreamRow, workflowPayload: any): { kind: AlertPriority; label: string; reason: string; rank: number } {
   const record = row as AlertStreamRow & Record<string, any>;
-  const facts = workflowFacts(workflowPayload);
+  const facts = workflowFacts(workflowWithIncidentProjection(row, workflowPayload));
   const metadata = record.metadata && typeof record.metadata === "object" ? record.metadata : {};
   const noiseMetadata = metadata.noise && typeof metadata.noise === "object" ? metadata.noise : {};
   const disposition = String(record.incident_disposition || facts.alert.incident_disposition || facts.incident.incident_disposition || "").toLowerCase();
@@ -197,12 +222,15 @@ function metricTrace(row: AlertStreamRow | null) {
 function observedAlertStages(row: AlertStreamRow, workflowPayload: any) {
   const display = displayAlert(row);
   const trace = metricTrace(row)!;
-  const facts = workflowFacts(workflowPayload);
+  const facts = workflowFacts(workflowWithIncidentProjection(row, workflowPayload));
   const contextSource = String(facts.metadata.context_source || facts.context.context_source || "").toLowerCase();
-  const stages = [{ id: "source", label: "Source", Icon: RadioTower, detail: display.channel === "prometheus" ? trace.job : sourceChannelLabel(display.channel) }];
-  if (display.channel === "prometheus") stages.push({ id: "alert", label: "Prometheus alert", Icon: BellRing, detail: trace.alertName });
+  const stages = [
+    { id: "application", label: "Application", Icon: Database, detail: display.project },
+    { id: "signal", label: "Signal", Icon: Activity, detail: trace.target },
+    { id: "source", label: "Alert landing", Icon: RadioTower, detail: display.channel === "prometheus" ? trace.job : sourceChannelLabel(display.channel) },
+  ];
+  if (display.channel === "prometheus") stages.push({ id: "alert", label: "Prometheus", Icon: BellRing, detail: trace.alertName });
   else stages.push({ id: "alert", label: "Alert received", Icon: BellRing, detail: trace.alertName });
-  if (!workflowPayload) return stages;
   if (facts.alert.id || facts.root.alert_id || facts.timeline.some((item: any) => /normaliz/i.test(String(item?.stage || item?.event_type || "")))) stages.push({ id: "normalize", label: "Normalize", Icon: Braces, detail: facts.alert.service || display.service });
   if (facts.duplicate || facts.alert.incident_disposition || facts.incident.incident_disposition) stages.push({ id: "deduplicate", label: "Deduplicate", Icon: GitMerge, detail: facts.duplicate ? "Duplicate linked" : "Unique signal" });
   if (facts.incident.id || facts.incident.incident_id) stages.push({ id: "incident", label: "Incident", Icon: Activity, detail: facts.incident.id || facts.incident.incident_id });
@@ -227,7 +255,7 @@ function AlertFlowSummary({ row, workflow, selected, onInspect }: { row: AlertSt
       <span className={`alert-priority-badge is-${priority.kind}`} title={priority.reason}>{priority.label}</span>
     </header>
     <div className="live-alert-flow-path" aria-label={`${display.title} processing flow`}>
-      {stages.map(({ id, label, Icon, detail }, index) => <div className={id === "alert" ? "is-alert" : ""} key={id}>
+      {stages.map(({ id, label, Icon, detail }, index) => <div className={id === "alert" ? "is-alert" : ""} key={id} aria-label={`${label}: ${detail}`}>
         <span className="metric-trace-sequence">{String(index + 1).padStart(2, "0")}</span><i><Icon size={17} /></i><strong>{label}</strong><small title={detail}>{detail}</small>
       </div>)}
     </div>
@@ -284,7 +312,8 @@ export default function AlertsRoute() {
     labels: traceSource.labels || {},
     annotations: traceSource.annotations || {},
   };
-  const facts = workflowFacts(traceWorkflow.data);
+  const traceWorkflowData = workflowWithIncidentProjection(activeTraceAlert, traceWorkflow.data);
+  const facts = workflowFacts(traceWorkflowData);
   useEffect(() => {
     let active = true;
     const load = async () => {
@@ -451,11 +480,11 @@ export default function AlertsRoute() {
         {traceStage === "parse" ? <><dl><div><dt>Metric</dt><dd><code>{trace.metric}</code></dd></div><div><dt>Observed value</dt><dd>{String(trace.value)}</dd></div><div><dt>Parsed from</dt><dd>{traceFileName || "Canonical alert payload"}</dd></div><div><dt>Fields extracted</dt><dd>alert name, service, application, severity, status, source, timestamps, labels, and annotations</dd></div></dl><pre className="metric-parsed-extract">{JSON.stringify(traceExtract, null, 2)}</pre></> : null}
         {traceStage === "store" ? <dl><div><dt>Series identity</dt><dd><code>{trace.metric}{`{job="${trace.job}"}`}</code></dd></div><div><dt>Labels retained</dt><dd>{Object.keys(trace.labels).join(", ") || "Not recorded"}</dd></div></dl> : null}
         {traceStage === "rule" ? <dl><div><dt>Expression</dt><dd><code>{trace.expression}</code></dd></div><div><dt>Decision</dt><dd>The observed series satisfied the configured alert condition.</dd></div></dl> : null}
-        {traceStage === "alert" ? <dl><div><dt>Alert</dt><dd>{trace.alertName}</dd></div><div><dt>Severity / state</dt><dd>{trace.severity} / {trace.status}</dd></div><div><dt>First observed</dt><dd>{trace.started}</dd></div><div><dt>Description</dt><dd>{trace.description || "No description received"}</dd></div></dl> : null}
+        {traceStage === "alert" ? <dl><div><dt>Alert</dt><dd>{trace.alertName}</dd></div><div><dt>Alert ID</dt><dd>{String(traceSource.alert_id || traceSource.id || "Not recorded")}</dd></div><div><dt>Trace ID</dt><dd>{String(traceSource.trace_id || "Not recorded")}</dd></div><div><dt>Severity / state</dt><dd>{trace.severity} / {trace.status}</dd></div><div><dt>First observed</dt><dd>{trace.started}</dd></div><div><dt>Description</dt><dd>{trace.description || "No description received"}</dd></div></dl> : null}
       </div>
       <div className="metric-handoff">
         <div className="metric-handoff-title"><div><span className="discovery-eyebrow">Downstream handoff</span><strong>{traceWorkflow.state === "ready" ? "Alert entered incident processing" : traceWorkflow.state === "pending" ? "Alert only · incident decision pending" : "Checking incident processing"}</strong></div>{traceWorkflow.loading ? <small>Loading status...</small> : traceWorkflow.error ? <small>Processing status could not be loaded. Retry with Refresh.</small> : traceWorkflow.state === "pending" ? <small>No incident projection has been created for this alert.</small> : null}</div>
-        {traceWorkflow.data ? <div className="metric-handoff-row">
+        {traceWorkflowData ? <div className="metric-handoff-row">
           <div><i><GitMerge size={17} /></i><span><small>Disposition</small><strong>{facts.incident.incident_disposition || facts.alert.incident_disposition || (facts.duplicate ? "Duplicate" : "Incident")}</strong></span></div>
           <div><i><BellRing size={17} /></i><span><small>Incident</small><strong>{facts.incident.id || facts.incident.incident_id || "Not created"}</strong></span></div>
           <div><i><Ticket size={17} /></i><span><small>Jira</small><strong>{facts.ticket || "Not created"}</strong></span></div>

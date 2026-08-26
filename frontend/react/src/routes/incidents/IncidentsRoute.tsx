@@ -513,7 +513,7 @@ export default function IncidentsRoute() {
     </div> : null}
     {incidents.error ? <p className="error">{incidents.error}</p> : null}
     <div className={`incident-summary-list view-${presentation}`} aria-busy={incidents.loading || alerts.loading}>
-      {showUnified ? <div className="unified-inbox-stack" aria-label="Prioritized operational activity">{visibleUnifiedRecords.map((record, index) => {
+      {showUnified ? <div className="unified-inbox-stack" role="region" aria-label="Prioritized operational activity">{visibleUnifiedRecords.map((record, index) => {
         if (record.kind === "incident") {
           const row = record.row;
           const incidentId = String(row.incident_id || row.id || index);
