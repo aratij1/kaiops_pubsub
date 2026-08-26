@@ -119,27 +119,37 @@ export type CloudPlanExecution = {
 type RowsResponse<T> = { rows: T[]; count: number };
 type ConnectionResponse = { connection: CloudConnection };
 
-async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
+async function requestJson<T>(accessToken: string, url: string, init?: RequestInit): Promise<T> {
+  const token = accessToken.trim();
+  if (!token) throw new Error("Not authenticated");
+  const response = await fetch(`/api-gateway${url}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+      ...(init?.headers ?? {}),
+    },
   });
   if (!response.ok) {
     const body = await response.text();
     throw new Error(body || `Request failed with ${response.status}`);
   }
-  return response.json() as Promise<T>;
+  const payload = await response.json() as T | { data?: T };
+  if (payload && typeof payload === "object" && "data" in payload && payload.data !== undefined) {
+    return payload.data;
+  }
+  return payload as T;
 }
 
-export function listConnections(projectId?: string) {
+export function listConnections(accessToken: string, projectId?: string) {
   const params = new URLSearchParams();
   if (projectId) params.set("project_id", projectId);
   const query = params.toString();
-  return requestJson<RowsResponse<CloudConnection>>(`/cloud-ops/connections${query ? `?${query}` : ""}`).then((data) => data.rows);
+  return requestJson<RowsResponse<CloudConnection>>(accessToken, `/cloud-ops/connections${query ? `?${query}` : ""}`).then((data) => data.rows);
 }
 
-export function createSimulatorConnection(projectId: string, name: string) {
-  return requestJson<ConnectionResponse>("/cloud-ops/connections", {
+export function createSimulatorConnection(accessToken: string, projectId: string, name: string) {
+  return requestJson<ConnectionResponse>(accessToken, "/cloud-ops/connections", {
     method: "POST",
     body: JSON.stringify({
       project_id: projectId,
@@ -156,69 +166,73 @@ export function createSimulatorConnection(projectId: string, name: string) {
   }).then((data) => data.connection);
 }
 
-export function validateConnection(connectionId: string) {
+export function validateConnection(accessToken: string, connectionId: string) {
   return requestJson<{ status: string; checks: unknown[]; warnings: string[]; errors: string[] }>(
+    accessToken,
     `/cloud-ops/connections/${encodeURIComponent(connectionId)}/validate`,
     { method: "POST", body: JSON.stringify({}) },
   );
 }
 
-export function discoverConnection(connectionId: string, projectId: string, serviceId = "checkout-api", environment = "prod") {
+export function discoverConnection(accessToken: string, connectionId: string, projectId: string, serviceId = "checkout-api", environment = "prod") {
   return requestJson<{ run_id: string; status: string; resources: CloudResource[]; relationships: unknown[] }>(
+    accessToken,
     `/cloud-ops/connections/${encodeURIComponent(connectionId)}/discover`,
     { method: "POST", body: JSON.stringify({ project_id: projectId, service_id: serviceId, environment }) },
   );
 }
 
-export function listResources(projectId?: string, serviceId?: string, environment?: string) {
+export function listResources(accessToken: string, projectId?: string, serviceId?: string, environment?: string) {
   const params = new URLSearchParams();
   if (projectId) params.set("project_id", projectId);
   if (serviceId) params.set("service_id", serviceId);
   if (environment) params.set("environment", environment);
   const query = params.toString();
-  return requestJson<RowsResponse<CloudResource>>(`/cloud-ops/resources${query ? `?${query}` : ""}`).then((data) => data.rows);
+  return requestJson<RowsResponse<CloudResource>>(accessToken, `/cloud-ops/resources${query ? `?${query}` : ""}`).then((data) => data.rows);
 }
 
-export function service360(projectId: string, serviceId: string, environment?: string) {
+export function service360(accessToken: string, projectId: string, serviceId: string, environment?: string) {
   const params = new URLSearchParams({ project_id: projectId });
   if (environment) params.set("environment", environment);
-  return requestJson<Service360>(`/cloud-ops/services/${encodeURIComponent(serviceId)}/360?${params.toString()}`);
+  return requestJson<Service360>(accessToken, `/cloud-ops/services/${encodeURIComponent(serviceId)}/360?${params.toString()}`);
 }
 
-export function serviceTopology(projectId: string, serviceId: string, environment?: string) {
+export function serviceTopology(accessToken: string, projectId: string, serviceId: string, environment?: string) {
   const params = new URLSearchParams({ project_id: projectId });
   if (environment) params.set("environment", environment);
-  return requestJson<{ nodes: CloudResource[]; edges: Array<Record<string, unknown>> }>(`/cloud-ops/services/${encodeURIComponent(serviceId)}/topology?${params.toString()}`);
+  return requestJson<{ nodes: CloudResource[]; edges: Array<Record<string, unknown>> }>(accessToken, `/cloud-ops/services/${encodeURIComponent(serviceId)}/topology?${params.toString()}`);
 }
 
-export function operationsCockpit(projectId?: string, environment?: string) {
+export function operationsCockpit(accessToken: string, projectId?: string, environment?: string) {
   const params = new URLSearchParams();
   if (projectId) params.set("project_id", projectId);
   if (environment) params.set("environment", environment);
   const query = params.toString();
-  return requestJson<CockpitSummary>(`/cloud-ops/cockpit${query ? `?${query}` : ""}`);
+  return requestJson<CockpitSummary>(accessToken, `/cloud-ops/cockpit${query ? `?${query}` : ""}`);
 }
 
-export function onboardingTemplates() {
-  return requestJson<{ templates: OnboardingTemplate[] }>("/cloud-ops/onboarding/templates").then((data) => data.templates);
+export function onboardingTemplates(accessToken: string) {
+  return requestJson<{ templates: OnboardingTemplate[] }>(accessToken, "/cloud-ops/onboarding/templates").then((data) => data.templates);
 }
 
-export function saveOnboardingProfile(serviceId: string, profile: OnboardingProfile) {
+export function saveOnboardingProfile(accessToken: string, serviceId: string, profile: OnboardingProfile) {
   return requestJson<{ profile: OnboardingProfile & { onboarding_state: string }; readiness: { state: string; overall_score: number; scores: Record<string, number> } }>(
+    accessToken,
     `/cloud-ops/services/${encodeURIComponent(serviceId)}/onboarding`,
     { method: "PUT", body: JSON.stringify(profile) },
   );
 }
 
-export function recalculateReadiness(projectId: string, serviceId: string, environment = "prod") {
+export function recalculateReadiness(accessToken: string, projectId: string, serviceId: string, environment = "prod") {
   return requestJson<{ state: string; overall_score: number; scores: Record<string, number> }>(
+    accessToken,
     `/cloud-ops/services/${encodeURIComponent(serviceId)}/readiness/recalculate`,
     { method: "POST", body: JSON.stringify({ project_id: projectId, environment }) },
   );
 }
 
-export function compileCloudPlan(input: { project_id: string; service_id: string; environment: string; intent: string; action_type: string; resource_id: string; rollback_action: string }) {
-  return requestJson<{ plan: CompiledPlan }>("/cloud-ops/plans/compile", {
+export function compileCloudPlan(accessToken: string, input: { project_id: string; service_id: string; environment: string; intent: string; action_type: string; resource_id: string; rollback_action: string }) {
+  return requestJson<{ plan: CompiledPlan }>(accessToken, "/cloud-ops/plans/compile", {
     method: "POST",
     body: JSON.stringify({
       project_id: input.project_id, service_id: input.service_id, environment: input.environment, intent: input.intent,
@@ -227,50 +241,50 @@ export function compileCloudPlan(input: { project_id: string; service_id: string
   }).then((data) => data.plan);
 }
 
-export function simulateCloudPlan(planId: string) {
-  return requestJson<{ simulation: PlanSimulation }>(`/cloud-ops/plans/${encodeURIComponent(planId)}/simulate`, {
+export function simulateCloudPlan(accessToken: string, planId: string) {
+  return requestJson<{ simulation: PlanSimulation }>(accessToken, `/cloud-ops/plans/${encodeURIComponent(planId)}/simulate`, {
     method: "POST", body: JSON.stringify({}),
   }).then((data) => data.simulation);
 }
 
-export function approveCloudPlan(plan: CompiledPlan, reason: string) {
-  return requestJson<{ approval: { id: string; decision: string; checksum: string } }>(`/cloud-ops/plans/${encodeURIComponent(plan.id)}/approval`, {
+export function approveCloudPlan(accessToken: string, plan: CompiledPlan, reason: string) {
+  return requestJson<{ approval: { id: string; decision: string; checksum: string } }>(accessToken, `/cloud-ops/plans/${encodeURIComponent(plan.id)}/approval`, {
     method: "POST", body: JSON.stringify({ checksum: plan.checksum, decision: "approved", reason }),
   }).then((data) => data.approval);
 }
 
-export function executeCloudPlan(planId: string) {
-  return requestJson<{ execution: CloudPlanExecution; reused: boolean }>(`/cloud-ops/plans/${encodeURIComponent(planId)}/execute`, {
+export function executeCloudPlan(accessToken: string, planId: string) {
+  return requestJson<{ execution: CloudPlanExecution; reused: boolean }>(accessToken, `/cloud-ops/plans/${encodeURIComponent(planId)}/execute`, {
     method: "POST", body: JSON.stringify({}),
   });
 }
 
-export function rollbackCloudExecution(executionId: string) {
-  return requestJson<{ execution: CloudPlanExecution; reused: boolean }>(`/cloud-ops/executions/${encodeURIComponent(executionId)}/rollback`, {
+export function rollbackCloudExecution(accessToken: string, executionId: string) {
+  return requestJson<{ execution: CloudPlanExecution; reused: boolean }>(accessToken, `/cloud-ops/executions/${encodeURIComponent(executionId)}/rollback`, {
     method: "POST", body: JSON.stringify({}),
   });
 }
 
-export function saveExecutionPolicy(projectId: string, environment: string, actionType: string) {
-  return requestJson<{ policy: Record<string, unknown> }>("/cloud-ops/governance/policy", {
+export function saveExecutionPolicy(accessToken: string, projectId: string, environment: string, actionType: string) {
+  return requestJson<{ policy: Record<string, unknown> }>(accessToken, "/cloud-ops/governance/policy", {
     method: "PUT", body: JSON.stringify({ project_id: projectId, environment, allowed_providers: ["simulator"], allowed_actions: [actionType], maximum_risk: "high", require_rollback: true, require_maintenance_window: true, enabled: true }),
   });
 }
 
-export function openMaintenanceWindow(projectId: string, environment: string, reason: string) {
+export function openMaintenanceWindow(accessToken: string, projectId: string, environment: string, reason: string) {
   const startsAt = new Date();
   const endsAt = new Date(startsAt.getTime() + 30 * 60 * 1000);
-  return requestJson<{ window: { id: string; starts_at: string; ends_at: string } }>("/cloud-ops/governance/maintenance-windows", {
+  return requestJson<{ window: { id: string; starts_at: string; ends_at: string } }>(accessToken, "/cloud-ops/governance/maintenance-windows", {
     method: "POST", body: JSON.stringify({ project_id: projectId, environment, starts_at: startsAt.toISOString(), ends_at: endsAt.toISOString(), reason }),
   });
 }
 
-export function recoverExecutionLeases() {
-  return requestJson<{ recovered: number }>("/cloud-ops/governance/leases/recover", { method: "POST", body: JSON.stringify({}) });
+export function recoverExecutionLeases(accessToken: string) {
+  return requestJson<{ recovered: number }>(accessToken, "/cloud-ops/governance/leases/recover", { method: "POST", body: JSON.stringify({}) });
 }
 
 export type CloudProviderStatus = { provider: string; registered: boolean; execution_enabled: boolean; health_status: string; connector_version?: string; write_operations: string[]; kill_switch_engaged?: boolean; canary_target_count?: number };
 
-export function listCloudProviderStatus() {
-  return requestJson<{ providers: CloudProviderStatus[] }>("/cloud-ops/providers/status").then((data) => data.providers);
+export function listCloudProviderStatus(accessToken: string) {
+  return requestJson<{ providers: CloudProviderStatus[] }>(accessToken, "/cloud-ops/providers/status").then((data) => data.providers);
 }

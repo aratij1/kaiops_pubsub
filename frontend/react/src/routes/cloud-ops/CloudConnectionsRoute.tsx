@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Cloud, Play, RefreshCw, ShieldCheck } from "lucide-react";
 
+import { useRouteRuntimeSlice } from "../../app/routeRuntime";
 import {
   createSimulatorConnection,
   discoverConnection,
@@ -11,6 +12,7 @@ import {
 import "./CloudOpsRoute.css";
 
 export default function CloudConnectionsRoute() {
+  const { accessToken } = useRouteRuntimeSlice("session");
   const [projectId, setProjectId] = useState("demo-project");
   const [serviceId, setServiceId] = useState("checkout-api");
   const [environment, setEnvironment] = useState("prod");
@@ -23,7 +25,7 @@ export default function CloudConnectionsRoute() {
     setBusy("refresh");
     setError("");
     try {
-      setConnections(await listConnections(projectId));
+      setConnections(await listConnections(accessToken, projectId));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to load cloud connections");
     } finally {
@@ -39,7 +41,7 @@ export default function CloudConnectionsRoute() {
     setBusy("create");
     setError("");
     try {
-      const row = await createSimulatorConnection(projectId, name);
+      const row = await createSimulatorConnection(accessToken, projectId, name);
       setConnections((current) => [row, ...current.filter((item) => item.id !== row.id)]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to create simulator connection");
@@ -52,8 +54,8 @@ export default function CloudConnectionsRoute() {
     setBusy(`${action}:${id}`);
     setError("");
     try {
-      if (action === "validate") await validateConnection(id);
-      else await discoverConnection(id, projectId, serviceId, environment);
+      if (action === "validate") await validateConnection(accessToken, id);
+      else await discoverConnection(accessToken, id, projectId, serviceId, environment);
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : `Unable to ${action} connection`);

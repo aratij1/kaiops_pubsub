@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Activity, AlertTriangle, CheckCircle2, Cloud, Gauge, RefreshCw, ShieldCheck } from "lucide-react";
 
+import { useRouteRuntimeSlice } from "../../app/routeRuntime";
 import { approveCloudPlan, compileCloudPlan, executeCloudPlan, listCloudProviderStatus, openMaintenanceWindow, operationsCockpit, recoverExecutionLeases, rollbackCloudExecution, saveExecutionPolicy, simulateCloudPlan, type CloudPlanExecution, type CloudProviderStatus, type CockpitSummary, type CompiledPlan, type PlanSimulation, type ReadinessRow } from "./cloudOpsApi";
 import "./CloudOpsRoute.css";
 
@@ -15,6 +16,7 @@ export function aggregateProjectReadiness(rows: ReadinessRow[]) {
 }
 
 export default function OperationsCockpitRoute() {
+  const { accessToken } = useRouteRuntimeSlice("session");
   const [projectId, setProjectId] = useState("demo-project");
   const [environment, setEnvironment] = useState("");
   const [summary, setSummary] = useState<CockpitSummary | null>(null);
@@ -34,7 +36,7 @@ export default function OperationsCockpitRoute() {
     setBusy(true);
     setError("");
     try {
-      const [cockpit, providers] = await Promise.all([operationsCockpit(projectId || undefined, environment || undefined), listCloudProviderStatus()]);
+      const [cockpit, providers] = await Promise.all([operationsCockpit(accessToken, projectId || undefined, environment || undefined), listCloudProviderStatus(accessToken)]);
       setSummary(cockpit);
       setProviderStatus(providers);
     } catch (err) {
@@ -55,9 +57,9 @@ export default function OperationsCockpitRoute() {
     setApproved(false);
     setExecution(null);
     try {
-      const plan = await compileCloudPlan({ project_id: projectId, service_id: planForm.serviceId, environment: environment || "prod", intent: planForm.intent, action_type: planForm.actionType, resource_id: planForm.resourceId, rollback_action: planForm.rollbackAction });
+      const plan = await compileCloudPlan(accessToken, { project_id: projectId, service_id: planForm.serviceId, environment: environment || "prod", intent: planForm.intent, action_type: planForm.actionType, resource_id: planForm.resourceId, rollback_action: planForm.rollbackAction });
       setCompiledPlan(plan);
-      setSimulation(await simulateCloudPlan(plan.id));
+      setSimulation(await simulateCloudPlan(accessToken, plan.id));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to compile and simulate plan");
     } finally {
@@ -69,9 +71,9 @@ export default function OperationsCockpitRoute() {
     if (!compiledPlan) return;
     setBusy(true); setError("");
     try {
-      await approveCloudPlan(compiledPlan, approvalReason);
+      await approveCloudPlan(accessToken, compiledPlan, approvalReason);
       setApproved(true);
-      setSimulation(await simulateCloudPlan(compiledPlan.id));
+      setSimulation(await simulateCloudPlan(accessToken, compiledPlan.id));
     } catch (err) { setError(err instanceof Error ? err.message : "Unable to approve plan"); }
     finally { setBusy(false); }
   }
@@ -79,7 +81,7 @@ export default function OperationsCockpitRoute() {
   async function executeApprovedPlan() {
     if (!compiledPlan) return;
     setBusy(true); setError("");
-    try { setExecution((await executeCloudPlan(compiledPlan.id)).execution); }
+    try { setExecution((await executeCloudPlan(accessToken, compiledPlan.id)).execution); }
     catch (err) { setError(err instanceof Error ? err.message : "Unable to execute plan"); }
     finally { setBusy(false); }
   }
@@ -87,7 +89,7 @@ export default function OperationsCockpitRoute() {
   async function rollbackExecution() {
     if (!execution) return;
     setBusy(true); setError("");
-    try { setExecution((await rollbackCloudExecution(execution.id)).execution); }
+    try { setExecution((await rollbackCloudExecution(accessToken, execution.id)).execution); }
     catch (err) { setError(err instanceof Error ? err.message : "Unable to roll back execution"); }
     finally { setBusy(false); }
   }
@@ -95,8 +97,8 @@ export default function OperationsCockpitRoute() {
   async function configureGovernance() {
     setBusy(true); setError("");
     try {
-      await saveExecutionPolicy(projectId, environment || "prod", planForm.actionType);
-      await openMaintenanceWindow(projectId, environment || "prod", "Operator-approved Phase 5 execution window");
+      await saveExecutionPolicy(accessToken, projectId, environment || "prod", planForm.actionType);
+      await openMaintenanceWindow(accessToken, projectId, environment || "prod", "Operator-approved Phase 5 execution window");
       setGovernanceStatus("Policy active · simulator enabled · maintenance window open for 30 minutes");
     } catch (err) { setError(err instanceof Error ? err.message : "Unable to configure governance"); }
     finally { setBusy(false); }
@@ -104,7 +106,7 @@ export default function OperationsCockpitRoute() {
 
   async function recoverLeases() {
     setBusy(true); setError("");
-    try { const result = await recoverExecutionLeases(); setGovernanceStatus(`${result.recovered} expired execution lease(s) recovered`); }
+    try { const result = await recoverExecutionLeases(accessToken); setGovernanceStatus(`${result.recovered} expired execution lease(s) recovered`); }
     catch (err) { setError(err instanceof Error ? err.message : "Unable to recover leases"); }
     finally { setBusy(false); }
   }

@@ -1,10 +1,12 @@
 import { useState } from "react";
 import { Gauge, RefreshCw, Route } from "lucide-react";
 
+import { useRouteRuntimeSlice } from "../../app/routeRuntime";
 import { service360, type Service360 } from "./cloudOpsApi";
 import "./CloudOpsRoute.css";
 
 export default function Service360Route() {
+  const { accessToken } = useRouteRuntimeSlice("session");
   const [projectId, setProjectId] = useState("demo-project");
   const [serviceId, setServiceId] = useState("checkout-api");
   const [environment, setEnvironment] = useState("prod");
@@ -16,7 +18,7 @@ export default function Service360Route() {
     setBusy(true);
     setError("");
     try {
-      setView(await service360(projectId, serviceId, environment || undefined));
+      setView(await service360(accessToken, projectId, serviceId, environment || undefined));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to load service 360");
     } finally {
