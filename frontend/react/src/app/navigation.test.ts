@@ -49,4 +49,10 @@ describe("authoritative navigation", () => {
     expect(tabForPath("/incidents/INC-3481")).toBe("summary");
     expect(breadcrumbForPath("/incidents/INC-3481").map((item) => item.label)).toEqual(["Operations", "Unified Inbox"]);
   });
+
+  it("keeps audit and administration as distinct canonical workspaces", () => {
+    expect(tabForPath("/audit")).toBe("audit");
+    expect(tabForPath("/admin/settings")).toBe("admin");
+    expect(NAVIGATION_ITEMS.find((item) => item.id === "audit")?.path).not.toBe(NAVIGATION_ITEMS.find((item) => item.id === "settings")?.path);
+  });
 });
