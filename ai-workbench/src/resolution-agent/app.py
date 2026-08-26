@@ -357,6 +357,9 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
     plan = dict(_catalog_plan_for(context, decision, recommendation))
     metadata = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
     metadata["model_proposed_execution_plan"] = metadata.get("execution_plan", {})
+    plan["rca_version"] = metadata.get("rca_version")
+    plan["evidence_snapshot_id"] = metadata.get("context_snapshot_id")
+    plan["recommendation_version"] = metadata.get("recommendation_version")
     investigation = metadata.get("investigation_report") if isinstance(metadata.get("investigation_report"), dict) else {}
     rca_analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
     plan["evidence_basis"] = list(rca_analysis.get("evidence_used") or [])

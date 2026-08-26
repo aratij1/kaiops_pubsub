@@ -115,7 +115,21 @@ def _signed_approval_readiness(context: dict[str, Any]) -> dict[str, Any]:
     profile = metadata.get("connection_profile") if isinstance(metadata.get("connection_profile"), dict) else {}
     rollback = plan.get("rollback_commands") if isinstance(plan.get("rollback_commands"), list) else []
     validators = plan.get("validators") if isinstance(plan.get("validators"), list) else []
+    credential_reference = str(
+        profile.get("secret_ref")
+        or profile.get("credential_ref")
+        or metadata.get("secret_ref")
+        or metadata.get("credential_ref")
+        or ""
+    ).strip()
+    opaque_credential = credential_reference.startswith((
+        "vault://", "secret://", "managed-identity://", "azure-keyvault://",
+        "aws-secretsmanager://", "gcp-secretmanager://",
+    ))
     checks = {
+        "rca_version_binding": bool(plan.get("rca_version")),
+        "evidence_snapshot_binding": bool(plan.get("evidence_snapshot_id")),
+        "recommendation_version_binding": bool(plan.get("recommendation_version")),
         "approved_runbook": str(metadata.get("runbook_status") or plan.get("runbook_status") or "").lower() == "approved",
         "valid_plan": bool(plan.get("plan_id") and plan.get("plan_fingerprint") and verify_plan_fingerprint(plan)),
         "execution_ready": (
@@ -125,7 +139,7 @@ def _signed_approval_readiness(context: dict[str, Any]) -> dict[str, Any]:
         ),
         "governed_target": bool(plan.get("target_resource_id") or plan.get("remediation_target")),
         "available_connector": bool(plan.get("connector_id") or profile.get("connector_id") or profile.get("executor_type")),
-        "current_credentials": bool(profile.get("credential_ref") or profile.get("secret_ref") or metadata.get("credential_ref")),
+        "current_credentials": opaque_credential,
         "required_validators": bool(validators),
         "rollback_readiness": str(plan.get("rollback_mode") or "").lower() == "not_applicable" or bool(rollback),
         "policy_acceptance": str(policy.get("decision") or metadata.get("policy_decision") or "").lower() in {"allow", "approved", "accept"},
@@ -145,6 +159,9 @@ def _signed_approval_readiness(context: dict[str, Any]) -> dict[str, Any]:
         "tenant_id": str(context.get("tenant_id") or recommendation.get("tenant_id") or ""),
         "incident_id": str(context.get("incident_id") or recommendation.get("incident_id") or ""),
         "recommendation_id": _first_recommendation_id(context, recommendation),
+        "rca_version": str(plan.get("rca_version") or ""),
+        "evidence_snapshot_id": str(plan.get("evidence_snapshot_id") or ""),
+        "recommendation_version": str(plan.get("recommendation_version") or ""),
         "plan_id": str(plan.get("plan_id") or ""),
         "plan_fingerprint": str(plan.get("plan_fingerprint") or ""),
         "state": "execution_eligible" if not missing else "blocked",
@@ -440,6 +457,15 @@ async def _approval_from_request(
     if decision == ApprovalDecision.MODIFIED:
         raise HTTPException(status_code=409, detail="Modified approvals cannot authorize execution.")
     if decision == ApprovalDecision.APPROVED:
+        pending_recommendation_id = (
+            _first_recommendation_id(pending, recommendation)
+            or str(plan.get("recommendation_version") or "").strip()
+        )
+        if not pending_recommendation_id or str(recommendation_id) != pending_recommendation_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Approval recommendation is stale and does not match the current governed plan.",
+            )
         if not plan:
             raise HTTPException(
                 status_code=409,
@@ -449,6 +475,7 @@ async def _approval_from_request(
                 ),
             )
         expected_tenant = str(plan.get("tenant_id") or "").strip()
+        expected_incident = str(plan.get("incident_id") or "").strip()
         expected_plan_id = str(plan.get("plan_id") or "").strip()
         expected_fingerprint = str(plan.get("plan_fingerprint") or "").strip()
         if not expected_plan_id or not expected_fingerprint:
@@ -458,6 +485,11 @@ async def _approval_from_request(
                     "Approval blocked: the governed execution plan is incomplete. "
                     "Regenerate incident analysis before approval."
                 ),
+            )
+        if str(plan.get("recommendation_version") or "") != pending_recommendation_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Approval recommendation version does not match the current governed recommendation.",
             )
         readiness = _signed_approval_readiness(pending)
         if readiness.get("state") != "execution_eligible":
@@ -476,6 +508,8 @@ async def _approval_from_request(
             raise HTTPException(status_code=409, detail="Approval blocked: execution plan has no verified tenant.")
         if request.tenant_id != expected_tenant:
             raise HTTPException(status_code=403, detail="Approval tenant does not match the execution plan tenant.")
+        if str(request.incident_id) != expected_incident:
+            raise HTTPException(status_code=409, detail="Approval incident does not match the execution plan incident.")
         if str(request.plan_id or "") != expected_plan_id or request.plan_fingerprint != expected_fingerprint:
             raise HTTPException(status_code=409, detail="Approval is not bound to the current execution plan fingerprint.")
         expiry = datetime.fromisoformat(str(plan.get("expiry") or "").replace("Z", "+00:00"))
@@ -502,6 +536,18 @@ async def _approval_from_request(
         metadata={
             "execution_confirmation_required": True,
             "authorization_scope": request.authorization_scope,
+            "rca_version": plan.get("rca_version") if decision == ApprovalDecision.APPROVED else None,
+            "evidence_snapshot_id": plan.get("evidence_snapshot_id") if decision == ApprovalDecision.APPROVED else None,
+            "recommendation_version": plan.get("recommendation_version") if decision == ApprovalDecision.APPROVED else None,
+            "target_resource_id": (
+                plan.get("target_resource_id") or plan.get("remediation_target")
+                if decision == ApprovalDecision.APPROVED else None
+            ),
+            "connector_id": plan.get("connector_id") if decision == ApprovalDecision.APPROVED else None,
+            "rollback_plan": (
+                plan.get("rollback") or plan.get("rollback_commands")
+                if decision == ApprovalDecision.APPROVED else None
+            ),
             **({"execution_plan": plan} if decision == ApprovalDecision.APPROVED else {}),
         },
     )
@@ -760,6 +806,13 @@ async def _store_and_publish(approval: Approval) -> None:
                     },
                     payload={
                         "recommendation_id": recommendation_id,
+                        "plan_id": str(approval.plan_id or "") or None,
+                        "plan_fingerprint": approval.plan_fingerprint,
+                        "rca_version": approval.metadata.get("rca_version"),
+                        "evidence_snapshot_id": approval.metadata.get("evidence_snapshot_id"),
+                        "recommendation_version": approval.metadata.get("recommendation_version"),
+                        "target_resource_id": approval.metadata.get("target_resource_id"),
+                        "connector_id": approval.metadata.get("connector_id"),
                         "decision": approval.decision.value,
                         "approver": approval.approver,
                         "channel": approval.channel,
@@ -831,6 +884,13 @@ def _build_approval_event_payload(approval: Approval) -> dict[str, Any]:
             "approver": approval.approver,
             "channel": approval.channel,
             "authorization_scope": approval.authorization_scope,
+            "plan_id": str(approval.plan_id or "") or None,
+            "plan_fingerprint": approval.plan_fingerprint,
+            "rca_version": approval.metadata.get("rca_version"),
+            "evidence_snapshot_id": approval.metadata.get("evidence_snapshot_id"),
+            "recommendation_version": approval.metadata.get("recommendation_version"),
+            "target_resource_id": approval.metadata.get("target_resource_id"),
+            "connector_id": approval.metadata.get("connector_id"),
             "topic": APPROVAL_EVENTS,
         },
         metadata={

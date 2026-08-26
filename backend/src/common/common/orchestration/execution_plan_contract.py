@@ -114,6 +114,9 @@ class ExecutionPlanV2(BaseModel):
     plan_id: UUID
     incident_id: UUID
     tenant_id: str
+    rca_version: str | None = None
+    evidence_snapshot_id: str | None = None
+    recommendation_version: str | None = None
     service: str
     environment: str
     generated_at: datetime
