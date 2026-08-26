@@ -118,6 +118,11 @@ def _signed_approval_readiness(context: dict[str, Any]) -> dict[str, Any]:
     checks = {
         "approved_runbook": str(metadata.get("runbook_status") or plan.get("runbook_status") or "").lower() == "approved",
         "valid_plan": bool(plan.get("plan_id") and plan.get("plan_fingerprint") and verify_plan_fingerprint(plan)),
+        "execution_ready": (
+            plan.get("execution_ready") is True
+            and plan.get("diagnostic_only") is not True
+            and str(plan.get("plan_kind") or "").lower() != "diagnostic"
+        ),
         "governed_target": bool(plan.get("target_resource_id") or plan.get("remediation_target")),
         "available_connector": bool(plan.get("connector_id") or profile.get("connector_id") or profile.get("executor_type")),
         "current_credentials": bool(profile.get("credential_ref") or profile.get("secret_ref") or metadata.get("credential_ref")),
@@ -435,12 +440,39 @@ async def _approval_from_request(
     if decision == ApprovalDecision.MODIFIED:
         raise HTTPException(status_code=409, detail="Modified approvals cannot authorize execution.")
     if decision == ApprovalDecision.APPROVED:
+        if not plan:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Approval blocked: this recommendation has no governed execution plan. "
+                    "Regenerate incident analysis to compile a current plan before approval."
+                ),
+            )
         expected_tenant = str(plan.get("tenant_id") or "").strip()
         expected_plan_id = str(plan.get("plan_id") or "").strip()
         expected_fingerprint = str(plan.get("plan_fingerprint") or "").strip()
+        if not expected_plan_id or not expected_fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Approval blocked: the governed execution plan is incomplete. "
+                    "Regenerate incident analysis before approval."
+                ),
+            )
+        readiness = _signed_approval_readiness(pending)
+        if readiness.get("state") != "execution_eligible":
+            missing = [str(item).replace("_", " ") for item in readiness.get("missing", []) if str(item).strip()]
+            missing_detail = f" Missing controls: {', '.join(missing)}." if missing else ""
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Approval blocked: the current execution plan is not execution-eligible."
+                    f"{missing_detail} Refresh evidence or regenerate analysis before approval."
+                ),
+            )
         if not verify_plan_fingerprint(plan):
             raise HTTPException(status_code=409, detail="Approval blocked: execution plan fingerprint is invalid.")
-        if not expected_tenant or expected_tenant.lower() == "default":
+        if not expected_tenant or (expected_tenant.lower() == "default" and settings.auth_mode != "local"):
             raise HTTPException(status_code=409, detail="Approval blocked: execution plan has no verified tenant.")
         if request.tenant_id != expected_tenant:
             raise HTTPException(status_code=403, detail="Approval tenant does not match the execution plan tenant.")

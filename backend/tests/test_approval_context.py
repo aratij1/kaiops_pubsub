@@ -12,19 +12,43 @@ def _approval_plan(incident_id: str) -> dict:
         "tenant_id": "tenant-a",
         "incident_id": incident_id,
         "plan_id": "33333333-3333-3333-3333-333333333333",
+        "execution_ready": True,
+        "diagnostic_only": False,
+        "plan_kind": "remediation",
+        "target_resource_id": "k8s:/clusters/prod/namespaces/payments/deployments/api",
+        "connector_id": "kubernetes-prod",
+        "validators": [{"validator_id": "availability-1"}],
+        "rollback_commands": ["governed:rollback-deployment"],
+        "rollback_mode": "automatic",
+        "policy_decision": {"decision": "allow"},
         "expiry": "2099-01-01T00:00:00+00:00",
     }
     plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
     return plan
 
 
+def _readiness_metadata(plan: dict) -> dict:
+    return {
+        "execution_plan": plan,
+        "runbook_status": "approved",
+        "connection_profile": {"credential_ref": "vault://tenant-a/prod-remediator"},
+        "evidence_quality": {
+            "evidence_coverage": 0.9,
+            "citation_coverage": 0.8,
+            "evidence_fresh": True,
+            "conflict_count": 0,
+        },
+    }
+
+
 def _set_pending_plan(module, incident_id: str, recommendation_id: str) -> dict:
+    module.settings.service_internal_token = "internal-test-token"
     plan = _approval_plan(incident_id)
     module.PENDING_INCIDENTS[module._pending_key("tenant-a", incident_id)] = {
         "recommendation": {
             "id": recommendation_id,
             "incident_id": incident_id,
-            "metadata": {"execution_plan": plan},
+            "metadata": _readiness_metadata(plan),
         }
     }
     return plan
@@ -100,6 +124,9 @@ def test_approval_readiness_is_backend_signed_only_when_every_gate_passes() -> N
         "tenant_id": "tenant-a",
         "incident_id": "11111111-1111-1111-1111-111111111111",
         "plan_id": "33333333-3333-3333-3333-333333333333",
+        "execution_ready": True,
+        "diagnostic_only": False,
+        "plan_kind": "remediation",
         "target_resource_id": "k8s:/clusters/prod/namespaces/payments/deployments/api",
         "connector_id": "kubernetes-prod",
         "validators": [{"validator_id": "availability-1"}],
@@ -357,6 +384,98 @@ async def test_approval_rejects_cross_tenant_or_changed_plan(
         await module._approval_from_request(request, module.ApprovalDecision.APPROVED)
 
     assert exc_info.value.status_code == status_code
+
+
+@pytest.mark.asyncio
+async def test_approval_rejects_legacy_recommendation_without_governed_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_approval_app_module()
+    incident_id = "11111111-1111-1111-1111-111111111111"
+    recommendation_id = "22222222-2222-2222-2222-222222222222"
+    module.PENDING_INCIDENTS[module._pending_key("tenant-a", incident_id)] = {
+        "recommendation": {"id": recommendation_id, "incident_id": incident_id, "metadata": {}},
+    }
+    monkeypatch.setattr(module.settings, "database_enabled", False)
+    request = module.ApprovalRequest(
+        incident_id=incident_id,
+        recommendation_id=recommendation_id,
+        tenant_id="tenant-a",
+        approver="l2.engineer",
+    )
+
+    with pytest.raises(module.HTTPException, match="no governed execution plan") as exc_info:
+        await module._approval_from_request(request, module.ApprovalDecision.APPROVED)
+
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_local_development_can_approve_default_tenant_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_approval_app_module()
+    module.settings.service_internal_token = "internal-test-token"
+    incident_id = "11111111-1111-1111-1111-111111111111"
+    recommendation_id = "22222222-2222-2222-2222-222222222222"
+    plan = _approval_plan(incident_id)
+    plan["tenant_id"] = "default"
+    plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
+    monkeypatch.setenv("ENVIRONMENT", "local")
+    monkeypatch.setenv("AUTH_MODE", "local")
+    monkeypatch.setenv("DEPLOYMENT_PROFILE", "local")
+    monkeypatch.setattr(module.settings, "auth_mode", "local")
+    module.PENDING_INCIDENTS[module._pending_key("default", incident_id)] = {
+        "recommendation": {
+            "id": recommendation_id,
+            "incident_id": incident_id,
+            "metadata": _readiness_metadata(plan),
+        },
+    }
+    request = module.ApprovalRequest(
+        incident_id=incident_id,
+        recommendation_id=recommendation_id,
+        tenant_id="default",
+        plan_id=plan["plan_id"],
+        plan_fingerprint=plan["plan_fingerprint"],
+        approver="admin",
+    )
+
+    approval = await module._approval_from_request(request, module.ApprovalDecision.APPROVED)
+
+    assert approval.tenant_id == "default"
+    assert str(approval.plan_id) == plan["plan_id"]
+
+
+@pytest.mark.asyncio
+async def test_approval_rejects_valid_diagnostic_plan_until_readiness_controls_pass() -> None:
+    module = load_approval_app_module()
+    module.settings.service_internal_token = "internal-test-token"
+    incident_id = "11111111-1111-1111-1111-111111111111"
+    recommendation_id = "22222222-2222-2222-2222-222222222222"
+    plan = _approval_plan(incident_id)
+    plan["execution_ready"] = False
+    plan["diagnostic_only"] = True
+    plan["plan_kind"] = "diagnostic"
+    plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
+    module.PENDING_INCIDENTS[module._pending_key("tenant-a", incident_id)] = {
+        "recommendation": {
+            "id": recommendation_id,
+            "incident_id": incident_id,
+            "metadata": {"execution_plan": plan},
+        },
+    }
+    request = module.ApprovalRequest(
+        incident_id=incident_id,
+        recommendation_id=recommendation_id,
+        tenant_id="tenant-a",
+        plan_id=plan["plan_id"],
+        plan_fingerprint=plan["plan_fingerprint"],
+        approver="l2.engineer",
+    )
+
+    with pytest.raises(module.HTTPException, match="not execution-eligible") as exc_info:
+        await module._approval_from_request(request, module.ApprovalDecision.APPROVED)
+
+    assert exc_info.value.status_code == 409
+    assert "execution ready" in str(exc_info.value.detail)
+    assert "current credentials" in str(exc_info.value.detail)
 
 
 @pytest.mark.asyncio

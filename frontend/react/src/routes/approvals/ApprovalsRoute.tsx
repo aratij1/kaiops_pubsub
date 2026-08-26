@@ -26,7 +26,8 @@ export default function ApprovalsRoute() {
   const [modifyPlan, setModifyPlan] = useState({ open: false, capability: "", target: "", reason: "" });
   const selected = approvals.rows.find((row) => approvals.incidentId(row) === approvals.selectedIncidentId);
   const packet = useMemo(() => {
-    const row = (selected || {}) as Packet;
+    const context = objectValue(approvals.contextPayload);
+    const row = ({ ...(selected || {}), ...context }) as Packet;
     const projection = objectValue(row.projection_payload);
     const event = objectValue(projection.event_payload);
     const recommendation = objectValue(projection.recommendation, event.recommendation, row.recommendation);
@@ -52,7 +53,7 @@ export default function ApprovalsRoute() {
       risk: plan.risk_tier || row.risk_tier,
     });
     return { row, recommendation, plan, quality, policy, readiness, readinessReceipt, backendEligibilityProven, decision: approvalDecisionFields(row) };
-  }, [selected]);
+  }, [selected, approvals.contextPayload]);
   const approvalDisabled = !approvals.selectedRecommendationId || approvals.actionLoading || !packet.readiness.eligible || !packet.backendEligibilityProven;
 
   function review(row: any) {
