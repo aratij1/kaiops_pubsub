@@ -19,6 +19,10 @@ def test_real_discovery_rows_compile_to_immutable_evidence() -> None:
                 "sha256": "a" * 64,
                 "timestamp": "2026-08-20T09:59:30Z",
                 "service": "api-gateway",
+                "project_id": "payments-prod",
+                "retrieval_tool": "logs.search",
+                "confidence_contribution": 0.3,
+                "contradiction_status": "supporting",
             }
         ],
         tenant_id="tenant-a",
@@ -34,6 +38,13 @@ def test_real_discovery_rows_compile_to_immutable_evidence() -> None:
     assert record.source_type == "log"
     assert record.source_uri == "log://containers/api-gateway#L42"
     assert record.freshness_seconds == 30
+    assert record.project_id == "payments-prod"
+    assert record.observation_window_start == collected - timedelta(minutes=5)
+    assert record.observation_window_end == collected
+    assert record.retrieval_tool == "logs.search"
+    assert record.relevant_content.endswith("upstream connection refused")
+    assert record.confidence_contribution == 0.3
+    assert record.contradiction_status == "supporting"
     assert record.metadata["current_operational_evidence"] is True
     assert record.metadata["guidance_only"] is False
 
@@ -92,3 +103,25 @@ def test_missing_timestamp_is_unknown_and_never_current_operational_evidence() -
     assert record.freshness_status == "unknown"
     assert record.current_operational_evidence is False
     assert record.metadata["timestamp_missing"] is True
+    assert record.confidence_contribution == 0.0
+
+
+def test_untrusted_contradiction_status_is_never_promoted_to_support() -> None:
+    record = EvidenceCompiler().compile(
+        [{
+            "source": "log",
+            "uri": "log://api/1",
+            "summary": "healthy upstream",
+            "timestamp": "2026-08-20T09:59:30Z",
+            "contradiction_status": "confirmed-root-cause",
+            "confidence_contribution": 2.0,
+        }],
+        tenant_id="tenant-a",
+        incident_id=uuid4(),
+        service="api",
+        environment="prod",
+        collected_at=datetime(2026, 8, 20, 10, 0, tzinfo=UTC),
+    )[0]
+
+    assert record.contradiction_status == "unknown"
+    assert record.confidence_contribution == 1.0

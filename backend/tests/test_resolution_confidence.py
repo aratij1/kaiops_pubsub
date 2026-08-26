@@ -46,6 +46,23 @@ def test_unresolved_contradiction_applies_penalty_and_ceiling() -> None:
     assert result.ceiling_reasons == ("unresolved_contradictions",)
 
 
+def test_missing_evidence_strictly_lowers_confidence() -> None:
+    complete = score_confidence(ConfidenceInputs(
+        evidence_quality=0.8, evidence_consistency=0.8, causal_strength=0.8,
+        independent_source_corroboration=0.8, temporal_alignment=0.8,
+        topology_alignment=0.8, historical_similarity=0.8, successful_test_ratio=0.8,
+    ))
+    incomplete = score_confidence(ConfidenceInputs(
+        evidence_quality=0.8, evidence_consistency=0.8, causal_strength=0.8,
+        independent_source_corroboration=0.8, temporal_alignment=0.8,
+        topology_alignment=0.8, historical_similarity=0.8, successful_test_ratio=0.8,
+        missing_data_penalty=0.3, sources_unavailable=True,
+    ))
+
+    assert incomplete.score < complete.score
+    assert incomplete.penalties["missing_data"] == 0.3
+
+
 def test_ambiguous_target_has_strictest_confidence_ceiling() -> None:
     result = score_confidence(ConfidenceInputs(
         evidence_quality=1.0,

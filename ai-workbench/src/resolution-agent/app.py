@@ -99,6 +99,20 @@ def _deterministic_recommendation_id(context: Context) -> UUID:
     return uuid5(NAMESPACE_URL, f"kaims:recommendation:{context.incident_id}:{identity}:v2")
 
 
+def _attach_rca_governance_binding(recommendation: Recommendation, context: Context) -> None:
+    """Bind one immutable RCA generation to the context snapshot it evaluated."""
+
+    context_metadata = context.metadata if isinstance(context.metadata, dict) else {}
+    recommendation.metadata = {
+        **(recommendation.metadata if isinstance(recommendation.metadata, dict) else {}),
+        "analysis_request_id": str(context_metadata.get("analysis_request_id") or "") or None,
+        "context_snapshot_id": str(context_metadata.get("context_snapshot_id") or "") or None,
+        "context_fingerprint": str(context_metadata.get("context_fingerprint") or "") or None,
+        "rca_version": str(recommendation.id),
+        "recommendation_version": str(recommendation.id),
+    }
+
+
 def _attach_resolution_options(
     recommendation: Recommendation,
     context: Context,
@@ -740,6 +754,11 @@ async def _persist_resolution_event(
                     "impact": recommendation.impact,
                     "risk": recommendation.risk,
                     "resolution_lifecycle": lifecycle or None,
+                    "analysis_request_id": metadata.get("analysis_request_id"),
+                    "context_snapshot_id": metadata.get("context_snapshot_id"),
+                    "context_fingerprint": metadata.get("context_fingerprint"),
+                    "rca_version": metadata.get("rca_version"),
+                    "recommendation_version": metadata.get("recommendation_version"),
                 },
             )
         )
@@ -832,6 +851,7 @@ async def startup(app: FastAPI) -> None:
         incident = Incident.model_validate(payload["incident"])
         decision_payload = payload.get("decision", {}) if isinstance(payload.get("decision"), dict) else {}
         recommendation = await _resolve_context(context)
+        _attach_rca_governance_binding(recommendation, context)
         recommendation.trace_id = str(incident.trace_id or context.alert.trace_id or "") or None
         recommendation.metadata["rag_documents"] = context.metadata.get("rag_documents", 0)
         recommendation.metadata["rag_matches"] = context.metadata.get("rag_matches", [])
@@ -1085,6 +1105,7 @@ async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, An
 @app.post("/resolve", response_model=Recommendation)
 async def resolve(context: Context, publish_events: bool = True) -> Recommendation:
     recommendation = await _resolve_context(context)
+    _attach_rca_governance_binding(recommendation, context)
     _apply_catalog_plan(recommendation, context)
     recommendation.trace_id = str(context.alert.trace_id or "") or None
     recommendation.metadata["rag_documents"] = context.metadata.get("rag_documents", 0)

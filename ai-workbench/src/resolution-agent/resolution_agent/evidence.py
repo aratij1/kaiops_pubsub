@@ -21,6 +21,7 @@ class EvidenceRecord(BaseModel):
 
     evidence_id: str
     tenant_id: str
+    project_id: str
     incident_id: UUID
     source_type: EvidenceSourceType
     source_system: str
@@ -29,6 +30,8 @@ class EvidenceRecord(BaseModel):
     source_uri: str
     observed_at: datetime
     collected_at: datetime
+    observation_window_start: datetime | None
+    observation_window_end: datetime
     service: str
     environment: str
     summary: str
@@ -37,8 +40,12 @@ class EvidenceRecord(BaseModel):
     incident_window_relation: Literal["before", "during", "after", "unknown"]
     freshness_status: Literal["fresh", "stale", "unknown"]
     query_reference: str
+    retrieval_tool: str
     result_checksum: str
     citation_provenance: str
+    relevant_content: str
+    confidence_contribution: float = Field(ge=0.0, le=1.0)
+    contradiction_status: Literal["supporting", "contradicting", "neutral", "unknown"]
     current_operational_evidence: bool
     freshness_seconds: int = Field(ge=0)
     reliability_score: float = Field(ge=0.0, le=1.0)
@@ -156,11 +163,18 @@ class EvidenceCompiler:
             outside_incident_window = bool(incident_started_at and observed < incident_started_at)
             guidance_only = source_type in self.GUIDANCE_TYPES
             reliability = float(row.get("reliability_score") or row.get("confidence") or self.RELIABILITY[source_type])
+            reliability = max(0.0, min(reliability, 1.0))
+            current_operational = not timestamp_missing and not guidance_only and not outside_incident_window
+            contradiction_status = str(row.get("contradiction_status") or "unknown").strip().lower()
+            if contradiction_status not in {"supporting", "contradicting", "neutral", "unknown"}:
+                contradiction_status = "unknown"
+            contribution = float(row.get("confidence_contribution") or 0.0)
             evidence_id = str(row.get("evidence_id") or f"{source_type.upper()}-{content_hash[:16]}")
             compiled.append(
                 EvidenceRecord(
                     evidence_id=evidence_id,
                     tenant_id=tenant_id,
+                    project_id=str(row.get("project_id") or row.get("project") or "unavailable"),
                     incident_id=incident_id,
                     source_type=source_type,
                     source_system=str(row.get("source_system") or raw_source),
@@ -169,23 +183,39 @@ class EvidenceCompiler:
                     source_uri=source_uri,
                     observed_at=observed,
                     collected_at=collected,
+                    observation_window_start=incident_started_at,
+                    observation_window_end=collected,
                     service=str(row.get("service") or service),
                     environment=str(row.get("environment") or environment or "unknown"),
                     summary=summary,
                     content_hash=content_hash,
                     lineage_id=lineage_id,
-                    incident_window_relation="unknown" if timestamp_missing else "before" if outside_incident_window else "during",
+                    incident_window_relation=(
+                        "unknown" if timestamp_missing
+                        else "before" if outside_incident_window
+                        else "after" if observed > collected
+                        else "during"
+                    ),
                     freshness_status="unknown" if timestamp_missing else "fresh" if freshness <= 900 else "stale",
                     query_reference=str(row.get("query_reference") or row.get("query") or source_uri),
+                    retrieval_tool=str(
+                        row.get("retrieval_tool")
+                        or row.get("tool")
+                        or row.get("source_system")
+                        or raw_source
+                    ),
                     result_checksum=f"sha256:{content_hash.removeprefix('sha256:')}",
                     citation_provenance=str(row.get("citation") or row.get("provenance") or source_uri),
-                    current_operational_evidence=not timestamp_missing and not guidance_only and not outside_incident_window,
+                    relevant_content=summary,
+                    confidence_contribution=max(0.0, min(contribution, 1.0)) if current_operational else 0.0,
+                    contradiction_status=contradiction_status,
+                    current_operational_evidence=current_operational,
                     freshness_seconds=freshness,
-                    reliability_score=max(0.0, min(reliability, 1.0)),
+                    reliability_score=reliability,
                     metadata={
                         **{key: value for key, value in row.items() if key not in {"content", "snippet"}},
                         "guidance_only": guidance_only,
-                        "current_operational_evidence": not timestamp_missing and not guidance_only and not outside_incident_window,
+                        "current_operational_evidence": current_operational,
                         "timestamp_missing": timestamp_missing,
                         "outside_incident_window": outside_incident_window,
                     },
