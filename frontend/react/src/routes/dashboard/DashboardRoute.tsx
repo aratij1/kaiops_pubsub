@@ -1,10 +1,11 @@
 import { Activity, ArrowRight, Bot, Check, CheckCircle2, CircleAlert, Clock3, FileCheck2, RefreshCw, RotateCcw, ShieldCheck, Siren, Sparkles } from "lucide-react";
 
 import { useRouteRuntime, type IncidentRow } from "../../app/routeRuntime";
+import { durableIncidentId } from "../../domain/incidentNavigation";
 import "./DashboardRoute.css";
 
 const terminal = (row: IncidentRow) => ["closed", "resolved", "recovered", "cancelled"].some((value) => String(row.status || "").toLowerCase().includes(value));
-const incidentId = (row: IncidentRow) => String(row.incident_id || row.id || "Incident");
+const incidentId = (row: IncidentRow) => durableIncidentId(row);
 const title = (row: IncidentRow) => String(row.title || row.summary || `${row.service || "Service"} incident`);
 const status = (row: IncidentRow) => String(row.status || "investigating").replaceAll("_", " ");
 const isCritical = (row: IncidentRow) => ["critical", "sev1", "p1"].includes(String(row.severity || "").toLowerCase());
@@ -21,10 +22,11 @@ function timeAgo(value: unknown) {
 }
 
 function WorkItem({ row, onOpen, action }: { row: IncidentRow; onOpen: () => void; action: string }) {
-  return <button type="button" className="oh-work-item" onClick={onOpen}>
+  const available = Boolean(incidentId(row));
+  return <button type="button" className="oh-work-item" onClick={onOpen} disabled={!available} title={available ? undefined : "Incident identifier unavailable"}>
     <span className={`oh-severity is-${String(row.severity || "unknown").toLowerCase()}`}>{row.severity || "Unrated"}</span>
     <span><strong>{title(row)}</strong><small>{incidentId(row)} · {row.service || "Service unavailable"} · {timeAgo(row.updated_at || row.created_at)}</small></span>
-    <span className="oh-work-action">{action}<ArrowRight aria-hidden="true" /></span>
+    <span className="oh-work-action">{available ? action : "Cannot open"}<ArrowRight aria-hidden="true" /></span>
   </button>;
 }
 

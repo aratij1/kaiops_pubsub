@@ -32,6 +32,51 @@ test("incident detail preserves nested alert identity while details load", async
   await expect(page.locator(".ic-command-header")).toContainText("investigating");
 });
 
+test("durable incident history stays separate from the technical workspace and surfaces missing identities", async ({ page }) => {
+  const incidentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const alertId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const valid = { incident_id: incidentId, alert_id: alertId, title: "Durable navigation incident", service: "api-gateway", environment: "prod", status: "investigating", projection_payload: { alert_id: alertId } };
+  await page.route("**/api-gateway/**", async (route) => {
+    const path = new URL(route.request().url()).pathname.replace(/^\/api-gateway/, "");
+    const body = path === "/auth/config"
+      ? { mode: "local", local_development_only: true }
+      : path === "/auth/login"
+        ? { access_token: "admin-token", refresh_token: "refresh-token", user: { id: 1, username: "admin", role_name: "Administrator" } }
+        : path.startsWith("/incidents/metadata")
+          ? { rows: [valid] }
+          : path.startsWith("/alerts/all")
+            ? { data: { rows: [{ id: alertId, alert_id: alertId, incident_id: incidentId, name: "GatewayFailure", service: "api-gateway" }] } }
+            : path.startsWith(`/alerts/${alertId}/processed-result`)
+              ? { data: { alert: { id: alertId, name: "GatewayFailure", service: "api-gateway" }, incident: valid, context: { metadata: {} }, timeline: [] } }
+              : { data: { rows: [] }, rows: [] };
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  });
+
+  await page.goto("/");
+  await page.getByLabel("Username").fill("admin");
+  await page.getByLabel("Password").fill("Admin@123456");
+  await page.getByRole("button", { name: "Sign In" }).click();
+  await page.getByRole("button", { name: /Durable navigation incident/ }).first().click();
+  await expect(page).toHaveURL(new RegExp(`/incidents/${incidentId}$`));
+  await page.goBack();
+  await expect(page).toHaveURL(/\/$/);
+  await page.goForward();
+  await expect(page).toHaveURL(new RegExp(`/incidents/${incidentId}$`));
+  await page.reload();
+  await page.getByLabel("Password").fill("Admin@123456");
+  await page.getByRole("button", { name: "Sign In" }).click();
+  await expect(page.getByRole("heading", { name: "Durable navigation incident" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Open full investigation" }).click();
+  await expect(page).toHaveURL(new RegExp(`workspace=alert&alert_id=${alertId}`));
+
+  await page.goto("/incidents/%20");
+  await page.getByLabel("Password").fill("Admin@123456");
+  await page.getByRole("button", { name: "Sign In" }).click();
+  await expect(page.getByText("Incident not found", { exact: true })).toBeVisible();
+  await expect(page.getByText("No role-authorized incident record matches")).toBeVisible();
+});
+
 test("detail URL reconstructs the selected alert after a page refresh", async ({ page }) => {
   const alertId = "33333333-3333-4333-8333-333333333333";
   const incidentId = "44444444-4444-4444-8444-444444444444";
