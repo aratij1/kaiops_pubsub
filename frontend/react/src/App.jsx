@@ -9929,7 +9929,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         restrictedDestination={restrictedDestination}
       >
       <div className="app-layout kai-legacy-frame">
-        <aside className="sidebar panel sidebar-panel">
+        {!routeOutlet ? <aside className="sidebar panel sidebar-panel">
           <div className="sidebar-head">
             <KaiMSBrand onActivate={() => onNavigatePath?.("/")} />
             <p className="sidebar-mission">From signal to verified resolution.</p>
@@ -10006,7 +10006,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             </div>
           </nav>
 
-        </aside>
+        </aside> : null}
 
         <section className="content-area" id="legacy-workspace-content" tabIndex={-1}>
           <header className="hero">
