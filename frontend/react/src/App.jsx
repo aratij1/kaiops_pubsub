@@ -1462,10 +1462,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     // refresh, browser history navigation, and shared links instead of relying
     // on an in-memory summary-row click from the current session.
     if (ALERT_UUID_PATTERN.test(routeAlertId)) {
+      const snapshotId = String(selectedAlertSnapshot?.alert_id || selectedAlertSnapshot?.id || selectedAlertSnapshot?.incident_id || "").trim();
+      const fallbackRow = snapshotId === routeAlertId
+        ? selectedAlertSnapshot
+        : alerts.rows.find((row) => String(row?.alert_id || row?.id || row?.incident_id || "").trim() === routeAlertId) || null;
       setSelectedAlertId(routeAlertId);
-      setSelectedAlertSnapshot(null);
+      setSelectedAlertSnapshot(fallbackRow);
       setHomeDetailTab("overview");
-      void loadAlertDetails(routeAlertId);
+      void loadAlertDetails(routeAlertId, fallbackRow);
       return;
     }
     // A landing-pad filename can end up in the URL from an earlier click that
@@ -1499,7 +1503,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     if (resolution.status === "pending") {
       setPendingCanonicalAlert(landingPadSourceRow);
     }
-  }, [adminSession.accessToken, activeTab, currentSearch, selectedAlertId, alerts.rows, landingPadRecent.rows]);
+  }, [adminSession.accessToken, activeTab, currentSearch, selectedAlertId, selectedAlertSnapshot, alerts.rows, landingPadRecent.rows]);
 
   function openGlobalOperationalItem(item) {
     if (!item?.row) return;
@@ -1576,11 +1580,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       || selectedAlertSnapshot?.incident_id
       || ""
     );
-    const snapshotInCurrentScope = filterRowsForMonitor(
-      selectedAlertSnapshot ? [selectedAlertSnapshot] : [],
-      applicationToMonitor,
-    ).length > 0;
-    const hasSelectedSnapshot = Boolean(selectedAlertId && snapshotAlertId === String(selectedAlertId) && snapshotInCurrentScope);
+    // An explicit incident drill-down owns its selection. Dashboard scope
+    // filters must not discard the clicked row while its full payload hydrates.
+    const hasSelectedSnapshot = Boolean(selectedAlertId && snapshotAlertId === String(selectedAlertId));
     if (activeTab !== "home") {
       return;
     }
@@ -5395,11 +5397,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       || selectedAlertSnapshot?.incident_id
       || ""
     );
-    const snapshotInCurrentScope = filterRowsForMonitor(
-      selectedAlertSnapshot ? [selectedAlertSnapshot] : [],
-      applicationToMonitor,
-    ).length > 0;
-    const snapshotRow = snapshotId === selectedAlertId && snapshotInCurrentScope ? selectedAlertSnapshot : null;
+    const snapshotRow = snapshotId === selectedAlertId ? selectedAlertSnapshot : null;
     const payload = selectedAlertData?.payload?.data || selectedAlertData?.payload || {};
     const processedAlert = payload?.alert && typeof payload.alert === "object" ? payload.alert : {};
     const processedIncident = payload?.incident && typeof payload.incident === "object" ? payload.incident : {};

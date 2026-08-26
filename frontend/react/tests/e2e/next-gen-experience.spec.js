@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 const INCIDENT_ID = "11111111-1111-4111-8111-111111111111";
+const ALERT_ID = "66666666-6666-4666-8666-666666666666";
 const RECOMMENDATION_ID = "22222222-2222-4222-8222-222222222222";
 const APPLICATION_ID = "33333333-3333-4333-8333-333333333333";
 const PLAN_ID = "44444444-4444-4444-8444-444444444444";
@@ -16,7 +17,7 @@ function incident(overrides = {}) {
   const now = new Date().toISOString();
   return {
     incident_id: INCIDENT_ID,
-    alert_id: "ALERT-NEXT-1",
+    alert_id: ALERT_ID,
     recommendation_id: RECOMMENDATION_ID,
     title: "Checkout latency affecting payments",
     summary: "18% of checkout attempts are failing",
@@ -246,6 +247,16 @@ test("signal to RCA to approval to canary validation and closure remains evidenc
   await expect(page.locator(".ic-validation")).toContainText("Recovery verified");
   await expect(page.locator(".ic-validation")).toContainText("12.4%");
   await expect(page.locator(".ic-validation")).toContainText("0.8%");
+});
+
+test("Full investigation retains the clicked incident while alert details hydrate", async ({ page }) => {
+  await installScenario(page);
+  await signIn(page, `/incidents/${INCIDENT_ID}`);
+
+  await page.getByRole("button", { name: "Open full investigation" }).click();
+  await expect(page).toHaveURL(new RegExp(`workspace=alert&alert_id=${ALERT_ID}`));
+  await expect(page.locator(".alert-details-cockpit").getByRole("heading", { name: "Incident Response" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Alert Details Cockpit" })).toHaveCount(0);
 });
 
 test("signed backend readiness blocks diagnostic plans from approval", async ({ page }) => {
