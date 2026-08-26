@@ -182,6 +182,7 @@ services:
       mysql: { condition: service_healthy }
 
   api-gateway:
+    build: *service-build
     image: kaiops-consolidated-api-gateway:latest
     environment: { <<: *service-env, SERVICE_NAME: api-gateway }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

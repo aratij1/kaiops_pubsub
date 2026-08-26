@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from fastapi import APIRouter, Depends, Header, Request
 
 from api_gateway.modules.users.permissions import AuthContext, current_auth_context, get_user_service, require_roles
@@ -23,6 +25,25 @@ from common.config import get_settings
 
 router = APIRouter(tags=["user-management"])
 settings = get_settings()
+
+
+@router.get("/auth/config")
+async def auth_config() -> dict:
+    mode = str(os.getenv("AUTH_MODE", "local") or "local").strip().lower()
+    if mode not in {"local", "oidc"}:
+        mode = "local"
+    return {
+        "mode": mode,
+        "local_development_only": mode == "local",
+        "issuer": os.getenv("OIDC_ISSUER") or None,
+        "client_id": os.getenv("OIDC_CLIENT_ID") or None,
+        "audience": os.getenv("OIDC_AUDIENCE") or None,
+        "authorization_endpoint": os.getenv("OIDC_AUTHORIZATION_ENDPOINT") or None,
+        "token_endpoint": os.getenv("OIDC_TOKEN_ENDPOINT") or None,
+        "redirect_uri": os.getenv("OIDC_REDIRECT_URI") or None,
+        "scope": os.getenv("OIDC_SCOPE", "openid profile email"),
+        "pkce_required": True,
+    }
 
 
 def _client_ip(request: Request, x_forwarded_for: str | None) -> str | None:

@@ -1,0 +1,23 @@
+.audit-workspace { display: grid; gap: 16px; }
+.audit-hero { display: grid; grid-template-columns: auto 1fr auto; gap: 16px; align-items: center; padding: 22px; border: 1px solid #cddde8; border-radius: 16px; background: linear-gradient(135deg,#f8fbfd,#eef5f8); }
+.audit-hero h2,.audit-ledger h3 { margin: 2px 0 4px; }
+.audit-hero p { margin: 0; color: var(--muted); }
+.audit-hero > div > span,.audit-ledger header span { color: #176b87; font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.audit-hero-icon { display: grid; place-items: center; width: 48px; height: 48px; border-radius: 13px; color: #fff; background: #176b87; }
+.audit-hero button { display: inline-flex; gap: 7px; align-items: center; }
+.audit-metrics { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 10px; }
+.audit-metrics article { display: flex; gap: 11px; align-items: center; padding: 15px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.audit-metrics article > svg { color: #176b87; }
+.audit-metrics span { display: grid; }
+.audit-metrics strong { font-size: 22px; }
+.audit-metrics small { color: var(--muted); }
+.audit-warning { display: flex; gap: 10px; padding: 13px; border: 1px solid #e7bc5e; border-radius: 10px; background: #fff8e5; }
+.audit-warning span { display: grid; }
+.audit-ledger { overflow: hidden; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+.audit-ledger > header { display: flex; justify-content: space-between; align-items: center; padding: 16px 18px; border-bottom: 1px solid var(--line); }
+.audit-ledger > header small { color: var(--muted); }
+.audit-ledger th,.audit-ledger td { white-space: nowrap; }
+.audit-ledger td:nth-child(2) { width: 36%; white-space: normal; }
+.audit-empty { display: flex; justify-content: center; gap: 10px; align-items: center; padding: 30px; color: var(--muted); }
+.audit-empty span { display: grid; }
+@media (max-width: 900px) { .audit-metrics { grid-template-columns: repeat(2,minmax(0,1fr)); } .audit-hero { grid-template-columns: auto 1fr; } .audit-hero button { grid-column: 1 / -1; justify-self: start; } }

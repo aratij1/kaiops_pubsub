@@ -67,3 +67,29 @@ test("a restricted deep link redirects with a clear role explanation", async ({ 
   await expect(page.getByRole("status")).toContainText("Users & Access is not available to your role");
   await expect(page.getByRole("navigation", { name: "Primary navigation" })).not.toContainText("Administration");
 });
+
+test("automation and audit render distinct governance workspaces", async ({ page }) => {
+  await page.route("**/api-gateway/**", async (route) => {
+    const path = new URL(route.request().url()).pathname.replace(/^\/api-gateway/, "");
+    const body = path === "/auth/config"
+      ? { mode: "local", local_development_only: true }
+      : path === "/auth/login"
+        ? { access_token: "admin-token", refresh_token: "refresh-token", user: { id: 1, username: "admin", role_name: "Administrator" } }
+        : path === "/gateway/recent"
+          ? { data: { rows: [{ id: "evt-1", created_at: "2026-08-26T12:00:00Z", path: "/alerts", status_code: 200, trace_id: "trace-1", safety: { decision: "allow", score: 0.96, reasons: ["policy passed"] } }] } }
+          : { data: { rows: [] }, rows: [], summary: {} };
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  });
+
+  await page.goto("/automation");
+  await page.getByLabel("Username").fill("admin");
+  await page.getByLabel("Password").fill("Admin@123456");
+  await page.getByRole("button", { name: /Sign in/i }).click();
+  await expect(page.getByRole("heading", { name: "Automation governance operators can understand" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Audit", exact: true }).click();
+  await expect(page).toHaveURL(/\/audit$/);
+  await expect(page.getByRole("heading", { name: "Audit trail" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Recorded gateway activity" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Automation governance operators can understand" })).toHaveCount(0);
+});

@@ -6,6 +6,7 @@ export type LegacyTabId =
   | "admin"
   | "trace"
   | "safety"
+  | "audit"
   | "rag"
   | "closed"
   | "summary"
@@ -53,7 +54,7 @@ export const NAVIGATION_ITEMS: readonly NavigationItem[] = [
   { id: "integrations", legacyTab: "admin", path: "/integrations", label: "Integrations", pageTitle: "Integration Launchpad", group: "platform", routeModule: "integrations", icon: "integrations", keywords: ["connectors", "monitoring", "providers", "onboarding"], allowedRoles: ENGINEERING_ROLES },
   { id: "knowledge", legacyTab: "rag", path: "/knowledge", label: "Knowledge", pageTitle: "Operational Knowledge", group: "platform", routeModule: "knowledge", icon: "knowledge", keywords: ["runbooks", "rag", "documents", "evidence"], allowedRoles: ENGINEERING_ROLES },
   { id: "safety", legacyTab: "safety", path: "/automation", label: "Automation", pageTitle: "AI Trust & Automation", group: "governance", routeModule: "gateway-safety", icon: "safety", keywords: ["autonomy", "policy", "risk", "guardrail", "trust"], allowedRoles: ENGINEERING_ROLES },
-  { id: "audit", legacyTab: "safety", path: "/audit", label: "Audit", pageTitle: "Audit Trail", group: "governance", routeModule: "audit", icon: "audit", keywords: ["history", "compliance", "events"], allowedRoles: ENGINEERING_ROLES },
+  { id: "audit", legacyTab: "audit", path: "/audit", label: "Audit", pageTitle: "Audit Trail", group: "governance", routeModule: "audit", icon: "audit", keywords: ["history", "compliance", "events"], allowedRoles: ENGINEERING_ROLES },
   { id: "closed", legacyTab: "closed", path: "/closed-incidents", label: "Closed Incidents", pageTitle: "Closed Incidents", group: "governance", routeModule: "closed-incidents", icon: "closed", keywords: ["resolved", "historical", "tickets"], allowedRoles: INCIDENT_ROLES, related: ["incidents"], showInNavigation: false },
   { id: "admin", legacyTab: "admin", path: "/admin/users", label: "Users & Access", pageTitle: "Users & Access", group: "administration", routeModule: "admin", icon: "admin", keywords: ["users", "roles", "access", "identity"], allowedRoles: ["administrator"] },
   { id: "settings", legacyTab: "admin", path: "/service-control", label: "Service Control", pageTitle: "Service Control Panel", group: "platform", routeModule: "admin", icon: "settings", keywords: ["platform", "services", "health", "status", "control panel"], allowedRoles: ENGINEERING_ROLES },
