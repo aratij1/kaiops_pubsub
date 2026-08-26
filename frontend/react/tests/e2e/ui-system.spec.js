@@ -57,6 +57,42 @@ for (const [path, pageTitle, workspaceSelector] of routes) {
   });
 }
 
+test("desktop routed shell gives the Unified Inbox the full workspace", async ({ page }) => {
+  await page.setViewportSize({ width: 1365, height: 768 });
+  await mockPlatform(page);
+  await signIn(page, "/incidents");
+  await expect(page.getByRole("heading", { level: 1, name: "Unified Inbox" })).toBeVisible({ timeout: 30_000 });
+  const inboxWorkspace = page.locator(".operations-center:visible");
+  await expect(inboxWorkspace).toBeVisible();
+
+  const geometry = await inboxWorkspace.evaluate((inboxElement) => {
+    const rect = (element) => element.getBoundingClientRect();
+    const routedFrame = inboxElement.closest(".kai-routed-frame");
+    const workspaceElement = inboxElement.closest(".kai-workspace-frame");
+    const shellElement = inboxElement.closest(".kai-shell");
+    const shell = rect(shellElement);
+    const workspace = rect(workspaceElement);
+    const inbox = rect(inboxElement);
+    const routedStyle = getComputedStyle(routedFrame);
+    return {
+      viewportWidth: window.innerWidth,
+      shellLeft: shell.left,
+      shellWidth: shell.width,
+      workspaceWidth: workspace.width,
+      inboxWidth: inbox.width,
+      routedDisplay: routedStyle.display,
+      routedColumns: routedStyle.gridTemplateColumns,
+    };
+  });
+
+  expect(geometry.shellLeft).toBeLessThan(1);
+  expect(geometry.shellWidth).toBeGreaterThan(geometry.viewportWidth - 20);
+  expect(geometry.workspaceWidth).toBeGreaterThan(geometry.viewportWidth - 260);
+  expect(geometry.inboxWidth).toBeGreaterThan(geometry.viewportWidth - 340);
+  expect(geometry.routedDisplay).toBe("block");
+  expect(geometry.routedColumns).toBe("none");
+});
+
 test("representative operational routes reflow and retain accessible semantics", async ({ page }) => {
   test.setTimeout(120_000);
   await mockPlatform(page);
