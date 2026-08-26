@@ -7,6 +7,7 @@ import { useOperationalEvents } from "./services/operationalEvents";
 import { beginOidcLogin, clearStoredSession, completeOidcLogin, restoreStoredSession, storeSessionTokens } from "./services/oidcClient";
 import { RouteRuntimeProvider } from "./app/routeRuntime";
 import { projectIdentityFromAlert } from "./domain/projectIdentity";
+import { isExpectedAnalysisVersion } from "./domain/analysisVersion";
 import { durableIncidentPath, effectiveExecutionStatus, effectiveIncidentStatus, executionProcessPresentation, incidentStatusLabel } from "./domain/incidentStatus";
 import { resolveResolutionControl } from "./domain/resolutionControl";
 import { incidentDraftHasSubstantiveContent, simpleIncidentReport } from "./domain/incidentReport";
@@ -2212,9 +2213,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           }));
           latestPayload = payload;
           const data = unwrap(payload) || {};
-          const workflow = data?.workflow && typeof data.workflow === "object" ? data.workflow : data;
-          const recommendationId = String(workflow?.recommendation?.id || data?.recommendation?.id || "").trim();
-          if (alertAnalysisReady(payload) && recommendationId === expectedRecommendationId) {
+          if (alertAnalysisReady(payload) && isExpectedAnalysisVersion(data, expectedRecommendationId)) {
             return { ready: true, payload, attempts: index + 1 };
           }
         }

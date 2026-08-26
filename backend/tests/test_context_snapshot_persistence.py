@@ -91,3 +91,42 @@ async def test_context_snapshot_and_outbox_are_committed_once(sqlite_session_fac
     assert snapshot.context_fingerprint == context.metadata["context_fingerprint"]
     assert snapshot.contract_version == "kaiops.context.v2"
     assert snapshot.expires_at >= snapshot.collected_at
+
+
+@pytest.mark.asyncio
+async def test_regeneration_preserves_prior_snapshot_and_binds_new_generation(sqlite_session_factory) -> None:
+    module = load_context_app_module()
+    module.settings.database_enabled = True
+    module.app.state.session_factory = sqlite_session_factory
+    alert = Alert(
+        tenant_id="tenant-a", source="prometheus", name="CheckoutErrors", service="checkout",
+        environment="prod", severity=AlertSeverity.HIGH, description="checkout errors",
+    )
+    incident = Incident(
+        tenant_id=alert.tenant_id, service=alert.service, environment=alert.environment,
+        severity=alert.severity, title=alert.name,
+    )
+    base = govern_context(
+        Context(tenant_id=alert.tenant_id, incident_id=incident.id, alert=alert),
+        tenant_id="tenant-a",
+        subject_fingerprint=context_subject_fingerprint(alert, "tenant-a"),
+    )
+    snapshot_ids: list[str] = []
+    for request_id in ("request-v1", "request-v2"):
+        context = base.model_copy(update={"metadata": {**base.metadata, "analysis_request_id": request_id}})
+        outgoing = module._build_context_event_payload(
+            alert=alert, incident=incident, context=context,
+            decision={"flow_id": str(incident.id)}, provider_used="rabbitmq",
+        )
+        assert await module._persist_context_event(
+            app=module.app, alert=alert, incident=incident, context=context,
+            decision={"flow_id": str(incident.id)}, provider_used="rabbitmq", outgoing_payload=outgoing,
+        ) is True
+        snapshot_ids.append(outgoing["context"]["metadata"]["context_snapshot_id"])
+
+    async with sqlite_session_factory() as session:
+        snapshots = (await session.execute(select(ContextSnapshotRecord))).scalars().all()
+
+    assert len(snapshots) == 2
+    assert snapshot_ids[0] != snapshot_ids[1]
+    assert {str(row.snapshot_id) for row in snapshots} == set(snapshot_ids)

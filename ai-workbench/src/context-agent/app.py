@@ -506,6 +506,21 @@ async def _persist_context_event(
     quality = context.metadata.get("context_quality") if isinstance(context.metadata.get("context_quality"), dict) else {}
     context_fingerprint = str(context.metadata.get("context_fingerprint") or "")
     subject_fingerprint = str(context.metadata.get("context_subject_fingerprint") or "")
+    analysis_request_id = str(context.metadata.get("analysis_request_id") or "").strip()
+    snapshot_identity = analysis_request_id or context_fingerprint
+    snapshot_id = uuid5(
+        NAMESPACE_URL,
+        f"kaims:context-snapshot:{tenant_id}:{incident.id}:{snapshot_identity}",
+    )
+    outgoing_context = outgoing_payload.get("context")
+    if isinstance(outgoing_context, dict):
+        outgoing_metadata = outgoing_context.get("metadata")
+        outgoing_metadata = outgoing_metadata if isinstance(outgoing_metadata, dict) else {}
+        outgoing_context["metadata"] = {
+            **outgoing_metadata,
+            "context_snapshot_id": str(snapshot_id),
+            "context_snapshot_identity": snapshot_identity,
+        }
     event_id = str((outgoing_payload.get("event_contract") or {}).get("event_id") or "")
     collected_at_raw = str(context.metadata.get("context_collected_at") or "")
     try:
@@ -573,19 +588,16 @@ async def _persist_context_event(
                     "context_evidence": context.metadata.get("context_evidence", {}),
                     "context_quality": quality,
                     "context_fingerprint": context_fingerprint,
+                    "context_snapshot_id": str(snapshot_id),
+                    "analysis_request_id": analysis_request_id or None,
                     "subject_fingerprint": subject_fingerprint,
                 },
             )
-        analysis_request_id = str(context.metadata.get("analysis_request_id") or "").strip()
         audit_identity = analysis_request_id or context_fingerprint
         incident_event["event_id"] = str(
             uuid5(NAMESPACE_URL, f"kaims:context-audit:{incident.id}:{audit_identity}")
         )
         await repo.save_incident_event(incident_event)
-        snapshot_id = uuid5(
-            NAMESPACE_URL,
-            f"kaims:context-snapshot:{tenant_id}:{incident.id}:{context_fingerprint}",
-        )
         await repo.save_context_snapshot(
             snapshot_id=snapshot_id,
             tenant_id=tenant_id,
@@ -598,7 +610,7 @@ async def _persist_context_event(
             quality_score=float(quality.get("quality_score") or 0.0),
             reusable=bool(quality.get("reusable")),
             source_manifest=context.metadata.get("context_sources", {}),
-            payload=context.model_dump(mode="json"),
+            payload=outgoing_context if isinstance(outgoing_context, dict) else context.model_dump(mode="json"),
             collected_at=collected_at,
             expires_at=expires_at,
         )

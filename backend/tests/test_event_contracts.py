@@ -237,7 +237,25 @@ async def test_analysis_request_identity_flows_from_context_to_recommendation() 
     assert first.metadata["force_full_analysis"] is True
     assert first_payload["event_contract"]["event_id"].endswith(first_request_id)
     assert second_payload["event_contract"]["event_id"].endswith(second_request_id)
-    assert resolution_agent_app._deterministic_recommendation_id(first) != resolution_agent_app._deterministic_recommendation_id(second)
+    assert (
+        resolution_agent_app._deterministic_recommendation_id(first)
+        != resolution_agent_app._deterministic_recommendation_id(second)
+    )
+
+    first = first.model_copy(update={"metadata": {**first.metadata, "context_snapshot_id": "snapshot-v1"}})
+    recommendation = Recommendation(
+        id=resolution_agent_app._deterministic_recommendation_id(first),
+        tenant_id=first.tenant_id, incident_id=first.incident_id,
+        root_cause="Insufficient evidence", confidence=0.2, impact="Unknown",
+        recommended_action="Collect evidence", severity=first.alert.severity,
+        rationale="Evidence is incomplete", commands=[], risk="low",
+    )
+    resolution_agent_app._attach_rca_governance_binding(recommendation, first)
+    assert recommendation.metadata["analysis_request_id"] == first_request_id
+    assert recommendation.metadata["context_snapshot_id"] == "snapshot-v1"
+    assert recommendation.metadata["context_fingerprint"] == first.metadata["context_fingerprint"]
+    assert recommendation.metadata["rca_version"] == str(recommendation.id)
+    assert recommendation.metadata["recommendation_version"] == str(recommendation.id)
 
 
 @pytest.mark.asyncio

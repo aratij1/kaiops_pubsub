@@ -101,6 +101,44 @@ async def test_keyword_overlap_alone_cannot_confirm_a_hypothesis() -> None:
 
 
 @pytest.mark.asyncio
+async def test_alert_label_never_becomes_confirmed_root_cause_without_corroboration() -> None:
+    context = make_context(hypotheses=[{
+        "cause": "checkout connection pool timeout after deployment",
+        "confidence": 0.99,
+    }])
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    investigator.max_steps = 1
+
+    report = await investigator.investigate(context)
+
+    assert report["conclusive"] is False
+    assert report["rca_result"]["root_cause"] is None
+    assert report["rca_result"]["outcome"] == "INSUFFICIENT_EVIDENCE"
+
+
+@pytest.mark.asyncio
+async def test_conflicting_operational_evidence_is_surfaced_and_blocks_root_cause() -> None:
+    hypothesis = {"cause": "checkout connection pool exhaustion", "confidence": 0.8}
+    client = FakeDiscoveryClient({
+        "changes.search": [{
+            "evidence_id": "LOG-CONTRADICTION",
+            "source": "log",
+            "snippet": "checkout connection pool healthy and normal",
+            "timestamp": "2026-08-20T09:59:30Z",
+        }],
+    })
+    investigator = IterativeInvestigator(client=client)
+    investigator.max_steps = 1
+
+    report = await investigator.investigate(make_context(hypotheses=[hypothesis]))
+
+    assert report["rca_result"]["outcome"] == "CONFLICTING_EVIDENCE"
+    assert report["rca_result"]["root_cause"] is None
+    assert "LOG-CONTRADICTION" in report["rca_result"]["contradicting_evidence_ids"]
+    assert "unresolved_contradicting_evidence" in report["evidence_graph"]["data_gaps"]
+
+
+@pytest.mark.asyncio
 async def test_discovery_client_rejects_mutating_or_unknown_tools() -> None:
     client = ReadOnlyDiscoveryClient()
 

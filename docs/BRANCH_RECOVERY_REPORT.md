@@ -60,4 +60,13 @@ No application implementation from the contaminated commits should be cherry-pic
 
 ## Remaining gates and promotion
 
-Implementation and validation are pending. Neither recovery branch is eligible for promotion until every mandatory backend, frontend, Playwright, Compose, Kubernetes, security, ancestry, and architecture gate passes. Promotion must occur through review of `recovery/kaims-consolidated-main`; `main` must not be force-pushed or replaced.
+Phase 3A and 3B are implemented on the recovery branch with durable navigation, protected-session bootstrap, and isolated audit/admin routing. Phase 3C now enforces explicit evidence scope/provenance fields, adversarial RCA abstention and conflict behavior, generation-specific immutable context snapshots, recommendation-to-snapshot version binding, and stale-response rejection in the frontend.
+
+Phase 3C validation evidence:
+
+- Governed RCA, confidence, investigation, snapshot, and event-contract tests: 32 passed.
+- Frontend ESLint, architecture budget (13,598/13,600), TypeScript, and unit suite: 105 passed across 24 files.
+- Python compilation of every changed RCA/context module and test: passed.
+- A standalone latest-Ruff probe reported pre-existing whole-file formatting debt in legacy modules; no lint rule or configuration was weakened. The canonical repository lint gate remains required in Phase 5.
+
+Approval/remediation, closure, platform controls, deployment validation, and the complete CI gate remain pending. The recovery branch is not eligible for promotion until every mandatory backend, frontend, Playwright, Compose, Kubernetes, security, ancestry, and architecture gate passes. Promotion must occur through review of `recovery/kaims-consolidated-main`; `main` must not be force-pushed or replaced.
