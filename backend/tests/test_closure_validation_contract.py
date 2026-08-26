@@ -39,6 +39,9 @@ def _plan(*, validators: list[dict] | None = None, stability_seconds: int = 60) 
         "schema_version": "kaims.execution-plan.v2",
         "plan_id": str(uuid4()),
         "tenant_id": "tenant-a",
+        "rca_version": "rca-v1",
+        "evidence_snapshot_id": "snapshot-v1",
+        "recommendation_version": "recommendation-v1",
         "validation_endpoints": [],
         "validators": validators,
         "required_validation_kinds": [item["kind"] for item in validators],
@@ -236,6 +239,18 @@ def test_observations_from_another_execution_cannot_close_incident() -> None:
 
     assert report.health_restored is False
     assert report.metadata["independent_validation_observations"] == []
+    assert report.metadata["outcome_validation"]["closure_authorized"] is False
+
+
+def test_changed_rca_snapshot_binding_cannot_close_incident() -> None:
+    plan = _plan(stability_seconds=60)
+    action = _action(plan=plan, completed_seconds_ago=90)
+    action.parameters["execution_plan"]["evidence_snapshot_id"] = "forged-snapshot"
+
+    report = asyncio.run(ClosureValidationAgent().validate(action))
+
+    assert report.validation["approved_plan_fingerprint_preserved"] is False
+    assert report.health_restored is False
     assert report.metadata["outcome_validation"]["closure_authorized"] is False
 
 
