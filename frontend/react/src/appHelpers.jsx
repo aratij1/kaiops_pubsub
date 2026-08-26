@@ -459,6 +459,9 @@ function isGeneratedOrTestAlert(row) {
   const labels = typeof row?.labels === "object" && row.labels ? row.labels : {};
   const metadata = typeof row?.metadata === "object" && row.metadata ? row.metadata : {};
   const annotations = typeof row?.annotations === "object" && row.annotations ? row.annotations : {};
+  const projection = typeof row?.projection_payload === "object" && row.projection_payload ? row.projection_payload : {};
+  const eventPayload = typeof projection?.event_payload === "object" && projection.event_payload ? projection.event_payload : {};
+  const projectionLabels = typeof eventPayload?.labels === "object" && eventPayload.labels ? eventPayload.labels : {};
   const explicitTestFlag = [
     row?.is_test,
     row?.test_alert,
@@ -476,6 +479,7 @@ function isGeneratedOrTestAlert(row) {
     row?.alert_id,
     row?.incident_id,
     row?.name,
+    row?.title,
     row?.alert_name,
     row?.rule_name,
     row?.rule,
@@ -503,6 +507,18 @@ function isGeneratedOrTestAlert(row) {
     metadata?.project,
     metadata?.project_name,
     metadata?.environment,
+    projection?.title,
+    projection?.alert_name,
+    projection?.application,
+    projection?.environment,
+    eventPayload?.title,
+    eventPayload?.name,
+    eventPayload?.alert_name,
+    eventPayload?.application,
+    eventPayload?.environment,
+    projectionLabels?.alertname,
+    projectionLabels?.application,
+    projectionLabels?.environment,
   ].map((value) => String(value || "").toLowerCase()).join(" ");
   return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test|test\d*|testing|demo|sample|mock|synthetic|fake|dummy)([-_\s]|$)/i.test(tokens)
     || tokens.includes("stresspipelinealert")
@@ -676,15 +692,7 @@ function ensureMinimumAlertsBySource(rows, sourceRows, minimums = MIN_VISIBLE_AL
   const candidates = (Array.isArray(sourceRows) ? sourceRows : [])
     .slice()
     .sort((left, right) => alertTimeMs(right) - alertTimeMs(left));
-  const seen = new Set(
-    selected.map((row) => String(
-      row?.alert_id
-      || row?.id
-      || row?.event_id
-      || row?.file
-      || `${normalizeAlertChannel(row)}:${row?.name || ""}:${row?.created_at || row?.received_at || ""}`
-    ))
-  );
+  const seen = new Set(selected.flatMap((row) => alertIdentityKeys(row)));
   const counts = Object.fromEntries(
     Object.keys(minimums).map((channel) => [
       channel,
@@ -698,17 +706,12 @@ function ensureMinimumAlertsBySource(rows, sourceRows, minimums = MIN_VISIBLE_AL
     if (!required || counts[channel] >= required) {
       continue;
     }
-    const identity = String(
-      row?.alert_id
-      || row?.id
-      || row?.event_id
-      || row?.file
-      || `${channel}:${row?.name || ""}:${row?.created_at || row?.received_at || ""}`
-    );
-    if (seen.has(identity)) {
+    const identities = alertIdentityKeys(row);
+    const fallbackIdentity = `${channel}:${row?.name || ""}:${row?.created_at || row?.received_at || ""}`;
+    if (identities.some((identity) => seen.has(identity)) || (!identities.length && seen.has(fallbackIdentity))) {
       continue;
     }
-    seen.add(identity);
+    (identities.length ? identities : [fallbackIdentity]).forEach((identity) => seen.add(identity));
     selected.push(row);
     counts[channel] += 1;
   }
@@ -983,7 +986,14 @@ function dedupeAndConsolidateAlertRows(rows, options = {}) {
           ? true
           : !existingIsLandingPad && incomingIsLandingPad
             ? false
-            : incomingScore > existingScore || (incomingScore === existingScore && incomingTime > existingTime);
+          : incomingScore > existingScore || (incomingScore === existingScore && incomingTime > existingTime);
+      const priorRow = group.row;
+      const priorCanonicalId = [priorRow?.alert_id, priorRow?.id]
+        .map((value) => String(value || "").trim())
+        .find((value) => ALERT_UUID_PATTERN.test(value)) || "";
+      const incomingCanonicalId = [row?.alert_id, row?.id]
+        .map((value) => String(value || "").trim())
+        .find((value) => ALERT_UUID_PATTERN.test(value)) || "";
       const priorApplication = alertApplicationCandidate(group.row);
       const incomingApplication = alertApplicationCandidate(row);
       if (shouldReplace) {
@@ -994,6 +1004,23 @@ function dedupeAndConsolidateAlertRows(rows, options = {}) {
       } else if (!priorApplication && incomingApplication) {
         group.row.application = incomingApplication;
       }
+      // Landing-pad occurrences can be newer than their canonical database
+      // row regardless of input order. Their filename is not an alert
+      // identity, so always merge the UUID and downstream relationship fields
+      // from the row that was not selected as the display state.
+      const canonicalId = incomingCanonicalId || priorCanonicalId;
+      const selectedCanonicalId = [group.row?.alert_id, group.row?.id]
+        .map((value) => String(value || "").trim())
+        .find((value) => ALERT_UUID_PATTERN.test(value)) || "";
+      if (!selectedCanonicalId && canonicalId) {
+        group.row.id = canonicalId;
+        group.row.alert_id = canonicalId;
+      }
+      const relationshipRow = shouldReplace ? priorRow : row;
+      ["incident_id", "ticket_id", "jira_key", "jira_url", "incident_projection", "correlation_id", "trace_id"]
+        .forEach((field) => {
+          if (!group.row[field] && relationshipRow?.[field]) group.row[field] = relationshipRow[field];
+        });
     }
 
     // Register every candidate key from this row against the resolved group so a later

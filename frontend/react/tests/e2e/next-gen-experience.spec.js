@@ -173,7 +173,8 @@ async function installScenario(page, options = {}) {
       return route.fulfill(json({ data: { status: "succeeded", incident_id: INCIDENT_ID } }));
     }
     if (path.startsWith("/alerts/all")) return route.fulfill(json({ data: { rows: options.alerts || [] } }));
-    if (path.startsWith("/landing-pad/recent") || path.startsWith("/alerts/applications")) return route.fulfill(json({ data: { rows: [] } }));
+    if (path.startsWith("/landing-pad/recent")) return route.fulfill(json({ data: { rows: options.landingAlerts || [] } }));
+    if (path.startsWith("/alerts/applications")) return route.fulfill(json({ data: { rows: [] } }));
     if (path.startsWith("/operations/queue-health")) return route.fulfill(json({ status: "healthy", healthy: true }));
     return route.fulfill(json({ data: { rows: [] }, rows: [], summary: {}, items: [] }));
   });
@@ -247,6 +248,36 @@ test("signal to RCA to approval to canary validation and closure remains evidenc
   await expect(page.locator(".ic-validation")).toContainText("Recovery verified");
   await expect(page.locator(".ic-validation")).toContainText("12.4%");
   await expect(page.locator(".ic-validation")).toContainText("0.8%");
+});
+
+test("a newer live occurrence retains its canonical incident link into Unified Inbox", async ({ page }) => {
+  test.setTimeout(90_000);
+  const fingerprint = "linked-alert-fingerprint";
+  const now = Date.now();
+  await installScenario(page, {
+    alerts: [{
+      id: ALERT_ID, alert_id: ALERT_ID, incident_id: INCIDENT_ID,
+      name: "CheckoutLatencyHigh", service: "checkout-api", application: "KaiOps", environment: "production",
+      severity: "critical", created_at: new Date(now - 60_000).toISOString(),
+      labels: { alertname: "CheckoutLatencyHigh", alert_fingerprint: fingerprint, service: "checkout-api", application: "KaiOps" },
+    }],
+    landingAlerts: [{
+      file: "20260826T050115Z_checkout_latency.json", name: "CheckoutLatencyHigh", service: "checkout-api",
+      severity: "critical", received_at: new Date(now).toISOString(),
+      labels: { alertname: "CheckoutLatencyHigh", alert_fingerprint: fingerprint, service: "checkout-api", application: "KaiOps" },
+    }],
+  });
+  await signIn(page, "/alerts");
+
+  const linkedAction = page.getByRole("button", { name: "Open in Unified Inbox" });
+  await expect(linkedAction).toBeVisible();
+  await linkedAction.click();
+  await expect(page).toHaveURL(new RegExp(`/incidents/${INCIDENT_ID}$`));
+  await expect(page.getByRole("heading", { name: "Unified Inbox" })).toBeVisible();
+  await expect(page.getByText("Checkout latency affecting payments", { exact: true }).first()).toBeVisible();
+  await page.getByRole("button", { name: "Incident inbox" }).click();
+  await expect(page.locator(".unified-inbox-card.is-incident")).toHaveCount(1);
+  await expect(page.locator(".unified-inbox-card.is-signal")).toHaveCount(0);
 });
 
 test("Full investigation retains the clicked incident while alert details hydrate", async ({ page }) => {
