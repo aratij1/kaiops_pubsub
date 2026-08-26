@@ -12,6 +12,9 @@ def _approval_plan(incident_id: str) -> dict:
         "tenant_id": "tenant-a",
         "incident_id": incident_id,
         "plan_id": "33333333-3333-3333-3333-333333333333",
+        "rca_version": "rca-v1",
+        "evidence_snapshot_id": "snapshot-v1",
+        "recommendation_version": "22222222-2222-2222-2222-222222222222",
         "execution_ready": True,
         "diagnostic_only": False,
         "plan_kind": "remediation",
@@ -124,6 +127,9 @@ def test_approval_readiness_is_backend_signed_only_when_every_gate_passes() -> N
         "tenant_id": "tenant-a",
         "incident_id": "11111111-1111-1111-1111-111111111111",
         "plan_id": "33333333-3333-3333-3333-333333333333",
+        "rca_version": "rca-v1",
+        "evidence_snapshot_id": "snapshot-v1",
+        "recommendation_version": "22222222-2222-2222-2222-222222222222",
         "execution_ready": True,
         "diagnostic_only": False,
         "plan_kind": "remediation",
@@ -168,6 +174,26 @@ def test_approval_readiness_fails_closed_without_signing_key() -> None:
     assert receipt["state"] == "blocked"
     assert "readiness_signing_key" in receipt["missing"]
     assert receipt["signature"] == ""
+
+
+def test_approval_readiness_rejects_raw_credentials() -> None:
+    module = load_approval_app_module()
+    module.settings.service_internal_token = "internal-test-token"
+    plan = _approval_plan("11111111-1111-1111-1111-111111111111")
+    metadata = _readiness_metadata(plan)
+    metadata["connection_profile"] = {"credential_ref": "plain-text-password"}
+    receipt = module._signed_approval_readiness({
+        "tenant_id": "tenant-a",
+        "incident_id": plan["incident_id"],
+        "recommendation": {
+            "id": plan["recommendation_version"],
+            "tenant_id": "tenant-a",
+            "metadata": metadata,
+        },
+    })
+
+    assert receipt["state"] == "blocked"
+    assert "current_credentials" in receipt["missing"]
 
 
 def test_approval_request_rejects_placeholder_tenant(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -384,6 +410,37 @@ async def test_approval_rejects_cross_tenant_or_changed_plan(
         await module._approval_from_request(request, module.ApprovalDecision.APPROVED)
 
     assert exc_info.value.status_code == status_code
+
+
+@pytest.mark.asyncio
+async def test_approval_rejects_stale_recommendation_and_records_exact_governance_binding() -> None:
+    module = load_approval_app_module()
+    incident_id = "11111111-1111-1111-1111-111111111111"
+    current_recommendation_id = "22222222-2222-2222-2222-222222222222"
+    stale_recommendation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    plan = _set_pending_plan(module, incident_id, current_recommendation_id)
+    stale_request = module.ApprovalRequest(
+        incident_id=incident_id,
+        recommendation_id=stale_recommendation_id,
+        tenant_id="tenant-a",
+        plan_id=plan["plan_id"],
+        plan_fingerprint=plan["plan_fingerprint"],
+        approver="l2.engineer",
+    )
+
+    with pytest.raises(module.HTTPException, match="stale") as exc_info:
+        await module._approval_from_request(stale_request, module.ApprovalDecision.APPROVED)
+    assert exc_info.value.status_code == 409
+
+    current_request = stale_request.model_copy(update={"recommendation_id": current_recommendation_id})
+    approval = await module._approval_from_request(current_request, module.ApprovalDecision.APPROVED)
+
+    assert approval.metadata["rca_version"] == "rca-v1"
+    assert approval.metadata["evidence_snapshot_id"] == "snapshot-v1"
+    assert approval.metadata["recommendation_version"] == current_recommendation_id
+    assert approval.metadata["target_resource_id"] == plan["target_resource_id"]
+    assert approval.metadata["connector_id"] == plan["connector_id"]
+    assert approval.metadata["rollback_plan"] == plan["rollback_commands"]
 
 
 @pytest.mark.asyncio
