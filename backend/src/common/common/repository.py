@@ -1767,6 +1767,14 @@ class IncidentRepository:
             )
         )
         projection_record = projection_result.scalar_one_or_none()
+        current_recommendation_id = (
+            projection_record.recommendation_id if projection_record is not None else None
+        )
+        current_approval_rows = [
+            approval for approval in approval_rows
+            if current_recommendation_id is None
+            or approval.recommendation_id == current_recommendation_id
+        ]
         latest_approval = approval_rows[0] if approval_rows else None
         latest_action = action_rows[0] if action_rows else None
         lifecycle_status = reduce_incident_status(
@@ -1855,6 +1863,17 @@ class IncidentRepository:
             evidence_sources = [f"event:{event_type}" for event_type in matched]
             state = "complete" if persisted else "waiting"
 
+            if row["stage"] == "approval_recorded":
+                # Approval is immutable authorization for one recommendation
+                # version. Historical approval events must not make a newly
+                # regenerated plan appear approved.
+                persisted = bool(current_approval_rows)
+                matched = matched if persisted else []
+                evidence_sources = (
+                    ["relational:approvals/current-recommendation"] if persisted else []
+                )
+                state = "complete" if persisted else "waiting"
+
             # Use persisted relational evidence to avoid under-reporting when some
             # services emit equivalent terminal states under different event names.
             if row["stage"] == "alert_enriched" and not persisted:
@@ -1875,9 +1894,7 @@ class IncidentRepository:
                     state = "in_progress"
                     evidence_sources.append("relational:agent_work_items/context-started")
             elif row["stage"] == "approval_recorded" and not persisted:
-                persisted = len(approval_rows) > 0
-                if persisted:
-                    evidence_sources.append("relational:approvals")
+                persisted = False
             elif row["stage"] == "remediation_executed" and not persisted:
                 policy_blocked_actions = [
                     action

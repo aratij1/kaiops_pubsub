@@ -4228,6 +4228,14 @@ function canonicalIncidentAnalysis(workflow, alertRow = null) {
     report.external_knowledge_error || metadata.external_knowledge_error,
     "",
   );
+  const rcaStatus = String(metadata.rca_status || "").trim().toLowerCase();
+  const analysisStatus = rcaStatus === "insufficient_evidence"
+    ? "insufficient-evidence"
+    : rcaStatus === "grounded"
+      ? "resolved-analysis"
+      : confirmedRootCause
+        ? "resolved-analysis"
+        : hypothesis ? "hypothesis" : "insufficient-evidence";
   return {
     rootCause,
     impact: explicitImpact || "Impact not established from current evidence.",
@@ -4235,7 +4243,7 @@ function canonicalIncidentAnalysis(workflow, alertRow = null) {
     rca,
     impactAnalysis: impact,
     remediation,
-    status: confirmedRootCause ? "resolved-analysis" : hypothesis ? "hypothesis" : "insufficient-evidence",
+    status: analysisStatus,
     confidence: Number(recommendation.confidence ?? rca.confidence_score ?? hypothesis?.confidence ?? 0),
     externalKnowledgeUsed,
     externalKnowledgeEligible,
