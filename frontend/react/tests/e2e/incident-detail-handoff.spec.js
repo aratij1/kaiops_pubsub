@@ -40,6 +40,52 @@ test("incident detail preserves nested alert identity while details load", async
   await expect(page.locator(".ic-command-header")).toContainText("investigating");
 });
 
+test("diagnostic recommendation does not expose execution controls", async ({ page }) => {
+  const alertId = "12121212-1212-4212-8212-121212121212";
+  const incidentId = "34343434-3434-4434-8434-343434343434";
+  const row = {
+    incident_id: incidentId,
+    alert_id: alertId,
+    title: "Insufficient evidence incident",
+    service: "mysql",
+    environment: "prod",
+    status: "investigating",
+    confidence: 0,
+    recommendation: {
+      root_cause: "Investigation inconclusive.",
+      recommended_action: "Collect telemetry and rerun resolution.",
+      confidence: 0,
+      metadata: {
+        execution_plan: {
+          execution_ready: false,
+          readiness_blocks: ["Missing evidence source: telemetry"],
+        },
+      },
+    },
+  };
+  await page.route("**/api-gateway/**", async (route) => {
+    const path = new URL(route.request().url()).pathname.replace(/^\/api-gateway/, "");
+    const body = path === "/auth/config"
+      ? { mode: "local", local_development_only: true }
+      : path === "/auth/login"
+        ? { access_token: "admin-token", refresh_token: "refresh-token", user: { id: 1, username: "admin", role_name: "Administrator" } }
+        : path.startsWith("/incidents/groups")
+          ? { data: { rows: [row], total_count: 1, filtered_count: 1 } }
+          : path === `/incidents/${incidentId}`
+            ? { data: row }
+            : { data: { rows: [] }, rows: [] };
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  });
+
+  await page.goto(`/incidents/${incidentId}`);
+  await signInIfNeeded(page);
+  const executionButton = page.getByRole("button", { name: "Execution unavailable — collect evidence" });
+  await expect(executionButton).toBeVisible();
+  await expect(executionButton).toBeDisabled();
+  await expect(page.getByRole("button", { name: "No execution to control" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: /Approve & let Kai resolve/ })).toHaveCount(0);
+});
+
 test("durable incident history stays separate from the technical workspace and surfaces missing identities", async ({ page }) => {
   const incidentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const alertId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
