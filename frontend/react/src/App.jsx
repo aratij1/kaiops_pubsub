@@ -8701,7 +8701,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     || selectedAlertRagDocuments.some((document) => String(document?.source_system || document?.metadata?.source_system || "").toLowerCase() === "kaims-execution-review");
   const incidentCockpitStages = [
     { id: "overview", short: "01", label: "Orient", accessibleLabel: "Overview", description: "Identity and lifecycle", complete: Boolean(selectedAlertId) },
-    { id: "evidence", short: "02", label: "Evidence & Understanding", accessibleLabel: "Evidence, RCA, and impact", description: `${selectedAlertRagDocuments.length} linked record(s) · RCA and impact`, complete: selectedAlertRagDocuments.length > 0 && Boolean(cockpitAnalysis.rootCause && cockpitAnalysis.rootCause !== "-") },
+    { id: "evidence", short: "02", label: "Evidence & Understanding", accessibleLabel: "Evidence, RCA, and impact", description: `${selectedAiTrust.evidence.length} linked record(s) · RCA and impact`, complete: selectedAiTrust.evidence.length > 0 && Boolean(cockpitAnalysis.rootCause && cockpitAnalysis.rootCause !== "-") },
     { id: "execution", short: "03", label: "Resolve", accessibleLabel: "Resolve incident", description: resolveStageDescription, complete: persistedDiagnosticCompletion || (["closed", "resolved"].includes(selectedCanonicalIncidentStatus) && executionAutoCloses) || (!executionPolicyBlocked && !executionAutoCloses && ["succeeded", "skipped", "failed", "dispatch_failed", "execution_failed", "validation_failed", "rolled_back", "rollback_failed", "timed_out", "cancelled", "manual_intervention_required"].includes(cockpitExecutionStatus)) },
     { id: "audit", short: "04", label: "Validate", accessibleLabel: "Audit Trail", description: selectedCanonicalIncidentStatus === "closed" ? "closed" : executionOutcomeReviewed ? "outcome reviewed" : "audit and recovery", complete: selectedCanonicalIncidentStatus === "closed" || executionOutcomeReviewed },
   ];
@@ -10942,8 +10942,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         <div className="incident-workspace-kpis">
                           <span><strong>{incidentStatusLabel(selectedCanonicalIncidentStatus)}</strong> lifecycle</span>
                           <span><strong>{selectedAlertTimelineRows.length}</strong> events</span>
-                          <span><strong>{selectedAlertRagDocuments.length}</strong> documents</span>
-                          <span className={Number(selectedAlertEvaluation.groundingScore || 0) < 0.5 ? "is-quality-warning" : ""}><strong>{formatQualityPercent(selectedAlertEvaluation.groundingScore)}</strong>{Number(selectedAlertEvaluation.groundingScore || 0) < 0.5 ? "grounding · review required" : "grounded"}</span>
+                          <span><strong>{selectedAiTrust.evidence.length}</strong> linked evidence</span>
+                          <span className={Number(selectedRcaDecision.confidence || 0) < 0.5 ? "is-quality-warning" : ""}><strong>{formatQualityPercent(selectedRcaDecision.confidence)}</strong> RCA confidence</span>
                         </div>
                       </header>
                       <details className="panel incident-workspace-section workspace-collapsible" open>
