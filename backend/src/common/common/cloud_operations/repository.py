@@ -231,6 +231,7 @@ class CloudOperationsRepository:
                 tenant_id=resource.tenant_id,
                 project_id=resource.project_id,
                 connection_id=resource.connection_id,
+                connection_binding_status="bound",
                 service_id=resource.service_id,
                 environment=resource.environment,
                 provider=resource.provider.value,
@@ -255,6 +256,7 @@ class CloudOperationsRepository:
             self.session.add(existing)
         else:
             existing.connection_id = resource.connection_id
+            existing.connection_binding_status = "bound"
             existing.service_id = resource.service_id
             existing.environment = resource.environment
             existing.resource_type = resource.resource_type
@@ -283,6 +285,21 @@ class CloudOperationsRepository:
         return existing
 
     async def upsert_relationship(self, relationship: ResourceRelationship) -> ResourceRelationshipRecord:
+        endpoint_ids = [UUID(relationship.source_resource_id), UUID(relationship.target_resource_id)]
+        endpoints = list(
+            (
+                await self.session.execute(
+                    select(DiscoveredResourceRecord).where(DiscoveredResourceRecord.id.in_(endpoint_ids))
+                )
+            ).scalars().all()
+        )
+        if len(endpoints) != 2 or any(
+            endpoint.tenant_id != relationship.tenant_id
+            or endpoint.project_id != relationship.project_id
+            or endpoint.connection_id != relationship.connection_id
+            for endpoint in endpoints
+        ):
+            raise ValueError("relationship endpoints must belong to the same tenant, project, and connection")
         existing = (
             await self.session.execute(
                 select(ResourceRelationshipRecord).where(
@@ -295,10 +312,13 @@ class CloudOperationsRepository:
             )
         ).scalar_one_or_none()
         if existing is None:
-            existing = ResourceRelationshipRecord(**relationship.model_dump(mode="python"))
+            existing = ResourceRelationshipRecord(
+                **relationship.model_dump(mode="python"), connection_binding_status="bound"
+            )
             self.session.add(existing)
         else:
             existing.connection_id = relationship.connection_id
+            existing.connection_binding_status = "bound"
             existing.source = relationship.source
             existing.relationship_source = relationship.relationship_source
             existing.confidence = relationship.confidence
@@ -1100,6 +1120,7 @@ class CloudOperationsRepository:
             "tenant_id": row.tenant_id,
             "project_id": row.project_id,
             "connection_id": str(row.connection_id) if row.connection_id else None,
+            "connection_binding_status": row.connection_binding_status,
             "service_id": row.service_id,
             "environment": row.environment,
             "provider": row.provider,
@@ -1130,6 +1151,7 @@ class CloudOperationsRepository:
             "tenant_id": row.tenant_id,
             "project_id": row.project_id,
             "connection_id": str(row.connection_id) if row.connection_id else None,
+            "connection_binding_status": row.connection_binding_status,
             "source_resource_id": row.source_resource_id,
             "target_resource_id": row.target_resource_id,
             "relationship_type": row.relationship_type,

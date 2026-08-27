@@ -137,6 +137,45 @@ async def test_repository_round_trip_discovers_and_maps_resources(sqlite_session
 
 
 @pytest.mark.asyncio
+async def test_relationship_rejects_endpoints_from_another_connection(sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        repo = CloudOperationsRepository(session)
+        connections = []
+        discoveries = []
+        for suffix in ("a", "b"):
+            row = await repo.create_connection(
+                CloudConnectionCreate(
+                    tenant_id="tenant-a",
+                    project_id="project-a",
+                    connection_name=f"simulator-{suffix}",
+                    provider_type=ProviderType.SIMULATOR,
+                    credential_ref="simulator://local/read-only",
+                    connection_owner="admin@example.com",
+                )
+            )
+            connection = CloudConnection.model_validate(repo.connection_payload(row))
+            request = DiscoveryRequest(
+                tenant_id="tenant-a",
+                project_id="project-a",
+                service_id=f"service-{suffix}",
+            )
+            discovery = await connector_for(ProviderType.SIMULATOR).discover_resources(connection, request)
+            for resource in discovery.resources:
+                await repo.upsert_resource(resource)
+            connections.append(row)
+            discoveries.append(discovery)
+        await session.flush()
+
+        malicious_edge = discoveries[0].relationships[0].model_copy(
+            update={"target_resource_id": str(discoveries[1].resources[0].id)}
+        )
+        with pytest.raises(ValueError, match="same tenant, project, and connection"):
+            await repo.upsert_relationship(malicious_edge)
+
+        assert connections[0].id != connections[1].id
+
+
+@pytest.mark.asyncio
 async def test_service_onboarding_calculates_readiness_and_cockpit(sqlite_session_factory) -> None:
     async with sqlite_session_factory() as session:
         repo = CloudOperationsRepository(session)

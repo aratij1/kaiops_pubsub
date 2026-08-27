@@ -295,20 +295,21 @@ async def discover_resources(
         if not row.read_capability:
             raise HTTPException(status_code=403, detail="Connection does not grant read capability")
         connection = CloudConnection.model_validate(repo.connection_payload(row))
+        authoritative_request = request.model_copy(update={"project_id": row.project_id})
         try:
             connector = _connector(connection.provider_type)
-            run = await repo.start_discovery(row, request)
-            result = await connector.discover_resources(connection, request)
-            result.run_id = run.id
+            result = await connector.discover_resources(connection, authoritative_request)
         except NotImplementedError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         _validate_discovery_scope(row, result)
-        await repo.complete_discovery(row, run, result, request=request)
+        run = await repo.start_discovery(row, authoritative_request)
+        result.run_id = run.id
+        await repo.complete_discovery(row, run, result, request=authoritative_request)
         await _publish(
             "discovery.completed",
             tenant_id=row.tenant_id,
             project_id=row.project_id,
-            service_id=request.service_id,
+            service_id=authoritative_request.service_id,
             payload={
                 "connection_id": str(row.id),
                 "run_id": str(run.id),
