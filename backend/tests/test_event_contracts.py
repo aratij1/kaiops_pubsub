@@ -55,6 +55,26 @@ assert _MONITORING_SPEC is not None and _MONITORING_SPEC.loader is not None
 monitoring_adapter_app = importlib.util.module_from_spec(_MONITORING_SPEC)
 _MONITORING_SPEC.loader.exec_module(monitoring_adapter_app)
 
+
+def test_inconclusive_diagnostic_recommendation_cannot_await_approval() -> None:
+    metadata = {
+        "iterative_investigation": {"conclusive": False},
+        "rca_analysis": {"evidence_used": []},
+        "execution_plan": {"execution_ready": False, "mutating": False},
+        "resolution_lifecycle": {"state": "awaiting_approval"},
+    }
+    assert resolution_agent_app._resolution_projection_status(metadata, requires_approval=True) == "investigating"
+
+
+def test_only_grounded_executable_recommendation_can_await_approval() -> None:
+    metadata = {
+        "iterative_investigation": {"conclusive": True},
+        "rca_analysis": {"evidence_used": ["metric:checkout:5xx"]},
+        "execution_plan": {"execution_ready": True, "mutating": True},
+        "resolution_lifecycle": {"state": "awaiting_approval"},
+    }
+    assert resolution_agent_app._resolution_projection_status(metadata, requires_approval=True) == "awaiting_approval"
+
 _API_GATEWAY_APP_PATH = Path(__file__).resolve().parents[1] / "src" / "api-gateway" / "app.py"
 _API_GATEWAY_SPEC = importlib.util.spec_from_file_location("api_gateway_app", _API_GATEWAY_APP_PATH)
 assert _API_GATEWAY_SPEC is not None and _API_GATEWAY_SPEC.loader is not None

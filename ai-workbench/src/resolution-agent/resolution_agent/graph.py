@@ -1511,7 +1511,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
         if fallback_hits >= max(1, len(state.get("model_usage", []))):
             score = min(score, 0.49)
 
-        state["confidence"] = round(max(0.05, min(score, 0.99)), 4)
+        if not state.get("rca_analysis", {}).get("evidence_used"):
+            score = 0.0
+        state["confidence"] = round(max(0.0, min(score, 0.99)), 4)
         return state
 
     async def resolve(self, context: Context) -> Recommendation:
@@ -1587,8 +1589,10 @@ class ResolutionIntelligenceAgent(BaseAgent):
             for value in state.get("rca_analysis", {}).get("evidence_used", [])
             if str(value or "").strip()
         ]
-        recommendation.metadata["evidence_ids"] = list(
-            dict.fromkeys([*accepted_evidence_ids, *(item.id for item in evidence)])
+        recommendation.metadata["evidence_ids"] = list(dict.fromkeys(accepted_evidence_ids))
+        recommendation.metadata["descriptive_artifacts"] = [item.model_dump(mode="json") for item in evidence]
+        recommendation.metadata["rca_status"] = (
+            "grounded" if accepted_evidence_ids else "insufficient_evidence"
         )
         recommendation.metadata["reasoning"] = state.get("rationale", "")
         recommendation.metadata["rca_analysis"] = state.get("rca_analysis", {})
