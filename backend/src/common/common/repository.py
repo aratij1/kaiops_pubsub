@@ -62,6 +62,7 @@ from common.database import (
     ValidationObservationRecord,
 )
 from common.incident_status import reduce_incident_status
+from common.incident_investigation import IncidentInvestigationContract
 from common.resolution_lifecycle import select_current_lifecycle
 from common.tenant_identity import require_tenant_id
 
@@ -1169,6 +1170,13 @@ class IncidentRepository:
                 },
                 "context": context_payload,
                 "recommendation": recommendation,
+                "investigation_integrity": {
+                    "status": "missing_recommendation",
+                    "verified": False,
+                    "blocking_reasons": ["alert is not linked to a persisted incident recommendation"],
+                    "recommendation_id": None,
+                    "context_snapshot_id": None,
+                },
                 "approval": {},
                 "remediation_action": {},
                 "closure_report": {},
@@ -1235,28 +1243,39 @@ class IncidentRepository:
         incident_payload["jira_status"] = jira_status
 
 
-        recommendation = {}
-        audit_stmt = (
-            select(AuditLogRecord)
-            .where(AuditLogRecord.resource_type == "incident")
-            .where(AuditLogRecord.resource_id == incident_id_str)
-            .where(AuditLogRecord.action == "recommendation.generated")
-            .where(AuditLogRecord.tenant_id == normalized_tenant_id)
-            .order_by(AuditLogRecord.updated_at.desc(), AuditLogRecord.created_at.desc())
-            .limit(1)
+        bound_projection = (
+            await self.session.execute(
+                select(IncidentProjectionRecord).where(
+                    IncidentProjectionRecord.incident_id == incident_record.id,
+                    IncidentProjectionRecord.alert_id == alert_uuid,
+                    IncidentProjectionRecord.tenant_id == normalized_tenant_id,
+                )
+            )
+        ).scalar_one_or_none()
+        bound_investigation = await self.get_bound_incident_investigation(
+            tenant_id=normalized_tenant_id,
+            incident_id=incident_record.id,
+            alert_id=alert_uuid,
+            recommendation_id=(
+                bound_projection.recommendation_id if bound_projection is not None else None
+            ),
         )
-        audit_result = await self.session.execute(audit_stmt)
-        audit_record = audit_result.scalar_one_or_none()
-        if audit_record is not None and isinstance(audit_record.payload, dict):
-            recommendation = audit_record.payload
+        recommendation = dict(bound_investigation.get("recommendation") or {})
+        investigation_integrity = dict(
+            bound_investigation.get("investigation_integrity") or {}
+        )
 
         approval = {}
-        approval_result = await self.session.execute(
-            select(ApprovalRecord)
-            .where(
+        approval_stmt = select(ApprovalRecord).where(
                 ApprovalRecord.incident_id == UUID(incident_id_str),
                 ApprovalRecord.tenant_id == normalized_tenant_id,
             )
+        if bound_projection is not None and bound_projection.recommendation_id is not None:
+            approval_stmt = approval_stmt.where(
+                ApprovalRecord.recommendation_id == bound_projection.recommendation_id
+            )
+        approval_result = await self.session.execute(
+            approval_stmt
             .order_by(ApprovalRecord.updated_at.desc(), ApprovalRecord.created_at.desc())
             .limit(1)
         )
@@ -1406,9 +1425,11 @@ class IncidentRepository:
             else {}
         )
 
-        durable_context_snapshot = await self.latest_context_snapshot(
-            incident_id_str,
-            tenant_id=str(incident_record.tenant_id or "default"),
+        # The recommendation's immutable snapshot binding is authoritative.  A
+        # newer independently collected snapshot belongs to a later analysis
+        # attempt and must never be substituted here.
+        durable_context_snapshot = dict(
+            bound_investigation.get("context_snapshot") or {}
         )
         context_payload: dict[str, Any] = (
             dict(durable_context_snapshot.get("context") or {})
@@ -1606,6 +1627,32 @@ class IncidentRepository:
         resolution_lifecycle = select_current_lifecycle(
             *({"resolution_lifecycle": item} for item in lifecycle_candidates if isinstance(item, dict))
         )
+        incident_investigation: dict[str, Any] | None = None
+        if investigation_integrity.get("verified") is True:
+            try:
+                incident_investigation = self.build_incident_investigation_contract(
+                    tenant_id=normalized_tenant_id,
+                    project_id=str(
+                        incident_payload.get("project_id")
+                        or alert_payload.get("project_id")
+                        or alert_labels.get("project_id")
+                        or "default"
+                    ),
+                    incident_id=incident_record.id,
+                    alert_id=alert_uuid,
+                    recommendation=recommendation,
+                    context_snapshot=durable_context_snapshot,
+                    approval=approval,
+                    remediation_action=remediation_action,
+                    validation_status=str(closure_report.get("status") or "pending"),
+                )
+            except ValueError:
+                investigation_integrity = {
+                    **investigation_integrity,
+                    "status": "contract_invalid",
+                    "verified": False,
+                    "blocking_reasons": ["bound investigation does not satisfy the canonical runtime contract"],
+                }
 
         return {
             "mode": "db-processed",
@@ -1628,6 +1675,8 @@ class IncidentRepository:
             },
             "context": context_payload,
             "recommendation": recommendation,
+            "incident_investigation": incident_investigation,
+            "investigation_integrity": investigation_integrity,
             "approval": approval,
             "remediation_action": remediation_action,
             "closure_report": closure_report,
@@ -3073,6 +3122,327 @@ class IncidentRepository:
             "collected_at": row.collected_at.isoformat(),
             "expires_at": row.expires_at.isoformat(),
         }
+
+    async def get_bound_incident_investigation(
+        self,
+        *,
+        tenant_id: str,
+        incident_id: UUID | str,
+        alert_id: UUID | str,
+        recommendation_id: UUID | str | None,
+    ) -> dict[str, Any]:
+        """Load one immutable recommendation/context pair and verify its binding.
+
+        This deliberately has no "latest snapshot" fallback.  Callers may still
+        render the alert and incident when integrity fails, but must not present
+        an independently selected context snapshot as RCA support.
+        """
+        normalized_tenant_id = str(self._require("tenant_id", tenant_id))
+        incident_uuid = self._parse_uuid(incident_id)
+        alert_uuid = self._parse_uuid(alert_id)
+        recommendation_uuid = self._parse_uuid(recommendation_id)
+        reasons: list[str] = []
+        referenced_snapshot_id: UUID | None = None
+
+        def result(
+            status: str,
+            *,
+            recommendation: dict[str, Any] | None = None,
+            snapshot: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            if not reasons:
+                reasons.append(status.replace("_", " "))
+            return {
+                "recommendation": recommendation or {},
+                "context_snapshot": snapshot or {},
+                "investigation_integrity": {
+                    "status": status,
+                    "verified": status == "verified",
+                    "blocking_reasons": [] if status == "verified" else list(dict.fromkeys(reasons)),
+                    "recommendation_id": str(recommendation_uuid) if recommendation_uuid else None,
+                    "context_snapshot_id": (
+                        str((snapshot or {}).get("snapshot_id") or referenced_snapshot_id or "").strip() or None
+                    ),
+                },
+            }
+
+        if incident_uuid is None or alert_uuid is None:
+            return result("contract_invalid")
+        if recommendation_uuid is None:
+            return result("missing_recommendation")
+
+        recommendation_record = (
+            await self.session.execute(
+                select(AuditLogRecord).where(
+                    AuditLogRecord.id == recommendation_uuid,
+                    AuditLogRecord.tenant_id == normalized_tenant_id,
+                    AuditLogRecord.resource_type == "incident",
+                    AuditLogRecord.resource_id == str(incident_uuid),
+                    AuditLogRecord.action == "recommendation.generated",
+                )
+            )
+        ).scalar_one_or_none()
+        if recommendation_record is None:
+            return result("missing_recommendation")
+        recommendation = (
+            dict(recommendation_record.payload)
+            if isinstance(recommendation_record.payload, dict)
+            else {}
+        )
+        metadata = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
+        referenced_snapshot_id = self._parse_uuid(metadata.get("context_snapshot_id"))
+        if referenced_snapshot_id is None:
+            reasons.append("recommendation does not reference a context snapshot")
+            status = "missing_snapshot_reference" if metadata.get("analysis_request_id") else "legacy_unbound"
+            return result(status, recommendation=recommendation)
+
+        # Query by immutable ID first so a cross-tenant record is distinguishable
+        # from a missing record without ever returning its contents.
+        snapshot_record = await self.session.get(ContextSnapshotRecord, referenced_snapshot_id)
+        if snapshot_record is None:
+            return result("snapshot_not_found", recommendation=recommendation)
+        if snapshot_record.tenant_id != normalized_tenant_id:
+            return result("tenant_mismatch", recommendation=recommendation)
+        if str(snapshot_record.incident_id) != str(incident_uuid):
+            return result("incident_mismatch", recommendation=recommendation)
+
+        snapshot_payload = dict(snapshot_record.payload) if isinstance(snapshot_record.payload, dict) else {}
+        snapshot_metadata = (
+            snapshot_payload.get("metadata")
+            if isinstance(snapshot_payload.get("metadata"), dict)
+            else {}
+        )
+        bound_alert_id = str(
+            metadata.get("alert_id")
+            or snapshot_metadata.get("alert_id")
+            or snapshot_payload.get("alert_id")
+            or ""
+        ).strip()
+        if bound_alert_id and bound_alert_id != str(alert_uuid):
+            return result("alert_mismatch", recommendation=recommendation)
+
+        expected_fingerprint = str(metadata.get("context_fingerprint") or "").strip()
+        if not expected_fingerprint or expected_fingerprint != str(snapshot_record.context_fingerprint):
+            return result("fingerprint_mismatch", recommendation=recommendation)
+
+        expected_project = str(metadata.get("project_id") or "").strip()
+        snapshot_project = str(
+            snapshot_metadata.get("project_id") or snapshot_payload.get("project_id") or ""
+        ).strip()
+        if expected_project and snapshot_project and expected_project != snapshot_project:
+            return result("project_mismatch", recommendation=recommendation)
+
+        now = datetime.now(UTC)
+        expires_at = snapshot_record.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if expires_at <= now:
+            return result("context_expired", recommendation=recommendation)
+
+        evidence_buckets = snapshot_metadata.get("context_evidence")
+        if not isinstance(evidence_buckets, dict):
+            evidence_buckets = snapshot_payload.get("context_evidence")
+        available_evidence_ids = {
+            str(item.get("evidence_id") or item.get("id") or "").strip()
+            for rows in (evidence_buckets.values() if isinstance(evidence_buckets, dict) else [])
+            if isinstance(rows, list)
+            for item in rows
+            if isinstance(item, dict)
+        }
+        available_evidence_ids.discard("")
+        accepted_evidence = metadata.get("evidence_ids")
+        if not isinstance(accepted_evidence, list):
+            rca_analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
+            accepted_evidence = rca_analysis.get("evidence_used", [])
+        missing_ids = sorted(
+            str(item).strip()
+            for item in accepted_evidence
+            if str(item).strip() and str(item).strip() not in available_evidence_ids
+        )
+        if missing_ids:
+            reasons.append("accepted RCA evidence is absent from the bound context snapshot")
+            return result("evidence_mismatch", recommendation=recommendation)
+
+        snapshot = {
+            "snapshot_id": str(snapshot_record.snapshot_id),
+            "tenant_id": snapshot_record.tenant_id,
+            "incident_id": snapshot_record.incident_id,
+            "context_fingerprint": snapshot_record.context_fingerprint,
+            "contract_version": snapshot_record.contract_version,
+            "quality_score": float(snapshot_record.quality_score or 0.0),
+            "reusable": bool(snapshot_record.reusable),
+            "source_manifest": snapshot_record.source_manifest or {},
+            "context": snapshot_payload,
+            "collected_at": snapshot_record.collected_at.isoformat(),
+            "expires_at": snapshot_record.expires_at.isoformat(),
+        }
+        return result("verified", recommendation=recommendation, snapshot=snapshot)
+
+    async def current_incident_investigation_binding(
+        self, *, tenant_id: str, incident_id: UUID | str, alert_id: UUID | str,
+    ) -> dict[str, str] | None:
+        incident_uuid = self._parse_uuid(incident_id)
+        alert_uuid = self._parse_uuid(alert_id)
+        if incident_uuid is None or alert_uuid is None:
+            return None
+        row = (
+            await self.session.execute(
+                select(IncidentProjectionRecord).where(
+                    IncidentProjectionRecord.tenant_id == self._require("tenant_id", tenant_id),
+                    IncidentProjectionRecord.incident_id == incident_uuid,
+                    IncidentProjectionRecord.alert_id == alert_uuid,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None or row.recommendation_id is None:
+            return None
+        return {
+            "tenant_id": row.tenant_id,
+            "incident_id": str(row.incident_id),
+            "alert_id": str(row.alert_id),
+            "recommendation_id": str(row.recommendation_id),
+        }
+
+    @staticmethod
+    def build_incident_investigation_contract(
+        *,
+        tenant_id: str,
+        project_id: str,
+        incident_id: UUID | str,
+        alert_id: UUID | str,
+        recommendation: dict[str, Any],
+        context_snapshot: dict[str, Any],
+        approval: dict[str, Any] | None = None,
+        remediation_action: dict[str, Any] | None = None,
+        validation_status: str = "pending",
+    ) -> dict[str, Any]:
+        """Construct and validate the versioned runtime contract.
+
+        Required immutable identifiers are intentionally not synthesized.  A
+        malformed or legacy payload raises validation failure so its caller can
+        downgrade integrity to ``contract_invalid``.
+        """
+        metadata = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
+        context = context_snapshot.get("context") if isinstance(context_snapshot.get("context"), dict) else {}
+        context_metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+        quality = context_metadata.get("context_quality") if isinstance(context_metadata.get("context_quality"), dict) else {}
+        source_manifest = context_metadata.get("context_sources") if isinstance(context_metadata.get("context_sources"), dict) else {}
+        evidence_buckets = context_metadata.get("context_evidence") if isinstance(context_metadata.get("context_evidence"), dict) else {}
+        evidence_rows = [
+            item
+            for bucket in evidence_buckets.values()
+            if isinstance(bucket, list)
+            for item in bucket
+            if isinstance(item, dict)
+        ]
+        sources = []
+        for source_id, details in source_manifest.items():
+            row = details if isinstance(details, dict) else {}
+            raw_status = str(row.get("status") or row.get("collection_status") or "skipped").lower()
+            status_aliases = {"collected": "completed", "success": "completed", "stale": "completed", "failed": "unavailable"}
+            status = status_aliases.get(raw_status, raw_status)
+            collected_at = row.get("collected_at") or context_snapshot.get("collected_at")
+            sources.append({
+                "source_id": str(source_id),
+                "category": str(row.get("category") or source_id),
+                "connector": str(row.get("connector") or row.get("provider") or source_id),
+                "status": status,
+                "collected_at": collected_at,
+                "error": str(row.get("error") or "") or None,
+            })
+        evidence = [{
+            "evidence_id": item.get("evidence_id") or item.get("id"),
+            "category": item.get("category") or item.get("source_type") or "unknown",
+            "source_id": item.get("source_id") or item.get("source") or item.get("connector") or "unknown",
+            "connector": item.get("connector") or item.get("source") or "unknown",
+            "tenant_id": item.get("tenant_id") or tenant_id,
+            "project_id": item.get("project_id") or project_id,
+            "service": item.get("service") or context.get("alert", {}).get("service") or "unknown",
+            "resource_id": item.get("resource_id"),
+            "observed_at": item.get("observed_at"),
+            "collected_at": item.get("collected_at") or context_snapshot.get("collected_at"),
+            "observation_window": item.get("observation_window"),
+            "freshness": str(item.get("freshness") or "unknown").lower(),
+            "provenance": item.get("provenance") if isinstance(item.get("provenance"), dict) else {},
+            "citation": item.get("citation"),
+            "epistemic_role": item.get("epistemic_role") or "current_observation",
+            "current_observation": item.get("current_observation") is not False,
+        } for item in evidence_rows]
+        analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
+        investigation = metadata.get("investigation_report") if isinstance(metadata.get("investigation_report"), dict) else {}
+        plan = metadata.get("execution_plan") if isinstance(metadata.get("execution_plan"), dict) else {}
+        accepted = metadata.get("evidence_ids") if isinstance(metadata.get("evidence_ids"), list) else analysis.get("evidence_used", [])
+        missing = analysis.get("missing_evidence", []) if isinstance(analysis.get("missing_evidence"), list) else []
+        conflicting = analysis.get("conflicting_evidence", []) if isinstance(analysis.get("conflicting_evidence"), list) else []
+        conclusive = investigation.get("conclusive") is True and str(investigation.get("status") or "").lower() == "conclusive"
+        grounded = str(metadata.get("rca_status") or "").lower() == "grounded" and bool(accepted)
+        plan_blocks = plan.get("readiness_blocks") if isinstance(plan.get("readiness_blocks"), list) else []
+        plan_id = plan.get("plan_id") or plan.get("id")
+        plan_fingerprint = plan.get("plan_fingerprint") or plan.get("fingerprint")
+        readiness_blocks = list(dict.fromkeys([
+            *[str(item) for item in missing], *[str(item) for item in conflicting], *[str(item) for item in plan_blocks],
+            *([] if conclusive else ["investigation is not conclusive"]),
+            *([] if grounded else ["RCA is not grounded in accepted evidence"]),
+            *([] if plan_id and plan_fingerprint else ["exact resolution plan is not ready"]),
+        ]))
+        execution_ready = bool(
+            conclusive and grounded and plan.get("execution_ready") is True
+            and plan.get("mutating") is True and plan_id and plan_fingerprint and not readiness_blocks
+        )
+        approval_payload = approval if isinstance(approval, dict) else {}
+        approval_status = str(approval_payload.get("decision") or approval_payload.get("status") or "not_ready").lower()
+        if approval_status not in {"not_ready", "pending", "approved", "rejected", "stale"}:
+            approval_status = "not_ready"
+        investigation_status = str(investigation.get("status") or "pending").lower()
+        payload = {
+            "contract_version": "kaiops.incident-investigation.v1",
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "incident_id": incident_id,
+            "alert_id": alert_id,
+            "analysis_request_id": metadata.get("analysis_request_id"),
+            "context_snapshot_id": context_snapshot.get("snapshot_id"),
+            "context_fingerprint": context_snapshot.get("context_fingerprint"),
+            "context_contract_version": context_snapshot.get("contract_version"),
+            "context_collected_at": context_snapshot.get("collected_at"),
+            "context_expires_at": context_snapshot.get("expires_at"),
+            "context_quality": {
+                "evidence_count": len(evidence),
+                "category_coverage": float(quality.get("coverage_score") or quality.get("category_coverage") or 0),
+                "freshness_score": float(quality.get("freshness_score") or 0),
+                "provenance_score": float(quality.get("provenance_score") or 0),
+                "independent_source_count": int(quality.get("independent_source_count") or 0),
+                "direct_observation_count": int(quality.get("direct_observation_count") or 0),
+                "valid": bool(quality.get("valid", quality.get("reusable", False))),
+                "blocking_reasons": [str(item) for item in quality.get("blocking_reasons", [])],
+            },
+            "context_sources": sources,
+            "context_evidence": evidence,
+            "investigation_id": investigation.get("investigation_id"),
+            "investigation_status": investigation_status,
+            "investigation_conclusive": conclusive,
+            "rca_version": metadata.get("rca_version"),
+            "rca_status": metadata.get("rca_status") or "pending",
+            "accepted_evidence_ids": [str(item) for item in accepted],
+            "missing_evidence": [str(item) for item in missing],
+            "conflicting_evidence": [str(item) for item in conflicting],
+            "recommendation_id": recommendation.get("id"),
+            "resolution_plan_id": plan_id,
+            "plan_fingerprint": plan_fingerprint,
+            "execution_ready": execution_ready,
+            "readiness_blocks": readiness_blocks,
+            "approval_status": approval_status,
+            "remediation_status": str((remediation_action or {}).get("status") or "not_started"),
+            "validation_status": validation_status,
+            "readiness": {
+                "investigation_ready": bool(evidence),
+                "rca_ready": conclusive and grounded,
+                "resolution_ready": conclusive and grounded and bool(plan_id),
+                "execution_ready": execution_ready,
+                "blocking_reasons": readiness_blocks,
+            },
+        }
+        return IncidentInvestigationContract.model_validate(payload).model_dump(mode="json")
 
     async def create_resolution_investigation(self, payload: dict[str, Any]) -> None:
         await self.session.execute(
