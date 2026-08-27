@@ -1,5 +1,7 @@
 -- Backfill incident_projections from existing incidents rows.
 -- Idempotent: safe to re-run.
+-- NOTE: incident_projections has no created_at column; the historical comment
+-- below explains an older ORM assumption and is superseded by this schema fact.
 
 -- created_at is set explicitly even though it's not otherwise used by this
 -- projection (first_seen_at/updated_at carry the meaningful timestamps):
@@ -28,7 +30,6 @@ INSERT INTO incident_projections (
     latest_event_type,
     latest_event_at,
     first_seen_at,
-    created_at,
     updated_at,
     projection_payload
 )
@@ -98,7 +99,6 @@ SELECT
     'incident.backfill' AS latest_event_type,
     i.updated_at AS latest_event_at,
     i.created_at AS first_seen_at,
-    i.created_at AS created_at,
     i.updated_at AS updated_at,
     i.payload AS projection_payload
 FROM incidents i
