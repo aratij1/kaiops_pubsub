@@ -150,8 +150,8 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
       incident_id: incidentId,
       alert,
       metadata: {
-        context_quality: { contract_version: "kaiops.context-quality.v1", quality_score: 0.94, coverage_score: 0.92, freshness_score: 0.98, provenance_score: 0.93, evidence_count: 1, reusable: true },
-        discovery_report: { evidence },
+        context_quality: { contract_version: "kaiops.context-quality.v1", quality_score: analysisComplete ? 0.94 : 0, coverage_score: analysisComplete ? 0.92 : 0, freshness_score: analysisComplete ? 0.98 : 0, provenance_score: analysisComplete ? 0.93 : 0, evidence_count: analysisComplete ? 1 : 0, reusable: analysisComplete },
+        context_evidence: analysisComplete ? { metrics: evidence.map((item) => ({ ...item, source_id: item.source, observed_at: item.timestamp, freshness: "fresh", current_observation: true })) } : {},
       },
     },
     recommendation: {
@@ -165,7 +165,8 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
       severity: "critical",
       rationale: "Request latency and queue depth rose together after connection-pool exhaustion.",
       metadata: {
-        rca_analysis: { root_cause: analysisComplete ? "API connection-pool saturation caused request queueing." : "Previous cached hypothesis.", causal_chain: "Pool exhaustion increased queue depth and request latency.", confidence_score: 0.94, evidence_used: ["metric-latency-1"] },
+        rca_status: analysisComplete ? "grounded" : "insufficient_evidence",
+        rca_analysis: { root_cause: analysisComplete ? "API connection-pool saturation caused request queueing." : "Previous cached hypothesis.", causal_chain: "Pool exhaustion increased queue depth and request latency.", confidence_score: analysisComplete ? 0.94 : 0, evidence_used: analysisComplete ? ["metric-latency-1"] : [] },
         impact_analysis: { impact_summary: "API requests exceeded the latency SLO.", customer_impact: "Customers experienced delayed API responses.", impacted_services: ["api-gateway"], evidence_used: ["metric-latency-1"] },
         remediation_analysis: { recommended_action: "Increase the API connection pool and recycle saturated workers through the governed rollout." },
         investigation_report: { status: "conclusive", conclusive: true, conclusion: { confidence: 0.94 } },
@@ -224,8 +225,8 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
   await page.getByLabel("Password").fill("Admin@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
   await expect(page.getByRole("heading", { name: "api-gateway: HighRequestLatency" })).toBeVisible();
-  await expect(page.getByText("1 linked evidence")).toBeVisible();
-  await expect(page.getByText("94% RCA confidence")).toBeVisible();
+  await expect(page.getByText("0 linked evidence")).toBeVisible();
+  await expect(page.getByText("0% RCA confidence")).toBeVisible();
 
   const tabs = page.getByRole("tablist", { name: "Incident workspace sections" });
   await tabs.getByRole("tab", { name: "Evidence, RCA, and impact" }).click();
