@@ -5910,8 +5910,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       "The causal mechanism was not supplied by the current analysis.",
     );
     const hasLinkedEvidence = selectedAiTrust.evidence.length > 0;
-    const reportedConfidence = Number(selectedAlertEvaluation.confidenceScore || analysis.confidence || 0);
-    const confidence = hasLinkedEvidence ? reportedConfidence : 0;
+    // canonicalIncidentEvidence already enforces the backend grounding
+    // contract. Preserve an explicit zero instead of treating it as a missing
+    // value and falling back to a different evaluation or legacy score.
+    const confidence = Number(selectedAiTrust.confidence ?? 0);
     const investigation = selectedAlertWorkflow?.recommendation?.metadata?.investigation_report
       || selectedAlertWorkflow?.recommendation?.metadata?.iterative_investigation
       || {};
