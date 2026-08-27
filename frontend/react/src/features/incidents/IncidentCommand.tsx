@@ -111,7 +111,8 @@ function Metric({ label, value, detail }: { label: string; value: ReactNode; det
 }
 
 export default function IncidentCommand() {
-  const { incidentId: routeIncidentId = "" } = useParams();
+  const routeParams = useParams();
+  const routeIncidentId = routeParams.incidentId ?? routeParams["*"] ?? "";
   const navigate = useNavigate();
   const incidents = useRouteRuntimeSlice("incidents");
   const approvals = useRouteRuntimeSlice("approvals");
