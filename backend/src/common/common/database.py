@@ -375,6 +375,40 @@ class ContextSnapshotRecord(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
+class IncidentInvestigationBindingRecord(Base):
+    """Immutable normalized identity chain for one governed RCA version."""
+
+    __tablename__ = "incident_investigation_bindings"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "analysis_request_id", name="uq_investigation_binding_request"),
+        UniqueConstraint("tenant_id", "incident_id", "rca_version", name="uq_investigation_binding_version"),
+        Index(
+            "idx_investigation_binding_current",
+            "tenant_id", "incident_id", "alert_id", "recommendation_id", "status",
+        ),
+        Index(
+            "idx_investigation_binding_context",
+            "tenant_id", "context_snapshot_id", "context_fingerprint",
+        ),
+    )
+
+    binding_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    alert_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    analysis_request_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    context_snapshot_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    context_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    recommendation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    rca_version: Mapped[int] = mapped_column(Integer)
+    resolution_plan_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    plan_fingerprint: Mapped[str | None] = mapped_column(String(71), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class AuditLogRecord(Base, TimestampMixin):
     __tablename__ = "audit_logs"
     __table_args__ = (Index("idx_audit_logs_resource_action_created", "resource_type", "action", "created_at"),)
