@@ -221,6 +221,35 @@ async def test_processed_result_and_stage_completeness_reject_cross_tenant_reads
 
 
 @pytest.mark.asyncio
+async def test_processed_result_does_not_guess_incident_by_service_and_severity(
+    sqlite_session_factory,
+) -> None:
+    alert = make_alert("tenant-a")
+    unrelated_incident = Incident(
+        tenant_id="tenant-a",
+        service=alert.service,
+        environment=alert.environment,
+        severity=alert.severity,
+        title="Unrelated incident with matching dimensions",
+    )
+    async with sqlite_session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_alert(alert)
+        await repo.save_incident(unrelated_incident)
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        processed = await IncidentRepository(session).get_processed_result_by_alert_id(
+            str(alert.id),
+            tenant_id="tenant-a",
+        )
+
+    assert processed is not None
+    assert processed["mode"] == "alert-only-fallback"
+    assert processed["incident"]["id"] is None
+
+
+@pytest.mark.asyncio
 async def test_actions_table_tenant_id_persists_and_is_isolated(sqlite_session_factory) -> None:
     async with sqlite_session_factory() as session:
         repo = IncidentRepository(session)

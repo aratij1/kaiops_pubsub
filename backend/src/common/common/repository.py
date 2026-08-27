@@ -1027,22 +1027,6 @@ class IncidentRepository:
                     break
 
         if incident_record is None:
-            # Fallback: match by service and severity for latest likely incident.
-            service = str(alert_payload.get("service") or "").strip()
-            severity = str(alert_payload.get("severity") or "").strip()
-            if service:
-                fallback_stmt = select(IncidentRecord).where(
-                    IncidentRecord.service == service,
-                    IncidentRecord.tenant_id == normalized_tenant_id,
-                )
-                if severity:
-                    fallback_stmt = fallback_stmt.where(IncidentRecord.severity == severity)
-                fallback_result = await self.session.execute(
-                    fallback_stmt.order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc()).limit(1)
-                )
-                incident_record = fallback_result.scalar_one_or_none()
-
-        if incident_record is None:
             alert_tokens = {_normalize_match_token(item) for item in _collect_alert_application_tokens(alert_payload)}
 
             app_result = await self.session.execute(

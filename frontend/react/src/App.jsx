@@ -2218,6 +2218,15 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     if (!selectedAlertRow || selectedAlertRegeneration.loading) {
       return;
     }
+    const canonicalIncidentId = String(selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "").trim();
+    if (!canonicalIncidentId) {
+      setSelectedAlertRegeneration({
+        loading: false,
+        message: "This alert was deduplicated or is still awaiting incident correlation. RCA runs only for a persisted canonical incident.",
+        error: "",
+      });
+      return;
+    }
     const alertId = String(selectedAlertRow?.id || selectedAlertRow?.alert_id || selectedAlertId || "").trim();
     setSelectedAlertRegeneration({ loading: true, message: "", error: "" });
     try {
@@ -10869,8 +10878,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           ["cache", "Cache only", "Use verified stored analysis without model work"],
                         ].map(([mode, label, description]) => <button key={mode} type="button" className={rcaAnalysisMode === mode ? "active" : ""} aria-pressed={rcaAnalysisMode === mode} title={description} onClick={() => setRcaAnalysisMode(mode)} disabled={selectedAlertRegeneration.loading}><strong>{label}</strong><small>{description}</small></button>)}
                       </div>
-                      <button type="button" className="button-primary" onClick={regenerateSelectedAlertAnalysis} disabled={!selectedAlertRow || selectedAlertRegeneration.loading}>
-                        {selectedAlertRegeneration.loading ? "Running analysis..." : rcaAnalysisMode === "fresh" ? "Run fresh analysis" : rcaAnalysisMode === "cache" ? "Load verified analysis" : "Run smart analysis"}
+                      <button type="button" className="button-primary" onClick={regenerateSelectedAlertAnalysis} disabled={!selectedAlertRow || !selectedIncidentId || selectedAlertRegeneration.loading} title={!selectedIncidentId ? "RCA becomes available after this alert is linked to a canonical incident." : undefined}>
+                        {selectedAlertRegeneration.loading ? "Running analysis..." : !selectedIncidentId ? "Awaiting incident" : rcaAnalysisMode === "fresh" ? "Run fresh analysis" : rcaAnalysisMode === "cache" ? "Load verified analysis" : "Run smart analysis"}
                       </button></> : null}
                     </div>
                   ) : null}
