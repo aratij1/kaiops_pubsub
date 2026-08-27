@@ -5,10 +5,19 @@ import hashlib
 import json
 from pathlib import Path
 
-
 REQUIRED = {
-    "kind", "title", "tenant_scope", "services", "owner_team", "last_reviewed",
-    "source_system", "source_ref", "review_status", "content_version", "created_at", "updated_at",
+    "kind",
+    "title",
+    "tenant_scope",
+    "services",
+    "owner_team",
+    "last_reviewed",
+    "source_system",
+    "source_ref",
+    "review_status",
+    "content_version",
+    "created_at",
+    "updated_at",
 }
 INCIDENT_REQUIRED = {"alert_id", "alert_name", "service", "environment", "observation_window", "incident_id"}
 DEPLOYMENT_REQUIRED = {"deployment", "service", "environment", "change_window"}
@@ -35,11 +44,19 @@ def classify(relative: str, suffix: str, meta: dict[str, str]) -> tuple[str, str
     if relative.startswith("execution/") and suffix == ".json":
         return "PRODUCTION_CURATED", "governed execution catalog; not indexed as RAG Markdown", "retained"
     if relative.startswith("_review/") and suffix == ".json":
-        return "GENERATED_UNVERIFIED", "review draft JSON; excluded by Markdown indexer", "retained in non-production review store"
+        return (
+            "GENERATED_UNVERIFIED",
+            "review draft JSON; excluded by Markdown indexer",
+            "retained in non-production review store",
+        )
     if relative == "execution/README.md":
         return "OBSOLETE", "operator documentation is not a knowledge document", "quarantined"
     if relative in {"flows.md", "flows.json"}:
-        return "GENERATED_UNVERIFIED", "generated flow catalog is explicitly excluded from matching", "quarantined" if suffix == ".md" else "retained non-indexed"
+        return (
+            "GENERATED_UNVERIFIED",
+            "generated flow catalog is explicitly excluded from matching",
+            "quarantined" if suffix == ".md" else "retained non-indexed",
+        )
     if relative == "scenarios.txt":
         return "DEMO_ONLY", "scenario fixture is not a reviewed production document", "retained non-indexed"
     if suffix == ".md":
@@ -66,36 +83,51 @@ def main() -> int:
             required |= DEPLOYMENT_REQUIRED
         missing = sorted(key for key in required if not meta.get(key)) if path.suffix.lower() == ".md" else []
         classification, evidence, action = classify(relative, path.suffix.lower(), meta)
-        rows.append({
-            "path": relative,
-            "classification": classification,
-            "missing": missing,
-            "provenance": "verified" if meta.get("source_system") and meta.get("source_ref") else "unverified",
-            "tenant": meta.get("tenant_scope") or "missing",
-            "deterministic_repair": not missing and classification in {"PRODUCTION_CURATED", "TENANT_CURATED"},
-            "action": action,
-            "evidence": evidence,
-            "sha256": hashlib.sha256(raw).hexdigest(),
-        })
+        rows.append(
+            {
+                "path": relative,
+                "classification": classification,
+                "missing": missing,
+                "provenance": "verified" if meta.get("source_system") and meta.get("source_ref") else "unverified",
+                "tenant": meta.get("tenant_scope") or "missing",
+                "deterministic_repair": not missing and classification in {"PRODUCTION_CURATED", "TENANT_CURATED"},
+                "action": action,
+                "evidence": evidence,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
     counts: dict[str, int] = {}
     for row in rows:
         key = str(row["classification"])
         counts[key] = counts.get(key, 0) + 1
     lines = [
-        "# RAG corpus remediation report", "",
-        "This inventory is generated deterministically from the pinned recovery corpus. Missing tenant, ownership, or provenance values are never inferred.", "",
-        "## Summary", "",
+        "# RAG corpus remediation report",
+        "",
+        "This inventory is generated deterministically from the pinned recovery corpus. "
+        "Missing tenant, ownership, or provenance values are never inferred.",
+        "",
+        "## Summary",
+        "",
         f"- Files inventoried: {len(rows)}",
         *[f"- {key}: {value}" for key, value in sorted(counts.items())],
-        "", "## File dispositions", "",
-        "| Current path | Classification | Missing metadata | Provenance | Tenant | Deterministic repair | Final action | Evidence | SHA-256 |",
+        "",
+        "## File dispositions",
+        "",
+        "| Current path | Classification | Missing metadata | Provenance | Tenant | "
+        "Deterministic repair | Final action | Evidence | SHA-256 |",
         "|---|---|---|---|---|---:|---|---|---|",
     ]
     for row in rows:
         values = [
-            f"`backend/rag/{row['path']}`", str(row["classification"]), ", ".join(row["missing"]) or "none",
-            str(row["provenance"]), str(row["tenant"]), "yes" if row["deterministic_repair"] else "no",
-            str(row["action"]), str(row["evidence"]), f"`{row['sha256']}`",
+            f"`backend/rag/{row['path']}`",
+            str(row["classification"]),
+            ", ".join(row["missing"]) or "none",
+            str(row["provenance"]),
+            str(row["tenant"]),
+            "yes" if row["deterministic_repair"] else "no",
+            str(row["action"]),
+            str(row["evidence"]),
+            f"`{row['sha256']}`",
         ]
         lines.append("| " + " | ".join(value.replace("|", "\\|") for value in values) + " |")
     Path(args.report).write_text("\n".join(lines) + "\n", encoding="utf-8")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from importlib import util
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from alert_intelligence import AlertIntelligenceAgent
@@ -130,6 +131,20 @@ async def test_duplicate_merge_uses_canonical_incident_from_same_tenant(sqlite_s
         repo = IncidentRepository(session)
         await repo.save_incident(tenant_a_incident)
         await repo.save_incident(tenant_b_incident)
+        await repo.acquire_canonical_incident(
+            incident=tenant_a_incident,
+            occurrence_id=uuid4(),
+            correlation_key=correlation_key,
+            project_id="payments",
+            idempotency_key="tenant-a-seed",
+        )
+        await repo.acquire_canonical_incident(
+            incident=tenant_b_incident,
+            occurrence_id=uuid4(),
+            correlation_key=correlation_key,
+            project_id="payments",
+            idempotency_key="tenant-b-seed",
+        )
         await session.commit()
 
     duplicate = make_alert("tenant-a")

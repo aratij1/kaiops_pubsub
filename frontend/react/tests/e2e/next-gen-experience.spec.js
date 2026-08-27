@@ -136,10 +136,36 @@ async function installScenario(page, options = {}) {
     if (path === `/applications/${APPLICATION_ID}/history`) return route.fulfill(json({ rows: onboardingEvents }));
     if (path === `/applications/${APPLICATION_ID}/validations`) return route.fulfill(json({ rows: [{ status: "passed", created_at: new Date().toISOString() }] }));
     if (path === `/applications/${APPLICATION_ID}/dashboards`) return route.fulfill(json({ rows: [{ title: "Checkout golden signals" }] }));
-    if (path.startsWith("/incidents/metadata")) {
+    if (path === "/incidents/inbox/feed") {
+      if (options.unifiedPages) {
+        const selectedPage = url.searchParams.get("cursor") === "page-2" ? options.unifiedPages[1] : options.unifiedPages[0];
+        return route.fulfill(json({ data: selectedPage }));
+      }
+      const incidentRows = [...(options.incidents || [currentIncident])].reduce((rows, row) => {
+        const key = row.correlation_id || row.incident_id;
+        const existing = rows.find((candidate) => (candidate.correlation_id || candidate.incident_id) === key);
+        if (existing) existing.total_occurrence_count = Number(existing.total_occurrence_count || 1) + 1;
+        else rows.push({ ...row, total_occurrence_count: Number(row.total_occurrence_count || 1) });
+        return rows;
+      }, []);
+      const alertRows = (options.alerts || []).filter((row) => !row.incident_id);
+      return route.fulfill(json({ data: {
+        rows: [
+          ...incidentRows.map((row, index) => ({ record_type: "incident", score: 100 - index, row })),
+          ...alertRows.map((row, index) => ({ record_type: "alert", score: 50 - index, row })),
+        ],
+        next_cursor: null,
+        previous_cursor: null,
+        total_count: incidentRows.length,
+        filtered_count: incidentRows.length + alertRows.length,
+        view_counts: { all: incidentRows.length + alertRows.length },
+      } }));
+    }
+    if (path.startsWith("/incidents/groups")) {
       const requestedStatus = url.searchParams.get("status");
       const include = !requestedStatus || String(currentIncident.status).toLowerCase().includes(requestedStatus);
-      return route.fulfill(json({ data: { rows: include ? (options.incidents || [currentIncident]) : [] } }));
+      const rows = include ? (options.incidents || [currentIncident]) : [];
+      return route.fulfill(json({ data: { rows, total_count: rows.length, filtered_count: rows.length } }));
     }
     if (path.startsWith("/incidents/closed")) return route.fulfill(json({ data: { rows: String(currentIncident.status).toLowerCase() === "recovered" ? [currentIncident] : [] } }));
     if (path === `/incidents/${INCIDENT_ID}/manual-close` && method === "POST") {
@@ -370,6 +396,55 @@ test("Unified Inbox collapses incident projections with the same durable correla
 
   await expect(page.locator(".unified-inbox-card.is-incident")).toHaveCount(1);
   await expect(page.getByText("2 occurrences", { exact: true })).toBeVisible();
+});
+
+test("separate recurrence ownership remains separate and an active incident is not hidden by terminal history", async ({ page }) => {
+  const fingerprint = "recurring-checkout-latency";
+  const recovered = incident({
+    incident_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    alert_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    title: "Recovered checkout recurrence",
+    correlation_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    fingerprint,
+    status: "resolved",
+  });
+  const active = incident({
+    incident_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    alert_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    title: "Active checkout recurrence",
+    correlation_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+    fingerprint,
+    status: "investigating",
+  });
+  await installScenario(page, { incidents: [recovered, active] });
+  await signIn(page, "/incidents");
+  await page.getByRole("tab", { name: /^Incidents/ }).click();
+
+  await expect(page.getByRole("button", { name: "Recovered checkout recurrence" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Active checkout recurrence" })).toBeVisible();
+  await expect(page.locator(".incident-summary-table tbody tr")).toHaveCount(2);
+});
+
+test("unified feed cursor pagination preserves totals without repeating alerts", async ({ page }) => {
+  const firstAlert = { id: "alert-page-1", name: "First paged signal", service: "checkout-api", severity: "high", status: "active" };
+  const secondAlert = { id: "alert-page-2", name: "Second paged signal", service: "payments-api", severity: "critical", status: "active" };
+  const pageShape = { total_count: 11, filtered_count: 11, view_counts: { all: 11 } };
+  await installScenario(page, { unifiedPages: [
+    { ...pageShape, rows: [{ record_type: "alert", score: 10, row: firstAlert }], next_cursor: "page-2", previous_cursor: null },
+    { ...pageShape, rows: [{ record_type: "alert", score: 9, row: secondAlert }], next_cursor: null, previous_cursor: "page-1" },
+  ] });
+  await signIn(page, "/incidents");
+
+  await expect(page.getByText("First paged signal", { exact: true })).toBeVisible();
+  await expect(page.getByText("Showing 1-10 of 11", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(page.getByText("Second paged signal", { exact: true })).toBeVisible();
+  await expect(page.getByText("Showing 11-11 of 11", { exact: true })).toBeVisible();
+  await expect(page.getByText("First paged signal", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".unified-inbox-card.is-signal")).toHaveCount(1);
+  await page.getByRole("button", { name: "Previous", exact: true }).click();
+  await expect(page.getByText("First paged signal", { exact: true })).toBeVisible();
+  await expect(page.getByText("Second paged signal", { exact: true })).toHaveCount(0);
 });
 
 test("Full investigation retains the clicked incident while alert details hydrate", async ({ page }) => {

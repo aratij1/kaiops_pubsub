@@ -1,29 +1,30 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
 import os
-from pathlib import Path
 import re
 import shlex
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlparse
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
+from ai_workbench_common.models import Context
 from common.config import get_settings
 from common.event_publishers import EventPublisher, RabbitMQPublisher, build_agent_event_contract, build_event_envelope
-from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
-from ai_workbench_common.models import Context
+from common.kafka import KafkaConsumer
+from common.kafka import consume_forever as consume_kafka_forever
 from common.models import Alert, Incident
+from common.rabbitmq import RabbitMQConsumer
+from common.rabbitmq import consume_forever as consume_rabbitmq_forever
 from common.rag_governance import content_checksum, retrieval_allowed
-from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app
-from common.tenant_identity import require_tenant_id
 from common.telemetry import (
     CONTEXT_KNOWLEDGE_OPERATIONS,
     CONTEXT_KNOWLEDGE_REUSE_COUNT,
@@ -34,6 +35,7 @@ from common.telemetry import (
     CONTEXT_STRATEGY_REQUESTS,
     EVENTS_PROCESSED,
 )
+from common.tenant_identity import require_tenant_id
 from common.topics import CONTEXT_EVENTS, ORCHESTRATION_EVENTS
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import VectorDBConnector
@@ -223,9 +225,9 @@ async def _collect_context_with_strategy_unlocked(
         historical_ttl = int(os.getenv("CONTEXT_HISTORICAL_MAX_AGE_SECONDS", "0") or 0)
         ttl_seconds = historical_ttl if strategy == "historical" else configured_ttl
         not_before = (
-            datetime.now(timezone.utc) - timedelta(seconds=max(60, ttl_seconds))
+            datetime.now(UTC) - timedelta(seconds=max(60, ttl_seconds))
             if ttl_seconds > 0
-            else datetime.min.replace(tzinfo=timezone.utc)
+            else datetime.min.replace(tzinfo=UTC)
         )
         try:
             async with session_factory() as session:
@@ -342,7 +344,7 @@ async def _collect_context_with_strategy_unlocked(
         CONTEXT_STRATEGY_REQUESTS.labels(strategy, "discovery_error").inc()
         CONTEXT_STRATEGY_DURATION.labels(strategy, "error").observe(max(0.0, perf_counter() - started))
         raise
-    collected_at = datetime.now(timezone.utc)
+    collected_at = datetime.now(UTC)
     context.metadata = {
         **(context.metadata if isinstance(context.metadata, dict) else {}),
         "context_strategy": strategy,
@@ -527,16 +529,16 @@ async def _persist_context_event(
     try:
         collected_at = datetime.fromisoformat(collected_at_raw.replace("Z", "+00:00"))
     except ValueError:
-        collected_at = datetime.now(timezone.utc)
+        collected_at = datetime.now(UTC)
     if collected_at.tzinfo is None:
-        collected_at = collected_at.replace(tzinfo=timezone.utc)
+        collected_at = collected_at.replace(tzinfo=UTC)
     assessed_at_raw = str(quality.get("assessed_at") or "")
     try:
         assessed_at = datetime.fromisoformat(assessed_at_raw.replace("Z", "+00:00"))
     except ValueError:
-        assessed_at = datetime.now(timezone.utc)
+        assessed_at = datetime.now(UTC)
     if assessed_at.tzinfo is None:
-        assessed_at = assessed_at.replace(tzinfo=timezone.utc)
+        assessed_at = assessed_at.replace(tzinfo=UTC)
     expires_at = assessed_at + timedelta(seconds=max(0, int(quality.get("valid_for_seconds") or 0)))
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
@@ -1261,8 +1263,8 @@ def _knowledge_pack_to_rag_request(
         corpus_classification="TENANT_CURATED",
         reviewed_by=approved_by,
         approved_by=approved_by,
-        approved_at=datetime.now(timezone.utc).isoformat(),
-        last_reviewed=datetime.now(timezone.utc).isoformat(),
+        approved_at=datetime.now(UTC).isoformat(),
+        last_reviewed=datetime.now(UTC).isoformat(),
         metadata={
             "environment": environment,
             "knowledge_pack_status": str(pack.get("status") or "approved"),
@@ -1272,7 +1274,7 @@ def _knowledge_pack_to_rag_request(
 
 
 def render_document(request: RagDocumentRequest) -> str:
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     metadata: dict[str, Any] = {
         "kind": request.kind,
         "title": request.title,
@@ -1498,7 +1500,7 @@ def create_evidence_rag_draft(*, alert: Alert, incident: Incident, context: Cont
             *evidence_lines,
         ]
     )
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     return _write_evidence_draft(
         {
             "draft_id": draft_id,
@@ -1737,7 +1739,7 @@ async def ingest_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
     })
     tenant_scope = require_tenant_id(governed_request.tenant_scope, source="RAG draft ingestion")
     draft_id = f"rag-{uuid4()}"
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     draft = {
         "draft_id": draft_id,
         "status": "pending_review",
@@ -1746,7 +1748,11 @@ async def ingest_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
         "updated_at": now,
         "request": governed_request.model_dump(mode="json"),
     }
-    _draft_path(draft_id).write_text(json.dumps(draft, indent=2), encoding="utf-8")
+    await asyncio.to_thread(
+        _draft_path(draft_id).write_text,
+        json.dumps(draft, indent=2),
+        encoding="utf-8",
+    )
     return {
         "status": "pending_review",
         "document_flag_updated": False,
@@ -1766,7 +1772,7 @@ async def approve_rag_document(
     if str(draft.get("status") or "") == "approved":
         return {"status": "approved", "draft": draft, "already_approved": True}
     payload = draft.get("request") if isinstance(draft.get("request"), dict) else {}
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     version = max(1, int(payload.get("content_version") or 1))
     governed = RagDocumentRequest.model_validate({
         **payload,
@@ -1851,7 +1857,7 @@ async def create_evidence_rag_draft_from_rca(request: dict[str, Any]) -> dict[st
     path = _draft_path(draft_id)
     if path.exists():
         return {"status": "existing", "draft": _read_evidence_draft(draft_id)}
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     draft = _write_evidence_draft({
         "draft_id": draft_id,
         "status": "draft",
@@ -1889,7 +1895,7 @@ async def review_evidence_rag_draft(
     draft["status"] = "reviewed"
     draft["reviewed_by"] = request.reviewed_by.strip()
     draft["review_notes"] = str(request.review_notes or "").strip() or None
-    draft["updated_at"] = datetime.now(timezone.utc).isoformat()
+    draft["updated_at"] = datetime.now(UTC).isoformat()
     return {"status": "reviewed", "draft": _write_evidence_draft(draft)}
 
 
@@ -1908,7 +1914,7 @@ async def approve_evidence_rag_draft(
     if len(content) < 20:
         raise HTTPException(status_code=422, detail="approved evidence content is too short")
     tenant_scope = require_tenant_id(str(draft.get("tenant_scope") or ""), source="evidence approval")
-    approved_at = datetime.now(timezone.utc).isoformat()
+    approved_at = datetime.now(UTC).isoformat()
     rag_request = RagDocumentRequest(
         kind="incident",
         alert_id=str(draft.get("alert_id") or "") or None,
@@ -2036,8 +2042,8 @@ async def update_rag_document(request: RagDocumentUpdateRequest) -> dict[str, An
     pending = RagDocumentRequest.model_validate({
         **payload,
         "content_version": next_version,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
         "review_status": "pending_review",
         "corpus_classification": "GENERATED_UNVERIFIED",
         "reviewed_by": None,

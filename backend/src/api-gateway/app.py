@@ -3451,7 +3451,7 @@ async def ingest_rag_document(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
-    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
 ) -> dict[str, Any]:
     payload = {
         **payload,
@@ -3479,7 +3479,7 @@ async def approve_rag_document(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
-    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
 ) -> dict[str, Any]:
     actor = auth.email or auth.username or str(auth.user_id)
     return await guarded_proxy(
@@ -3596,7 +3596,11 @@ async def list_evidence_rag_drafts(
     x_trace_id: str | None = Header(default=None),
     tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
-    params = {key: value for key, value in {"alert_id": alert_id, "status": status, "tenant_scope": tenant_id}.items() if value}
+    params = {
+        key: value
+        for key, value in {"alert_id": alert_id, "status": status, "tenant_scope": tenant_id}.items()
+        if value
+    }
     return await guarded_proxy(
         request=request,
         method="GET",
@@ -3631,7 +3635,7 @@ async def review_evidence_rag_draft(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
-    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
@@ -3653,7 +3657,7 @@ async def approve_evidence_rag_draft(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
-    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
@@ -3708,7 +3712,7 @@ async def approve_knowledge_pack(
     request: Request,
     payload: Any = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
-    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
 ) -> dict[str, Any]:
     payload = await knowledge_pack_payload_from_request(request, payload, "Knowledge Pack approval payload")
     payload = {
@@ -3782,7 +3786,7 @@ async def update_rag_document(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
-    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,

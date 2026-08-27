@@ -56,13 +56,24 @@ def migrate(
         try:
             normalized, reason = _normalize(raw)
         except ValueError as exc:
-            records.append(MigrationRecord(path.relative_to(root).as_posix(), "rejected", before, before, False, str(exc)))
+            records.append(
+                MigrationRecord(path.relative_to(root).as_posix(), "rejected", before, before, False, str(exc))
+            )
             continue
         after = _sha256(normalized)
         changed = raw != normalized
         if changed and apply:
             path.write_bytes(normalized)
-        records.append(MigrationRecord(path.relative_to(root).as_posix(), "applied" if changed and apply else "change-required" if changed else "unchanged", before, after, changed, reason if changed else "already normalized"))
+        records.append(
+            MigrationRecord(
+                path.relative_to(root).as_posix(),
+                "applied" if changed and apply else "change-required" if changed else "unchanged",
+                before,
+                after,
+                changed,
+                reason if changed else "already normalized",
+            )
+        )
     return records
 
 

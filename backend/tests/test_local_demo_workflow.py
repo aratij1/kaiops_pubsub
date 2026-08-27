@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 from context_agent import ContextIntelligenceAgent
+from context_agent.connectors import VectorDBConnector
 from model_router import ModelRouter
 from model_router.router import ModelProvider, ModelResponse, build_usage
 from resolution_agent import ResolutionIntelligenceAgent
@@ -86,8 +87,11 @@ def load_monitoring_app_module():
 
 
 class InProcessAiLayerClient:
-    def __init__(self, router: ModelRouter) -> None:
-        self.context_agent = ContextIntelligenceAgent()
+    def __init__(self, router: ModelRouter, rag_root=None) -> None:
+        connectors = ContextIntelligenceAgent().connectors
+        if rag_root is not None:
+            connectors[-1] = VectorDBConnector(rag_root=rag_root)
+        self.context_agent = ContextIntelligenceAgent(connectors=connectors)
         self.resolution_agent = ResolutionIntelligenceAgent(model_router=router)
 
     async def collect_context(self, *, alert, incident, decision=None):
@@ -98,11 +102,11 @@ class InProcessAiLayerClient:
 
 
 @pytest.mark.asyncio
-async def test_local_payment_workflow_generates_recommendation() -> None:
+async def test_local_payment_workflow_generates_recommendation(governed_rag_root) -> None:
     module = load_monitoring_app_module()
     module.settings.database_enabled = False
     router = static_router()
-    module.AiLayerClient = lambda _settings: InProcessAiLayerClient(router)
+    module.AiLayerClient = lambda _settings: InProcessAiLayerClient(router, governed_rag_root)
 
     workflow = await module.run_local_payment_workflow(trace_id="trace-123", model_router=router, run_comparison=False)
 

@@ -1760,8 +1760,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       return prev.loading === loading && !prev.error ? prev : { ...prev, loading, error: "" };
     });
     try {
-      // List views need projection fields, not the heavier action/evaluation
-      // enrichment that is fetched when an operator opens an incident.
       const params = new URLSearchParams({ limit: String(options?.limit || 10) });
       if (String(options?.cursor || "").trim()) params.set("cursor", String(options.cursor).trim());
       const currentFilters = ignoreFilters

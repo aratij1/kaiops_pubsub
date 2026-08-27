@@ -9,7 +9,11 @@ test("incident detail preserves nested alert identity while details load", async
     if (path === "/auth/config") body = { mode: "local", local_development_only: true };
     else if (path === "/auth/login") body = { access_token: "admin-token", refresh_token: "refresh-token", user: { id: 1, username: "admin", role_name: "Administrator" } };
     else if (path === "/healthz") body = { status: "ok" };
-    else if (path.startsWith("/incidents/metadata")) body = { rows: [{ incident_id: incidentId, title: "Context agent incident", service: "kaiops-context-agent", environment: "prod", status: "investigating", projection_payload: { alert_id: alertId, event_payload: { alert_id: alertId, incident_id: incidentId } } }] };
+    else if (path.startsWith("/incidents/groups")) body = { data: { rows: [{ incident_id: incidentId, title: "Context agent incident", service: "kaiops-context-agent", environment: "prod", status: "investigating", projection_payload: { alert_id: alertId, event_payload: { alert_id: alertId, incident_id: incidentId } } }], total_count: 1, filtered_count: 1 } };
+    else if (path === `/incidents/${incidentId}`) {
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      body = { data: { incident_id: incidentId, alert_id: alertId, title: "Context agent incident", service: "kaiops-context-agent", environment: "prod", status: "investigating", projection_payload: { alert_id: alertId } } };
+    }
     else if (path.startsWith(`/alerts/${alertId}/processed-result`)) {
       await new Promise((resolve) => setTimeout(resolve, 1200));
       body = { data: { alert: { id: alertId, name: "ContextAgentFailure", service: "kaiops-context-agent", severity: "high" }, incident: { id: incidentId, service: "kaiops-context-agent", environment: "prod", status: "investigating" }, context: { metadata: {} }, timeline: [] } };
@@ -17,13 +21,10 @@ test("incident detail preserves nested alert identity while details load", async
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
   });
 
-  await page.goto("/incidents");
+  await page.goto(`/incidents/${incidentId}`);
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill("Admin@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
-  await expect(page.getByRole("button", { name: "Context agent incident", exact: true })).toBeVisible();
-  await expect(page.getByText(incidentId, { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Context agent incident", exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/incidents/${incidentId}$`));
   await expect(page.getByRole("heading", { name: "Context agent incident" })).toBeVisible();
   await expect(page.getByText("From signal to verified recovery")).toBeVisible();
@@ -42,13 +43,15 @@ test("durable incident history stays separate from the technical workspace and s
       ? { mode: "local", local_development_only: true }
       : path === "/auth/login"
         ? { access_token: "admin-token", refresh_token: "refresh-token", user: { id: 1, username: "admin", role_name: "Administrator" } }
-        : path.startsWith("/incidents/metadata")
-          ? { rows: [valid] }
-          : path.startsWith("/alerts/all")
-            ? { data: { rows: [{ id: alertId, alert_id: alertId, incident_id: incidentId, name: "GatewayFailure", service: "api-gateway" }] } }
-            : path.startsWith(`/alerts/${alertId}/processed-result`)
-              ? { data: { alert: { id: alertId, name: "GatewayFailure", service: "api-gateway" }, incident: valid, context: { metadata: {} }, timeline: [] } }
-              : { data: { rows: [] }, rows: [] };
+        : path.startsWith("/incidents/groups")
+          ? { data: { rows: [valid], total_count: 1, filtered_count: 1 } }
+          : path === `/incidents/${incidentId}`
+            ? { data: valid }
+            : path.startsWith("/alerts/all")
+              ? { data: { rows: [{ id: alertId, alert_id: alertId, incident_id: incidentId, name: "GatewayFailure", service: "api-gateway" }] } }
+              : path.startsWith(`/alerts/${alertId}/processed-result`)
+                ? { data: { alert: { id: alertId, name: "GatewayFailure", service: "api-gateway" }, incident: valid, context: { metadata: {} }, timeline: [] } }
+                : { data: { rows: [] }, rows: [] };
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
   });
 
@@ -248,7 +251,7 @@ test("incident summary connects source application and Prometheus to KaiOps proc
     let body = { data: [], rows: [], summary: {}, items: [] };
     if (path === "/auth/config") body = { mode: "local", local_development_only: true };
     else if (path === "/auth/login") body = { access_token: "admin-token", refresh_token: "refresh-token", user: { id: 1, username: "admin", role_name: "Administrator" } };
-    else if (path.startsWith("/incidents/metadata")) body = { rows: [{ incident_id: incidentId, alert_id: alertId, title: "httpbin-failure-lab: ExternalApplicationUnavailable", service: "httpbin-failure-lab", environment: "public-internet", status: "awaiting_approval", ticket_id: "KAN-1376", source: "public-internet-blackbox", projection_payload: { context_source: "realtime_collection", event_payload: { labels: { application: "httpbin-failure-lab", project_name: "KaiOps", instance: "https://httpbin.org/status/503", alertname: "ExternalApplicationUnavailable", job: "blackbox", transport: "alertmanager", environment: "public-internet" } } } }] };
+    else if (path.startsWith("/incidents/groups")) body = { data: { rows: [{ incident_id: incidentId, alert_id: alertId, title: "httpbin-failure-lab: ExternalApplicationUnavailable", service: "httpbin-failure-lab", environment: "public-internet", status: "awaiting_approval", ticket_id: "KAN-1376", source: "public-internet-blackbox", projection_payload: { context_source: "realtime_collection", event_payload: { labels: { application: "httpbin-failure-lab", project_name: "KaiOps", instance: "https://httpbin.org/status/503", alertname: "ExternalApplicationUnavailable", job: "blackbox", transport: "alertmanager", environment: "public-internet" } } } }], total_count: 1, filtered_count: 1 } };
     else if (path.startsWith("/alerts/all")) body = { data: { rows: [{ id: alertId, name: "ExternalApplicationUnavailable", service: "httpbin-failure-lab", source: "public-internet-blackbox", starts_at: "2026-08-11T15:23:20Z", trace_id: "trace-httpbin-503", description: "HTTPS probe failed for https://httpbin.org/status/503 in public-internet.", labels: { application: "httpbin-failure-lab", project_name: "KaiOps", instance: "https://httpbin.org/status/503", alertname: "ExternalApplicationUnavailable", job: "blackbox", transport: "alertmanager", alert_status: "firing", ingestion_channel: "monitoring" }, annotations: { generatorURL: "http://prometheus:9090/graph?g0.expr=probe_success" } }] } };
     else if (path.startsWith("/landing-pad/recent") || path === "/applications") body = { data: { rows: [] } };
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });

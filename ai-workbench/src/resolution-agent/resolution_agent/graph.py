@@ -1444,7 +1444,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
         if mutating and evidence_quality.get("sufficiency") != "sufficient":
             readiness_blocks.append("The causal hypothesis is not independently corroborated by sufficient evidence.")
         if context_quality.get("discovery_degraded") or context_quality.get("execution_ready") is False:
-            readiness_blocks.append("Discovery evidence is degraded or unavailable; collect fresh diagnostics before execution.")
+            readiness_blocks.append(
+                "Discovery evidence is degraded or unavailable; collect fresh diagnostics before execution."
+            )
         state["remediation_analysis"] = {
             # Deterministic defaults first, so a real model answer (when
             # RESOLUTION_DEEP_ANALYSIS_ENABLED=true) always wins if it supplies its
