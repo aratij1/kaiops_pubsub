@@ -130,3 +130,41 @@ async def test_regeneration_preserves_prior_snapshot_and_binds_new_generation(sq
     assert len(snapshots) == 2
     assert snapshot_ids[0] != snapshot_ids[1]
     assert {str(row.snapshot_id) for row in snapshots} == set(snapshot_ids)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_persists_when_event_publication_is_disabled(sqlite_session_factory) -> None:
+    module = load_context_app_module()
+    module.settings.database_enabled = True
+    module.app.state.session_factory = sqlite_session_factory
+    alert = Alert(
+        tenant_id="tenant-a", source="prometheus", name="CheckoutErrors", service="checkout",
+        environment="prod", severity=AlertSeverity.HIGH, description="checkout errors",
+    )
+    incident = Incident(
+        tenant_id=alert.tenant_id, service=alert.service, environment=alert.environment,
+        severity=alert.severity, title=alert.name,
+    )
+    context = govern_context(
+        Context(tenant_id=alert.tenant_id, incident_id=incident.id, alert=alert),
+        tenant_id="tenant-a",
+        subject_fingerprint=context_subject_fingerprint(alert, "tenant-a"),
+    )
+    outgoing = module._build_context_event_payload(
+        alert=alert, incident=incident, context=context,
+        decision={"flow_id": str(incident.id)}, provider_used="rabbitmq",
+    )
+
+    enqueued = await module._persist_context_event(
+        app=module.app, alert=alert, incident=incident, context=context,
+        decision={"flow_id": str(incident.id)}, provider_used="rabbitmq",
+        outgoing_payload=outgoing, enqueue_event=False,
+    )
+
+    async with sqlite_session_factory() as session:
+        snapshots = await session.scalar(select(func.count()).select_from(ContextSnapshotRecord))
+        outbox_rows = await session.scalar(select(func.count()).select_from(ResolutionOutboxRecord))
+    assert enqueued is False
+    assert snapshots == 1
+    assert outbox_rows == 0
+    assert context.metadata["context_snapshot_id"] == outgoing["context"]["metadata"]["context_snapshot_id"]

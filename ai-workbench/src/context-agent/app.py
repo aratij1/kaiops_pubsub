@@ -501,6 +501,7 @@ async def _persist_context_event(
     decision: dict[str, Any] | None,
     provider_used: str,
     outgoing_payload: dict[str, Any],
+    enqueue_event: bool = True,
 ) -> bool:
     if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
         return True
@@ -515,6 +516,8 @@ async def _persist_context_event(
         NAMESPACE_URL,
         f"kaims:context-snapshot:{tenant_id}:{incident.id}:{snapshot_identity}",
     )
+    context.metadata["context_snapshot_id"] = str(snapshot_id)
+    context.metadata["context_snapshot_identity"] = snapshot_identity
     outgoing_context = outgoing_payload.get("context")
     if isinstance(outgoing_context, dict):
         outgoing_metadata = outgoing_context.get("metadata")
@@ -617,15 +620,17 @@ async def _persist_context_event(
             collected_at=collected_at,
             expires_at=expires_at,
         )
-        enqueued = await repo.enqueue_resolution_event(
-            event_id=event_id,
-            aggregate_id=str(incident.id),
-            topic=CONTEXT_EVENTS,
-            partition_key=str(alert.service or incident.id),
-            payload=outgoing_payload,
-            tenant_id=tenant_id,
-            available_after_seconds=float(getattr(settings, "resolution_outbox_initial_delay_seconds", 60.0) or 60.0),
-        )
+        enqueued = False
+        if enqueue_event:
+            enqueued = await repo.enqueue_resolution_event(
+                event_id=event_id,
+                aggregate_id=str(incident.id),
+                topic=CONTEXT_EVENTS,
+                partition_key=str(alert.service or incident.id),
+                payload=outgoing_payload,
+                tenant_id=tenant_id,
+                available_after_seconds=float(getattr(settings, "resolution_outbox_initial_delay_seconds", 60.0) or 60.0),
+            )
         await session.commit()
         return enqueued
 
@@ -1656,36 +1661,36 @@ async def collect(payload: dict, publish_events: bool = True) -> Context:
         decision=payload.get("decision"),
         analysis_request=payload.get("analysis_request"),
     )
-    if publish_events:
-        provider = _extract_message_bus_provider(payload)
-        publishers: dict[str, EventPublisher] = getattr(app.state, "message_bus_publishers", {})
-        provider_used = provider if publishers.get(provider) is not None else "rabbitmq"
-        outgoing_payload = _build_context_event_payload(
-            alert=alert,
-            incident=incident,
-            context=context,
-            decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
-            provider_used=provider_used,
-        )
-        enqueued = await _persist_context_event(
+    provider = _extract_message_bus_provider(payload)
+    publishers: dict[str, EventPublisher] = getattr(app.state, "message_bus_publishers", {})
+    provider_used = provider if publishers.get(provider) is not None else "rabbitmq"
+    outgoing_payload = _build_context_event_payload(
+        alert=alert,
+        incident=incident,
+        context=context,
+        decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
+        provider_used=provider_used,
+    )
+    enqueued = await _persist_context_event(
+        app=app,
+        alert=alert,
+        incident=incident,
+        context=context,
+        decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
+        provider_used=provider_used,
+        outgoing_payload=outgoing_payload,
+        enqueue_event=publish_events,
+    )
+    if publish_events and enqueued:
+        await _publish_context_event(
             app=app,
+            provider=provider_used,
             alert=alert,
             incident=incident,
             context=context,
             decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
-            provider_used=provider_used,
-            outgoing_payload=outgoing_payload,
+            payload=outgoing_payload,
         )
-        if enqueued:
-            await _publish_context_event(
-                app=app,
-                provider=provider_used,
-                alert=alert,
-                incident=incident,
-                context=context,
-                decision=payload.get("decision") if isinstance(payload.get("decision"), dict) else None,
-                payload=outgoing_payload,
-            )
     return context
 
 
