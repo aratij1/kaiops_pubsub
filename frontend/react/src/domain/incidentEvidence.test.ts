@@ -24,4 +24,21 @@ describe("canonical incident evidence", () => {
     expect(result.evidence[0].accepted).toBe(true);
     expect(result.executionReady).toBe(true);
   });
+
+  it("keeps collected context separate from evidence accepted by the RCA", () => {
+    const result = canonicalIncidentEvidence({
+      context: { metadata: { context_evidence: { metrics: [
+        { evidence_id: "metric-1", source_id: "prometheus", freshness: "fresh" },
+      ] } } },
+      recommendation: { confidence: .74, metadata: {
+        rca_status: "insufficient_evidence",
+        rca_analysis: { evidence_used: [], missing_evidence: ["traces"] },
+      } },
+    });
+    expect(result.evidence).toHaveLength(1);
+    expect(result.evidence[0].accepted).toBe(false);
+    expect(result.acceptedEvidenceIds).toEqual([]);
+    expect(result.confidence).toBe(0);
+    expect(result.grounded).toBe(false);
+  });
 });
