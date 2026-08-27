@@ -281,7 +281,8 @@ async def test_analysis_request_identity_flows_from_context_to_recommendation() 
     assert recommendation.metadata["analysis_request_id"] == first_request_id
     assert recommendation.metadata["context_snapshot_id"] == "snapshot-v1"
     assert recommendation.metadata["context_fingerprint"] == first.metadata["context_fingerprint"]
-    assert recommendation.metadata["rca_version"] == str(recommendation.id)
+    assert recommendation.metadata["rca_version"] == 1
+    assert recommendation.metadata["recommendation_version"] == str(recommendation.id)
     assert recommendation.metadata["recommendation_version"] == str(recommendation.id)
 
 
