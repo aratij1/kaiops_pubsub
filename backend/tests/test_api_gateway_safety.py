@@ -9,7 +9,7 @@ from uuid import uuid4
 import pytest
 from api_gateway import SafetyAnalyzer
 from common.models import SafetyDecision
-from common.database import AlertRecord, AuditLogRecord, HumanCorrectionRecord, IncidentProjectionRecord, IncidentRecord
+from common.database import AlertRecord, AuditLogRecord, HumanCorrectionRecord, IncidentOccurrenceRecord, IncidentProjectionRecord, IncidentRecord
 from ai_workbench_common.model_evaluation import build_quality_evaluation
 from api_gateway.auth_policy import route_auth_rule
 from pydantic import ValidationError
@@ -464,6 +464,56 @@ async def test_analysis_regeneration_reconstructs_historical_source_payload(
     assert captured["alert"].severity.value == "critical"
     assert captured["incident"].status.value == "investigating"
     assert captured["incident"].alert_ids == [alert_uuid]
+
+
+@pytest.mark.asyncio
+async def test_analysis_regeneration_resolves_canonical_incident_occurrence(
+    monkeypatch, sqlite_session_factory,
+) -> None:
+    module = load_api_gateway_app_module()
+    alert_uuid = uuid4()
+    canonical_alert_uuid = uuid4()
+    incident_uuid = uuid4()
+    family_uuid = uuid4()
+    captured: dict = {}
+    async with sqlite_session_factory() as session:
+        session.add(AlertRecord(
+            id=alert_uuid, tenant_id="tenant-a", source="prometheus", name="RepeatedLatency",
+            service="api-gateway", environment="prod", severity="warning",
+            payload={"description": "repeated latency occurrence"},
+        ))
+        session.add(IncidentRecord(
+            id=incident_uuid, tenant_id="tenant-a", service="api-gateway", environment="prod",
+            severity="warning", status="investigating", title="Canonical latency incident", payload={},
+        ))
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_uuid, alert_id=canonical_alert_uuid, tenant_id="tenant-a",
+            service="api-gateway", environment="prod", severity="warning", status="investigating",
+            projection_payload={},
+        ))
+        session.add(IncidentOccurrenceRecord(
+            tenant_id="tenant-a", project_id="kaiops", environment="prod", service="api-gateway",
+            correlation_family_id=family_uuid, correlation_generation=1,
+            canonical_incident_id=incident_uuid, occurrence_id=alert_uuid,
+            idempotency_key=f"alert-occurrence:{alert_uuid}",
+        ))
+        await session.commit()
+
+    async def publish_stub(**kwargs):
+        captured.update(kwargs)
+        return "published"
+
+    monkeypatch.setattr(module, "_publish_analysis_regeneration_command", publish_stub)
+    monkeypatch.setattr(module.app.state, "session_factory", sqlite_session_factory, raising=False)
+    result = await module.regenerate_alert_analysis(
+        str(alert_uuid), SimpleNamespace(app=module.app), payload={"mode": "fresh"},
+        x_trace_id=None, tenant_id="tenant-a",
+    )
+
+    assert result["status"] == "accepted"
+    assert result["incident_id"] == str(incident_uuid)
+    assert captured["incident"].id == incident_uuid
+    assert captured["alert"].id == alert_uuid
 
 
 @pytest.mark.asyncio

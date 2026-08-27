@@ -1012,6 +1012,26 @@ class IncidentRepository:
                 incident_record = projection_incident_result.scalar_one_or_none()
 
         if incident_record is None:
+            occurrence_result = await self.session.execute(
+                select(IncidentOccurrenceRecord)
+                .where(
+                    IncidentOccurrenceRecord.occurrence_id == alert_uuid,
+                    IncidentOccurrenceRecord.tenant_id == normalized_tenant_id,
+                )
+                .order_by(IncidentOccurrenceRecord.observed_at.desc())
+                .limit(1)
+            )
+            occurrence_record = occurrence_result.scalar_one_or_none()
+            if occurrence_record is not None:
+                occurrence_incident_result = await self.session.execute(
+                    select(IncidentRecord).where(
+                        IncidentRecord.id == occurrence_record.canonical_incident_id,
+                        IncidentRecord.tenant_id == normalized_tenant_id,
+                    )
+                )
+                incident_record = occurrence_incident_result.scalar_one_or_none()
+
+        if incident_record is None:
             incident_rows = await self.session.execute(
                 select(IncidentRecord)
                 .where(IncidentRecord.tenant_id == normalized_tenant_id)
