@@ -79,8 +79,17 @@ def _fallback_actionability(alert: Alert) -> tuple[bool, str]:
             "error scraping",
             "cannot scrape",
             "failed",
+            "failure",
+            "latency",
+            "degraded",
+            "above threshold",
+            "row count is high",
+            "disk space low",
+            "saturation",
         )
     )
+    severity = str(getattr(alert.severity, "value", alert.severity) or "").strip().lower()
+    actionable = actionable or severity in {"high", "critical"}
     return (
         actionable,
         "Signal indicates a persistent failure requiring operator investigation."
