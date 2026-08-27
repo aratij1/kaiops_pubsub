@@ -66,8 +66,8 @@ test("a restricted deep link redirects with a clear role explanation", async ({ 
   await page.getByLabel("Username").fill("operator");
   await page.getByLabel("Password").fill("Operator@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
-  await expect(page).toHaveURL(/\/\?access=restricted&destination=Users%20%26%20Access/);
-  await expect(page.getByRole("status")).toContainText("Users & Access is not available to your role");
+  await expect(page).toHaveURL(/\/\?access=restricted&destination=Platform%20Settings/);
+  await expect(page.getByRole("status")).toContainText("Platform Settings is not available to your role");
   await expect(page.getByRole("navigation", { name: "Primary navigation" })).not.toContainText("Settings");
 });
 
@@ -113,4 +113,10 @@ test("audit and administration remain isolated routed workspaces", async ({ page
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await expect(page).toHaveURL(/\/admin\/settings$/);
   await expect(page.getByRole("heading", { level: 1, name: "Platform Settings" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 2, name: "Platform Settings" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Operate the platform as one system." })).toHaveCount(0);
+  await page.getByRole("button", { name: "Control Plane", exact: true }).click();
+  await expect(page).toHaveURL(/\/platform$/);
+  await expect(page.getByRole("heading", { name: "Operate the platform as one system." })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Primary navigation" }).getByRole("button", { name: "Platform Settings", exact: true })).toHaveCount(0);
 });

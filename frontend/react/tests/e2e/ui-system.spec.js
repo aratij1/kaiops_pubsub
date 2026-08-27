@@ -16,7 +16,7 @@ const routes = [
   ["/agent-flow", "Kai Trace", ".agent-flow-workspace"],
   ["/knowledge", "Knowledge", ".ai-hub"],
   ["/gateway-safety", "Gateway safety details", ".trust-center"],
-  ["/audit", "Platform Health & Audit", ".governance-workspace.is-audit"],
+  ["/audit", "Platform Health & Audit", ".audit-workspace"],
   ["/closed-incidents", "Closed Incidents", ".resolution-history-workspace"],
   ["/applications", "Applications", ".applications-workspace"],
   ["/integrations", "Integration setup", ".onboarding-workspace"],
@@ -112,8 +112,8 @@ test("representative operational routes reflow and retain accessible semantics",
 test("audit and safety controls communicate distinct purposes", async ({ page }) => {
   await mockPlatform(page);
   await signIn(page, "/audit");
-  await expect(page.getByRole("heading", { name: "Policy decision audit trail" })).toBeVisible();
-  await expect(page.getByText("Governance evidence", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Audit trail", exact: true })).toBeVisible();
+  await expect(page.getByText("Governance record", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Gateway safety decisions" })).toHaveCount(0);
 });
 

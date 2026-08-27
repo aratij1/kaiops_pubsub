@@ -42,9 +42,16 @@ test("ten production incident cockpits are read-only and status-consistent", asy
     // depends on a second processed-result read and can legitimately show its
     // bounded timeout state without saying anything about the incident route.
     await page.goto(`/incidents/${encodeURIComponent(incidentId)}`);
-    await page.getByLabel("Username").fill(username);
-    await page.getByLabel("Password").fill(password);
-    await page.getByRole("button", { name: /sign in/i }).click();
+    const loginInput = page.getByLabel("Username");
+    const loginRequired = await Promise.race([
+      page.locator(".app-layout").waitFor({ state: "visible", timeout: 30_000 }).then(() => false),
+      loginInput.waitFor({ state: "visible", timeout: 30_000 }).then(() => true),
+    ]);
+    if (loginRequired) {
+      await loginInput.fill(username);
+      await page.getByLabel("Password").fill(password);
+      await page.getByRole("button", { name: /sign in/i }).click();
+    }
     const cockpit = page.locator(".incident-command");
     await expect(cockpit).toBeVisible({ timeout: 45_000 });
     await expect(cockpit.locator(".ic-resolution")).toBeVisible({ timeout: 30_000 });

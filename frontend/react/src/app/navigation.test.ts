@@ -53,6 +53,20 @@ describe("authoritative navigation", () => {
   it("keeps audit and administration as distinct canonical workspaces", () => {
     expect(tabForPath("/audit")).toBe("audit");
     expect(tabForPath("/admin/settings")).toBe("admin");
-    expect(NAVIGATION_ITEMS.find((item) => item.id === "audit")?.path).not.toBe(NAVIGATION_ITEMS.find((item) => item.id === "settings")?.path);
+    const audit = NAVIGATION_ITEMS.find((item) => item.id === "audit");
+    const administration = NAVIGATION_ITEMS.find((item) => item.id === "admin");
+    expect(audit?.path).not.toBe(NAVIGATION_ITEMS.find((item) => item.id === "settings")?.path);
+    expect(audit?.pageTitle).toBe("Platform Health & Audit");
+    expect(administration?.pageTitle).toBe("Platform Settings");
+  });
+
+  it("exposes one settings destination distinct from the control plane", () => {
+    const controlPlane = NAVIGATION_ITEMS.find((item) => item.id === "platformOverview");
+    const settings = NAVIGATION_ITEMS.find((item) => item.id === "settings");
+    const legacyAdmin = NAVIGATION_ITEMS.find((item) => item.id === "admin");
+    expect(controlPlane?.path).toBe("/platform");
+    expect(settings?.path).toBe("/admin/settings");
+    expect(settings?.path).not.toBe(controlPlane?.path);
+    expect(legacyAdmin?.showInNavigation).toBe(false);
   });
 });

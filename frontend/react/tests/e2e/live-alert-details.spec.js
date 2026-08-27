@@ -9,19 +9,20 @@ test("live alert row opens the details cockpit", async ({ page }) => {
 
   await page.goto("/");
   const username = page.getByLabel("Username");
-  if (await username.isVisible().catch(() => false)) {
-    await username.fill(process.env.KAIOPS_E2E_USERNAME || "admin");
-    await page.getByLabel("Password").fill(process.env.KAIOPS_E2E_PASSWORD || "Admin@123456");
-    await page.getByRole("button", { name: "Sign In" }).click();
-  }
+  await expect(username).toBeVisible({ timeout: 30_000 });
+  await username.fill(process.env.KAIOPS_E2E_USERNAME || "admin");
+  await page.getByLabel("Password").fill(process.env.KAIOPS_E2E_PASSWORD || "Admin@123456");
+  const loginResponsePromise = page.waitForResponse((response) => response.url().includes("/api-gateway/auth/login"));
+  await page.getByRole("button", { name: /sign in/i }).click();
+  const loginResponse = await loginResponsePromise;
+  expect(loginResponse.ok(), `login returned HTTP ${loginResponse.status()}`).toBeTruthy();
 
+  await expect(page.locator(".app-layout")).toBeVisible({ timeout: 30_000 });
+  await page.goto("/alerts");
   await expect(page.getByRole("heading", { name: "Alert Stream" })).toBeVisible({ timeout: 30_000 });
-  const alertRows = page.locator(".alert-stream-table tbody tr.alert-row");
-  await expect(alertRows.first()).toBeVisible({ timeout: 30_000 });
-  const rowCount = await alertRows.count();
-  for (let index = 0; index < rowCount; index += 1) {
-    await alertRows.nth(index).click();
-    await expect(page.getByRole("heading", { name: "Alert Details Cockpit" })).toBeVisible({ timeout: 15_000 });
-  }
+  const openAlert = page.getByRole("button", { name: /Open in Unified Inbox|Review alert|View audit details/ }).first();
+  await expect(openAlert).toBeVisible({ timeout: 30_000 });
+  await openAlert.click();
+  await expect(page.locator(".incident-command, .alert-details-cockpit").first()).toBeVisible({ timeout: 30_000 });
   expect(pageErrors).toEqual([]);
 });

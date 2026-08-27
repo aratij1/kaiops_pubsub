@@ -139,7 +139,7 @@ async function installScenario(page, options = {}) {
     if (path.startsWith("/incidents/metadata")) {
       const requestedStatus = url.searchParams.get("status");
       const include = !requestedStatus || String(currentIncident.status).toLowerCase().includes(requestedStatus);
-      return route.fulfill(json({ data: { rows: include ? [currentIncident] : [] } }));
+      return route.fulfill(json({ data: { rows: include ? (options.incidents || [currentIncident]) : [] } }));
     }
     if (path.startsWith("/incidents/closed")) return route.fulfill(json({ data: { rows: String(currentIncident.status).toLowerCase() === "recovered" ? [currentIncident] : [] } }));
     if (path === `/incidents/${INCIDENT_ID}/manual-close` && method === "POST") {
@@ -288,6 +288,34 @@ test("legacy approval can generate a fresh governed plan before approval", async
   await expect(page.locator("body")).not.toContainText("Approval unavailable");
 });
 
+test("approval queue keeps every decision packet legible when the list scrolls", async ({ page }) => {
+  const incidents = Array.from({ length: 12 }, (_, index) => incident({
+    incident_id: `11111111-1111-4111-8111-${String(index + 1).padStart(12, "0")}`,
+    service: index < 6 ? "remediation-engine" : "api-gateway",
+    environment: "production",
+    risk_tier: "high",
+  }));
+  await installScenario(page, { incidents });
+  await page.setViewportSize({ width: 1040, height: 580 });
+  await signIn(page, "/approvals");
+
+  const tickets = page.locator(".approval-ticket");
+  await expect(tickets).toHaveCount(12);
+  const geometry = await tickets.evaluateAll((rows) => rows.slice(0, 8).map((row) => {
+    const bounds = row.getBoundingClientRect();
+    const children = Array.from(row.children).map((child) => child.getBoundingClientRect());
+    return {
+      top: bounds.top,
+      bottom: bounds.bottom,
+      height: bounds.height,
+      childrenContained: children.every((child) => child.top >= bounds.top && child.bottom <= bounds.bottom),
+    };
+  }));
+  expect(geometry.every((row) => row.height >= 76 && row.childrenContained)).toBeTruthy();
+  expect(geometry.slice(1).every((row, index) => row.top >= geometry[index].bottom)).toBeTruthy();
+  await expect(page.getByLabel("Queue filter")).toBeVisible();
+});
+
 test("a newer live occurrence retains its canonical incident link into Unified Inbox", async ({ page }) => {
   test.setTimeout(90_000);
   const fingerprint = "linked-alert-fingerprint";
@@ -316,6 +344,32 @@ test("a newer live occurrence retains its canonical incident link into Unified I
   await page.getByRole("button", { name: "Incident inbox" }).click();
   await expect(page.locator(".unified-inbox-card.is-incident")).toHaveCount(1);
   await expect(page.locator(".unified-inbox-card.is-signal")).toHaveCount(0);
+});
+
+test("Unified Inbox collapses incident projections with the same durable correlation", async ({ page }) => {
+  const correlationId = "4759f3fa-970d-4cd4-b888-6f513fbf4297";
+  const fingerprint = "8c86631aff1f2ce527dddb7d27eed7e3468eb38a1f7d4b0d7dbc4b65fb3a82ab";
+  const first = incident({
+    incident_id: "1e6e0b97-cbcc-4c28-a60e-fbeccdbba930",
+    alert_id: "a9b53b21-c9c0-4807-9826-c4d00fb83b24",
+    title: "KaiOpsHighLatencyP99",
+    service: "api-gateway",
+    correlation_id: correlationId,
+    fingerprint,
+  });
+  const second = incident({
+    incident_id: "c74f3fe4-8cfd-4b64-9bc9-f19131177438",
+    alert_id: "0a4599b4-c54d-41a4-bf81-528f338450a0",
+    title: "KaiOpsHighLatencyP99",
+    service: "api-gateway",
+    correlation_id: correlationId,
+    fingerprint,
+  });
+  await installScenario(page, { incidents: [first, second] });
+  await signIn(page, "/incidents");
+
+  await expect(page.locator(".unified-inbox-card.is-incident")).toHaveCount(1);
+  await expect(page.getByText("2 occurrences", { exact: true })).toBeVisible();
 });
 
 test("Full investigation retains the clicked incident while alert details hydrate", async ({ page }) => {

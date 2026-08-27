@@ -376,19 +376,29 @@ function incidentProgress(row: IncidentRow) {
   return terminalBonus + furthestStage;
 }
 
-function groupIncidentsByJira(rows: IncidentRow[]): GroupedIncidentRow[] {
+function groupCorrelatedIncidents(rows: IncidentRow[]): GroupedIncidentRow[] {
   const groups = new Map<string, IncidentRow[]>();
   rows.forEach((row) => {
+    const sourceAlert = row.source_alert || {};
+    const correlationId = String(row.correlation_id || sourceAlert.correlation_id || "").trim().toLowerCase();
+    const fingerprint = String(row.fingerprint || sourceAlert.fingerprint || "").trim().toLowerCase();
     const jiraKey = String(row.ticket_id || row.jira_key || "").trim().toUpperCase();
-    // Incidents without a Jira ticket are still independent workflow records.
     const incidentId = String(row.incident_id || row.id || "").trim();
-    const key = jiraKey ? `jira:${jiraKey}` : `incident:${incidentId}`;
+    // Correlation and fingerprint are the durable signal identities. Jira remains
+    // a compatibility fallback for older records that did not expose either key.
+    const key = correlationId
+      ? `correlation:${correlationId}`
+      : fingerprint
+        ? `fingerprint:${fingerprint}`
+        : jiraKey
+          ? `jira:${jiraKey}`
+          : `incident:${incidentId}`;
     groups.set(key, [...(groups.get(key) || []), row]);
   });
   return Array.from(groups.values()).map((group) => {
     // A newer duplicate can still be near the start of processing while an
     // older record for the same Jira has context, RCA, or approval results.
-    // Represent the Jira with the furthest-progressed workflow so opening the
+    // Represent the correlated signal with the furthest-progressed workflow so opening the
     // row does not hide those results; use recency only between equal stages.
     const sorted = group.slice().sort((left, right) => (
       incidentProgress(right) - incidentProgress(left)
@@ -434,7 +444,7 @@ export default function IncidentsRoute() {
   };
   const groupedIncidents = useMemo(() => {
     const alertsById = new Map(inboxAlertRows.map((alert) => [String(alert.id || (alert as typeof alert & { alert_id?: string }).alert_id || ""), alert]));
-    return groupIncidentsByJira(incidents.rows.map((row) => ({
+    return groupCorrelatedIncidents(incidents.rows.map((row) => ({
       ...row,
       source_alert: row.source_alert || alertsById.get(String(row.alert_id || "")),
     }))).sort((left, right) => attentionScore(right) - attentionScore(left));
@@ -668,7 +678,7 @@ export default function IncidentsRoute() {
               <details className="full-alert-payload"><summary>View complete alert payload</summary><pre>{JSON.stringify(fullAlertPayload(row), null, 2)}</pre></details>
             </section>
             {!['closed','resolved'].includes(normalizedStatus(row)) ? <section className="incident-stage-inspector manual-closure-panel"><header><div><small>Operator command</small><h3>Close incident with audit comment</h3></div></header><label>Closure comment<textarea rows={3} value={closure.incidentId === incidentId ? closure.comment : ""} onChange={(event) => setClosure({ incidentId, comment: event.target.value, loading: false, message: "", error: "" })} placeholder="Explain the evidence, decision, and any follow-up action." /></label><button type="button" className="button-danger" disabled={closure.loading || closure.incidentId !== incidentId || closure.comment.trim().length < 10} onClick={() => void closeIncident(row)}>{closure.loading && closure.incidentId === incidentId ? "Closing…" : "Close incident and update Jira"}</button>{closure.incidentId === incidentId && closure.error ? <p className="error">{closure.error}</p> : null}{closure.incidentId === incidentId && closure.message ? <p className="status-message">{closure.message}</p> : null}</section> : null}
-            {row.duplicateIncidents.length ? <details className="duplicate-occurrences"><summary><span><small>Grouped by Jira</small><strong>{row.duplicateIncidents.length + 1} total occurrences</strong></span><span>Duplicates are merged into {jiraKey}; view history</span></summary><div className="duplicate-occurrence-summary"><span><small>First observed</small><strong>{formatIstTimestamp([...row.duplicateIncidents, row].sort((a, b) => incidentTime(a) - incidentTime(b))[0]?.created_at)}</strong></span><span><small>Latest observed</small><strong>{formatIstTimestamp([...row.duplicateIncidents, row].sort((a, b) => incidentTime(b) - incidentTime(a))[0]?.updated_at)}</strong></span><span><small>Service</small><strong>{row.service || "Unknown service"}</strong></span></div><div className="duplicate-occurrence-list">{row.duplicateIncidents.map((duplicate) => { const duplicateId = String(duplicate.incident_id || duplicate.id || "Not recorded"); return <div key={duplicateId}><code>{duplicateId}</code><span>{formatIstTimestamp(duplicate.updated_at || duplicate.created_at)}</span><span>{incidentStatusLabel(duplicate)}</span></div>; })}</div></details> : null}
+            {row.duplicateIncidents.length ? <details className="duplicate-occurrences"><summary><span><small>Correlated occurrences</small><strong>{row.duplicateIncidents.length + 1} total occurrences</strong></span><span>Repeated signal records are shown as one incident; view history</span></summary><div className="duplicate-occurrence-summary"><span><small>First observed</small><strong>{formatIstTimestamp([...row.duplicateIncidents, row].sort((a, b) => incidentTime(a) - incidentTime(b))[0]?.created_at)}</strong></span><span><small>Latest observed</small><strong>{formatIstTimestamp([...row.duplicateIncidents, row].sort((a, b) => incidentTime(b) - incidentTime(a))[0]?.updated_at)}</strong></span><span><small>Service</small><strong>{row.service || "Unknown service"}</strong></span></div><div className="duplicate-occurrence-list">{row.duplicateIncidents.map((duplicate) => { const duplicateId = String(duplicate.incident_id || duplicate.id || "Not recorded"); return <div key={duplicateId}><code>{duplicateId}</code><span>{formatIstTimestamp(duplicate.updated_at || duplicate.created_at)}</span><span>{incidentStatusLabel(duplicate)}</span></div>; })}</div></details> : null}
           </div> : null}
         </article>;
       }) : null}

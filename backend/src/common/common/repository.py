@@ -4492,12 +4492,24 @@ class IncidentRepository:
         response_rows: list[dict[str, Any]] = []
         for row in rows:
             canonical_alert_id = row.alert_id or canonical_alert_by_incident.get(row.incident_id)
+            # An immutable incident event can outlive (or predate) its durable
+            # AlertRecord.  Such an identity is useful provenance, but it is
+            # not a navigable alert contract: processed-result and analysis
+            # regeneration are both keyed by a tenant-scoped AlertRecord.
+            # Never advertise a dead alert link from incident metadata.
+            navigable_alert_id = (
+                canonical_alert_id
+                if canonical_alert_id is not None and canonical_alert_id in source_alert_by_id
+                else None
+            )
             pending = pending_by_incident.get(row.incident_id)
             merged_recommendation_id = row.recommendation_id or (pending.recommendation_id if pending is not None else None)
             merged_flow_id = row.flow_id or (pending.flow_id if pending is not None else None)
             projection_payload = dict(row.projection_payload or {}) if include_enrichment else {}
-            if canonical_alert_id is not None:
-                projection_payload.setdefault("alert_id", str(canonical_alert_id))
+            if navigable_alert_id is not None:
+                projection_payload["alert_id"] = str(navigable_alert_id)
+            else:
+                projection_payload.pop("alert_id", None)
             event_payload = (
                 projection_payload.get("event_payload")
                 if isinstance(projection_payload.get("event_payload"), dict)
@@ -4921,7 +4933,7 @@ class IncidentRepository:
             response_rows.append(
                 {
                     "incident_id": str(row.incident_id),
-                    "alert_id": str(canonical_alert_id) if canonical_alert_id else None,
+                    "alert_id": str(navigable_alert_id) if navigable_alert_id else None,
                     "trace_id": row.trace_id,
                     "recommendation_id": str(merged_recommendation_id) if merged_recommendation_id else None,
                     "flow_id": merged_flow_id,
@@ -4956,6 +4968,11 @@ class IncidentRepository:
                     "summary": summary,
                     "source": source_name,
                     "origin_system": origin_system,
+                    # Keep the durable alert identity available on compact incident
+                    # responses.  The inbox uses these fields to collapse historical
+                    # projections that were created for the same correlated signal.
+                    "fingerprint": normalized_source_alert.get("fingerprint"),
+                    "correlation_id": normalized_source_alert.get("correlation_id"),
                     "deduplicated_count": deduplicated_count,
                     "deduplication_reason": deduplication_reason,
                     "customer_impact": customer_impact,
