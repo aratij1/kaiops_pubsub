@@ -1596,6 +1596,24 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
         recommendation.metadata["reasoning"] = state.get("rationale", "")
         recommendation.metadata["rca_analysis"] = state.get("rca_analysis", {})
+        evidence_quality = (
+            recommendation.metadata["rca_analysis"].get("evidence_quality", {})
+            if isinstance(recommendation.metadata["rca_analysis"], dict)
+            else {}
+        )
+        available_evidence_count = int(
+            (recommendation.metadata["rca_analysis"].get("evidence_validation") or {}).get("available_count") or 0
+        )
+        accepted_count = int(evidence_quality.get("accepted_evidence") or 0)
+        recommendation.metadata["evidence_quality"] = {
+            "evidence_coverage": min(1.0, accepted_count / 2.0),
+            "citation_coverage": min(1.0, accepted_count / max(1, available_evidence_count)),
+            "evidence_fresh": int(evidence_quality.get("fresh_direct_evidence") or 0) > 0,
+            "conflict_count": 1 if evidence_quality.get("contradictory") else 0,
+            "independent_source_count": int(evidence_quality.get("independent_sources") or 0),
+            "direct_observation_count": int(evidence_quality.get("direct_evidence") or 0),
+            "sufficiency": str(evidence_quality.get("sufficiency") or "insufficient"),
+        }
         recommendation.metadata["impact_analysis"] = state.get("impact_analysis", {})
         recommendation.metadata["remediation_analysis"] = state.get("remediation_analysis", {})
         recommendation.metadata["investigation_report"] = state.get("investigation_report", {})

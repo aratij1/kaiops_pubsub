@@ -142,7 +142,7 @@ def _signed_approval_readiness(context: dict[str, Any]) -> dict[str, Any]:
         "current_credentials": opaque_credential,
         "required_validators": bool(validators),
         "rollback_readiness": str(plan.get("rollback_mode") or "").lower() == "not_applicable" or bool(rollback),
-        "policy_acceptance": str(policy.get("decision") or metadata.get("policy_decision") or "").lower() in {"allow", "approved", "accept"},
+        "policy_acceptance": str(policy.get("decision") or metadata.get("policy_decision") or "").lower() in {"allow", "approved", "accept", "hitl"},
         "evidence_threshold": (
             float(quality.get("evidence_coverage") or 0.0) >= 0.85
             and float(quality.get("citation_coverage") or 0.0) > 0.0

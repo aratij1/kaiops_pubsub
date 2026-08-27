@@ -176,6 +176,25 @@ def test_approval_readiness_fails_closed_without_signing_key() -> None:
     assert receipt["signature"] == ""
 
 
+@pytest.mark.parametrize("decision,eligible", [("hitl", True), ("investigate", False), ("block", False)])
+def test_approval_readiness_understands_resolution_policy_disposition(decision: str, eligible: bool) -> None:
+    module = load_approval_app_module()
+    module.settings.service_internal_token = "internal-test-token"
+    plan = _approval_plan("11111111-1111-1111-1111-111111111111")
+    plan["policy_decision"] = {"decision": decision}
+    plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
+    receipt = module._signed_approval_readiness({
+        "tenant_id": "tenant-a",
+        "incident_id": plan["incident_id"],
+        "recommendation": {
+            "id": plan["recommendation_version"],
+            "tenant_id": "tenant-a",
+            "metadata": _readiness_metadata(plan),
+        },
+    })
+    assert (receipt["state"] == "execution_eligible") is eligible
+
+
 def test_approval_readiness_rejects_raw_credentials() -> None:
     module = load_approval_app_module()
     module.settings.service_internal_token = "internal-test-token"
