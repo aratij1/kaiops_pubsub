@@ -662,7 +662,9 @@ async def _persist_context_event(
                 partition_key=str(alert.service or incident.id),
                 payload=outgoing_payload,
                 tenant_id=tenant_id,
-                available_after_seconds=float(getattr(settings, "resolution_outbox_initial_delay_seconds", 60.0) or 60.0),
+                available_after_seconds=float(
+                    getattr(settings, "resolution_outbox_initial_delay_seconds", 60.0) or 60.0
+                ),
             )
         await session.commit()
         return enqueued

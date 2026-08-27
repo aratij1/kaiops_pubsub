@@ -3162,7 +3162,8 @@ class IncidentRepository:
                 select(ContextSnapshotRecord).where(
                     ContextSnapshotRecord.snapshot_id == snapshot_uuid,
                     ContextSnapshotRecord.tenant_id == str(self._require("context_snapshot.tenant_id", tenant_id)),
-                    ContextSnapshotRecord.incident_id == str(self._require("context_snapshot.incident_id", incident_id)),
+                    ContextSnapshotRecord.incident_id
+                    == str(self._require("context_snapshot.incident_id", incident_id)),
                 )
             )
         ).scalar_one_or_none()
@@ -3398,9 +3399,21 @@ class IncidentRepository:
         metadata = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
         context = context_snapshot.get("context") if isinstance(context_snapshot.get("context"), dict) else {}
         context_metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
-        quality = context_metadata.get("context_quality") if isinstance(context_metadata.get("context_quality"), dict) else {}
-        source_manifest = context_metadata.get("context_sources") if isinstance(context_metadata.get("context_sources"), dict) else {}
-        evidence_buckets = context_metadata.get("context_evidence") if isinstance(context_metadata.get("context_evidence"), dict) else {}
+        quality = (
+            context_metadata.get("context_quality")
+            if isinstance(context_metadata.get("context_quality"), dict)
+            else {}
+        )
+        source_manifest = (
+            context_metadata.get("context_sources")
+            if isinstance(context_metadata.get("context_sources"), dict)
+            else {}
+        )
+        evidence_buckets = (
+            context_metadata.get("context_evidence")
+            if isinstance(context_metadata.get("context_evidence"), dict)
+            else {}
+        )
         evidence_rows = [
             item
             for bucket in evidence_buckets.values()
@@ -3412,7 +3425,12 @@ class IncidentRepository:
         for source_id, details in source_manifest.items():
             row = details if isinstance(details, dict) else {}
             raw_status = str(row.get("status") or row.get("collection_status") or "skipped").lower()
-            status_aliases = {"collected": "completed", "success": "completed", "stale": "completed", "failed": "unavailable"}
+            status_aliases = {
+                "collected": "completed",
+                "success": "completed",
+                "stale": "completed",
+                "failed": "unavailable",
+            }
             status = status_aliases.get(raw_status, raw_status)
             collected_at = row.get("collected_at") or context_snapshot.get("collected_at")
             sources.append({
@@ -3442,18 +3460,35 @@ class IncidentRepository:
             "current_observation": item.get("current_observation") is not False,
         } for item in evidence_rows]
         analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
-        investigation = metadata.get("investigation_report") if isinstance(metadata.get("investigation_report"), dict) else {}
+        investigation = (
+            metadata.get("investigation_report")
+            if isinstance(metadata.get("investigation_report"), dict)
+            else {}
+        )
         plan = metadata.get("execution_plan") if isinstance(metadata.get("execution_plan"), dict) else {}
-        accepted = metadata.get("evidence_ids") if isinstance(metadata.get("evidence_ids"), list) else analysis.get("evidence_used", [])
+        accepted = (
+            metadata.get("evidence_ids")
+            if isinstance(metadata.get("evidence_ids"), list)
+            else analysis.get("evidence_used", [])
+        )
         missing = analysis.get("missing_evidence", []) if isinstance(analysis.get("missing_evidence"), list) else []
-        conflicting = analysis.get("conflicting_evidence", []) if isinstance(analysis.get("conflicting_evidence"), list) else []
-        conclusive = investigation.get("conclusive") is True and str(investigation.get("status") or "").lower() == "conclusive"
+        conflicting = (
+            analysis.get("conflicting_evidence", [])
+            if isinstance(analysis.get("conflicting_evidence"), list)
+            else []
+        )
+        conclusive = (
+            investigation.get("conclusive") is True
+            and str(investigation.get("status") or "").lower() == "conclusive"
+        )
         grounded = str(metadata.get("rca_status") or "").lower() == "grounded" and bool(accepted)
         plan_blocks = plan.get("readiness_blocks") if isinstance(plan.get("readiness_blocks"), list) else []
         plan_id = plan.get("plan_id") or plan.get("id")
         plan_fingerprint = plan.get("plan_fingerprint") or plan.get("fingerprint")
         readiness_blocks = list(dict.fromkeys([
-            *[str(item) for item in missing], *[str(item) for item in conflicting], *[str(item) for item in plan_blocks],
+            *[str(item) for item in missing],
+            *[str(item) for item in conflicting],
+            *[str(item) for item in plan_blocks],
             *([] if conclusive else ["investigation is not conclusive"]),
             *([] if grounded else ["RCA is not grounded in accepted evidence"]),
             *([] if plan_id and plan_fingerprint else ["exact resolution plan is not ready"]),
@@ -3845,7 +3880,8 @@ class IncidentRepository:
         integrations = (
             await self.session.execute(
                 select(MonitoringIntegrationRecord).where(
-                    MonitoringIntegrationRecord.tenant_id == self._require("monitoring_integration.tenant_id", tenant_id),
+                    MonitoringIntegrationRecord.tenant_id
+                    == self._require("monitoring_integration.tenant_id", tenant_id),
                     MonitoringIntegrationRecord.active.is_(True),
                     func.lower(MonitoringIntegrationRecord.project_name).in_(candidates),
                 )
@@ -5054,7 +5090,16 @@ class IncidentRepository:
                 raise ValueError("Invalid unified inbox cursor") from exc
 
         terminal = ("closed", "resolved", "recovered", "cancelled", "canceled")
-        attention = ("failed", "blocked", "manual_intervention", "validation_failed", "rollback_failed", "awaiting_approval", "pending_approval", "approval_required")
+        attention = (
+            "failed",
+            "blocked",
+            "manual_intervention",
+            "validation_failed",
+            "rollback_failed",
+            "awaiting_approval",
+            "pending_approval",
+            "approval_required",
+        )
         latest_generation = (
             select(
                 IncidentCorrelationOwnershipRecord.correlation_family_id.label("family_id"),
@@ -5090,18 +5135,37 @@ class IncidentRepository:
             )
         )
         if normalized["project_id"]:
-            incident_query = incident_query.where(func.lower(IncidentCorrelationOwnershipRecord.project_id) == normalized["project_id"])
+            incident_query = incident_query.where(
+                func.lower(IncidentCorrelationOwnershipRecord.project_id) == normalized["project_id"]
+            )
         if normalized["service"]:
-            incident_query = incident_query.where(func.lower(IncidentCorrelationOwnershipRecord.service) == normalized["service"])
+            incident_query = incident_query.where(
+                func.lower(IncidentCorrelationOwnershipRecord.service) == normalized["service"]
+            )
         if normalized["status"]:
-            incident_query = incident_query.where(func.lower(IncidentCorrelationOwnershipRecord.lifecycle_state) == normalized["status"])
+            incident_query = incident_query.where(
+                func.lower(IncidentCorrelationOwnershipRecord.lifecycle_state) == normalized["status"]
+            )
         if normalized["severity"]:
-            incident_query = incident_query.where(func.lower(IncidentProjectionRecord.severity) == normalized["severity"])
-        for field, column in (("risk_tier", IncidentProjectionRecord.risk_tier), ("execution_mode", IncidentProjectionRecord.execution_mode), ("transport_provider", IncidentProjectionRecord.transport_provider)):
+            incident_query = incident_query.where(
+                func.lower(IncidentProjectionRecord.severity) == normalized["severity"]
+            )
+        projection_filters = (
+            ("risk_tier", IncidentProjectionRecord.risk_tier),
+            ("execution_mode", IncidentProjectionRecord.execution_mode),
+            ("transport_provider", IncidentProjectionRecord.transport_provider),
+        )
+        for field, column in projection_filters:
             if normalized[field]:
                 incident_query = incident_query.where(func.lower(column) == normalized[field])
 
-        alert_project = func.lower(func.coalesce(AlertRecord.payload["project_id"].as_string(), AlertRecord.payload["project"].as_string(), ""))
+        alert_project = func.lower(
+            func.coalesce(
+                AlertRecord.payload["project_id"].as_string(),
+                AlertRecord.payload["project"].as_string(),
+                "",
+            )
+        )
         alert_score = case((func.lower(AlertRecord.severity) == "critical", 175), else_=75)
         alert_query = select(
             literal("alert").label("record_type"), AlertRecord.id.label("record_id"),
@@ -5138,7 +5202,13 @@ class IncidentRepository:
             is_terminal = candidates.c.row_status.in_(terminal)
             is_attention = candidates.c.row_status.in_(attention)
             if view == "needs_me":
-                return or_(and_(is_incident, is_attention), and_(~is_incident, candidates.c.row_severity.in_(("critical", "high", "p1", "p2", "sev1", "sev2"))))
+                return or_(
+                    and_(is_incident, is_attention),
+                    and_(
+                        ~is_incident,
+                        candidates.c.row_severity.in_(("critical", "high", "p1", "p2", "sev1", "sev2")),
+                    ),
+                )
             if view == "kai_handling":
                 return and_(~is_terminal, or_(~is_incident, ~is_attention))
             if view == "critical":
@@ -5151,7 +5221,10 @@ class IncidentRepository:
 
         total_count = int((await self.session.scalar(select(func.count()).select_from(candidates))) or 0)
         view_counts = {
-            view: int((await self.session.scalar(select(func.count()).select_from(candidates).where(view_clause(view)))) or 0)
+            view: int(
+                (await self.session.scalar(select(func.count()).select_from(candidates).where(view_clause(view))))
+                or 0
+            )
             for view in views
         }
         page_query = select(candidates).where(view_clause(normalized["inbox_view"]))
@@ -5159,7 +5232,11 @@ class IncidentRepository:
             page_query = page_query.where(or_(
                 candidates.c.score < cursor_score,
                 and_(candidates.c.score == cursor_score, candidates.c.observed_at < cursor_at),
-                and_(candidates.c.score == cursor_score, candidates.c.observed_at == cursor_at, candidates.c.record_id < cursor_id),
+                and_(
+                    candidates.c.score == cursor_score,
+                    candidates.c.observed_at == cursor_at,
+                    candidates.c.record_id < cursor_id,
+                ),
             ))
         page_rows = (await self.session.execute(page_query.order_by(
             candidates.c.score.desc(), candidates.c.observed_at.desc(), candidates.c.record_id.desc(),
@@ -5168,25 +5245,74 @@ class IncidentRepository:
         page_rows = page_rows[:safe_limit]
         incident_ids = [row["record_id"] for row in page_rows if row["record_type"] == "incident"]
         alert_ids = [row["record_id"] for row in page_rows if row["record_type"] == "alert"]
-        projections = await self.list_incident_projections(limit=safe_limit, tenant_id=tenant_id, include_enrichment=False, incident_ids=incident_ids)
+        projections = await self.list_incident_projections(
+            limit=safe_limit,
+            tenant_id=tenant_id,
+            include_enrichment=False,
+            incident_ids=incident_ids,
+        )
         projection_by_id = {str(row.get("incident_id") or row.get("id")): row for row in projections}
-        alert_rows = (await self.session.execute(select(AlertRecord).where(AlertRecord.id.in_(alert_ids)))).scalars().all() if alert_ids else []
-        alert_by_id = {str(row.id): {**dict(row.payload or {}), "id": str(row.id), "alert_id": str(row.id), "service": row.service, "environment": row.environment, "severity": row.severity, "source": row.source, "created_at": row.created_at.isoformat()} for row in alert_rows}
+        alert_rows = (
+            (await self.session.execute(select(AlertRecord).where(AlertRecord.id.in_(alert_ids)))).scalars().all()
+            if alert_ids
+            else []
+        )
+        alert_by_id = {
+            str(row.id): {
+                **dict(row.payload or {}),
+                "id": str(row.id),
+                "alert_id": str(row.id),
+                "service": row.service,
+                "environment": row.environment,
+                "severity": row.severity,
+                "source": row.source,
+                "created_at": row.created_at.isoformat(),
+            }
+            for row in alert_rows
+        }
         rows = []
         for item in page_rows:
             record_id = str(item["record_id"])
-            row = dict(projection_by_id.get(record_id, {})) if item["record_type"] == "incident" else dict(alert_by_id.get(record_id, {}))
+            row = (
+                dict(projection_by_id.get(record_id, {}))
+                if item["record_type"] == "incident"
+                else dict(alert_by_id.get(record_id, {}))
+            )
             row.setdefault("id", record_id)
             if item["record_type"] == "incident":
                 row.update({"incident_id": record_id, "status": item["row_status"]})
-            rows.append({"record_type": item["record_type"], "score": int(item["score"]), "observed_at": item["observed_at"].isoformat(), "row": row})
+            rows.append(
+                {
+                    "record_type": item["record_type"],
+                    "score": int(item["score"]),
+                    "observed_at": item["observed_at"].isoformat(),
+                    "row": row,
+                }
+            )
 
         next_cursor = None
         if has_more and page_rows:
             last = page_rows[-1]
-            payload = json.dumps({"filter": fingerprint, "snapshot": snapshot.isoformat(), "score": int(last["score"]), "at": last["observed_at"].isoformat(), "id": str(last["record_id"])}, separators=(",", ":")).encode()
+            payload = json.dumps(
+                {
+                    "filter": fingerprint,
+                    "snapshot": snapshot.isoformat(),
+                    "score": int(last["score"]),
+                    "at": last["observed_at"].isoformat(),
+                    "id": str(last["record_id"]),
+                },
+                separators=(",", ":"),
+            ).encode()
             next_cursor = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
-        return {"rows": rows, "next_cursor": next_cursor, "previous_cursor": None, "total_count": total_count, "filtered_count": total_count, "view_counts": view_counts, "snapshot_at": snapshot.isoformat()}
+        return {
+            "rows": rows,
+            "next_cursor": next_cursor,
+            "previous_cursor": None,
+            "total_count": total_count,
+            "filtered_count": total_count,
+            "view_counts": view_counts,
+            "snapshot_at": snapshot.isoformat(),
+        }
 
     async def list_incident_groups(
         self,
@@ -5493,7 +5619,13 @@ class IncidentRepository:
                 "last_seen_at": ownership.last_seen_at.isoformat(),
                 "latest_occurrences": occurrences_by_incident.get(ownership.canonical_incident_id, []),
                 "terminal_history_count": terminal_history.get(ownership.correlation_family_id, 0),
-                "attention_state": "needs_attention" if lifecycle in attention else "active" if lifecycle not in terminal else "terminal",
+                "attention_state": (
+                    "needs_attention"
+                    if lifecycle in attention
+                    else "active"
+                    if lifecycle not in terminal
+                    else "terminal"
+                ),
                 "project_id": ownership.project_id,
                 "service": ownership.service,
                 "environment": ownership.environment,
@@ -5783,7 +5915,11 @@ class IncidentRepository:
         context_snapshot_by_id: dict[str, ContextSnapshotRecord] = {}
         referenced_snapshot_ids: set[UUID] = set()
         for recommendation_payload in recommendation_by_id.values():
-            metadata = recommendation_payload.get("metadata") if isinstance(recommendation_payload.get("metadata"), dict) else {}
+            metadata = (
+                recommendation_payload.get("metadata")
+                if isinstance(recommendation_payload.get("metadata"), dict)
+                else {}
+            )
             snapshot_uuid = self._parse_uuid(metadata.get("context_snapshot_id"))
             if snapshot_uuid is not None:
                 referenced_snapshot_ids.add(snapshot_uuid)
@@ -5830,7 +5966,11 @@ class IncidentRepository:
                 if isinstance(projection_payload.get("event_payload"), dict)
                 else {}
             )
-            historical_context_event = historical_context_event_by_incident.get(row.incident_id, {}) if not recommendation_payload else {}
+            historical_context_event = (
+                historical_context_event_by_incident.get(row.incident_id, {})
+                if not recommendation_payload
+                else {}
+            )
             event_context = (
                 event_payload.get("context")
                 if isinstance(event_payload.get("context"), dict)
@@ -5862,10 +6002,14 @@ class IncidentRepository:
             if recommendation_payload:
                 binding_status = "missing_snapshot_reference" if not bound_snapshot_id else "snapshot_not_found"
             if context_snapshot is not None:
-                if context_snapshot.tenant_id != row.tenant_id or str(context_snapshot.incident_id) != str(row.incident_id):
+                if context_snapshot.tenant_id != row.tenant_id or str(context_snapshot.incident_id) != str(
+                    row.incident_id
+                ):
                     context_snapshot = None
                     binding_status = "identity_mismatch"
-                elif str(context_snapshot.context_fingerprint) != str(recommendation_metadata.get("context_fingerprint") or ""):
+                elif str(context_snapshot.context_fingerprint) != str(
+                    recommendation_metadata.get("context_fingerprint") or ""
+                ):
                     context_snapshot = None
                     binding_status = "fingerprint_mismatch"
                 else:

@@ -9,7 +9,14 @@ from uuid import uuid4
 import pytest
 from api_gateway import SafetyAnalyzer
 from common.models import SafetyDecision
-from common.database import AlertRecord, AuditLogRecord, HumanCorrectionRecord, IncidentOccurrenceRecord, IncidentProjectionRecord, IncidentRecord
+from common.database import (
+    AlertRecord,
+    AuditLogRecord,
+    HumanCorrectionRecord,
+    IncidentOccurrenceRecord,
+    IncidentProjectionRecord,
+    IncidentRecord,
+)
 from ai_workbench_common.model_evaluation import build_quality_evaluation
 from api_gateway.auth_policy import route_auth_rule
 from pydantic import ValidationError

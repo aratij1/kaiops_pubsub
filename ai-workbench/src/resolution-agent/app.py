@@ -140,7 +140,10 @@ async def _require_context_snapshot_binding(context: Context) -> dict[str, Any] 
             snapshot_id, tenant_id=context.tenant_id, incident_id=context.incident_id,
         )
     if snapshot is None:
-        raise HTTPException(status_code=409, detail="the bound context snapshot does not exist for this tenant and incident")
+        raise HTTPException(
+            status_code=409,
+            detail="the bound context snapshot does not exist for this tenant and incident",
+        )
     persisted = snapshot.get("context") if isinstance(snapshot.get("context"), dict) else {}
     persisted_alert = persisted.get("alert") if isinstance(persisted.get("alert"), dict) else {}
     if str(persisted_alert.get("id") or "") != str(context.alert.id):
@@ -706,7 +709,11 @@ def _build_resolution_event_payload(
 
 def _resolution_projection_status(metadata: dict[str, Any], *, requires_approval: bool) -> str:
     plan = metadata.get("execution_plan") if isinstance(metadata.get("execution_plan"), dict) else {}
-    iterative = metadata.get("iterative_investigation") if isinstance(metadata.get("iterative_investigation"), dict) else {}
+    iterative = (
+        metadata.get("iterative_investigation")
+        if isinstance(metadata.get("iterative_investigation"), dict)
+        else {}
+    )
     rca_analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
     lifecycle = metadata.get("resolution_lifecycle") if isinstance(metadata.get("resolution_lifecycle"), dict) else {}
     lifecycle_state = str(lifecycle.get("state") or "").strip().lower()
@@ -1007,16 +1014,34 @@ class ResolutionSelectionRequest(BaseModel):
 async def _require_catalog_readiness(request: ResolutionCatalogRequest | ResolutionSelectionRequest) -> dict[str, Any]:
     tenant_id = require_tenant_id(request.tenant_id, source="resolution catalog readiness")
     if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
-        raise HTTPException(status_code=503, detail={"code": "readiness_store_unavailable", "blocking_reasons": ["investigation persistence is unavailable"]})
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "readiness_store_unavailable",
+                "blocking_reasons": ["investigation persistence is unavailable"],
+            },
+        )
     async with app.state.session_factory() as session:
         repository = IncidentRepository(session)
         current = await repository.current_incident_investigation_binding(
             tenant_id=tenant_id, incident_id=request.incident_id, alert_id=request.alert_id,
         )
         if current is None:
-            raise HTTPException(status_code=409, detail={"code": "investigation_binding_missing", "blocking_reasons": ["no current incident investigation binding exists"]})
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "investigation_binding_missing",
+                    "blocking_reasons": ["no current incident investigation binding exists"],
+                },
+            )
         if current["recommendation_id"] != str(request.recommendation_id):
-            raise HTTPException(status_code=409, detail={"code": "stale_recommendation", "blocking_reasons": ["recommendation is not the incident projection's current version"]})
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "stale_recommendation",
+                    "blocking_reasons": ["recommendation is not the incident projection's current version"],
+                },
+            )
         bound = await repository.get_bound_incident_investigation(
             tenant_id=tenant_id,
             incident_id=request.incident_id,
@@ -1045,9 +1070,16 @@ async def _require_catalog_readiness(request: ResolutionCatalogRequest | Resolut
     if persisted_rca_version != request.rca_version:
         identity_mismatches.append("RCA version does not match")
     if identity_mismatches:
-        raise HTTPException(status_code=409, detail={"code": "stale_investigation_binding", "blocking_reasons": identity_mismatches})
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "stale_investigation_binding", "blocking_reasons": identity_mismatches},
+        )
     analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
-    investigation = metadata.get("investigation_report") if isinstance(metadata.get("investigation_report"), dict) else {}
+    investigation = (
+        metadata.get("investigation_report")
+        if isinstance(metadata.get("investigation_report"), dict)
+        else {}
+    )
     accepted = metadata.get("evidence_ids") if isinstance(metadata.get("evidence_ids"), list) else []
     blocks = []
     if investigation.get("conclusive") is not True or str(investigation.get("status") or "").lower() != "conclusive":
