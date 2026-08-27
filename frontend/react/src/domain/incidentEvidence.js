@@ -50,6 +50,12 @@ export function canonicalIncidentEvidence(workflow) {
   const executionReady = Boolean(contract && integrityVerified && conclusive && grounded
     && contract.execution_ready && contract.readiness.execution_ready
     && contract.readiness_blocks.length === 0);
+  const diagnosticConfidence = Number(
+    analysis.confidence_score
+    ?? investigation?.conclusion?.confidence
+    ?? recommendation.confidence
+    ?? 0,
+  );
   return {
     analysis, evidence, missing, conflicting,
     sources: object(contextMetadata.context_sources),
@@ -57,7 +63,11 @@ export function canonicalIncidentEvidence(workflow) {
     conclusive, grounded, integrity, integrityVerified, executionReady,
     contract, contractValid: parsedContract.success,
     contractError: parsedContract.success ? null : "Investigation contract invalid",
-    confidence: grounded ? Number(investigation?.conclusion?.confidence || recommendation.confidence || 0) : 0,
+    // Confidence describes the bounded diagnostic assessment. Grounding and
+    // execution readiness remain separate, stricter booleans so showing an
+    // honest low/ungrounded score can never authorize remediation.
+    confidence: Number.isFinite(diagnosticConfidence) ? diagnosticConfidence : 0,
+    confidenceGrounded: grounded,
   };
 }
 import { IncidentInvestigationV1 } from "../schemas/incidentInvestigation";

@@ -1511,8 +1511,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
         if fallback_hits >= max(1, len(state.get("model_usage", []))):
             score = min(score, 0.49)
 
-        if not state.get("rca_analysis", {}).get("evidence_used"):
-            score = 0.0
+        # Missing accepted citations makes the result ungrounded and blocks
+        # execution, but it does not mean the model/investigation expressed
+        # literally zero certainty.  The evidence ceiling and policy gates
+        # above already keep this below the actionable threshold. Preserve the
+        # bounded diagnostic score so the aggregate confidence agrees with the
+        # structured RCA confidence shown to operators.
         state["confidence"] = round(max(0.0, min(score, 0.99)), 4)
         return state
 
@@ -1820,7 +1824,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
         rca_status = str(result.metadata.get("rca_status") or "").strip().lower()
         if result.confidence == 0 and rca_status != "insufficient_evidence":
             raise ValidationError("zero confidence requires explicit insufficient_evidence status")
-        if result.confidence > 0 and (not isinstance(evidence_ids, list) or not evidence_ids):
+        if (
+            result.confidence > 0
+            and (not isinstance(evidence_ids, list) or not evidence_ids)
+            and rca_status != "insufficient_evidence"
+        ):
             raise ValidationError("recommendation must include evidence_ids")
         return True
 
