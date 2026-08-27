@@ -425,6 +425,12 @@ def transition_lifecycle(lifecycle: dict[str, Any], state: ResolutionState | str
 
 def initial_plan_state(plan: dict[str, Any], *, requires_approval: bool) -> ResolutionState:
     executable = [*(plan.get("commands") or []), *(plan.get("scripts") or [])]
-    if not any(str(item).strip() for item in executable):
+    if (
+        plan.get("execution_ready") is not True
+        or plan.get("mutating") is not True
+        or plan.get("diagnostic_only") is True
+        or str(plan.get("plan_kind") or "").lower() == "diagnostic"
+        or not any(str(item).strip() for item in executable)
+    ):
         return ResolutionState.DIAGNOSTIC_ONLY
     return ResolutionState.AWAITING_APPROVAL if requires_approval else ResolutionState.READY_TO_EXECUTE

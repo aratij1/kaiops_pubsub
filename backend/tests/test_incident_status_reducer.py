@@ -1,9 +1,32 @@
 from datetime import datetime, timedelta, timezone
 
 from common.incident_status import reduce_incident_status
+from common.resolution_lifecycle import ResolutionState, initial_plan_state
 
 
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
+
+
+def test_commands_cannot_advance_a_non_ready_plan() -> None:
+    plan = {
+        "commands": ["kubectl rollout restart deployment/api"],
+        "execution_ready": False,
+        "mutating": True,
+        "diagnostic_only": True,
+        "plan_kind": "diagnostic",
+    }
+    assert initial_plan_state(plan, requires_approval=True) == ResolutionState.DIAGNOSTIC_ONLY
+
+
+def test_only_ready_mutating_plan_enters_approval() -> None:
+    plan = {
+        "commands": ["kubectl rollout restart deployment/api"],
+        "execution_ready": True,
+        "mutating": True,
+        "diagnostic_only": False,
+        "plan_kind": "corrective",
+    }
+    assert initial_plan_state(plan, requires_approval=True) == ResolutionState.AWAITING_APPROVAL
 
 
 def test_new_approval_supersedes_an_older_policy_block() -> None:
