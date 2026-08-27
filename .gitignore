@@ -46,3 +46,5 @@ backend/rag/changes/**
 backend/rag/dependencies/*.md
 backend/rag/incidents/*-rule-onboarding.md
 backend/rag/runbooks/*-rule-runbook.md
+# Runtime review packets are evidence awaiting governance, never source fixtures.
+backend/rag/_review/**/*.json
