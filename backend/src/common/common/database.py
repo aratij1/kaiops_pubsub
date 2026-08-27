@@ -150,6 +150,21 @@ class IncidentOccurrenceRecord(Base):
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
+class IncidentCorrelationBackfillRecord(Base, TimestampMixin):
+    __tablename__ = "incident_correlation_backfill"
+
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    backfill_version: Mapped[str] = mapped_column(String(64), index=True)
+    source: Mapped[str] = mapped_column(String(64), default="incidents")
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    reason: Mapped[str] = mapped_column(String(255))
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    needs_scope_review: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    correlation_family_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    correlation_generation: Mapped[int | None] = mapped_column(Integer)
+
+
 class ApprovalRecord(Base, TimestampMixin):
     __tablename__ = "approvals"
 
