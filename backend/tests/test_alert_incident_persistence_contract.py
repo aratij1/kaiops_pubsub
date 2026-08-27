@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 from importlib import util
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import select, text
 
-from common.database import IncidentCorrelationOwnershipRecord
+from common.database import IncidentCorrelationOwnershipRecord, IncidentProjectionRecord
 from common.models import Incident, IncidentStatus
 from common.repository import IncidentRepository
 
@@ -78,11 +78,62 @@ async def test_canonical_incident_lookup_does_not_require_jira(sqlite_session_fa
     async with sqlite_session_factory() as session:
         repository = IncidentRepository(session)
         canonical = await repository.find_open_incident_by_correlation_key("checkout-error-family")
-        jira_key = await repository.find_open_jira_by_correlation_key("checkout-error-family")
+        jira_key = await repository.find_open_jira_by_correlation_key(
+            "checkout-error-family",
+            tenant_id="default",
+            project_id="commerce",
+            environment="prod",
+            service="checkout",
+        )
 
     assert canonical is not None
     assert canonical["id"] == str(incident.id)
     assert jira_key is None
+
+
+@pytest.mark.asyncio
+async def test_jira_reuse_requires_the_complete_authoritative_scope(sqlite_session_factory) -> None:
+    incident = Incident(
+        tenant_id="tenant-a",
+        service="checkout",
+        environment="prod",
+        severity="critical",
+        status=IncidentStatus.INVESTIGATING,
+        title="Checkout errors",
+        ticket_id="KAIMS-42",
+        metadata={"incident_candidate": {"correlation_key": "shared-family"}},
+    )
+    async with sqlite_session_factory() as session:
+        repository = IncidentRepository(session)
+        await repository.acquire_canonical_incident(
+            incident=incident,
+            occurrence_id=uuid4(),
+            correlation_key="shared-family",
+            project_id="commerce-a",
+            idempotency_key="jira-scope-source-1",
+        )
+        await repository.save_incident(incident)
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        repository = IncidentRepository(session)
+        matching = await repository.find_open_jira_by_correlation_key(
+            "shared-family",
+            tenant_id="tenant-a",
+            project_id="commerce-a",
+            environment="prod",
+            service="checkout",
+        )
+        other_project = await repository.find_open_jira_by_correlation_key(
+            "shared-family",
+            tenant_id="tenant-a",
+            project_id="commerce-b",
+            environment="prod",
+            service="checkout",
+        )
+
+    assert matching == "KAIMS-42"
+    assert other_project is None
 
 
 @pytest.mark.asyncio
@@ -104,6 +155,38 @@ async def test_matching_occurrences_acquire_one_canonical_incident(sqlite_sessio
 
     assert first_owner["canonical_incident_id"] == second_owner["canonical_incident_id"] == first.id
     assert first_owner["correlation_generation"] == second_owner["correlation_generation"] == 1
+
+
+@pytest.mark.asyncio
+async def test_incident_groups_include_legacy_projections_until_backfill(sqlite_session_factory) -> None:
+    incident_id = uuid4()
+    async with sqlite_session_factory() as session:
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_id,
+            tenant_id="tenant-a",
+            service="checkout",
+            environment="prod",
+            severity="critical",
+            status="investigating",
+            first_seen_at=datetime.now(UTC),
+            projection_payload={
+                "incident_id": str(incident_id),
+                "title": "Historical checkout incident",
+                "service": "checkout",
+                "environment": "prod",
+                "status": "investigating",
+            },
+        ))
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        result = await IncidentRepository(session).list_incident_groups(tenant_id="tenant-a")
+
+    assert result["migration_state"] == "legacy_fallback"
+    assert result["total_count"] == result["filtered_count"] == 1
+    assert result["rows"][0]["incident_id"] == str(incident_id)
+    assert result["rows"][0]["project_id"] == "legacy-unassigned"
+    assert result["rows"][0]["needs_scope_review"] is True
 
 
 @pytest.mark.asyncio
@@ -151,6 +234,50 @@ async def test_terminal_incident_creates_a_new_correlation_generation(sqlite_ses
     assert recurrence_owner["canonical_incident_id"] != first_owner["canonical_incident_id"]
     assert recurrence_owner["correlation_generation"] == 2
     assert recurrence_owner["correlation_family_id"] == first_owner["correlation_family_id"]
+
+
+@pytest.mark.asyncio
+async def test_event_older_than_terminal_generation_does_not_create_phantom_recurrence(
+    sqlite_session_factory,
+) -> None:
+    observed_at = datetime.now(UTC)
+    first = Incident(
+        service="checkout",
+        environment="prod",
+        severity="critical",
+        status=IncidentStatus.RESOLVED,
+        title="Resolved checkout errors",
+    )
+    delayed = Incident(
+        service="checkout",
+        environment="prod",
+        severity="critical",
+        status=IncidentStatus.INVESTIGATING,
+        title="Delayed historical checkout event",
+    )
+    async with sqlite_session_factory() as session:
+        repository = IncidentRepository(session)
+        terminal_owner = await repository.acquire_canonical_incident(
+            incident=first,
+            occurrence_id=uuid4(),
+            correlation_key="historical-checkout-errors",
+            project_id="commerce",
+            idempotency_key="terminal-source-event",
+            observed_at=observed_at,
+        )
+        await repository.save_incident(first)
+        delayed_owner = await repository.acquire_canonical_incident(
+            incident=delayed,
+            occurrence_id=uuid4(),
+            correlation_key="historical-checkout-errors",
+            project_id="commerce",
+            idempotency_key="delayed-source-event",
+            observed_at=observed_at - timedelta(minutes=5),
+        )
+        await session.commit()
+
+    assert delayed_owner["canonical_incident_id"] == terminal_owner["canonical_incident_id"]
+    assert delayed_owner["correlation_generation"] == terminal_owner["correlation_generation"] == 1
 
 
 @pytest.mark.asyncio

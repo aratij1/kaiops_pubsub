@@ -269,12 +269,20 @@ async def _reuse_correlated_jira(incident: Any) -> str | None:
     metadata = incident.metadata if isinstance(incident.metadata, dict) else {}
     candidate = metadata.get("incident_candidate") if isinstance(metadata.get("incident_candidate"), dict) else {}
     correlation_key = str(candidate.get("correlation_key") or "").strip()
-    if not correlation_key:
+    canonical = metadata.get("canonical_correlation") if isinstance(metadata.get("canonical_correlation"), dict) else {}
+    project_id = str(canonical.get("project_id") or "").strip()
+    tenant_id = str(incident.tenant_id or "").strip()
+    environment = str(incident.environment or "").strip()
+    service = str(incident.service or "").strip()
+    if not all((correlation_key, tenant_id, project_id, environment, service)):
         return None
     async with app.state.session_factory() as session:
         jira_key = await IncidentRepository(session).find_open_jira_by_correlation_key(
             correlation_key,
-            tenant_id=str(incident.tenant_id or "default"),
+            tenant_id=tenant_id,
+            project_id=project_id,
+            environment=environment,
+            service=service,
         )
     if jira_key:
         incident.ticket_id = jira_key

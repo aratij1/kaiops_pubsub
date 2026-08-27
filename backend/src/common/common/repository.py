@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import base64
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -2010,10 +2010,19 @@ class IncidentRepository:
         ownership_expiry = ownership.correlation_window_expires_at if ownership is not None else None
         if ownership_expiry is not None and ownership_expiry.tzinfo is None:
             ownership_expiry = ownership_expiry.replace(tzinfo=timezone.utc)
+        ownership_last_seen = ownership.last_seen_at if ownership is not None else None
+        if ownership_last_seen is not None and ownership_last_seen.tzinfo is None:
+            ownership_last_seen = ownership_last_seen.replace(tzinfo=UTC)
+        historical_event = ownership_last_seen is not None and now <= ownership_last_seen
         create_generation = (
             ownership is None
-            or str(ownership.lifecycle_state or "").lower() in terminal
-            or ownership_expiry < now
+            or (
+                not historical_event
+                and (
+                    str(ownership.lifecycle_state or "").lower() in terminal
+                    or ownership_expiry < now
+                )
+            )
         )
         created = False
         if create_generation:
@@ -2182,9 +2191,26 @@ class IncidentRepository:
         record = result.scalar_one_or_none()
         return record.payload if record else None
 
-    async def find_open_jira_by_correlation_key(self, correlation_key: str, *, tenant_id: str = "default") -> str | None:
+    async def find_open_jira_by_correlation_key(
+        self,
+        correlation_key: str,
+        *,
+        tenant_id: str,
+        project_id: str,
+        environment: str,
+        service: str,
+    ) -> str | None:
         """Resolve a previously qualified Jira incident for a correlated signal."""
-        incident = await self.find_open_incident_by_correlation_key(correlation_key, tenant_id=tenant_id)
+        required_scope = (tenant_id, project_id, environment, service, correlation_key)
+        if any(not str(value or "").strip() for value in required_scope):
+            return None
+        incident = await self.find_open_incident_by_correlation_key(
+            correlation_key,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            environment=environment,
+            service=service,
+        )
         if not incident:
             return None
         metadata = incident.get("metadata") if isinstance(incident.get("metadata"), dict) else {}
@@ -4507,6 +4533,101 @@ class IncidentRepository:
             )
             .where(AlertRecord.tenant_id == tenant_id, IncidentOccurrenceRecord.id.is_(None))
         )) or 0)
+
+        # Expand/backfill/cutover safety: deployments can contain durable
+        # incident projections before canonical ownership has been backfilled.
+        # Keep those incidents visible instead of presenting an empty inbox.
+        # The explicit legacy scope prevents unverified project attribution.
+        if total_count == 0:
+            legacy_rows = await self.list_incident_projections(
+                limit=safe_limit,
+                tenant_id=tenant_id,
+                include_enrichment=False,
+                risk_tier=risk_tier,
+                execution_mode=execution_mode,
+                status=status,
+                service=service,
+            )
+            projection_scope = select(IncidentProjectionRecord).where(
+                IncidentProjectionRecord.tenant_id == tenant_id
+            )
+            filtered_scope = projection_scope
+            if status:
+                filtered_scope = filtered_scope.where(
+                    IncidentProjectionRecord.status == status.strip().lower()
+                )
+            if service:
+                filtered_scope = filtered_scope.where(IncidentProjectionRecord.service == service.strip())
+            if risk_tier:
+                filtered_scope = filtered_scope.where(
+                    IncidentProjectionRecord.risk_tier == risk_tier.strip().lower()
+                )
+            if execution_mode:
+                filtered_scope = filtered_scope.where(
+                    IncidentProjectionRecord.execution_mode == execution_mode.strip().lower()
+                )
+            legacy_total = int((await self.session.scalar(
+                select(func.count()).select_from(projection_scope.subquery())
+            )) or 0)
+            legacy_filtered = int((await self.session.scalar(
+                select(func.count()).select_from(filtered_scope.subquery())
+            )) or 0)
+            legacy_active = int((await self.session.scalar(
+                select(func.count()).select_from(
+                    projection_scope.where(IncidentProjectionRecord.status.not_in(terminal)).subquery()
+                )
+            )) or 0)
+            legacy_attention = int((await self.session.scalar(
+                select(func.count()).select_from(
+                    projection_scope.where(IncidentProjectionRecord.status.in_(attention)).subquery()
+                )
+            )) or 0)
+            response_rows = []
+            for projection in legacy_rows:
+                incident_id = str(projection.get("incident_id") or projection.get("id") or "")
+                lifecycle = str(projection.get("status") or "open").strip().lower()
+                first_seen = str(
+                    projection.get("first_seen_at")
+                    or projection.get("created_at")
+                    or projection.get("latest_event_at")
+                    or datetime.now(UTC).isoformat()
+                )
+                last_seen = str(projection.get("latest_event_at") or projection.get("updated_at") or first_seen)
+                projection.update({
+                    "canonical_incident_id": incident_id,
+                    "incident_id": incident_id,
+                    "correlation_family_id": str(uuid5(NAMESPACE_URL, f"kaims-legacy:{tenant_id}:{incident_id}")),
+                    "generation": 1,
+                    "correlation_generation": 1,
+                    "canonical_status": lifecycle,
+                    "status": lifecycle,
+                    "active_occurrence_count": 0,
+                    "total_occurrence_count": 0,
+                    "first_seen_at": first_seen,
+                    "last_seen_at": last_seen,
+                    "latest_occurrences": [],
+                    "terminal_history_count": 1 if lifecycle in terminal else 0,
+                    "attention_state": (
+                        "needs_attention" if lifecycle in attention
+                        else "active" if lifecycle not in terminal else "terminal"
+                    ),
+                    "project_id": "legacy-unassigned",
+                    "needs_scope_review": True,
+                    "correlation_backfill_status": "pending",
+                })
+                response_rows.append(projection)
+            return {
+                "rows": response_rows,
+                "next_cursor": None,
+                "previous_cursor": None,
+                "total_count": legacy_total,
+                "filtered_count": legacy_filtered,
+                "active_count": legacy_active,
+                "needs_attention_count": legacy_attention,
+                "unlinked_signal_count": unlinked_signal_count,
+                "migration_state": "legacy_fallback",
+                "generated_at": datetime.now(UTC).isoformat(),
+            }
 
         direction = "next"
         cursor_at: datetime | None = None
