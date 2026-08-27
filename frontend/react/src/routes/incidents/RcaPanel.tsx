@@ -76,7 +76,7 @@ export default function RcaPanel({
   const recommendationMetadata = selectedAlertWorkflow?.recommendation?.metadata || {};
   const contextMetadata = selectedAlertWorkflow?.context?.metadata || {};
   const contextQuality = contextMetadata?.context_quality || {};
-  const contextSourceManifest = contextMetadata?.context_sources || {};
+  const contextSourceManifest = selectedAiTrust?.sources || contextMetadata?.context_sources || {};
   const contextSourceRows = Object.entries(contextSourceManifest).map(([source, details]: [string, any]) => ({
     source,
     status: String(details?.status || details?.collection_status || "unknown"),
@@ -99,12 +99,14 @@ export default function RcaPanel({
   const investigationConclusive = investigationReport?.conclusive === true
     && String(investigationReport?.status || "").toLowerCase() === "conclusive";
   const groundingScore = Number(selectedAlertEvaluation?.groundingScore || 0);
-  const confidence = Number(selectedRcaDecision?.confidence || 0);
+  const confidence = Number(selectedAiTrust?.confidence || 0);
   const confidencePercent = Math.max(0, Math.min(100, Math.round(confidence * 100)));
   const reviewRequired = Boolean(
     selectedRcaDecision?.reviewRequired
     || missingEvidence.length
     || conflictingEvidence.length
+    || evidenceRows.length === 0
+    || selectedAiTrust?.integrityVerified !== true
     || !investigationConclusive
     || investigationConfidence < 0.85
     || groundingScore < 0.85
@@ -149,6 +151,11 @@ export default function RcaPanel({
     let active = true;
     setSelectedResolution(null);
     setResolutionStatus("");
+    if (selectedAiTrust?.executionReady !== true) {
+      setResolutionOptions([]);
+      setResolutionStatus("Resolution actions remain blocked until backend investigation readiness is verified.");
+      return () => { active = false; };
+    }
     fetchJson("/api-gateway/analysis/resolution-catalog/relevant", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
@@ -166,9 +173,13 @@ export default function RcaPanel({
       if (active) setResolutionStatus("Resolution options are temporarily unavailable.");
     });
     return () => { active = false; };
-  }, [accessToken, selectedAlertId, selectedRcaDecision?.rootCause, selectedRcaDecision?.action, resolutionService]);
+  }, [accessToken, selectedAlertId, selectedRcaDecision?.rootCause, selectedRcaDecision?.action, resolutionService, selectedAiTrust?.executionReady]);
 
   async function chooseResolution(option: any) {
+    if (selectedAiTrust?.executionReady !== true) {
+      setResolutionStatus("Resolution selection is blocked until backend readiness is verified.");
+      return;
+    }
     setResolutionStatus("Preparing the selected resolution...");
     try {
       const response: any = await fetchJson("/api-gateway/analysis/resolution-catalog/select", {
@@ -242,7 +253,7 @@ export default function RcaPanel({
           <div className={`decision-readiness-card is-${reviewRequired ? "review" : "ready"}`} role="status">{reviewRequired ? <ShieldAlert size={22} /> : <CheckCircle2 size={22} />}<div><strong>{decisionStatus}</strong><span>{reviewRequired ? (missingEvidence.length || conflictingEvidence.length ? `${missingEvidence.length} gap(s) and ${conflictingEvidence.length} conflict(s) need attention.` : "Confidence or grounding requires operator validation.") : `${evidenceRows.length} evidence record(s) support operator review.`}</span></div></div>
           <div className="decision-confidence-meter"><div><span>Recommendation confidence</span><strong>{confidencePercent}%</strong></div><div role="progressbar" aria-label="Recommendation confidence" aria-valuemin={0} aria-valuemax={100} aria-valuenow={confidencePercent}><span style={{ width: `${confidencePercent}%` }} /></div><p>Confidence measures evidence support. It is not execution permission.</p></div>
           <dl className="decision-context-facts"><div><dt>Signal source</dt><dd>{sourceChannel || "Unknown"}</dd></div><div><dt>Context package</dt><dd>{contextMetadata.context_reused ? "Validated reuse" : "Current incident"}</dd></div><div><dt>Evidence freshness</dt><dd>{freshEvidenceCount} live / {cachedEvidenceCount} cached</dd></div></dl>
-          <div className="decision-command-actions"><button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("evidence")}>Inspect evidence</button><button type="button" className="button-primary" onClick={() => onSetHomeDetailTab("execution")}>Review remediation plan</button></div>
+          <div className="decision-command-actions"><button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("evidence")}>Inspect evidence</button><button type="button" className="button-primary" disabled={selectedAiTrust?.executionReady !== true} onClick={() => onSetHomeDetailTab("execution")}>{selectedAiTrust?.executionReady === true ? "Review remediation plan" : "Plan blocked by readiness"}</button></div>
         </aside>
         <footer className="explainability-legend" aria-label="Explainability legend"><span><i className="is-observed" />Observed: directly reported by a source</span><span><i className="is-inferred" />Inferred: generated from linked evidence</span><span><i className="is-action" />Action: requires policy and operator gates</span></footer>
       </section> : null}
