@@ -219,6 +219,13 @@ jobs:
         run: uv sync --frozen --extra dev
       - name: Validate migration runner and correlation backfill
         run: uv run pytest backend/tests/test_apply_migrations.py backend/tests/test_incident_correlation_backfill.py
+      - name: Bootstrap canonical database schema
+        run: >-
+          docker run --rm --network host
+          -e MYSQL_PWD=kaiops
+          -v "${PWD}:/work:ro"
+          mysql:8.4
+          sh -lc 'mysql -h127.0.0.1 -ukaiops kaiops < /work/backend/database/schema.sql'
       - name: Dry-run, upgrade, and idempotency validation
         env:
           DATABASE_URL: mysql+pymysql://kaiops:kaiops@127.0.0.1:3306/kaiops
