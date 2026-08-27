@@ -96,7 +96,7 @@ SET @idx_incident_exists := (
       AND index_name = 'idx_agent_work_items_incident'
 );
 SET @create_idx_incident_sql := IF(
-    @idx_incident_exists = 0,
+    @has_agent_work_items = 1 AND @idx_incident_exists = 0,
     'CREATE INDEX idx_agent_work_items_incident ON agent_work_items (incident_id)',
     'SELECT 1'
 );
@@ -112,7 +112,7 @@ SET @idx_agent_seq_exists := (
       AND index_name = 'idx_agent_work_items_agent_seq'
 );
 SET @create_idx_agent_seq_sql := IF(
-    @idx_agent_seq_exists = 0,
+    @has_agent_work_items = 1 AND @idx_agent_seq_exists = 0,
     'CREATE INDEX idx_agent_work_items_agent_seq ON agent_work_items (agent_name, sequence)',
     'SELECT 1'
 );

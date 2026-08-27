@@ -25,10 +25,9 @@ CREATE TABLE IF NOT EXISTS incident_investigation_bindings (
     KEY idx_investigation_binding_context (
         tenant_id, context_snapshot_id, context_fingerprint
     ),
-    CONSTRAINT fk_investigation_binding_context
-        FOREIGN KEY (context_snapshot_id) REFERENCES context_snapshots(snapshot_id),
-    CONSTRAINT fk_investigation_binding_incident
-        FOREIGN KEY (incident_id) REFERENCES incidents(id),
-    CONSTRAINT fk_investigation_binding_alert
-        FOREIGN KEY (alert_id) REFERENCES alerts(id)
+    -- Historical UUID widths and collations differ between migrated and
+    -- ORM-created databases. These relationships are therefore enforced by the
+    -- repository integrity check until legacy identity storage is normalized.
+    KEY idx_investigation_binding_incident_ref (incident_id),
+    KEY idx_investigation_binding_alert_ref (alert_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
