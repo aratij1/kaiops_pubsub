@@ -52,13 +52,15 @@ describe("canonical incident evidence", () => {
       ] } } },
       recommendation: { confidence: .74, metadata: {
         rca_status: "insufficient_evidence",
-        rca_analysis: { evidence_used: [], missing_evidence: ["traces"] },
+        rca_analysis: { evidence_used: [], missing_evidence: ["traces"], confidence_score: .35 },
       } },
     });
     expect(result.evidence).toHaveLength(1);
     expect(result.evidence[0].accepted).toBe(false);
     expect(result.acceptedEvidenceIds).toEqual([]);
-    expect(result.confidence).toBe(0);
+    expect(result.confidence).toBe(.35);
+    expect(result.confidenceGrounded).toBe(false);
     expect(result.grounded).toBe(false);
+    expect(result.executionReady).toBe(false);
   });
 });

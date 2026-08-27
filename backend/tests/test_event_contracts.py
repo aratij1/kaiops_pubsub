@@ -284,6 +284,8 @@ async def test_analysis_request_identity_flows_from_context_to_recommendation() 
     assert recommendation.metadata["rca_version"] == 1
     assert recommendation.metadata["recommendation_version"] == str(recommendation.id)
     assert recommendation.metadata["recommendation_version"] == str(recommendation.id)
+    plan = resolution_agent_app._apply_catalog_plan(recommendation, first)
+    assert plan["rca_version"] == "1"
 
 
 @pytest.mark.asyncio

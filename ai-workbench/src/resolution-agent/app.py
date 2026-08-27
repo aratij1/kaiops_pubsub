@@ -405,7 +405,11 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
     plan = dict(_catalog_plan_for(context, decision, recommendation))
     metadata = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
     metadata["model_proposed_execution_plan"] = metadata.get("execution_plan", {})
-    plan["rca_version"] = metadata.get("rca_version")
+    # The normalized investigation contract uses an integer generation, while
+    # ExecutionPlanV2 carries the immutable version as a string.  Normalize at
+    # this boundary so a fresh, bound RCA cannot fail after analysis merely
+    # because Pydantic does not coerce numbers in strict string fields.
+    plan["rca_version"] = str(metadata.get("rca_version") or "") or None
     plan["evidence_snapshot_id"] = metadata.get("context_snapshot_id")
     plan["recommendation_version"] = metadata.get("recommendation_version")
     investigation = metadata.get("investigation_report") if isinstance(metadata.get("investigation_report"), dict) else {}

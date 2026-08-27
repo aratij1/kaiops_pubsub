@@ -606,6 +606,10 @@ async def test_resolution_agent_prefers_model_risk_level_over_severity_heuristic
     recommendation = await agent.resolve(context)
 
     assert recommendation.risk == "low"
+    assert 0.0 < recommendation.confidence < 0.5
+    assert recommendation.metadata["rca_status"] == "insufficient_evidence"
+    assert recommendation.metadata["execution_plan"]["execution_ready"] is False
+    assert await agent.validate(recommendation) is True
 
 
 @pytest.mark.asyncio
