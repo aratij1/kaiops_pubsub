@@ -5259,16 +5259,16 @@ class IncidentRepository:
         page_query = select(candidates).where(view_clause(normalized["inbox_view"]))
         if cursor_score is not None and cursor_at is not None and cursor_id is not None:
             page_query = page_query.where(or_(
-                candidates.c.score < cursor_score,
-                and_(candidates.c.score == cursor_score, candidates.c.observed_at < cursor_at),
+                candidates.c.observed_at < cursor_at,
+                and_(candidates.c.observed_at == cursor_at, candidates.c.score < cursor_score),
                 and_(
-                    candidates.c.score == cursor_score,
                     candidates.c.observed_at == cursor_at,
+                    candidates.c.score == cursor_score,
                     candidates.c.record_id < cursor_id,
                 ),
             ))
         page_rows = (await self.session.execute(page_query.order_by(
-            candidates.c.score.desc(), candidates.c.observed_at.desc(), candidates.c.record_id.desc(),
+            candidates.c.observed_at.desc(), candidates.c.score.desc(), candidates.c.record_id.desc(),
         ).limit(safe_limit + 1))).mappings().all()
         has_more = len(page_rows) > safe_limit
         page_rows = page_rows[:safe_limit]

@@ -559,3 +559,41 @@ async def test_unified_inbox_cursor_is_bound_to_filters(sqlite_session_factory) 
         assert page["rows"] == []
         with pytest.raises(ValueError, match="Invalid unified inbox cursor"):
             await repository.list_unified_inbox(tenant_id="tenant-empty", cursor="invalid")
+
+
+@pytest.mark.asyncio
+async def test_unified_inbox_does_not_starve_new_alerts_behind_older_attention_incidents(
+    sqlite_session_factory,
+) -> None:
+    now = datetime.now(UTC)
+    incident_id = uuid4()
+    async with sqlite_session_factory() as session:
+        session.add(IncidentCorrelationOwnershipRecord(
+            tenant_id="tenant-recency", project_id="commerce", environment="prod",
+            service="checkout", correlation_key="older-blocked",
+            correlation_family_id=uuid4(), correlation_generation=1,
+            canonical_incident_id=incident_id, first_seen_at=now - timedelta(hours=1),
+            last_seen_at=now - timedelta(hours=1),
+            correlation_window_expires_at=now + timedelta(hours=1), lifecycle_state="failed",
+        ))
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_id, tenant_id="tenant-recency", service="checkout",
+            environment="prod", severity="critical", status="failed",
+            first_seen_at=now - timedelta(hours=1), projection_payload={},
+        ))
+        new_alert_id = uuid4()
+        session.add(AlertRecord(
+            id=new_alert_id, tenant_id="tenant-recency", source="prometheus",
+            name="Newest warning", service="checkout", environment="prod",
+            severity="warning", fingerprint="newest-warning",
+            payload={"project_id": "commerce"}, created_at=now,
+        ))
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        page = await IncidentRepository(session).list_unified_inbox(
+            tenant_id="tenant-recency", limit=2,
+        )
+
+    assert [item["record_type"] for item in page["rows"]] == ["alert", "incident"]
+    assert page["rows"][0]["row"]["alert_id"] == str(new_alert_id)
