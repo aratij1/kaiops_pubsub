@@ -1814,10 +1814,13 @@ class ResolutionIntelligenceAgent(BaseAgent):
     async def validate(self, result: Any) -> bool:
         if not isinstance(result, Recommendation):
             return False
-        if result.confidence <= 0:
-            raise ValidationError("confidence must be greater than zero")
+        if result.confidence < 0 or result.confidence > 1:
+            raise ValidationError("confidence must be between zero and one")
         evidence_ids = result.metadata.get("evidence_ids", [])
-        if not isinstance(evidence_ids, list) or not evidence_ids:
+        rca_status = str(result.metadata.get("rca_status") or "").strip().lower()
+        if result.confidence == 0 and rca_status != "insufficient_evidence":
+            raise ValidationError("zero confidence requires explicit insufficient_evidence status")
+        if result.confidence > 0 and (not isinstance(evidence_ids, list) or not evidence_ids):
             raise ValidationError("recommendation must include evidence_ids")
         return True
 

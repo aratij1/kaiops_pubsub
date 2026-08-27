@@ -69,6 +69,11 @@ MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(os.getenv("MESSAGE_BUS_DUAL_CONSUME_ENABL
 ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any, Any, None]]
 
 
+def _utc_aware(value: datetime | str) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
 def _resolution_quality_score(payload: Any) -> float:
     if not isinstance(payload, dict) or not payload:
         return 0.0
@@ -136,7 +141,9 @@ async def _require_context_snapshot_binding(context: Context) -> dict[str, Any] 
     freshness_mandatory = bool(metadata.get("force_full_analysis")) or str(
         metadata.get("analysis_mode") or metadata.get("context_strategy") or ""
     ).lower() in {"fresh", "realtime"}
-    expires_at = datetime.fromisoformat(str(snapshot["expires_at"]).replace("Z", "+00:00"))
+    # MySQL may return DATETIME values without tzinfo. Normalize at the
+    # service boundary before comparing them with an aware UTC clock.
+    expires_at = _utc_aware(snapshot["expires_at"])
     if freshness_mandatory and expires_at <= datetime.now(UTC):
         raise HTTPException(status_code=409, detail="the bound context snapshot has expired")
     return snapshot
@@ -796,7 +803,7 @@ async def _persist_resolution_event(
                     "root_cause": recommendation.root_cause,
                     "impact": recommendation.impact,
                     "risk": recommendation.risk,
-                    "resolution_lifecycle": lifecycle or None,
+                    "resolution_lifecycle": metadata.get("resolution_lifecycle") or None,
                     "analysis_request_id": metadata.get("analysis_request_id"),
                     "context_snapshot_id": metadata.get("context_snapshot_id"),
                     "context_fingerprint": metadata.get("context_fingerprint"),

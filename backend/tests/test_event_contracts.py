@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,12 @@ _RESOLUTION_SPEC = importlib.util.spec_from_file_location("resolution_agent_app"
 assert _RESOLUTION_SPEC is not None and _RESOLUTION_SPEC.loader is not None
 resolution_agent_app = importlib.util.module_from_spec(_RESOLUTION_SPEC)
 _RESOLUTION_SPEC.loader.exec_module(resolution_agent_app)
+
+
+def test_resolution_snapshot_expiry_normalizes_naive_database_datetime() -> None:
+    normalized = resolution_agent_app._utc_aware(datetime(2026, 8, 27, 12, 0, 0))
+    assert normalized.tzinfo is UTC
+    assert normalized == datetime(2026, 8, 27, 12, 0, 0, tzinfo=UTC)
 
 _APPROVAL_APP_PATH = Path(__file__).resolve().parents[1] / "src" / "approval-service" / "app.py"
 _APPROVAL_SPEC = importlib.util.spec_from_file_location("approval_service_app", _APPROVAL_APP_PATH)
