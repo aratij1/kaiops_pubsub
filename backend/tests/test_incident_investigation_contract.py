@@ -1,15 +1,14 @@
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from pydantic import ValidationError
-
 from common.incident_investigation import IncidentInvestigationContract
+from pydantic import ValidationError
 
 
 def investigation_payload() -> dict:
-    collected_at = datetime.now(timezone.utc)
+    collected_at = datetime.now(UTC)
     return {
         "contract_version": "kaiops.incident-investigation.v1",
         "tenant_id": "tenant-a",

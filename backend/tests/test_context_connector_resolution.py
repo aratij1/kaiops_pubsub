@@ -2,7 +2,6 @@ from uuid import uuid4
 
 import httpx
 import pytest
-
 from common.models import Alert, AlertSeverity, Incident
 from common.repository import IncidentRepository
 from context_agent.connectors import PrometheusConnector
@@ -66,7 +65,13 @@ async def test_prometheus_uses_original_range_query_and_preserves_scope(monkeypa
             }],
         },
     )
-    incident = Incident(tenant_id="tenant-a", service=alert.service, environment=alert.environment, severity=alert.severity, title=alert.name)
+    incident = Incident(
+        tenant_id="tenant-a",
+        service=alert.service,
+        environment=alert.environment,
+        severity=alert.severity,
+        title=alert.name,
+    )
     result = await PrometheusConnector().fetch(alert, incident)
     request = captured["request"]
     assert result["_source_status"] == "empty"

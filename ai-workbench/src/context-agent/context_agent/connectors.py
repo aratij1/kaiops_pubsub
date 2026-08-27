@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 import hashlib
 import heapq
 import ipaddress
@@ -9,29 +8,29 @@ import json
 import os
 import re
 import threading
-from time import monotonic
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic
 from typing import Any, TypedDict
 from urllib.parse import urlsplit
 
 import httpx
+from ai_workbench_common.agent_runtime import AgentRuntime, ContextFailure
+from ai_workbench_common.agentic import AgentContext, BaseAgent
+from ai_workbench_common.embeddings import cosine_similarity, describe_embedding_model, get_embedding_model
+from ai_workbench_common.models import Context
+from common.config import get_settings
+from common.models import Alert, Incident
+from common.rag_governance import production_retrievable, retrieval_allowed
+from common.resilience import retry_async
+from common.tenant_identity import require_tenant_id
+from common.tool_registry import ToolRegistry, ToolSpec
 from langchain_core.embeddings import Embeddings
 from langgraph.graph import END, StateGraph
 
-from context_agent.knowledge_graph import KnowledgeGraph
-
-from ai_workbench_common.agent_runtime import AgentRuntime, ContextFailure
-from ai_workbench_common.agentic import AgentContext, BaseAgent
-from common.config import get_settings
-from ai_workbench_common.embeddings import describe_embedding_model, get_embedding_model, cosine_similarity
-from ai_workbench_common.models import Context
-from common.models import Alert, Incident
-from common.rag_governance import production_retrievable, retrieval_allowed
-from common.tenant_identity import require_tenant_id
-from common.resilience import retry_async
-from common.tool_registry import ToolRegistry, ToolSpec
 from context_agent.context_quality import context_subject_fingerprint, govern_context, plan_connectors
+from context_agent.knowledge_graph import KnowledgeGraph
 
 
 class BaseConnector:
@@ -96,29 +95,58 @@ class PrometheusConnector(BaseConnector):
         snapshot = _metadata_dict(alert, "observability", "metrics", "prometheus")
         observed = _metadata_dict(alert, "observed_values", "signal")
         metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
-        resolved = metadata.get("resolved_context_connectors") if isinstance(metadata.get("resolved_context_connectors"), list) else []
-        connector = next((row for row in resolved if str(row.get("provider") or "").lower() in {"prometheus", "alertmanager"}), None)
+        resolved = (
+            metadata.get("resolved_context_connectors")
+            if isinstance(metadata.get("resolved_context_connectors"), list)
+            else []
+        )
+        connector = next(
+            (
+                row
+                for row in resolved
+                if str(row.get("provider") or "").lower() in {"prometheus", "alertmanager"}
+            ),
+            None,
+        )
         if connector and (metadata.get("connector_resolution") or {}).get("status") == "completed":
             endpoint = str(connector.get("endpoint_identity") or "").rstrip("/")
             if not endpoint:
                 return {"_source_status": "misconfigured", "error": "configured Prometheus endpoint is missing"}
             labels = alert.labels if isinstance(alert.labels, dict) else {}
             config = connector.get("config") if isinstance(connector.get("config"), dict) else {}
-            expression = next((str(metadata.get(key) or labels.get(key) or "").strip() for key in ("prometheus_expression", "rule_expression", "expression", "promql") if str(metadata.get(key) or labels.get(key) or "").strip()), "")
-            metric_name = str(metadata.get("metric_name") or labels.get("__name__") or labels.get("metric") or "").strip()
+            expression = next(
+                (
+                    str(metadata.get(key) or labels.get(key) or "").strip()
+                    for key in ("prometheus_expression", "rule_expression", "expression", "promql")
+                    if str(metadata.get(key) or labels.get(key) or "").strip()
+                ),
+                "",
+            )
+            metric_name = str(
+                metadata.get("metric_name") or labels.get("__name__") or labels.get("metric") or ""
+            ).strip()
             if not expression and metric_name:
                 matchers = []
                 for key in ("environment", "cluster", "namespace", "service", "instance"):
-                    value = str(labels.get(key) or (alert.environment if key == "environment" else alert.service if key == "service" else "")).strip()
+                    fallback = alert.environment if key == "environment" else alert.service if key == "service" else ""
+                    value = str(labels.get(key) or fallback).strip()
                     if value and re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", key):
                         escaped_value = value.replace('"', '\\"')
                         matchers.append(f'{key}="{escaped_value}"')
                 expression = f'{metric_name}{{{",".join(matchers)}}}' if matchers else metric_name
             if not expression:
-                return {"_source_status": "misconfigured", "error": "alert rule expression and metric identity are missing"}
-            end = datetime.now(timezone.utc)
+                return {
+                    "_source_status": "misconfigured",
+                    "error": "alert rule expression and metric identity are missing",
+                }
+            end = datetime.now(UTC)
             window_seconds = max(60, min(int(config.get("observation_window_seconds") or 900), 86400))
-            params = {"query": expression, "start": (end - timedelta(seconds=window_seconds)).timestamp(), "end": end.timestamp(), "step": max(15, min(int(config.get("step_seconds") or 60), 3600))}
+            params = {
+                "query": expression,
+                "start": (end - timedelta(seconds=window_seconds)).timestamp(),
+                "end": end.timestamp(),
+                "step": max(15, min(int(config.get("step_seconds") or 60), 3600)),
+            }
             headers: dict[str, str] = {}
             secret_ref = str(connector.get("secret_ref") or "")
             if secret_ref.startswith("env://"):
@@ -130,7 +158,10 @@ class PrometheusConnector(BaseConnector):
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     response = await client.get(f"{endpoint}/api/v1/query_range", params=params, headers=headers)
                 if response.status_code in {401, 403}:
-                    return {"_source_status": "unauthorized", "error": f"Prometheus returned HTTP {response.status_code}"}
+                    return {
+                        "_source_status": "unauthorized",
+                        "error": f"Prometheus returned HTTP {response.status_code}",
+                    }
                 response.raise_for_status()
                 payload = response.json()
                 result = ((payload.get("data") or {}).get("result") or []) if isinstance(payload, dict) else []
@@ -141,8 +172,16 @@ class PrometheusConnector(BaseConnector):
                     "endpoint_identity": endpoint,
                     "observation_window": {"start": params["start"], "end": params["end"], "step": params["step"]},
                     "series": result,
-                    "preserved_labels": {key: labels.get(key) for key in ("environment", "cluster", "namespace", "service", "instance") if labels.get(key)},
-                    "provenance": {"source": "onboarded-prometheus", "integration_id": connector.get("integration_id"), "grounded": bool(result)},
+                    "preserved_labels": {
+                        key: labels.get(key)
+                        for key in ("environment", "cluster", "namespace", "service", "instance")
+                        if labels.get(key)
+                    },
+                    "provenance": {
+                        "source": "onboarded-prometheus",
+                        "integration_id": connector.get("integration_id"),
+                        "grounded": bool(result),
+                    },
                 }
             except httpx.TimeoutException:
                 return {"_source_status": "timed_out", "error": "Prometheus range query timed out"}

@@ -6,7 +6,6 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-
 INVESTIGATION_CONTRACT_VERSION = "kaiops.incident-investigation.v1"
 
 
@@ -68,7 +67,7 @@ class InvestigationReadinessContract(BaseModel):
     blocking_reasons: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def require_monotonic_readiness(self) -> "InvestigationReadinessContract":
+    def require_monotonic_readiness(self) -> InvestigationReadinessContract:
         if self.execution_ready and not self.resolution_ready:
             raise ValueError("execution readiness requires resolution readiness")
         if self.resolution_ready and not self.rca_ready:
@@ -118,7 +117,7 @@ class IncidentInvestigationContract(BaseModel):
     readiness: InvestigationReadinessContract
 
     @model_validator(mode="after")
-    def verify_cross_stage_integrity(self) -> "IncidentInvestigationContract":
+    def verify_cross_stage_integrity(self) -> IncidentInvestigationContract:
         evidence_ids = {item.evidence_id for item in self.context_evidence}
         if not set(self.accepted_evidence_ids).issubset(evidence_ids):
             raise ValueError("accepted RCA evidence must exist in the bound context snapshot")

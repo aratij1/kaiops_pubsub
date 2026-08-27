@@ -482,7 +482,9 @@ async def test_incident_group_cursor_scales_to_ten_thousand_and_uses_page_index(
 
 
 @pytest.mark.asyncio
-async def test_unified_inbox_filters_and_paginates_in_database_with_snapshot_consistency(sqlite_session_factory) -> None:
+async def test_unified_inbox_filters_and_paginates_in_database_with_snapshot_consistency(
+    sqlite_session_factory,
+) -> None:
     now = datetime.now(UTC)
     incident_ids = [uuid4() for _ in range(3)]
     family_ids = [uuid4() for _ in range(3)]
