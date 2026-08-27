@@ -27,6 +27,7 @@ from common.config import get_settings
 from ai_workbench_common.embeddings import describe_embedding_model, get_embedding_model, cosine_similarity
 from ai_workbench_common.models import Context
 from common.models import Alert, Incident
+from common.rag_governance import production_retrievable, retrieval_allowed
 from common.tenant_identity import require_tenant_id
 from common.resilience import retry_async
 from common.tool_registry import ToolRegistry, ToolSpec
@@ -1116,7 +1117,10 @@ class AzureAISearchVectorStore:
         if not tenant:
             raise ValueError("remote RAG search requires authenticated tenant identity")
         filters: list[str] = [
-            f"((tenant_scope eq {self._odata_literal(tenant)}) or (tenant_scope eq 'global' and corpus_classification eq 'PRODUCTION_CURATED'))",
+            "("
+            f"(tenant_scope eq {self._odata_literal(tenant)} and corpus_classification eq 'TENANT_CURATED')"
+            " or (tenant_scope eq 'global' and corpus_classification eq 'PRODUCTION_CURATED')"
+            ")",
             "review_status eq 'approved'",
         ]
         kinds = sorted({str(item).strip().lower() for item in (preferred_kinds or set()) if str(item).strip()})
@@ -1204,7 +1208,8 @@ class AzureAISearchVectorStore:
             services = doc.get("services", [])
             if isinstance(services, str):
                 doc["services"] = [item.strip() for item in services.split(",") if item.strip()]
-            results.append(doc)
+            if retrieval_allowed(doc, tenant_id):
+                results.append(doc)
         return results
 
     def upsert_documents(self, documents: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1264,6 +1269,44 @@ class AzureAISearchVectorStore:
             return {"attempted": True, "indexed": 0, "error": str(exc)}
         self.last_error = ""
         return {"attempted": True, "indexed": len(rows), "index_name": self._index_name}
+
+    def delete_document(self, document_id: str) -> dict[str, Any]:
+        """Remove every remote chunk for one quarantined or superseded document."""
+        if not self.configured:
+            return {"attempted": False, "deleted": 0, "reason": "azure ai search is not configured"}
+        identity = str(document_id or "").strip()
+        if not identity:
+            raise ValueError("document_id is required for remote RAG deletion")
+        search_payload = {
+            "search": "*",
+            "top": 1000,
+            "select": "id,document_id",
+            "filter": f"document_id eq {self._odata_literal(identity)}",
+        }
+        try:
+            with httpx.Client(timeout=self._timeout_seconds) as client:
+                response = client.post(
+                    self._url("/docs/search"), headers=self._headers(), json=search_payload
+                )
+                response.raise_for_status()
+                rows = response.json().get("value", [])
+                deletions = [
+                    {"@search.action": "delete", "id": str(row.get("id"))}
+                    for row in rows
+                    if isinstance(row, dict) and str(row.get("id") or "").strip()
+                ]
+                if deletions:
+                    deleted = client.post(
+                        self._url("/docs/index"),
+                        headers=self._headers(),
+                        json={"value": deletions},
+                    )
+                    deleted.raise_for_status()
+        except Exception as exc:
+            self.last_error = str(exc)
+            return {"attempted": True, "deleted": 0, "error": str(exc)}
+        self.last_error = ""
+        return {"attempted": True, "deleted": len(deletions), "document_id": identity}
 
 
 @dataclass
@@ -1416,10 +1459,16 @@ class VectorDBConnector(BaseConnector):
             for doc in self.documents
             if not doc.get("_synthetic")
         ]
-        return remote.upsert_documents([doc for doc in full_docs if doc])
+        return remote.upsert_documents([doc for doc in full_docs if doc and production_retrievable(doc)])
 
     def index_info(self) -> dict[str, Any]:
         docs = [doc for doc in self.documents if not doc.get("_synthetic")]
+        active_docs = [doc for doc in docs if production_retrievable(doc)]
+        pending_docs = [
+            doc for doc in docs
+            if str(doc.get("review_status") or "").strip().lower() in {"draft", "pending_review"}
+        ]
+        quarantined_docs = [doc for doc in docs if doc not in active_docs and doc not in pending_docs]
         synthetic_docs = [doc for doc in self.documents if doc.get("_synthetic")]
         by_kind: dict[str, int] = {}
         embedded_metadata = 0
@@ -1430,12 +1479,19 @@ class VectorDBConnector(BaseConnector):
                 embedded_metadata += 1
         return {
             "contract_version": "kaiops.rag-index.v1",
-            "status": "ready" if docs else "empty",
+            "status": "ready" if active_docs else "degraded_empty_corpus",
+            "execution_ready": bool(active_docs),
+            "degraded": not active_docs,
+            "degraded_reason": "no approved retrievable RAG documents" if not active_docs else "",
             "vector_store": self.vector_store_info(),
             "embedding_model": self.embedding_info(),
             "remote_index_enabled": self.remote_store().configured,
             "enterprise_index_enabled": self.remote_store().configured,
-            "document_count": len(docs),
+            "document_count": len(active_docs),
+            "inventory_count": len(docs),
+            "approved_retrievable_count": len(active_docs),
+            "pending_review_count": len(pending_docs),
+            "quarantined_count": len(quarantined_docs),
             "synthetic_document_count": len(synthetic_docs),
             "metadata_embedding_count": embedded_metadata,
             "full_document_cache_count": len(self._document_cache),
@@ -1502,12 +1558,7 @@ class VectorDBConnector(BaseConnector):
 
     @staticmethod
     def _tenant_allowed(doc: dict[str, Any], tenant_id: str) -> bool:
-        scope = str(doc.get("tenant_scope") or "").strip()
-        review_status = str(doc.get("review_status") or "").strip().lower()
-        corpus_class = str(doc.get("corpus_classification") or "").strip().upper()
-        if review_status != "approved" or corpus_class in {"DEMO_ONLY", "GENERATED_UNVERIFIED", "MALFORMED", "OBSOLETE"}:
-            return False
-        return scope == tenant_id or (scope.lower() == "global" and corpus_class == "PRODUCTION_CURATED")
+        return retrieval_allowed(doc, tenant_id)
 
     def root_path(self) -> Path:
         root = self.rag_root or self._discover_rag_root()

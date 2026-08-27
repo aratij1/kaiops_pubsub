@@ -12,13 +12,14 @@ import shlex
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlparse
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from common.config import get_settings
 from common.event_publishers import EventPublisher, RabbitMQPublisher, build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from ai_workbench_common.models import Context
 from common.models import Alert, Incident
+from common.rag_governance import content_checksum, retrieval_allowed
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
 from common.service import create_app
@@ -907,13 +908,34 @@ class RagDocumentRequest(BaseModel):
     resolved_by: str | None = None
     closed_at: str | None = None
     metadata: dict[str, str] = Field(default_factory=dict)
+    tenant_scope: str = Field(default="", max_length=128)
+    owner_team: str = Field(default="", max_length=160)
+    review_status: str = Field(default="pending_review", pattern="^(draft|pending_review|approved|rejected)$")
+    corpus_classification: str = Field(
+        default="GENERATED_UNVERIFIED",
+        pattern="^(PRODUCTION_CURATED|TENANT_CURATED|GENERATED_UNVERIFIED|DEMO_ONLY|MALFORMED|OBSOLETE)$",
+    )
+    content_version: int = Field(default=1, ge=1)
+    created_at: str | None = None
+    updated_at: str | None = None
+    last_reviewed: str | None = None
+    reviewed_by: str | None = Field(default=None, max_length=160)
+    approved_by: str | None = Field(default=None, max_length=160)
+    approved_at: str | None = None
 
 
 class RagDocumentUpdateRequest(RagDocumentRequest):
     path: str = Field(min_length=3)
 
 
+class RagDocumentApproveRequest(BaseModel):
+    tenant_scope: str = Field(min_length=1, max_length=128)
+    approved_by: str = Field(min_length=1, max_length=160)
+    owner_team: str = Field(min_length=2, max_length=160)
+
+
 class EvidenceRagDraftReviewRequest(BaseModel):
+    tenant_scope: str = Field(min_length=1, max_length=128)
     title: str | None = Field(default=None, min_length=3, max_length=160)
     content: str | None = Field(default=None, min_length=20)
     reviewed_by: str = Field(min_length=2, max_length=120)
@@ -921,7 +943,9 @@ class EvidenceRagDraftReviewRequest(BaseModel):
 
 
 class EvidenceRagDraftApproveRequest(BaseModel):
+    tenant_scope: str = Field(min_length=1, max_length=128)
     approved_by: str = Field(min_length=2, max_length=120)
+    owner_team: str = Field(min_length=2, max_length=160)
     title: str | None = Field(default=None, min_length=3, max_length=160)
     content: str | None = Field(default=None, min_length=20)
 
@@ -1182,7 +1206,9 @@ def build_knowledge_pack(request: KnowledgePackRequest) -> dict[str, Any]:
     }
 
 
-def _knowledge_pack_to_rag_request(pack: dict[str, Any], approved_by: str | None = None) -> RagDocumentRequest:
+def _knowledge_pack_to_rag_request(
+    pack: dict[str, Any], approved_by: str, tenant_scope: str
+) -> RagDocumentRequest:
     facts = pack.get("facts") if isinstance(pack.get("facts"), dict) else {}
 
     def fact_value(key: str, default: Any = "") -> Any:
@@ -1192,7 +1218,9 @@ def _knowledge_pack_to_rag_request(pack: dict[str, Any], approved_by: str | None
 
     service = str(fact_value("service", "unknown-service")).strip() or "unknown-service"
     environment = str(fact_value("environment", "prod")).strip() or "prod"
-    owner = str(fact_value("owner_team", approved_by or "unassigned")).strip() or "unassigned"
+    owner = str(fact_value("owner_team", "")).strip()
+    if not owner:
+        raise HTTPException(status_code=422, detail="owner_team must be explicitly approved")
     dependencies = fact_value("dependencies", [])
     commands = fact_value("commands", [])
     validation = fact_value("validation_checks", [])
@@ -1225,7 +1253,16 @@ def _knowledge_pack_to_rag_request(pack: dict[str, Any], approved_by: str | None
         commands=commands if isinstance(commands, list) else [],
         queries=validation if isinstance(validation, list) else [],
         source_system="knowledge-pack",
+        source_ref=f"knowledge-pack://{service}/{environment}",
         resolved_by=owner,
+        tenant_scope=tenant_scope,
+        owner_team=owner,
+        review_status="approved",
+        corpus_classification="TENANT_CURATED",
+        reviewed_by=approved_by,
+        approved_by=approved_by,
+        approved_at=datetime.now(timezone.utc).isoformat(),
+        last_reviewed=datetime.now(timezone.utc).isoformat(),
         metadata={
             "environment": environment,
             "knowledge_pack_status": str(pack.get("status") or "approved"),
@@ -1235,9 +1272,25 @@ def _knowledge_pack_to_rag_request(pack: dict[str, Any], approved_by: str | None
 
 
 def render_document(request: RagDocumentRequest) -> str:
+    now = datetime.now(timezone.utc).isoformat()
     metadata: dict[str, Any] = {
         "kind": request.kind,
         "title": request.title,
+        "tenant_scope": request.tenant_scope,
+        "services": ", ".join(request.services),
+        "owner_team": request.owner_team,
+        "source_system": request.source_system or "",
+        "source_ref": request.source_ref or "",
+        "review_status": request.review_status,
+        "corpus_classification": request.corpus_classification,
+        "content_version": request.content_version,
+        "created_at": request.created_at or now,
+        "updated_at": request.updated_at or now,
+        "last_reviewed": request.last_reviewed or "",
+        "reviewed_by": request.reviewed_by or "",
+        "approved_by": request.approved_by or "",
+        "approved_at": request.approved_at or "",
+        "content_checksum": content_checksum(request.content),
     }
     if request.alert_id:
         metadata["alert_id"] = request.alert_id
@@ -1245,8 +1298,6 @@ def render_document(request: RagDocumentRequest) -> str:
         metadata["alert_type"] = request.alert_type
     if request.severity:
         metadata["severity"] = request.severity.lower()
-    if request.services:
-        metadata["services"] = ", ".join(request.services)
     if request.deployment:
         metadata["deployment"] = request.deployment
     if request.dependencies:
@@ -1416,7 +1467,7 @@ def create_evidence_rag_draft(*, alert: Alert, incident: Incident, context: Cont
     ]
     if not grounded:
         return None
-    draft_id = f"evidence-{alert.id}"
+    draft_id = f"evidence-{slugify(alert.tenant_id)}-{alert.id}"
     path = _draft_path(draft_id)
     if path.exists():
         return _read_evidence_draft(draft_id)
@@ -1452,6 +1503,7 @@ def create_evidence_rag_draft(*, alert: Alert, incident: Incident, context: Cont
         {
             "draft_id": draft_id,
             "status": "draft",
+            "tenant_scope": alert.tenant_id,
             "alert_id": str(alert.id),
             "incident_id": str(incident.id),
             "alert_type": alert.name,
@@ -1675,32 +1727,84 @@ async def latest_context_snapshot(incident_id: str, tenant_id: str = "default") 
 
 @app.post("/rag/documents")
 async def ingest_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
-    result = write_rag_document(request)
-    if request.kind == "incident":
+    governed_request = request.model_copy(update={
+        "review_status": "pending_review",
+        "corpus_classification": "GENERATED_UNVERIFIED",
+        "reviewed_by": None,
+        "approved_by": None,
+        "approved_at": None,
+        "last_reviewed": None,
+    })
+    tenant_scope = require_tenant_id(governed_request.tenant_scope, source="RAG draft ingestion")
+    draft_id = f"rag-{uuid4()}"
+    now = datetime.now(timezone.utc).isoformat()
+    draft = {
+        "draft_id": draft_id,
+        "status": "pending_review",
+        "tenant_scope": tenant_scope,
+        "created_at": now,
+        "updated_at": now,
+        "request": governed_request.model_dump(mode="json"),
+    }
+    _draft_path(draft_id).write_text(json.dumps(draft, indent=2), encoding="utf-8")
+    return {
+        "status": "pending_review",
+        "document_flag_updated": False,
+        "draft": draft,
+        "document_count": vector_connector().reload(),
+        "index": vector_connector().index_info(),
+    }
+
+
+@app.post("/rag/documents/{draft_id}/approve")
+async def approve_rag_document(
+    draft_id: str, request: RagDocumentApproveRequest
+) -> dict[str, Any]:
+    draft = _read_evidence_draft(draft_id)
+    if str(draft.get("tenant_scope") or "") != request.tenant_scope:
+        raise HTTPException(status_code=404, detail="RAG draft not found")
+    if str(draft.get("status") or "") == "approved":
+        return {"status": "approved", "draft": draft, "already_approved": True}
+    payload = draft.get("request") if isinstance(draft.get("request"), dict) else {}
+    now = datetime.now(timezone.utc).isoformat()
+    version = max(1, int(payload.get("content_version") or 1))
+    governed = RagDocumentRequest.model_validate({
+        **payload,
+        "tenant_scope": request.tenant_scope,
+        "owner_team": request.owner_team,
+        "review_status": "approved",
+        "corpus_classification": "TENANT_CURATED",
+        "content_version": version,
+        "last_reviewed": now,
+        "reviewed_by": request.approved_by,
+        "approved_by": request.approved_by,
+        "approved_at": now,
+        "updated_at": now,
+    })
+    result = write_rag_document(governed)
+    draft.update({
+        "status": "approved",
+        "updated_at": now,
+        "approved_by": request.approved_by,
+        "approved_at": now,
+        "rag_document_path": result["path"],
+        "content_checksum": content_checksum(governed.content),
+    })
+    _write_evidence_draft(draft)
+    if governed.kind == "incident":
         rebuild_flow_catalog_from_rag(vector_connector())
-    document_flag_updated = False
-    if request.alert_id and settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
-        async with app.state.session_factory() as session:
-            repo = IncidentRepository(session)
-            document_flag_updated = await repo.update_projection_document_flag(request.alert_id, True)
-            await session.commit()
-    return {"status": "ingested", "document_flag_updated": document_flag_updated, **result}
+    return {"status": "approved", "draft": draft, "rag_document": result}
 
 
-def _list_evidence_rag_drafts_sync(alert_id: str | None, status: str | None) -> list[dict[str, Any]]:
+def _list_evidence_rag_drafts_sync(
+    alert_id: str | None, status: str | None, tenant_scope: str
+) -> list[dict[str, Any]]:
     if alert_id:
-        path = _draft_path(f"evidence-{alert_id}")
-        if not path.exists():
-            return []
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
-        if not isinstance(payload, dict) or str(payload.get("alert_id") or "") != alert_id:
-            return []
-        if status and str(payload.get("status") or "").lower() != status.lower():
-            return []
-        return [payload]
+        return [
+            payload
+            for payload in _list_evidence_rag_drafts_sync(None, status, tenant_scope)
+            if str(payload.get("alert_id") or "") == alert_id
+        ]
 
     drafts: list[dict[str, Any]] = []
     for path in sorted(_evidence_draft_dir().glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
@@ -1710,6 +1814,8 @@ def _list_evidence_rag_drafts_sync(alert_id: str | None, status: str | None) -> 
             continue
         if not isinstance(payload, dict):
             continue
+        if str(payload.get("tenant_scope") or "") != tenant_scope:
+            continue
         if status and str(payload.get("status") or "").lower() != status.lower():
             continue
         drafts.append(payload)
@@ -1717,10 +1823,15 @@ def _list_evidence_rag_drafts_sync(alert_id: str | None, status: str | None) -> 
 
 
 @app.get("/rag/evidence-drafts")
-async def list_evidence_rag_drafts(alert_id: str | None = None, status: str | None = None) -> dict[str, Any]:
+async def list_evidence_rag_drafts(
+    alert_id: str | None = None,
+    status: str | None = None,
+    tenant_scope: str = "",
+) -> dict[str, Any]:
     # The review directory can live on a high-latency bind mount. Never block
     # RabbitMQ heartbeats and incident consumers while walking/stat-ing it.
-    drafts = await asyncio.to_thread(_list_evidence_rag_drafts_sync, alert_id, status)
+    tenant = require_tenant_id(tenant_scope, source="evidence draft listing")
+    drafts = await asyncio.to_thread(_list_evidence_rag_drafts_sync, alert_id, status, tenant)
     return {"count": len(drafts), "drafts": drafts}
 
 
@@ -1733,7 +1844,10 @@ async def create_evidence_rag_draft_from_rca(request: dict[str, Any]) -> dict[st
         raise HTTPException(status_code=422, detail="alert_id is required")
     if len(content) < 20:
         raise HTTPException(status_code=422, detail="grounded RCA content is required")
-    draft_id = f"evidence-{alert_id}"
+    tenant_scope = require_tenant_id(
+        str(request.get("tenant_scope") or ""), source="evidence draft creation"
+    )
+    draft_id = f"evidence-{slugify(tenant_scope)}-{alert_id}"
     path = _draft_path(draft_id)
     if path.exists():
         return {"status": "existing", "draft": _read_evidence_draft(draft_id)}
@@ -1741,6 +1855,7 @@ async def create_evidence_rag_draft_from_rca(request: dict[str, Any]) -> dict[st
     draft = _write_evidence_draft({
         "draft_id": draft_id,
         "status": "draft",
+        "tenant_scope": tenant_scope,
         "alert_id": alert_id,
         "incident_id": str(request.get("incident_id") or ""),
         "alert_type": str(request.get("alert_type") or "Alert"),
@@ -1763,6 +1878,8 @@ async def review_evidence_rag_draft(
     request: EvidenceRagDraftReviewRequest,
 ) -> dict[str, Any]:
     draft = _read_evidence_draft(draft_id)
+    if str(draft.get("tenant_scope") or "") != request.tenant_scope:
+        raise HTTPException(status_code=404, detail="evidence RAG draft not found")
     if str(draft.get("status") or "") == "approved":
         raise HTTPException(status_code=409, detail="approved evidence documents cannot be edited")
     if request.title is not None:
@@ -1782,12 +1899,15 @@ async def approve_evidence_rag_draft(
     request: EvidenceRagDraftApproveRequest,
 ) -> dict[str, Any]:
     draft = _read_evidence_draft(draft_id)
+    if str(draft.get("tenant_scope") or "") != request.tenant_scope:
+        raise HTTPException(status_code=404, detail="evidence RAG draft not found")
     if str(draft.get("status") or "") == "approved":
         return {"status": "approved", "draft": draft, "already_approved": True}
     title = str(request.title or draft.get("title") or "").strip()
     content = str(request.content or draft.get("content") or "").strip()
     if len(content) < 20:
         raise HTTPException(status_code=422, detail="approved evidence content is too short")
+    tenant_scope = require_tenant_id(str(draft.get("tenant_scope") or ""), source="evidence approval")
     approved_at = datetime.now(timezone.utc).isoformat()
     rag_request = RagDocumentRequest(
         kind="incident",
@@ -1801,6 +1921,14 @@ async def approve_evidence_rag_draft(
         source_system="kaiops-evidence-review",
         source_ref=f"evidence-draft://{draft_id}",
         resolved_by=request.approved_by.strip(),
+        tenant_scope=tenant_scope,
+        owner_team=request.owner_team.strip(),
+        review_status="approved",
+        corpus_classification="TENANT_CURATED",
+        reviewed_by=str(draft.get("reviewed_by") or request.approved_by).strip(),
+        approved_by=request.approved_by.strip(),
+        approved_at=approved_at,
+        last_reviewed=approved_at,
         metadata={
             "approval_status": "approved",
             "approved_by": request.approved_by.strip(),
@@ -1863,7 +1991,11 @@ async def approve_knowledge_pack(request: KnowledgePackApproveRequest) -> dict[s
     # pre-override extraction average instead of what was actually approved.
     pack["validation"] = _compute_knowledge_pack_validation(facts)
     pack["status"] = "approved"
-    rag_request = _knowledge_pack_to_rag_request(pack, request.approved_by)
+    rag_request = _knowledge_pack_to_rag_request(
+        pack,
+        request.approved_by,
+        require_tenant_id(request.tenant_id, source="knowledge pack approval"),
+    )
     result = write_rag_document(rag_request)
     runbook_id = str(uuid5(NAMESPACE_URL, rag_request.content))
     checksum = f"sha256:{hashlib.sha256(rag_request.content.encode('utf-8')).hexdigest()}"
@@ -1886,17 +2018,35 @@ async def approve_knowledge_pack(request: KnowledgePackApproveRequest) -> dict[s
 
 @app.put("/rag/documents")
 async def update_rag_document(request: RagDocumentUpdateRequest) -> dict[str, Any]:
+    connector = vector_connector()
+    root = connector.root_path().resolve()
+    target = Path(request.path).expanduser().resolve()
+    if root not in target.parents or target.suffix.lower() != ".md":
+        raise HTTPException(status_code=400, detail="Document path is outside the RAG directory")
+    existing = connector._load_full_document(str(target))
+    if not existing:
+        raise HTTPException(status_code=404, detail="RAG document not found")
+    if str(existing.get("tenant_scope") or "") != request.tenant_scope:
+        raise HTTPException(status_code=404, detail="RAG document not found")
+    try:
+        next_version = int(existing.get("content_version") or 1) + 1
+    except (TypeError, ValueError):
+        next_version = 2
     payload = request.model_dump(exclude={"path"})
-    result = write_rag_document_to_path(RagDocumentRequest(**payload), request.path)
-    if request.kind == "incident":
-        rebuild_flow_catalog_from_rag(vector_connector())
-    document_flag_updated = False
-    if request.alert_id and settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
-        async with app.state.session_factory() as session:
-            repo = IncidentRepository(session)
-            document_flag_updated = await repo.update_projection_document_flag(request.alert_id, True)
-            await session.commit()
-    return {"status": "updated", "document_flag_updated": document_flag_updated, **result}
+    pending = RagDocumentRequest.model_validate({
+        **payload,
+        "content_version": next_version,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "review_status": "pending_review",
+        "corpus_classification": "GENERATED_UNVERIFIED",
+        "reviewed_by": None,
+        "approved_by": None,
+        "approved_at": None,
+        "last_reviewed": None,
+    })
+    result = await ingest_rag_document(pending)
+    return {**result, "status": "pending_review", "supersedes": str(target)}
 
 
 _RAG_DOCUMENT_INTERNAL_FIELDS = {"_embedding", "_metadata_embedding", "_synthetic"}
@@ -1918,7 +2068,7 @@ def _public_rag_document(doc: dict[str, Any], connector: VectorDBConnector) -> d
 
 
 @app.get("/rag/documents")
-def list_rag_documents() -> dict[str, Any]:
+def list_rag_documents(tenant_scope: str) -> dict[str, Any]:
     """Build the potentially large catalog on FastAPI's worker pool.
 
     Connector metadata and document projection are synchronous and can take
@@ -1926,7 +2076,11 @@ def list_rag_documents() -> dict[str, Any]:
     the event loop so health checks and incident consumers stay responsive.
     """
     connector = vector_connector()
-    documents = [doc for doc in connector.documents if not doc.get("_synthetic")]
+    tenant = require_tenant_id(tenant_scope, source="RAG inventory")
+    documents = [
+        doc for doc in connector.documents
+        if not doc.get("_synthetic") and retrieval_allowed(doc, tenant)
+    ]
     return {
         "document_count": len(documents),
         "index": connector.index_info(),
@@ -1935,13 +2089,14 @@ def list_rag_documents() -> dict[str, Any]:
 
 
 @app.get("/rag/documents/content")
-async def get_rag_document_content(path: str) -> dict[str, Any]:
+async def get_rag_document_content(path: str, tenant_scope: str) -> dict[str, Any]:
     connector = vector_connector()
+    tenant = require_tenant_id(tenant_scope, source="RAG content lookup")
     known_paths = {str(doc.get("path", "")) for doc in connector.documents}
     if path not in known_paths:
         raise HTTPException(status_code=404, detail="document not found")
     full_doc = connector._load_full_document(path)
-    if not full_doc:
+    if not full_doc or not retrieval_allowed(full_doc, tenant):
         raise HTTPException(status_code=404, detail="document not found")
     return {key: value for key, value in full_doc.items() if key not in _RAG_DOCUMENT_INTERNAL_FIELDS}
 
