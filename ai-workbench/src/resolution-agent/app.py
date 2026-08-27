@@ -688,6 +688,26 @@ def _build_resolution_event_payload(
     }
 
 
+def _resolution_projection_status(metadata: dict[str, Any], *, requires_approval: bool) -> str:
+    plan = metadata.get("execution_plan") if isinstance(metadata.get("execution_plan"), dict) else {}
+    iterative = metadata.get("iterative_investigation") if isinstance(metadata.get("iterative_investigation"), dict) else {}
+    rca_analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
+    lifecycle = metadata.get("resolution_lifecycle") if isinstance(metadata.get("resolution_lifecycle"), dict) else {}
+    lifecycle_state = str(lifecycle.get("state") or "").strip().lower()
+    accepted_evidence = [value for value in rca_analysis.get("evidence_used", []) if str(value).strip()]
+    recommendation_ready = (
+        iterative.get("conclusive") is True
+        and bool(accepted_evidence)
+        and plan.get("execution_ready") is True
+        and plan.get("mutating") is True
+    )
+    if recommendation_ready and (requires_approval or lifecycle_state == "awaiting_approval"):
+        return "awaiting_approval"
+    if recommendation_ready and lifecycle_state == "ready_to_execute":
+        return "approved"
+    return "investigating"
+
+
 async def _persist_resolution_event(
     *,
     app: FastAPI,
@@ -705,16 +725,7 @@ async def _persist_resolution_event(
     requires_approval = decision_payload.get("requires_approval")
     if requires_approval is None:
         requires_approval = orchestration.get("requires_approval")
-    lifecycle = metadata.get("resolution_lifecycle") if isinstance(metadata.get("resolution_lifecycle"), dict) else {}
-    lifecycle_state = str(lifecycle.get("state") or "").strip().lower()
-    if bool(requires_approval) or lifecycle_state == "awaiting_approval":
-        status = "awaiting_approval"
-    elif lifecycle_state == "ready_to_execute":
-        # A reviewed plan is execution-ready, but no mutation has started yet.
-        # Only remediation-engine may advance the projection to remediating.
-        status = "approved"
-    else:
-        status = "investigating"
+    status = _resolution_projection_status(metadata, requires_approval=bool(requires_approval))
     provider = decision_payload.get("message_bus_provider") or orchestration.get("message_bus_provider") or "unknown"
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
