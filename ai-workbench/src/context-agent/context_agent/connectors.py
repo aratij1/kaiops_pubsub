@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import heapq
 import ipaddress
@@ -93,9 +93,61 @@ class PrometheusConnector(BaseConnector):
     name = "prometheus"
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
-        await asyncio.sleep(0)
         snapshot = _metadata_dict(alert, "observability", "metrics", "prometheus")
         observed = _metadata_dict(alert, "observed_values", "signal")
+        metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
+        resolved = metadata.get("resolved_context_connectors") if isinstance(metadata.get("resolved_context_connectors"), list) else []
+        connector = next((row for row in resolved if str(row.get("provider") or "").lower() in {"prometheus", "alertmanager"}), None)
+        if connector and (metadata.get("connector_resolution") or {}).get("status") == "completed":
+            endpoint = str(connector.get("endpoint_identity") or "").rstrip("/")
+            if not endpoint:
+                return {"_source_status": "misconfigured", "error": "configured Prometheus endpoint is missing"}
+            labels = alert.labels if isinstance(alert.labels, dict) else {}
+            config = connector.get("config") if isinstance(connector.get("config"), dict) else {}
+            expression = next((str(metadata.get(key) or labels.get(key) or "").strip() for key in ("prometheus_expression", "rule_expression", "expression", "promql") if str(metadata.get(key) or labels.get(key) or "").strip()), "")
+            metric_name = str(metadata.get("metric_name") or labels.get("__name__") or labels.get("metric") or "").strip()
+            if not expression and metric_name:
+                matchers = []
+                for key in ("environment", "cluster", "namespace", "service", "instance"):
+                    value = str(labels.get(key) or (alert.environment if key == "environment" else alert.service if key == "service" else "")).strip()
+                    if value and re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", key):
+                        escaped_value = value.replace('"', '\\"')
+                        matchers.append(f'{key}="{escaped_value}"')
+                expression = f'{metric_name}{{{",".join(matchers)}}}' if matchers else metric_name
+            if not expression:
+                return {"_source_status": "misconfigured", "error": "alert rule expression and metric identity are missing"}
+            end = datetime.now(timezone.utc)
+            window_seconds = max(60, min(int(config.get("observation_window_seconds") or 900), 86400))
+            params = {"query": expression, "start": (end - timedelta(seconds=window_seconds)).timestamp(), "end": end.timestamp(), "step": max(15, min(int(config.get("step_seconds") or 60), 3600))}
+            headers: dict[str, str] = {}
+            secret_ref = str(connector.get("secret_ref") or "")
+            if secret_ref.startswith("env://"):
+                token = os.getenv(secret_ref.removeprefix("env://"), "")
+                if not token:
+                    return {"_source_status": "unauthorized", "error": "configured environment secret is unavailable"}
+                headers["Authorization"] = f"Bearer {token}"
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(f"{endpoint}/api/v1/query_range", params=params, headers=headers)
+                if response.status_code in {401, 403}:
+                    return {"_source_status": "unauthorized", "error": f"Prometheus returned HTTP {response.status_code}"}
+                response.raise_for_status()
+                payload = response.json()
+                result = ((payload.get("data") or {}).get("result") or []) if isinstance(payload, dict) else []
+                return {
+                    "_source_status": "completed" if result else "empty",
+                    "query": expression,
+                    "query_kind": "range",
+                    "endpoint_identity": endpoint,
+                    "observation_window": {"start": params["start"], "end": params["end"], "step": params["step"]},
+                    "series": result,
+                    "preserved_labels": {key: labels.get(key) for key in ("environment", "cluster", "namespace", "service", "instance") if labels.get(key)},
+                    "provenance": {"source": "onboarded-prometheus", "integration_id": connector.get("integration_id"), "grounded": bool(result)},
+                }
+            except httpx.TimeoutException:
+                return {"_source_status": "timed_out", "error": "Prometheus range query timed out"}
+            except (httpx.HTTPError, ValueError) as exc:
+                return {"_source_status": "unavailable", "error": str(exc)[:300]}
         if not snapshot and not observed:
             return {}
         return {
@@ -2077,14 +2129,21 @@ class ContextIntelligenceAgent(BaseAgent):
                     attempts=attempts,
                     base_delay=0.15,
                 )
+                explicit_status = str(result.get("_source_status") or "").strip().lower()
                 return result, {
-                    "status": "collected",
+                    "status": explicit_status or "completed",
                     "latency_ms": round((monotonic() - connector_started) * 1000, 2),
                     "attempts": attempts,
                 }
             except Exception as exc:  # A connector failure must not erase healthy evidence.
+                failure_status = (
+                    "timed_out" if isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+                    else "unauthorized" if isinstance(exc, PermissionError)
+                    else "misconfigured" if isinstance(exc, (KeyError, ValueError))
+                    else "unavailable"
+                )
                 return {}, {
-                    "status": "failed",
+                    "status": failure_status,
                     "latency_ms": round((monotonic() - connector_started) * 1000, 2),
                     "attempts": attempts,
                     "error_type": type(exc).__name__,
@@ -2110,13 +2169,13 @@ class ContextIntelligenceAgent(BaseAgent):
                 and any(
                     value not in (None, "", [], {}, False)
                     for key, value in result.items()
-                    if key != "provenance"
+                    if key not in {"provenance", "_source_status", "error"}
                 )
             )
             health[name] = (
                 status
-                if status.get("status") != "collected"
-                else {**status, "status": "collected" if has_material_result else "no_data"}
+                if status.get("status") != "completed"
+                else {**status, "status": "completed" if has_material_result else "empty"}
             )
         for task in pending:
             name = task_names[task]
@@ -2330,6 +2389,18 @@ class ContextIntelligenceAgent(BaseAgent):
                     if str(row.get("evidence_id") or "").strip()
                 ],
             }
+        prometheus_health = state.get("connector_health", {}).get("prometheus", {})
+        if isinstance(prometheus_health, dict) and prometheus_health:
+            context_source_manifest["telemetry"] = {
+                **context_source_manifest.get("telemetry", {}),
+                "attempted": prometheus_health.get("status") != "skipped",
+                "status": str(prometheus_health.get("status") or "unavailable"),
+                "connector": "prometheus",
+                "endpoint_identity": by_name["prometheus"].get("endpoint_identity"),
+                "query": by_name["prometheus"].get("query"),
+                "result_count": len(by_name["prometheus"].get("series") or []),
+                "error": prometheus_health.get("error") or by_name["prometheus"].get("error"),
+            }
         context = Context(
             tenant_id=alert.tenant_id,
             incident_id=incident.id,
@@ -2377,10 +2448,10 @@ class ContextIntelligenceAgent(BaseAgent):
                     "connectors": state.get("connector_health", {}),
                     "collected_count": sum(
                         1 for item in state.get("connector_health", {}).values()
-                        if item.get("status") == "collected"
+                        if item.get("status") == "completed"
                     ),
                     "degraded": any(
-                        item.get("status") in {"failed", "timed_out"}
+                        item.get("status") in {"unavailable", "unauthorized", "misconfigured", "timed_out"}
                         for item in state.get("connector_health", {}).values()
                     ),
                 },

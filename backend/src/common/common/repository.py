@@ -3371,6 +3371,51 @@ class IncidentRepository:
             for row in rows
         ]
 
+    async def resolve_context_integrations(
+        self, *, tenant_id: str, project_candidates: list[str],
+    ) -> list[dict[str, Any]]:
+        """Resolve active onboarding connectors by exact tenant/project identity."""
+        candidates = {str(value).strip().lower() for value in project_candidates if str(value).strip()}
+        if not candidates:
+            return []
+        integrations = (
+            await self.session.execute(
+                select(MonitoringIntegrationRecord).where(
+                    MonitoringIntegrationRecord.tenant_id == self._require("monitoring_integration.tenant_id", tenant_id),
+                    MonitoringIntegrationRecord.active.is_(True),
+                    func.lower(MonitoringIntegrationRecord.project_name).in_(candidates),
+                )
+            )
+        ).scalars().all()
+        if not integrations:
+            return []
+        integration_ids = [row.id for row in integrations]
+        credentials = (
+            await self.session.execute(
+                select(MonitoringCredentialRecord).where(
+                    MonitoringCredentialRecord.integration_id.in_(integration_ids)
+                )
+            )
+        ).scalars().all()
+        credential_by_integration = {row.integration_id: row for row in credentials}
+        return [
+            {
+                "integration_id": str(row.id),
+                "tenant_id": row.tenant_id,
+                "project_id": row.project_name,
+                "provider": row.provider,
+                "status": row.status,
+                "endpoint_identity": row.endpoint_url,
+                "auth_type": row.auth_type,
+                "secret_ref": (
+                    credential_by_integration[row.id].secret_ref
+                    if row.id in credential_by_integration else None
+                ),
+                "config": dict(row.config_payload or {}),
+            }
+            for row in integrations
+        ]
+
     async def get_monitoring_integration(self, integration_id: Any) -> dict[str, Any] | None:
         parsed_id = self._parse_uuid(integration_id)
         if parsed_id is None:

@@ -185,6 +185,39 @@ async def _collect_context_with_strategy_unlocked(
     max_evidence = int(getattr(settings, "context_max_evidence_per_source", 20) or 20)
     session_factory = getattr(app.state, "session_factory", None)
     database_available = bool(settings.database_enabled and session_factory is not None)
+    if database_available:
+        metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
+        candidates = [
+            metadata.get("project_id"), metadata.get("project"), metadata.get("application_id"),
+            metadata.get("application"), metadata.get("application_name"), alert.service,
+        ]
+        try:
+            async with session_factory() as session:
+                resolved_connectors = await IncidentRepository(session).resolve_context_integrations(
+                    tenant_id=tenant_id,
+                    project_candidates=[str(value) for value in candidates if str(value or "").strip()],
+                )
+            alert.metadata = {
+                **metadata,
+                "resolved_context_connectors": resolved_connectors,
+                "connector_resolution": {
+                    "status": "completed" if resolved_connectors else "misconfigured",
+                    "tenant_id": tenant_id,
+                    "project_candidates": [str(value) for value in candidates if str(value or "").strip()],
+                    "resolved_count": len(resolved_connectors),
+                },
+            }
+        except Exception as exc:
+            logger.exception("failed to resolve onboarded context connectors")
+            alert.metadata = {
+                **metadata,
+                "resolved_context_connectors": [],
+                "connector_resolution": {
+                    "status": "unavailable",
+                    "tenant_id": tenant_id,
+                    "error": str(exc)[:300],
+                },
+            }
 
     if isinstance(supplied_context, dict):
         try:
