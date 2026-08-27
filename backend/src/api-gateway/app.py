@@ -27,7 +27,7 @@ from api_gateway.modules.triage.router import TriageCorrectionCreate as TriageCo
 from api_gateway.modules.triage.router import router as triage_router
 from api_gateway.modules.users.service import UserService
 from common.config import get_settings
-from common.database import ActionRecord, AlertRecord, ApprovalRecord, AuditLogRecord, IncidentProjectionRecord, IncidentRecord, MonitoringConnectionHealthRecord
+from common.database import ActionRecord, AlertRecord, ApprovalRecord, AuditLogRecord, IncidentOccurrenceRecord, IncidentProjectionRecord, IncidentRecord, MonitoringConnectionHealthRecord
 from common.event_publishers import build_agent_event_contract, build_orchestration_envelope
 from common.kafka import normalize_payload
 from common.models import Alert, GatewayAuditEvent, Incident, SafetyDecision
@@ -1906,6 +1906,27 @@ async def _load_analysis_regeneration_subject(
                 .limit(1)
             )
         ).scalar_one_or_none()
+        if projection_record is None:
+            occurrence_record = (
+                await session.execute(
+                    select(IncidentOccurrenceRecord)
+                    .where(
+                        IncidentOccurrenceRecord.occurrence_id == alert_uuid,
+                        IncidentOccurrenceRecord.tenant_id == tenant_id,
+                    )
+                    .order_by(IncidentOccurrenceRecord.observed_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if occurrence_record is not None:
+                projection_record = (
+                    await session.execute(
+                        select(IncidentProjectionRecord).where(
+                            IncidentProjectionRecord.incident_id == occurrence_record.canonical_incident_id,
+                            IncidentProjectionRecord.tenant_id == tenant_id,
+                        )
+                    )
+                ).scalar_one_or_none()
         if projection_record is None:
             raise HTTPException(
                 status_code=409,
