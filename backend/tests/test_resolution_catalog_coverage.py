@@ -1,3 +1,4 @@
+import pytest
 from resolution_agent.catalog import (
     RESOLUTION_CATALOG,
     prepare_resolution_plan,
@@ -29,7 +30,8 @@ def test_matching_prioritizes_issue_family_and_platform() -> None:
 
 def test_global_knowledge_is_review_only_and_cannot_execute() -> None:
     rows = register_global_knowledge(
-        [
+        tenant_id="tenant-a",
+        matches=[
             {
                 "title": "Vendor recovery guide",
                 "path": "global/runbooks/vendor.md",
@@ -39,7 +41,16 @@ def test_global_knowledge_is_review_only_and_cannot_execute() -> None:
         ]
     )
     assert rows[0]["relevance"] == 0.6
-    plan = prepare_resolution_plan(option_id=rows[0]["id"], issue="unknown vendor fault", service="payments")
+    plan = prepare_resolution_plan(
+        tenant_id="tenant-a", option_id=rows[0]["id"],
+        issue="unknown vendor fault", service="payments",
+    )
     assert plan["agent_status"] == "knowledge_candidate_requires_validation"
     assert plan["execution_eligible"] is False
     assert "Do not execute directly" in plan["steps"][0]
+
+    with pytest.raises(ValueError, match="Unknown resolution option"):
+        prepare_resolution_plan(
+            tenant_id="tenant-b", option_id=rows[0]["id"],
+            issue="unknown vendor fault", service="payments",
+        )
