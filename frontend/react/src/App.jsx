@@ -14,6 +14,7 @@ import { incidentDraftHasSubstantiveContent, simpleIncidentReport } from "./doma
 import { approvalFlowFromPayload, approvalFlowId, approvalIncidentId, approvalRecommendationFromPayload, approvalRecommendationId, approvalTraceId } from "./domain/approvalContext";
 import { buildOnboardingSources } from "./domain/onboardingSources";
 import { buildAlertDocumentDraft as buildRcaEvidenceDocumentDraft } from "./domain/alertDocumentDraft";
+import { canonicalIncidentEvidence } from "./domain/incidentEvidence";
 import { buildIncidentGroupQuery } from "./features/incidents/incidentGroupQuery";
 import RcaPanel from "./routes/incidents/RcaPanel";
 import ResolutionPanel from "./routes/incidents/ResolutionPanel";
@@ -5876,48 +5877,17 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       ? selectedAlertWorkflow.recommendation
       : {};
     const metadata = recommendation?.metadata && typeof recommendation.metadata === "object" ? recommendation.metadata : {};
-    const analysis = metadata?.rca_analysis && typeof metadata.rca_analysis === "object" ? metadata.rca_analysis : {};
-    const missing = Array.isArray(analysis.missing_evidence)
-      ? analysis.missing_evidence
-      : analysis.missing_evidence ? [analysis.missing_evidence] : [];
-    const conflicting = Array.isArray(analysis.conflicting_evidence)
-      ? analysis.conflicting_evidence
-      : Array.isArray(metadata.conflicting_evidence) ? metadata.conflicting_evidence : [];
+    const canonical = canonicalIncidentEvidence(selectedAlertWorkflow);
     const providerRow = selectedAlertUsage.find((row) => row.provider !== "-" || row.model !== "-");
     const fallbackUsed = selectedAlertUsage.some((row) => row.fallback);
-    const discoveryEvidence = selectedAlertWorkflow?.context?.metadata?.discovery_report?.evidence;
-    const evidenceInputs = [
-      ...selectedAlertRagDocuments.map((row) => ({ ...row, context_source: row?.context_source || "cached" })),
-      ...(Array.isArray(discoveryEvidence) ? discoveryEvidence.map((row) => ({ ...row, context_source: row?.context_source || "fresh" })) : []),
-    ];
-    const now = Date.now();
-    const evidence = evidenceInputs.map((doc, index) => {
-      const timestamp = doc?.evidence_timestamp || doc?.updated_at || doc?.created_at || doc?.timestamp || "";
-      const parsed = parseUtcTimestamp(timestamp);
-      const ageMs = parsed ? Math.max(0, now - parsed.getTime()) : null;
-      const cached = Boolean(doc?.cached || doc?.cache_hit || doc?.context_source === "cached" || doc?.fresh === false);
-      return {
-        id: String(doc?.evidence_id || doc?.document_id || doc?.path || `evidence-${index + 1}`),
-        source: String(doc?.source || doc?.kind || doc?.document_kind || "knowledge document"),
-        title: String(doc?.title || ""),
-        summary: String(doc?.summary || doc?.snippet || doc?.description || ""),
-        timestamp,
-        age: ageMs === null ? "unknown" : ageMs < 3600000 ? `${Math.max(1, Math.round(ageMs / 60000))}m` : ageMs < 86400000 ? `${Math.round(ageMs / 3600000)}h` : `${Math.round(ageMs / 86400000)}d`,
-        freshness: !parsed ? "Freshness unknown" : ageMs <= 3600000 ? "Fresh" : ageMs <= 86400000 ? "Recent" : "Stale",
-        citation: String(doc?.uri || doc?.url || doc?.citation || doc?.path || ""),
-        uri: String(doc?.uri || doc?.url || ""),
-        path: String(doc?.path || ""),
-        cached,
-      };
-    }).filter((row, index, rows) => rows.findIndex((candidate) => candidate.id === row.id) === index);
     const confidenceReasons = [
-      `${evidence.length} linked evidence source(s)`,
+      `${canonical.evidence.length} linked evidence source(s)`,
       `${formatQualityPercent(selectedAlertEvaluation.citationCoverage)} citation coverage`,
       `${formatQualityPercent(selectedAlertEvaluation.groundingScore)} grounding`,
-      missing.length ? `${missing.length} evidence gap(s)` : "No declared evidence gaps",
+      canonical.missing.length ? `${canonical.missing.length} evidence gap(s)` : "No declared evidence gaps",
     ];
-    return { analysis, missing, conflicting, evidence, providerRow, fallbackUsed, confidenceReasons };
-  }, [selectedAlertWorkflow, selectedAlertUsage, selectedAlertRagDocuments, selectedAlertEvaluation]);
+    return { ...canonical, providerRow, fallbackUsed, confidenceReasons };
+  }, [selectedAlertWorkflow, selectedAlertUsage, selectedAlertEvaluation]);
 
   const selectedRcaDecision = useMemo(() => {
     const analysis = canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow);
