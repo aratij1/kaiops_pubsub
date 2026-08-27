@@ -2025,11 +2025,13 @@ async def approve_knowledge_pack(request: KnowledgePackApproveRequest) -> dict[s
 @app.put("/rag/documents")
 async def update_rag_document(request: RagDocumentUpdateRequest) -> dict[str, Any]:
     connector = vector_connector()
-    root = connector.root_path().resolve()
-    target = Path(request.path).expanduser().resolve()
+    root, target = await asyncio.gather(
+        asyncio.to_thread(lambda: connector.root_path().resolve()),
+        asyncio.to_thread(lambda: Path(request.path).expanduser().resolve()),
+    )
     if root not in target.parents or target.suffix.lower() != ".md":
         raise HTTPException(status_code=400, detail="Document path is outside the RAG directory")
-    existing = connector._load_full_document(str(target))
+    existing = await asyncio.to_thread(connector._load_full_document, str(target))
     if not existing:
         raise HTTPException(status_code=404, detail="RAG document not found")
     if str(existing.get("tenant_scope") or "") != request.tenant_scope:
