@@ -3,11 +3,14 @@ import { expect, test } from "@playwright/test";
 async function signIn(page, path = "/") {
   await page.goto(path);
   const username = page.getByLabel("Username");
-  await expect(username).toBeVisible({ timeout: 30_000 });
-  await username.fill(process.env.KAIOPS_E2E_USERNAME || "admin");
-  await page.getByLabel("Password").fill(process.env.KAIOPS_E2E_PASSWORD || "Admin@123456");
-  await page.getByRole("button", { name: /sign in/i }).click();
-  await expect(page.locator(".app-layout")).toBeVisible({ timeout: 45_000 });
+  const application = page.locator(".app-layout");
+  await expect(username.or(application)).toBeVisible({ timeout: 30_000 });
+  if (await username.isVisible()) {
+    await username.fill(process.env.KAIOPS_E2E_USERNAME || "admin");
+    await page.getByLabel("Password").fill(process.env.KAIOPS_E2E_PASSWORD || "Admin@123456");
+    await page.getByRole("button", { name: /sign in/i }).click();
+  }
+  await expect(application).toBeVisible({ timeout: 45_000 });
 }
 
 async function observeStability(page, navigationLabel, path, rootSelector, screenshot, durationMs = Number(process.env.KAIMS_STABILITY_WINDOW_MS || 65_000)) {
