@@ -3581,6 +3581,7 @@ async def get_unified_incident_inbox(
     request: Request,
     limit: int = 25,
     cursor: str | None = None,
+    project_id: str | None = None,
     risk_tier: str | None = None,
     execution_mode: str | None = None,
     transport_provider: str | None = None,
@@ -3600,6 +3601,7 @@ async def get_unified_incident_inbox(
     }
     for key, value in {
         "cursor": cursor,
+        "project_id": project_id,
         "risk_tier": risk_tier,
         "execution_mode": execution_mode,
         "transport_provider": transport_provider,

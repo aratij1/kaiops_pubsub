@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from sqlalchemy import and_, delete, func, or_, select, text
+from sqlalchemy import and_, case, delete, exists, func, literal, or_, select, text, union_all
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -4532,6 +4532,197 @@ class IncidentRepository:
             separators=(",", ":"),
         ).encode("utf-8")
         return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    async def list_unified_inbox(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 25,
+        cursor: str | None = None,
+        project_id: str | None = None,
+        risk_tier: str | None = None,
+        execution_mode: str | None = None,
+        transport_provider: str | None = None,
+        status: str | None = None,
+        service: str | None = None,
+        inbox_view: str = "all",
+        record_type: str = "all",
+        severity: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a snapshot-consistent, database-filtered incident and alert feed."""
+        tenant_id = self._require("tenant_id", tenant_id)
+        safe_limit = max(1, min(int(limit), 100))
+        normalized = {
+            "tenant_id": tenant_id,
+            "project_id": str(project_id or "").strip().lower(),
+            "risk_tier": str(risk_tier or "").strip().lower(),
+            "execution_mode": str(execution_mode or "").strip().lower(),
+            "transport_provider": str(transport_provider or "").strip().lower(),
+            "status": str(status or "").strip().lower(),
+            "service": str(service or "").strip().lower(),
+            "inbox_view": str(inbox_view or "all").strip().lower(),
+            "record_type": str(record_type or "all").strip().lower(),
+            "severity": str(severity or "").strip().lower(),
+        }
+        views = ("all", "needs_me", "kai_handling", "critical", "watching", "resolved")
+        if normalized["inbox_view"] not in views:
+            raise ValueError("Unsupported inbox view")
+        if normalized["record_type"] not in {"all", "incidents", "alerts"}:
+            raise ValueError("Unsupported inbox record type")
+        fingerprint = hashlib.sha256(
+            json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        snapshot = datetime.now(UTC)
+        cursor_score: int | None = None
+        cursor_at: datetime | None = None
+        cursor_id: UUID | None = None
+        if cursor:
+            try:
+                padding = "=" * (-len(cursor) % 4)
+                decoded = json.loads(base64.urlsafe_b64decode(cursor + padding).decode("utf-8"))
+                if decoded.get("filter") != fingerprint:
+                    raise ValueError("filter mismatch")
+                snapshot = datetime.fromisoformat(str(decoded["snapshot"]).replace("Z", "+00:00"))
+                cursor_score = int(decoded["score"])
+                cursor_at = datetime.fromisoformat(str(decoded["at"]).replace("Z", "+00:00"))
+                cursor_id = UUID(str(decoded["id"]))
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+                raise ValueError("Invalid unified inbox cursor") from exc
+
+        terminal = ("closed", "resolved", "recovered", "cancelled", "canceled")
+        attention = ("failed", "blocked", "manual_intervention", "validation_failed", "rollback_failed", "awaiting_approval", "pending_approval", "approval_required")
+        latest_generation = (
+            select(
+                IncidentCorrelationOwnershipRecord.correlation_family_id.label("family_id"),
+                func.max(IncidentCorrelationOwnershipRecord.correlation_generation).label("generation"),
+            )
+            .where(IncidentCorrelationOwnershipRecord.tenant_id == tenant_id)
+            .group_by(IncidentCorrelationOwnershipRecord.correlation_family_id)
+            .subquery()
+        )
+        incident_score = case(
+            (IncidentCorrelationOwnershipRecord.lifecycle_state.in_(attention), 200), else_=100,
+        ) + case((func.lower(func.coalesce(IncidentProjectionRecord.severity, "")) == "critical", 80), else_=0)
+        incident_query = (
+            select(
+                literal("incident").label("record_type"),
+                IncidentCorrelationOwnershipRecord.canonical_incident_id.label("record_id"),
+                IncidentCorrelationOwnershipRecord.last_seen_at.label("observed_at"),
+                incident_score.label("score"),
+                IncidentCorrelationOwnershipRecord.lifecycle_state.label("row_status"),
+                func.lower(func.coalesce(IncidentProjectionRecord.severity, "")).label("row_severity"),
+            )
+            .join(latest_generation, and_(
+                latest_generation.c.family_id == IncidentCorrelationOwnershipRecord.correlation_family_id,
+                latest_generation.c.generation == IncidentCorrelationOwnershipRecord.correlation_generation,
+            ))
+            .outerjoin(IncidentProjectionRecord, and_(
+                IncidentProjectionRecord.incident_id == IncidentCorrelationOwnershipRecord.canonical_incident_id,
+                IncidentProjectionRecord.tenant_id == tenant_id,
+            ))
+            .where(
+                IncidentCorrelationOwnershipRecord.tenant_id == tenant_id,
+                IncidentCorrelationOwnershipRecord.last_seen_at <= snapshot,
+            )
+        )
+        if normalized["project_id"]:
+            incident_query = incident_query.where(func.lower(IncidentCorrelationOwnershipRecord.project_id) == normalized["project_id"])
+        if normalized["service"]:
+            incident_query = incident_query.where(func.lower(IncidentCorrelationOwnershipRecord.service) == normalized["service"])
+        if normalized["status"]:
+            incident_query = incident_query.where(func.lower(IncidentCorrelationOwnershipRecord.lifecycle_state) == normalized["status"])
+        if normalized["severity"]:
+            incident_query = incident_query.where(func.lower(IncidentProjectionRecord.severity) == normalized["severity"])
+        for field, column in (("risk_tier", IncidentProjectionRecord.risk_tier), ("execution_mode", IncidentProjectionRecord.execution_mode), ("transport_provider", IncidentProjectionRecord.transport_provider)):
+            if normalized[field]:
+                incident_query = incident_query.where(func.lower(column) == normalized[field])
+
+        alert_project = func.lower(func.coalesce(AlertRecord.payload["project_id"].as_string(), AlertRecord.payload["project"].as_string(), ""))
+        alert_score = case((func.lower(AlertRecord.severity) == "critical", 175), else_=75)
+        alert_query = select(
+            literal("alert").label("record_type"), AlertRecord.id.label("record_id"),
+            AlertRecord.created_at.label("observed_at"), alert_score.label("score"),
+            literal("open").label("row_status"), func.lower(AlertRecord.severity).label("row_severity"),
+        ).where(
+            AlertRecord.tenant_id == tenant_id,
+            AlertRecord.created_at <= snapshot,
+            ~exists(select(IncidentOccurrenceRecord.id).where(and_(
+                IncidentOccurrenceRecord.tenant_id == tenant_id,
+                IncidentOccurrenceRecord.occurrence_id == AlertRecord.id,
+            ))),
+        )
+        if normalized["project_id"]:
+            alert_query = alert_query.where(alert_project == normalized["project_id"])
+        if normalized["service"]:
+            alert_query = alert_query.where(func.lower(AlertRecord.service) == normalized["service"])
+        if normalized["severity"]:
+            alert_query = alert_query.where(func.lower(AlertRecord.severity) == normalized["severity"])
+        if normalized["status"] and normalized["status"] != "open":
+            alert_query = alert_query.where(literal(False))
+        if any(normalized[key] for key in ("risk_tier", "execution_mode", "transport_provider")):
+            alert_query = alert_query.where(literal(False))
+
+        selected = []
+        if normalized["record_type"] in {"all", "incidents"}:
+            selected.append(incident_query)
+        if normalized["record_type"] in {"all", "alerts"}:
+            selected.append(alert_query)
+        candidates = (selected[0] if len(selected) == 1 else union_all(*selected)).subquery()
+
+        def view_clause(view: str):
+            is_incident = candidates.c.record_type == "incident"
+            is_terminal = candidates.c.row_status.in_(terminal)
+            is_attention = candidates.c.row_status.in_(attention)
+            if view == "needs_me":
+                return or_(and_(is_incident, is_attention), and_(~is_incident, candidates.c.row_severity.in_(("critical", "high", "p1", "p2", "sev1", "sev2"))))
+            if view == "kai_handling":
+                return and_(~is_terminal, or_(~is_incident, ~is_attention))
+            if view == "critical":
+                return and_(~is_terminal, candidates.c.row_severity.in_(("critical", "p1", "sev1")))
+            if view == "watching":
+                return and_(~is_terminal, candidates.c.row_severity.in_(("medium", "warning", "low", "info")))
+            if view == "resolved":
+                return and_(is_incident, is_terminal)
+            return literal(True)
+
+        total_count = int((await self.session.scalar(select(func.count()).select_from(candidates))) or 0)
+        view_counts = {
+            view: int((await self.session.scalar(select(func.count()).select_from(candidates).where(view_clause(view)))) or 0)
+            for view in views
+        }
+        page_query = select(candidates).where(view_clause(normalized["inbox_view"]))
+        if cursor_score is not None and cursor_at is not None and cursor_id is not None:
+            page_query = page_query.where(or_(
+                candidates.c.score < cursor_score,
+                and_(candidates.c.score == cursor_score, candidates.c.observed_at < cursor_at),
+                and_(candidates.c.score == cursor_score, candidates.c.observed_at == cursor_at, candidates.c.record_id < cursor_id),
+            ))
+        page_rows = (await self.session.execute(page_query.order_by(
+            candidates.c.score.desc(), candidates.c.observed_at.desc(), candidates.c.record_id.desc(),
+        ).limit(safe_limit + 1))).mappings().all()
+        has_more = len(page_rows) > safe_limit
+        page_rows = page_rows[:safe_limit]
+        incident_ids = [row["record_id"] for row in page_rows if row["record_type"] == "incident"]
+        alert_ids = [row["record_id"] for row in page_rows if row["record_type"] == "alert"]
+        projections = await self.list_incident_projections(limit=safe_limit, tenant_id=tenant_id, include_enrichment=False, incident_ids=incident_ids)
+        projection_by_id = {str(row.get("incident_id") or row.get("id")): row for row in projections}
+        alert_rows = (await self.session.execute(select(AlertRecord).where(AlertRecord.id.in_(alert_ids)))).scalars().all() if alert_ids else []
+        alert_by_id = {str(row.id): {**dict(row.payload or {}), "id": str(row.id), "alert_id": str(row.id), "service": row.service, "environment": row.environment, "severity": row.severity, "source": row.source, "created_at": row.created_at.isoformat()} for row in alert_rows}
+        rows = []
+        for item in page_rows:
+            record_id = str(item["record_id"])
+            row = dict(projection_by_id.get(record_id, {})) if item["record_type"] == "incident" else dict(alert_by_id.get(record_id, {}))
+            row.setdefault("id", record_id)
+            if item["record_type"] == "incident":
+                row.update({"incident_id": record_id, "status": item["row_status"]})
+            rows.append({"record_type": item["record_type"], "score": int(item["score"]), "observed_at": item["observed_at"].isoformat(), "row": row})
+
+        next_cursor = None
+        if has_more and page_rows:
+            last = page_rows[-1]
+            payload = json.dumps({"filter": fingerprint, "snapshot": snapshot.isoformat(), "score": int(last["score"]), "at": last["observed_at"].isoformat(), "id": str(last["record_id"])}, separators=(",", ":")).encode()
+            next_cursor = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+        return {"rows": rows, "next_cursor": next_cursor, "previous_cursor": None, "total_count": total_count, "filtered_count": total_count, "view_counts": view_counts, "snapshot_at": snapshot.isoformat()}
 
     async def list_incident_groups(
         self,
