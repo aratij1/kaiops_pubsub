@@ -55,8 +55,8 @@ if (!uiDockerfile.includes("frontend/react")) failures.push("the production UI i
 if (uiDockerfile.includes("services/ui/react")) failures.push("the production UI image still owns the legacy services/ui/react frontend");
 
 const legacyAppLines = lineCount("frontend/react/src/App.jsx");
-if (legacyAppLines > 13_600) failures.push(`src/App.jsx grew beyond the migration budget (${legacyAppLines} > 13600 lines)`);
-else notes.push(`legacy App.jsx migration budget: ${legacyAppLines}/13600 lines`);
+if (legacyAppLines > 13_585) failures.push(`src/App.jsx grew beyond the migration budget (${legacyAppLines} > 13585 lines)`);
+else notes.push(`legacy App.jsx migration budget: ${legacyAppLines}/13585 lines`);
 
 const featureFiles = walk(join(frontendRoot, "src", "features"));
 for (const file of featureFiles) {
