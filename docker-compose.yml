@@ -119,6 +119,7 @@ x-service-env: &service-env
   PROMETHEUS_URL: http://prometheus:9090
   GRAFANA_URL: http://grafana:3000
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
   OPENAI_GPT5_MODEL: ${OPENAI_GPT5_MODEL:-gpt-5}
   OPENAI_GPT4O_MODEL: ${OPENAI_GPT4O_MODEL:-gpt-4o}
   REASONING_STANDARD_MODEL: ${REASONING_STANDARD_MODEL:-gpt-5.6-terra}

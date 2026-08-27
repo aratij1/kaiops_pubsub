@@ -821,6 +821,20 @@ class ModelRouter:
 
 
 def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
+    # Some existing installations stored an Azure OpenAI endpoint/key in the
+    # legacy OPENAI_* variables. Detect the endpoint rather than sending an
+    # Azure key to api.openai.com with Bearer authentication. This keeps the
+    # migration backward compatible and selects the adapter with the correct
+    # deployment URL and api-key header.
+    legacy_openai_is_azure = ".openai.azure.com" in settings.openai_base_url.strip().lower()
+    azure_endpoint = settings.azure_openai_endpoint or (
+        settings.openai_base_url if legacy_openai_is_azure else ""
+    )
+    azure_api_key = settings.azure_openai_api_key or (
+        settings.openai_api_key if legacy_openai_is_azure else None
+    )
+    azure_deployment = settings.azure_openai_chat_deployment or settings.openai_gpt4o_model
+
     local_llama_provider: ModelProvider
     if settings.local_llm_enabled:
         local_llama_provider = OllamaModelProvider(
@@ -835,15 +849,15 @@ def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
             reason="set LOCAL_LLM_ENABLED=true and LOCAL_LLM_ENDPOINT to use Ollama",
         )
 
-    if settings.model_router_reasoning_backend.strip().lower() == "azure-openai":
+    if settings.model_router_reasoning_backend.strip().lower() == "azure-openai" or legacy_openai_is_azure:
         standard_reasoning: ModelProvider = AzureOpenAIModelProvider(
-            name="reasoning-standard", model=settings.reasoning_standard_model,
-            api_key=settings.azure_openai_api_key, base_url=settings.azure_openai_endpoint,
+            name="reasoning-standard", model=azure_deployment,
+            api_key=azure_api_key, base_url=azure_endpoint,
             api_version=settings.azure_openai_api_version, timeout_seconds=settings.llm_request_timeout_seconds,
         )
         critical_reasoning: ModelProvider = AzureOpenAIModelProvider(
-            name="reasoning-critical", model=settings.reasoning_critical_model,
-            api_key=settings.azure_openai_api_key, base_url=settings.azure_openai_endpoint,
+            name="reasoning-critical", model=azure_deployment,
+            api_key=azure_api_key, base_url=azure_endpoint,
             api_version=settings.azure_openai_api_version, timeout_seconds=settings.llm_request_timeout_seconds,
         )
     else:
@@ -867,29 +881,33 @@ def build_default_providers(settings: Settings) -> dict[str, ModelProvider]:
         "reasoning-critical": critical_reasoning,
         "azure-openai": AzureOpenAIModelProvider(
             name="azure-openai",
-            model=settings.azure_openai_chat_deployment,
-            api_key=settings.azure_openai_api_key,
-            base_url=settings.azure_openai_endpoint,
+            model=azure_deployment,
+            api_key=azure_api_key,
+            base_url=azure_endpoint,
             api_version=settings.azure_openai_api_version,
             timeout_seconds=settings.llm_request_timeout_seconds,
         ),
-        "gpt-5": OpenAIModelProvider(
+        "gpt-5": (AzureOpenAIModelProvider if legacy_openai_is_azure else OpenAIModelProvider)(
             name="gpt-5",
-            model=settings.openai_gpt5_model,
+            model=azure_deployment if legacy_openai_is_azure else settings.openai_gpt5_model,
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url,
+            **({"api_version": settings.azure_openai_api_version} if legacy_openai_is_azure else {
+                "input_cost_per_million": settings.openai_gpt5_input_cost_per_million,
+                "output_cost_per_million": settings.openai_gpt5_output_cost_per_million,
+            }),
             timeout_seconds=settings.llm_request_timeout_seconds,
-            input_cost_per_million=settings.openai_gpt5_input_cost_per_million,
-            output_cost_per_million=settings.openai_gpt5_output_cost_per_million,
         ),
-        "gpt-4o": OpenAIModelProvider(
+        "gpt-4o": (AzureOpenAIModelProvider if legacy_openai_is_azure else OpenAIModelProvider)(
             name="gpt-4o",
-            model=settings.openai_gpt4o_model,
+            model=azure_deployment if legacy_openai_is_azure else settings.openai_gpt4o_model,
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url,
+            **({"api_version": settings.azure_openai_api_version} if legacy_openai_is_azure else {
+                "input_cost_per_million": settings.openai_gpt4o_input_cost_per_million,
+                "output_cost_per_million": settings.openai_gpt4o_output_cost_per_million,
+            }),
             timeout_seconds=settings.llm_request_timeout_seconds,
-            input_cost_per_million=settings.openai_gpt4o_input_cost_per_million,
-            output_cost_per_million=settings.openai_gpt4o_output_cost_per_million,
         ),
         "claude": UnconfiguredModelProvider(
             name="claude",

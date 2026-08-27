@@ -7,6 +7,7 @@ from model_router.router import (
     _sanitize_model_payload,
     ModelProvider,
     ModelResponse,
+    AzureOpenAIModelProvider,
     build_default_providers,
     build_usage,
     provider_error_message,
@@ -55,6 +56,23 @@ def test_default_gpt_provider_model_names() -> None:
     assert providers["gpt-4o"].model == "gpt-4o"
     assert providers["gemini"].model == "gemini-2.5-flash"
     assert providers["groq"].model == "llama-3.3-70b-versatile"
+
+
+def test_legacy_openai_variables_select_azure_adapter_for_azure_endpoint() -> None:
+    from common.config import Settings
+
+    providers = build_default_providers(Settings(
+        OPENAI_BASE_URL="https://example.openai.azure.com",
+        OPENAI_API_KEY="azure-style-key",
+        OPENAI_GPT4O_MODEL="production-gpt4o",
+        AZURE_OPENAI_CHAT_DEPLOYMENT="production-gpt4o",
+    ))
+
+    for name in ("reasoning-standard", "reasoning-critical", "azure-openai", "gpt-5", "gpt-4o"):
+        assert isinstance(providers[name], AzureOpenAIModelProvider)
+        assert providers[name].base_url == "https://example.openai.azure.com"
+        assert providers[name].api_key == "azure-style-key"
+        assert providers[name].model == "production-gpt4o"
 
 
 def test_evaluation_policy_requires_eligible_confirmed_sample(tmp_path) -> None:
