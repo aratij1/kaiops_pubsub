@@ -35,6 +35,19 @@ const RCA_VIEWS: Array<{ id: RcaDetailView; label: string; description: string }
   { id: "technical", label: "Technical trace", description: "Queries, retrieval, and handoffs" },
 ];
 
+export function resolutionBindingFor(workflow: any, selectedAlertId: string | null | undefined) {
+  const contract = workflow?.incident_investigation || {};
+  return {
+    incident_id: contract.incident_id || workflow?.incident?.id || "",
+    alert_id: contract.alert_id || selectedAlertId || "",
+    analysis_request_id: contract.analysis_request_id || "",
+    recommendation_id: contract.recommendation_id || "",
+    rca_version: contract.rca_version || 0,
+    context_snapshot_id: contract.context_snapshot_id || "",
+    context_fingerprint: contract.context_fingerprint || "",
+  };
+}
+
 interface RcaPanelProps {
   rcaDetailView: RcaDetailView;
   onSetRcaDetailView: (view: RcaDetailView) => void;
@@ -74,6 +87,13 @@ export default function RcaPanel({
   const [resolutionStatus, setResolutionStatus] = useState("");
   const [feedbackDraft, setFeedbackDraft] = useState({ decision: "", reason_category: "", corrected_cause: "", missing_evidence: "", comment: "" });
   const recommendationMetadata = selectedAlertWorkflow?.recommendation?.metadata || {};
+  const investigationContract = selectedAlertWorkflow?.incident_investigation || {};
+  const resolutionBinding = useMemo(() => resolutionBindingFor(selectedAlertWorkflow, selectedAlertId), [
+    investigationContract.incident_id, investigationContract.alert_id,
+    investigationContract.analysis_request_id, investigationContract.recommendation_id,
+    investigationContract.rca_version, investigationContract.context_snapshot_id,
+    investigationContract.context_fingerprint, selectedAlertWorkflow?.incident?.id, selectedAlertId,
+  ]);
   const contextMetadata = selectedAlertWorkflow?.context?.metadata || {};
   const contextQuality = contextMetadata?.context_quality || {};
   const contextSourceManifest = selectedAiTrust?.sources || contextMetadata?.context_sources || {};
@@ -161,7 +181,7 @@ export default function RcaPanel({
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
       body: JSON.stringify({
-        tenant_id: selectedAlertWorkflow?.context?.tenant_id || selectedAlertRow?.tenant_id,
+        ...resolutionBinding,
         issue: selectedRcaDecision?.rootCause,
         service: resolutionService,
         recommended_action: selectedRcaDecision?.action,
@@ -174,7 +194,7 @@ export default function RcaPanel({
       if (active) setResolutionStatus("Resolution options are temporarily unavailable.");
     });
     return () => { active = false; };
-  }, [accessToken, selectedAlertId, selectedRcaDecision?.rootCause, selectedRcaDecision?.action, resolutionService, selectedAiTrust?.executionReady]);
+  }, [accessToken, selectedAlertId, selectedRcaDecision?.rootCause, selectedRcaDecision?.action, resolutionBinding, resolutionService, selectedAiTrust?.executionReady]);
 
   async function chooseResolution(option: any) {
     if (selectedAiTrust?.executionReady !== true) {
@@ -186,7 +206,7 @@ export default function RcaPanel({
       const response: any = await fetchJson("/api-gateway/analysis/resolution-catalog/select", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
-        body: JSON.stringify({ tenant_id: selectedAlertWorkflow?.context?.tenant_id || selectedAlertRow?.tenant_id, option_id: option.id, issue: selectedRcaDecision?.rootCause, service: resolutionService, incident_id: selectedAlertId || "" }),
+        body: JSON.stringify({ ...resolutionBinding, option_id: option.id, issue: selectedRcaDecision?.rootCause, service: resolutionService }),
         timeoutMs: 10000,
       });
       const result = response?.data || response || {};
@@ -204,6 +224,7 @@ export default function RcaPanel({
 
   return (
     <section className="combined-analysis-page context-workspace">
+      {selectedAiTrust?.contractValid !== true ? <p className="ai-trust-warning" role="alert"><ShieldAlert size={16} />Investigation contract invalid. Resolution and approval actions are disabled until fresh analysis publishes a valid bound contract.</p> : null}
       <header className="context-workspace-hero">
         <div className="context-workspace-title">
           <span className="discovery-eyebrow">Incident understanding</span>
@@ -279,7 +300,7 @@ export default function RcaPanel({
           {contextQuality?.contract_version ? <section className={`context-quality-card ${contextQuality.reusable ? "is-reusable" : "needs-refresh"}`} aria-labelledby="context-package-title"><header><div><span className="discovery-eyebrow">Context package</span><strong id="context-package-title">{contextQuality.reusable ? "Validated and reusable" : "Refresh required"}</strong><small>{contextMetadata.context_reused ? "Reused after scope and freshness validation" : "Collected for this incident"} · {contextQuality.contract_version}</small></div><b>{formatQualityPercent(Number(contextQuality.quality_score || 0))}</b></header><dl><div><dt>Coverage</dt><dd>{formatQualityPercent(Number(contextQuality.coverage_score || 0))}</dd></div><div><dt>Freshness</dt><dd>{formatQualityPercent(Number(contextQuality.freshness_score || 0))}</dd></div><div><dt>Provenance</dt><dd>{formatQualityPercent(Number(contextQuality.provenance_score || 0))}</dd></div><div><dt>Evidence</dt><dd>{Number(contextQuality.evidence_count || 0)} records</dd></div></dl><div className="context-source-statuses">{contextSourceRows.length ? contextSourceRows.map((source) => <span key={source.source} className={`is-${source.status.replaceAll("_", "-")}`}><i aria-hidden="true" /><strong>{source.source}</strong><small>{source.status.replaceAll("_", " ")} · {source.count} records{source.inferredTimestamps ? ` · ${source.inferredTimestamps} inferred timestamps` : ""}</small></span>) : <span className="is-missing"><i aria-hidden="true" /><strong>No source manifest</strong><small>Refresh required</small></span>}</div>{contextQuality.missing_required?.length || contextQuality.stale_sources?.length || inferredContextTimestamps ? <p role="status"><ShieldAlert size={16} />{contextQuality.missing_required?.length ? `Missing: ${contextQuality.missing_required.join(", ")}. ` : ""}{contextQuality.stale_sources?.length ? `Stale: ${contextQuality.stale_sources.join(", ")}. ` : ""}{inferredContextTimestamps ? `${inferredContextTimestamps} record(s) have inferred timestamps.` : ""}</p> : null}</section> : <section className="context-quality-card needs-refresh" aria-label="Context package unavailable"><header><div><span className="discovery-eyebrow">Context package</span><strong>Quality contract unavailable</strong><small>The backend did not return coverage, freshness, and provenance scores.</small></div></header></section>}
           <div className="evidence-health-strip" aria-label="Evidence health"><span><i><Database size={17} /></i><strong>{evidenceRows.length}</strong><small>linked records</small></span><span><i><Activity size={17} /></i><strong>{freshEvidenceCount}</strong><small>live observations</small></span><span><i><Clock3 size={17} /></i><strong>{cachedEvidenceCount}</strong><small>cached records</small></span><span className={conflictingEvidence.length ? "has-risk" : "is-clear"}><i><ShieldAlert size={17} /></i><strong>{conflictingEvidence.length}</strong><small>conflicts</small></span><span className={missingEvidence.length ? "has-risk" : "is-clear"}><i><Search size={17} /></i><strong>{missingEvidence.length}</strong><small>evidence gaps</small></span></div>
           <section className="evidence-inference-brief"><div><span className="explainability-label is-inference">AI inference</span><strong>{selectedAiTrust?.analysis?.root_cause || canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow).rootCause}</strong><p>This conclusion is derived from the ledger below; it is not itself a direct observation.</p></div><button type="button" className="button-secondary" onClick={() => onSetRcaDetailView("detailed")}>Review reasoning</button></section>
-          {evidenceRows.some((row: any) => row.cached && row.freshness === "Stale") ? <p className="ai-trust-warning" role="status">Cached context may predate the current deployment. Refresh before approving a change.</p> : null}
+          {evidenceRows.some((row: any) => row.cached && row.freshness === "stale") ? <p className="ai-trust-warning" role="status">Cached context may predate the current deployment. Refresh before approving a change.</p> : null}
           <details className="evidence-ledger evidence-ledger-modern" open><summary><div><strong>Evidence ledger</strong><span>{evidenceRows.length} context records; {supportingEvidenceRows.length} accepted as RCA support</span></div><span>Show records</span></summary><div className="table-wrap ai-evidence-table contained-table"><table><thead><tr><th>Source</th><th>Observed</th><th>Freshness</th><th>Citation</th><th>Evidence role</th></tr></thead><tbody>{evidenceRows.length ? evidenceRows.map((row: any) => <tr key={row.id}><td><span className="source-badge">{row.source}</span></td><td>{row.timestamp ? formatUtcTimestamp(row.timestamp) : "Timestamp unavailable"}<small className="table-secondary">{row.age}</small></td><td><span className={`evidence-freshness ${row.cached ? "is-cached" : "is-fresh"}`}>{row.cached ? "Cached" : "Live"}</span><small className="table-secondary">{row.freshness}</small></td><td className="evidence-citation"><code title={row.citation || "Not supplied"}>{row.citation || "Not supplied"}</code></td><td>{row.accepted ? "Supports RCA" : row.cached ? "Historical context only" : "Collected context only"}</td></tr>) : <tr><td colSpan={5}>No linked evidence records. Treat this recommendation as ungrounded and require human review.</td></tr>}</tbody></table></div></details>
           <details className="evidence-model-details"><summary>Model diagnostics and confidence reasons</summary><div className="ai-trust-summary-grid ai-trust-summary-compact"><div><strong>Confidence reasons</strong>{confidenceReasons.length ? <ul>{confidenceReasons.map((reason: string) => <li key={reason}>{reason}</li>)}</ul> : <p>No confidence reasons supplied.</p>}</div><div><strong>Model / provider</strong><p>{selectedAiTrust?.providerRow ? `${selectedAiTrust.providerRow.model} / ${selectedAiTrust.providerRow.provider}` : "Not supplied by the workflow contract"}</p></div><div><strong>Fallback model</strong><p>{selectedAiTrust?.fallbackUsed ? "Used — review required" : "No fallback usage reported"}</p></div><div><strong>Analysis attempt</strong><p>{selectedAlertRegeneration?.message || "Current persisted analysis"}</p></div></div></details>
           <section className="structured-ai-feedback" aria-labelledby="ai-feedback-title">
