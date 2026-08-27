@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from common.database import IncidentCorrelationOwnershipRecord, IncidentProjectionRecord
+from common.database import AlertRecord, IncidentCorrelationOwnershipRecord, IncidentProjectionRecord
 from common.models import Incident, IncidentStatus
 from common.repository import IncidentRepository
 from sqlalchemy import select, text
@@ -479,3 +479,81 @@ async def test_incident_group_cursor_scales_to_ten_thousand_and_uses_page_index(
     )
     assert oldest_on_page not in {row["canonical_incident_id"] for row in first["rows"]}
     assert "idx_incident_correlation_page" in indexes
+
+
+@pytest.mark.asyncio
+async def test_unified_inbox_filters_and_paginates_in_database_with_snapshot_consistency(sqlite_session_factory) -> None:
+    now = datetime.now(UTC)
+    incident_ids = [uuid4() for _ in range(3)]
+    family_ids = [uuid4() for _ in range(3)]
+    async with sqlite_session_factory() as session:
+        for index, incident_id in enumerate(incident_ids):
+            session.add(IncidentCorrelationOwnershipRecord(
+                tenant_id="tenant-inbox", project_id="commerce", environment="prod",
+                service="checkout", correlation_key=f"inbox-{index}",
+                correlation_family_id=family_ids[index], correlation_generation=1,
+                canonical_incident_id=incident_id, first_seen_at=now - timedelta(minutes=index),
+                last_seen_at=now - timedelta(minutes=index),
+                correlation_window_expires_at=now + timedelta(hours=1),
+                lifecycle_state="awaiting_approval" if index == 0 else "investigating",
+            ))
+            session.add(IncidentProjectionRecord(
+                incident_id=incident_id, tenant_id="tenant-inbox", service="checkout",
+                environment="prod", severity="critical" if index == 0 else "warning",
+                status="awaiting_approval" if index == 0 else "investigating",
+                first_seen_at=now - timedelta(minutes=index), projection_payload={},
+            ))
+        session.add(AlertRecord(
+            id=uuid4(), tenant_id="tenant-inbox", source="prometheus", name="Orphan alert",
+            service="checkout", environment="prod", severity="critical", fingerprint="orphan",
+            payload={"project_id": "commerce", "name": "Orphan alert"},
+        ))
+        session.add(AlertRecord(
+            id=uuid4(), tenant_id="other-tenant", source="prometheus", name="Hidden alert",
+            service="checkout", environment="prod", severity="critical", fingerprint="hidden",
+            payload={"project_id": "commerce"},
+        ))
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        repository = IncidentRepository(session)
+        first = await repository.list_unified_inbox(
+            tenant_id="tenant-inbox", project_id="commerce", service="checkout", limit=2,
+        )
+        assert first["total_count"] == first["filtered_count"] == 4
+        assert first["view_counts"]["needs_me"] == 2
+        assert len(first["rows"]) == 2
+        assert first["next_cursor"]
+        snapshot = first["snapshot_at"]
+        session.add(AlertRecord(
+            id=uuid4(), tenant_id="tenant-inbox", source="prometheus", name="Late alert",
+            service="checkout", environment="prod", severity="critical", fingerprint="late",
+            payload={"project_id": "commerce"}, created_at=datetime.now(UTC) + timedelta(seconds=1),
+        ))
+        await session.commit()
+        second = await repository.list_unified_inbox(
+            tenant_id="tenant-inbox", project_id="commerce", service="checkout", limit=2,
+            cursor=first["next_cursor"],
+        )
+        with pytest.raises(ValueError, match="Invalid unified inbox cursor"):
+            await repository.list_unified_inbox(
+                tenant_id="tenant-inbox", project_id="commerce", service="checkout",
+                severity="warning", limit=2, cursor=first["next_cursor"],
+            )
+
+    assert second["snapshot_at"] == snapshot
+    assert second["total_count"] == 4
+    assert len(second["rows"]) == 2
+    assert {item["row"]["id"] for item in first["rows"]}.isdisjoint(
+        {item["row"]["id"] for item in second["rows"]}
+    )
+
+
+@pytest.mark.asyncio
+async def test_unified_inbox_cursor_is_bound_to_filters(sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        repository = IncidentRepository(session)
+        page = await repository.list_unified_inbox(tenant_id="tenant-empty", limit=1)
+        assert page["rows"] == []
+        with pytest.raises(ValueError, match="Invalid unified inbox cursor"):
+            await repository.list_unified_inbox(tenant_id="tenant-empty", cursor="invalid")

@@ -6475,6 +6475,7 @@ async def get_unified_incident_inbox(
     tenant_id: str,
     limit: int = 25,
     cursor: str | None = None,
+    project_id: str | None = None,
     risk_tier: str | None = None,
     execution_mode: str | None = None,
     transport_provider: str | None = None,
@@ -6487,154 +6488,17 @@ async def get_unified_incident_inbox(
     session_factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or session_factory is None:
         raise HTTPException(status_code=503, detail="Unified incident inbox is unavailable")
-    safe_limit = max(1, min(int(limit), 100))
-    normalized = {
-        "tenant_id": tenant_id,
-        "risk_tier": str(risk_tier or "").strip().lower(),
-        "execution_mode": str(execution_mode or "").strip().lower(),
-        "transport_provider": str(transport_provider or "").strip().lower(),
-        "status": str(status or "").strip().lower(),
-        "service": str(service or "").strip().lower(),
-        "inbox_view": str(inbox_view or "all").strip().lower(),
-        "record_type": str(record_type or "all").strip().lower(),
-        "severity": str(severity or "").strip().lower(),
-    }
-    if normalized["inbox_view"] not in {"all", "needs_me", "kai_handling", "critical", "watching", "resolved"}:
-        raise HTTPException(status_code=422, detail="Unsupported inbox view")
-    if normalized["record_type"] not in {"all", "incidents", "alerts"}:
-        raise HTTPException(status_code=422, detail="Unsupported inbox record type")
-    fingerprint = hashlib.sha256(json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    offset = 0
-    snapshot = datetime.now(UTC)
-    if cursor:
-        try:
-            padding = "=" * (-len(cursor) % 4)
-            decoded = json.loads(base64.urlsafe_b64decode(cursor + padding).decode())
-            if decoded.get("filter") != fingerprint:
-                raise ValueError("filter mismatch")
-            offset = max(0, int(decoded["offset"]))
-            snapshot = datetime.fromisoformat(str(decoded["snapshot"]).replace("Z", "+00:00"))
-        except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-            raise HTTPException(status_code=422, detail="Invalid unified inbox cursor") from exc
-
     async with session_factory() as session:
         repo = IncidentRepository(session)
-        incident_page = await repo.list_incident_groups(
-            tenant_id=tenant_id,
-            limit=10000,
-        )
-        alerts = await repo.list_alerts(limit=10000, include_incident_context=True, tenant_id=tenant_id)
-
-    terminal_tokens = ("closed", "resolved", "recovered", "cancelled", "canceled")
-    attention_tokens = ("approval", "failed", "blocked", "manual_intervention", "validation_failed", "rollback_failed")
-
-    def after_snapshot(value: str) -> bool:
-        if not value:
-            return False
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return False
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        return parsed > snapshot
-
-    def view_matches(kind: str, row: dict[str, Any], view: str | None = None) -> bool:
-        row_status = str(row.get("status") or "").lower()
-        row_severity = str(row.get("severity") or row.get("priority") or "").lower()
-        terminal = any(token in row_status for token in terminal_tokens)
-        needs_human = any(token in row_status for token in attention_tokens)
-        selected_view = view or normalized["inbox_view"]
-        if kind == "alert" and selected_view == "resolved":
-            return False
-        if selected_view == "needs_me":
-            return (
-                needs_human
-                if kind == "incident"
-                else row_severity in {"critical", "high", "p1", "p2", "sev1", "sev2"}
+            return await repo.list_unified_inbox(
+                tenant_id=tenant_id, limit=limit, cursor=cursor, project_id=project_id,
+                risk_tier=risk_tier, execution_mode=execution_mode,
+                transport_provider=transport_provider, status=status, service=service,
+                inbox_view=inbox_view, record_type=record_type, severity=severity,
             )
-        if selected_view == "kai_handling":
-            return not terminal and not needs_human
-        if selected_view == "critical":
-            return not terminal and row_severity in {"critical", "p1", "sev1"}
-        if selected_view == "watching":
-            return not terminal and row_severity in {"medium", "warning", "low", "info"}
-        if selected_view == "resolved":
-            return terminal
-        return True
-
-    candidates: list[dict[str, Any]] = []
-    if normalized["record_type"] in {"all", "incidents"}:
-        for row in incident_page.get("rows", []):
-            observed = str(row.get("updated_at") or row.get("last_seen_at") or row.get("created_at") or "")
-            if after_snapshot(observed):
-                continue
-            score = 200 if any(token in str(row.get("status") or "").lower() for token in attention_tokens) else 100
-            score += 80 if str(row.get("severity") or "").lower() == "critical" else 0
-            candidates.append({"record_type": "incident", "score": score, "observed_at": observed, "row": row})
-    if normalized["record_type"] in {"all", "alerts"}:
-        for row in alerts:
-            alert_id = str(row.get("alert_id") or row.get("id") or "")
-            incident_id = str(row.get("incident_id") or "")
-            if incident_id and incident_id != alert_id:
-                continue
-            observed = str(row.get("received_at") or row.get("created_at") or row.get("starts_at") or "")
-            if after_snapshot(observed):
-                continue
-            score = 175 if str(row.get("severity") or "").lower() == "critical" else 75
-            candidates.append({"record_type": "alert", "score": score, "observed_at": observed, "row": row})
-
-    total_count = len(candidates)
-
-    def static_filters_match(item: dict[str, Any]) -> bool:
-        row = item["row"]
-        if normalized["risk_tier"] and str(row.get("risk_tier") or "").lower() != normalized["risk_tier"]:
-            return False
-        if (
-            normalized["execution_mode"]
-            and str(row.get("execution_mode") or "").lower() != normalized["execution_mode"]
-        ):
-            return False
-        if (
-            normalized["transport_provider"]
-            and str(row.get("transport_provider") or "").lower() != normalized["transport_provider"]
-        ):
-            return False
-        if normalized["status"] and str(row.get("status") or "").lower() != normalized["status"]:
-            return False
-        if normalized["service"] and normalized["service"] not in str(row.get("service") or "").lower():
-            return False
-        return not normalized["severity"] or str(row.get("severity") or "").lower() == normalized["severity"]
-
-    records = [item for item in candidates if static_filters_match(item)]
-    filtered_count = len(records)
-    view_counts = {
-        view: sum(1 for item in records if view_matches(item["record_type"], item["row"], view))
-        for view in ("all", "needs_me", "kai_handling", "critical", "watching", "resolved")
-    }
-    records = [item for item in records if view_matches(item["record_type"], item["row"])]
-    records.sort(
-        key=lambda item: (int(item["score"]), str(item["observed_at"]), str(item["row"].get("id") or "")),
-        reverse=True,
-    )
-    page = records[offset:offset + safe_limit]
-
-    def encode(next_offset: int) -> str:
-        payload = json.dumps(
-            {"filter": fingerprint, "snapshot": snapshot.isoformat(), "offset": next_offset},
-            separators=(",", ":"),
-        ).encode()
-        return base64.urlsafe_b64encode(payload).decode().rstrip("=")
-
-    return {
-        "rows": page,
-        "next_cursor": encode(offset + safe_limit) if offset + safe_limit < len(records) else None,
-        "previous_cursor": encode(max(0, offset - safe_limit)) if offset > 0 else None,
-        "total_count": total_count,
-        "filtered_count": filtered_count,
-        "view_counts": view_counts,
-        "snapshot_at": snapshot.isoformat(),
-    }
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/incidents/{incident_id}/stage-completeness")
