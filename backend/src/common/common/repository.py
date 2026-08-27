@@ -1667,12 +1667,15 @@ class IncidentRepository:
                     remediation_action=remediation_action,
                     validation_status=str(closure_report.get("status") or "pending"),
                 )
-            except ValueError:
+            except ValueError as exc:
                 investigation_integrity = {
                     **investigation_integrity,
                     "status": "contract_invalid",
                     "verified": False,
-                    "blocking_reasons": ["bound investigation does not satisfy the canonical runtime contract"],
+                    "blocking_reasons": [
+                        "bound investigation does not satisfy the canonical runtime contract",
+                        str(exc)[:1000],
+                    ],
                 }
 
         return {
@@ -3458,6 +3461,8 @@ class IncidentRepository:
                 "collected": "completed",
                 "success": "completed",
                 "stale": "completed",
+                "fresh": "completed",
+                "no_matches": "empty",
                 "failed": "unavailable",
             }
             status = status_aliases.get(raw_status, raw_status)
@@ -3480,17 +3485,28 @@ class IncidentRepository:
             "service": item.get("service") or context.get("alert", {}).get("service") or "unknown",
             "resource_id": item.get("resource_id"),
             "observed_at": item.get("observed_at"),
-            "collected_at": item.get("collected_at") or context_snapshot.get("collected_at"),
+            "collected_at": (
+                item.get("collected_at")
+                or (item.get("provenance") or {}).get("generated_at")
+                or context_snapshot.get("collected_at")
+            ),
             "observation_window": item.get("observation_window"),
             "freshness": str(item.get("freshness") or "unknown").lower(),
             "provenance": item.get("provenance") if isinstance(item.get("provenance"), dict) else {},
-            "citation": item.get("citation"),
+            "citation": (
+                item.get("citation")
+                or item.get("source_uri")
+                or item.get("uri")
+                or (item.get("provenance") or {}).get("primary_source")
+            ),
             "epistemic_role": item.get("epistemic_role") or "current_observation",
             "current_observation": item.get("current_observation") is not False,
         } for item in evidence_rows]
         analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
         investigation = (
-            metadata.get("investigation_report")
+            metadata.get("iterative_investigation")
+            if isinstance(metadata.get("iterative_investigation"), dict)
+            else metadata.get("investigation_report")
             if isinstance(metadata.get("investigation_report"), dict)
             else {}
         )
@@ -3530,7 +3546,12 @@ class IncidentRepository:
         approval_status = str(approval_payload.get("decision") or approval_payload.get("status") or "not_ready").lower()
         if approval_status not in {"not_ready", "pending", "approved", "rejected", "stale"}:
             approval_status = "not_ready"
-        investigation_status = str(investigation.get("status") or "pending").lower()
+        raw_investigation_status = str(investigation.get("status") or "pending").lower()
+        investigation_status = {
+            "budget_exhausted": "inconclusive",
+            "completed": "conclusive" if conclusive else "inconclusive",
+            "running": "investigating",
+        }.get(raw_investigation_status, raw_investigation_status)
         payload = {
             "contract_version": "kaiops.incident-investigation.v1",
             "tenant_id": tenant_id,
