@@ -88,6 +88,35 @@ async def test_late_action_and_event_cannot_regress_closed_projection(sqlite_ses
 
 
 @pytest.mark.asyncio
+async def test_policy_blocked_skip_keeps_incident_in_investigation(sqlite_session_factory) -> None:
+    incident_id = uuid4()
+    async with sqlite_session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_incident_event(_event(
+            incident_id=str(incident_id),
+            status="investigating",
+            event_type="incident.recommendation.generated",
+        ))
+        await repo.save_action(RemediationAction(
+            tenant_id="tenant-a",
+            incident_id=incident_id,
+            action_type="policy-blocked",
+            target="checkout",
+            status=RemediationStatus.SKIPPED,
+            error="confidence below execution threshold",
+            metadata={"policy_blocked": True},
+        ))
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        projection = await session.get(IncidentProjectionRecord, incident_id)
+
+    assert projection is not None
+    assert projection.status == "investigating"
+    assert projection.projection_payload["remediation_status"] == "skipped"
+
+
+@pytest.mark.asyncio
 async def test_diagnostic_stage_summary_omits_inapplicable_approval(sqlite_session_factory) -> None:
     incident_id = uuid4()
     event_types = (
