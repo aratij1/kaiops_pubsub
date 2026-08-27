@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from functools import lru_cache
+from time import monotonic
 from typing import Any
 
 # 20 failure families x 10 targets x 5 safe strategies = 1,000 options.
@@ -219,7 +220,12 @@ def _build_catalog() -> tuple[dict[str, Any], ...]:
 
 RESOLUTION_CATALOG = _build_catalog()
 _BY_ID = {row["id"]: row for row in RESOLUTION_CATALOG}
-_KNOWLEDGE: dict[str, dict[str, Any]] = {}
+# Runtime fallback candidates are never globally addressable.  Their key is
+# scoped by the authenticated tenant so possession of an option ID cannot be
+# used to probe or select another tenant's retrieved knowledge.
+_KNOWLEDGE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_KNOWLEDGE_TTL_SECONDS = 300.0
+_KNOWLEDGE_MAX_ENTRIES = 256
 
 
 def _tokens(value: str) -> set[str]:
@@ -279,7 +285,11 @@ def relevant_resolutions(
     ]
 
 
-def register_global_knowledge(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def register_global_knowledge(*, tenant_id: str, matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    now = monotonic()
+    for key, (registered_at, _) in list(_KNOWLEDGE.items()):
+        if now - registered_at >= _KNOWLEDGE_TTL_SECONDS:
+            _KNOWLEDGE.pop(key, None)
     rows = []
     for index, match in enumerate(matches[:6]):
         path = str(match.get("path") or "")
@@ -313,13 +323,23 @@ def register_global_knowledge(matches: list[dict[str, Any]]) -> list[dict[str, A
             "match_reasons": ["global knowledge fallback"],
             "relevance": min(0.6, max(0.0, float(match.get("score") or 0))),
         }
-        _KNOWLEDGE[option_id] = row
+        while len(_KNOWLEDGE) >= _KNOWLEDGE_MAX_ENTRIES:
+            oldest_key = min(_KNOWLEDGE, key=lambda key: _KNOWLEDGE[key][0])
+            _KNOWLEDGE.pop(oldest_key, None)
+        _KNOWLEDGE[(tenant_id, option_id)] = (now, row)
         rows.append(row)
     return rows
 
 
-def prepare_resolution_plan(*, option_id: str, issue: str, service: str) -> dict[str, Any]:
-    option = _BY_ID.get(option_id) or _KNOWLEDGE.get(option_id)
+def prepare_resolution_plan(*, tenant_id: str, option_id: str, issue: str, service: str) -> dict[str, Any]:
+    option = _BY_ID.get(option_id)
+    cached = _KNOWLEDGE.get((tenant_id, option_id))
+    if cached is not None:
+        registered_at, candidate = cached
+        if monotonic() - registered_at >= _KNOWLEDGE_TTL_SECONDS:
+            _KNOWLEDGE.pop((tenant_id, option_id), None)
+        elif option is None:
+            option = candidate
     if option is None:
         raise ValueError(f"Unknown resolution option: {option_id}")
     external = option.get("source") == "global-knowledge-repository"

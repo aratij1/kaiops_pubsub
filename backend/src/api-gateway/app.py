@@ -2029,6 +2029,28 @@ async def _load_analysis_regeneration_subject(
             if projection_record.recommendation_id is not None
             else None
         )
+        previous_rca_version = 0
+        if projection_record.recommendation_id is not None:
+            previous_payload = (
+                await session.execute(
+                    select(AuditLogRecord.payload).where(
+                        AuditLogRecord.id == projection_record.recommendation_id,
+                        AuditLogRecord.tenant_id == tenant_id,
+                        AuditLogRecord.resource_id == str(projection_record.incident_id),
+                        AuditLogRecord.action == "recommendation.generated",
+                    )
+                )
+            ).scalar_one_or_none()
+            previous_metadata = (
+                previous_payload.get("metadata")
+                if isinstance(previous_payload, dict) and isinstance(previous_payload.get("metadata"), dict)
+                else {}
+            )
+            try:
+                previous_rca_version = max(0, int(previous_metadata.get("rca_version") or 0))
+            except (TypeError, ValueError):
+                previous_rca_version = 0
+        decision["rca_version"] = previous_rca_version + 1
 
     try:
         return (
@@ -2081,6 +2103,7 @@ async def regenerate_alert_analysis(
         "context_strategy": strategies[mode],
         "force_full_analysis": mode == "fresh",
         "regeneration_requested": True,
+        "rca_version": max(1, int(existing_decision.get("rca_version") or 1)),
     }
     delivery = await _publish_analysis_regeneration_command(
         request_id=request_id,
@@ -2216,14 +2239,14 @@ async def select_analysis_resolution(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
-    _: str = Depends(current_tenant_id),
+    tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
         method="POST",
         path="/resolution-catalog/select",
         target_base=settings.resolution_agent_url,
-        payload=payload,
+        payload={**payload, "tenant_id": tenant_id},
         trace_id=trace_id_from_header(x_trace_id),
     )
 
