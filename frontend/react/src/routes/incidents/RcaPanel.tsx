@@ -225,6 +225,7 @@ export default function RcaPanel({
   return (
     <section className="combined-analysis-page context-workspace">
       {selectedAiTrust?.contractValid !== true ? <p className="ai-trust-warning" role="alert"><ShieldAlert size={16} />Investigation contract invalid. Resolution and approval actions are disabled until fresh analysis publishes a valid bound contract.</p> : null}
+      {selectedAiTrust?.integrityVerified !== true && selectedAiTrust?.integrity?.status ? <p className="ai-trust-warning" role="alert"><ShieldAlert size={16} />Investigation integrity error: {String(selectedAiTrust.integrity.status).replaceAll("_", " ")}. Resolution is blocked.</p> : null}
       <header className="context-workspace-hero">
         <div className="context-workspace-title">
           <span className="discovery-eyebrow">Incident understanding</span>
