@@ -32,6 +32,7 @@ from common.database import (
     GrafanaDashboardRecord,
     IncidentCorrelationOwnershipRecord,
     IncidentEventRecord,
+    IncidentInvestigationBindingRecord,
     IncidentOccurrenceRecord,
     IncidentProjectionRecord,
     IncidentRecord,
@@ -2906,6 +2907,60 @@ class IncidentRepository:
                 payload=recommendation.model_dump(mode="json"),
             )
         )
+        metadata = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
+        analysis_request_id = self._parse_uuid(metadata.get("analysis_request_id"))
+        context_snapshot_id = self._parse_uuid(metadata.get("context_snapshot_id"))
+        alert_id = self._parse_uuid(metadata.get("alert_id"))
+        context_fingerprint = str(metadata.get("context_fingerprint") or "").strip()
+        try:
+            rca_version = int(metadata.get("rca_version") or 0)
+        except (TypeError, ValueError):
+            rca_version = 0
+        if not all((analysis_request_id, context_snapshot_id, alert_id, context_fingerprint, rca_version > 0)):
+            # Historical recommendations remain readable but explicitly
+            # unbound; never fabricate normalized identities for them.
+            return
+        snapshot = await self.session.get(ContextSnapshotRecord, context_snapshot_id)
+        if (
+            snapshot is None
+            or snapshot.tenant_id != verified_tenant
+            or str(snapshot.incident_id) != str(recommendation.incident_id)
+            or snapshot.context_fingerprint != context_fingerprint
+        ):
+            raise ValueError("recommendation context binding is not valid for persistence")
+        plan = metadata.get("execution_plan") if isinstance(metadata.get("execution_plan"), dict) else {}
+        values = {
+            "binding_id": recommendation.id,
+            "tenant_id": verified_tenant,
+            "project_id": self._require("recommendation.project_id", metadata.get("project_id")),
+            "incident_id": recommendation.incident_id,
+            "alert_id": alert_id,
+            "analysis_request_id": analysis_request_id,
+            "context_snapshot_id": context_snapshot_id,
+            "context_fingerprint": context_fingerprint,
+            "recommendation_id": recommendation.id,
+            "rca_version": rca_version,
+            "resolution_plan_id": self._parse_uuid(plan.get("plan_id") or plan.get("id")),
+            "plan_fingerprint": str(plan.get("plan_fingerprint") or plan.get("fingerprint") or "") or None,
+            "status": str(metadata.get("rca_status") or "pending"),
+            "created_at": recommendation.created_at,
+            "expires_at": snapshot.expires_at,
+        }
+        existing = await self.session.get(IncidentInvestigationBindingRecord, recommendation.id)
+        if existing is not None:
+            immutable = (
+                existing.tenant_id, existing.project_id, existing.incident_id, existing.alert_id,
+                existing.analysis_request_id, existing.context_snapshot_id, existing.context_fingerprint,
+                existing.recommendation_id, existing.rca_version,
+            )
+            incoming = tuple(values[key] for key in (
+                "tenant_id", "project_id", "incident_id", "alert_id", "analysis_request_id",
+                "context_snapshot_id", "context_fingerprint", "recommendation_id", "rca_version",
+            ))
+            if immutable != incoming:
+                raise ValueError("immutable investigation binding already exists with different identities")
+            return
+        self.session.add(IncidentInvestigationBindingRecord(**values))
 
     async def save_knowledge_base(self, report: ResolutionReport, service: str = "unknown", *, tenant_id: str | None = None) -> None:
         verified_tenant = require_tenant_id(report.tenant_id, source="resolution knowledge persistence")
@@ -3190,11 +3245,29 @@ class IncidentRepository:
             else {}
         )
         metadata = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
+        binding_record = await self.session.get(IncidentInvestigationBindingRecord, recommendation_uuid)
+        if binding_record is None:
+            reasons.append("recommendation predates the normalized investigation binding contract")
+            return result("legacy_unbound", recommendation=recommendation)
+        if binding_record.tenant_id != normalized_tenant_id:
+            return result("tenant_mismatch", recommendation=recommendation)
+        if binding_record.incident_id != incident_uuid:
+            return result("incident_mismatch", recommendation=recommendation)
+        if binding_record.alert_id != alert_uuid:
+            return result("alert_mismatch", recommendation=recommendation)
+        if binding_record.recommendation_id != recommendation_uuid:
+            return result("contract_invalid", recommendation=recommendation)
+        if str(metadata.get("analysis_request_id") or "") != str(binding_record.analysis_request_id):
+            return result("contract_invalid", recommendation=recommendation)
+        if str(metadata.get("project_id") or "") != binding_record.project_id:
+            return result("project_mismatch", recommendation=recommendation)
         referenced_snapshot_id = self._parse_uuid(metadata.get("context_snapshot_id"))
         if referenced_snapshot_id is None:
             reasons.append("recommendation does not reference a context snapshot")
             status = "missing_snapshot_reference" if metadata.get("analysis_request_id") else "legacy_unbound"
             return result(status, recommendation=recommendation)
+        if referenced_snapshot_id != binding_record.context_snapshot_id:
+            return result("contract_invalid", recommendation=recommendation)
 
         # Query by immutable ID first so a cross-tenant record is distinguishable
         # from a missing record without ever returning its contents.

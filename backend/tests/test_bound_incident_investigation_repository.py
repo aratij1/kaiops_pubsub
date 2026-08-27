@@ -8,6 +8,7 @@ from common.database import (
     AlertRecord,
     AuditLogRecord,
     ContextSnapshotRecord,
+    IncidentInvestigationBindingRecord,
     IncidentProjectionRecord,
     IncidentRecord,
 )
@@ -27,6 +28,7 @@ async def _seed_pair(
     expires_at: datetime | None = None,
 ) -> None:
     now = datetime.now(UTC)
+    analysis_request_id = uuid4()
     session.add(ContextSnapshotRecord(
         snapshot_id=snapshot_id,
         tenant_id=tenant_id,
@@ -77,7 +79,7 @@ async def _seed_pair(
             "metadata": {
                 "alert_id": str(alert_id),
                 "project_id": "payments",
-                "analysis_request_id": str(uuid4()),
+                "analysis_request_id": str(analysis_request_id),
                 "context_snapshot_id": str(snapshot_id),
                 "context_fingerprint": fingerprint,
                 "evidence_ids": [evidence_id],
@@ -90,6 +92,14 @@ async def _seed_pair(
                 "execution_plan": {"execution_ready": False, "mutating": False, "readiness_blocks": []},
             },
         },
+    ))
+    session.add(IncidentInvestigationBindingRecord(
+        binding_id=recommendation_id, tenant_id=tenant_id, project_id="payments",
+        incident_id=incident_id, alert_id=alert_id, analysis_request_id=analysis_request_id,
+        context_snapshot_id=snapshot_id, context_fingerprint=fingerprint,
+        recommendation_id=recommendation_id, rca_version=1, resolution_plan_id=None,
+        plan_fingerprint=None, status="grounded", created_at=now,
+        expires_at=expires_at or now + timedelta(hours=1),
     ))
 
 
