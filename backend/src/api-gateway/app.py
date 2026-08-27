@@ -1926,34 +1926,65 @@ async def _load_analysis_regeneration_subject(
                 detail="The incident projection is incomplete; refresh after persistence completes",
             )
 
-        alert_payload = dict(alert_record.payload) if isinstance(alert_record.payload, dict) else {}
-        alert_payload.update(
-            {
-                "id": str(alert_record.id),
-                "tenant_id": tenant_id,
-                "source": alert_record.source,
-                "name": alert_record.name,
-                "service": alert_record.service,
-                "environment": alert_record.environment,
-                "severity": alert_record.severity,
-                "description": str(alert_payload.get("description") or alert_record.name),
-                "fingerprint": alert_record.fingerprint,
-                "correlation_id": alert_record.correlation_id,
-            }
-        )
-        incident_payload = dict(incident_record.payload) if isinstance(incident_record.payload, dict) else {}
-        incident_payload.update(
-            {
-                "id": str(incident_record.id),
-                "tenant_id": tenant_id,
-                "service": incident_record.service,
-                "environment": incident_record.environment,
-                "severity": incident_record.severity,
-                "status": incident_record.status,
-                "title": incident_record.title,
-                "ticket_id": incident_record.ticket_id,
-            }
-        )
+        # Historical rows contain source-specific keys that are intentionally
+        # forbidden by the canonical command models. Reconstruct the command
+        # from typed columns and copy only compatible enrichment instead of
+        # validating the complete stored source payload as an Alert/Incident.
+        stored_alert = dict(alert_record.payload) if isinstance(alert_record.payload, dict) else {}
+        stored_incident = dict(incident_record.payload) if isinstance(incident_record.payload, dict) else {}
+        valid_severities = {"info", "warning", "high", "critical"}
+        alert_severity = str(alert_record.severity or "warning").strip().lower()
+        incident_severity = str(incident_record.severity or alert_severity).strip().lower()
+        if alert_severity not in valid_severities:
+            alert_severity = "warning"
+        if incident_severity not in valid_severities:
+            incident_severity = alert_severity
+        valid_statuses = {
+            "open", "investigating", "awaiting_approval", "approved", "remediating",
+            "validating", "resolved", "closed", "failed", "cancelled",
+        }
+        incident_status = str(incident_record.status or "investigating").strip().lower().replace("-", "_")
+        if incident_status not in valid_statuses:
+            incident_status = "investigating"
+        alert_payload = {
+            "id": str(alert_record.id),
+            "created_at": alert_record.created_at,
+            "tenant_id": tenant_id,
+            "source": alert_record.source,
+            "name": alert_record.name,
+            "service": alert_record.service,
+            "environment": alert_record.environment,
+            "severity": alert_severity,
+            "description": str(
+                stored_alert.get("description") or stored_alert.get("summary") or alert_record.name
+            ),
+            "fingerprint": alert_record.fingerprint,
+            "correlation_id": alert_record.correlation_id,
+            "labels": stored_alert.get("labels") if isinstance(stored_alert.get("labels"), dict) else {},
+            "annotations": stored_alert.get("annotations") if isinstance(stored_alert.get("annotations"), dict) else {},
+        }
+        alert_ids = []
+        for candidate in stored_incident.get("alert_ids") or []:
+            try:
+                alert_ids.append(str(UUID(str(candidate))))
+            except (TypeError, ValueError):
+                continue
+        if str(alert_record.id) not in alert_ids:
+            alert_ids.append(str(alert_record.id))
+        incident_payload = {
+            "id": str(incident_record.id),
+            "created_at": incident_record.created_at,
+            "tenant_id": tenant_id,
+            "alert_ids": alert_ids,
+            "service": incident_record.service,
+            "environment": incident_record.environment,
+            "severity": incident_severity,
+            "status": incident_status,
+            "title": incident_record.title,
+            "summary": str(stored_incident.get("summary") or stored_alert.get("description") or incident_record.title),
+            "owner_team": str(stored_incident.get("owner_team") or stored_incident.get("owner") or "") or None,
+            "ticket_id": incident_record.ticket_id,
+        }
         projection_payload = (
             projection_record.projection_payload
             if isinstance(projection_record.projection_payload, dict)

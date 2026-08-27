@@ -420,6 +420,53 @@ async def test_analysis_regeneration_queues_one_tenant_scoped_command(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_analysis_regeneration_reconstructs_historical_source_payload(
+    monkeypatch, sqlite_session_factory,
+) -> None:
+    module = load_api_gateway_app_module()
+    alert_uuid = uuid4()
+    incident_uuid = uuid4()
+    captured: dict = {}
+    async with sqlite_session_factory() as session:
+        session.add(AlertRecord(
+            id=alert_uuid, tenant_id="tenant-a", source="prometheus", name="LegacyLatency",
+            service="api-gateway", environment="prod", severity="CRITICAL",
+            payload={
+                "description": "latency",
+                "provider_payload": {"unexpected": True},
+                "labels": {"team": "platform"},
+            },
+        ))
+        session.add(IncidentRecord(
+            id=incident_uuid, tenant_id="tenant-a", service="api-gateway", environment="prod",
+            severity="critical", status="awaiting-decision", title="Historical latency", ticket_id=None,
+            payload={"alert_ids": ["not-a-uuid"], "legacy_projection": {"unexpected": True}},
+        ))
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_uuid, alert_id=alert_uuid, tenant_id="tenant-a",
+            service="api-gateway", environment="prod", severity="critical", status="awaiting_approval",
+            requires_approval=True, projection_payload={},
+        ))
+        await session.commit()
+
+    async def publish_stub(**kwargs):
+        captured.update(kwargs)
+        return "published"
+
+    monkeypatch.setattr(module, "_publish_analysis_regeneration_command", publish_stub)
+    monkeypatch.setattr(module.app.state, "session_factory", sqlite_session_factory, raising=False)
+    result = await module.regenerate_alert_analysis(
+        str(alert_uuid), SimpleNamespace(app=module.app), payload={"mode": "fresh"},
+        x_trace_id=None, tenant_id="tenant-a",
+    )
+
+    assert result["status"] == "accepted"
+    assert captured["alert"].severity.value == "critical"
+    assert captured["incident"].status.value == "investigating"
+    assert captured["incident"].alert_ids == [alert_uuid]
+
+
+@pytest.mark.asyncio
 async def test_analysis_regeneration_rejects_alert_without_persisted_incident(monkeypatch, sqlite_session_factory) -> None:
     module = load_api_gateway_app_module()
     alert_uuid = uuid4()
