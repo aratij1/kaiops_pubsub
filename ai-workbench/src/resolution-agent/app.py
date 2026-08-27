@@ -113,6 +113,35 @@ def _attach_rca_governance_binding(recommendation: Recommendation, context: Cont
     }
 
 
+async def _require_context_snapshot_binding(context: Context) -> dict[str, Any] | None:
+    """Fail closed before persisting an RCA against orphaned or stale context."""
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        return None
+    metadata = context.metadata if isinstance(context.metadata, dict) else {}
+    snapshot_id = str(metadata.get("context_snapshot_id") or "").strip()
+    if not snapshot_id:
+        raise HTTPException(status_code=409, detail="context_snapshot_id is required before RCA persistence")
+    async with app.state.session_factory() as session:
+        snapshot = await IncidentRepository(session).context_snapshot_by_id(
+            snapshot_id, tenant_id=context.tenant_id, incident_id=context.incident_id,
+        )
+    if snapshot is None:
+        raise HTTPException(status_code=409, detail="the bound context snapshot does not exist for this tenant and incident")
+    persisted = snapshot.get("context") if isinstance(snapshot.get("context"), dict) else {}
+    persisted_alert = persisted.get("alert") if isinstance(persisted.get("alert"), dict) else {}
+    if str(persisted_alert.get("id") or "") != str(context.alert.id):
+        raise HTTPException(status_code=409, detail="the bound context snapshot belongs to a different alert")
+    if str(snapshot.get("context_fingerprint") or "") != str(metadata.get("context_fingerprint") or ""):
+        raise HTTPException(status_code=409, detail="the bound context snapshot fingerprint does not match")
+    freshness_mandatory = bool(metadata.get("force_full_analysis")) or str(
+        metadata.get("analysis_mode") or metadata.get("context_strategy") or ""
+    ).lower() in {"fresh", "realtime"}
+    expires_at = datetime.fromisoformat(str(snapshot["expires_at"]).replace("Z", "+00:00"))
+    if freshness_mandatory and expires_at <= datetime.now(UTC):
+        raise HTTPException(status_code=409, detail="the bound context snapshot has expired")
+    return snapshot
+
+
 def _attach_resolution_options(
     recommendation: Recommendation,
     context: Context,
@@ -852,6 +881,7 @@ async def startup(app: FastAPI) -> None:
     async def handle(payload: dict) -> None:
         context = Context.model_validate(payload["context"])
         incident = Incident.model_validate(payload["incident"])
+        await _require_context_snapshot_binding(context)
         decision_payload = payload.get("decision", {}) if isinstance(payload.get("decision"), dict) else {}
         recommendation = await _resolve_context(context)
         _attach_rca_governance_binding(recommendation, context)
@@ -1107,6 +1137,7 @@ async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, An
 
 @app.post("/resolve", response_model=Recommendation)
 async def resolve(context: Context, publish_events: bool = True) -> Recommendation:
+    await _require_context_snapshot_binding(context)
     recommendation = await _resolve_context(context)
     _attach_rca_governance_binding(recommendation, context)
     _apply_catalog_plan(recommendation, context)

@@ -7,6 +7,7 @@ import sys
 import pytest
 from ai_workbench_common.models import Context
 from common.database import ContextSnapshotRecord, ResolutionOutboxRecord
+from common.repository import IncidentRepository
 from common.models import Alert, AlertSeverity, Incident
 from context_agent.context_quality import context_subject_fingerprint, govern_context
 from sqlalchemy import func, select
@@ -168,3 +169,15 @@ async def test_snapshot_persists_when_event_publication_is_disabled(sqlite_sessi
     assert snapshots == 1
     assert outbox_rows == 0
     assert context.metadata["context_snapshot_id"] == outgoing["context"]["metadata"]["context_snapshot_id"]
+
+    async with sqlite_session_factory() as session:
+        repo = IncidentRepository(session)
+        exact = await repo.context_snapshot_by_id(
+            context.metadata["context_snapshot_id"], tenant_id="tenant-a", incident_id=incident.id,
+        )
+        wrong_tenant = await repo.context_snapshot_by_id(
+            context.metadata["context_snapshot_id"], tenant_id="tenant-b", incident_id=incident.id,
+        )
+    assert exact is not None
+    assert exact["context_fingerprint"] == context.metadata["context_fingerprint"]
+    assert wrong_tenant is None
