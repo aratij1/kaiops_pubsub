@@ -3528,6 +3528,66 @@ async def get_incident_groups(
     )
 
 
+@app.get("/incidents/{incident_id}")
+async def get_incident_by_id(
+    incident_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/incidents/{quote(incident_id, safe='')}?{urlencode({'tenant_id': tenant_id})}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/incidents/inbox/feed")
+async def get_unified_incident_inbox(
+    request: Request,
+    limit: int = 25,
+    cursor: str | None = None,
+    risk_tier: str | None = None,
+    execution_mode: str | None = None,
+    transport_provider: str | None = None,
+    status: str | None = None,
+    service: str | None = None,
+    inbox_view: str = "all",
+    record_type: str = "all",
+    severity: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params = {
+        "tenant_id": tenant_id,
+        "limit": str(max(1, min(int(limit), 100))),
+        "inbox_view": inbox_view,
+        "record_type": record_type,
+    }
+    for key, value in {
+        "cursor": cursor,
+        "risk_tier": risk_tier,
+        "execution_mode": execution_mode,
+        "transport_provider": transport_provider,
+        "status": status,
+        "service": service,
+        "severity": severity,
+    }.items():
+        if value:
+            params[key] = str(value)
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/incidents/inbox/feed?{urlencode(params)}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/rag/evidence-drafts")
 async def list_evidence_rag_drafts(
     request: Request,

@@ -336,6 +336,16 @@ async def test_incident_groups_paginate_after_correlation_with_server_counts(sql
     assert first_ids.isdisjoint(second_ids)
     assert second["previous_cursor"]
 
+    async with sqlite_session_factory() as session:
+        repository = IncidentRepository(session)
+        with pytest.raises(ValueError, match="active filters"):
+            await repository.list_incident_groups(
+                tenant_id="tenant-a",
+                limit=2,
+                cursor=first["next_cursor"],
+                service="service-1",
+            )
+
 
 @pytest.mark.asyncio
 async def test_incident_group_cursor_scales_to_ten_thousand_and_uses_page_index(sqlite_session_factory) -> None:

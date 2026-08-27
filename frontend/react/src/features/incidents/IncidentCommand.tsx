@@ -146,18 +146,16 @@ export default function IncidentCommand() {
     const loadRequestedIncident = async () => {
       setDirectIncident((current) => ({ ...current, loading: true, loaded: false, error: "" }));
       try {
-        const params = new URLSearchParams({ limit: "1", incident_id: requestedIncidentId, include_enrichment: "true" });
-        const response = await fetch(`/api-gateway/incidents/metadata?${params.toString()}`, {
+        const response = await fetch(`/api-gateway/incidents/${encodeURIComponent(requestedIncidentId)}`, {
           headers: session.accessToken ? { Authorization: `Bearer ${session.accessToken}`, Accept: "application/json" } : { Accept: "application/json" },
           signal: controller.signal,
         });
         if (!response.ok) throw new Error(`Incident service returned HTTP ${response.status}`);
         const payload = record(await response.json() as unknown);
         const data = Object.keys(record(payload.data)).length ? record(payload.data) : payload;
-        const responseRows = Array.isArray(data.rows) ? data.rows : [];
-        const match = responseRows
-          .map((candidate) => record(candidate) as IncidentRow)
-          .find((candidate) => incidentId(candidate).toLowerCase() === requestedIncidentId.toLowerCase()) || null;
+        const match = incidentId(data as IncidentRow).toLowerCase() === requestedIncidentId.toLowerCase()
+          ? data as IncidentRow
+          : null;
         setDirectIncident({ loading: false, loaded: true, row: match, error: "" });
       } catch (error) {
         if (controller.signal.aborted) return;
