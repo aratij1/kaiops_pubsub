@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from importlib import util
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import pytest
+from sqlalchemy import select, text
 
+from common.database import IncidentCorrelationOwnershipRecord
 from common.models import Incident, IncidentStatus
 from common.repository import IncidentRepository
 
@@ -60,6 +65,13 @@ async def test_canonical_incident_lookup_does_not_require_jira(sqlite_session_fa
 
     async with sqlite_session_factory() as session:
         repository = IncidentRepository(session)
+        await repository.acquire_canonical_incident(
+            incident=incident,
+            occurrence_id=uuid4(),
+            correlation_key="checkout-error-family",
+            project_id="commerce",
+            idempotency_key="alert-checkout-1",
+        )
         await repository.save_incident(incident)
         await session.commit()
 
@@ -71,3 +83,180 @@ async def test_canonical_incident_lookup_does_not_require_jira(sqlite_session_fa
     assert canonical is not None
     assert canonical["id"] == str(incident.id)
     assert jira_key is None
+
+
+@pytest.mark.asyncio
+async def test_matching_occurrences_acquire_one_canonical_incident(sqlite_session_factory) -> None:
+    first = Incident(service="checkout", environment="prod", severity="critical", status=IncidentStatus.INVESTIGATING, title="Checkout errors")
+    second = Incident(service="checkout", environment="prod", severity="critical", status=IncidentStatus.INVESTIGATING, title="Checkout errors")
+    async with sqlite_session_factory() as session:
+        repository = IncidentRepository(session)
+        first_owner = await repository.acquire_canonical_incident(
+            incident=first, occurrence_id=uuid4(), correlation_key="checkout-errors",
+            project_id="commerce", idempotency_key="source-event-1",
+        )
+        await repository.save_incident(first)
+        second_owner = await repository.acquire_canonical_incident(
+            incident=second, occurrence_id=uuid4(), correlation_key="checkout-errors",
+            project_id="commerce", idempotency_key="source-event-2",
+        )
+        await session.commit()
+
+    assert first_owner["canonical_incident_id"] == second_owner["canonical_incident_id"] == first.id
+    assert first_owner["correlation_generation"] == second_owner["correlation_generation"] == 1
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_matching_alerts_converge_on_one_owner(sqlite_session_factory) -> None:
+    async def acquire(index: int):
+        incident = Incident(service="checkout", environment="prod", severity="critical", status=IncidentStatus.INVESTIGATING, title="Checkout errors")
+        async with sqlite_session_factory() as session:
+            repository = IncidentRepository(session)
+            owner = await repository.acquire_canonical_incident(
+                incident=incident, occurrence_id=uuid4(), correlation_key="concurrent-checkout-errors",
+                project_id="commerce", idempotency_key=f"concurrent-source-event-{index}",
+            )
+            if owner["canonical_incident_id"] == incident.id:
+                await repository.save_incident(incident)
+            await session.commit()
+            return owner
+
+    owners = await asyncio.gather(acquire(1), acquire(2))
+
+    assert len({owner["canonical_incident_id"] for owner in owners}) == 1
+    assert {owner["correlation_generation"] for owner in owners} == {1}
+
+
+@pytest.mark.asyncio
+async def test_terminal_incident_creates_a_new_correlation_generation(sqlite_session_factory) -> None:
+    first = Incident(service="checkout", environment="prod", severity="critical", status=IncidentStatus.INVESTIGATING, title="Checkout errors")
+    async with sqlite_session_factory() as session:
+        repository = IncidentRepository(session)
+        first_owner = await repository.acquire_canonical_incident(
+            incident=first, occurrence_id=uuid4(), correlation_key="checkout-errors",
+            project_id="commerce", idempotency_key="source-event-1",
+        )
+        await repository.save_incident(first)
+        first.status = IncidentStatus.RESOLVED
+        await repository.save_incident(first)
+        recurrence = Incident(service="checkout", environment="prod", severity="critical", status=IncidentStatus.INVESTIGATING, title="Checkout errors recurring")
+        recurrence_owner = await repository.acquire_canonical_incident(
+            incident=recurrence, occurrence_id=uuid4(), correlation_key="checkout-errors",
+            project_id="commerce", idempotency_key="source-event-2",
+        )
+        await repository.save_incident(recurrence)
+        await session.commit()
+
+    assert recurrence_owner["canonical_incident_id"] == recurrence.id
+    assert recurrence_owner["canonical_incident_id"] != first_owner["canonical_incident_id"]
+    assert recurrence_owner["correlation_generation"] == 2
+    assert recurrence_owner["correlation_family_id"] == first_owner["correlation_family_id"]
+
+
+@pytest.mark.asyncio
+async def test_correlation_isolated_by_tenant_and_environment(sqlite_session_factory) -> None:
+    async with sqlite_session_factory() as session:
+        repository = IncidentRepository(session)
+        owners = []
+        for index, (tenant, environment) in enumerate((("tenant-a", "prod"), ("tenant-b", "prod"), ("tenant-a", "stage"))):
+            incident = Incident(tenant_id=tenant, service="checkout", environment=environment, severity="critical", status=IncidentStatus.INVESTIGATING, title="Checkout errors")
+            owners.append(await repository.acquire_canonical_incident(
+                incident=incident, occurrence_id=uuid4(), correlation_key="same-key",
+                project_id="commerce", idempotency_key=f"source-event-{index}",
+            ))
+            await repository.save_incident(incident)
+        await session.commit()
+
+    assert len({owner["canonical_incident_id"] for owner in owners}) == 3
+    assert all(owner["correlation_generation"] == 1 for owner in owners)
+
+
+@pytest.mark.asyncio
+async def test_incident_groups_paginate_after_correlation_with_server_counts(sqlite_session_factory) -> None:
+    now = datetime.now(timezone.utc)
+    async with sqlite_session_factory() as session:
+        repository = IncidentRepository(session)
+        for index in range(3):
+            incident = Incident(tenant_id="tenant-a", service=f"service-{index}", environment="prod", severity="critical", status=IncidentStatus.INVESTIGATING, title=f"Incident {index}")
+            await repository.acquire_canonical_incident(
+                incident=incident,
+                occurrence_id=uuid4(),
+                correlation_key=f"family-{index}",
+                project_id="commerce",
+                idempotency_key=f"page-event-{index}",
+                observed_at=now - timedelta(minutes=index),
+            )
+            await repository.save_incident(incident)
+        other_tenant = Incident(tenant_id="tenant-b", service="service-x", environment="prod", severity="critical", status=IncidentStatus.INVESTIGATING, title="Other tenant")
+        await repository.acquire_canonical_incident(
+            incident=other_tenant, occurrence_id=uuid4(), correlation_key="family-x",
+            project_id="commerce", idempotency_key="other-tenant-event", observed_at=now,
+        )
+        await repository.save_incident(other_tenant)
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        repository = IncidentRepository(session)
+        first = await repository.list_incident_groups(tenant_id="tenant-a", limit=2)
+        second = await repository.list_incident_groups(tenant_id="tenant-a", limit=2, cursor=first["next_cursor"])
+
+    first_ids = {row["canonical_incident_id"] for row in first["rows"]}
+    second_ids = {row["canonical_incident_id"] for row in second["rows"]}
+    assert first["total_count"] == first["filtered_count"] == first["active_count"] == 3
+    assert first["needs_attention_count"] == first["unlinked_signal_count"] == 0
+    assert len(first["rows"]) == 2
+    assert len(second["rows"]) == 1
+    assert first_ids.isdisjoint(second_ids)
+    assert second["previous_cursor"]
+
+
+@pytest.mark.asyncio
+async def test_incident_group_cursor_scales_to_ten_thousand_and_uses_page_index(sqlite_session_factory) -> None:
+    now = datetime.now(timezone.utc)
+    rows = []
+    for index in range(10_100):
+        tenant = "tenant-scale" if index < 10_000 else "tenant-other"
+        incident_id = uuid4()
+        rows.append(IncidentCorrelationOwnershipRecord(
+            tenant_id=tenant,
+            project_id=f"project-{index % 5}",
+            environment="prod" if index % 2 == 0 else "stage",
+            service=f"service-{index % 40}",
+            correlation_key=f"family-{index}",
+            correlation_family_id=uuid4(),
+            correlation_generation=1,
+            canonical_incident_id=incident_id,
+            first_seen_at=now - timedelta(seconds=index),
+            last_seen_at=now - timedelta(seconds=index),
+            correlation_window_expires_at=now + timedelta(hours=1),
+            lifecycle_state="investigating",
+        ))
+    async with sqlite_session_factory() as session:
+        session.add_all(rows)
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        repository = IncidentRepository(session)
+        first = await repository.list_incident_groups(tenant_id="tenant-scale", limit=50)
+        oldest_on_page = uuid4()
+        ownership = (await session.execute(
+            select(IncidentCorrelationOwnershipRecord)
+            .where(IncidentCorrelationOwnershipRecord.tenant_id == "tenant-scale")
+            .order_by(IncidentCorrelationOwnershipRecord.first_seen_at.asc())
+            .limit(1)
+        )).scalar_one()
+        oldest_on_page = ownership.canonical_incident_id
+        ownership.last_seen_at = now + timedelta(hours=2)
+        await session.commit()
+        second = await repository.list_incident_groups(
+            tenant_id="tenant-scale", limit=50, cursor=first["next_cursor"]
+        )
+        indexes = {row[1] for row in (await session.execute(text("PRAGMA index_list('incident_correlation_ownership')"))).all()}
+
+    assert first["total_count"] == first["filtered_count"] == 10_000
+    assert len(first["rows"]) == len(second["rows"]) == 50
+    assert {row["canonical_incident_id"] for row in first["rows"]}.isdisjoint(
+        {row["canonical_incident_id"] for row in second["rows"]}
+    )
+    assert oldest_on_page not in {row["canonical_incident_id"] for row in first["rows"]}
+    assert "idx_incident_correlation_page" in indexes

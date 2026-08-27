@@ -3,11 +3,15 @@
 import hashlib
 import json
 import re
+import base64
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy import and_, delete, func, or_, select, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
@@ -29,6 +33,8 @@ from common.database import (
     EvaluationRecord,
     GrafanaDashboardRecord,
     IncidentEventRecord,
+    IncidentCorrelationOwnershipRecord,
+    IncidentOccurrenceRecord,
     LearningAuditRecord,
     IncidentRecord,
     IncidentProjectionRecord,
@@ -1945,6 +1951,175 @@ class IncidentRepository:
             "latest_event_at": latest_event_at,
         }
 
+    async def acquire_canonical_incident(
+        self,
+        *,
+        incident: Incident,
+        occurrence_id: UUID,
+        correlation_key: str,
+        project_id: str,
+        idempotency_key: str,
+        causation_id: str | None = None,
+        correlation_window_minutes: int = 60,
+        observed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Atomically acquire bounded correlation ownership and attach an occurrence."""
+        tenant_id = self._require("tenant_id", incident.tenant_id)
+        project_id = self._require("project_id", project_id)
+        environment = self._require("environment", incident.environment)
+        service = self._require("service", incident.service)
+        correlation_key = self._require("correlation_key", correlation_key)
+        idempotency_key = self._require("idempotency_key", idempotency_key)
+        now = observed_at or datetime.now(timezone.utc)
+        window = timedelta(minutes=max(1, min(int(correlation_window_minutes), 1440)))
+
+        existing_occurrence = (
+            await self.session.execute(
+                select(IncidentOccurrenceRecord).where(
+                    IncidentOccurrenceRecord.tenant_id == tenant_id,
+                    IncidentOccurrenceRecord.idempotency_key == idempotency_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_occurrence is not None:
+            return {
+                "canonical_incident_id": existing_occurrence.canonical_incident_id,
+                "correlation_family_id": existing_occurrence.correlation_family_id,
+                "correlation_generation": existing_occurrence.correlation_generation,
+                "created": False,
+                "retried": True,
+            }
+
+        scope = (
+            IncidentCorrelationOwnershipRecord.tenant_id == tenant_id,
+            IncidentCorrelationOwnershipRecord.project_id == project_id,
+            IncidentCorrelationOwnershipRecord.environment == environment,
+            IncidentCorrelationOwnershipRecord.service == service,
+            IncidentCorrelationOwnershipRecord.correlation_key == correlation_key,
+        )
+        ownership = (
+            await self.session.execute(
+                select(IncidentCorrelationOwnershipRecord)
+                .where(*scope)
+                .order_by(IncidentCorrelationOwnershipRecord.correlation_generation.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        terminal = {"closed", "resolved", "cancelled", "canceled"}
+        ownership_expiry = ownership.correlation_window_expires_at if ownership is not None else None
+        if ownership_expiry is not None and ownership_expiry.tzinfo is None:
+            ownership_expiry = ownership_expiry.replace(tzinfo=timezone.utc)
+        create_generation = (
+            ownership is None
+            or str(ownership.lifecycle_state or "").lower() in terminal
+            or ownership_expiry < now
+        )
+        created = False
+        if create_generation:
+            generation = 1 if ownership is None else int(ownership.correlation_generation) + 1
+            family_id = ownership.correlation_family_id if ownership is not None else uuid5(
+                NAMESPACE_URL, f"kaims-correlation:{tenant_id}:{project_id}:{environment}:{service}:{correlation_key}"
+            )
+            candidate_values = dict(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                project_id=project_id,
+                environment=environment,
+                service=service,
+                correlation_key=correlation_key,
+                correlation_family_id=family_id,
+                correlation_generation=generation,
+                canonical_incident_id=incident.id,
+                first_seen_at=now,
+                last_seen_at=now,
+                correlation_window_expires_at=now + window,
+                lifecycle_state=incident.status.value,
+                version=1,
+                created_at=now,
+                updated_at=now,
+            )
+            dialect_name = self.session.get_bind().dialect.name
+            if dialect_name == "mysql":
+                statement = mysql_insert(IncidentCorrelationOwnershipRecord).values(**candidate_values)
+                statement = statement.on_duplicate_key_update(
+                    id=IncidentCorrelationOwnershipRecord.id
+                )
+                await self.session.execute(statement)
+            elif dialect_name == "sqlite":
+                statement = sqlite_insert(IncidentCorrelationOwnershipRecord).values(**candidate_values)
+                statement = statement.on_conflict_do_nothing(
+                    index_elements=[
+                        "tenant_id", "project_id", "environment", "service",
+                        "correlation_key", "correlation_generation",
+                    ]
+                )
+                await self.session.execute(statement)
+            else:
+                async with self.session.begin_nested():
+                    self.session.add(IncidentCorrelationOwnershipRecord(**candidate_values))
+                    await self.session.flush()
+            ownership = (
+                await self.session.execute(
+                    select(IncidentCorrelationOwnershipRecord)
+                    .where(*scope)
+                    .order_by(IncidentCorrelationOwnershipRecord.correlation_generation.desc())
+                    .limit(1)
+                    .with_for_update()
+                )
+            ).scalar_one()
+            created = ownership.canonical_incident_id == incident.id
+        else:
+            last_seen = ownership.last_seen_at
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
+            ownership.last_seen_at = max(last_seen, now)
+            ownership.version = int(ownership.version or 1) + 1
+
+        occurrence = IncidentOccurrenceRecord(
+            tenant_id=tenant_id,
+            project_id=project_id,
+            environment=environment,
+            service=service,
+            correlation_family_id=ownership.correlation_family_id,
+            correlation_generation=ownership.correlation_generation,
+            canonical_incident_id=ownership.canonical_incident_id,
+            occurrence_id=occurrence_id,
+            idempotency_key=idempotency_key,
+            causation_id=causation_id,
+            observed_at=now,
+            payload={"incoming_incident_id": str(incident.id), "correlation_key": correlation_key},
+        )
+        try:
+            async with self.session.begin_nested():
+                self.session.add(occurrence)
+                await self.session.flush()
+        except IntegrityError:
+            existing_occurrence = (
+                await self.session.execute(
+                    select(IncidentOccurrenceRecord).where(
+                        IncidentOccurrenceRecord.tenant_id == tenant_id,
+                        IncidentOccurrenceRecord.idempotency_key == idempotency_key,
+                    )
+                )
+            ).scalar_one()
+            ownership = (
+                await self.session.execute(
+                    select(IncidentCorrelationOwnershipRecord).where(
+                        IncidentCorrelationOwnershipRecord.correlation_family_id == existing_occurrence.correlation_family_id,
+                        IncidentCorrelationOwnershipRecord.correlation_generation == existing_occurrence.correlation_generation,
+                    )
+                )
+            ).scalar_one()
+            created = False
+        return {
+            "canonical_incident_id": ownership.canonical_incident_id,
+            "correlation_family_id": ownership.correlation_family_id,
+            "correlation_generation": ownership.correlation_generation,
+            "created": created,
+            "retried": False,
+        }
+
     async def save_incident(self, incident: Incident) -> None:
         incident_id = self._require("incident.id", incident.id)
         incoming_status = self._require("incident.status", incident.status.value)
@@ -1984,6 +2159,17 @@ class IncidentRepository:
                 payload=incident.model_dump(mode="json"),
             )
         )
+        ownership_rows = (
+            await self.session.execute(
+                select(IncidentCorrelationOwnershipRecord).where(
+                    IncidentCorrelationOwnershipRecord.canonical_incident_id == incident_id,
+                    IncidentCorrelationOwnershipRecord.tenant_id == (incident.tenant_id or "default"),
+                )
+            )
+        ).scalars().all()
+        for ownership in ownership_rows:
+            ownership.lifecycle_state = incoming_status
+            ownership.version = int(ownership.version or 1) + 1
 
     async def get_incident(self, incident_id: str, *, tenant_id: str | None = None) -> dict[str, Any] | None:
         incident_uuid = self._parse_uuid(incident_id)
@@ -2006,36 +2192,43 @@ class IncidentRepository:
         return str(incident.get("ticket_id") or candidate.get("jira_key") or "").strip() or None
 
     async def find_open_incident_by_correlation_key(
-        self, correlation_key: str, *, tenant_id: str = "default"
+        self,
+        correlation_key: str,
+        *,
+        tenant_id: str = "default",
+        project_id: str | None = None,
+        environment: str | None = None,
+        service: str | None = None,
     ) -> dict[str, Any] | None:
-        """Resolve the canonical open incident that owns a correlated alert group.
-
-        Canonical incident identity is independent of Jira. Requiring a ticket
-        here caused every duplicate received before Jira creation (or during a
-        Jira outage) to create a second incident instead of merging into the
-        already-open incident.
-        """
+        """Resolve indexed canonical ownership without inspecting JSON payloads."""
         normalized = str(correlation_key or "").strip()
         if not normalized:
             return None
-        result = await self.session.execute(
-            select(IncidentRecord)
-            .where(IncidentRecord.tenant_id == tenant_id)
-            .where(IncidentRecord.status.not_in(("closed", "resolved", "cancelled", "canceled")))
-            .order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc())
-            .limit(1000)
+        ownership_query = select(IncidentCorrelationOwnershipRecord).where(
+            IncidentCorrelationOwnershipRecord.tenant_id == tenant_id,
+            IncidentCorrelationOwnershipRecord.correlation_key == normalized,
+            IncidentCorrelationOwnershipRecord.lifecycle_state.not_in(
+                ("closed", "resolved", "cancelled", "canceled")
+            ),
         )
-        for record in result.scalars().all():
-            payload = record.payload if isinstance(record.payload, dict) else {}
-            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-            candidate = (
-                metadata.get("incident_candidate")
-                if isinstance(metadata.get("incident_candidate"), dict)
-                else {}
+        if project_id:
+            ownership_query = ownership_query.where(IncidentCorrelationOwnershipRecord.project_id == project_id)
+        if environment:
+            ownership_query = ownership_query.where(IncidentCorrelationOwnershipRecord.environment == environment)
+        if service:
+            ownership_query = ownership_query.where(IncidentCorrelationOwnershipRecord.service == service)
+        ownership = (
+            await self.session.execute(
+                ownership_query.order_by(
+                    IncidentCorrelationOwnershipRecord.last_seen_at.desc(),
+                    IncidentCorrelationOwnershipRecord.correlation_generation.desc(),
+                ).limit(1)
             )
-            if str(candidate.get("correlation_key") or "").strip() == normalized:
-                return payload
-        return None
+        ).scalar_one_or_none()
+        if ownership is None:
+            return None
+        record = await self.session.get(IncidentRecord, ownership.canonical_incident_id)
+        return record.payload if record is not None else None
 
     async def list_unresolved_incident_family(
         self,
@@ -4225,6 +4418,231 @@ class IncidentRepository:
 
         return len(rebuilt_ids)
 
+    @staticmethod
+    def _incident_group_cursor(row: IncidentCorrelationOwnershipRecord, direction: str) -> str:
+        payload = json.dumps(
+            {"at": row.first_seen_at.isoformat(), "id": str(row.id), "direction": direction},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    async def list_incident_groups(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 25,
+        cursor: str | None = None,
+        status: str | None = None,
+        service: str | None = None,
+        risk_tier: str | None = None,
+        execution_mode: str | None = None,
+    ) -> dict[str, Any]:
+        """Return canonical correlation families before applying cursor pagination."""
+        tenant_id = self._require("tenant_id", tenant_id)
+        safe_limit = max(1, min(int(limit), 100))
+        terminal = ("closed", "resolved", "cancelled", "canceled")
+        attention = ("failed", "blocked", "awaiting_approval", "pending_approval", "approval_required")
+        latest_generation = (
+            select(
+                IncidentCorrelationOwnershipRecord.correlation_family_id.label("family_id"),
+                func.max(IncidentCorrelationOwnershipRecord.correlation_generation).label("generation"),
+            )
+            .where(IncidentCorrelationOwnershipRecord.tenant_id == tenant_id)
+            .group_by(IncidentCorrelationOwnershipRecord.correlation_family_id)
+            .subquery()
+        )
+
+        def scoped_query(*, apply_filters: bool):
+            query = (
+                select(IncidentCorrelationOwnershipRecord)
+                .join(
+                    latest_generation,
+                    and_(
+                        latest_generation.c.family_id == IncidentCorrelationOwnershipRecord.correlation_family_id,
+                        latest_generation.c.generation == IncidentCorrelationOwnershipRecord.correlation_generation,
+                    ),
+                )
+                .outerjoin(
+                    IncidentProjectionRecord,
+                    IncidentProjectionRecord.incident_id == IncidentCorrelationOwnershipRecord.canonical_incident_id,
+                )
+                .where(IncidentCorrelationOwnershipRecord.tenant_id == tenant_id)
+            )
+            if apply_filters:
+                if status:
+                    query = query.where(IncidentCorrelationOwnershipRecord.lifecycle_state == status.strip().lower())
+                if service:
+                    query = query.where(IncidentCorrelationOwnershipRecord.service == service.strip())
+                if risk_tier:
+                    query = query.where(IncidentProjectionRecord.risk_tier == risk_tier.strip().lower())
+                if execution_mode:
+                    query = query.where(IncidentProjectionRecord.execution_mode == execution_mode.strip().lower())
+            return query
+
+        total_count = int((await self.session.scalar(select(func.count()).select_from(scoped_query(apply_filters=False).subquery()))) or 0)
+        filtered_count = int((await self.session.scalar(select(func.count()).select_from(scoped_query(apply_filters=True).subquery()))) or 0)
+        active_count = int((await self.session.scalar(
+            select(func.count()).select_from(
+                scoped_query(apply_filters=False)
+                .where(IncidentCorrelationOwnershipRecord.lifecycle_state.not_in(terminal))
+                .subquery()
+            )
+        )) or 0)
+        needs_attention_count = int((await self.session.scalar(
+            select(func.count()).select_from(
+                scoped_query(apply_filters=False)
+                .where(IncidentCorrelationOwnershipRecord.lifecycle_state.in_(attention))
+                .subquery()
+            )
+        )) or 0)
+        unlinked_signal_count = int((await self.session.scalar(
+            select(func.count(AlertRecord.id))
+            .select_from(AlertRecord)
+            .outerjoin(
+                IncidentOccurrenceRecord,
+                and_(
+                    IncidentOccurrenceRecord.tenant_id == AlertRecord.tenant_id,
+                    IncidentOccurrenceRecord.occurrence_id == AlertRecord.id,
+                ),
+            )
+            .where(AlertRecord.tenant_id == tenant_id, IncidentOccurrenceRecord.id.is_(None))
+        )) or 0)
+
+        direction = "next"
+        cursor_at: datetime | None = None
+        cursor_id: UUID | None = None
+        if cursor:
+            try:
+                padding = "=" * (-len(cursor) % 4)
+                decoded = json.loads(base64.urlsafe_b64decode(cursor + padding).decode("utf-8"))
+                cursor_at = datetime.fromisoformat(str(decoded["at"]).replace("Z", "+00:00"))
+                cursor_id = UUID(str(decoded["id"]))
+                direction = "previous" if decoded.get("direction") == "previous" else "next"
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+                raise ValueError("Invalid incident group cursor") from exc
+
+        page_query = scoped_query(apply_filters=True)
+        if cursor_at is not None and cursor_id is not None:
+            if direction == "previous":
+                page_query = page_query.where(or_(
+                    IncidentCorrelationOwnershipRecord.first_seen_at > cursor_at,
+                    and_(IncidentCorrelationOwnershipRecord.first_seen_at == cursor_at, IncidentCorrelationOwnershipRecord.id > cursor_id),
+                ))
+            else:
+                page_query = page_query.where(or_(
+                    IncidentCorrelationOwnershipRecord.first_seen_at < cursor_at,
+                    and_(IncidentCorrelationOwnershipRecord.first_seen_at == cursor_at, IncidentCorrelationOwnershipRecord.id < cursor_id),
+                ))
+        if direction == "previous":
+            page_query = page_query.order_by(
+                IncidentCorrelationOwnershipRecord.first_seen_at.asc(),
+                IncidentCorrelationOwnershipRecord.id.asc(),
+            )
+        else:
+            page_query = page_query.order_by(
+                IncidentCorrelationOwnershipRecord.first_seen_at.desc(),
+                IncidentCorrelationOwnershipRecord.id.desc(),
+            )
+        ownership_rows = list((await self.session.execute(page_query.limit(safe_limit + 1))).scalars().all())
+        has_more = len(ownership_rows) > safe_limit
+        ownership_rows = ownership_rows[:safe_limit]
+        if direction == "previous":
+            ownership_rows.reverse()
+
+        canonical_ids = [row.canonical_incident_id for row in ownership_rows]
+        projections = await self.list_incident_projections(
+            limit=safe_limit,
+            tenant_id=tenant_id,
+            include_enrichment=False,
+            incident_ids=canonical_ids,
+        )
+        projection_by_id = {str(row.get("incident_id") or row.get("id")): row for row in projections}
+        occurrence_counts: dict[UUID, int] = {}
+        occurrences_by_incident: dict[UUID, list[dict[str, Any]]] = {}
+        terminal_history: dict[UUID, int] = {}
+        if canonical_ids:
+            count_rows = await self.session.execute(
+                select(IncidentOccurrenceRecord.canonical_incident_id, func.count(IncidentOccurrenceRecord.id))
+                .where(IncidentOccurrenceRecord.canonical_incident_id.in_(canonical_ids))
+                .group_by(IncidentOccurrenceRecord.canonical_incident_id)
+            )
+            occurrence_counts = {incident_id: int(count) for incident_id, count in count_rows.all()}
+            occurrence_rows = (
+                await self.session.execute(
+                    select(IncidentOccurrenceRecord)
+                    .where(IncidentOccurrenceRecord.canonical_incident_id.in_(canonical_ids))
+                    .order_by(IncidentOccurrenceRecord.observed_at.desc(), IncidentOccurrenceRecord.id.desc())
+                )
+            ).scalars().all()
+            for occurrence in occurrence_rows:
+                bucket = occurrences_by_incident.setdefault(occurrence.canonical_incident_id, [])
+                if len(bucket) < 5:
+                    bucket.append({
+                        "occurrence_id": str(occurrence.occurrence_id),
+                        "observed_at": occurrence.observed_at.isoformat(),
+                        "idempotency_key": occurrence.idempotency_key,
+                    })
+            family_ids = [row.correlation_family_id for row in ownership_rows]
+            history_rows = await self.session.execute(
+                select(
+                    IncidentCorrelationOwnershipRecord.correlation_family_id,
+                    func.count(IncidentCorrelationOwnershipRecord.id),
+                )
+                .where(
+                    IncidentCorrelationOwnershipRecord.correlation_family_id.in_(family_ids),
+                    IncidentCorrelationOwnershipRecord.lifecycle_state.in_(terminal),
+                )
+                .group_by(IncidentCorrelationOwnershipRecord.correlation_family_id)
+            )
+            terminal_history = {family_id: int(count) for family_id, count in history_rows.all()}
+
+        response_rows: list[dict[str, Any]] = []
+        for ownership in ownership_rows:
+            projection = dict(projection_by_id.get(str(ownership.canonical_incident_id), {}))
+            count = occurrence_counts.get(ownership.canonical_incident_id, 0)
+            lifecycle = str(ownership.lifecycle_state or "").lower()
+            projection.update({
+                "canonical_incident_id": str(ownership.canonical_incident_id),
+                "incident_id": str(ownership.canonical_incident_id),
+                "correlation_family_id": str(ownership.correlation_family_id),
+                "generation": ownership.correlation_generation,
+                "correlation_generation": ownership.correlation_generation,
+                "canonical_status": lifecycle,
+                "status": lifecycle,
+                "active_occurrence_count": count if lifecycle not in terminal else 0,
+                "total_occurrence_count": count,
+                "first_seen_at": ownership.first_seen_at.isoformat(),
+                "last_seen_at": ownership.last_seen_at.isoformat(),
+                "latest_occurrences": occurrences_by_incident.get(ownership.canonical_incident_id, []),
+                "terminal_history_count": terminal_history.get(ownership.correlation_family_id, 0),
+                "attention_state": "needs_attention" if lifecycle in attention else "active" if lifecycle not in terminal else "terminal",
+                "project_id": ownership.project_id,
+                "service": ownership.service,
+                "environment": ownership.environment,
+            })
+            response_rows.append(projection)
+
+        next_cursor = None
+        previous_cursor = None
+        if ownership_rows:
+            if direction == "next" and has_more:
+                next_cursor = self._incident_group_cursor(ownership_rows[-1], "next")
+            elif direction == "previous" or cursor:
+                next_cursor = self._incident_group_cursor(ownership_rows[-1], "next")
+            if cursor or direction == "previous":
+                previous_cursor = self._incident_group_cursor(ownership_rows[0], "previous")
+        return {
+            "rows": response_rows,
+            "next_cursor": next_cursor,
+            "previous_cursor": previous_cursor,
+            "total_count": total_count,
+            "filtered_count": filtered_count,
+            "active_count": active_count,
+            "needs_attention_count": needs_attention_count,
+            "unlinked_signal_count": unlinked_signal_count,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     async def list_incident_projections(
         self,
         *,
@@ -4237,6 +4655,7 @@ class IncidentRepository:
         status: str | None = None,
         service: str | None = None,
         incident_id: str | None = None,
+        incident_ids: list[UUID] | None = None,
     ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 1000))
         # Apply ordering and the limit to narrow scalar columns before loading
@@ -4255,6 +4674,10 @@ class IncidentRepository:
             if parsed_incident_id is None:
                 return []
             latest_stmt = latest_stmt.where(IncidentProjectionRecord.incident_id == parsed_incident_id)
+        if incident_ids is not None:
+            if not incident_ids:
+                return []
+            latest_stmt = latest_stmt.where(IncidentProjectionRecord.incident_id.in_(incident_ids))
         if risk_tier:
             latest_stmt = latest_stmt.where(
                 IncidentProjectionRecord.risk_tier == str(risk_tier).strip().lower()

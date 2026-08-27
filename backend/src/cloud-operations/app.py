@@ -109,8 +109,88 @@ async def _repo():
     try:
         yield CloudOperationsRepository(session)
         await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
     finally:
         await session.close()
+
+
+async def _record_project_binding_rejection(
+    *, row: Any, requested_project: str, actor: str, action: str
+) -> None:
+    """Commit security evidence independently from the rejected work transaction."""
+    session_factory = getattr(app.state, "session_factory", None)
+    if session_factory is None:
+        return
+    session = session_factory()
+    try:
+        repo = CloudOperationsRepository(session)
+        await repo.audit(
+            tenant_id=row.tenant_id,
+            project_id=row.project_id,
+            actor=actor,
+            action="connection.project_binding_rejected",
+            resource_type="provider_connection",
+            resource_id=str(row.id),
+            payload={
+                "operation": action,
+                "authoritative_project_id": row.project_id,
+                "requested_project_id": requested_project,
+            },
+        )
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+    finally:
+        await session.close()
+
+
+async def _bound_connection(
+    repo: CloudOperationsRepository,
+    connection_id: UUID,
+    *,
+    tenant_id: str,
+    requested_project: str | None,
+    actor: str,
+    action: str,
+) -> Any:
+    """Resolve the connection's immutable tenant/project scope and reject relocation."""
+    row = await repo.get_connection(connection_id, tenant_id=tenant_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    candidate = str(requested_project or "").strip()
+    if candidate and candidate != row.project_id:
+        await _record_project_binding_rejection(
+            row=row, requested_project=candidate, actor=actor, action=action
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Requested project does not match the connection's authoritative project",
+        )
+    return row
+
+
+def _validate_discovery_scope(row: Any, result: Any) -> None:
+    resource_ids: set[str] = set()
+    for resource in result.resources:
+        if (
+            resource.tenant_id != row.tenant_id
+            or resource.project_id != row.project_id
+            or resource.connection_id != row.id
+        ):
+            raise HTTPException(status_code=409, detail="Discovery returned an out-of-scope resource")
+        resource_ids.add(str(resource.id))
+    for relationship in result.relationships:
+        if (
+            relationship.tenant_id != row.tenant_id
+            or relationship.project_id != row.project_id
+            or relationship.connection_id != row.id
+            or relationship.source_resource_id not in resource_ids
+            or relationship.target_resource_id not in resource_ids
+        ):
+            raise HTTPException(status_code=409, detail="Discovery returned an out-of-scope relationship")
 
 
 async def _publish(event_type: str, *, tenant_id: str, project_id: str, service_id: str | None, payload: dict[str, Any]) -> None:
@@ -179,9 +259,10 @@ async def validate_connection(
     tenant_id = require_tenant_id(payload.get("tenant_id"), source="cloud operations connection validation")
     actor = str(payload.get("actor") or "system").strip() or "system"
     async with _repo() as repo:
-        row = await repo.get_connection(connection_id, tenant_id=tenant_id)
-        if row is None:
-            raise HTTPException(status_code=404, detail="Connection not found")
+        row = await _bound_connection(
+            repo, connection_id, tenant_id=tenant_id,
+            requested_project=payload.get("project_id"), actor=actor, action="validate",
+        )
         connection = CloudConnection.model_validate(repo.connection_payload(row))
         try:
             result = await _connector(connection.provider_type).validate_connection(connection)
@@ -205,9 +286,10 @@ async def discover_resources(
 ) -> dict[str, Any]:
     request = DiscoveryRequest.model_validate(payload)
     async with _repo() as repo:
-        row = await repo.get_connection(connection_id, tenant_id=request.tenant_id)
-        if row is None:
-            raise HTTPException(status_code=404, detail="Connection not found")
+        row = await _bound_connection(
+            repo, connection_id, tenant_id=request.tenant_id,
+            requested_project=request.project_id, actor=request.actor, action="discover",
+        )
         if row.status != "validated":
             raise HTTPException(status_code=409, detail="Connection must be validated before discovery")
         if not row.read_capability:
@@ -220,11 +302,12 @@ async def discover_resources(
             result.run_id = run.id
         except NotImplementedError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        _validate_discovery_scope(row, result)
         await repo.complete_discovery(row, run, result, request=request)
         await _publish(
             "discovery.completed",
-            tenant_id=request.tenant_id,
-            project_id=request.project_id,
+            tenant_id=row.tenant_id,
+            project_id=row.project_id,
             service_id=request.service_id,
             payload={
                 "connection_id": str(row.id),

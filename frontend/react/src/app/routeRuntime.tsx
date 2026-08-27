@@ -29,7 +29,20 @@ export interface IncidentFilters { risk_tier: string; execution_mode: string; tr
 export interface IncidentsRouteRuntime { rows: IncidentRow[]; loading: boolean; error: string; application: string; filters: IncidentFilters; refresh: () => void; updateFilter: (name: keyof IncidentFilters, value: string) => void; open: (row: IncidentRow, stage?: string) => void; openTechnical: (row: IncidentRow, stage?: string) => void; }
 export interface AlertStreamRow { id?: string | number; ticket_id?: string; jira_key?: string; jira_url?: string; file?: string; source_channel?: string; status?: string; error?: string; name?: string; alert_name?: string; description?: string; labels?: { alertname?: string; alert_fingerprint?: string; fingerprint?: string; service?: string; job?: string; severity?: string; application?: string; project_name?: string; project?: string; ticket_id?: string; jira_issue_key?: string }; annotations?: { description?: string }; received_at?: string; created_at?: string; modified_at?: string; first_seen?: string; starts_at?: string; last_seen?: string; ends_at?: string; updated_at?: string; service?: string; application?: string; project_name?: string; project?: string; severity?: string; occurrence_count?: number; occurrences?: unknown[]; assignee?: string; owner?: string; jira_assignee?: string; deduplication_reason?: string; correlation_reason?: string; suppression_reason?: string; maintenance_window?: string; }
 export interface AlertStreamRow { alert_id?: string | number; incident_id?: string | number; incident_projection?: IncidentRow; jira_key?: string; jira_url?: string; trace_id?: string; incident_disposition?: string; source?: string; origin_system?: string; ingestion_channel?: string; deduplicated_count?: number; summary?: unknown; message?: unknown; title?: unknown; component?: unknown; priority?: unknown; alert_status?: unknown; }
-export interface IncidentRow { incident_disposition?: string; }
+export interface IncidentRow {
+  incident_disposition?: string;
+  canonical_incident_id?: string;
+  correlation_family_id?: string;
+  correlation_generation?: number;
+  generation?: number;
+  canonical_status?: string;
+  active_occurrence_count?: number;
+  total_occurrence_count?: number;
+  terminal_history_count?: number;
+  attention_state?: string;
+  latest_occurrences?: Array<Record<string, unknown>>;
+  project_id?: string;
+}
 export interface AlertStreamFilters { timeRange: string; severity: string; application: string; environment: string; }
 export interface AlertsRouteRuntime { loading: boolean; error: string; paused: boolean; liveState: string; lastEventAt: string; rows: AlertStreamRow[]; inboxRows: AlertStreamRow[]; totalRows: number; project: string; updatedAt: string; section: string; view: string; savedViews: { id: string; label: string }[]; filters: AlertStreamFilters; filterOptions: { applications: string[]; environments: string[] }; density: string; counts: Record<string, number>; channel: string; query: string; refresh: () => void; open: (row: AlertStreamRow, stage?: string) => void; openIncident: (row: AlertStreamRow) => void; togglePaused: () => void; setSection: (value: string) => void; setView: (value: string) => void; applyView: (value: string) => void; updateFilter: (name: keyof AlertStreamFilters, value: string) => void; setDensity: (value: string) => void; setChannel: (value: string) => void; setQuery: (value: string) => void; }
 export interface ChartItem { label: string; value: number; displayValue?: string; tone?: string; }

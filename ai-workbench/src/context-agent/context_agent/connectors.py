@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 import hashlib
 import heapq
+import ipaddress
 import json
 import os
 import re
@@ -12,6 +13,7 @@ from time import monotonic
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypedDict
+from urllib.parse import urlsplit
 
 import httpx
 from langchain_core.embeddings import Embeddings
@@ -310,6 +312,88 @@ class DiscoveryMCPConnector(BaseConnector):
             0.0,
             min(1.0, float(os.getenv("RCA_EXTERNAL_ESCALATION_CONFIDENCE_THRESHOLD", "0.65"))),
         )
+
+    @staticmethod
+    def _internal_url(url: str) -> bool:
+        host = str(urlsplit(url).hostname or "").strip().lower()
+        if not host or host == "localhost" or host.endswith((".local", ".internal")) or "." not in host:
+            return True
+        try:
+            address = ipaddress.ip_address(host)
+            return address.is_private or address.is_loopback
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _safe_proxy_description(proxy_url: str | None) -> dict[str, Any]:
+        if not proxy_url:
+            return {"configured": False}
+        parsed = urlsplit(proxy_url)
+        return {
+            "configured": True,
+            "scheme": parsed.scheme.lower(),
+            "host": parsed.hostname or "",
+            "port": parsed.port,
+            "credentials_redacted": bool(parsed.username or parsed.password),
+        }
+
+    def _client_policy(self, target_url: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        internal = self._internal_url(target_url)
+        proxy_url = str(os.getenv("DISCOVERY_MCP_PROXY_URL") or "").strip() or None
+        if internal:
+            return {"timeout": self.timeout, "trust_env": False}, {
+                "target": "internal", "trust_env": False, "proxy": {"configured": False},
+            }
+        if proxy_url:
+            scheme = str(urlsplit(proxy_url).scheme or "").lower()
+            if scheme not in {"http", "https", "socks5", "socks5h"}:
+                raise ValueError(f"Unsupported discovery proxy scheme: {scheme or 'missing'}")
+        options: dict[str, Any] = {"timeout": self.timeout, "trust_env": False}
+        if proxy_url:
+            options["proxy"] = proxy_url
+        return options, {
+            "target": "external", "trust_env": False,
+            "proxy": self._safe_proxy_description(proxy_url),
+        }
+
+    def _build_client(self, target_url: str) -> tuple[httpx.AsyncClient, dict[str, Any]]:
+        options, policy = self._client_policy(target_url)
+        return httpx.AsyncClient(**options), policy
+
+    def _degraded_discovery(
+        self, *, terms: list[str], tools: list[str], stages: list[dict[str, Any]], error: Exception
+    ) -> dict[str, Any]:
+        message = str(error)[:240] or type(error).__name__
+        failed_stages = [
+            *stages,
+            {"stage": "client_construction", "status": "failed", "error": message},
+            {"stage": "discovery_completed", "status": "degraded", "result_count": 0},
+        ]
+        return {
+            "protocol": "mcp-jsonrpc-2.0",
+            "server": self.mcp_url,
+            "provider_status": "degraded",
+            "query_terms": terms,
+            "collection_plan": {"mode": "adaptive", "selected_tools": tools},
+            "evidence": [],
+            "evidence_gap": {
+                "source": self.name,
+                "reason": "discovery_client_unavailable",
+                "detail": message,
+                "execution_ready": False,
+                "confidence_ceiling": 0.49,
+            },
+            "report": {
+                "summary": "Discovery evidence is unavailable; root cause remains ungrounded.",
+                "hypotheses": [],
+                "insufficient_evidence": True,
+                "confidence_ceiling": 0.49,
+            },
+            "detected_errors": [],
+            "retrieval_stages": failed_stages,
+            "model_usage": {},
+            "model_interaction": {"task": "rca", "status": "skipped", "reason": "discovery_client_unavailable"},
+        }
 
     @staticmethod
     def _query_terms(alert: Alert, incident: Incident) -> list[str]:
@@ -832,7 +916,15 @@ class DiscoveryMCPConnector(BaseConnector):
             ),
         ]
         evidence_by_tool: dict[str, list[dict[str, Any]]] = {}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        client: httpx.AsyncClient | None = None
+        try:
+            client, mcp_proxy_policy = self._build_client(self.mcp_url)
+            model_client, model_proxy_policy = self._build_client(self.model_router_url)
+        except Exception as exc:
+            if client is not None:
+                await client.aclose()
+            return self._degraded_discovery(terms=terms, tools=discovery_tools, stages=stages, error=exc)
+        async with client, model_client:
             results = await asyncio.gather(
                 *(
                     self._call_mcp(client, tool, terms, alert)
@@ -929,7 +1021,7 @@ class DiscoveryMCPConnector(BaseConnector):
                     }
                     stages.append({"stage": "llm_analysis", "status": "deferred_to_resolution_agent"})
                 else:
-                    report, usage, model_interaction = await self._analyze(client, alert, deduped, stages)
+                    report, usage, model_interaction = await self._analyze(model_client, alert, deduped, stages)
                     stages.append({"stage": "llm_analysis", "status": "completed", "model": report.get("model")})
             except Exception as exc:
                 report = self._fallback_report(deduped, stages)
@@ -973,6 +1065,7 @@ class DiscoveryMCPConnector(BaseConnector):
             "retrieval_stages": stages,
             "model_usage": usage,
             "model_interaction": model_interaction,
+            "proxy_policy": {"discovery": mcp_proxy_policy, "model_router": model_proxy_policy},
         }
 
 
@@ -1018,8 +1111,14 @@ class AzureAISearchVectorStore:
     def _odata_literal(self, value: str) -> str:
         return "'" + str(value).replace("'", "''") + "'"
 
-    def _filter(self, *, preferred_kinds: set[str] | None, service: str | None) -> str | None:
-        filters: list[str] = []
+    def _filter(self, *, preferred_kinds: set[str] | None, service: str | None, tenant_id: str) -> str | None:
+        tenant = str(tenant_id or "").strip()
+        if not tenant:
+            raise ValueError("remote RAG search requires authenticated tenant identity")
+        filters: list[str] = [
+            f"((tenant_scope eq {self._odata_literal(tenant)}) or (tenant_scope eq 'global' and corpus_classification eq 'PRODUCTION_CURATED'))",
+            "review_status eq 'approved'",
+        ]
         kinds = sorted({str(item).strip().lower() for item in (preferred_kinds or set()) if str(item).strip()})
         if kinds:
             filters.append("(" + " or ".join(f"kind eq {self._odata_literal(kind)}" for kind in kinds) + ")")
@@ -1056,6 +1155,7 @@ class AzureAISearchVectorStore:
         limit: int,
         preferred_kinds: set[str] | None = None,
         service: str | None = None,
+        tenant_id: str,
     ) -> list[dict[str, Any]]:
         if not self.configured:
             return []
@@ -1064,7 +1164,8 @@ class AzureAISearchVectorStore:
             "top": max(1, min(limit, 50)),
             "select": (
                 "id,document_id,chunk_id,kind,title,content,services,deployment,dependencies,change_id,"
-                "alert_id,incident_id,source_system,source_ref,owner,version,freshness_score,embedding_model,path"
+                "alert_id,incident_id,tenant_scope,source_system,source_ref,review_status,content_version,"
+                "corpus_classification,owner,version,freshness_score,embedding_model,path"
             ),
             "vectorQueries": [
                 {
@@ -1075,7 +1176,7 @@ class AzureAISearchVectorStore:
                 }
             ],
         }
-        filter_expression = self._filter(preferred_kinds=preferred_kinds, service=service)
+        filter_expression = self._filter(preferred_kinds=preferred_kinds, service=service, tenant_id=tenant_id)
         if filter_expression:
             payload["filter"] = filter_expression
         try:
@@ -1139,8 +1240,12 @@ class AzureAISearchVectorStore:
                         "change_id": str(doc.get("change_id") or ""),
                         "alert_id": str(doc.get("alert_id") or ""),
                         "incident_id": str(doc.get("incident_id") or ""),
+                        "tenant_scope": str(doc.get("tenant_scope") or ""),
                         "source_system": str(doc.get("source_system") or ""),
                         "source_ref": str(doc.get("source_ref") or ""),
+                        "review_status": str(doc.get("review_status") or ""),
+                        "content_version": str(doc.get("content_version") or ""),
+                        "corpus_classification": str(doc.get("corpus_classification") or ""),
                         "owner": str(doc.get("owner") or doc.get("resolved_by") or "unassigned"),
                         "version": str(doc.get("version") or "v1"),
                         "freshness_score": float(doc.get("freshness_score") or 0.75),
@@ -1194,11 +1299,15 @@ class VectorDBConnector(BaseConnector):
                 " ".join(f"{key}={value}" for key, value in alert.annotations.items()),
             ]
         )
+        tenant_id = str(getattr(alert, "tenant_id", "") or getattr(incident, "tenant_id", "")).strip()
+        if not tenant_id:
+            return {"matches": [], "document_count": len(self.documents), "evidence_gap": "authenticated tenant identity is missing"}
         ranked = self.search(
             query,
             limit=8,
             preferred_kinds={"runbook", "incident", "deployment", "dependency", "change"},
             service=str(alert.service or "").strip(),
+            tenant_id=tenant_id,
         )
         return {
             "matches": ranked,
@@ -1357,7 +1466,11 @@ class VectorDBConnector(BaseConnector):
         preferred_kind: str | None = None,
         preferred_kinds: set[str] | None = None,
         service: str | None = None,
+        tenant_id: str,
     ) -> list[dict[str, Any]]:
+        normalized_tenant = str(tenant_id or "").strip()
+        if not normalized_tenant:
+            raise ValueError("RAG search requires authenticated tenant identity")
         if not self.documents:
             with self._load_lock:
                 if not self.documents:
@@ -1374,6 +1487,7 @@ class VectorDBConnector(BaseConnector):
             limit=limit,
             preferred_kinds=kind_filter,
             service=service,
+            tenant_id=normalized_tenant,
         )
         if remote_matches:
             return remote_matches
@@ -1383,7 +1497,17 @@ class VectorDBConnector(BaseConnector):
             limit=limit,
             preferred_kinds=kind_filter,
             service=service,
+            tenant_id=normalized_tenant,
         )
+
+    @staticmethod
+    def _tenant_allowed(doc: dict[str, Any], tenant_id: str) -> bool:
+        scope = str(doc.get("tenant_scope") or "").strip()
+        review_status = str(doc.get("review_status") or "").strip().lower()
+        corpus_class = str(doc.get("corpus_classification") or "").strip().upper()
+        if review_status != "approved" or corpus_class in {"DEMO_ONLY", "GENERATED_UNVERIFIED", "MALFORMED", "OBSOLETE"}:
+            return False
+        return scope == tenant_id or (scope.lower() == "global" and corpus_class == "PRODUCTION_CURATED")
 
     def root_path(self) -> Path:
         root = self.rag_root or self._discover_rag_root()
@@ -1716,17 +1840,16 @@ class VectorDBConnector(BaseConnector):
         limit: int,
         preferred_kinds: set[str] | None = None,
         service: str | None = None,
+        tenant_id: str,
     ) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 20))
         candidates = [
             doc
             for doc in self.documents
-            if self._kind_matches(doc, preferred_kinds) and self._service_matches(doc, service)
+            if self._tenant_allowed(doc, tenant_id) and self._kind_matches(doc, preferred_kinds) and self._service_matches(doc, service)
         ]
         if not candidates and preferred_kinds:
-            candidates = [doc for doc in self.documents if self._service_matches(doc, service)]
-        if not candidates:
-            candidates = list(self.documents)
+            candidates = [doc for doc in self.documents if self._tenant_allowed(doc, tenant_id) and self._service_matches(doc, service)]
 
         shortlist_size = min(max(limit * 4, 12), len(candidates))
         shortlisted = heapq.nlargest(

@@ -142,6 +142,7 @@ class DiscoveredResource(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     tenant_id: str
     project_id: str
+    connection_id: UUID
     service_id: str
     environment: str
     provider: ProviderType
@@ -174,6 +175,7 @@ class ResourceRelationship(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     tenant_id: str
     project_id: str
+    connection_id: UUID
     source_resource_id: str
     target_resource_id: str
     relationship_type: str

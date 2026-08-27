@@ -6421,6 +6421,35 @@ async def get_incident_metadata(
     return {"rows": rows, "count": len(rows)}
 
 
+@app.get("/incidents/groups")
+async def get_incident_groups(
+    tenant_id: str,
+    limit: int = 25,
+    cursor: str | None = None,
+    risk_tier: str | None = None,
+    execution_mode: str | None = None,
+    status: str | None = None,
+    service: str | None = None,
+) -> dict[str, Any]:
+    session_factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or session_factory is None:
+        raise HTTPException(status_code=503, detail="Incident group read model is unavailable")
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        try:
+            return await repo.list_incident_groups(
+                tenant_id=tenant_id,
+                limit=limit,
+                cursor=cursor,
+                risk_tier=risk_tier,
+                execution_mode=execution_mode,
+                status=status,
+                service=service,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.get("/incidents/{incident_id}/stage-completeness")
 async def get_incident_stage_completeness(incident_id: str, tenant_id: str) -> dict[str, Any]:
     session_factory = getattr(app.state, "session_factory", None)

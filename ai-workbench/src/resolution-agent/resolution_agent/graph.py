@@ -906,6 +906,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "labels": context.alert.labels,
             },
             "observability": context.observability,
+            "context_quality": (
+                context.metadata.get("context_quality")
+                if isinstance(context.metadata.get("context_quality"), dict)
+                else {}
+            ),
             "discovery_evidence": relevant_evidence,
             "knowledge_evidence_count": len(knowledge_evidence),
             "knowledge_role": "historical_guidance_not_current_observation",
@@ -1169,6 +1174,20 @@ class ResolutionIntelligenceAgent(BaseAgent):
             reference_time=context.alert.created_at,
         )
         model_confidence = min(model_confidence, evidence_quality.confidence_ceiling)
+        context_quality = state["gathered_context"].get("context_quality", {})
+        discovery_degraded = bool(
+            context_quality.get("discovery_degraded")
+            or context_quality.get("execution_ready") is False
+        )
+        if discovery_degraded:
+            model_confidence = min(model_confidence, 0.49)
+            missing_evidence = state["rca_analysis"].get("missing_evidence")
+            if not isinstance(missing_evidence, list):
+                missing_evidence = []
+            if "discovery_evidence" not in missing_evidence:
+                missing_evidence.append("discovery_evidence")
+            state["rca_analysis"]["missing_evidence"] = missing_evidence
+            state["rca_analysis"]["context_degraded"] = True
         state["rca_analysis"]["confidence_score"] = model_confidence
         state["rca_analysis"]["evidence_quality"] = {
             "accepted_evidence": evidence_quality.accepted_evidence,
@@ -1419,10 +1438,13 @@ class ResolutionIntelligenceAgent(BaseAgent):
             readiness_blocks.append("No rollback or explicit non-reversible recovery strategy is defined.")
         investigation = state.get("investigation_report", {})
         evidence_quality = state.get("rca_analysis", {}).get("evidence_quality", {})
+        context_quality = state.get("gathered_context", {}).get("context_quality", {})
         if mutating and not investigation.get("application_evidence_available"):
             readiness_blocks.append("No application runtime, log, telemetry, or code evidence supports this corrective action.")
         if mutating and evidence_quality.get("sufficiency") != "sufficient":
             readiness_blocks.append("The causal hypothesis is not independently corroborated by sufficient evidence.")
+        if context_quality.get("discovery_degraded") or context_quality.get("execution_ready") is False:
+            readiness_blocks.append("Discovery evidence is degraded or unavailable; collect fresh diagnostics before execution.")
         state["remediation_analysis"] = {
             # Deterministic defaults first, so a real model answer (when
             # RESOLUTION_DEEP_ANALYSIS_ENABLED=true) always wins if it supplies its

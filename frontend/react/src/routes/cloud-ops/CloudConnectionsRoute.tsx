@@ -21,11 +21,11 @@ export default function CloudConnectionsRoute() {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
 
-  async function refresh() {
+  async function refresh(scopeProjectId = projectId) {
     setBusy("refresh");
     setError("");
     try {
-      setConnections(await listConnections(accessToken, projectId));
+      setConnections(await listConnections(accessToken, scopeProjectId));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to load cloud connections");
     } finally {
@@ -34,8 +34,22 @@ export default function CloudConnectionsRoute() {
   }
 
   useEffect(() => {
-    if (accessToken) void refresh();
-  }, [accessToken]);
+    setConnections([]);
+    setError("");
+    if (!accessToken || !projectId.trim()) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      setBusy("refresh");
+      void listConnections(accessToken, projectId.trim())
+        .then((rows) => { if (!cancelled) setConnections(rows); })
+        .catch((err) => { if (!cancelled) setError(err instanceof Error ? err.message : "Unable to load cloud connections"); })
+        .finally(() => { if (!cancelled) setBusy(""); });
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [accessToken, projectId]);
 
   async function createConnection() {
     setBusy("create");
@@ -51,6 +65,11 @@ export default function CloudConnectionsRoute() {
   }
 
   async function runConnectionAction(id: string, action: "validate" | "discover") {
+    const connection = connections.find((item) => item.id === id);
+    if (!connection || connection.project_id !== projectId.trim()) {
+      setError("Connection actions are disabled because the selected project scope changed.");
+      return;
+    }
     setBusy(`${action}:${id}`);
     setError("");
     try {
@@ -80,7 +99,7 @@ export default function CloudConnectionsRoute() {
         <div className="cloud-ops-toolbar">
           <label>
             <span>Project ID</span>
-            <input value={projectId} onChange={(event) => setProjectId(event.target.value)} />
+            <input value={projectId} onChange={(event) => { setConnections([]); setProjectId(event.target.value); }} />
           </label>
           <label>
             <span>Connection name</span>
@@ -118,10 +137,10 @@ export default function CloudConnectionsRoute() {
               <span>Owner: {connection.connection_owner}</span>
             </div>
             <div className="cloud-ops-toolbar">
-              <button type="button" className="button-secondary" onClick={() => runConnectionAction(connection.id, "validate")} disabled={Boolean(busy)}>
+              <button type="button" className="button-secondary" onClick={() => runConnectionAction(connection.id, "validate")} disabled={Boolean(busy) || connection.project_id !== projectId.trim()}>
                 <ShieldCheck size={16} /> Validate
               </button>
-              <button type="button" className="button-secondary" onClick={() => runConnectionAction(connection.id, "discover")} disabled={Boolean(busy)}>
+              <button type="button" className="button-secondary" onClick={() => runConnectionAction(connection.id, "discover")} disabled={Boolean(busy) || connection.project_id !== projectId.trim()}>
                 <Play size={16} /> Discover
               </button>
             </div>
