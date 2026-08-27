@@ -761,7 +761,12 @@ def _attach_analysis_request_metadata(
     request_payload = analysis_request if isinstance(analysis_request, dict) else {}
     request_id = str(routing.get("analysis_request_id") or request_payload.get("id") or "").strip()
     if not request_id:
-        return context
+        metadata = context.metadata if isinstance(context.metadata, dict) else {}
+        request_id = str(uuid5(
+            NAMESPACE_URL,
+            f"kaims:analysis-request:{context.incident_id}:{context.alert.id}:"
+            f"{metadata.get('context_fingerprint') or context.alert.fingerprint or 'initial'}",
+        ))
     mode = str(routing.get("analysis_mode") or request_payload.get("mode") or "smart").strip().lower()
     metadata = context.metadata if isinstance(context.metadata, dict) else {}
     return context.model_copy(update={
@@ -769,6 +774,7 @@ def _attach_analysis_request_metadata(
             **metadata,
             "analysis_request_id": request_id,
             "analysis_mode": mode,
+            "rca_version": max(1, int(routing.get("rca_version") or 1)),
             "force_full_analysis": bool(routing.get("force_full_analysis")) or mode == "fresh",
             "regeneration_requested": True,
             "regenerated_from_alert_id": str(context.alert.id),

@@ -100,7 +100,14 @@ def _deterministic_recommendation_id(context: Context) -> UUID:
     # when the underlying evidence fingerprint is unchanged. Without this
     # request identity, polling cannot distinguish the new result from the
     # recommendation that existed before the operator clicked regenerate.
-    identity = metadata.get("analysis_request_id") or metadata.get("context_fingerprint") or context.alert.id
+    identity = str(metadata.get("analysis_request_id") or "").strip()
+    try:
+        UUID(identity)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=409,
+            detail="a durable UUID analysis_request_id is required before RCA generation",
+        ) from None
     return uuid5(NAMESPACE_URL, f"kaims:recommendation:{context.incident_id}:{identity}:v2")
 
 
@@ -111,9 +118,11 @@ def _attach_rca_governance_binding(recommendation: Recommendation, context: Cont
     recommendation.metadata = {
         **(recommendation.metadata if isinstance(recommendation.metadata, dict) else {}),
         "analysis_request_id": str(context_metadata.get("analysis_request_id") or "") or None,
+        "project_id": str(context_metadata.get("project_id") or context.alert.labels.get("project_id") or "default"),
+        "alert_id": str(context.alert.id),
         "context_snapshot_id": str(context_metadata.get("context_snapshot_id") or "") or None,
         "context_fingerprint": str(context_metadata.get("context_fingerprint") or "") or None,
-        "rca_version": str(recommendation.id),
+        "rca_version": max(1, int(context_metadata.get("rca_version") or 1)),
         "recommendation_version": str(recommendation.id),
     }
 
@@ -967,16 +976,91 @@ app = create_app(title="KaiMS Resolution Intelligence Agent", settings=settings,
 
 class ResolutionCatalogRequest(BaseModel):
     tenant_id: str
+    incident_id: UUID
+    alert_id: UUID
+    analysis_request_id: UUID
+    recommendation_id: UUID
+    rca_version: int = Field(ge=1)
+    context_snapshot_id: UUID
+    context_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     issue: str
     service: str = "unknown"
     recommended_action: str = ""
 
 
 class ResolutionSelectionRequest(BaseModel):
+    tenant_id: str
+    incident_id: UUID
+    alert_id: UUID
+    analysis_request_id: UUID
+    recommendation_id: UUID
+    rca_version: int = Field(ge=1)
+    context_snapshot_id: UUID
+    context_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    resolution_plan_id: UUID | None = None
+    plan_fingerprint: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
     option_id: str
     issue: str
     service: str = "unknown"
-    incident_id: str = ""
+
+
+async def _require_catalog_readiness(request: ResolutionCatalogRequest | ResolutionSelectionRequest) -> dict[str, Any]:
+    tenant_id = require_tenant_id(request.tenant_id, source="resolution catalog readiness")
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        raise HTTPException(status_code=503, detail={"code": "readiness_store_unavailable", "blocking_reasons": ["investigation persistence is unavailable"]})
+    async with app.state.session_factory() as session:
+        repository = IncidentRepository(session)
+        current = await repository.current_incident_investigation_binding(
+            tenant_id=tenant_id, incident_id=request.incident_id, alert_id=request.alert_id,
+        )
+        if current is None:
+            raise HTTPException(status_code=409, detail={"code": "investigation_binding_missing", "blocking_reasons": ["no current incident investigation binding exists"]})
+        if current["recommendation_id"] != str(request.recommendation_id):
+            raise HTTPException(status_code=409, detail={"code": "stale_recommendation", "blocking_reasons": ["recommendation is not the incident projection's current version"]})
+        bound = await repository.get_bound_incident_investigation(
+            tenant_id=tenant_id,
+            incident_id=request.incident_id,
+            alert_id=request.alert_id,
+            recommendation_id=request.recommendation_id,
+        )
+    integrity = bound.get("investigation_integrity") if isinstance(bound.get("investigation_integrity"), dict) else {}
+    if integrity.get("verified") is not True:
+        raise HTTPException(status_code=409, detail={
+            "code": f"investigation_{integrity.get('status') or 'invalid'}",
+            "blocking_reasons": integrity.get("blocking_reasons") or ["investigation integrity is not verified"],
+        })
+    recommendation = bound.get("recommendation") if isinstance(bound.get("recommendation"), dict) else {}
+    metadata = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
+    identity_mismatches = []
+    if str(metadata.get("analysis_request_id") or "") != str(request.analysis_request_id):
+        identity_mismatches.append("analysis request does not match")
+    if str(metadata.get("context_snapshot_id") or "") != str(request.context_snapshot_id):
+        identity_mismatches.append("context snapshot does not match")
+    if str(metadata.get("context_fingerprint") or "") != request.context_fingerprint:
+        identity_mismatches.append("context fingerprint does not match")
+    try:
+        persisted_rca_version = int(metadata.get("rca_version") or 0)
+    except (TypeError, ValueError):
+        persisted_rca_version = 0
+    if persisted_rca_version != request.rca_version:
+        identity_mismatches.append("RCA version does not match")
+    if identity_mismatches:
+        raise HTTPException(status_code=409, detail={"code": "stale_investigation_binding", "blocking_reasons": identity_mismatches})
+    analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
+    investigation = metadata.get("investigation_report") if isinstance(metadata.get("investigation_report"), dict) else {}
+    accepted = metadata.get("evidence_ids") if isinstance(metadata.get("evidence_ids"), list) else []
+    blocks = []
+    if investigation.get("conclusive") is not True or str(investigation.get("status") or "").lower() != "conclusive":
+        blocks.append("investigation is not conclusive")
+    if str(metadata.get("rca_status") or "").lower() != "grounded" or not accepted:
+        blocks.append("RCA is not grounded in accepted evidence")
+    if isinstance(analysis.get("missing_evidence"), list) and analysis["missing_evidence"]:
+        blocks.append("declared evidence gaps remain")
+    if isinstance(analysis.get("conflicting_evidence"), list) and analysis["conflicting_evidence"]:
+        blocks.append("conflicting evidence remains unresolved")
+    if blocks:
+        raise HTTPException(status_code=409, detail={"code": "resolution_not_ready", "blocking_reasons": blocks})
+    return bound
 
 
 @app.get("/investigations/{incident_id}")
@@ -1099,6 +1183,7 @@ async def reconsider_execution(request: ExecutionFailureRequest) -> dict[str, An
 @app.post("/resolution-catalog/relevant")
 async def resolution_catalog(request: ResolutionCatalogRequest) -> dict[str, Any]:
     tenant_id = require_tenant_id(request.tenant_id, source="resolution catalog request")
+    await _require_catalog_readiness(request)
     rows = relevant_resolutions(
         issue=request.issue, service=request.service, recommended_action=request.recommended_action
     )
@@ -1128,7 +1213,10 @@ async def resolution_catalog(request: ResolutionCatalogRequest) -> dict[str, Any
                     oldest_key = min(_GLOBAL_KNOWLEDGE_CACHE, key=lambda key: _GLOBAL_KNOWLEDGE_CACHE[key][0])
                     _GLOBAL_KNOWLEDGE_CACHE.pop(oldest_key, None)
                 _GLOBAL_KNOWLEDGE_CACHE[cache_key] = (monotonic(), matches)
-            knowledge_rows = register_global_knowledge(matches if isinstance(matches, list) else [])
+            knowledge_rows = register_global_knowledge(
+                tenant_id=tenant_id,
+                matches=matches if isinstance(matches, list) else [],
+            )
             if knowledge_rows:
                 rows = [*rows, *knowledge_rows]
                 fallback["used"] = True
@@ -1144,13 +1232,20 @@ async def resolution_catalog(request: ResolutionCatalogRequest) -> dict[str, Any
 
 @app.post("/resolution-catalog/select")
 async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, Any]:
+    tenant_id = require_tenant_id(request.tenant_id, source="resolution selection request")
+    await _require_catalog_readiness(request)
     try:
-        plan = prepare_resolution_plan(option_id=request.option_id, issue=request.issue, service=request.service)
+        plan = prepare_resolution_plan(
+            tenant_id=tenant_id,
+            option_id=request.option_id,
+            issue=request.issue,
+            service=request.service,
+        )
     except ValueError as exc:
         from fastapi import HTTPException
 
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"incident_id": request.incident_id, "selected": plan}
+    return {"incident_id": str(request.incident_id), "selected": plan}
 
 
 @app.post("/resolve", response_model=Recommendation)
