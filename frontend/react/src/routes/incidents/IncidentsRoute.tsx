@@ -12,19 +12,6 @@ const PAGE_SIZE = 10;
 type InboxView = "needs_me" | "kai_handling" | "critical" | "watching" | "resolved" | "all";
 type RecordType = "all" | "incidents" | "alerts";
 
-function attentionScore(row: IncidentRow) {
-  const severity = String(row.severity || "").toLowerCase();
-  const status = String(row.status || "").toLowerCase();
-  const payload = row.projection_payload && typeof row.projection_payload === "object" ? row.projection_payload : {};
-  const ageHours = Math.max(0, (Date.now() - new Date(String(row.created_at || row.updated_at || Date.now())).getTime()) / 3_600_000);
-  return (["critical", "sev1", "p1"].includes(severity) ? 100 : ["high", "sev2", "p2"].includes(severity) ? 60 : severity === "medium" ? 30 : 10)
-    + (status.includes("approval") ? 120 : 0)
-    + (["failed", "blocked", "manual_intervention_required", "validation_failed", "rollback_failed"].some((value) => status.includes(value)) ? 140 : 0)
-    + (payload.customer_impact || payload.business_impact || payload.impact ? 50 : 0)
-    + (String(row.risk_tier || "").toLowerCase() === "high" ? 35 : 0)
-    + Math.min(48, ageHours);
-}
-
 function belongsToInboxView(row: IncidentRow, view: InboxView) {
   const status = String(row.status || "").toLowerCase();
   const severity = String(row.severity || "").toLowerCase();
@@ -53,15 +40,6 @@ function alertLinkedIncidentId(row: AlertStreamRow) {
   // Some source adapters reuse the alert identifier in incident_id before an
   // incident exists. Only a distinct identifier is an evidence-backed link.
   return candidate && candidate !== alertId ? candidate : "";
-}
-
-function alertAttentionScore(row: AlertStreamRow) {
-  const severity = String(row.severity || row.priority || "").toLowerCase();
-  const disposition = alertDisposition(row);
-  const ageHours = Math.max(0, (Date.now() - new Date(String(row.received_at || row.created_at || row.first_seen || Date.now())).getTime()) / 3_600_000);
-  return (["critical", "p1", "sev1"].includes(severity) ? 95 : ["high", "p2", "sev2"].includes(severity) ? 55 : severity === "medium" || severity === "warning" ? 25 : 8)
-    + (disposition.noise ? -100 : disposition.duplicate ? -35 : 35)
-    + Math.min(24, ageHours);
 }
 
 function alertBelongsToInboxView(row: AlertStreamRow, view: InboxView) {
@@ -106,12 +84,15 @@ type IncidentGroupPage = {
   unlinked_signal_count: number;
   generated_at: string;
 };
+type UnifiedRecord = { record_type: "incident"; score: number; row: IncidentRow } | { record_type: "alert"; score: number; row: AlertStreamRow };
+type UnifiedPage = { rows: UnifiedRecord[]; next_cursor: string | null; previous_cursor: string | null; total_count: number; filtered_count: number; view_counts: Record<string, number> };
 
 const EMPTY_GROUP_PAGE: IncidentGroupPage = {
   rows: [], next_cursor: null, previous_cursor: null, total_count: 0,
   filtered_count: 0, active_count: 0, needs_attention_count: 0,
   unlinked_signal_count: 0, generated_at: "",
 };
+const EMPTY_UNIFIED_PAGE: UnifiedPage = { rows: [], next_cursor: null, previous_cursor: null, total_count: 0, filtered_count: 0, view_counts: {} };
 
 function incidentTime(row: IncidentRow) {
   const timestamp = Date.parse(String(row.updated_at || row.created_at || ""));
@@ -390,9 +371,9 @@ export default function IncidentsRoute() {
   const [searchParams, setSearchParams] = useSearchParams();
   const cursor = String(searchParams.get("cursor") || "");
   const restoredFilter = (name: keyof IncidentFilters) => String(searchParams.get(name) ?? incidents.filters[name] ?? "");
-  const [groupPage, setGroupPage] = useState<IncidentGroupPage>(EMPTY_GROUP_PAGE);
-  const [groupLoading, setGroupLoading] = useState(false);
-  const [groupError, setGroupError] = useState("");
+  const groupPage: IncidentGroupPage = { ...EMPTY_GROUP_PAGE, ...incidents.page, rows: incidents.rows };
+  const groupLoading = incidents.loading;
+  const groupError = incidents.error;
   const focusedIncidentId = String(searchParams.get("incident_id") || "").trim();
   const [recordType, setRecordType] = useState<RecordType>(() => {
     const requested = searchParams.get("type");
@@ -405,37 +386,38 @@ export default function IncidentsRoute() {
   });
   const [page, setPage] = useState(1);
   const [inboxView, setInboxView] = useState<InboxView>("all");
+  const [unifiedPage, setUnifiedPage] = useState<UnifiedPage>(EMPTY_UNIFIED_PAGE);
+  const [unifiedLoading, setUnifiedLoading] = useState(false);
+  const [unifiedError, setUnifiedError] = useState("");
   const [inspector, setInspector] = useState<{ incidentId: string; stage: string } | null>(null);
   const [closure, setClosure] = useState({ incidentId: "", comment: "", loading: false, message: "", error: "" });
   const inboxAlertRows = alerts.inboxRows || alerts.rows;
+  useEffect(() => { incidents.loadPage(cursor); }, [cursor]);
   useEffect(() => {
-    if (!session.accessToken) return;
-    const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
+    if (!session.accessToken || recordType !== "all") return undefined;
+    const params = new URLSearchParams({ limit: String(PAGE_SIZE), inbox_view: inboxView, record_type: "all" });
     if (cursor) params.set("cursor", cursor);
-    for (const [key, value] of Object.entries({
-      risk_tier: restoredFilter("risk_tier"),
-      execution_mode: restoredFilter("execution_mode"),
-      status: restoredFilter("status"),
+    for (const [key, filterValue] of Object.entries({
+      risk_tier: restoredFilter("risk_tier"), execution_mode: restoredFilter("execution_mode"),
+      transport_provider: restoredFilter("transport_provider"), status: restoredFilter("status"),
       service: restoredFilter("service"),
-    })) {
-      if (value && value !== "all") params.set(key, value);
-    }
+    })) if (filterValue && filterValue !== "all") params.set(key, filterValue);
     const controller = new AbortController();
-    setGroupLoading(true);
-    setGroupError("");
-    void fetch(`/api-gateway/incidents/groups?${params.toString()}`, {
+    setUnifiedLoading(true);
+    setUnifiedError("");
+    void fetch(`/api-gateway/incidents/inbox/feed?${params.toString()}`, {
       headers: { Authorization: `Bearer ${session.accessToken}` }, signal: controller.signal,
     }).then(async (response) => {
       const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(String(payload?.detail?.message || payload?.detail || `Incident groups failed (${response.status})`));
+      if (!response.ok) throw new Error(String(payload?.detail?.message || payload?.detail || `Unified inbox failed (${response.status})`));
       const result = payload?.data && typeof payload.data === "object" ? payload.data : payload;
-      setGroupPage({ ...EMPTY_GROUP_PAGE, ...result, rows: Array.isArray(result?.rows) ? result.rows : [] });
+      setUnifiedPage({ ...EMPTY_UNIFIED_PAGE, ...result, rows: Array.isArray(result?.rows) ? result.rows : [] });
     }).catch((error) => {
       if (error instanceof DOMException && error.name === "AbortError") return;
-      setGroupError(String((error as Error).message || error));
-    }).finally(() => { if (!controller.signal.aborted) setGroupLoading(false); });
+      setUnifiedError(String((error as Error).message || error));
+    }).finally(() => { if (!controller.signal.aborted) setUnifiedLoading(false); });
     return () => controller.abort();
-  }, [cursor, incidents.filters.execution_mode, incidents.filters.risk_tier, incidents.filters.service, incidents.filters.status, session.accessToken]);
+  }, [cursor, inboxView, recordType, session.accessToken, incidents.filters.execution_mode, incidents.filters.risk_tier, incidents.filters.service, incidents.filters.status, incidents.filters.transport_provider]);
   const closeIncident = async (row: IncidentRow) => {
     const incidentId = String(row.incident_id || row.id || "").trim();
     const comment = closure.comment.trim();
@@ -480,11 +462,10 @@ export default function IncidentsRoute() {
         .some((value) => String(value || "").toLowerCase().includes(serviceQuery));
     });
   }, [inboxAlertRows, incidents.filters.service, inboxView, recordType, unlinkedAlerts]);
-  const unifiedRecords = useMemo(() => [
-    ...filteredIncidents.map((row) => ({ kind: "incident" as const, score: attentionScore(row), row })),
-    ...filteredAlerts.map((row) => ({ kind: "alert" as const, score: alertAttentionScore(row), row })),
-  ].sort((left, right) => right.score - left.score), [filteredAlerts, filteredIncidents]);
-  const totalRecords = recordType === "all" ? groupPage.filtered_count + groupPage.unlinked_signal_count : recordType === "alerts" ? filteredAlerts.length : groupPage.filtered_count;
+  const unifiedRecords = useMemo(() => unifiedPage.rows.map((item) => item.record_type === "incident"
+    ? { kind: "incident" as const, score: item.score, row: item.row as IncidentRow }
+    : { kind: "alert" as const, score: item.score, row: item.row as AlertStreamRow }), [unifiedPage.rows]);
+  const totalRecords = recordType === "all" ? unifiedPage.filtered_count : recordType === "alerts" ? filteredAlerts.length : groupPage.filtered_count;
   const pages = Math.max(1, Math.ceil(totalRecords / PAGE_SIZE));
   useEffect(() => {
     if (!focusedIncidentId) return;
@@ -500,7 +481,7 @@ export default function IncidentsRoute() {
     return filteredIncidents;
   }, [focusedIncidentId, groupedIncidents, filteredIncidents]);
   const visibleAlerts = useMemo(() => filteredAlerts.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE), [filteredAlerts, page]);
-  const visibleUnifiedRecords = useMemo(() => unifiedRecords.slice(0, PAGE_SIZE), [unifiedRecords]);
+  const visibleUnifiedRecords = unifiedRecords;
   const changePresentation = (next: Presentation) => {
     if (next === "summary" && focusedIncidentId) setSearchParams({}, { replace: true });
     setPresentation(next);
@@ -515,8 +496,7 @@ export default function IncidentsRoute() {
   const needsAttention = groupPage.needs_attention_count;
   const viewCount = (view: InboxView) => {
     const incidentCount = view === "all" ? groupPage.total_count : view === "needs_me" ? groupPage.needs_attention_count : view === "resolved" ? Math.max(0, groupPage.total_count - groupPage.active_count) : groupedIncidents.filter((row) => belongsToInboxView(row, view)).length;
-    const alertCount = unlinkedAlerts.filter((row) => alertBelongsToInboxView(row, view)).length;
-    return recordType === "incidents" ? incidentCount : recordType === "alerts" ? inboxAlertRows.filter((row) => alertBelongsToInboxView(row, view)).length : incidentCount + alertCount;
+    return recordType === "incidents" ? incidentCount : recordType === "alerts" ? inboxAlertRows.filter((row) => alertBelongsToInboxView(row, view)).length : Number(unifiedPage.view_counts[view] || 0);
   };
   const showUnified = recordType === "all";
   const showAlerts = recordType === "alerts";
@@ -530,7 +510,7 @@ export default function IncidentsRoute() {
     </header>
     <nav className="incident-inbox-views" aria-label="Incident inbox views">{([
       ["needs_me", "Needs me"], ["kai_handling", "Kai handling"], ["critical", "Critical"], ["watching", "Watching"], ["resolved", "Resolved recently"], ["all", "All"],
-    ] as const).map(([id, label]) => <button type="button" key={id} className={inboxView === id ? "active" : ""} aria-pressed={inboxView === id} onClick={() => { setInboxView(id); setPage(1); }}>{label}<span>{viewCount(id)}</span></button>)}</nav>
+    ] as const).map(([id, label]) => <button type="button" key={id} className={inboxView === id ? "active" : ""} aria-pressed={inboxView === id} onClick={() => { setInboxView(id); setPage(1); setSearchParams((current) => { const next = new URLSearchParams(current); next.delete("cursor"); return next; }); }}>{label}<span>{viewCount(id)}</span></button>)}</nav>
     <div className="inbox-source-tabs" role="tablist" aria-label="Inbox source">
       <button type="button" role="tab" aria-selected={showUnified} className={showUnified ? "active" : ""} onClick={() => { setRecordType("all"); setPresentation("summary"); setPage(1); }}><span>All activity</span><strong>{groupPage.total_count + groupPage.unlinked_signal_count}</strong><small>Incidents + unlinked signals</small></button>
       <button type="button" role="tab" aria-selected={showIncidents} className={showIncidents ? "active" : ""} onClick={() => { setRecordType("incidents"); setPage(1); }}><span>Incidents</span><strong>{groupPage.total_count}</strong><small>Correlated operational work</small></button>
@@ -548,8 +528,8 @@ export default function IncidentsRoute() {
       <button type="button" role="radio" aria-checked={presentation === "details"} className={presentation === "details" ? "active" : ""} onClick={() => changePresentation("details")}><Rows3 size={15} /><span><strong>Split Workspace</strong><small>{showAlerts ? "Alert and evidence" : "Incident and evidence"}</small></span></button>
       <button type="button" role="radio" aria-checked={presentation === "flow"} className={presentation === "flow" ? "active" : ""} onClick={() => changePresentation("flow")}><Workflow size={15} /><span><strong>Correlation Timeline</strong><small>{showAlerts ? "Signal processing path" : "Executed lifecycle"}</small></span></button>
     </div> : null}
-    {incidents.error || groupError ? <p className="error">{groupError || incidents.error}</p> : null}
-    <div className={`incident-summary-list view-${presentation}`} aria-busy={incidents.loading || groupLoading || alerts.loading}>
+    {showUnified ? (unifiedError ? <p className="error">{unifiedError}</p> : null) : incidents.error || groupError ? <p className="error">{groupError || incidents.error}</p> : null}
+    <div className={`incident-summary-list view-${presentation}`} aria-busy={showUnified ? unifiedLoading : incidents.loading || groupLoading || alerts.loading}>
       {showUnified ? <div className="unified-inbox-stack" role="region" aria-label="Prioritized operational activity">{visibleUnifiedRecords.map((record, index) => {
         if (record.kind === "incident") {
           const row = record.row;
@@ -704,6 +684,6 @@ export default function IncidentsRoute() {
       {showAlerts && !visibleAlerts.length && !alerts.loading ? <p className="empty-state">No signals match this view.</p> : null}
       {showIncidents && !rows.length && !incidents.loading ? <p className="empty-state">No incidents match this view.</p> : null}
     </div>
-    {!focusedIncidentId ? <footer className="table-pagination"><span>Showing {totalRecords ? ((page - 1) * PAGE_SIZE) + 1 : 0}-{Math.min(page * PAGE_SIZE, totalRecords)} of {totalRecords}</span><div><button className="button-secondary" disabled={!showAlerts ? !groupPage.previous_cursor : page <= 1} onClick={() => { if (!showAlerts && groupPage.previous_cursor) { setSearchParams((current) => { const next = new URLSearchParams(current); next.set("cursor", groupPage.previous_cursor || ""); return next; }); } setPage((value) => Math.max(1, value - 1)); }}>Previous</button><span>{page} / {pages}</span><button className="button-secondary" disabled={!showAlerts ? !groupPage.next_cursor : page >= pages} onClick={() => { if (!showAlerts && groupPage.next_cursor) { setSearchParams((current) => { const next = new URLSearchParams(current); next.set("cursor", groupPage.next_cursor || ""); return next; }); } setPage((value) => value + 1); }}>Next</button></div></footer> : null}
+    {!focusedIncidentId ? <footer className="table-pagination"><span>Showing {totalRecords ? ((page - 1) * PAGE_SIZE) + 1 : 0}-{Math.min(page * PAGE_SIZE, totalRecords)} of {totalRecords}</span><div><button className="button-secondary" disabled={showAlerts ? page <= 1 : !(showUnified ? unifiedPage.previous_cursor : groupPage.previous_cursor)} onClick={() => { const previous = showUnified ? unifiedPage.previous_cursor : groupPage.previous_cursor; if (!showAlerts && previous) { setSearchParams((current) => { const next = new URLSearchParams(current); next.set("cursor", previous); return next; }); } setPage((value) => Math.max(1, value - 1)); }}>Previous</button><span>{page} / {pages}</span><button className="button-secondary" disabled={showAlerts ? page >= pages : !(showUnified ? unifiedPage.next_cursor : groupPage.next_cursor)} onClick={() => { const nextCursor = showUnified ? unifiedPage.next_cursor : groupPage.next_cursor; if (!showAlerts && nextCursor) { setSearchParams((current) => { const next = new URLSearchParams(current); next.set("cursor", nextCursor); return next; }); } setPage((value) => value + 1); }}>Next</button></div></footer> : null}
   </section>;
 }

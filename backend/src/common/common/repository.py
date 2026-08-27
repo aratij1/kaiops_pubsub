@@ -745,7 +745,7 @@ class IncidentRepository:
         include_incident_context: bool = True,
         tenant_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(int(limit), 5000))
+        safe_limit = max(1, min(int(limit), 10000))
         alert_ids_query = select(AlertRecord.id)
         if tenant_id is not None:
             alert_ids_query = alert_ids_query.where(AlertRecord.tenant_id == self._require("tenant_id", tenant_id))
@@ -4445,9 +4445,18 @@ class IncidentRepository:
         return len(rebuilt_ids)
 
     @staticmethod
-    def _incident_group_cursor(row: IncidentCorrelationOwnershipRecord, direction: str) -> str:
+    def _incident_group_cursor(
+        row: IncidentCorrelationOwnershipRecord,
+        direction: str,
+        filter_fingerprint: str,
+    ) -> str:
         payload = json.dumps(
-            {"at": row.first_seen_at.isoformat(), "id": str(row.id), "direction": direction},
+            {
+                "at": row.first_seen_at.isoformat(),
+                "id": str(row.id),
+                "direction": direction,
+                "filter": filter_fingerprint,
+            },
             separators=(",", ":"),
         ).encode("utf-8")
         return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
@@ -4465,9 +4474,16 @@ class IncidentRepository:
     ) -> dict[str, Any]:
         """Return canonical correlation families before applying cursor pagination."""
         tenant_id = self._require("tenant_id", tenant_id)
-        safe_limit = max(1, min(int(limit), 100))
+        safe_limit = max(1, min(int(limit), 10000))
         terminal = ("closed", "resolved", "cancelled", "canceled")
         attention = ("failed", "blocked", "awaiting_approval", "pending_approval", "approval_required")
+        filter_fingerprint = hashlib.sha256(json.dumps({
+            "tenant_id": tenant_id,
+            "status": str(status or "").strip().lower(),
+            "service": str(service or "").strip(),
+            "risk_tier": str(risk_tier or "").strip().lower(),
+            "execution_mode": str(execution_mode or "").strip().lower(),
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         latest_generation = (
             select(
                 IncidentCorrelationOwnershipRecord.correlation_family_id.label("family_id"),
@@ -4641,6 +4657,8 @@ class IncidentRepository:
                 direction = "previous" if decoded.get("direction") == "previous" else "next"
             except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
                 raise ValueError("Invalid incident group cursor") from exc
+            if decoded.get("filter") != filter_fingerprint:
+                raise ValueError("Incident group cursor does not match the active filters")
 
         page_query = scoped_query(apply_filters=True)
         if cursor_at is not None and cursor_id is not None:
@@ -4747,11 +4765,11 @@ class IncidentRepository:
         previous_cursor = None
         if ownership_rows:
             if direction == "next" and has_more:
-                next_cursor = self._incident_group_cursor(ownership_rows[-1], "next")
+                next_cursor = self._incident_group_cursor(ownership_rows[-1], "next", filter_fingerprint)
             elif direction == "previous" or cursor:
-                next_cursor = self._incident_group_cursor(ownership_rows[-1], "next")
+                next_cursor = self._incident_group_cursor(ownership_rows[-1], "next", filter_fingerprint)
             if cursor or direction == "previous":
-                previous_cursor = self._incident_group_cursor(ownership_rows[0], "previous")
+                previous_cursor = self._incident_group_cursor(ownership_rows[0], "previous", filter_fingerprint)
         return {
             "rows": response_rows,
             "next_cursor": next_cursor,
@@ -4778,7 +4796,7 @@ class IncidentRepository:
         incident_id: str | None = None,
         incident_ids: list[UUID] | None = None,
     ) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(int(limit), 1000))
+        safe_limit = max(1, min(int(limit), 10000))
         # Apply ordering and the limit to narrow scalar columns before loading
         # projection_payload. On databases that drifted without the updated_at
         # index, sorting full JSON-bearing rows can exhaust MySQL's sort buffer.

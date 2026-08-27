@@ -481,7 +481,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }, [dashboardAlertQuery]);
   const [dashboardAlertFocus, setDashboardAlertFocus] = useState("all");
   const [dashboardAlertSource, setDashboardAlertSource] = useState("all");
-  const [incidentMetadata, setIncidentMetadata] = useState({ loading: false, rows: [], error: "" });
+  const [incidentMetadata, setIncidentMetadata] = useState({ loading: false, rows: [], error: "", page: {} });
   const [closedIncidents, setClosedIncidents] = useState({ loading: false, rows: [], error: "" });
   const [flows, setFlows] = useState({ loading: false, rows: [], error: "" });
   const [gatewaySummary, setGatewaySummary] = useState({ loading: false, data: {}, error: "" });
@@ -1762,7 +1762,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     try {
       // List views need projection fields, not the heavier action/evaluation
       // enrichment that is fetched when an operator opens an incident.
-      const params = new URLSearchParams({ limit: "100" });
+      const params = new URLSearchParams({ limit: String(options?.limit || 10) });
+      if (String(options?.cursor || "").trim()) params.set("cursor", String(options.cursor).trim());
       const currentFilters = ignoreFilters
         ? { risk_tier: "all", execution_mode: "all", transport_provider: "all", status: "all", service: "" }
         : incidentMetadataFiltersRef.current;
@@ -1788,14 +1789,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const data = unwrap(payload);
       const rows = data?.rows || [];
       const nextRows = Array.isArray(rows) ? rows : [];
-      setIncidentMetadata((prev) => JSON.stringify(prev.rows) === JSON.stringify(nextRows) && !prev.loading && !prev.error
-        ? prev
-        : { loading: false, rows: nextRows, error: "" });
+      setIncidentMetadata({ loading: false, rows: nextRows, error: "", page: data || {} });
     } catch (error) {
       setIncidentMetadata((prev) => ({
         loading: false,
         rows: Array.isArray(prev.rows) ? prev.rows : [],
         error: Array.isArray(prev.rows) && prev.rows.length ? "" : error.message,
+        page: prev.page || {},
       }));
     } finally {
       const pending = Boolean(incidentMetadataRequestRef.current.pending);
@@ -10234,11 +10234,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               // Keep the inbox aligned with the same production/test and
               // application scope used by Live Alerts.
               rows: monitorScopedIncidentMetadata,
+              page: incidentMetadata.page || {},
               loading: incidentMetadata.loading,
               error: incidentMetadata.error || "",
               application: applicationToMonitor,
               filters: metadataFilters,
               refresh: loadIncidentMetadata,
+              loadPage: (cursor = "") => loadIncidentMetadata({ cursor, limit: 10 }),
               updateFilter: (name, value) => setMetadataFilters((current) => ({ ...current, [name]: value })),
               open: (row) => {
                 const path = durableIncidentPath(row);
