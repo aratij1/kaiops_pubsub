@@ -226,6 +226,12 @@ class Settings(BaseSettings):
     # Defaults to "gpt-4o" since that's the deployment already proven live on
     # this endpoint via the evaluation client.
     azure_openai_chat_deployment: str = Field(default="gpt-4o", alias="AZURE_OPENAI_CHAT_DEPLOYMENT")
+    azure_openai_reasoning_standard_deployment: str = Field(
+        default="", alias="AZURE_OPENAI_REASONING_STANDARD_DEPLOYMENT"
+    )
+    azure_openai_reasoning_critical_deployment: str = Field(
+        default="", alias="AZURE_OPENAI_REASONING_CRITICAL_DEPLOYMENT"
+    )
     llm_request_timeout_seconds: float = Field(default=120.0, alias="LLM_REQUEST_TIMEOUT_SECONDS")
     model_router_prompt_cache_enabled: bool = Field(default=True, alias="MODEL_ROUTER_PROMPT_CACHE_ENABLED")
     model_router_prompt_cache_ttl_seconds: float = Field(default=300.0, alias="MODEL_ROUTER_PROMPT_CACHE_TTL_SECONDS")

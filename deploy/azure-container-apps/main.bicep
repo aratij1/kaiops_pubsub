@@ -12,6 +12,13 @@ param oidcClientId string
 param otlpEndpoint string
 @description('Reachable Temporal frontend host:port, typically a managed Temporal endpoint.')
 param temporalAddress string
+param azureOpenAIEndpoint string
+param azureOpenAIApiVersion string = '2024-06-01'
+param azureOpenAIChatDeployment string
+param azureOpenAIReasoningStandardDeployment string = ''
+param azureOpenAIReasoningCriticalDeployment string = ''
+param modelRouterReasoningBackend string = 'azure-openai'
+param modelRouterDefaultProvider string = 'azure-openai'
 param mysqlDatabase string = 'kaiops'
 param revisionSuffix string = utcNow('yyyyMMddHHmm')
 @description('Purpose-built, allowlisted remediation runner image used by the manual Container Apps Job.')
@@ -27,6 +34,8 @@ param azureBlobConnectionSecretUri string
 param remediationInternalTokenSecretUri string
 @secure()
 param eventEnvelopeSigningKeySecretUri string
+@secure()
+param azureOpenAIApiKeySecretUri string
 
 @description('Existing KaiOps-compatible processes. Domain is metadata; it does not merge runtimes.')
 param apps array
@@ -124,6 +133,7 @@ resource containerApps 'Microsoft.App/containerApps@2024-03-01' = [for app in ap
         { name: 'blob-connection', keyVaultUrl: azureBlobConnectionSecretUri, identity: identity.id }
         { name: 'remediation-internal-token', keyVaultUrl: remediationInternalTokenSecretUri, identity: identity.id }
         { name: 'event-envelope-signing-key', keyVaultUrl: eventEnvelopeSigningKeySecretUri, identity: identity.id }
+        { name: 'azure-openai-api-key', keyVaultUrl: azureOpenAIApiKeySecretUri, identity: identity.id }
       ]
     }
     template: {
@@ -155,6 +165,13 @@ resource containerApps 'Microsoft.App/containerApps@2024-03-01' = [for app in ap
           { name: 'AZURE_BLOB_CONNECTION_STRING', secretRef: 'blob-connection' }
           { name: 'OTEL_EXPORTER_OTLP_ENDPOINT', value: otlpEndpoint }
           { name: 'TEMPORAL_ADDRESS', value: temporalAddress }
+          { name: 'AZURE_OPENAI_ENDPOINT', value: azureOpenAIEndpoint }
+          { name: 'AZURE_OPENAI_API_VERSION', value: azureOpenAIApiVersion }
+          { name: 'AZURE_OPENAI_CHAT_DEPLOYMENT', value: azureOpenAIChatDeployment }
+          { name: 'AZURE_OPENAI_REASONING_STANDARD_DEPLOYMENT', value: azureOpenAIReasoningStandardDeployment }
+          { name: 'AZURE_OPENAI_REASONING_CRITICAL_DEPLOYMENT', value: azureOpenAIReasoningCriticalDeployment }
+          { name: 'MODEL_ROUTER_REASONING_BACKEND', value: modelRouterReasoningBackend }
+          { name: 'MODEL_ROUTER_DEFAULT_PROVIDER', value: modelRouterDefaultProvider }
           { name: 'CONTEXT_AGENT_URL', value: 'https://${namePrefix}-context-agent.${environment.properties.defaultDomain}' }
           { name: 'RESOLUTION_AGENT_URL', value: 'https://${namePrefix}-resolution-agent.${environment.properties.defaultDomain}' }
           { name: 'APPROVAL_SERVICE_URL', value: 'https://${namePrefix}-approval-service.${environment.properties.defaultDomain}' }
@@ -163,7 +180,9 @@ resource containerApps 'Microsoft.App/containerApps@2024-03-01' = [for app in ap
           { name: 'MONITORING_ADAPTER_URL', value: 'https://${namePrefix}-monitoring-adapter.${environment.properties.defaultDomain}' }
           { name: 'MODEL_ROUTER_URL', value: 'https://${namePrefix}-model-router.${environment.properties.defaultDomain}' }
           { name: 'APPLICATION_ONBOARDING_URL', value: 'https://${namePrefix}-application-onboarding.${environment.properties.defaultDomain}' }
-        ], app.name == 'remediation-engine' ? [
+        ], contains(['model-router', 'context-agent', 'resolution-agent'], app.name) ? [
+          { name: 'AZURE_OPENAI_API_KEY', secretRef: 'azure-openai-api-key' }
+        ] : [], app.name == 'remediation-engine' ? [
           { name: 'REMEDIATION_TEMPORAL_ENABLED', value: 'true' }
           { name: 'REMEDIATION_TEMPORAL_TASK_QUEUE', value: 'kaiops-remediation' }
           { name: 'REMEDIATION_INTERNAL_TOKEN', secretRef: 'remediation-internal-token' }
