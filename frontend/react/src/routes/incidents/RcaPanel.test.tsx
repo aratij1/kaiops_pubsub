@@ -3,11 +3,19 @@ import "@testing-library/jest-dom/vitest";
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import RcaPanel from "./RcaPanel";
+import RcaPanel, { resolutionBindingFor } from "./RcaPanel";
 
 vi.mock("../../app/routeRuntime", () => ({ useRouteRuntimeSlice: () => ({ accessToken: "test-token" }) }));
 
 describe("RcaPanel canonical evidence gate", () => {
+  it("never substitutes the alert id for the canonical incident id", () => {
+    const binding = resolutionBindingFor(
+      { incident: { id: "incident-123" }, incident_investigation: { alert_id: "alert-456" } },
+      "alert-456",
+    );
+    expect(binding.incident_id).toBe("incident-123");
+    expect(binding.incident_id).not.toBe(binding.alert_id);
+  });
   it("shows zero linked records and blocks remediation navigation without backend readiness", () => {
     render(<RcaPanel
       rcaDetailView="simple" onSetRcaDetailView={vi.fn()} onSetHomeDetailTab={vi.fn()}
