@@ -39,6 +39,6 @@ async def test_context_collection_preserves_healthy_evidence_when_a_connector_fa
     assert context.observability["latency_p95_ms"] == 420
     assert graph["collected_count"] == 1
     assert graph["degraded"] is True
-    assert graph["connectors"]["prometheus"]["status"] == "collected"
-    assert graph["connectors"]["kubernetes"]["status"] == "failed"
+    assert graph["connectors"]["prometheus"]["status"] == "completed"
+    assert graph["connectors"]["kubernetes"]["status"] == "unavailable"
     assert graph["connectors"]["kubernetes"]["error_type"] == "RuntimeError"
