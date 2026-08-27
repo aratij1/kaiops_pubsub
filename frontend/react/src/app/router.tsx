@@ -66,6 +66,7 @@ export const router = createBrowserRouter([
     errorElement: <RouteErrorBoundary />,
     children: [
       { path: "/incidents/:incidentId", element: routeElement(IncidentCommandRoute) },
+      { path: "/incidents/*", element: routeElement(IncidentCommandRoute) },
       { path: "/applications/:applicationId", element: routeElement(ApplicationsRoute) },
       ...NAVIGATION_ITEMS.map((item) => ({ path: item.path, element: routeElement(ROUTE_COMPONENTS[item.id]) })),
       ...LEGACY_REDIRECTS.map((redirect) => ({ path: redirect.from, element: <Navigate to={redirect.to} replace /> })),
