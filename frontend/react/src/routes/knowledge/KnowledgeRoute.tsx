@@ -79,7 +79,7 @@ export default function KnowledgeRoute() {
 
   return <section className="grid single-col ai-hub">
     <article className="panel ai-hub-hero">
-      <div className="ai-hub-hero-copy"><span className="discovery-eyebrow"><Sparkles size={14} aria-hidden="true" /> KaiMS intelligence control plane</span><h1>Operational Knowledge</h1><h2>Operational intelligence</h2><p>Govern the knowledge, agents, and delivery pipelines that power trusted incident resolution.</p><div className="ai-hub-hero-meta"><span><i className={groundingActive ? "is-online" : "is-idle"} />{groundingActive ? "Grounding online" : "Awaiting workflow data"}</span><span>{knowledge.application || "KaiMS"} workspace</span></div></div>
+      <div className="ai-hub-hero-copy"><span className="discovery-eyebrow"><Sparkles size={14} aria-hidden="true" /> KaiMS intelligence control plane</span><h2>Operational Knowledge</h2><h3>Operational intelligence</h3><p>Govern the knowledge, agents, and delivery pipelines that power trusted incident resolution.</p><div className="ai-hub-hero-meta"><span><i className={groundingActive ? "is-online" : "is-idle"} />{groundingActive ? "Grounding online" : "Awaiting workflow data"}</span><span>{knowledge.application || "KaiMS"} workspace</span></div></div>
       <button className="button-secondary ai-hub-refresh" onClick={refreshHub}><RefreshCw size={15} aria-hidden="true" /> Refresh status</button>
     </article>
     <nav className="settings-tabs ai-hub-tabs" aria-label="AI Hub sections" role="tablist">{hubTabs.map(([id,label]) => <button type="button" role="tab" aria-selected={view===id} aria-controls={`ai-hub-panel-${id}`} id={`ai-hub-tab-${id}`} key={id} className={view===id?'active':''} onClick={()=>setView(id)}>{label}</button>)}</nav>

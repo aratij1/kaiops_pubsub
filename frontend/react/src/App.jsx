@@ -5900,7 +5900,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       analysis.rca?.causal_chain || analysis.rca?.mechanism || analysis.rca?.reasoning || analysis.rca?.contributing_factors,
       "The causal mechanism was not supplied by the current analysis.",
     );
-    const confidence = Number(selectedAlertEvaluation.confidenceScore || analysis.confidence || 0);
+    const hasLinkedEvidence = selectedAiTrust.evidence.length > 0;
+    const reportedConfidence = Number(selectedAlertEvaluation.confidenceScore || analysis.confidence || 0);
+    const confidence = hasLinkedEvidence ? reportedConfidence : 0;
     const investigation = selectedAlertWorkflow?.recommendation?.metadata?.investigation_report
       || selectedAlertWorkflow?.recommendation?.metadata?.iterative_investigation
       || {};
@@ -5910,6 +5912,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const groundingScore = Number(selectedAlertEvaluation.groundingScore || 0);
     const reviewRequired = Boolean(
       selectedAlertEvaluation.requiresReview
+      || !hasLinkedEvidence
       || confidence < 0.85
       || groundingScore < 0.85
       || !investigationConclusive
@@ -5922,7 +5925,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       ...analysis,
       confidence,
       reviewRequired,
-      confidenceLabel: confidence >= 0.85 ? "High confidence" : confidence >= 0.7 ? "Moderate confidence" : "Low confidence",
+      confidenceLabel: !hasLinkedEvidence ? "Ungrounded" : confidence >= 0.85 ? "High confidence" : confidence >= 0.7 ? "Moderate confidence" : "Low confidence",
       impactedServices,
       causalDetails,
       impactEvidence: evidenceUsed,
@@ -5939,7 +5942,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       dependencyImpact: readableImpactText(impact.dependency_impact, "Dependency impact was not established by the collected evidence."),
       urgency: cleanRecommendationText(impact.severity_rationale || impact.urgency, selectedAlertRow?.severity ? `${selectedAlertRow.severity} alert priority; business urgency requires operator validation.` : "Operational urgency was not established."),
     };
-  }, [selectedAlertWorkflow, selectedAlertRow, selectedAlertEvaluation, selectedAiTrust.missing.length, selectedAiTrust.conflicting.length]);
+  }, [selectedAlertWorkflow, selectedAlertRow, selectedAlertEvaluation, selectedAiTrust.evidence.length, selectedAiTrust.missing.length, selectedAiTrust.conflicting.length]);
 
   const selectedInvestigationReport = selectedAlertWorkflow?.recommendation?.metadata?.investigation_report
     || selectedAlertWorkflow?.recommendation?.metadata?.iterative_investigation
@@ -10983,13 +10986,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                       <div className="alert-rule-summary-grid">
                         <article className="alert-rule-summary-card">
                           <span>Overall Quality</span>
-                          <strong>{formatQualityPercent(selectedAlertEvaluation.overallScore)}</strong>
-                          <small>{selectedAlertEvaluation.qualityLabel} | {selectedAlertEvaluation.provider}</small>
+                          <strong>{selectedAiTrust.evidence.length ? formatQualityPercent(selectedAlertEvaluation.overallScore) : "Unavailable"}</strong>
+                          <small>{selectedAiTrust.evidence.length ? `${selectedAlertEvaluation.qualityLabel} | ${selectedAlertEvaluation.provider}` : "No linked evidence"}</small>
                         </article>
                         <article className="alert-rule-summary-card">
                           <span>Confidence</span>
-                          <strong>{formatQualityPercent(selectedAlertEvaluation.confidenceScore)}</strong>
-                          <small>Recommendation certainty</small>
+                          <strong>{selectedAiTrust.evidence.length ? formatQualityPercent(selectedRcaDecision.confidence) : "Unavailable"}</strong>
+                          <small>{selectedAiTrust.evidence.length ? "Evidence-grounded recommendation certainty" : "Ungrounded recommendation"}</small>
                         </article>
                         <article className="alert-rule-summary-card">
                           <span>Grounding</span>
