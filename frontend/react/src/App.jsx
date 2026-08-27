@@ -14,6 +14,7 @@ import { incidentDraftHasSubstantiveContent, simpleIncidentReport } from "./doma
 import { approvalFlowFromPayload, approvalFlowId, approvalIncidentId, approvalRecommendationFromPayload, approvalRecommendationId, approvalTraceId } from "./domain/approvalContext";
 import { buildOnboardingSources } from "./domain/onboardingSources";
 import { buildAlertDocumentDraft as buildRcaEvidenceDocumentDraft } from "./domain/alertDocumentDraft";
+import { buildIncidentGroupQuery } from "./features/incidents/incidentGroupQuery";
 import RcaPanel from "./routes/incidents/RcaPanel";
 import ResolutionPanel from "./routes/incidents/ResolutionPanel";
 import VerifyWorkspace from "./routes/incidents/VerifyWorkspace";
@@ -21,6 +22,7 @@ import "./routes/incidents/ExecutionWorkspace.css";
 import "./routes/incidents/AnalysisModeSelector.css";
 import "./styles/product-ui.css";
 import "./styles/product-foundation.css";
+import "./styles/legacy-operations.css";
 import CopilotRoute from "./routes/copilot/CopilotRoute";
 import { breadcrumbForPath, groupedNavigationForRole, navigationItemForPath, TAB_SHORTCUT_BY_CODE, VALID_LEGACY_TABS } from "./app/navigation";
 import { allowedLegacyTabsForRole, canAccessDestination } from "./app/permissions";
@@ -1760,28 +1762,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       return prev.loading === loading && !prev.error ? prev : { ...prev, loading, error: "" };
     });
     try {
-      const params = new URLSearchParams({ limit: String(options?.limit || 10) });
-      if (String(options?.cursor || "").trim()) params.set("cursor", String(options.cursor).trim());
       const currentFilters = ignoreFilters
         ? { risk_tier: "all", execution_mode: "all", transport_provider: "all", status: "all", service: "" }
         : incidentMetadataFiltersRef.current;
-      if (currentFilters.risk_tier !== "all") {
-        params.set("risk_tier", currentFilters.risk_tier);
-      }
-      if (currentFilters.execution_mode !== "all") {
-        params.set("execution_mode", currentFilters.execution_mode);
-      }
-      if (currentFilters.transport_provider !== "all") {
-        params.set("transport_provider", currentFilters.transport_provider);
-      }
-      if (currentFilters.status !== "all") {
-        params.set("status", currentFilters.status);
-      }
-      if (String(currentFilters.service || "").trim()) {
-        params.set("service", String(currentFilters.service).trim());
-      }
       const payload = await fetchJson(
-        `/api-gateway/incidents/groups?${params.toString()}`,
+        `/api-gateway/incidents/groups?${buildIncidentGroupQuery(options || {}, currentFilters)}`,
         authenticatedOptions(),
       );
       const data = unwrap(payload);

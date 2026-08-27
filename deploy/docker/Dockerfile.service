@@ -14,7 +14,7 @@ COPY deploy/docker/requirements.service.txt ./requirements.service.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip install --upgrade pip \
-    && pip install -r requirements.service.txt
+    && pip install --require-hashes -r requirements.service.txt
 
 COPY pyproject.toml README.md ./
 COPY backend/src ./backend/src
