@@ -4,12 +4,14 @@ from common.config import get_settings
 from common.models import AlertSeverity
 from model_router import ModelRouter, ModelTask
 from model_router.router import (
-    _sanitize_model_payload,
+    AzureOpenAIModelProvider,
     ModelProvider,
     ModelResponse,
-    AzureOpenAIModelProvider,
+    OpenAIModelProvider,
+    _sanitize_model_payload,
     build_default_providers,
     build_usage,
+    normalize_azure_openai_endpoint,
     provider_error_message,
 )
 
@@ -73,6 +75,122 @@ def test_legacy_openai_variables_select_azure_adapter_for_azure_endpoint() -> No
         assert providers[name].base_url == "https://example.openai.azure.com"
         assert providers[name].api_key == "azure-style-key"
         assert providers[name].model == "production-gpt4o"
+
+
+@pytest.mark.parametrize(
+    ("settings_kwargs", "azure_aliases", "expected_key"),
+    [
+        ({"OPENAI_API_KEY": "openai-key"}, {"azure-openai"}, "openai-key"),
+        (
+            {
+                "AZURE_OPENAI_ENDPOINT": "https://example.openai.azure.com/",
+                "AZURE_OPENAI_API_KEY": "azure-key",
+            },
+            {"reasoning-standard", "reasoning-critical", "azure-openai", "gpt-5", "gpt-4o"},
+            "azure-key",
+        ),
+        (
+            {
+                "OPENAI_BASE_URL": "https://legacy.openai.azure.com",
+                "OPENAI_API_KEY": "legacy-azure-key",
+            },
+            {"reasoning-standard", "reasoning-critical", "azure-openai", "gpt-5", "gpt-4o"},
+            "legacy-azure-key",
+        ),
+        (
+            {
+                "AZURE_OPENAI_ENDPOINT": "https://example.openai.azure.com",
+                "AZURE_OPENAI_API_KEY": "azure-key",
+                "OPENAI_API_KEY": "openai-key",
+            },
+            {"reasoning-standard", "reasoning-critical", "azure-openai", "gpt-5", "gpt-4o"},
+            "azure-key",
+        ),
+        (
+            {
+                "OPENAI_BASE_URL": "https://models.example.test/v1",
+                "OPENAI_API_KEY": "openai-compatible-key",
+                "AZURE_OPENAI_API_KEY": "azure-key-must-not-leak",
+            },
+            {"azure-openai"},
+            "openai-compatible-key",
+        ),
+    ],
+)
+def test_provider_credential_routing_matrix(settings_kwargs, azure_aliases, expected_key) -> None:
+    from common.config import Settings
+
+    providers = build_default_providers(Settings(**settings_kwargs))
+
+    for name in ("reasoning-standard", "reasoning-critical", "azure-openai", "gpt-5", "gpt-4o"):
+        if name in azure_aliases:
+            assert isinstance(providers[name], AzureOpenAIModelProvider)
+        else:
+            assert isinstance(providers[name], OpenAIModelProvider)
+    assert providers["gpt-4o"].api_key == expected_key
+    assert providers["gpt-4o"].api_key != "azure-key-must-not-leak"
+
+
+def test_azure_key_without_endpoint_is_not_sent_to_native_openai() -> None:
+    from common.config import Settings
+
+    providers = build_default_providers(Settings(AZURE_OPENAI_API_KEY="azure-only-key"))
+
+    assert isinstance(providers["gpt-4o"], OpenAIModelProvider)
+    assert providers["gpt-4o"].api_key is None
+    assert providers["azure-openai"].api_key == "azure-only-key"
+    assert providers["azure-openai"].base_url == ""
+
+
+def test_legacy_azure_endpoint_with_azure_only_key_keeps_default_provider_usable() -> None:
+    from common.config import Settings
+
+    settings = Settings(
+        OPENAI_BASE_URL="https://example.openai.azure.com",
+        AZURE_OPENAI_API_KEY="azure-only-key",
+        OPENAI_API_KEY=None,
+    )
+    providers = build_default_providers(settings)
+    default_provider = providers[settings.model_router_default_provider]
+
+    assert isinstance(default_provider, AzureOpenAIModelProvider)
+    assert default_provider.api_key == "azure-only-key"
+    assert default_provider.base_url == "https://example.openai.azure.com"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://example.openai.azure.com",
+        "https://api.openai.com/v1",
+        "https://example.openai.azure.com/openai/deployments/prod",
+        "https://example.openai.azure.com/chat/completions",
+        "https://example.openai.azure.com?api-version=secret",
+        "https://example.openai.azure.com.evil.test",
+    ],
+)
+def test_azure_endpoint_rejects_non_resource_roots(endpoint: str) -> None:
+    with pytest.raises(ValueError, match="AZURE_OPENAI_ENDPOINT"):
+        normalize_azure_openai_endpoint(endpoint)
+
+
+def test_azure_reasoning_deployments_route_independently() -> None:
+    from common.config import Settings
+
+    providers = build_default_providers(
+        Settings(
+            AZURE_OPENAI_ENDPOINT="https://example.openai.azure.com",
+            AZURE_OPENAI_API_KEY="azure-key",
+            AZURE_OPENAI_CHAT_DEPLOYMENT="chat",
+            AZURE_OPENAI_REASONING_STANDARD_DEPLOYMENT="standard",
+            AZURE_OPENAI_REASONING_CRITICAL_DEPLOYMENT="critical",
+            MODEL_ROUTER_DEFAULT_PROVIDER="azure-openai",
+        )
+    )
+
+    assert providers["reasoning-standard"].model == "standard"
+    assert providers["reasoning-critical"].model == "critical"
+    assert providers["azure-openai"].model == "chat"
 
 
 def test_evaluation_policy_requires_eligible_confirmed_sample(tmp_path) -> None:
