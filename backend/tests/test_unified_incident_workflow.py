@@ -92,3 +92,19 @@ def test_discovery_suppresses_known_internal_pipeline_noise() -> None:
 
     assert candidate.actionable is False
     assert "noise" in candidate.actionability_reason.lower()
+
+
+def test_discovery_keeps_operational_latency_and_failure_signals_actionable() -> None:
+    latency = Alert(
+        source="prometheus", name="KaiOpsHighLatencyP95", service="api-gateway",
+        environment="prod", severity=AlertSeverity.WARNING,
+        description="P95 latency is above 2s for the API gateway.",
+    )
+    failure = Alert(
+        source="prometheus", name="WorkflowExecutionFailure", service="orchestrator",
+        environment="prod", severity=AlertSeverity.CRITICAL,
+        description="One or more workflow services reported non-ok processing results.",
+    )
+
+    assert build_incident_candidate(latency, _incident(latency)).actionable is True
+    assert build_incident_candidate(failure, _incident(failure)).actionable is True
