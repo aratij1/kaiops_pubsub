@@ -224,6 +224,8 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
   await page.getByLabel("Password").fill("Admin@123456");
   await page.getByRole("button", { name: "Sign In" }).click();
   await expect(page.getByRole("heading", { name: "api-gateway: HighRequestLatency" })).toBeVisible();
+  await expect(page.getByText("1 linked evidence")).toBeVisible();
+  await expect(page.getByText("94% RCA confidence")).toBeVisible();
 
   const tabs = page.getByRole("tablist", { name: "Incident workspace sections" });
   await tabs.getByRole("tab", { name: "Evidence, RCA, and impact" }).click();
@@ -233,6 +235,7 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
   await expect(page.getByText(`Fresh context and RCA analysis completed for alert ${alertId}.`)).toBeVisible();
   await expect(page.getByText("API connection-pool saturation caused request queueing.").first()).toBeVisible();
   await expect(page.getByText("Increase the API connection pool and recycle saturated workers through the governed rollout.").first()).toBeVisible();
+  await expect(page.getByText("1 linked record(s) · RCA and impact")).toBeVisible();
   await expect(page.getByText(/HTTP 401|Not authenticated/)).toHaveCount(0);
   expect(protectedRequests.some(({ path }) => path === `/analysis/alerts/${alertId}/regenerate`)).toBeTruthy();
   const orchestrationRequests = protectedRequests.filter(({ path }) => path === `/analysis/alerts/${alertId}/regenerate`
