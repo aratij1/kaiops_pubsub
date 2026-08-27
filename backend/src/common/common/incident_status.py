@@ -104,6 +104,22 @@ def reduce_incident_status(
     projection_at = _timestamp(projection_updated_at)
 
     action_fact = _action_incident_status(action)
+
+    # A fresh analysis can deliberately reopen an incident after an older
+    # approval or execution attempt. The materialized projection is the durable
+    # result of that analysis; stale action/approval/canonical rows must not
+    # keep the read model pinned to a superseded failure. Successful closure
+    # remains monotonic because it is handled above.
+    if (
+        projection
+        and projection_at > max(canonical_at, approval_at, action_at)
+    ):
+        return {
+            "status": projection,
+            "source": "projection",
+            "reason": "A newer persisted lifecycle projection supersedes earlier approval or remediation attempts.",
+        }
+
     if action_fact is not None and action_at >= approval_at:
         status, reason = action_fact
         return {"status": status, "source": "remediation_action", "reason": reason}

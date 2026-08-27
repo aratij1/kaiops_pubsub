@@ -61,6 +61,23 @@ def test_failed_execution_supersedes_stale_approved_incident() -> None:
     assert result["source"] == "remediation_action"
 
 
+def test_new_investigation_projection_supersedes_old_failed_attempt() -> None:
+    result = reduce_incident_status(
+        projection_status="investigating",
+        projection_updated_at=NOW,
+        canonical_status="failed",
+        canonical_updated_at=NOW - timedelta(days=1),
+        approval_status="rejected",
+        approval_updated_at=NOW - timedelta(hours=2),
+        action_status="skipped",
+        action_updated_at=NOW - timedelta(hours=1),
+    )
+
+    assert result["status"] == "investigating"
+    assert result["source"] == "projection"
+    assert "supersedes" in result["reason"]
+
+
 def test_successful_execution_enters_validation_until_closure() -> None:
     result = reduce_incident_status(
         projection_status="remediating",

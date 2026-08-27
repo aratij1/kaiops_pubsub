@@ -1312,6 +1312,26 @@ class IncidentRepository:
         if report_record is not None and isinstance(report_record.payload, dict):
             closure_report = report_record.payload
 
+        closure_metadata = (
+            closure_report.get("metadata")
+            if isinstance(closure_report.get("metadata"), dict)
+            else {}
+        )
+        processed_status = reduce_incident_status(
+            projection_status=(bound_projection.status if bound_projection is not None else None),
+            projection_updated_at=(bound_projection.updated_at if bound_projection is not None else None),
+            canonical_status=incident_record.status,
+            canonical_updated_at=incident_record.updated_at,
+            approval_status=(approval_record.decision if approval_record is not None else None),
+            approval_updated_at=(approval_record.updated_at if approval_record is not None else None),
+            action_status=(action_record.status if action_record is not None else None),
+            action_updated_at=(action_record.updated_at if action_record is not None else None),
+            closure_kind=closure_metadata.get("closure_kind"),
+        )
+        incident_payload["status"] = processed_status["status"]
+        incident_payload["status_source"] = processed_status["source"]
+        incident_payload["status_reason"] = processed_status["reason"]
+
         work_rows_result = await self.session.execute(
             select(AgentWorkItemRecord)
             .where(AgentWorkItemRecord.incident_id == UUID(incident_id_str))
@@ -2593,6 +2613,15 @@ class IncidentRepository:
         }.get(str(action_status).lower())
         if action_status == "skipped" and action.action_type == "diagnostic_completion":
             incident_status = "validating"
+        if (
+            action_status == "skipped"
+            and str(action.action_type or "").strip().lower().replace("_", "-") == "policy-blocked"
+        ):
+            # Policy enforcement succeeded: execution did not fail. Keep the
+            # incident in investigation so the operator can collect evidence
+            # or regenerate a safe plan instead of presenting false recovery
+            # failure semantics.
+            incident_status = "investigating"
         if incident_status:
             projection = await self.session.get(IncidentProjectionRecord, action.incident_id)
             if (
