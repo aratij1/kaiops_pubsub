@@ -3026,6 +3026,33 @@ class IncidentRepository:
             "expires_at": row.expires_at.isoformat(),
         }
 
+    async def context_snapshot_by_id(
+        self, snapshot_id: UUID | str, *, tenant_id: str, incident_id: UUID | str,
+    ) -> dict[str, Any] | None:
+        snapshot_uuid = self._parse_uuid(snapshot_id)
+        if snapshot_uuid is None:
+            return None
+        row = (
+            await self.session.execute(
+                select(ContextSnapshotRecord).where(
+                    ContextSnapshotRecord.snapshot_id == snapshot_uuid,
+                    ContextSnapshotRecord.tenant_id == str(self._require("context_snapshot.tenant_id", tenant_id)),
+                    ContextSnapshotRecord.incident_id == str(self._require("context_snapshot.incident_id", incident_id)),
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return {
+            "snapshot_id": str(row.snapshot_id),
+            "tenant_id": row.tenant_id,
+            "incident_id": row.incident_id,
+            "context_fingerprint": row.context_fingerprint,
+            "context": row.payload if isinstance(row.payload, dict) else {},
+            "collected_at": row.collected_at.isoformat(),
+            "expires_at": row.expires_at.isoformat(),
+        }
+
     async def create_resolution_investigation(self, payload: dict[str, Any]) -> None:
         await self.session.execute(
             text(
