@@ -19,8 +19,9 @@ export type CloudResource = {
   id: string;
   tenant_id: string;
   project_id: string;
-  connection_id?: string | null;
-  connection_id: string;
+  // Required for newly discovered resources. Legacy rows may remain null
+  // until authoritative connection reconciliation succeeds.
+  connection_id: string | null;
   provider: string;
   provider_resource_id: string;
   resource_type: string;
@@ -142,11 +143,15 @@ async function requestJson<T>(accessToken: string, url: string, init?: RequestIn
   return payload as T;
 }
 
-export function listConnections(accessToken: string, projectId?: string) {
+export function listConnections(accessToken: string, projectId?: string, signal?: AbortSignal) {
   const params = new URLSearchParams();
   if (projectId) params.set("project_id", projectId);
   const query = params.toString();
-  return requestJson<RowsResponse<CloudConnection>>(accessToken, `/cloud-ops/connections${query ? `?${query}` : ""}`).then((data) => data.rows);
+  return requestJson<RowsResponse<CloudConnection>>(
+    accessToken,
+    `/cloud-ops/connections${query ? `?${query}` : ""}`,
+    { signal },
+  ).then((data) => data.rows);
 }
 
 export function createSimulatorConnection(accessToken: string, projectId: string, name: string) {
@@ -167,19 +172,19 @@ export function createSimulatorConnection(accessToken: string, projectId: string
   }).then((data) => data.connection);
 }
 
-export function validateConnection(accessToken: string, connectionId: string) {
+export function validateConnection(accessToken: string, connectionId: string, signal?: AbortSignal) {
   return requestJson<{ status: string; checks: unknown[]; warnings: string[]; errors: string[] }>(
     accessToken,
     `/cloud-ops/connections/${encodeURIComponent(connectionId)}/validate`,
-    { method: "POST", body: JSON.stringify({}) },
+    { method: "POST", body: JSON.stringify({}), signal },
   );
 }
 
-export function discoverConnection(accessToken: string, connectionId: string, projectId: string, serviceId = "checkout-api", environment = "prod") {
+export function discoverConnection(accessToken: string, connectionId: string, projectId: string, serviceId = "checkout-api", environment = "prod", signal?: AbortSignal) {
   return requestJson<{ run_id: string; status: string; resources: CloudResource[]; relationships: unknown[] }>(
     accessToken,
     `/cloud-ops/connections/${encodeURIComponent(connectionId)}/discover`,
-    { method: "POST", body: JSON.stringify({ project_id: projectId, service_id: serviceId, environment }) },
+    { method: "POST", body: JSON.stringify({ project_id: projectId, service_id: serviceId, environment }), signal },
   );
 }
 

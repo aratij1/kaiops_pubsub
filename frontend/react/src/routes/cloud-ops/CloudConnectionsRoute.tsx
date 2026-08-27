@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Cloud, Play, RefreshCw, ShieldCheck } from "lucide-react";
 
 import { useRouteRuntimeSlice } from "../../app/routeRuntime";
@@ -20,43 +20,58 @@ export default function CloudConnectionsRoute() {
   const [connections, setConnections] = useState<CloudConnection[]>([]);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const selectedProjectRef = useRef(projectId.trim());
+  const refreshControllerRef = useRef<AbortController | null>(null);
+  const actionControllerRef = useRef<AbortController | null>(null);
+  const normalizedProjectId = projectId.trim();
+  selectedProjectRef.current = normalizedProjectId;
 
-  async function refresh(scopeProjectId = projectId) {
+  const refresh = useCallback(async () => {
+    const scopeProjectId = normalizedProjectId;
+    if (!accessToken || !scopeProjectId) return;
+    refreshControllerRef.current?.abort();
+    const controller = new AbortController();
+    refreshControllerRef.current = controller;
     setBusy("refresh");
     setError("");
     try {
-      setConnections(await listConnections(accessToken, scopeProjectId));
+      const rows = await listConnections(accessToken, scopeProjectId, controller.signal);
+      if (!controller.signal.aborted && selectedProjectRef.current === scopeProjectId) setConnections(rows);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to load cloud connections");
+      if (!controller.signal.aborted && selectedProjectRef.current === scopeProjectId) {
+        setError(err instanceof Error ? err.message : "Unable to load cloud connections");
+      }
     } finally {
-      setBusy("");
+      if (refreshControllerRef.current === controller) setBusy("");
     }
-  }
+  }, [accessToken, normalizedProjectId]);
 
   useEffect(() => {
+    refreshControllerRef.current?.abort();
+    actionControllerRef.current?.abort();
     setConnections([]);
     setError("");
-    if (!accessToken || !projectId.trim()) return;
-    let cancelled = false;
+    if (!accessToken || !normalizedProjectId) return undefined;
     const timer = window.setTimeout(() => {
-      setBusy("refresh");
-      void listConnections(accessToken, projectId.trim())
-        .then((rows) => { if (!cancelled) setConnections(rows); })
-        .catch((err) => { if (!cancelled) setError(err instanceof Error ? err.message : "Unable to load cloud connections"); })
-        .finally(() => { if (!cancelled) setBusy(""); });
+      void refresh();
     }, 250);
     return () => {
-      cancelled = true;
       window.clearTimeout(timer);
+      refreshControllerRef.current?.abort();
+      actionControllerRef.current?.abort();
     };
-  }, [accessToken, projectId]);
+  }, [accessToken, normalizedProjectId, refresh]);
 
   async function createConnection() {
+    const scopeProjectId = normalizedProjectId;
+    if (!scopeProjectId) return;
     setBusy("create");
     setError("");
     try {
-      const row = await createSimulatorConnection(accessToken, projectId, name);
-      setConnections((current) => [row, ...current.filter((item) => item.id !== row.id)]);
+      const row = await createSimulatorConnection(accessToken, scopeProjectId, name.trim());
+      if (selectedProjectRef.current === scopeProjectId && row.project_id === scopeProjectId) {
+        setConnections((current) => [row, ...current.filter((item) => item.id !== row.id)]);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to create simulator connection");
     } finally {
@@ -65,21 +80,27 @@ export default function CloudConnectionsRoute() {
   }
 
   async function runConnectionAction(id: string, action: "validate" | "discover") {
+    const scopeProjectId = normalizedProjectId;
     const connection = connections.find((item) => item.id === id);
-    if (!connection || connection.project_id !== projectId.trim()) {
+    if (!connection || connection.project_id !== scopeProjectId) {
       setError("Connection actions are disabled because the selected project scope changed.");
       return;
     }
+    actionControllerRef.current?.abort();
+    const controller = new AbortController();
+    actionControllerRef.current = controller;
     setBusy(`${action}:${id}`);
     setError("");
     try {
-      if (action === "validate") await validateConnection(accessToken, id);
-      else await discoverConnection(accessToken, id, projectId, serviceId, environment);
-      await refresh();
+      if (action === "validate") await validateConnection(accessToken, id, controller.signal);
+      else await discoverConnection(accessToken, id, scopeProjectId, serviceId.trim(), environment.trim(), controller.signal);
+      if (!controller.signal.aborted && selectedProjectRef.current === scopeProjectId) await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : `Unable to ${action} connection`);
+      if (!controller.signal.aborted && selectedProjectRef.current === scopeProjectId) {
+        setError(err instanceof Error ? err.message : `Unable to ${action} connection`);
+      }
     } finally {
-      setBusy("");
+      if (actionControllerRef.current === controller) setBusy("");
     }
   }
 
@@ -91,7 +112,7 @@ export default function CloudConnectionsRoute() {
             <h2 id="cloud-connections-title">Provider connections</h2>
             <p>Start with the simulator provider, then plug in real cloud adapters behind the same contract.</p>
           </div>
-          <button type="button" className="button-secondary" onClick={refresh} disabled={Boolean(busy)}>
+          <button type="button" className="button-secondary" onClick={() => void refresh()} disabled={Boolean(busy)}>
             <RefreshCw size={16} /> Refresh
           </button>
         </header>
@@ -113,7 +134,7 @@ export default function CloudConnectionsRoute() {
             <span>Environment</span>
             <input value={environment} onChange={(event) => setEnvironment(event.target.value)} />
           </label>
-          <button type="button" className="button-primary" onClick={createConnection} disabled={Boolean(busy || !projectId || !name)}>
+          <button type="button" className="button-primary" onClick={createConnection} disabled={Boolean(busy || !normalizedProjectId || !name.trim())}>
             <Cloud size={16} /> Add simulator connection
           </button>
         </div>
@@ -137,10 +158,10 @@ export default function CloudConnectionsRoute() {
               <span>Owner: {connection.connection_owner}</span>
             </div>
             <div className="cloud-ops-toolbar">
-              <button type="button" className="button-secondary" onClick={() => runConnectionAction(connection.id, "validate")} disabled={Boolean(busy) || connection.project_id !== projectId.trim()}>
+              <button type="button" className="button-secondary" onClick={() => runConnectionAction(connection.id, "validate")} disabled={Boolean(busy) || connection.project_id !== normalizedProjectId}>
                 <ShieldCheck size={16} /> Validate
               </button>
-              <button type="button" className="button-secondary" onClick={() => runConnectionAction(connection.id, "discover")} disabled={Boolean(busy) || connection.project_id !== projectId.trim()}>
+              <button type="button" className="button-secondary" onClick={() => runConnectionAction(connection.id, "discover")} disabled={Boolean(busy) || connection.project_id !== normalizedProjectId}>
                 <Play size={16} /> Discover
               </button>
             </div>
