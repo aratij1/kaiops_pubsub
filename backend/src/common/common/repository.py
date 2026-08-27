@@ -5022,16 +5022,6 @@ class IncidentRepository:
             for evaluation in evaluation_result.scalars().all():
                 evaluation_by_incident.setdefault(evaluation.incident_id, evaluation)
 
-        context_snapshot_by_incident: dict[str, ContextSnapshotRecord] = {}
-        if include_enrichment and incident_ids:
-            context_snapshot_result = await self.session.execute(
-                select(ContextSnapshotRecord)
-                .where(ContextSnapshotRecord.incident_id.in_([str(incident_id) for incident_id in incident_ids]))
-                .order_by(ContextSnapshotRecord.collected_at.desc())
-            )
-            for snapshot in context_snapshot_result.scalars().all():
-                context_snapshot_by_incident.setdefault(str(snapshot.incident_id), snapshot)
-
         source_alert_by_id: dict[UUID, dict[str, Any]] = {}
         if incident_ids:
             source_alert_ids = {
@@ -5090,6 +5080,21 @@ class IncidentRepository:
                 for record in recommendation_result.scalars().all()
             }
 
+        context_snapshot_by_id: dict[str, ContextSnapshotRecord] = {}
+        referenced_snapshot_ids: set[UUID] = set()
+        for recommendation_payload in recommendation_by_id.values():
+            metadata = recommendation_payload.get("metadata") if isinstance(recommendation_payload.get("metadata"), dict) else {}
+            snapshot_uuid = self._parse_uuid(metadata.get("context_snapshot_id"))
+            if snapshot_uuid is not None:
+                referenced_snapshot_ids.add(snapshot_uuid)
+        if include_enrichment and referenced_snapshot_ids:
+            context_snapshot_result = await self.session.execute(
+                select(ContextSnapshotRecord).where(ContextSnapshotRecord.snapshot_id.in_(referenced_snapshot_ids))
+            )
+            context_snapshot_by_id = {
+                str(snapshot.snapshot_id): snapshot for snapshot in context_snapshot_result.scalars().all()
+            }
+
         response_rows: list[dict[str, Any]] = []
         for row in rows:
             canonical_alert_id = row.alert_id or canonical_alert_by_incident.get(row.incident_id)
@@ -5105,8 +5110,17 @@ class IncidentRepository:
             )
             pending = pending_by_incident.get(row.incident_id)
             merged_recommendation_id = row.recommendation_id or (pending.recommendation_id if pending is not None else None)
+            recommendation_payload = recommendation_by_id.get(merged_recommendation_id, {})
+            recommendation_metadata = (
+                recommendation_payload.get("metadata")
+                if isinstance(recommendation_payload.get("metadata"), dict)
+                else {}
+            )
             merged_flow_id = row.flow_id or (pending.flow_id if pending is not None else None)
             projection_payload = dict(row.projection_payload or {}) if include_enrichment else {}
+            if recommendation_payload:
+                for stale_context_key in ("context", "context_metadata", "context_snapshot"):
+                    projection_payload.pop(stale_context_key, None)
             if navigable_alert_id is not None:
                 projection_payload["alert_id"] = str(navigable_alert_id)
             else:
@@ -5116,7 +5130,7 @@ class IncidentRepository:
                 if isinstance(projection_payload.get("event_payload"), dict)
                 else {}
             )
-            historical_context_event = historical_context_event_by_incident.get(row.incident_id, {})
+            historical_context_event = historical_context_event_by_incident.get(row.incident_id, {}) if not recommendation_payload else {}
             event_context = (
                 event_payload.get("context")
                 if isinstance(event_payload.get("context"), dict)
@@ -5140,22 +5154,22 @@ class IncidentRepository:
             durable_source_alert = source_alert_by_id.get(canonical_alert_id, {}) if canonical_alert_id else {}
             if durable_source_alert:
                 projection_payload["source_alert"] = durable_source_alert
-                if not isinstance(projection_payload.get("context"), dict) or not projection_payload.get("context"):
-                    # Legacy incidents may predate durable context snapshots,
-                    # but their source alert and recommendation remain
-                    # authoritative evidence. Expose that retained record as
-                    # recovered context and label its provenance explicitly.
-                    projection_payload["context"] = {
-                        "alert": durable_source_alert,
-                        "metadata": {
-                            "contract_version": "kaiops.context.read-model.v1",
-                            "recovered": True,
-                            "recovered_from": ["alerts", "recommendation_audit"],
-                        },
-                    }
             elif event_context_alert:
                 projection_payload.setdefault("source_alert", event_context_alert)
-            context_snapshot = context_snapshot_by_incident.get(str(row.incident_id))
+            bound_snapshot_id = str(recommendation_metadata.get("context_snapshot_id") or "").strip()
+            context_snapshot = context_snapshot_by_id.get(bound_snapshot_id)
+            binding_status = "not_applicable"
+            if recommendation_payload:
+                binding_status = "missing_snapshot_reference" if not bound_snapshot_id else "snapshot_not_found"
+            if context_snapshot is not None:
+                if context_snapshot.tenant_id != row.tenant_id or str(context_snapshot.incident_id) != str(row.incident_id):
+                    context_snapshot = None
+                    binding_status = "identity_mismatch"
+                elif str(context_snapshot.context_fingerprint) != str(recommendation_metadata.get("context_fingerprint") or ""):
+                    context_snapshot = None
+                    binding_status = "fingerprint_mismatch"
+                else:
+                    binding_status = "verified"
             if context_snapshot is not None:
                 snapshot_context = (
                     dict(context_snapshot.payload)
@@ -5163,28 +5177,30 @@ class IncidentRepository:
                     else {}
                 )
                 if snapshot_context:
-                    projection_payload.setdefault("context", snapshot_context)
+                    projection_payload["context"] = snapshot_context
                     snapshot_metadata = (
                         snapshot_context.get("metadata")
                         if isinstance(snapshot_context.get("metadata"), dict)
                         else {}
                     )
                     if snapshot_metadata:
-                        projection_payload.setdefault("context_metadata", snapshot_metadata)
-                projection_payload.setdefault(
-                    "context_snapshot",
-                    {
-                        "snapshot_id": str(context_snapshot.snapshot_id),
-                        "source_incident_id": context_snapshot.source_incident_id,
-                        "context_fingerprint": context_snapshot.context_fingerprint,
-                        "contract_version": context_snapshot.contract_version,
-                        "quality_score": float(context_snapshot.quality_score or 0.0),
-                        "reusable": bool(context_snapshot.reusable),
-                        "source_manifest": context_snapshot.source_manifest or {},
-                        "collected_at": context_snapshot.collected_at,
-                        "expires_at": context_snapshot.expires_at,
-                    },
-                )
+                        projection_payload["context_metadata"] = snapshot_metadata
+                projection_payload["context_snapshot"] = {
+                    "snapshot_id": str(context_snapshot.snapshot_id),
+                    "source_incident_id": context_snapshot.source_incident_id,
+                    "context_fingerprint": context_snapshot.context_fingerprint,
+                    "contract_version": context_snapshot.contract_version,
+                    "quality_score": float(context_snapshot.quality_score or 0.0),
+                    "reusable": bool(context_snapshot.reusable),
+                    "source_manifest": context_snapshot.source_manifest or {},
+                    "collected_at": context_snapshot.collected_at,
+                    "expires_at": context_snapshot.expires_at,
+                }
+            projection_payload["investigation_integrity"] = {
+                "status": binding_status,
+                "recommendation_id": str(merged_recommendation_id) if merged_recommendation_id else None,
+                "context_snapshot_id": bound_snapshot_id or None,
+            }
             evaluation = evaluation_by_incident.get(row.incident_id)
             if evaluation is not None:
                 evaluation_payload = dict(evaluation.report_payload or {})
@@ -5218,7 +5234,6 @@ class IncidentRepository:
             if resolution_lifecycle:
                 projection_payload["resolution_lifecycle"] = resolution_lifecycle
 
-            recommendation_payload = recommendation_by_id.get(merged_recommendation_id, {})
             if recommendation_payload:
                 # The projection stores the latest lifecycle event, while the
                 # full RCA/recommendation is durably stored in the audit log.
@@ -5240,11 +5255,6 @@ class IncidentRepository:
                         "confidence": event_payload.get("confidence"),
                     },
                 )
-            recommendation_metadata = (
-                recommendation_payload.get("metadata")
-                if isinstance(recommendation_payload.get("metadata"), dict)
-                else {}
-            )
             orchestration_path = (
                 recommendation_metadata.get("orchestration_path")
                 if isinstance(recommendation_metadata.get("orchestration_path"), dict)
