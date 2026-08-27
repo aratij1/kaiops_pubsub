@@ -1,13 +1,26 @@
 ﻿import json
 import pytest
+from uuid import uuid4
 from ai_workbench_common.models import Context
 from ai_workbench_common.memory_store import InMemoryStore
-from common.models import Alert, AlertSeverity, Incident
+from common.models import Alert, AlertSeverity, Incident, Recommendation
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import DiscoveryMCPConnector, VectorDBConnector
 from model_router import ModelRouter
 from model_router.router import ModelProvider, ModelResponse, build_usage
 from resolution_agent import ResolutionIntelligenceAgent
+
+
+@pytest.mark.asyncio
+async def test_resolution_runtime_accepts_explicit_zero_confidence_abstention() -> None:
+    recommendation = Recommendation(
+        root_cause="Insufficient evidence", confidence=0, impact="Unknown",
+        recommended_action="Collect evidence", severity=AlertSeverity.WARNING,
+        tenant_id="tenant-a", incident_id=uuid4(),
+        rationale="No linked evidence supports a hypothesis.",
+        metadata={"rca_status": "insufficient_evidence", "evidence_ids": []},
+    )
+    assert await ResolutionIntelligenceAgent().validate(recommendation) is True
 
 
 class StaticProvider(ModelProvider):
