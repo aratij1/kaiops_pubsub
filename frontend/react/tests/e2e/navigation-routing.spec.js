@@ -78,7 +78,8 @@ test("a validated session restores before a protected deep link renders", async 
     const body = path === "/auth/config" ? { mode: "local", local_development_only: true }
       : path === "/auth/login" ? { access_token: "access-1", refresh_token: "refresh-1", user: { id: 1, username: "admin", role_name: "Administrator" } }
         : path === "/auth/refresh" ? (refreshes += 1, { access_token: "access-2", refresh_token: "refresh-2", user: { id: 1, username: "admin", role_name: "Administrator" } })
-          : path.startsWith("/incidents/metadata") ? { rows: [{ incident_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", title: "Authenticated deep link", service: "api-gateway", status: "investigating" }] }
+          : path.startsWith("/incidents/groups") ? { data: { rows: [{ incident_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", title: "Authenticated deep link", service: "api-gateway", status: "investigating" }], total_count: 1, filtered_count: 1 } }
+            : path === "/incidents/cccccccc-cccc-4ccc-8ccc-cccccccccccc" ? { data: { incident_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", title: "Authenticated deep link", service: "api-gateway", status: "investigating" } }
             : { data: { rows: [] }, rows: [] };
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
   });

@@ -1,7 +1,7 @@
 from __future__ import annotations
+
 import asyncio
 import base64
-from collections import deque
 import hashlib
 import heapq
 import json
@@ -9,37 +9,39 @@ import os
 import re
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from collections import deque
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
 from uuid import UUID
 
-from common.config import get_settings
+import httpx
+from ai_workbench_common.model_evaluation import build_quality_evaluation
+from ai_workbench_common.prompts import PROMPT_SUMMARIZE_RCA
 from common.ai_layer_client import AiLayerClient
+from common.config import get_settings
 from common.database import create_engine, create_schema, create_session_factory
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.logging import get_logger
-from ai_workbench_common.model_evaluation import build_quality_evaluation
 from common.models import (
     Alert,
     AlertSeverity,
-    EvidenceReference,
-    RawAlert,
-    Incident,
-    IncidentStatus,
     Approval,
     ApprovalDecision,
+    EvidenceReference,
+    Incident,
+    IncidentStatus,
+    RawAlert,
     Recommendation,
     RemediationAction,
     RemediationStatus,
     ResolutionReport,
 )
-from common.repository import IncidentRepository, ObjectStorageRepository
-from common.orchestration.execution_plan import resolve_execution_plan
 from common.object_storage import build_object_storage
+from common.orchestration.execution_plan import resolve_execution_plan
+from common.repository import IncidentRepository, ObjectStorageRepository
 from common.service import create_app
 from common.telemetry import EVENT_CONTRACTS_EMITTED, EVENT_PUBLISH_LATENCY
 from common.topics import (
@@ -49,54 +51,13 @@ from common.topics import (
     ALERT_RECEIVED,
     APPROVAL_REQUESTED,
     AUTOMATION_EXECUTED,
-    JIRA_INVESTIGATIONS,
     RAW_ALERTS,
     RESOLUTION_GENERATED,
 )
-from ai_workbench_common.prompts import PROMPT_SUMMARIZE_RCA
-import httpx
 from fastapi import BackgroundTasks, Body, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, model_validator
-from monitoring_adapter.state import (
-    ALERT_SEVERITY_OVERRIDES_FILE,
-    FLOW_CATALOG_FILE,
-    ONBOARDING_CONNECTIVITY_FILE,
-    SCENARIOS,
-    SCENARIOS_TEXT_FILE,
-    alert_severity_overrides_path,
-    default_flow_catalog_entries,
-    ensure_flow_catalog_exists,
-    flow_catalog_path,
-    load_alert_severity_overrides,
-    list_scenarios,
-    load_onboarding_connectivity,
-    load_scenarios_from_text_file,
-    merged_scenarios,
-    onboarding_connectivity_path,
-    rag_root_path,
-    remove_alert_severity_override,
-    resolve_flow_id,
-    save_alert_severity_overrides,
-    save_onboarding_connectivity,
-    scenario_source_rows,
-    scenarios_text_path,
-    severity_from_string,
-    slugify,
-    upsert_alert_severity_override,
-)
-from monitoring_adapter.workflow_routes import build_workflow_router
-from monitoring_adapter.onboarding_pipelines import (
-    ExistingRulePipelineRequest,
-    NewRuleOnboardingRequest,
-    build_prometheus_rules_yaml,
-    capabilities_catalog,
-    find_pipeline_rows,
-    run_existing_rule_pipeline,
-    run_new_rule_pipeline,
-)
-from monitoring_adapter.project_inventory import activation_readiness_blockers, collect_alert_applications, record_successful_test_alert
-from monitoring_adapter.onboarding_sources import OnboardingMonitoringSource, normalize_email_endpoint, normalize_http_endpoint
+from monitoring_adapter.dedup import compute_fingerprint
+from monitoring_adapter.email_ingestion import EmailPollState, ImapConfig, email_to_alert_payload, fetch_unseen_emails
 from monitoring_adapter.existing_monitoring import (
     apply_field_mapping,
     build_webhook_path,
@@ -107,12 +68,10 @@ from monitoring_adapter.existing_monitoring import (
     normalize_provider_name,
     verify_hmac_signature,
 )
+from monitoring_adapter.jira_admission import JiraAdmissionState
+from monitoring_adapter.jira_client import JiraClient, JiraClientError
 from monitoring_adapter.landing_pad_normalizer import normalize_landing_pad_alert
 from monitoring_adapter.landing_pad_sources import SUPPORTED_SUFFIXES, load_landing_pad_file
-from monitoring_adapter.email_ingestion import EmailPollState, ImapConfig, email_to_alert_payload, fetch_unseen_emails
-from monitoring_adapter.dedup import compute_fingerprint
-from monitoring_adapter.jira_client import JiraClient, JiraClientError
-from monitoring_adapter.jira_admission import JiraAdmissionState
 from monitoring_adapter.log_ingestion import (
     LogWatchState,
     OpenSearchLogState,
@@ -120,6 +79,45 @@ from monitoring_adapter.log_ingestion import (
     fetch_opensearch_error_logs,
     log_line_to_alert_payload,
 )
+from monitoring_adapter.onboarding_pipelines import (
+    ExistingRulePipelineRequest,
+    NewRuleOnboardingRequest,
+    build_prometheus_rules_yaml,
+    capabilities_catalog,
+    find_pipeline_rows,
+    run_existing_rule_pipeline,
+    run_new_rule_pipeline,
+)
+from monitoring_adapter.onboarding_sources import (
+    OnboardingMonitoringSource,
+    normalize_email_endpoint,
+    normalize_http_endpoint,
+)
+from monitoring_adapter.project_inventory import (
+    activation_readiness_blockers,
+    collect_alert_applications,
+    record_successful_test_alert,
+)
+from monitoring_adapter.state import (
+    ALERT_SEVERITY_OVERRIDES_FILE,
+    alert_severity_overrides_path,
+    flow_catalog_path,
+    list_scenarios,
+    load_alert_severity_overrides,
+    load_onboarding_connectivity,
+    merged_scenarios,
+    rag_root_path,
+    remove_alert_severity_override,
+    resolve_flow_id,
+    save_onboarding_connectivity,
+    scenario_source_rows,
+    scenarios_text_path,
+    severity_from_string,
+    slugify,
+    upsert_alert_severity_override,
+)
+from monitoring_adapter.workflow_routes import build_workflow_router
+from pydantic import BaseModel, Field, model_validator
 
 ALERT_BODY = Body(...)
 
@@ -471,7 +469,7 @@ def _recent_date_partition_dirs(base: Path, *, days: int) -> list[Path]:
     Bounds directory scans (dedup checks, recent-file listings) to a fixed
     number of small partitions instead of walking a growing multi-year archive.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     directories: list[Path] = []
     seen: set[Path] = set()
     for offset in range(days):
@@ -512,7 +510,7 @@ def _persist_alert_to_landing_pad(
 ) -> str | None:
     try:
         base_dir = LANDING_PAD_PROCESSED_DIR if status == "processed" else LANDING_PAD_FAILED_DIR
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         # Must match the YYYY/MM/DD scheme every reader scans
         # (_collect_partitioned_json_files / _recent_date_partition_dirs /
         # the dedup check / GET /landing-pad/recent) — a prior source-named
@@ -582,7 +580,7 @@ def _record_live_stream_event(
     to the same in-memory buffer GET /landing-pad/recent serves, so it shows
     up in the Live Stream UI. These actions have their own system of record
     (jira_ticket_links, SMTP) and don't need a landing-pad file — only visibility."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     RECENT_INGESTION_EVENTS.appendleft(
         {
             "file": None,
@@ -612,7 +610,7 @@ def _record_live_stream_event(
 
 def _write_alert_to_landing_pad_input(mapped_payload: dict[str, Any], raw_alert: dict[str, Any]) -> Path:
     LANDING_PAD_INPUT_DIR.mkdir(parents=True, exist_ok=True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     alert_name = slugify(str(mapped_payload.get("name") or "prometheus-alert"))
     labels = mapped_payload.get("labels", {}) if isinstance(mapped_payload.get("labels"), dict) else {}
     fingerprint = str(labels.get("alert_fingerprint") or uuid.uuid4().hex).strip() or uuid.uuid4().hex
@@ -663,7 +661,7 @@ def _landing_pad_file_rows(source_dir: Path, limit: int, *, partitioned: bool = 
         entry: dict[str, Any] = {
             "file": path.name,
             "path": str(path),
-            "modified_at": datetime.fromtimestamp(stat_info.st_mtime, tz=timezone.utc).isoformat(),
+            "modified_at": datetime.fromtimestamp(stat_info.st_mtime, tz=UTC).isoformat(),
             "size_bytes": int(stat_info.st_size),
         }
         try:
@@ -819,7 +817,7 @@ def _mapped_alerts_from_landing_pad_payload(payload: dict[str, Any]) -> list[tup
 
 
 def _archive_landing_pad_input_file(path: Path, target_dir: Path) -> str:
-    partition_dir = _date_partition_dir(target_dir, datetime.now(timezone.utc))
+    partition_dir = _date_partition_dir(target_dir, datetime.now(UTC))
     partition_dir.mkdir(parents=True, exist_ok=True)
     original_name = path.name.split("_", 1)[1] if path.parent.name == ".claiming" and "_" in path.name else path.name
     target_path = partition_dir / original_name
@@ -841,8 +839,8 @@ def _landing_pad_input_is_stale(path: Path, *, original_parent: Path) -> bool:
         return False
     if original_parent.resolve() != LANDING_PAD_INPUT_DIR.resolve():
         return False
-    modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    age_seconds = (datetime.now(timezone.utc) - modified_at).total_seconds()
+    modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+    age_seconds = (datetime.now(UTC) - modified_at).total_seconds()
     return age_seconds > LANDING_PAD_FILE_WATCHER_STALE_HOURS * 3600
 
 
@@ -905,7 +903,7 @@ def _recover_stale_claims() -> int:
     parent dir, never `.claiming/`). This sweep recovers those orphans.
     """
     recovered = 0
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for directory in [LANDING_PAD_INPUT_DIR, *LANDING_PAD_ADDITIONAL_INPUT_DIRS]:
         claim_dir = directory / ".claiming"
         if not claim_dir.is_dir():
@@ -914,7 +912,7 @@ def _recover_stale_claims() -> int:
             if not claimed_path.is_file():
                 continue
             try:
-                modified_at = datetime.fromtimestamp(claimed_path.stat().st_mtime, tz=timezone.utc)
+                modified_at = datetime.fromtimestamp(claimed_path.stat().st_mtime, tz=UTC)
                 age_seconds = (now - modified_at).total_seconds()
                 if age_seconds <= LANDING_PAD_CLAIM_STALE_MINUTES * 60:
                     continue
@@ -1539,7 +1537,7 @@ def _sweep_landing_pad_archive_once() -> dict[str, int]:
     counter dict so callers (worker loop or the manual trigger endpoint) can
     report how much was moved.
     """
-    cutoff = datetime.now(timezone.utc).timestamp() - (LANDING_PAD_ARCHIVE_AFTER_DAYS * 86400)
+    cutoff = datetime.now(UTC).timestamp() - (LANDING_PAD_ARCHIVE_AFTER_DAYS * 86400)
     moved = 0
     errors = 0
     for base_dir in (LANDING_PAD_PROCESSED_DIR, LANDING_PAD_FAILED_DIR):
@@ -1765,7 +1763,7 @@ async def _opensearch_log_poll_worker() -> None:
                 document_id = str(record.get("document_id") or "")
                 if document_id:
                     seen = state.load()
-                    seen[document_id] = str(record.get("timestamp") or datetime.now(timezone.utc).isoformat())
+                    seen[document_id] = str(record.get("timestamp") or datetime.now(UTC).isoformat())
                     state.save(seen)
             logger.info(
                 "opensearch_log_batch_complete fetched=%s batch_limit=%s next_poll_seconds=%s",
@@ -2519,7 +2517,7 @@ async def persist_onboarding_connectivity(payload: dict[str, Any]) -> None:
         "active_provider": _normalize_provider_name(str(payload.get("active_provider", ""))) if payload.get("active_provider") else None,
     }
     selected_provider = _normalize_provider_name(str(payload.get("active_provider", "project")))
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     async with session_factory() as session:
         repo = IncidentRepository(session)
@@ -2586,7 +2584,7 @@ async def persist_onboarding_pipeline_result(result: dict[str, Any]) -> None:
         "summary": result.get("summary") or result.get("approval_package") or {},
         "event_contract": result.get("event_contract") or {},
         "result": result,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
     }
 
     async with session_factory() as session:
@@ -2602,7 +2600,7 @@ async def persist_onboarding_pipeline_result(result: dict[str, Any]) -> None:
             test_message=f"{provider_name} workflow persisted",
             project_payload=project,
             connectivity_payload=payload,
-            last_tested_at=datetime.now(timezone.utc),
+            last_tested_at=datetime.now(UTC),
         )
         await session.commit()
 
@@ -2711,7 +2709,7 @@ async def run_local_payment_workflow(
     enriched_alert, incident = await AlertIntelligenceAgent().process(alert)
     incident.trace_id = trace_id
     await persist_step(lambda repo: repo.save_alert(enriched_alert), lambda repo: repo.save_incident(incident))
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     await persist_step(
         *[
             track_agent_work_operation(
@@ -2770,7 +2768,7 @@ async def run_local_payment_workflow(
                 "metrics": alert_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     context_task = asyncio.create_task(ai_client.collect_context(alert=enriched_alert, incident=incident))
@@ -2822,7 +2820,7 @@ async def run_local_payment_workflow(
                 "metrics": orchestrator_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     orchestration_envelope = _build_local_metadata_envelope(
@@ -2886,7 +2884,7 @@ async def run_local_payment_workflow(
                 "metrics": context_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     model_errors: list[dict[str, str]] = []
@@ -3097,7 +3095,7 @@ async def run_local_payment_workflow(
                 "llm_errors": resolution_event.get("llm_errors", []),
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     requires_human_approval = enriched_alert.severity in {AlertSeverity.HIGH, AlertSeverity.CRITICAL}
@@ -3332,7 +3330,7 @@ async def run_local_payment_workflow(
                 "metrics": approval_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     engine = RemediationEngine()
@@ -3400,7 +3398,7 @@ async def run_local_payment_workflow(
                 "metrics": remediation_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     closure_report = await ClosureValidationAgent().validate(action)
@@ -3445,7 +3443,7 @@ async def run_local_payment_workflow(
                 "metrics": closure_event["metrics"],
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     )
     metrics = {
@@ -3694,7 +3692,7 @@ async def continue_pending_workflow(
         },
     )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     await persist_step(
         lambda repo: repo.save_approval(approval),
         track_agent_work_operation(
@@ -3707,7 +3705,7 @@ async def continue_pending_workflow(
             ticket_id=str(pending.get("ticket_id") or "") or None,
             details={"decision": approval.decision.value, "channel": approval.channel},
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         ),
     )
 
@@ -3772,7 +3770,7 @@ async def continue_pending_workflow(
             ticket_id=str(pending.get("ticket_id") or "") or None,
             details={"status": action.status.value, "target": action.target},
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         ),
         track_agent_work_operation(
             incident_id_value=incident_uuid,
@@ -3787,7 +3785,7 @@ async def continue_pending_workflow(
                 "alerts_cleared": closure_report.alerts_cleared,
             },
             started_at=now,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         ),
     )
 
@@ -3846,7 +3844,7 @@ async def continue_pending_workflow(
     final_incident_payload = {
         **incident_data,
         "status": final_incident_status.value,
-        "closed_at": datetime.now(timezone.utc).isoformat() if closure_report.health_restored else incident_data.get("closed_at"),
+        "closed_at": datetime.now(UTC).isoformat() if closure_report.health_restored else incident_data.get("closed_at"),
     }
     final_incident = Incident.model_validate(final_incident_payload)
     metrics = {
@@ -3975,7 +3973,7 @@ def _record_closed_incident(
             "root_cause": str(closure_report.get("root_cause") or "N/A"),
             "impact": str(closure_report.get("impact") or "N/A"),
             "trace_id": str(trace_id or closure_report.get("trace_id") or ""),
-            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "closed_at": datetime.now(UTC).isoformat(),
         }
     )
 
@@ -4184,7 +4182,7 @@ async def _publish_lifecycle_events(normalized: dict[str, Any], trace_id: str | 
         "labels": normalized.get("labels", {}),
         "annotations": normalized.get("annotations", {}),
         "normalized": normalized,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
     }
     for topic in (
         ALERT_RECEIVED,
@@ -4293,7 +4291,7 @@ def _integration_health_snapshot(
         "provider": provider,
         "validation": validation,
         "detail": detail or {},
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
     }
     return {
         "status": "healthy" if test_ok and bool(validation.get("valid", False)) else "degraded",
@@ -4404,7 +4402,7 @@ async def create_monitoring_integration(payload: dict[str, Any] = ALERT_BODY) ->
             authentication_ok=health["authentication_ok"],
             webhook_ok=health["webhook_ok"],
             last_received_alert_at=None,
-            last_successful_test_at=datetime.now(timezone.utc),
+            last_successful_test_at=datetime.now(UTC),
             rate_limit_remaining=None,
             payload=health["payload"],
         )
@@ -4528,7 +4526,7 @@ async def validate_monitoring_integration(integration_id: str, payload: dict[str
             authentication_ok=health["authentication_ok"],
             webhook_ok=health["webhook_ok"],
             last_received_alert_at=None,
-            last_successful_test_at=datetime.now(timezone.utc),
+            last_successful_test_at=datetime.now(UTC),
             rate_limit_remaining=None,
             payload=health["payload"],
         )
@@ -6105,10 +6103,10 @@ async def get_landing_pad_recent(limit: int = 20, include_archive: bool = False)
     rows: list[dict[str, Any]] = []
     for path in files:
         try:
-            filename_timestamp = datetime.strptime(path.name[:22], "%Y%m%dT%H%M%S%fZ").replace(tzinfo=timezone.utc)
+            filename_timestamp = datetime.strptime(path.name[:22], "%Y%m%dT%H%M%S%fZ").replace(tzinfo=UTC)
             modified_at = filename_timestamp.isoformat()
         except ValueError:
-            modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+            modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat()
         entry: dict[str, Any] = {
             "file": path.name,
             "path": str(path),
@@ -6507,7 +6505,7 @@ async def get_unified_incident_inbox(
         raise HTTPException(status_code=422, detail="Unsupported inbox record type")
     fingerprint = hashlib.sha256(json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     offset = 0
-    snapshot = datetime.now(timezone.utc)
+    snapshot = datetime.now(UTC)
     if cursor:
         try:
             padding = "=" * (-len(cursor) % 4)
@@ -6538,7 +6536,7 @@ async def get_unified_incident_inbox(
         except ValueError:
             return False
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+            parsed = parsed.replace(tzinfo=UTC)
         return parsed > snapshot
 
     def view_matches(kind: str, row: dict[str, Any], view: str | None = None) -> bool:
@@ -6550,7 +6548,11 @@ async def get_unified_incident_inbox(
         if kind == "alert" and selected_view == "resolved":
             return False
         if selected_view == "needs_me":
-            return needs_human if kind == "incident" else row_severity in {"critical", "high", "p1", "p2", "sev1", "sev2"}
+            return (
+                needs_human
+                if kind == "incident"
+                else row_severity in {"critical", "high", "p1", "p2", "sev1", "sev2"}
+            )
         if selected_view == "kai_handling":
             return not terminal and not needs_human
         if selected_view == "critical":
@@ -6588,9 +6590,15 @@ async def get_unified_incident_inbox(
         row = item["row"]
         if normalized["risk_tier"] and str(row.get("risk_tier") or "").lower() != normalized["risk_tier"]:
             return False
-        if normalized["execution_mode"] and str(row.get("execution_mode") or "").lower() != normalized["execution_mode"]:
+        if (
+            normalized["execution_mode"]
+            and str(row.get("execution_mode") or "").lower() != normalized["execution_mode"]
+        ):
             return False
-        if normalized["transport_provider"] and str(row.get("transport_provider") or "").lower() != normalized["transport_provider"]:
+        if (
+            normalized["transport_provider"]
+            and str(row.get("transport_provider") or "").lower() != normalized["transport_provider"]
+        ):
             return False
         if normalized["status"] and str(row.get("status") or "").lower() != normalized["status"]:
             return False
@@ -6605,11 +6613,17 @@ async def get_unified_incident_inbox(
         for view in ("all", "needs_me", "kai_handling", "critical", "watching", "resolved")
     }
     records = [item for item in records if view_matches(item["record_type"], item["row"])]
-    records.sort(key=lambda item: (int(item["score"]), str(item["observed_at"]), str(item["row"].get("id") or "")), reverse=True)
+    records.sort(
+        key=lambda item: (int(item["score"]), str(item["observed_at"]), str(item["row"].get("id") or "")),
+        reverse=True,
+    )
     page = records[offset:offset + safe_limit]
 
     def encode(next_offset: int) -> str:
-        payload = json.dumps({"filter": fingerprint, "snapshot": snapshot.isoformat(), "offset": next_offset}, separators=(",", ":")).encode()
+        payload = json.dumps(
+            {"filter": fingerprint, "snapshot": snapshot.isoformat(), "offset": next_offset},
+            separators=(",", ":"),
+        ).encode()
         return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
     return {
@@ -6873,7 +6887,7 @@ async def update_onboarding_rules_pipeline(workflow_id: str, payload: dict[str, 
                 "pipeline": str(connectivity_payload.get("pipeline") or latest.get("provider_name") or "onboarding_pipeline"),
                 "summary": payload.get("summary") if isinstance(payload.get("summary"), dict) else connectivity_payload.get("summary", {}),
                 "result": merged_result,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
             }
         )
 
@@ -6888,7 +6902,7 @@ async def update_onboarding_rules_pipeline(workflow_id: str, payload: dict[str, 
             test_message=str(payload.get("test_message") or latest.get("test_message") or "Workflow updated by admin"),
             project_payload=project_payload,
             connectivity_payload=connectivity_payload,
-            last_tested_at=datetime.now(timezone.utc),
+            last_tested_at=datetime.now(UTC),
         )
         await session.commit()
 

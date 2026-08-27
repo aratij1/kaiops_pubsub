@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, Boxes, ChevronRight, GitBranch, Layers3, Network, RefreshCw, Search, Server, Workflow, X } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 
@@ -45,15 +45,28 @@ export default function CloudResourcesRoute() {
   const [relationships, setRelationships] = useState<Array<Record<string, unknown>>>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const refreshSequence = useRef(0);
+
+  function scopeChanged(update: () => void) {
+    refreshSequence.current += 1;
+    setBusy(false);
+    setError("");
+    update();
+  }
 
   async function refresh() {
+    const sequence = ++refreshSequence.current;
     setBusy(true); setError("");
     try {
       const rows = await listResources(accessToken, projectId || undefined, serviceId || undefined, environment || undefined);
+      if (sequence !== refreshSequence.current) return;
       setResources(rows);
       setSelectedId((current) => rows.some((item) => item.id === current) ? current : (rows[0]?.id ?? ""));
-    } catch (err) { setError(err instanceof Error ? err.message : "Unable to load resource inventory"); }
-    finally { setBusy(false); }
+    } catch (err) {
+      if (sequence === refreshSequence.current) setError(err instanceof Error ? err.message : "Unable to load resource inventory");
+    } finally {
+      if (sequence === refreshSequence.current) setBusy(false);
+    }
   }
 
   useEffect(() => { if (accessToken) void refresh(); }, [accessToken]);
@@ -71,7 +84,7 @@ export default function CloudResourcesRoute() {
 
   return <section className="cloud-ops-route resource-explorer" aria-labelledby="cloud-resources-title">
     <article className="cloud-ops-panel resource-explorer-header"><header><div><span className="resource-eyebrow">Operational Digital Twin</span><h2 id="cloud-resources-title">Resource Explorer</h2><p>Search the operational estate, inspect health and provenance, and follow deterministic topology relationships.</p></div><button type="button" className="button-secondary" onClick={refresh} disabled={busy}><RefreshCw className={busy ? "spin" : ""} size={16} /> {busy ? "Refreshing…" : "Refresh"}</button></header>
-      <form className="cloud-ops-toolbar" onSubmit={(event) => { event.preventDefault(); void refresh(); }}><label><span>Project ID</span><input value={projectId} onChange={(event) => setProjectId(event.target.value)} /></label><label><span>Service ID</span><input placeholder="All services" value={serviceId} onChange={(event) => setServiceId(event.target.value)} /></label><label><span>Environment</span><input placeholder="All environments" value={environment} onChange={(event) => setEnvironment(event.target.value)} /></label><button type="submit" className="button-primary" disabled={busy}>Apply scope</button></form>
+      <form className="cloud-ops-toolbar" onSubmit={(event) => { event.preventDefault(); void refresh(); }}><label><span>Project ID</span><input value={projectId} onChange={(event) => scopeChanged(() => setProjectId(event.target.value))} /></label><label><span>Service ID</span><input placeholder="All services" value={serviceId} onChange={(event) => scopeChanged(() => setServiceId(event.target.value))} /></label><label><span>Environment</span><input placeholder="All environments" value={environment} onChange={(event) => scopeChanged(() => setEnvironment(event.target.value))} /></label><button type="submit" className="button-primary" disabled={busy}>Apply scope</button></form>
     </article>
     {error ? <div className="cloud-ops-error" role="alert">{error}</div> : null}
     <div className="resource-explorer-layout">

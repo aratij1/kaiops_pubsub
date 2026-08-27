@@ -1,70 +1,69 @@
 ﻿from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
-import base64
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy import and_, delete, func, or_, select, text
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
-from common.incident_status import reduce_incident_status
-from common.resolution_lifecycle import select_current_lifecycle
-from common.tenant_identity import require_tenant_id
-
 from common.database import (
     ActionRecord,
-    AlertRuleRecord,
     AgentWorkItemRecord,
     AlertRecord,
+    AlertRuleRecord,
     ApplicationEnvironmentRecord,
     ApplicationLabelRecord,
     ApplicationRecord,
     ApprovalRecord,
     AuditLogRecord,
+    ContextKnowledgeRecord,
+    ContextSnapshotRecord,
     DraftPullRequestOutboxRecord,
     EvaluationRecord,
     GrafanaDashboardRecord,
-    IncidentEventRecord,
     IncidentCorrelationOwnershipRecord,
+    IncidentEventRecord,
     IncidentOccurrenceRecord,
-    LearningAuditRecord,
-    IncidentRecord,
     IncidentProjectionRecord,
+    IncidentRecord,
     JiraTicketLinkRecord,
     KnowledgeBaseRecord,
-    ContextKnowledgeRecord,
-    ContextSnapshotRecord,
-    MonitoringProfileRecord,
-    MonitoringIntegrationRecord,
-    MonitoringCredentialRecord,
-    MonitoringWebhookEndpointRecord,
+    LearningAuditRecord,
     MonitoringAlertMappingRecord,
-    MonitoringConnectionHealthRecord,
-    MonitoringReceivedAlertRecord,
-    MonitoringNormalizedAlertRecord,
     MonitoringConnectionAuditRecord,
+    MonitoringConnectionHealthRecord,
+    MonitoringCredentialRecord,
+    MonitoringIntegrationRecord,
+    MonitoringNormalizedAlertRecord,
+    MonitoringProfileRecord,
+    MonitoringReceivedAlertRecord,
+    MonitoringWebhookEndpointRecord,
+    ObjectStorageRecord,
+    OnboardingControlPlaneRecord,
     OnboardingHistoryRecord,
-    RcaReportRecord,
-    RunbookVersionRecord,
-    RunbookOutcomeRecord,
+    OnboardingStateRecord,
+    PendingWorkflowRecord,
     PrometheusConfigRecord,
+    RcaReportRecord,
     RecordingRuleRecord,
     ResolutionOutboxRecord,
-    OnboardingStateRecord,
-    OnboardingControlPlaneRecord,
-    ObjectStorageRecord,
-    PendingWorkflowRecord,
+    RunbookOutcomeRecord,
+    RunbookVersionRecord,
     ValidationHistoryRecord,
     ValidationObservationRecord,
 )
+from common.incident_status import reduce_incident_status
+from common.resolution_lifecycle import select_current_lifecycle
+from common.tenant_identity import require_tenant_id
 
 
 class ObjectStorageRepository:
@@ -130,9 +129,9 @@ class ObjectStorageRepository:
         await self.session.flush()
 from common.models import (
     Alert,
+    ApplicationRegistration,
     Approval,
     ApprovalDecision,
-    ApplicationRegistration,
     GrafanaDashboardResult,
     Incident,
     MetricsValidationResult,
@@ -141,11 +140,10 @@ from common.models import (
     PrometheusUpdateResult,
     Recommendation,
     RemediationAction,
-    RulesGeneratedResult,
     ResolutionReport,
+    RulesGeneratedResult,
     utc_now,
 )
-
 
 _PLACEHOLDER_TOKENS = {"", "-", "n/a", "na", "none", "null", "unknown"}
 _PENDING_DECISIONS = {"PENDING", "QUEUED", "AWAITING_APPROVAL", "AWAITING USER APPROVAL", "STANDBY"}
@@ -505,8 +503,8 @@ def _utc_dt(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _extract_recommendation_uuid(payload: dict[str, Any] | None) -> UUID | None:
@@ -1970,7 +1968,7 @@ class IncidentRepository:
         service = self._require("service", incident.service)
         correlation_key = self._require("correlation_key", correlation_key)
         idempotency_key = self._require("idempotency_key", idempotency_key)
-        now = observed_at or datetime.now(timezone.utc)
+        now = observed_at or datetime.now(UTC)
         window = timedelta(minutes=max(1, min(int(correlation_window_minutes), 1440)))
 
         existing_occurrence = (
@@ -2009,7 +2007,7 @@ class IncidentRepository:
         terminal = {"closed", "resolved", "cancelled", "canceled"}
         ownership_expiry = ownership.correlation_window_expires_at if ownership is not None else None
         if ownership_expiry is not None and ownership_expiry.tzinfo is None:
-            ownership_expiry = ownership_expiry.replace(tzinfo=timezone.utc)
+            ownership_expiry = ownership_expiry.replace(tzinfo=UTC)
         ownership_last_seen = ownership.last_seen_at if ownership is not None else None
         if ownership_last_seen is not None and ownership_last_seen.tzinfo is None:
             ownership_last_seen = ownership_last_seen.replace(tzinfo=UTC)
@@ -2081,7 +2079,7 @@ class IncidentRepository:
         else:
             last_seen = ownership.last_seen_at
             if last_seen.tzinfo is None:
-                last_seen = last_seen.replace(tzinfo=timezone.utc)
+                last_seen = last_seen.replace(tzinfo=UTC)
             ownership.last_seen_at = max(last_seen, now)
             ownership.version = int(ownership.version or 1) + 1
 
@@ -2115,8 +2113,10 @@ class IncidentRepository:
             ownership = (
                 await self.session.execute(
                     select(IncidentCorrelationOwnershipRecord).where(
-                        IncidentCorrelationOwnershipRecord.correlation_family_id == existing_occurrence.correlation_family_id,
-                        IncidentCorrelationOwnershipRecord.correlation_generation == existing_occurrence.correlation_generation,
+                        IncidentCorrelationOwnershipRecord.correlation_family_id
+                        == existing_occurrence.correlation_family_id,
+                        IncidentCorrelationOwnershipRecord.correlation_generation
+                        == existing_occurrence.correlation_generation,
                     )
                 )
             ).scalar_one()
@@ -2409,14 +2409,14 @@ class IncidentRepository:
             return False
         expires_at = record.approval_expires_at
         if expires_at is not None and expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
+            expires_at = expires_at.replace(tzinfo=UTC)
         return (
             str(record.plan_id or record.payload.get("plan_id") or "") == str(plan_id or "")
             and str(record.plan_fingerprint or record.payload.get("plan_fingerprint") or "") == plan_fingerprint
             and str(record.payload.get("tenant_id") or "") == normalized_tenant
             and str(record.payload.get("authorization_scope") or "execution") == "execution"
             and expires_at is not None
-            and expires_at > datetime.now(timezone.utc)
+            and expires_at > datetime.now(UTC)
         )
 
     async def update_incident_approval_status(
@@ -2712,7 +2712,7 @@ class IncidentRepository:
             self.session.add(row)
         row.approval_status = "approved"
         row.approved_by = str(approved_by)
-        row.approved_at = datetime.now(timezone.utc)
+        row.approved_at = datetime.now(UTC)
         row.content = payload or row.content or {}
         await self.session.flush()
         return {"runbook_id": str(row.runbook_id), "version": row.version, "status": row.approval_status}
@@ -2746,7 +2746,7 @@ class IncidentRepository:
             content = dict(row.content or {})
             content["suspended_reason"] = f"modified during execution by {actor}" if modified else f"execution failed; recorded by {actor}"
             row.content = content
-        row.last_validated_at = datetime.now(timezone.utc)
+        row.last_validated_at = datetime.now(UTC)
         outcome_payload = dict(metadata or {})
         incident_id = str(outcome_payload.get("incident_id") or outcome_payload.get("alert_id") or "unknown")[:128]
         outcome_key = f"{tenant_id}:{incident_id}:{row.runbook_id}:{row.version}"
@@ -4521,8 +4521,14 @@ class IncidentRepository:
                     query = query.where(IncidentProjectionRecord.execution_mode == execution_mode.strip().lower())
             return query
 
-        total_count = int((await self.session.scalar(select(func.count()).select_from(scoped_query(apply_filters=False).subquery()))) or 0)
-        filtered_count = int((await self.session.scalar(select(func.count()).select_from(scoped_query(apply_filters=True).subquery()))) or 0)
+        total_count = int(
+            (await self.session.scalar(select(func.count()).select_from(scoped_query(apply_filters=False).subquery())))
+            or 0
+        )
+        filtered_count = int(
+            (await self.session.scalar(select(func.count()).select_from(scoped_query(apply_filters=True).subquery())))
+            or 0
+        )
         active_count = int((await self.session.scalar(
             select(func.count()).select_from(
                 scoped_query(apply_filters=False)
@@ -4665,12 +4671,18 @@ class IncidentRepository:
             if direction == "previous":
                 page_query = page_query.where(or_(
                     IncidentCorrelationOwnershipRecord.first_seen_at > cursor_at,
-                    and_(IncidentCorrelationOwnershipRecord.first_seen_at == cursor_at, IncidentCorrelationOwnershipRecord.id > cursor_id),
+                    and_(
+                        IncidentCorrelationOwnershipRecord.first_seen_at == cursor_at,
+                        IncidentCorrelationOwnershipRecord.id > cursor_id,
+                    ),
                 ))
             else:
                 page_query = page_query.where(or_(
                     IncidentCorrelationOwnershipRecord.first_seen_at < cursor_at,
-                    and_(IncidentCorrelationOwnershipRecord.first_seen_at == cursor_at, IncidentCorrelationOwnershipRecord.id < cursor_id),
+                    and_(
+                        IncidentCorrelationOwnershipRecord.first_seen_at == cursor_at,
+                        IncidentCorrelationOwnershipRecord.id < cursor_id,
+                    ),
                 ))
         if direction == "previous":
             page_query = page_query.order_by(
@@ -4779,7 +4791,7 @@ class IncidentRepository:
             "active_count": active_count,
             "needs_attention_count": needs_attention_count,
             "unlinked_signal_count": unlinked_signal_count,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": datetime.now(UTC).isoformat(),
         }
 
     async def list_incident_projections(
@@ -5933,7 +5945,7 @@ class EvaluationRepository:
         for row in rows:
             expired_at = row.expires_at
             if expired_at is not None and expired_at.tzinfo is None:
-                expired_at = expired_at.replace(tzinfo=timezone.utc)
+                expired_at = expired_at.replace(tzinfo=UTC)
             await self.session.delete(row)
             self.session.add(
                 AuditLogRecord(

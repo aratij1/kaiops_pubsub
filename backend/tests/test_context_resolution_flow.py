@@ -293,8 +293,8 @@ def test_resolution_agent_rejects_malformed_structured_output_as_display_text() 
     assert parsed == "Impact is not established from validated evidence."
 
 
-def test_vector_db_connector_loads_rag_documents() -> None:
-    connector = VectorDBConnector()
+def test_vector_db_connector_loads_rag_documents(governed_rag_root) -> None:
+    connector = VectorDBConnector(rag_root=governed_rag_root)
     connector.reload()
 
     assert connector.documents
@@ -410,7 +410,7 @@ async def test_resolution_builds_application_crawl_and_historical_hypotheses() -
 
 
 @pytest.mark.asyncio
-async def test_context_agent_returns_requested_shape() -> None:
+async def test_context_agent_returns_requested_shape(governed_rag_root) -> None:
     alert = Alert(
         tenant_id="tenant-a",
         source="prometheus",
@@ -422,7 +422,10 @@ async def test_context_agent_returns_requested_shape() -> None:
     )
     incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
 
-    context = await ContextIntelligenceAgent().collect(alert, incident)
+    connectors = ContextIntelligenceAgent().connectors
+    connectors[-1] = VectorDBConnector(rag_root=governed_rag_root)
+    agent = ContextIntelligenceAgent(connectors=connectors)
+    context = await agent.collect(alert, incident)
 
     assert context.deployment == "payments-api"
     assert context.runbook
@@ -473,7 +476,7 @@ async def test_context_agent_persists_multi_source_evidence_manifest() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolution_agent_generates_recommendation() -> None:
+async def test_resolution_agent_generates_recommendation(governed_rag_root) -> None:
     alert = Alert(
         tenant_id="tenant-a",
         source="prometheus",
@@ -484,7 +487,10 @@ async def test_resolution_agent_generates_recommendation() -> None:
         labels={"deployment": "payments-api"},
     )
     incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
-    context = await ContextIntelligenceAgent().collect(alert, incident)
+    connectors = ContextIntelligenceAgent().connectors
+    connectors[-1] = VectorDBConnector(rag_root=governed_rag_root)
+    agent = ContextIntelligenceAgent(connectors=connectors)
+    context = await agent.collect(alert, incident)
 
     recommendation = await ResolutionIntelligenceAgent(model_router=static_router()).resolve(context)
 

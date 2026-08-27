@@ -109,7 +109,12 @@ class IncidentCorrelationOwnershipRecord(Base, TimestampMixin):
             "tenant_id", "project_id", "environment", "service", "correlation_key",
         ),
         Index("idx_incident_correlation_page", "tenant_id", "first_seen_at", "id"),
-        Index("idx_incident_correlation_family_generation", "tenant_id", "correlation_family_id", "correlation_generation"),
+        Index(
+            "idx_incident_correlation_family_generation",
+            "tenant_id",
+            "correlation_family_id",
+            "correlation_generation",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)

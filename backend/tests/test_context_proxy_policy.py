@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-
 from ai_workbench_common.models import Context
 from common.models import Alert, AlertSeverity, Incident
 from context_agent.connectors import DiscoveryMCPConnector
@@ -38,7 +37,9 @@ def test_internal_service_bypasses_environment_and_explicit_proxy(monkeypatch) -
     assert report == {"target": "internal", "trust_env": False, "proxy": {"configured": False}}
 
 
-@pytest.mark.parametrize("proxy_url", ["http://proxy.example:8080", "socks5://proxy.example:1080", "socks5h://proxy.example:1080"])
+@pytest.mark.parametrize(
+    "proxy_url", ["http://proxy.example:8080", "socks5://proxy.example:1080", "socks5h://proxy.example:1080"]
+)
 def test_external_proxy_schemes_are_explicit_and_supported(monkeypatch, proxy_url: str) -> None:
     monkeypatch.setenv("DISCOVERY_MCP_PROXY_URL", proxy_url)
     connector = DiscoveryMCPConnector()
@@ -65,7 +66,9 @@ def test_proxy_report_redacts_credentials_and_rejects_unsupported_scheme(monkeyp
 async def test_client_construction_failure_returns_explicit_evidence_gap(monkeypatch) -> None:
     connector = DiscoveryMCPConnector()
     alert, incident = _alert_and_incident()
-    monkeypatch.setattr(connector, "_build_client", lambda _url: (_ for _ in ()).throw(RuntimeError("proxy bootstrap failed")))
+    monkeypatch.setattr(
+        connector, "_build_client", lambda _url: (_ for _ in ()).throw(RuntimeError("proxy bootstrap failed"))
+    )
 
     result = await connector.fetch(alert, incident)
 

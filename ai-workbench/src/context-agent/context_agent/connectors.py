@@ -1344,7 +1344,11 @@ class VectorDBConnector(BaseConnector):
         )
         tenant_id = str(getattr(alert, "tenant_id", "") or getattr(incident, "tenant_id", "")).strip()
         if not tenant_id:
-            return {"matches": [], "document_count": len(self.documents), "evidence_gap": "authenticated tenant identity is missing"}
+            return {
+                "matches": [],
+                "document_count": len(self.documents),
+                "evidence_gap": "authenticated tenant identity is missing",
+            }
         ranked = self.search(
             query,
             limit=8,
@@ -1897,10 +1901,16 @@ class VectorDBConnector(BaseConnector):
         candidates = [
             doc
             for doc in self.documents
-            if self._tenant_allowed(doc, tenant_id) and self._kind_matches(doc, preferred_kinds) and self._service_matches(doc, service)
+            if self._tenant_allowed(doc, tenant_id)
+            and self._kind_matches(doc, preferred_kinds)
+            and self._service_matches(doc, service)
         ]
         if not candidates and preferred_kinds:
-            candidates = [doc for doc in self.documents if self._tenant_allowed(doc, tenant_id) and self._service_matches(doc, service)]
+            candidates = [
+                doc
+                for doc in self.documents
+                if self._tenant_allowed(doc, tenant_id) and self._service_matches(doc, service)
+            ]
 
         shortlist_size = min(max(limit * 4, 12), len(candidates))
         shortlisted = heapq.nlargest(

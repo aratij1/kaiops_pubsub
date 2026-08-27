@@ -8,6 +8,7 @@ from ai_workbench_common.model_evaluation import EvaluationResult
 from ai_workbench_common.models import Context
 from common.models import Alert, AlertSeverity, Incident, Recommendation
 from context_agent import ContextIntelligenceAgent
+from context_agent.connectors import VectorDBConnector
 from model_router import ModelRouter
 from model_router.router import ModelProvider, ModelResponse, build_usage
 from resolution_agent import ResolutionIntelligenceAgent
@@ -47,14 +48,18 @@ class StubJudgeClient:
         return EvaluationResult(metric=metric, score=self._score, explanation="stub", confidence=self._confidence)
 
 
-async def _sample_context() -> Context:
+async def _sample_context(rag_root=None) -> Context:
     alert = Alert(
         tenant_id="tenant-a",
         source="prometheus", name="PaymentLatencyHigh", service="payments", severity=AlertSeverity.CRITICAL,
         description="payment latency after deployment", labels={"deployment": "payments-api"},
     )
     incident = Incident(tenant_id="tenant-a", service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
-    return await ContextIntelligenceAgent().collect(alert, incident)
+    connectors = ContextIntelligenceAgent().connectors
+    if rag_root is not None:
+        connectors[-1] = VectorDBConnector(rag_root=rag_root)
+    agent = ContextIntelligenceAgent(connectors=connectors)
+    return await agent.collect(alert, incident)
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +198,7 @@ async def test_post_evaluation_swallows_transport_failures(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_wires_external_judge_into_evaluation(monkeypatch) -> None:
+async def test_resolve_wires_external_judge_into_evaluation(monkeypatch, governed_rag_root) -> None:
     import resolution_agent.graph as graph_module
 
     class NoopAsyncClient:
@@ -211,7 +216,7 @@ async def test_resolve_wires_external_judge_into_evaluation(monkeypatch) -> None
 
     monkeypatch.setattr(graph_module.httpx, "AsyncClient", NoopAsyncClient)
 
-    context = await _sample_context()
+    context = await _sample_context(governed_rag_root)
     judge = StubJudgeClient(score=0.66, confidence=0.5)
     agent = ResolutionIntelligenceAgent(model_router=static_router(), evaluation_client=judge)
 
