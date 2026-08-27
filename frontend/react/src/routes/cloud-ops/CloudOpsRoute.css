@@ -107,11 +107,22 @@
 }
 
 .cloud-ops-empty {
+  display: grid;
+  justify-items: center;
+  gap: 0.65rem;
   border: 1px dashed var(--border-subtle, rgba(148, 163, 184, 0.45));
   border-radius: 16px;
   color: var(--text-muted, #64748b);
   padding: 1rem;
   text-align: center;
+}
+
+.cloud-ops-empty > strong {
+  color: var(--text, #172033);
+}
+
+.cloud-ops-empty > .button-primary {
+  margin-top: 0.25rem;
 }
 
 .cloud-ops-readiness {

@@ -34,8 +34,8 @@ export default function CloudConnectionsRoute() {
   }
 
   useEffect(() => {
-    void refresh();
-  }, []);
+    if (accessToken) void refresh();
+  }, [accessToken]);
 
   async function createConnection() {
     setBusy("create");

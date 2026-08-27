@@ -452,6 +452,7 @@ function visibleManagedApplication(row) {
 export default function App({ initialTab = "home", currentPath = "/", currentSearch = "", onActiveTabChange, onNavigatePath, routeOutlet = null } = {}) {
   const queryClient = useQueryClient();
   const skipNextActiveTabNavigationRef = useRef(false);
+  const skipInitialPreferencesPersistRef = useRef(true);
   const defaultMonitorApplications = FIXED_MONITOR_SCOPES;
   const [applicationToMonitor, setApplicationToMonitor] = useState("KaiMS");
   const [monitorApplications, setMonitorApplications] = useState(defaultMonitorApplications);
@@ -4948,6 +4949,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     if (typeof window === "undefined") {
       return;
     }
+    if (skipInitialPreferencesPersistRef.current) { skipInitialPreferencesPersistRef.current = false; return; }
     const payload = {
       applicationToMonitor,
       uiDensity,
