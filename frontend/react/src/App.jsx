@@ -10926,7 +10926,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         <div className="incident-workspace-kpis">
                           <span><strong>{incidentStatusLabel(selectedCanonicalIncidentStatus)}</strong> lifecycle</span>
                           <span><strong>{selectedAlertTimelineRows.length}</strong> events</span>
-                          <span><strong>{selectedAiTrust.evidence.length}</strong> linked evidence</span>
+                          <span><strong>{selectedAiTrust.evidence.filter((row) => row.accepted).length}</strong> RCA-supporting evidence</span>
                           <span className={Number(selectedRcaDecision.confidence || 0) < 0.5 ? "is-quality-warning" : ""}><strong>{formatQualityPercent(selectedRcaDecision.confidence)}</strong> RCA confidence</span>
                         </div>
                       </header>
