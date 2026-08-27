@@ -306,6 +306,11 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
     now = now or utc_now()
     metadata = context.metadata if isinstance(context.metadata, dict) else {}
     buckets = metadata.get("context_evidence") if isinstance(metadata.get("context_evidence"), dict) else {}
+    discovery = metadata.get("discovery_report") if isinstance(metadata.get("discovery_report"), dict) else {}
+    discovery_degraded = bool(
+        discovery.get("evidence_gap")
+        or str(discovery.get("provider_status") or "").lower() in {"failed", "degraded", "unavailable"}
+    )
     all_rows = [row for rows in buckets.values() if isinstance(rows, list) for row in rows if isinstance(row, dict)]
     present = {
         "identity": bool(str(context.alert.service or "").strip() and str(context.alert.service).lower() != "unknown"),
@@ -323,6 +328,8 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
     missing_required = [name for name in required if name != "causal_or_action" and not present.get(name)]
     if "causal_or_action" in required and not (present["causal"] or present["action"]):
         missing_required.append("causal_or_action")
+    if discovery_degraded and "discovery_evidence" not in missing_required:
+        missing_required.append("discovery_evidence")
     missing = [name for name, available in present.items() if not available]
 
     if all_rows:
@@ -357,6 +364,8 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
     conflicts = metadata.get("context_conflicts") if isinstance(metadata.get("context_conflicts"), list) else []
     confidence = (coverage * 0.45) + (freshness * 0.25) + (provenance * 0.20) + (relevance * 0.10)
     confidence = max(0.0, min(confidence, 1.0))
+    if discovery_degraded:
+        confidence = min(confidence, 0.49)
     reusable = bool(confidence >= threshold and not missing_required and not stale_sources and not conflicts)
     valid_for = min(
         (
@@ -374,6 +383,8 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
         "relevance_score": round(relevance, 4),
         "threshold": round(max(0.0, min(threshold, 1.0)), 4),
         "reusable": reusable,
+        "execution_ready": bool(reusable and not discovery_degraded),
+        "discovery_degraded": discovery_degraded,
         "present": present,
         "missing_context": missing,
         "missing_required": missing_required,

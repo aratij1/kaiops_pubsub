@@ -3451,13 +3451,47 @@ async def ingest_rag_document(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
 ) -> dict[str, Any]:
+    payload = {**payload, "tenant_scope": auth.tenant_id}
     return await guarded_proxy(
         request=request,
         method="POST",
         path="/rag/documents",
         target_base=settings.context_agent_url,
         payload=payload,
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.get("/incidents/groups")
+async def get_incident_groups(
+    request: Request,
+    limit: int = 25,
+    cursor: str | None = None,
+    risk_tier: str | None = None,
+    execution_mode: str | None = None,
+    status: str | None = None,
+    service: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    params: dict[str, str] = {"limit": str(max(1, min(int(limit), 100))), "tenant_id": tenant_id}
+    for key, value in {
+        "cursor": cursor,
+        "risk_tier": risk_tier,
+        "execution_mode": execution_mode,
+        "status": status,
+        "service": service,
+    }.items():
+        if value:
+            params[key] = str(value)
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path=f"/incidents/groups?{urlencode(params)}",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
         trace_id=trace_id_from_header(x_trace_id),
     )
 

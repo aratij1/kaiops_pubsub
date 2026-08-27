@@ -1992,12 +1992,8 @@ async def search_rag(
         limit=max(1, min(limit, 20)),
         preferred_kind=kind,
         service=service,
+        tenant_id=tenant_id,
     )
-    matches = [
-        match for match in matches
-        if str(match.get("tenant_id") or "").strip() == tenant_id
-        or str(match.get("tenant_scope") or "").strip().lower() == "global"
-    ]
     return {
         "query": query,
         "index": vector_connector().index_info(),
@@ -2008,6 +2004,11 @@ async def search_rag(
                 "services": match.get("services", []),
                 "deployment": match.get("deployment"),
                 "path": match.get("path"),
+                "tenant_scope": match.get("tenant_scope"),
+                "source_system": match.get("source_system"),
+                "source_ref": match.get("source_ref"),
+                "content_version": match.get("content_version"),
+                "review_status": match.get("review_status"),
                 "score": match.get("_similarity", 0.0),
                 "semantic_score": match.get("_semantic_score", 0.0),
                 "metadata_match_score": match.get("_metadata_match_score", 0.0),

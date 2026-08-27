@@ -1,0 +1,1348 @@
+{
+  "mode": "apply",
+  "records": [
+    {
+      "after_sha256": "295e58b40767a3e65d6a82839187e9e391199b9a528dea1e22b5be31dad15fcd",
+      "before_sha256": "5092a895d8855c1a77e7468caa57942f238f06e65393c345c2a346f0df489331",
+      "changed": true,
+      "path": "deployments/0669dbc6-d12e-4ec5-b6ed-2bc1eaa06d4f.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "ed41665d3dcbad62e9dd9c652a208cfefabe69d073d0c1f1b64cd82991be4b83",
+      "before_sha256": "154b4c07946b044cf7ec2502fbeafef0aa0da0fb577c2c524674bc85043d8634",
+      "changed": true,
+      "path": "deployments/593b8ce5-2336-4d09-8f84-5324fcc0b333.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "c709487adcf9e857ddfd529fa4ab2e03bd5004ac6a78444dea092c9bc6008373",
+      "before_sha256": "b12c00fd902b0da5aeba45d8d870b1e833431d5db420975321cb3423eff2ac98",
+      "changed": true,
+      "path": "deployments/5baeecf4-994e-45b8-b3ec-96006786a23e.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "ac2af26d3cb82f9b925fb4ee698a8a1f62cfdfd43d59b62e98448ecbe5950933",
+      "before_sha256": "888afab49c8228346dd1156011e6ea7651b10209d1b7ba7c4b2157079c711efe",
+      "changed": true,
+      "path": "deployments/8f2e775f-839d-4fa0-b182-9568c249a55f.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "dc0f32103f309384bb3f10bf67855d239610e1730b1207137ed63ae810a3f8e8",
+      "before_sha256": "8e55dc2ef6db37db106f174dfd0a683b4de80386c1f320c56efef430dc10c54b",
+      "changed": true,
+      "path": "deployments/b2f5ab95-99d2-4202-9f9b-17b453081676.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "db97453f1cfa442467ea451c0c47d12f690a5e4069acaf8ac6d1b7359146e6f3",
+      "before_sha256": "e5e1f3c0fe6d25df0ec14fadfe7d43439e2ebed12d815d1c858b6f3ef4542601",
+      "changed": true,
+      "path": "deployments/c455c797-af5d-4abd-8c13-b44b53b5f0db.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "3751d3cbbcd31627261dcf57274b30e1ab577fb9d15fef10884cf4b916a650b8",
+      "before_sha256": "86c4e293125b2e0f4901931ae5cfca34467411936ed5062a76cdca14ae04e74b",
+      "changed": true,
+      "path": "deployments/db91cf05-db73-4b4b-b1b9-0fe5d280c8a8.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "daa304baa45729e277fc68c7c3ae33dd84f4317ba70a73c1aa6e1b539f9c0a69",
+      "before_sha256": "9a242afd55346ec8adec0e544442fb1c7e171adb4a243bfbd88f764b53c16c51",
+      "changed": true,
+      "path": "execution/README.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "a53a8a51986247d14ebc185a9ccea499b33621109d559abea5a13efd9da26007",
+      "before_sha256": "a53a8a51986247d14ebc185a9ccea499b33621109d559abea5a13efd9da26007",
+      "changed": false,
+      "path": "flows.md",
+      "reason": "NUL byte makes text normalization ambiguous",
+      "status": "rejected"
+    },
+    {
+      "after_sha256": "5b37977abc6ce1d4ae2a1e6cae2760add0583b30a940d3131c6cd521c8c3a4b0",
+      "before_sha256": "eda6f18c52e55980bc5963d3699b4a63e5c6cf1c45c43d1e401943b33e56f1be",
+      "changed": true,
+      "path": "incidents/0669dbc6-d12e-4ec5-b6ed-2bc1eaa06d4f.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "56646984bbadb52f42c199fb636846b461b0fc174f3eb476fbcf85c22e8034bd",
+      "before_sha256": "85bbcf1340e8d804c907fb097b5b51fb0c0928fa2de401f061d9c51051b53ead",
+      "changed": true,
+      "path": "incidents/593b8ce5-2336-4d09-8f84-5324fcc0b333.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "81b3147f305801d8caa81e6c8628542a117d52f6bbda8cfeb26e708a8ec3e6e5",
+      "before_sha256": "163e382eef5f7b0e9d9e72baaa3dbb3390503977060e915d97e9a2d48089e2d1",
+      "changed": true,
+      "path": "incidents/5baeecf4-994e-45b8-b3ec-96006786a23e.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "417c659060a3c1f876baea6b98fdcf334e315f29c497cf8ad933fa1cab4ef04e",
+      "before_sha256": "1f744fd8f064ae783a1645ad13d165f38c2c07fa655879c259643a5a5280855f",
+      "changed": true,
+      "path": "incidents/8f2e775f-839d-4fa0-b182-9568c249a55f.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "d9b8de7b332c8e059c6da2d769619eef8d68267c1c679771e08f2646b3d92d0f",
+      "before_sha256": "959d980a406f9f6b6e5dfa79a49bf972999ffa3e80495e6758a2436f1ba4ef90",
+      "changed": true,
+      "path": "incidents/alert-when-checkout-latency-exceeds-2-seconds.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "c5f7c0fff5410076f71fd1183422ee9c2f3f11f15ec47f09e7ac76f60c90445e",
+      "before_sha256": "b26eb801f06b5a662db5389d67b0e488e41efaa55fa79be43f726ef2e07a5434",
+      "changed": true,
+      "path": "incidents/auth-session-store-hotspot-incident.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "4e473333655710f746474d39b12b64626fcca585e6e629a928072e78ff408313",
+      "before_sha256": "8670701e255119c09b377bb22c46e22d8001cff4b8b30f5fec8fa6775ca353f4",
+      "changed": true,
+      "path": "incidents/b2f5ab95-99d2-4202-9f9b-17b453081676.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "48c2a6de64ae36c7dba6046c9e1490ebe906d51ffd14b93d89bc08763b67ea90",
+      "before_sha256": "fcd0c5331de40dfe45d44c5e56abb4c77dd63fed889ae66ac533b383d729e1d2",
+      "changed": true,
+      "path": "incidents/c455c797-af5d-4abd-8c13-b44b53b5f0db.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "8c075ec0710f637da9691a91e023dfab1ad5bd82ae46247555b60bc42c347d6f",
+      "before_sha256": "195fe03ec98b2596ff797185bf3e6ea363a56067b7bc0314022806423eea256e",
+      "changed": true,
+      "path": "incidents/catalog-cache-stale-incident.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "13b6458ae7f818dac7b26cac7307bdd519b888868ec9630d75b29a213d2afcbb",
+      "before_sha256": "afa70fbc97ec9ff7d9bd9888b427b0927f565c1d4d0fa0a404fbf14af5b56cc1",
+      "changed": true,
+      "path": "incidents/db91cf05-db73-4b4b-b1b9-0fe5d280c8a8.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "54b388b315da4da0604ef89918edbd9c59faaa7e1d9426cf33a36e29aa5a36d9",
+      "before_sha256": "ace3c4aa66bcf45bf5bd61d7da929eec762c0adc607fa06926126a1ee300075e",
+      "changed": true,
+      "path": "incidents/dw-1001-etl-job-failure.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "8cdbcf1801051bebe113bce70a243d58f5cd3b48002f0ef423f3bdab3ffba863",
+      "before_sha256": "1ea12adc7b3b5bd28b434f6d4bcb6727999a681ce8e3c722e23848d2d22e0f71",
+      "changed": true,
+      "path": "incidents/dw-1002-data-load-delay.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "45d1f118fc2a042bfa2d98fb8f4c5eed3a3df4d2b67f35be1cc171a6a3172c92",
+      "before_sha256": "6d3355cef74fe27f6e97bcd9727c5c862dae4f71fd6f14a6ece6886a3bca7f68",
+      "changed": true,
+      "path": "incidents/dw-1003-source-system-unavailable.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "7bc7e770846cdcd88eac24a7049b29948b736d0b9037dcea8380b07cdd47794e",
+      "before_sha256": "70fd8e2deab18a190fdc3bd4195c9fd5cb22fda386abec9eed6112946e759a03",
+      "changed": true,
+      "path": "incidents/dw-1004-kafka-consumer-lag-high.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "c600c17d35821a27e7c1a28d6fd81fe8dc5e9e54dc047337b2e1cd1aa17ecbe9",
+      "before_sha256": "c602b78dd3d6e6779c71af5685fc918a14f7865a9b7f8b31d2ababdd2bd120f3",
+      "changed": true,
+      "path": "incidents/dw-1005-data-quality-check-failed.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "96378b0dab82c2ab88125caf5ea48a1eb8ca0168b9ed0424320500d0d1ccf25a",
+      "before_sha256": "6d16c5a6d508381382444d2de75e5b73272fdb0e7912fe4ae865f664ae137090",
+      "changed": true,
+      "path": "incidents/dw-1006-missing-daily-partition.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "3c9652b155be09f31aa77c0231107f584898843824248559dea08ab972c99a9b",
+      "before_sha256": "0bf275252ea9c2f76e7518315f3cbcfa49c6b2629fc0ff0f7a2c25956d014290",
+      "changed": true,
+      "path": "incidents/dw-1007-warehouse-storage-usage-high.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "50d2c275707dae752ee401b7bc51969919145e95b529dffe20efffb4b8a4b252",
+      "before_sha256": "2e3857486ab4121e26ad69517f366a5869996c7f17f40120c16357d9d1e2e12b",
+      "changed": true,
+      "path": "incidents/dw-1008-query-performance-degradation.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "891218948d3d965e85592157e255b3e76e63824eda83795d2321abf563e255ad",
+      "before_sha256": "ffc3a0f01a4917a18ca8cedb691db140cdf60ee61ce5403d1c7cd3e3301bde2a",
+      "changed": true,
+      "path": "incidents/dw-1009-replication-lag-exceeded-threshold.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "ddaca2a1ac4f8d8921fe23453ee41f8a6c041442691fd84b0c1cb72403b921eb",
+      "before_sha256": "e3a6000dfa819c17ec0ce29e62a16bb189df2d98019ddc1d2f5e073513d85ebe",
+      "changed": true,
+      "path": "incidents/dw-1010-schema-drift-detected.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "6fdbf1a107a17108b680b22c595b5e3a73b9a0241909bed698aedf918c60e956",
+      "before_sha256": "680fc2ed4220b95b06d181b4c468a6ac9f6cce0922a9d2887ff50244758e2d78",
+      "changed": true,
+      "path": "incidents/dw-1011-late-arriving-data.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "db65e109f313645c2a81e877a1139325a742ff30b793098035eaf60252e6e541",
+      "before_sha256": "9227cd959bef58e143213b1dcf4647d71d9e5044f1dfae1aad5e666d264e2ef3",
+      "changed": true,
+      "path": "incidents/dw-1012-dimension-load-failure.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "0ffb4881421320d226c22d3444baf559f0e325646133280238fb4180225cafd7",
+      "before_sha256": "e69e76d6087304667a684e3a81ad55a3762adef5674d360cd0de20d835ed38a9",
+      "changed": true,
+      "path": "incidents/dw-1013-fact-table-record-count-mismatch.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "ba2be1358f74c02ecb058a00dca71329fe760d3d93ea09e7dbf57c0ec6fabcaa",
+      "before_sha256": "13598882faa6a5a9a48ff98e3995aa485550bf5894d6b410739bbf4387e58bc0",
+      "changed": true,
+      "path": "incidents/dw-1014-airflow-scheduler-down.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "7dff31245b93cbe58405f930ea5f3e38b2abb57650f46e610b41b9590d9da59e",
+      "before_sha256": "78eec61c7517115b31a0f5784006235fd7c08225f8839eeabc84f14c25a44bf6",
+      "changed": true,
+      "path": "incidents/dw-1015-spark-executor-memory-exhausted.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "68c114f667d2225973f3fe576d2b7ef7b3626454241d4a687abfb4f68a343b08",
+      "before_sha256": "8c06639162d2ed7fda1fa0a0108013d02baaad61546f81e9e353a4f13e80de8f",
+      "changed": true,
+      "path": "incidents/dw-1016-failed-cdc-processing.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "a83c59e3e4aaeb33fbc9a157a752b5285405418ee30ef069ac835996589b0f5b",
+      "before_sha256": "6c7c303a9f63ccbd4dabf4b29969f64b05e0d86cd70f3731d254f5dffe99eac6",
+      "changed": true,
+      "path": "incidents/dw-1017-business-sla-missed.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "65b8f1171bc4a590ff819b89c91b1f00b9a806dd1007fac24bc077af65be43ca",
+      "before_sha256": "43114b9559445af15f08b829fdeb873019f089214ce8a379009fbcb15e6b3362",
+      "changed": true,
+      "path": "incidents/dw-1018-data-pipeline-backlog-growing.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "6381e5c66b9ff13595c28022ba41ba236d6befc3f32439a9c811683133acc24c",
+      "before_sha256": "71b8f81291e45db8791afe4f4973c25012c2650b6f5c407d6c85a8584d4bf23f",
+      "changed": true,
+      "path": "incidents/dw-1019-unauthorized-data-access-attempt.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "df239fbb77141cfd31180e4b8adbdcbda9163a6a0bca9a947a3062f78c3167aa",
+      "before_sha256": "ba051e7c789fea1ff8c7dec0cd6bfe612e1e57528b0fab659d96c7a57320b9a1",
+      "changed": true,
+      "path": "incidents/dw-1020-dashboard-refresh-failure.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "0851cdbd7b93085c8bbfe1c36515ab4ee261587d6e8832b4eee5e5fa91886cec",
+      "before_sha256": "15d52e5ca2227f4dfbc31beedc37ea88352b8172be23b7f623e1d480a3a2c56b",
+      "changed": true,
+      "path": "incidents/inc-8842-payment-latency.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "4f408fcb247b5896d009e4a3ffadc1fb011f57cf94198ace89fc77bc5f06a21c",
+      "before_sha256": "f8c4678d5762ddf77859c07a475fc68444e346b56b351241d695c63c3c099605",
+      "changed": true,
+      "path": "incidents/inc-9011-database-lag.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "21bdd28ee94ec0ff313a5fc789ac59474b28f5c3373181bebd8afdd9255124ef",
+      "before_sha256": "63de4be1639462ce7030cac81545a7302457a75376d05fcb92a6d898a20cfeea",
+      "changed": true,
+      "path": "incidents/kaiops-service-health-baseline-2.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "21bdd28ee94ec0ff313a5fc789ac59474b28f5c3373181bebd8afdd9255124ef",
+      "before_sha256": "63de4be1639462ce7030cac81545a7302457a75376d05fcb92a6d898a20cfeea",
+      "changed": true,
+      "path": "incidents/kaiops-service-health-baseline-3.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "21bdd28ee94ec0ff313a5fc789ac59474b28f5c3373181bebd8afdd9255124ef",
+      "before_sha256": "63de4be1639462ce7030cac81545a7302457a75376d05fcb92a6d898a20cfeea",
+      "changed": true,
+      "path": "incidents/kaiops-service-health-baseline.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "118c5a519fd0e39804116f477340cd8ac1a5292eb245ce7bf82e36b0ef0e486d",
+      "before_sha256": "e4e8463d1bec0bbd1fb2cb01d6d646cd51d8aa16a2cc9254450c8b6334040b30",
+      "changed": true,
+      "path": "incidents/mysql-exporter-availability-baseline-2.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "118c5a519fd0e39804116f477340cd8ac1a5292eb245ce7bf82e36b0ef0e486d",
+      "before_sha256": "e4e8463d1bec0bbd1fb2cb01d6d646cd51d8aa16a2cc9254450c8b6334040b30",
+      "changed": true,
+      "path": "incidents/mysql-exporter-availability-baseline-3.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "118c5a519fd0e39804116f477340cd8ac1a5292eb245ce7bf82e36b0ef0e486d",
+      "before_sha256": "e4e8463d1bec0bbd1fb2cb01d6d646cd51d8aa16a2cc9254450c8b6334040b30",
+      "changed": true,
+      "path": "incidents/mysql-exporter-availability-baseline.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "93632260b10e747bd78234fdcc143e1a5afb8ecc1f4241bc64dd254b0e33d24d",
+      "before_sha256": "4c3ac93fdd6958697f26321b81f8d51e9b76432623a4bd13c21705b14e634133",
+      "changed": true,
+      "path": "incidents/mysql-exporter-privilege-denied-incident.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "44ff4a5489d8098f33c9809704e86ad54afa85725d3a0042bb0436aa4c635ff0",
+      "before_sha256": "7c33474a0eadb185f59df82b6e2fe754c32ceba74dd0429fd4255f5c6f4c70e5",
+      "changed": true,
+      "path": "incidents/new-alert-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "4e9f84d606e645840720af6bd446f3022f90ab5c9d0208c778b2cfde62584252",
+      "before_sha256": "27d10046eb573c35b724ed4af215df9f8199fd67df49603ea9186ef401304498",
+      "changed": true,
+      "path": "incidents/orders-replica-lag-incident.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "096194ffad81eeeb6a315fb3b793d4e4d0077761c9f8e8ea7c681972ce1ed844",
+      "before_sha256": "2988b2c368499bd2bec3e5d15c3b096a6741ec0e47ffc37638fde53c0e1616bc",
+      "changed": true,
+      "path": "incidents/payments-webhook-retry-storm-incident.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "f3a2feca10e367122f399bc35803b5292661d229f7e7ef509b2c3f0144422766",
+      "before_sha256": "f3a2feca10e367122f399bc35803b5292661d229f7e7ef509b2c3f0144422766",
+      "changed": false,
+      "path": "incidents/rag-doc.md",
+      "reason": "NUL byte makes text normalization ambiguous",
+      "status": "rejected"
+    },
+    {
+      "after_sha256": "12c7ae38e23484c4c5ac5bde5a03f41fbfc634dc33ccb8d76ef9639bcc8a8284",
+      "before_sha256": "187e2bdb4ea7dd6e55ff09c5ba173ed14039bc85299ffd09b4f846c66991dccd",
+      "changed": true,
+      "path": "onboarding/auth-session-store-hotspot-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "115835a5a092fc92f77170a742e6c9750367d84158a4488331e12da16dce865f",
+      "before_sha256": "f843d234dcd03c870475044a3303e06b0540a046fa12a91ed3b85e8cc71bcf2b",
+      "changed": true,
+      "path": "onboarding/catalog-cache-stale-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "4915cb8c78dace75b882ce6b92f9a122c5c369b89e8b64d7e93ebd56b43ec290",
+      "before_sha256": "db9825fe16869643fcee456829a4251bef4d22dcafdd113c3162f82d3fbb4ac5",
+      "changed": true,
+      "path": "onboarding/dw-1001-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "2deb6407ff291532b462b2adc833486d589f5e94b40e103ffc03ca09c594c4c6",
+      "before_sha256": "943988acfb03fd07ffaaabb2ad38263c9724a7a89db0598e9e5878e0490ae45e",
+      "changed": true,
+      "path": "onboarding/dw-1002-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "b3f181031637001d73a08fa9c0b2c7fcc99816b18fcc26fb95e7c47d44755247",
+      "before_sha256": "6a8fe75f60231b36de4b93c2969fea9f73b29ef14342a66329992719df76ccd7",
+      "changed": true,
+      "path": "onboarding/dw-1003-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "8727ace7122be53b6a556b4bdd5a35022a617a0e6b0ab5b9df1959aa8c779589",
+      "before_sha256": "14afea61ff5604a64b0887240fa107e96bde587c9fe23356c9d1e61e8f74cc9f",
+      "changed": true,
+      "path": "onboarding/dw-1004-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "14db6f3df0f21241e8df1e6319fcced7f7ff7a249e50f38ed88ef1310b553018",
+      "before_sha256": "e8604589b40df6353aee3aced810cf6b92704905d593e9d2c578a9239961277e",
+      "changed": true,
+      "path": "onboarding/dw-1005-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "2dee4f66a3321c92517bcf31f34f79fa445906ce6b6933f66afddbcf15b0af71",
+      "before_sha256": "d42a38187d8a0bbd956dbbac5fabbc40232ec87aa2856489c62a98f4f6621849",
+      "changed": true,
+      "path": "onboarding/dw-1006-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "f07d473a1fc60f19a257d9d9f61bd89fed8ecf81c764915b66ab3f9c93f132e0",
+      "before_sha256": "eb782ab99cbbd55c894a6da6b9463d9757a1bc7238421c4d5b6590ab3ce82d57",
+      "changed": true,
+      "path": "onboarding/dw-1007-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "110cb7beee169698a44752ef7d91c40a240fefa14f1b6083f9ab226e7891d35e",
+      "before_sha256": "c609bfe2eafd3619176c14a36f048c6118b47d4d9e622bf421293d363e37b81d",
+      "changed": true,
+      "path": "onboarding/dw-1008-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "c90624e2b165c9e65fdb937cbb2a80c3e7f8e8331e2c0cef6e8f14baa9bfd656",
+      "before_sha256": "8bf8c65a3185f1d589f4f6b2fa63163b25a70d3d5108aff39e3e1f29292e1bcd",
+      "changed": true,
+      "path": "onboarding/dw-1009-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "46482509eb0a16abfefa421f36d7bbd7b57401047884376499f74bb8cf730495",
+      "before_sha256": "db0b9c298da9d77c2b8432dbb543c1a3e3db03a90245c8364b9ba870b9260a79",
+      "changed": true,
+      "path": "onboarding/dw-1010-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "6fd9899a4290a1b1a3d97e2d9cd8b2f7fa9d5129697203a147c61b5a0fd0578c",
+      "before_sha256": "96d8b2bb319dd5b3a2ff07cd5a8c049fe8cab7c7e5b59d2bace0cc2a2a1852e0",
+      "changed": true,
+      "path": "onboarding/dw-1011-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "1e0eab04fb3aadd7641fe0b8057e6d878ef31ba5aa9f888e57b12f9d70f1d23a",
+      "before_sha256": "2bf6921569631909d45a6122174282bd9361ee5efe1de66ba98c82af781765a0",
+      "changed": true,
+      "path": "onboarding/dw-1012-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "0b05e1ed1b59c5b4d97ddf3f2ed79db141fef89d2bbe6a3dee4c1abb0e1a8486",
+      "before_sha256": "201b28c5f747fa2766207c684b5cf8425aa658f268dfaa8c3aa9b41c6bb316e9",
+      "changed": true,
+      "path": "onboarding/dw-1013-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "712f07a262c736e2f9a61bd84c8ec567793b748afb471eedc7d7bf49d7c29391",
+      "before_sha256": "4738a2e4bdbaf62077dc15bad138da38bcbc25e2237ff463420629f6f975c127",
+      "changed": true,
+      "path": "onboarding/dw-1014-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "542182c2fc1523d092906f9926079e20558eed7ba31d1a622663c23a3a1c7cfa",
+      "before_sha256": "6c2392353fa72a7adef3678b627a36c40fcd24cfdac86eed35a08c09052559e8",
+      "changed": true,
+      "path": "onboarding/dw-1015-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "d46574a53f72fdf4ddaa36110feeb515cee879b30d339020d8ff2e9c20f74444",
+      "before_sha256": "711091d1d971c51e0edad4b6bde814e7ccaff2c6daa0dc967d1cc3c58d88c5ae",
+      "changed": true,
+      "path": "onboarding/dw-1016-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "632bfd7ea9b5e2ab93d07a0c4a0a4633469a4e72ca1d9a2c47a1f365f02ca72d",
+      "before_sha256": "a30845920fde6f86d04518579867e5145574eafe5bc8f8a66d3f3d194f9f5718",
+      "changed": true,
+      "path": "onboarding/dw-1017-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "c317aba7cbb8bb8fcd35e117e54b818dcbe0e25051f406cb2142f924729af8d5",
+      "before_sha256": "9383c459ce9024935405962f522f25015cf0d21f538319b3d485977bd690e940",
+      "changed": true,
+      "path": "onboarding/dw-1018-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "0a11d472ba465b76479d532b333ce45130c09377f26b79286a5afccd1e3d04e8",
+      "before_sha256": "0099ed38f723a8a19a4c2f279ec6ab86eebbcb3337ef8030e1d0dfd643387d48",
+      "changed": true,
+      "path": "onboarding/dw-1019-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "a08ca1c1a4989dda166fae9b8cab7f37950bf4abef971197deb4cf0b90e99778",
+      "before_sha256": "a0d11245ab8a77c211c6850111c3783a9db5f8570c818dfc119c70c60297b572",
+      "changed": true,
+      "path": "onboarding/dw-1020-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "119b75fdc61fbe7a7250892b697f9857c1bf0512c7b6f28ca9e37ed3ecdcfbcb",
+      "before_sha256": "f2f0e1f9311c23656e2164b0a76edf4a1ac2a9c00ca47bb8f6379679a0871199",
+      "changed": true,
+      "path": "onboarding/inc-8842-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "49824cec5064affb65cacbbbd8bac7e1ea78e9dc2b1762d30ea5f133ba092c9b",
+      "before_sha256": "d1efe35fe2a27219cfe599a9cb870c23ea2e586cd6cd9b9b895cc138497bc958",
+      "changed": true,
+      "path": "onboarding/inc-9011-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "dff4c233f954e087784627a323b53cc9f0f2fe572d70c3a0f4861727c4e5cffe",
+      "before_sha256": "e3947a065c6f0294c6bd9ece57a89e87d2d2d4cc7f240c9cc6ef361f6f13086a",
+      "changed": true,
+      "path": "onboarding/incident-onboarding-coverage.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "2441cfe23143d3399265923a62b958d5d09537203c936dd704006bdfd02266f1",
+      "before_sha256": "0c7765a27690096a47100b2d5ec11618e2b708ebd5577dc70c1993fe85789150",
+      "changed": true,
+      "path": "onboarding/orders-replica-lag-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "9993afcd36df2e6d8c84b62471677f92c677276f89b433a11a64a1d9369ae02a",
+      "before_sha256": "090d969d212ff978a8be169334b1b9ee66ba3e6a90e48b00cb005b6b3196ec90",
+      "changed": true,
+      "path": "onboarding/payments-webhook-retry-storm-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "9c91984bc204356c0620dc0a4e8a13323cf99d9238d6751520fa1ff56548b617",
+      "before_sha256": "f089c496427fd88555428be07722ff8ff81183282996f540471d7f19ea3b2dbb",
+      "changed": true,
+      "path": "onboarding/prometheus-mysql-monitoring-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "3a10a2d70c69ba6224494ee0f5e47b9a6487bda5cbdeb3a0af1083c70076519d",
+      "before_sha256": "f2a944b199a7f14a8d0459a4bf32d8f46714bbe8c1b8e2464628e85cfa1c27d0",
+      "changed": true,
+      "path": "onboarding/rag-doc-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "efa37f65317ef73d1ea63be44013339f2f6f85b19291cd153a57036adbecf8d2",
+      "before_sha256": "0b28b871ee152ba824f1de585362b168b05a642762aa5ff48c34f8c536d51846",
+      "changed": true,
+      "path": "runbooks/0669dbc6-d12e-4ec5-b6ed-2bc1eaa06d4f.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "844cc4ce73d057d52bf6779d5cff02109530300d1f4e1ae4456e7bd6edb2ae73",
+      "before_sha256": "f8ea37937c2176cb9aeb826774b41ad11fa056d3f58246237bca63cb8ee15adf",
+      "changed": true,
+      "path": "runbooks/217f818bfd942ddf.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "4e8ab8b0451be89c1eef79c5eab728c3a964bedee7bb4f9dc505ba2a2922f664",
+      "before_sha256": "f09232b01211652d08ed3b857e6ea9a49f38e853a52ef22faef71e90a66b43a3",
+      "changed": true,
+      "path": "runbooks/46e408884901f001.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "1a072695cd3aecd253bcf5ae492659814c063acb3997245bf174d31c930d9162",
+      "before_sha256": "6923920ebe56db0b2bf5ad15e5ae48ec5b27796b22fa5d319b94aa9016ce5201",
+      "changed": true,
+      "path": "runbooks/593b8ce5-2336-4d09-8f84-5324fcc0b333.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "87e0ab56b1a0ecf1e24133e9d4d69b8c2084cc9214b31fb3b021d659ece5b277",
+      "before_sha256": "7fff88b2cdf693fc20c8ea69a9c0a3198be4586655b77475d90d474aa555cc6c",
+      "changed": true,
+      "path": "runbooks/5baeecf4-994e-45b8-b3ec-96006786a23e.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "ad8a595d017657f626a3101a9ffdad71c1140a0e046806f459ff3f5186d607a6",
+      "before_sha256": "d196ea00f452da31da5d4524ce433d3d684efff232e5646e1dd00d8321e56415",
+      "changed": true,
+      "path": "runbooks/6a09296a-a0a1-483f-9f0d-cc6f57ce8577.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "6e826542b3600cdb9fdefb8a3c6ebdee62c907e76e0e60659dfc45dd4868f2ff",
+      "before_sha256": "ec8154db54968293420cffa94cb01f98d44a46c4d019a921b5492258c47d7527",
+      "changed": true,
+      "path": "runbooks/79c77347-25f4-40d8-ae6f-6d6e9b43c707.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "df4843dad93194bc4c6616b63834c070c2dad97fe4166c4103880733b1e14b03",
+      "before_sha256": "919af737b4e6df2a7907dbb7154c5b218b0f60e69ec339122510f5176f50de16",
+      "changed": true,
+      "path": "runbooks/8f2e775f-839d-4fa0-b182-9568c249a55f.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "cf72aef6b80d524e7a06d7447c14dc591e12e7392408f60d4250034cbd01be70",
+      "before_sha256": "416dbac57201ef200c66c93f103b882744d220bb500d92177bdff553c578b7f0",
+      "changed": true,
+      "path": "runbooks/auth-session-store-hotspot-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "c8f29c9bb43c3f04ec77943c8c9a75ecf3399c60afa7f1f151c71fca5436ce7c",
+      "before_sha256": "ce4445d5604364baa1ba5130e9c2653bc2b92e15d71161e3e65078ba82e74d4f",
+      "changed": true,
+      "path": "runbooks/autodoc-test-1.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "6dfc24adc4c38962ca0d9a52997febfa773b4e96f6c2a441779448ec793e1e0d",
+      "before_sha256": "e80cdc39210c5ebb4f5c6bd0d420e074ecc1ff2ba3e2b923fb52f93fa9175f01",
+      "changed": true,
+      "path": "runbooks/b2f5ab95-99d2-4202-9f9b-17b453081676.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "badd3296cb541808459b8874e54a7c87666197968e69fb5ba6ba6bd67acfa93e",
+      "before_sha256": "b8caca8b2768ce68666a39b523cd15b896a179863e79eb07f1c583fdf2593271",
+      "changed": true,
+      "path": "runbooks/bee532e2-eec3-43f0-9582-1e7456d13c4a.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "407cca064efa00ca98e4a98beebbb54921bde0b9d41ab526b31fbf015720f3d5",
+      "before_sha256": "bf3891a725c5eccd579ec07d019985e3c260106e59749afa622acb4a5cd170ee",
+      "changed": true,
+      "path": "runbooks/c455c797-af5d-4abd-8c13-b44b53b5f0db.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "c53d02f401511585f6f7c9fb3697eb37548e7d82ab0ad1f9bbef4584334dbfa3",
+      "before_sha256": "4b8214e3671f6125ce8ebf5d3b1e10e87e410a62e1b3418c50d45a64236dade8",
+      "changed": true,
+      "path": "runbooks/catalog-cache-stale-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "08939a24a2c724648d151e16acf7605bd92a68b73cbca10128ccbcafb4ec9332",
+      "before_sha256": "14d7d73b77db9d35c76dda1abce52336a9834228a245073c30ebbe2e49e3f86c",
+      "changed": true,
+      "path": "runbooks/cfa156f60c81a9ed.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "a3cd891637fc1b59dc1fff1b7f607981ad2daed55622f862626bedef5742a553",
+      "before_sha256": "fbb2fbeaaa6b712e484ea1dae9f78553120b3bb5cd588a2da04b8a7c3dd7b23d",
+      "changed": true,
+      "path": "runbooks/checkout-api-knowledge-pack.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "adb1c975a38e0d5d1929c20905aa2b6e1b75af5c0aa14887a9007331e0d364b2",
+      "before_sha256": "edf65c0e888358415059942c632c9fcbcbdafa93ac2c4068121e0017f01e0f29",
+      "changed": true,
+      "path": "runbooks/checkout-pod-restart.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "27a8878bbab4b34f5d04abc6b3c85d846e44eb11ff0dabd4391b18c7f7fc0bef",
+      "before_sha256": "7f799909f5b9199db95fc52758f1ae1beeb7a57ead5d46d02620671ead6b2ceb",
+      "changed": true,
+      "path": "runbooks/data-warehouse-incident-response.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "27bc8b83caaecc639b76187b51bc62e924da90b0d9289abb348ea0cffeed7f2a",
+      "before_sha256": "cc65f805255d482088f87d97847ffb740c84256cd321c6c6830cb19c56b98816",
+      "changed": true,
+      "path": "runbooks/database-failover.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "566e8b26f7492c8638cbbd3b3bb5b51dc3808b7bb2bb9649af5526a95ca9bdc6",
+      "before_sha256": "c6fdce3fbf8c45c41de5181f3f830866ecc406c8915b50cc47fe948fb6df0032",
+      "changed": true,
+      "path": "runbooks/db91cf05-db73-4b4b-b1b9-0fe5d280c8a8.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "e7f67f52427c814990527f2c9f1b3cc09fb5ab0222484441e838293053033177",
+      "before_sha256": "fa0334ce0e286da46ef5ec7b7ea2586df8acc9cc7de786d7ba0f9f1242d5fad2",
+      "changed": true,
+      "path": "runbooks/dw-1001-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "11d3cb615cf59d97e4c67dcafe99df350e98134fa22d54e91b2eec0330de582f",
+      "before_sha256": "f3d760e81a7ded78acea84f7f2019b2e2516df92b82037278cd350a9b1c0b021",
+      "changed": true,
+      "path": "runbooks/dw-1002-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "346f584dde2e15e92a5816c4a84dcadd79d1ab166b7a22cebc91e7ac37f0f9c7",
+      "before_sha256": "f32d85cbc7ef04b8f716e68746d9c2f33119780a47deb42e84ce80834f46acc0",
+      "changed": true,
+      "path": "runbooks/dw-1003-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "12e7ea2b21aa6a049874473e0457c3ed97a0a36ed200ab6fefbc8b8660d57eaa",
+      "before_sha256": "1c3ca1fb565f355752caf374e74bd018bad3cd389acaa06998c485dacf824e58",
+      "changed": true,
+      "path": "runbooks/dw-1004-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "5e7b72d7bcdafa42807604f39fbfe5c4213c32cf2acc544dea7de5e5afbacc6c",
+      "before_sha256": "53ce361dd8ca731069a2c80d66787e640a5fc891ca5401a88805f8cd710b2329",
+      "changed": true,
+      "path": "runbooks/dw-1005-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "6eb4475be18079a1899c4e1fdce437afcbda249b2b3d7e3ec7a930d66f7ed20f",
+      "before_sha256": "7a892266f8084fde53ba6cd9d28052123c326807152d15b35a286ac0b0ba1f7f",
+      "changed": true,
+      "path": "runbooks/dw-1006-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "79b60918f93f93797654358adcae0faa445e122a4f14c0aadd5165982fd24740",
+      "before_sha256": "5b53f6ca95d3e2b12267413bdef47a7f62d7d4b8f4e0e7b6280d1bcca839b01b",
+      "changed": true,
+      "path": "runbooks/dw-1007-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "774d409f41b692fee5134413a606a544b1069e5cfb91e285e42eaf16bc6a86b0",
+      "before_sha256": "9f794de0c7b31c353503c8341699c458c4951a73162542b6cfb4159e22443e63",
+      "changed": true,
+      "path": "runbooks/dw-1008-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "9608930bd36651aca1ba6095975d60a7dae443e28925d949ed0a793f359406d4",
+      "before_sha256": "b19b53f2ce69a0f2107839371b1c4c4ecaaa6fafa02c62cdaf796559ad3563c6",
+      "changed": true,
+      "path": "runbooks/dw-1009-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "4f5a27adafc087f27bb892ef71ab6fc4f2efefbfbbba89491c2357a65a103ed4",
+      "before_sha256": "ff58242b523e23567856501e5b1efaf3d9359ce936991e69dcf9865a726b5290",
+      "changed": true,
+      "path": "runbooks/dw-1010-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "9cc044737e8cf8d0ca24d574d3c4673024dd25f4c47ab0fd0180bd34bcf482ba",
+      "before_sha256": "b4f1e0329e77eeaedef00b8af6805401ef8ac0489a32317bbe1b63048b3ff12e",
+      "changed": true,
+      "path": "runbooks/dw-1011-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "5fa14a9f399347c6321f2de97d67e518caff821803e983a6d5bc606864e53afb",
+      "before_sha256": "35ef7543bf28b02f72e130072648c8eb02bce212b87c19767cb55ea08a7a13c5",
+      "changed": true,
+      "path": "runbooks/dw-1012-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "d6cdeff93de48b7ddad22f35bb1ee9cc238cd31ba6913b5dba382f1be1f29a5f",
+      "before_sha256": "cd81d34cb81881548f103f0b205822fac0e3f6809d152835dcde172f65d952f6",
+      "changed": true,
+      "path": "runbooks/dw-1013-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "9f2735a9dd3bd6bc62768c775c789ddf1c7313e0614052334a46909b8d3218e4",
+      "before_sha256": "c20d1d33ed1790c5e845c153f356075b7d6e9fd550193ca52020fae909982634",
+      "changed": true,
+      "path": "runbooks/dw-1014-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "1b57236a883ec2f1f838017cc7c7654d6dad6911a3ce1ea3a24113c94bdd2d9d",
+      "before_sha256": "e1f9f53c948563de2cd12dff254e6311df1082eccba4e5c1698f3e58a9a1733f",
+      "changed": true,
+      "path": "runbooks/dw-1015-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "2c4c24d9200e350e530bd5c9e49916190a1a5f0a2943ccdc03b5cdafe8d862a9",
+      "before_sha256": "a19aa4cb7d7eb2b80926de35fbc572c1dc69f42b2e4fac6999c3c38415b6dc13",
+      "changed": true,
+      "path": "runbooks/dw-1016-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "e0311e895122eb2882bf27af9af70947dda1a57841c47e269e1825f6978b7dd4",
+      "before_sha256": "a89fc4e0dd7d0d4aa12118c3c5d67bca55ac09d50bff4845d6539577f0a87f8e",
+      "changed": true,
+      "path": "runbooks/dw-1017-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "d28fc718f0a3e63413faec7003c2ef61483ab403ab9c5f2378ae81815591cf14",
+      "before_sha256": "047de4d62f8c93e1b16577d1b562e89ffafe15b3edc5c59eed8b0f91073be112",
+      "changed": true,
+      "path": "runbooks/dw-1018-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "0e817f0222f7de29d47986883e1ce9809b0868ddbdc4beb79b5cfa18efde59eb",
+      "before_sha256": "c87fab13fb983350122216e8e21b6e9792f899e6917854332f80232b2ff25cdd",
+      "changed": true,
+      "path": "runbooks/dw-1019-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "d01b3296820926341d15eb242d6eb52f008ec307824da0aba3c5223a3fb9fed4",
+      "before_sha256": "d5a5a578061a6e2a75a9dbed42e484af261f6c6187709ff55a0b49c0ff7c2487",
+      "changed": true,
+      "path": "runbooks/dw-1020-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "f61640a8eed0d24ec9db85c91481bda51a0d0d98d21d7fc5f87861471beb168f",
+      "before_sha256": "a95c58e9c85fc2715b2568eb3982590c98a5700fa149b0a52627e9aa6af3e6a8",
+      "changed": true,
+      "path": "runbooks/e9789b8fc444fa39.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "cd35d18b6ee0fe6e48e662d2917adc71a588c9422d046259d5e94af95aa5e206",
+      "before_sha256": "09e3356eaf97cdc2afb73e060402d6032afd35167244f88e091bcec4ffbdd471",
+      "changed": true,
+      "path": "runbooks/etl-orders-dq-20260721130504-knowledge-pack.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "aee5df9d1e517741ed0e771f54bccade93adccc495c26051f1cbddc08522290a",
+      "before_sha256": "96705875c17bfccc3e2ee5283da6fa7c4e6dd2ceaab9c9a4bd47b80bbf0a2417",
+      "changed": true,
+      "path": "runbooks/etl-orders-dq-20260721131241-knowledge-pack.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "41dc5d3613514414d31330eb7e9633e6f9053277b33c4528523817259ec17bd7",
+      "before_sha256": "e43c3317295b8e40de0970be35d8338474ed0b6eeeda755dfb9175fc23db596d",
+      "changed": true,
+      "path": "runbooks/etl-orders-dq-20260721131727-knowledge-pack.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "2178bac7930951a978eedff4ed728716e37fbefde7858990e5001e6a25a11aa8",
+      "before_sha256": "4d5884537afb2c50f357eb8d77fd72550a48d609050a38db943a87175c08d811",
+      "changed": true,
+      "path": "runbooks/etl-orders-dq-20260721131834-knowledge-pack.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "06bd5b23316085e7e57c2d3cd652087ac5d9cfc50d2c5cfb5bb8b767e650dd19",
+      "before_sha256": "700a685d2e0f3622820f471465817c7ba4fdd88f63de7d373e699e19e113e05c",
+      "changed": true,
+      "path": "runbooks/etl-orders-dq-20260722141810-alert-knowledge-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "6904d5eacfb459734880f78f1d071230ca25385ede7dcd52b6730c717021658e",
+      "before_sha256": "09275e9d00f3dd40cb7cfc78bc64b0d5e36d7ebf8c58d2f135a5aef3a9f1e73c",
+      "changed": true,
+      "path": "runbooks/etl-orders-dq-20260722141810-knowledge-pack-2.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "6904d5eacfb459734880f78f1d071230ca25385ede7dcd52b6730c717021658e",
+      "before_sha256": "09275e9d00f3dd40cb7cfc78bc64b0d5e36d7ebf8c58d2f135a5aef3a9f1e73c",
+      "changed": true,
+      "path": "runbooks/etl-orders-dq-20260722141810-knowledge-pack-3.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "6904d5eacfb459734880f78f1d071230ca25385ede7dcd52b6730c717021658e",
+      "before_sha256": "09275e9d00f3dd40cb7cfc78bc64b0d5e36d7ebf8c58d2f135a5aef3a9f1e73c",
+      "changed": true,
+      "path": "runbooks/etl-orders-dq-20260722141810-knowledge-pack-4.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "5bb8aebc9dee7bcb0786b5fa21a5e991e7e632055b02d98c91189c34fe3f9718",
+      "before_sha256": "1c569b5bf7b7412badf8f507ef2325fe466347294876fd097d58e1e0d39142b4",
+      "changed": true,
+      "path": "runbooks/etl-orders-dq-20260722141810-knowledge-pack-5.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "5bb8aebc9dee7bcb0786b5fa21a5e991e7e632055b02d98c91189c34fe3f9718",
+      "before_sha256": "1c569b5bf7b7412badf8f507ef2325fe466347294876fd097d58e1e0d39142b4",
+      "changed": true,
+      "path": "runbooks/etl-orders-dq-20260722141810-knowledge-pack.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "81895468d5fc4fc8a759768a5574cd66f04e6257f2ddaba61a1e80dfe7ae03d9",
+      "before_sha256": "456d3b92df114115949072ffc61bbd6bf4c37f02006ebfd4f634b80b5147f0e0",
+      "changed": true,
+      "path": "runbooks/fb589b55-18bd-4ce3-8eaf-a275049c047d.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "ea9e692a5511ff863087c5797923ba6ecb8b28bd6cf5f065dc9e3803573165bf",
+      "before_sha256": "beb583395d0cfb8910f56975aeecd74cf355319330d4363c0fbb988c3554e0e0",
+      "changed": true,
+      "path": "runbooks/inc-8842-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "13db6f72b2a9b52ccf47415f5befc43ef18bb3518230864eaf4ae199314ed9b0",
+      "before_sha256": "72c45c01b60c27b23feb5105f738179823fd941381fcaa3c7434e852118f0dc4",
+      "changed": true,
+      "path": "runbooks/inc-9011-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "7da9951a790589147636cf3cd6b8164422cd66b29b9fda9e7cea23df7812f894",
+      "before_sha256": "56f17c6e30dff4a7cf9338ac8cd1a53e8def41709ade4760137c7e889477b167",
+      "changed": true,
+      "path": "runbooks/incident-runbook-coverage.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "54c0bdd59c77d7ea39b7df3663b9c020d79c08302e63ce5d11e9edfb766d5c8d",
+      "before_sha256": "5d549e0b6b30a703430809b11a5352fc96fb1a22f10f089b74d20a261865fab9",
+      "changed": true,
+      "path": "runbooks/kaiops-core1-alert-knowledge-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "2f788b61d8615cf11313945f2fc4be7a05a65645df577f21615dff645cc736fe",
+      "before_sha256": "2f14c39d8fade991e91418c44e40a1ef2a93870333b5ad44eed79630b13dc119",
+      "changed": true,
+      "path": "runbooks/kaiops-core1-knowledge-pack-2.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "2f788b61d8615cf11313945f2fc4be7a05a65645df577f21615dff645cc736fe",
+      "before_sha256": "2f14c39d8fade991e91418c44e40a1ef2a93870333b5ad44eed79630b13dc119",
+      "changed": true,
+      "path": "runbooks/kaiops-core1-knowledge-pack.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "04929a6f86d3c39470c3cd240d79d8b65b805aad36eb69fb8e9714a953a32d44",
+      "before_sha256": "d69a7d5de9b16a7792d431e09c4dc14167f15d2c52d2ead13ca2478a6627788b",
+      "changed": true,
+      "path": "runbooks/kaiops-platform-knowledge-pack.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "c8f38ae630efbccfb46732a43a71bae21de2fec56e1493bae5b06de2d0d5f698",
+      "before_sha256": "59589d620e929969dff8627b0d00528b090682d3167b61e54896e9146f8465ce",
+      "changed": true,
+      "path": "runbooks/landing-alert-e2e-20260721181052-alert-knowledge-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "fd9484527f70ca86e395bc8a9bd9c965817888c894ba72a0bb243a99f7622b68",
+      "before_sha256": "a4819e7931b792f07a96cb7db6e40712aac6c443187043f6250c6a292d3af3d5",
+      "changed": true,
+      "path": "runbooks/landing-alert-e2e-20260721181052-knowledge-pack-2.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "86cffb5c304090e35e92a86e90c42f995ba7f507a9dda7aeb4728767e2588ea7",
+      "before_sha256": "0dfce8ce2fcdd5ef5fb999aa29928f25529ab2d4524545f8e4051692c74a8136",
+      "changed": true,
+      "path": "runbooks/landing-alert-e2e-20260721181052-knowledge-pack.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "dbac535b21005bfc4f9b120a4bc155c359e9ce2489b557701fc96fc7f8877e14",
+      "before_sha256": "7260673abdecd5e08e8e9a4d3fae3fd66802777b660b4b8c64d7680432998a68",
+      "changed": true,
+      "path": "runbooks/mysql-alerts-table-rows-high-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "9683dfa2494d3efa79d7be97fee3f17df47b8b47d1571af368cab87a2033ee2b",
+      "before_sha256": "af63bd2d99249157450d10ba03798be505923a7dcbf7940a4ff8ee8061411467",
+      "changed": true,
+      "path": "runbooks/mysql-exporter-privilege-denied-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "d1d8d61ad066387a54749125676d495dea9a6cc8eeb4a8883346114b04bc22fc",
+      "before_sha256": "464e26e647e8bc86d39a28ba62c5d9ebe3ddcfb81583d854ea48fe76c55cf88c",
+      "changed": true,
+      "path": "runbooks/new-kaiops-alert-knowledge-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "a2a3f257efe4f15aa1d01c95b814eba877bbe7f4d414570f0e941eadee5c9bf5",
+      "before_sha256": "8d270721809ac25b7904105a6119d7dfeead85f5dd7c39cfc5392036bca01f18",
+      "changed": true,
+      "path": "runbooks/new-kaiops-knowledge-pack.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "7d1606f9956915904e7e6934db39ef27cadc4a12e342a8ecbc9b5c721bee5225",
+      "before_sha256": "6ff42e4f0f925f107d99d2ba9a585b368315d9694473325d791d4c97d6fd52a3",
+      "changed": true,
+      "path": "runbooks/orders-replica-lag-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "bd47c220d67173a2dbcb86b8965ab63345cea1d95ad9b8dc9d5b306d64cec619",
+      "before_sha256": "0061d91e78b0263c3e24ec3d28c6e25d2729a0f36821c3c514fa2513e6204eb0",
+      "changed": true,
+      "path": "runbooks/payments-latency-rollback.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "cb421beee72b08cbd7f6c12a549434cd5169c075a453d5269f80d3b6b8a32bd4",
+      "before_sha256": "ee4b1d22218cf9266ef9b3786b4920e902924ed8c8788bb05c39451302a43782",
+      "changed": true,
+      "path": "runbooks/payments-webhook-retry-storm-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "4c2b43c66bf4d930d676530ac7b4040c70ad852bca51de8e45786d091ed5ffcb",
+      "before_sha256": "23a2f46fbc27632a6a15aeb2a89894c9e140867b08689b7ba983584346d3345a",
+      "changed": true,
+      "path": "runbooks/prometheus-mysql-landing-pad-triage.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "80a5d481d754b539044e2bac5e0077407961dde3c2ffbc43573c412c34bc7eb2",
+      "before_sha256": "9d32bdb58795b0670fdebc8c00434a76bdfa900ea255877842ee2585388cd62e",
+      "changed": true,
+      "path": "runbooks/rag-doc-2.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "a3784d0a499f498c91fb2ca49026a097e7accb450f968c1f9b758f46d5b2fc6c",
+      "before_sha256": "4fc683af30cf21f6d0e8918296b6e2564b4546290529c1eeef13a289f5196d2c",
+      "changed": true,
+      "path": "runbooks/rag-doc-runbook.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "ec6dce44950819570fe6498867293be733c1f1ca3c63270681b06b4492260501",
+      "before_sha256": "65c1be47e930aaeaff22478b755c9e58f8aaac975db48b3d9c50dede785ff309",
+      "changed": true,
+      "path": "runbooks/rag-doc.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "4a32484d6892d608b22b0692656d717b4525a51ad124581c701f824b7f9396fe",
+      "before_sha256": "662460d883643459fca69f4e45f3180ac8fe81939fa44816b9ae43e7a59ceda1",
+      "changed": true,
+      "path": "runbooks/runbook-kaiops-test-verify-2.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "d839cc1871d80ba4877d28096fc27521c7211ac22cb7cfdb7f09f5a900841d6a",
+      "before_sha256": "6f8488c4ba5efd3e8f186ab6e55b3eb12f9fdd1a40382420dec44e3319a7cedc",
+      "changed": true,
+      "path": "runbooks/stress-onboard-20260720053305-alert-knowledge-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "ab28fb13c496b5370d5c0bc3376c14b85c7bad0fc48f2bd25dd17042fa70b378",
+      "before_sha256": "cd40a40970b40272a88bfe94869ba8d054bdd58bea45762fee6baeac3ac33b9d",
+      "changed": true,
+      "path": "runbooks/test-alert-knowledge-onboarding-2.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "52ade536ca657c413f272209e841bc1cfcfde2575b81a4830a4a8f9465246a06",
+      "before_sha256": "240d96aec95e8ca36cdd7bf0bae48c44a4bb8ade32d5db45743d8f632e4873dd",
+      "changed": true,
+      "path": "runbooks/test-alert-knowledge-onboarding.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "e1f8e91ccd3cfca09c65e2915534e3d2af96bae433a92d5f392be45f9384c963",
+      "before_sha256": "1ce1a8ae1b9700b840add6d67ab03124fd47d5771e88ba859fc585b5796bf665",
+      "changed": true,
+      "path": "runbooks/test-confidence-fix-knowledge-pack.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "8be6d27846f27fb89d976027495b667641b11a49a5fceb0eb3b97b4cd40ca9d3",
+      "before_sha256": "2a26b2ae522343c899742f38da37ecabdf1418f5ca0d23b2459f2f9b5dfb6f7f",
+      "changed": true,
+      "path": "runbooks/test-knowledge-pack-2.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "9244df9d14e94583e6c3ab1c58415918f8085dc21330455068e2b8c70a90b523",
+      "before_sha256": "98abc59066f7a22501e9874890009c43ae017b166e90241934dff689eb42a814",
+      "changed": true,
+      "path": "runbooks/test-knowledge-pack.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "92b0b2b391ae141acdb376f0dd943fb4033a1aee0974a33e26f03e2f64eeac5f",
+      "before_sha256": "335d9d3e2a287aaf82791aac11a6f938381df485eb5ef8dc2d6fe510ed57b6c3",
+      "changed": true,
+      "path": "runbooks/verify-fix-test-knowledge-pack.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "86aed001ace9003c5daded2274c927791e37258b10b379a9000b4164124332b2",
+      "before_sha256": "43794e0243ae740e7cecdaa49af59e6ec7b6376f0cca4afd2cf0f54d64f9409f",
+      "changed": true,
+      "path": "sops/auth-session-store-hotspot-sop.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "0fd5c4c5ccd4fde516b089153353451dbebece6e50dc97da5413c2092d5250ad",
+      "before_sha256": "113806c8b4db236a30476e0935fdca25b58e2e36210d48904fa2e8df8a46a85d",
+      "changed": true,
+      "path": "sops/catalog-cache-stale-sop.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "a975b2ee8ef79ad134b99cc542290e527cf4339b741faead8759b7c6aa939eba",
+      "before_sha256": "6601f9273a4c840ce9223a46ccf210ed514ec862029dd3230a1b2afc9129f246",
+      "changed": true,
+      "path": "sops/data-warehouse-standard-operating-procedures.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "a6bc87433fb76076e6d4b684e5e276385a0b05846485648d73a2e26208dafdf0",
+      "before_sha256": "48f7283afcc3b2267a4bdfa145ecc4386f9abf5881a0ac222c911502559550ef",
+      "changed": true,
+      "path": "sops/orders-replica-lag-sop.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    },
+    {
+      "after_sha256": "ebd3620b14a6339c0d6db2450ab69b21f3f44673ba4531fc5da952a6bf43ecae",
+      "before_sha256": "8f7e9e22c5b53c3918eb379590b52417c9674625fb8a7c82de7d24560a5445a4",
+      "changed": true,
+      "path": "sops/payments-webhook-retry-storm-sop.md",
+      "reason": "normalized deterministic CR/CRLF line endings",
+      "status": "applied"
+    }
+  ],
+  "root": "backend/rag-quarantine",
+  "schema_version": "kaims.rag-text-migration.v1",
+  "summary": {
+    "changed": 165,
+    "rejected": 2,
+    "scanned": 167
+  }
+}

@@ -1762,7 +1762,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     try {
       // List views need projection fields, not the heavier action/evaluation
       // enrichment that is fetched when an operator opens an incident.
-      const params = new URLSearchParams({ limit: "120", include_enrichment: "false" });
+      const params = new URLSearchParams({ limit: "100" });
       const currentFilters = ignoreFilters
         ? { risk_tier: "all", execution_mode: "all", transport_provider: "all", status: "all", service: "" }
         : incidentMetadataFiltersRef.current;
@@ -1782,7 +1782,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         params.set("service", String(currentFilters.service).trim());
       }
       const payload = await fetchJson(
-        `/api-gateway/incidents/metadata?${params.toString()}`,
+        `/api-gateway/incidents/groups?${params.toString()}`,
         authenticatedOptions(),
       );
       const data = unwrap(payload);

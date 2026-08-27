@@ -230,6 +230,7 @@ class CloudOperationsRepository:
                 id=resource.id,
                 tenant_id=resource.tenant_id,
                 project_id=resource.project_id,
+                connection_id=resource.connection_id,
                 service_id=resource.service_id,
                 environment=resource.environment,
                 provider=resource.provider.value,
@@ -253,6 +254,7 @@ class CloudOperationsRepository:
             )
             self.session.add(existing)
         else:
+            existing.connection_id = resource.connection_id
             existing.service_id = resource.service_id
             existing.environment = resource.environment
             existing.resource_type = resource.resource_type
@@ -296,6 +298,7 @@ class CloudOperationsRepository:
             existing = ResourceRelationshipRecord(**relationship.model_dump(mode="python"))
             self.session.add(existing)
         else:
+            existing.connection_id = relationship.connection_id
             existing.source = relationship.source
             existing.relationship_source = relationship.relationship_source
             existing.confidence = relationship.confidence
@@ -1096,6 +1099,7 @@ class CloudOperationsRepository:
             "id": str(row.id),
             "tenant_id": row.tenant_id,
             "project_id": row.project_id,
+            "connection_id": str(row.connection_id) if row.connection_id else None,
             "service_id": row.service_id,
             "environment": row.environment,
             "provider": row.provider,
@@ -1125,6 +1129,7 @@ class CloudOperationsRepository:
             "id": str(row.id),
             "tenant_id": row.tenant_id,
             "project_id": row.project_id,
+            "connection_id": str(row.connection_id) if row.connection_id else None,
             "source_resource_id": row.source_resource_id,
             "target_resource_id": row.target_resource_id,
             "relationship_type": row.relationship_type,

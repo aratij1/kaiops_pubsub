@@ -497,6 +497,36 @@ async def test_resolution_agent_generates_recommendation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolution_agent_blocks_high_confidence_when_discovery_is_degraded() -> None:
+    alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus",
+        name="PaymentLatencyHigh",
+        service="payments",
+        severity=AlertSeverity.CRITICAL,
+        description="payment latency after deployment",
+        labels={"deployment": "payments-api"},
+    )
+    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+    context.metadata["context_quality"] = {
+        "quality_score": 0.92,
+        "discovery_degraded": True,
+        "execution_ready": False,
+    }
+
+    recommendation = await ResolutionIntelligenceAgent(model_router=static_router()).resolve(context)
+
+    rca = recommendation.metadata["rca_analysis"]
+    plan = recommendation.metadata["execution_plan"]
+    assert rca["confidence_score"] <= 0.49
+    assert rca["context_degraded"] is True
+    assert "discovery_evidence" in rca["missing_evidence"]
+    assert plan["execution_ready"] is False
+    assert any("Discovery evidence is degraded" in reason for reason in plan["readiness_blocks"])
+
+
+@pytest.mark.asyncio
 async def test_resolution_agent_uses_severity_heuristic_risk_when_model_omits_risk_level() -> None:
     """Default (deterministic fast-path) behavior must be unchanged: the fix step never
     returns a risk_level, so recommendation.risk keeps falling back to the severity-only

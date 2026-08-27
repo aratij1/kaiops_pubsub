@@ -19,6 +19,7 @@ export type CloudResource = {
   id: string;
   tenant_id: string;
   project_id: string;
+  connection_id?: string | null;
   connection_id: string;
   provider: string;
   provider_resource_id: string;
