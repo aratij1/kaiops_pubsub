@@ -1,5 +1,14 @@
 import { expect, test } from "@playwright/test";
 
+async function signInIfNeeded(page) {
+  const username = page.getByLabel("Username");
+  if (await username.waitFor({ state: "visible", timeout: 8000 }).then(() => true).catch(() => false)) {
+    await username.fill("admin");
+    await page.getByLabel("Password").fill("Admin@123456");
+    await page.getByRole("button", { name: "Sign In" }).click();
+  }
+}
+
 test("incident detail preserves nested alert identity while details load", async ({ page }) => {
   const alertId = "11111111-1111-4111-8111-111111111111";
   const incidentId = "22222222-2222-4222-8222-222222222222";
@@ -22,9 +31,7 @@ test("incident detail preserves nested alert identity while details load", async
   });
 
   await page.goto(`/incidents/${incidentId}`);
-  await page.getByLabel("Username").fill("admin");
-  await page.getByLabel("Password").fill("Admin@123456");
-  await page.getByRole("button", { name: "Sign In" }).click();
+  await signInIfNeeded(page);
   await expect(page).toHaveURL(new RegExp(`/incidents/${incidentId}$`));
   await expect(page.getByRole("heading", { name: "Context agent incident" })).toBeVisible();
   await expect(page.getByText("From signal to verified recovery")).toBeVisible();
@@ -56,9 +63,7 @@ test("durable incident history stays separate from the technical workspace and s
   });
 
   await page.goto("/");
-  await page.getByLabel("Username").fill("admin");
-  await page.getByLabel("Password").fill("Admin@123456");
-  await page.getByRole("button", { name: "Sign In" }).click();
+  await signInIfNeeded(page);
   await page.getByRole("button", { name: /Durable navigation incident/ }).first().click();
   await expect(page).toHaveURL(new RegExp(`/incidents/${incidentId}$`));
   await page.goBack();
@@ -66,16 +71,14 @@ test("durable incident history stays separate from the technical workspace and s
   await page.goForward();
   await expect(page).toHaveURL(new RegExp(`/incidents/${incidentId}$`));
   await page.reload();
-  await page.getByLabel("Password").fill("Admin@123456");
-  await page.getByRole("button", { name: "Sign In" }).click();
+  await signInIfNeeded(page);
   await expect(page.getByRole("heading", { name: "Durable navigation incident" })).toBeVisible();
 
   await page.getByRole("button", { name: "Open full investigation" }).click();
   await expect(page).toHaveURL(new RegExp(`workspace=alert&alert_id=${alertId}`));
 
   await page.goto("/incidents/%20");
-  await page.getByLabel("Password").fill("Admin@123456");
-  await page.getByRole("button", { name: "Sign In" }).click();
+  await signInIfNeeded(page);
   await expect(page.getByText("Incident not found", { exact: true })).toBeVisible();
   await expect(page.getByText("No role-authorized incident record matches")).toBeVisible();
 });
@@ -95,15 +98,12 @@ test("detail URL reconstructs the selected alert after a page refresh", async ({
   });
 
   await page.goto(`/?workspace=alert&alert_id=${alertId}`);
-  await page.getByLabel("Username").fill("admin");
-  await page.getByLabel("Password").fill("Admin@123456");
-  await page.getByRole("button", { name: "Sign In" }).click();
+  await signInIfNeeded(page);
   await expect(page.getByRole("heading", { name: "kaiops-api-gateway: ReloadedAlert" })).toBeVisible();
   await expect(page.locator(".kai-navigation")).toHaveCount(1);
   await expect(page.locator(".sidebar-panel")).toHaveCount(0);
   await page.reload();
-  await page.getByLabel("Password").fill("Admin@123456");
-  await page.getByRole("button", { name: "Sign In" }).click();
+  await signInIfNeeded(page);
   await expect(page.getByRole("heading", { name: "kaiops-api-gateway: ReloadedAlert" })).toBeVisible();
   await expect(page.locator(".kai-navigation")).toHaveCount(1);
   await expect(page.locator(".sidebar-panel")).toHaveCount(0);
@@ -134,6 +134,7 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
     environment: "prod",
     status: "investigating",
   };
+  let integrityMismatch = false;
   const evidence = [{
     evidence_id: "metric-latency-1",
     source: "prometheus-metrics",
@@ -145,6 +146,28 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
   const analyzedWorkflow = () => ({
     alert,
     incident,
+    investigation_integrity: analysisComplete
+      ? integrityMismatch
+        ? { status: "fingerprint_mismatch", verified: false, blocking_reasons: ["context fingerprint does not match"] }
+        : { status: "verified", verified: true, blocking_reasons: [] }
+      : { status: "missing_recommendation", verified: false, blocking_reasons: ["analysis pending"] },
+    incident_investigation: analysisComplete ? {
+      contract_version: "kaiops.incident-investigation.v1", tenant_id: "default", project_id: "KaiMS",
+      incident_id: incidentId, alert_id: alertId,
+      analysis_request_id: "99999999-9999-4999-8999-999999999999",
+      context_snapshot_id: "77777777-7777-4777-8777-777777777777",
+      context_fingerprint: "a".repeat(64), context_contract_version: "kaiops.context.v2",
+      context_collected_at: "2026-08-26T05:30:00Z", context_expires_at: "2026-08-28T05:30:00Z",
+      context_quality: { evidence_count: 1, category_coverage: 1, freshness_score: 1, provenance_score: 1, independent_source_count: 1, direct_observation_count: 1, valid: true, blocking_reasons: [] },
+      context_sources: [],
+      context_evidence: [{ evidence_id: "metric-latency-1", category: "metrics", source_id: "prometheus-metrics", connector: "prometheus", tenant_id: "default", project_id: "KaiMS", service: "api-gateway", observed_at: "2026-08-26T05:30:00Z", collected_at: "2026-08-26T05:30:00Z", freshness: "fresh", provenance: {}, citation: "prometheus://api-gateway/http_request_duration_seconds", epistemic_role: "current_observation", current_observation: true }],
+      investigation_id: "66666666-6666-4666-8666-666666666667", investigation_status: "conclusive", investigation_conclusive: true,
+      rca_version: 1, rca_status: "grounded", accepted_evidence_ids: ["metric-latency-1"], missing_evidence: [], conflicting_evidence: [],
+      recommendation_id: "88888888-8888-5888-8888-888888888888", resolution_plan_id: "55555555-5555-4555-8555-555555555557",
+      plan_fingerprint: `sha256:${"b".repeat(64)}`, execution_ready: true, readiness_blocks: [], approval_status: "pending",
+      remediation_status: "not_started", validation_status: "pending",
+      readiness: { investigation_ready: true, rca_ready: true, resolution_ready: true, execution_ready: true, blocking_reasons: [] },
+    } : null,
     context: {
       tenant_id: "default",
       incident_id: incidentId,
@@ -170,6 +193,7 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
         impact_analysis: { impact_summary: "API requests exceeded the latency SLO.", customer_impact: "Customers experienced delayed API responses.", impacted_services: ["api-gateway"], evidence_used: ["metric-latency-1"] },
         remediation_analysis: { recommended_action: "Increase the API connection pool and recycle saturated workers through the governed rollout." },
         investigation_report: { status: "conclusive", conclusive: true, conclusion: { confidence: 0.94 } },
+        execution_plan: analysisComplete ? { plan_id: "55555555-5555-4555-8555-555555555557", plan_fingerprint: `sha256:${"b".repeat(64)}`, execution_ready: true, mutating: true, readiness_blocks: [] } : {},
       },
     },
     timeline: [],
@@ -213,7 +237,8 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
         status: "complete",
         ready: true,
       };
-    } else if (path === "/analysis/resolution-catalog/relevant") body = { data: { rows: [] } };
+    } else if (path === "/analysis/resolution-catalog/relevant") body = { data: { rows: [{ id: "catalog-plan-1", title: "Scale API pool", risk: "medium" }] } };
+    else if (path === "/analysis/resolution-catalog/select") body = { data: { selected: { id: "catalog-plan-1", title: "Scale API pool", execution_eligible: false } } };
     else if (path.startsWith("/incidents/metadata")) body = { rows: [{ ...incident, title: "api-gateway: HighRequestLatency", projection_payload: { alert_id: alertId } }] };
     else if (path.startsWith("/alerts/all")) body = { data: { rows: [alert] } };
     else if (path.startsWith("/landing-pad/recent") || path === "/applications") body = { data: { rows: [] } };
@@ -221,11 +246,9 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
   });
 
   await page.goto(`/?workspace=alert&alert_id=${alertId}`);
-  await page.getByLabel("Username").fill("admin");
-  await page.getByLabel("Password").fill("Admin@123456");
-  await page.getByRole("button", { name: "Sign In" }).click();
+  await signInIfNeeded(page);
   await expect(page.getByRole("heading", { name: "api-gateway: HighRequestLatency" })).toBeVisible();
-  await expect(page.getByText("0 linked evidence")).toBeVisible();
+  await expect(page.getByText("0 linked record(s) · RCA and impact")).toBeVisible();
   await expect(page.getByText("0% RCA confidence")).toBeVisible();
 
   const tabs = page.getByRole("tablist", { name: "Incident workspace sections" });
@@ -237,6 +260,14 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
   await expect(page.getByText("API connection-pool saturation caused request queueing.").first()).toBeVisible();
   await expect(page.getByText("Increase the API connection pool and recycle saturated workers through the governed rollout.").first()).toBeVisible();
   await expect(page.getByText("1 linked record(s) · RCA and impact")).toBeVisible();
+  await page.getByRole("button", { name: "Review remediation plan" }).click();
+  await expect(page.getByRole("heading", { name: "Resolution command center" })).toBeVisible();
+  integrityMismatch = true;
+  await page.reload();
+  await signInIfNeeded(page);
+  await page.getByRole("tablist", { name: "Incident workspace sections" }).getByRole("tab", { name: "Evidence, RCA, and impact" }).click();
+  await expect(page.getByText("Investigation integrity error: fingerprint mismatch. Resolution is blocked.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Plan blocked by readiness" })).toBeDisabled();
   await expect(page.getByText(/HTTP 401|Not authenticated/)).toHaveCount(0);
   expect(protectedRequests.some(({ path }) => path === `/analysis/alerts/${alertId}/regenerate`)).toBeTruthy();
   const orchestrationRequests = protectedRequests.filter(({ path }) => path === `/analysis/alerts/${alertId}/regenerate`
@@ -262,9 +293,7 @@ test("incident summary connects source application and Prometheus to KaiOps proc
   });
 
   await page.goto("/alerts");
-  await page.getByLabel("Username").fill("admin");
-  await page.getByLabel("Password").fill("Admin@123456");
-  await page.getByRole("button", { name: "Sign In" }).click();
+  await signInIfNeeded(page);
   await page.getByRole("radio", { name: /Correlation Timeline/ }).click();
   await expect(page.getByLabel("Application: httpbin-failure-lab")).toBeVisible();
   await expect(page.getByLabel("Signal: https://httpbin.org/status/503")).toBeVisible();
