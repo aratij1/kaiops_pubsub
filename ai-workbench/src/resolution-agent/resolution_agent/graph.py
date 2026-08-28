@@ -1522,6 +1522,25 @@ class ResolutionIntelligenceAgent(BaseAgent):
 
     async def resolve(self, context: Context) -> Recommendation:
         state = await self.graph.ainvoke({"context": context})
+        rca_analysis = state.get("rca_analysis", {}) if isinstance(state.get("rca_analysis"), dict) else {}
+        rca_confidence = float(rca_analysis.get("confidence_score") or 0.0)
+        diagnostic_confidence = float(state.get("confidence") or 0.0)
+        existing_rationale = str(state.get("rationale") or "").strip()
+        rationale_prefix = re.match(
+            r"^(Model .*? proposed the RCA with \d+ validated evidence citation\(s\))",
+            existing_rationale,
+        )
+        prefix = rationale_prefix.group(1) if rationale_prefix else "The resolution agent evaluated the RCA"
+        external_note = (
+            " External knowledge fallback was used because grounded RCA text was insufficient."
+            if "External knowledge fallback was used" in existing_rationale
+            else ""
+        )
+        state["rationale"] = (
+            f"{prefix}; RCA evidence confidence={rca_confidence:.2f}; "
+            f"overall diagnostic confidence={diagnostic_confidence:.2f}."
+            f"{external_note}"
+        )
         runbook_present = bool((context.runbook or "").strip())
         discovery_evidence = state.get("gathered_context", {}).get("discovery_evidence") or []
         evidence = [

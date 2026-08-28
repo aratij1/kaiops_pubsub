@@ -208,6 +208,10 @@ export default function IncidentCommand() {
   const isTerminal = TERMINAL.some((value) => status.includes(value));
   const currentJourneyIndex = isTerminal ? 6 : status.includes("validat") || status.includes("verif") ? 5 : status.includes("execut") || status.includes("remediat") || status.includes("rollback") ? 4 : status.includes("approval") || recommendation.action || recommendation.title ? 3 : rootCause ? 2 : status.includes("investigat") || status.includes("analy") ? 1 : 0;
   const action = text(recommendation.title, recommendation.action, recommendation.recommended_action, eventPayload.recommended_action, projection.recommended_action);
+  const rawResolutionRationale = text(recommendation.why, recommendation.rationale, recommendation.reason, projection.recommendation_reason);
+  const resolutionRationale = /proposed the RCA with 0 validated evidence citation\(s\); confidence=0(?:\.0+)?\.?/i.test(rawResolutionRationale)
+    ? `No validated causal evidence citations support this RCA. The published ${confidence ?? 0}% score is bounded diagnostic confidence only and does not authorize execution.`
+    : rawResolutionRationale;
   const approvalCandidatePending = Boolean(approval) && !["approved", "rejected", "completed"].includes(text(approval?.approval_status, approval?.status).toLowerCase());
   const sourceTimestamp = text(source.received_at, source.created_at, row.created_at);
   const updatedTimestamp = text(row.latest_event_at, row.updated_at, row.created_at);
@@ -289,7 +293,7 @@ export default function IncidentCommand() {
         <section className="ic-section ic-resolution">
           <header><div><span>Recommended resolution</span><h3>{action || "No resolution recommendation available"}</h3></div><Wrench aria-hidden="true" /></header>
           {resolutionAvailable ? <>
-            <p className="ic-resolution-why">{text(recommendation.why, recommendation.rationale, recommendation.reason, projection.recommendation_reason) || "The backend did not include a human-readable rationale."}</p>
+            <p className="ic-resolution-why">{resolutionRationale || "The backend did not include a human-readable rationale."}</p>
             <div className="ic-resolution-facts">
               <Metric label="Risk" value={valueOrUnavailable(text(recommendation.risk_tier, row.risk_tier))} />
               <Metric label="Blast radius" value={valueOrUnavailable(text(recommendation.blast_radius, executionPlan.blast_radius, safety.allowed_scope))} />
