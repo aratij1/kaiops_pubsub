@@ -169,17 +169,17 @@ services:
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
 
-  cloud-operations:
-    image: kaiops-consolidated-cloud-operations:latest
-    environment:
-      <<: *service-env
-      SERVICE_NAME: cloud-operations
-      CLOUD_OPERATIONS_ENABLED: "true"
-    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    working_dir: /app/backend/src/cloud-operations
-    depends_on:
-      rabbitmq: { condition: service_healthy }
-      mysql: { condition: service_healthy }
+  # cloud-operations:
+  #   image: kaiops-consolidated-cloud-operations:latest
+  #   environment:
+  #     <<: *service-env
+  #     SERVICE_NAME: cloud-operations
+  #     CLOUD_OPERATIONS_ENABLED: "true"
+  #   command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+  #   working_dir: /app/backend/src/cloud-operations
+  #   depends_on:
+  #     rabbitmq: { condition: service_healthy }
+  #     mysql: { condition: service_healthy }
 
   api-gateway:
     build: *service-build
@@ -200,7 +200,7 @@ services:
       start_period: 10s
     depends_on:
       application-onboarding: { condition: service_started }
-      cloud-operations: { condition: service_started }
+      # cloud-operations: { condition: service_started }
       monitoring-adapter: { condition: service_started }
       approval-service: { condition: service_started }
 
@@ -240,6 +240,7 @@ services:
       mysql: { condition: service_healthy }
 
   model-router:
+    build: *service-build  
     image: kaiops-consolidated-model-router:latest
     environment: { <<: *service-env, SERVICE_NAME: model-router }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
