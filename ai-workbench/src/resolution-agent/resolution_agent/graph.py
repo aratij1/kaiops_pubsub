@@ -307,7 +307,16 @@ class ResolutionIntelligenceAgent(BaseAgent):
             return []
         accepted: list[str] = []
         for value in values:
-            raw = str(value or "").strip()
+            if isinstance(value, dict):
+                raw = str(
+                    value.get("evidence_id")
+                    or value.get("evidenceId")
+                    or value.get("id")
+                    or value.get("citation")
+                    or ""
+                ).strip()
+            else:
+                raw = str(value or "").strip()
             match = raw if raw in valid_ids else next(
                 (
                     evidence_id
@@ -1064,11 +1073,21 @@ class ResolutionIntelligenceAgent(BaseAgent):
     async def generate_rca(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
         prompt = PROMPT_IDENTIFY_ROOT_CAUSE
+        ordered_valid_ids = [
+            str(row.get("evidence_id"))
+            for row in state["gathered_context"].get("discovery_evidence", [])
+            if isinstance(row, dict) and row.get("evidence_id")
+        ]
         payload = {
             "summary": context.alert.description,
             **state["gathered_context"],
             "investigation_report": state.get("investigation_report", {}),
             "ranked_hypotheses": state.get("hypothesis_analysis", {}).get("ranked", []),
+            "available_evidence_ids": ordered_valid_ids,
+            "evidence_citation_contract": (
+                "Return evidence_used as an array containing only exact values from available_evidence_ids. "
+                "Do not return descriptions or source names in that array."
+            ),
         }
         response = await self._generate_with_fallback(
             context=context,
@@ -1107,11 +1126,6 @@ class ResolutionIntelligenceAgent(BaseAgent):
             service=str(context.alert.service or ""),
         ) and bool(external_rca_meta.get("used"))
         state["root_cause"] = external_rca_text if use_external_rca else inferred_root_cause
-        ordered_valid_ids = [
-            str(row.get("evidence_id"))
-            for row in state["gathered_context"].get("discovery_evidence", [])
-            if isinstance(row, dict) and row.get("evidence_id")
-        ]
         valid_ids = set(ordered_valid_ids)
         cited = self._validated_evidence_ids(parsed.get("evidence_used"), valid_ids)
         code_review = state["gathered_context"].get("code_review")

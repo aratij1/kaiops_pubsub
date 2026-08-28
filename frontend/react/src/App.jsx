@@ -10965,29 +10965,33 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                             <tr>
                                <th>Jira Ticket</th>
                                <td>
-                                 {(selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id) ? (
+                                 {(selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.incident?.jira_key || selectedAlertWorkflow?.ticket_id || selectedAlertWorkflow?.jira_key) ? (
+                                   (selectedAlertWorkflow?.incident?.jira_url || selectedAlertWorkflow?.incident?.jira_link || selectedAlertWorkflow?.jira_url || selectedAlertWorkflow?.jira_link) ? (
                                    <a
-                                     href={selectedAlertWorkflow?.incident?.jira_link || selectedAlertWorkflow?.jira_link || `https://kaiops-test.atlassian.net/browse/${selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id}`}
+                                     href={selectedAlertWorkflow?.incident?.jira_url || selectedAlertWorkflow?.incident?.jira_link || selectedAlertWorkflow?.jira_url || selectedAlertWorkflow?.jira_link}
                                      target="_blank"
                                      rel="noopener noreferrer"
                                      style={{ color: "#22d3ee", textDecoration: "underline", fontWeight: "bold" }}
                                    >
-                                     {selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id}
+                                     {selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.incident?.jira_key || selectedAlertWorkflow?.ticket_id || selectedAlertWorkflow?.jira_key}
                                    </a>
+                                   ) : (
+                                     <span>{selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.incident?.jira_key || selectedAlertWorkflow?.ticket_id || selectedAlertWorkflow?.jira_key}</span>
+                                   )
                                  ) : (
-                                   "-"
+                                   "Not linked"
                                  )}
                                </td>
                              </tr>
                              <tr>
                                <th>Jira Status</th>
                                <td>
-                                 {(selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.ticket_id) ? (
+                                 {(selectedAlertWorkflow?.incident?.ticket_id || selectedAlertWorkflow?.incident?.jira_key || selectedAlertWorkflow?.ticket_id || selectedAlertWorkflow?.jira_key) ? (
                                    <span className={`pill ${(selectedAlertWorkflow?.incident?.jira_status || selectedAlertWorkflow?.jira_status) === "Done" ? "status-success" : "status-warning"}`}>
-                                     {selectedAlertWorkflow?.incident?.jira_status || selectedAlertWorkflow?.jira_status || "In Progress"}
+                                     {selectedAlertWorkflow?.incident?.jira_status || selectedAlertWorkflow?.jira_status || "Status unavailable"}
                                    </span>
                                  ) : (
-                                   "-"
+                                   "Not linked"
                                  )}
                                </td>
                              </tr>

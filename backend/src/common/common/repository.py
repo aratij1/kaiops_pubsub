@@ -1235,12 +1235,14 @@ class IncidentRepository:
         incident_payload["jira_url"] = jira_link
 
         status_lower = str(incident_record.status or "").strip().lower()
-        if status_lower in {"closed", "resolved", "done"}:
-            jira_status = "Done"
-        elif status_lower in {"pending", "awaiting_approval"}:
-            jira_status = "Awaiting Approval"
-        else:
-            jira_status = "In Progress"
+        jira_status = None
+        if ticket_id:
+            if status_lower in {"closed", "resolved", "done"}:
+                jira_status = "Done"
+            elif status_lower in {"pending", "awaiting_approval"}:
+                jira_status = "Awaiting Approval"
+            else:
+                jira_status = "In Progress"
         incident_payload["jira_status"] = jira_status
 
 
@@ -6238,12 +6240,14 @@ class IncidentRepository:
             jira_link = f"{jira_base}/browse/{ticket_id}" if (ticket_id and jira_base) else None
 
             status_lower = str(projected_status or "").strip().lower()
-            if status_lower in {"closed", "resolved", "done"}:
-                jira_status = "Done"
-            elif status_lower in {"pending", "awaiting_approval"}:
-                jira_status = "Awaiting Approval"
-            else:
-                jira_status = "In Progress"
+            jira_status = None
+            if ticket_id:
+                if status_lower in {"closed", "resolved", "done"}:
+                    jira_status = "Done"
+                elif status_lower in {"pending", "awaiting_approval"}:
+                    jira_status = "Awaiting Approval"
+                else:
+                    jira_status = "In Progress"
 
             projection_payload["ticket_id"] = ticket_id or None
             projection_payload["jira_link"] = jira_link
@@ -6583,10 +6587,9 @@ class IncidentRepository:
             jira_link = f"{jira_base}/browse/{ticket_id}" if (ticket_id and jira_base) else None
 
             status_lower = str(row.status or "").strip().lower()
-            if status_lower in {"closed", "resolved", "done"}:
-                jira_status = "Done"
-            else:
-                jira_status = "In Progress"
+            jira_status = None
+            if ticket_id:
+                jira_status = "Done" if status_lower in {"closed", "resolved", "done"} else "In Progress"
 
             projection_payload["ticket_id"] = ticket_id or None
             projection_payload["jira_link"] = jira_link

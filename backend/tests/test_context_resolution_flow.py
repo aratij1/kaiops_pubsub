@@ -11,6 +11,19 @@ from model_router.router import ModelProvider, ModelResponse, build_usage
 from resolution_agent import ResolutionIntelligenceAgent
 
 
+def test_rca_evidence_validator_accepts_structured_model_citations() -> None:
+    valid_ids = {"LOG-1", "METRIC-2"}
+
+    assert ResolutionIntelligenceAgent._validated_evidence_ids(
+        [
+            {"evidence_id": "LOG-1", "reason": "direct error"},
+            {"id": "METRIC-2"},
+            {"evidence_id": "UNRELATED"},
+        ],
+        valid_ids,
+    ) == ["LOG-1", "METRIC-2"]
+
+
 @pytest.mark.asyncio
 async def test_resolution_runtime_accepts_explicit_zero_confidence_abstention() -> None:
     recommendation = Recommendation(

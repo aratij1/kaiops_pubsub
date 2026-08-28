@@ -178,6 +178,9 @@ async def test_processed_result_uses_projection_recommendation_snapshot_and_emit
     assert result["investigation_integrity"]["status"] == "verified"
     assert result["incident_investigation"]["context_snapshot_id"] == str(snapshot_v1)
     assert result["context"]["metadata"]["snapshot"]["snapshot_id"] == str(snapshot_v1)
+    assert result["incident"]["ticket_id"] is None
+    assert result["incident"]["jira_key"] is None
+    assert result["incident"]["jira_status"] is None
 
 
 @pytest.mark.asyncio
