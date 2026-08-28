@@ -1,0 +1,46 @@
+-- Immutable governed catalog selections and immutable supersession relations.
+CREATE TABLE IF NOT EXISTS governed_resolution_plans (
+    plan_id CHAR(32) NOT NULL,
+    tenant_id VARCHAR(128) NOT NULL,
+    project_id VARCHAR(128) NOT NULL,
+    incident_id CHAR(32) NOT NULL,
+    alert_id CHAR(32) NOT NULL,
+    analysis_request_id CHAR(32) NOT NULL,
+    context_snapshot_id CHAR(32) NOT NULL,
+    context_fingerprint VARCHAR(64) NOT NULL,
+    rca_version INT NOT NULL,
+    recommendation_id CHAR(32) NOT NULL,
+    recommendation_version INT NOT NULL,
+    catalog_option_id VARCHAR(255) NOT NULL,
+    catalog_option_version VARCHAR(64) NOT NULL,
+    plan_version INT NOT NULL,
+    plan_fingerprint VARCHAR(71) NOT NULL,
+    idempotency_key VARCHAR(64) NOT NULL,
+    supersedes_plan_id CHAR(32) NULL,
+    target_resource VARCHAR(255) NOT NULL,
+    connector_id VARCHAR(255) NOT NULL,
+    selected_by VARCHAR(255) NOT NULL,
+    payload JSON NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    expires_at DATETIME(6) NOT NULL,
+    PRIMARY KEY (plan_id),
+    UNIQUE KEY uq_governed_plan_idempotency (tenant_id, idempotency_key),
+    UNIQUE KEY uq_governed_plan_version (tenant_id, incident_id, plan_version),
+    KEY idx_governed_plan_current (tenant_id, incident_id, recommendation_id, plan_version),
+    KEY idx_governed_plan_binding (tenant_id, context_snapshot_id, context_fingerprint, rca_version),
+    KEY idx_governed_plan_supersedes (supersedes_plan_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS resolution_plan_supersessions (
+    relation_id CHAR(32) NOT NULL,
+    tenant_id VARCHAR(128) NOT NULL,
+    incident_id CHAR(32) NOT NULL,
+    supersedes CHAR(32) NOT NULL,
+    superseded_by CHAR(32) NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (relation_id),
+    UNIQUE KEY uq_plan_superseded_by (tenant_id, superseded_by),
+    KEY idx_plan_supersession_incident (tenant_id, incident_id, created_at),
+    KEY idx_plan_supersession_old (supersedes),
+    KEY idx_plan_supersession_new (superseded_by)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

@@ -996,6 +996,7 @@ class ResolutionCatalogRequest(BaseModel):
     context_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     issue: str
     service: str = "unknown"
+    environment: str = "unknown"
     recommended_action: str = ""
 
 
@@ -1013,6 +1014,8 @@ class ResolutionSelectionRequest(BaseModel):
     option_id: str
     issue: str
     service: str = "unknown"
+    environment: str = "unknown"
+    actor: str
 
 
 async def _require_catalog_readiness(request: ResolutionCatalogRequest | ResolutionSelectionRequest) -> dict[str, Any]:
@@ -1281,7 +1284,32 @@ async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, An
         from fastapi import HTTPException
 
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"incident_id": str(request.incident_id), "selected": plan}
+    plan["target_resource"] = request.service
+    plan["connector_id"] = "diagnostic-only"
+    plan["commands"] = []
+    async with app.state.session_factory() as session:
+        repository = IncidentRepository(session)
+        try:
+            persisted = await repository.persist_governed_resolution_selection(
+                tenant_id=tenant_id,
+                incident_id=request.incident_id,
+                alert_id=request.alert_id,
+                analysis_request_id=request.analysis_request_id,
+                context_snapshot_id=request.context_snapshot_id,
+                context_fingerprint=request.context_fingerprint,
+                recommendation_id=request.recommendation_id,
+                rca_version=request.rca_version,
+                option=plan,
+                selected_by=request.actor,
+            )
+            await session.commit()
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "stale_or_invalid_resolution_selection", "blocking_reasons": [str(exc)]},
+            ) from exc
+    return {"incident_id": str(request.incident_id), "selected": persisted}
 
 
 @app.post("/resolve", response_model=Recommendation)

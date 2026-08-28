@@ -30,6 +30,7 @@ from common.database import (
     DraftPullRequestOutboxRecord,
     EvaluationRecord,
     GrafanaDashboardRecord,
+    GovernedResolutionPlanRecord,
     IncidentCorrelationOwnershipRecord,
     IncidentEventRecord,
     IncidentInvestigationBindingRecord,
@@ -57,6 +58,7 @@ from common.database import (
     RcaReportRecord,
     RecordingRuleRecord,
     ResolutionOutboxRecord,
+    ResolutionPlanSupersessionRecord,
     RunbookOutcomeRecord,
     RunbookVersionRecord,
     ValidationHistoryRecord,
@@ -64,6 +66,7 @@ from common.database import (
 )
 from common.incident_status import reduce_incident_status
 from common.incident_investigation import IncidentInvestigationContract
+from common.orchestration.execution_plan_contract import canonical_plan_fingerprint, verify_plan_fingerprint
 from common.resolution_lifecycle import select_current_lifecycle
 from common.tenant_identity import require_tenant_id
 
@@ -3409,6 +3412,170 @@ class IncidentRepository:
             "recommendation_id": str(row.recommendation_id),
         }
 
+    async def persist_governed_resolution_selection(
+        self,
+        *,
+        tenant_id: str,
+        incident_id: UUID | str,
+        alert_id: UUID | str,
+        analysis_request_id: UUID | str,
+        context_snapshot_id: UUID | str,
+        context_fingerprint: str,
+        recommendation_id: UUID | str,
+        rca_version: int,
+        option: dict[str, Any],
+        selected_by: str,
+    ) -> dict[str, Any]:
+        """Atomically persist one immutable, idempotent catalog selection."""
+        tenant = require_tenant_id(tenant_id, source="governed resolution selection")
+        incident_uuid = self._parse_uuid(incident_id)
+        alert_uuid = self._parse_uuid(alert_id)
+        analysis_uuid = self._parse_uuid(analysis_request_id)
+        snapshot_uuid = self._parse_uuid(context_snapshot_id)
+        recommendation_uuid = self._parse_uuid(recommendation_id)
+        if not all((incident_uuid, alert_uuid, analysis_uuid, snapshot_uuid, recommendation_uuid)):
+            raise ValueError("governed resolution selection requires complete UUID identities")
+
+        projection = (
+            await self.session.execute(
+                select(IncidentProjectionRecord).where(
+                    IncidentProjectionRecord.tenant_id == tenant,
+                    IncidentProjectionRecord.incident_id == incident_uuid,
+                    IncidentProjectionRecord.alert_id == alert_uuid,
+                ).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if projection is None or projection.recommendation_id != recommendation_uuid:
+            raise ValueError("stale recommendation or incident projection")
+        binding = await self.session.get(IncidentInvestigationBindingRecord, recommendation_uuid)
+        if binding is None:
+            raise ValueError("normalized investigation binding is missing")
+        expected = (
+            tenant, incident_uuid, alert_uuid, analysis_uuid, snapshot_uuid,
+            str(context_fingerprint), recommendation_uuid, int(rca_version),
+        )
+        actual = (
+            binding.tenant_id, binding.incident_id, binding.alert_id, binding.analysis_request_id,
+            binding.context_snapshot_id, binding.context_fingerprint, binding.recommendation_id,
+            int(binding.rca_version),
+        )
+        if actual != expected:
+            raise ValueError("stale investigation identity binding")
+
+        option_id = self._require("catalog_option_id", option.get("id"))
+        option_version = self._require("catalog_option_version", option.get("source"))
+        target = self._require("target_resource", option.get("target_resource") or option.get("service"))
+        connector = self._require("connector_id", option.get("connector_id"))
+        if option.get("source") != "kaims-governed-catalog-v1":
+            raise ValueError("unverified global knowledge cannot create a governed plan")
+        if not isinstance(option.get("validation"), list) or not option["validation"]:
+            raise ValueError("catalog option requires validators")
+        if not isinstance(option.get("rollback"), list) or not option["rollback"]:
+            raise ValueError("catalog option requires rollback")
+        if option.get("execution_eligible") is not False:
+            raise ValueError("catalog selection must remain non-executable before approval readiness")
+
+        key_material = ":".join((
+            tenant, str(incident_uuid), str(rca_version), str(recommendation_uuid),
+            option_id, str(context_fingerprint),
+        ))
+        idempotency_key = hashlib.sha256(key_material.encode()).hexdigest()
+        existing = (
+            await self.session.execute(
+                select(GovernedResolutionPlanRecord).where(
+                    GovernedResolutionPlanRecord.tenant_id == tenant,
+                    GovernedResolutionPlanRecord.idempotency_key == idempotency_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return dict(existing.payload)
+
+        previous = (
+            await self.session.execute(
+                select(GovernedResolutionPlanRecord).where(
+                    GovernedResolutionPlanRecord.tenant_id == tenant,
+                    GovernedResolutionPlanRecord.incident_id == incident_uuid,
+                ).order_by(GovernedResolutionPlanRecord.plan_version.desc()).limit(1)
+            )
+        ).scalar_one_or_none()
+        plan_id = uuid4()
+        plan_version = int(previous.plan_version if previous else 0) + 1
+        plan = {
+            "schema_version": "kaiops.governed-resolution-plan.v1",
+            "plan_id": str(plan_id),
+            "plan_version": plan_version,
+            "tenant_id": tenant,
+            "project_id": binding.project_id,
+            "incident_id": str(incident_uuid),
+            "alert_id": str(alert_uuid),
+            "analysis_request_id": str(analysis_uuid),
+            "context_snapshot_id": str(snapshot_uuid),
+            "context_fingerprint": context_fingerprint,
+            "rca_version": int(rca_version),
+            "recommendation_id": str(recommendation_uuid),
+            "recommendation_version": int(rca_version),
+            "catalog_option_id": option_id,
+            "catalog_option_version": option_version,
+            "target_resource": target,
+            "connector_id": connector,
+            "risk": str(option.get("risk") or "high"),
+            "commands": list(option.get("commands") or []),
+            "validators": list(option.get("validation") or []),
+            "rollback": list(option.get("rollback") or []),
+            "expiry": binding.expires_at.isoformat(),
+            "execution_eligible": False,
+            "requires_operator_review": True,
+            "supersedes": str(previous.plan_id) if previous else None,
+            "selected_by": self._require("selected_by", selected_by),
+            "selection": option,
+        }
+        plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
+        plan["idempotency_key"] = idempotency_key
+        if not verify_plan_fingerprint(plan):
+            raise ValueError("canonical plan fingerprint verification failed")
+        row = GovernedResolutionPlanRecord(
+            plan_id=plan_id, tenant_id=tenant, project_id=binding.project_id,
+            incident_id=incident_uuid, alert_id=alert_uuid, analysis_request_id=analysis_uuid,
+            context_snapshot_id=snapshot_uuid, context_fingerprint=context_fingerprint,
+            rca_version=int(rca_version), recommendation_id=recommendation_uuid,
+            recommendation_version=int(rca_version), catalog_option_id=option_id,
+            catalog_option_version=option_version, plan_version=plan_version,
+            plan_fingerprint=plan["plan_fingerprint"], idempotency_key=idempotency_key,
+            supersedes_plan_id=previous.plan_id if previous else None, target_resource=target,
+            connector_id=connector, selected_by=selected_by, payload=plan, expires_at=binding.expires_at,
+        )
+        self.session.add(row)
+        if previous is not None:
+            self.session.add(ResolutionPlanSupersessionRecord(
+                tenant_id=tenant, incident_id=incident_uuid,
+                supersedes=previous.plan_id, superseded_by=plan_id,
+            ))
+        self.session.add(AuditLogRecord(
+            tenant_id=tenant, actor=selected_by, action="resolution.plan.selected",
+            resource_type="resolution_plan", resource_id=str(plan_id), payload=plan,
+        ))
+        event_payload = {
+            "event_type": "incident.resolution.plan.selected", "tenant_id": tenant,
+            "incident_id": str(incident_uuid), "alert_id": str(alert_uuid),
+            "recommendation_id": str(recommendation_uuid), "resolution_plan": plan,
+        }
+        await self.enqueue_resolution_event(
+            event_id=f"resolution-plan-selected:{plan_id}", aggregate_id=str(incident_uuid),
+            topic="resolution.events", partition_key=str(incident_uuid), payload=event_payload,
+            tenant_id=tenant, available_after_seconds=0,
+        )
+        projection_payload = dict(projection.projection_payload or {})
+        projection_payload["resolution_plan"] = plan
+        projection_payload["resolution_plan_id"] = str(plan_id)
+        projection_payload["plan_fingerprint"] = plan["plan_fingerprint"]
+        projection.projection_payload = projection_payload
+        projection.latest_event_type = "incident.resolution.plan.selected"
+        projection.latest_event_at = utc_now()
+        projection.updated_at = utc_now()
+        await self.session.flush()
+        return plan
+
     @staticmethod
     def build_incident_investigation_contract(
         *,
@@ -3547,14 +3714,15 @@ class IncidentRepository:
         plan_blocks = plan.get("readiness_blocks") if isinstance(plan.get("readiness_blocks"), list) else []
         plan_id = plan.get("plan_id") or plan.get("id")
         plan_fingerprint = plan.get("plan_fingerprint") or plan.get("fingerprint")
-        resolution_ready = bool(rca_ready and recommendation.get("id") and plan_id and plan_fingerprint)
+        plan_integrity_valid = bool(plan_id and plan_fingerprint and verify_plan_fingerprint(plan))
+        resolution_ready = bool(rca_ready and recommendation.get("id") and plan_integrity_valid)
         readiness_blocks = list(dict.fromkeys([
             *[str(item) for item in missing],
             *[str(item) for item in conflicting],
             *[str(item) for item in plan_blocks],
             *([] if conclusive else ["investigation is not conclusive"]),
             *([] if grounded else ["RCA is not grounded in accepted evidence"]),
-            *([] if plan_id and plan_fingerprint else ["exact resolution plan is not ready"]),
+            *([] if plan_integrity_valid else ["exact resolution plan is not ready or its fingerprint is invalid"]),
         ]))
         approval_payload = approval if isinstance(approval, dict) else {}
         approval_status = str(approval_payload.get("decision") or approval_payload.get("status") or "not_ready").lower()
@@ -6171,6 +6339,21 @@ class IncidentRepository:
                 # full RCA/recommendation is durably stored in the audit log.
                 # Rejoin it into the read model so UI consumers do not have to
                 # reconstruct a report from whichever event happened last.
+                governed_plan = (
+                    projection_payload.get("resolution_plan")
+                    if isinstance(projection_payload.get("resolution_plan"), dict)
+                    else {}
+                )
+                if governed_plan:
+                    recommendation_payload = dict(recommendation_payload)
+                    hydrated_metadata = (
+                        dict(recommendation_payload.get("metadata"))
+                        if isinstance(recommendation_payload.get("metadata"), dict)
+                        else {}
+                    )
+                    hydrated_metadata["execution_plan"] = governed_plan
+                    hydrated_metadata["governed_resolution_plan"] = governed_plan
+                    recommendation_payload["metadata"] = hydrated_metadata
                 projection_payload["recommendation"] = recommendation_payload
             elif any(
                 event_payload.get(key) is not None

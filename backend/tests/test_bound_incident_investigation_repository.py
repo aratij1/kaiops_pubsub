@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import func, select
 from common.database import (
     AlertRecord,
     AuditLogRecord,
@@ -11,8 +12,12 @@ from common.database import (
     IncidentInvestigationBindingRecord,
     IncidentProjectionRecord,
     IncidentRecord,
+    GovernedResolutionPlanRecord,
+    ResolutionOutboxRecord,
+    ResolutionPlanSupersessionRecord,
 )
 from common.repository import IncidentRepository
+from common.orchestration.execution_plan_contract import verify_plan_fingerprint
 
 
 async def _seed_pair(
@@ -220,3 +225,123 @@ async def test_bound_investigation_fails_closed(
     assert result["investigation_integrity"]["status"] == expected
     assert result["investigation_integrity"]["verified"] is False
     assert result["context_snapshot"] == {}
+
+
+def _catalog_option(option_id: str = "latency-kubernetes-diagnose") -> dict:
+    return {
+        "id": option_id,
+        "source": "kaims-governed-catalog-v1",
+        "service": "payments",
+        "target_resource": "payments",
+        "connector_id": "diagnostic-only",
+        "risk": "low",
+        "commands": [],
+        "validation": ["Latency returns within SLO"],
+        "rollback": ["No mutation is permitted before approval"],
+        "execution_eligible": False,
+        "requires_operator_review": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_catalog_selection_persists_once_with_projection_audit_and_outbox(
+    sqlite_session_factory,
+) -> None:
+    incident_id, alert_id, snapshot_id, recommendation_id = uuid4(), uuid4(), uuid4(), uuid4()
+    async with sqlite_session_factory() as session:
+        await _seed_pair(
+            session, tenant_id="tenant-a", incident_id=incident_id, alert_id=alert_id,
+            snapshot_id=snapshot_id, recommendation_id=recommendation_id,
+            fingerprint="a" * 64, evidence_id="evidence-1",
+        )
+        binding = await session.get(IncidentInvestigationBindingRecord, recommendation_id)
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_id, alert_id=alert_id, recommendation_id=recommendation_id,
+            tenant_id="tenant-a", service="payments", environment="prod", severity="critical",
+            status="investigating", first_seen_at=datetime.now(UTC), projection_payload={},
+        ))
+        await session.commit()
+        repo = IncidentRepository(session)
+        kwargs = dict(
+            tenant_id="tenant-a", incident_id=incident_id, alert_id=alert_id,
+            analysis_request_id=binding.analysis_request_id, context_snapshot_id=snapshot_id,
+            context_fingerprint="a" * 64, recommendation_id=recommendation_id, rca_version=1,
+            option=_catalog_option(), selected_by="operator-a",
+        )
+        first = await repo.persist_governed_resolution_selection(**kwargs)
+        await session.commit()
+        second = await repo.persist_governed_resolution_selection(**kwargs)
+        await session.commit()
+
+        assert second == first
+        assert verify_plan_fingerprint(first)
+        assert first["plan_version"] == 1
+        assert await session.scalar(select(func.count()).select_from(GovernedResolutionPlanRecord)) == 1
+        assert await session.scalar(select(func.count()).select_from(ResolutionOutboxRecord)) == 1
+        projection = await session.get(IncidentProjectionRecord, incident_id)
+        assert projection.projection_payload["resolution_plan"]["plan_id"] == first["plan_id"]
+        audit = await session.scalar(select(AuditLogRecord).where(AuditLogRecord.action == "resolution.plan.selected"))
+        assert audit.payload["plan_fingerprint"] == first["plan_fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_new_catalog_option_creates_immutable_supersession_relation(sqlite_session_factory) -> None:
+    incident_id, alert_id, snapshot_id, recommendation_id = uuid4(), uuid4(), uuid4(), uuid4()
+    async with sqlite_session_factory() as session:
+        await _seed_pair(
+            session, tenant_id="tenant-a", incident_id=incident_id, alert_id=alert_id,
+            snapshot_id=snapshot_id, recommendation_id=recommendation_id,
+            fingerprint="b" * 64, evidence_id="evidence-1",
+        )
+        binding = await session.get(IncidentInvestigationBindingRecord, recommendation_id)
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_id, alert_id=alert_id, recommendation_id=recommendation_id,
+            tenant_id="tenant-a", service="payments", environment="prod", severity="critical",
+            status="investigating", first_seen_at=datetime.now(UTC), projection_payload={},
+        ))
+        await session.commit()
+        repo = IncidentRepository(session)
+        base = dict(
+            tenant_id="tenant-a", incident_id=incident_id, alert_id=alert_id,
+            analysis_request_id=binding.analysis_request_id, context_snapshot_id=snapshot_id,
+            context_fingerprint="b" * 64, recommendation_id=recommendation_id, rca_version=1,
+            selected_by="operator-a",
+        )
+        first = await repo.persist_governed_resolution_selection(**base, option=_catalog_option("option-one"))
+        await session.commit()
+        second = await repo.persist_governed_resolution_selection(**base, option=_catalog_option("option-two"))
+        await session.commit()
+        relation = await session.scalar(select(ResolutionPlanSupersessionRecord))
+        assert first["plan_id"] != second["plan_id"]
+        assert second["plan_version"] == 2
+        assert second["supersedes"] == first["plan_id"]
+        assert str(relation.supersedes) == first["plan_id"]
+        assert str(relation.superseded_by) == second["plan_id"]
+
+
+@pytest.mark.asyncio
+async def test_stale_catalog_selection_writes_nothing(sqlite_session_factory) -> None:
+    incident_id, alert_id, snapshot_id, recommendation_id = uuid4(), uuid4(), uuid4(), uuid4()
+    async with sqlite_session_factory() as session:
+        await _seed_pair(
+            session, tenant_id="tenant-a", incident_id=incident_id, alert_id=alert_id,
+            snapshot_id=snapshot_id, recommendation_id=recommendation_id,
+            fingerprint="c" * 64, evidence_id="evidence-1",
+        )
+        binding = await session.get(IncidentInvestigationBindingRecord, recommendation_id)
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_id, alert_id=alert_id, recommendation_id=uuid4(),
+            tenant_id="tenant-a", service="payments", environment="prod", severity="critical",
+            status="investigating", first_seen_at=datetime.now(UTC), projection_payload={},
+        ))
+        await session.commit()
+        with pytest.raises(ValueError, match="stale recommendation"):
+            await IncidentRepository(session).persist_governed_resolution_selection(
+                tenant_id="tenant-a", incident_id=incident_id, alert_id=alert_id,
+                analysis_request_id=binding.analysis_request_id, context_snapshot_id=snapshot_id,
+                context_fingerprint="c" * 64, recommendation_id=recommendation_id, rca_version=1,
+                option=_catalog_option(), selected_by="operator-a",
+            )
+        await session.rollback()
+        assert await session.scalar(select(func.count()).select_from(GovernedResolutionPlanRecord)) == 0
+        assert await session.scalar(select(func.count()).select_from(ResolutionOutboxRecord)) == 0

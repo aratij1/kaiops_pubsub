@@ -409,6 +409,56 @@ class IncidentInvestigationBindingRecord(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
+class GovernedResolutionPlanRecord(Base):
+    """Immutable catalog selection bound to one exact RCA generation."""
+
+    __tablename__ = "governed_resolution_plans"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_governed_plan_idempotency"),
+        UniqueConstraint("tenant_id", "incident_id", "plan_version", name="uq_governed_plan_version"),
+        Index("idx_governed_plan_current", "tenant_id", "incident_id", "recommendation_id", "plan_version"),
+        Index("idx_governed_plan_binding", "tenant_id", "context_snapshot_id", "context_fingerprint", "rca_version"),
+    )
+
+    plan_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    project_id: Mapped[str] = mapped_column(String(128), index=True)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    alert_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    analysis_request_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    context_snapshot_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    context_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    rca_version: Mapped[int] = mapped_column(Integer)
+    recommendation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    recommendation_version: Mapped[int] = mapped_column(Integer)
+    catalog_option_id: Mapped[str] = mapped_column(String(255), index=True)
+    catalog_option_version: Mapped[str] = mapped_column(String(64))
+    plan_version: Mapped[int] = mapped_column(Integer)
+    plan_fingerprint: Mapped[str] = mapped_column(String(71), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    supersedes_plan_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    target_resource: Mapped[str] = mapped_column(String(255))
+    connector_id: Mapped[str] = mapped_column(String(255))
+    selected_by: Mapped[str] = mapped_column(String(255))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class ResolutionPlanSupersessionRecord(Base):
+    """Immutable relation recording both sides of a plan supersession."""
+
+    __tablename__ = "resolution_plan_supersessions"
+    __table_args__ = (UniqueConstraint("tenant_id", "superseded_by", name="uq_plan_superseded_by"),)
+
+    relation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    supersedes: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    superseded_by: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class AuditLogRecord(Base, TimestampMixin):
     __tablename__ = "audit_logs"
     __table_args__ = (Index("idx_audit_logs_resource_action_created", "resource_type", "action", "created_at"),)

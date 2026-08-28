@@ -2239,14 +2239,18 @@ async def select_analysis_resolution(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
-    tenant_id: str = Depends(current_tenant_id),
+    auth: AuthContext = Depends(require_roles(
+        SystemRole.ADMINISTRATOR.value,
+        SystemRole.L2_ENGINEER.value,
+        SystemRole.L3_ENGINEER.value,
+    )),
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
         method="POST",
         path="/resolution-catalog/select",
         target_base=settings.resolution_agent_url,
-        payload={**payload, "tenant_id": tenant_id},
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or str(auth.user_id)},
         trace_id=trace_id_from_header(x_trace_id),
     )
 
