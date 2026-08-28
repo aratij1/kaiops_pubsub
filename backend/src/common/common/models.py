@@ -433,6 +433,9 @@ class RemediationAction(BaseEvent):
     tenant_id: str
     incident_id: UUID
     approval_id: UUID | None = None
+    recommendation_id: UUID | None = None
+    resolution_plan_id: UUID | None = None
+    plan_fingerprint: str | None = None
     action_type: str
     target: str
     # Deterministic sha256(incident_id:recommendation_id:action_type). Stable
@@ -458,7 +461,13 @@ class ResolutionReport(BaseEvent):
     incident_id: UUID
     ticket_id: str | None = None
     recommendation_id: UUID | None = None
+    resolution_plan_id: UUID | None = None
+    plan_fingerprint: str | None = None
+    approval_id: UUID | None = None
     remediation_action_id: UUID | None = None
+    validation_checksum: str | None = None
+    closure_kind: str | None = None
+    closure_status: str | None = None
     root_cause: str
     impact: str
     action_taken: str

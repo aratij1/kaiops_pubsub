@@ -218,11 +218,18 @@ class ApprovalAssignmentRecord(Base, TimestampMixin):
 
 class ActionRecord(Base, TimestampMixin):
     __tablename__ = "actions"
-    __table_args__ = (Index("idx_actions_tenant_updated", "tenant_id", "updated_at"),)
+    __table_args__ = (
+        Index("idx_actions_tenant_updated", "tenant_id", "updated_at"),
+        Index("idx_actions_lifecycle_binding", "tenant_id", "incident_id", "recommendation_id", "resolution_plan_id", "approval_id", "updated_at"),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    recommendation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    resolution_plan_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    plan_fingerprint: Mapped[str | None] = mapped_column(String(71), index=True)
+    approval_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
     action_type: Mapped[str] = mapped_column(String(128), index=True)
     target: Mapped[str] = mapped_column(String(255), index=True)
     idempotency_key: Mapped[str | None] = mapped_column(String(64), unique=True)
@@ -278,9 +285,21 @@ class DraftPullRequestOutboxRecord(Base, TimestampMixin):
 class RcaReportRecord(Base, TimestampMixin):
     __tablename__ = "rca_reports"
 
+    __table_args__ = (
+        Index("idx_reports_lifecycle_binding", "tenant_id", "incident_id", "recommendation_id", "resolution_plan_id", "approval_id", "remediation_action_id", "updated_at"),
+    )
+
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    recommendation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    resolution_plan_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    plan_fingerprint: Mapped[str | None] = mapped_column(String(71), index=True)
+    approval_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    remediation_action_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    validation_checksum: Mapped[str | None] = mapped_column(String(80), index=True)
+    closure_kind: Mapped[str | None] = mapped_column(String(32), index=True)
+    closure_status: Mapped[str | None] = mapped_column(String(32), index=True)
     root_cause: Mapped[str] = mapped_column(Text)
     impact: Mapped[str] = mapped_column(Text)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)

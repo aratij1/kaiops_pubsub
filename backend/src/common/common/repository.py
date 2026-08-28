@@ -1268,6 +1268,13 @@ class IncidentRepository:
         investigation_integrity = dict(
             bound_investigation.get("investigation_integrity") or {}
         )
+        current_binding = (
+            await self.session.get(IncidentInvestigationBindingRecord, bound_projection.recommendation_id)
+            if bound_projection is not None and bound_projection.recommendation_id is not None
+            else None
+        )
+        current_plan_id = current_binding.resolution_plan_id if current_binding is not None else None
+        current_plan_fingerprint = current_binding.plan_fingerprint if current_binding is not None else None
 
         approval = {}
         approval_stmt = select(ApprovalRecord).where(
@@ -1278,6 +1285,14 @@ class IncidentRepository:
             approval_stmt = approval_stmt.where(
                 ApprovalRecord.recommendation_id == bound_projection.recommendation_id
             )
+        if current_plan_id is not None and current_plan_fingerprint:
+            approval_stmt = approval_stmt.where(
+                ApprovalRecord.plan_id == current_plan_id,
+                ApprovalRecord.plan_fingerprint == current_plan_fingerprint,
+            )
+        else:
+            # An approval cannot be current before an immutable governed plan exists.
+            approval_stmt = approval_stmt.where(ApprovalRecord.id.is_(None))
         approval_result = await self.session.execute(
             approval_stmt
             .order_by(ApprovalRecord.updated_at.desc(), ApprovalRecord.created_at.desc())
@@ -1288,32 +1303,86 @@ class IncidentRepository:
             approval = approval_record.payload
 
         remediation_action = {}
-        action_result = await self.session.execute(
-            select(ActionRecord)
-            .where(
+        action_stmt = select(ActionRecord).where(ActionRecord.id.is_(None))
+        if approval_record is not None and current_plan_id is not None and current_plan_fingerprint:
+            action_stmt = select(ActionRecord).where(
                 ActionRecord.incident_id == UUID(incident_id_str),
                 ActionRecord.tenant_id == normalized_tenant_id,
+                ActionRecord.recommendation_id == bound_projection.recommendation_id,
+                ActionRecord.resolution_plan_id == current_plan_id,
+                ActionRecord.plan_fingerprint == current_plan_fingerprint,
+                ActionRecord.approval_id == approval_record.id,
             )
-            .order_by(ActionRecord.updated_at.desc(), ActionRecord.created_at.desc())
-            .limit(1)
+        action_result = await self.session.execute(
+            action_stmt.order_by(ActionRecord.updated_at.desc(), ActionRecord.created_at.desc()).limit(1)
         )
         action_record = action_result.scalar_one_or_none()
         if action_record is not None and isinstance(action_record.payload, dict):
             remediation_action = action_record.payload
 
         closure_report = {}
-        report_result = await self.session.execute(
-            select(RcaReportRecord)
-            .where(
+        report_stmt = select(RcaReportRecord).where(RcaReportRecord.id.is_(None))
+        if action_record is not None and approval_record is not None:
+            report_stmt = select(RcaReportRecord).where(
                 RcaReportRecord.incident_id == UUID(incident_id_str),
                 RcaReportRecord.tenant_id == normalized_tenant_id,
+                RcaReportRecord.recommendation_id == bound_projection.recommendation_id,
+                RcaReportRecord.resolution_plan_id == current_plan_id,
+                RcaReportRecord.plan_fingerprint == current_plan_fingerprint,
+                RcaReportRecord.approval_id == approval_record.id,
+                RcaReportRecord.remediation_action_id == action_record.id,
             )
-            .order_by(RcaReportRecord.updated_at.desc(), RcaReportRecord.created_at.desc())
-            .limit(1)
+        report_result = await self.session.execute(
+            report_stmt.order_by(RcaReportRecord.updated_at.desc(), RcaReportRecord.created_at.desc()).limit(1)
         )
         report_record = report_result.scalar_one_or_none()
         if report_record is not None and isinstance(report_record.payload, dict):
             closure_report = report_record.payload
+
+        legacy_actions_result = await self.session.execute(
+            select(ActionRecord).where(
+                ActionRecord.incident_id == UUID(incident_id_str),
+                ActionRecord.tenant_id == normalized_tenant_id,
+                or_(
+                    ActionRecord.recommendation_id.is_(None),
+                    ActionRecord.resolution_plan_id.is_(None),
+                    ActionRecord.plan_fingerprint.is_(None),
+                    ActionRecord.approval_id.is_(None),
+                ),
+            ).order_by(ActionRecord.updated_at.desc()).limit(50)
+        )
+        legacy_reports_result = await self.session.execute(
+            select(RcaReportRecord).where(
+                RcaReportRecord.incident_id == UUID(incident_id_str),
+                RcaReportRecord.tenant_id == normalized_tenant_id,
+                or_(
+                    RcaReportRecord.recommendation_id.is_(None),
+                    RcaReportRecord.resolution_plan_id.is_(None),
+                    RcaReportRecord.plan_fingerprint.is_(None),
+                    RcaReportRecord.approval_id.is_(None),
+                    RcaReportRecord.remediation_action_id.is_(None),
+                ),
+            ).order_by(RcaReportRecord.updated_at.desc()).limit(50)
+        )
+        legacy_lifecycle_records = [
+            {
+                "record_type": "remediation_action",
+                "record_id": str(row.id),
+                "status": "legacy_unbound",
+                "recorded_status": row.status,
+                "created_at": row.created_at,
+            }
+            for row in legacy_actions_result.scalars().all()
+        ] + [
+            {
+                "record_type": "closure_report",
+                "record_id": str(row.id),
+                "status": "legacy_unbound",
+                "recorded_status": row.closure_status,
+                "created_at": row.created_at,
+            }
+            for row in legacy_reports_result.scalars().all()
+        ]
 
         closure_metadata = (
             closure_report.get("metadata")
@@ -1707,6 +1776,7 @@ class IncidentRepository:
             "approval": approval,
             "remediation_action": remediation_action,
             "closure_report": closure_report,
+            "legacy_lifecycle_records": legacy_lifecycle_records,
             "resolution_lifecycle": resolution_lifecycle,
             "metrics": metrics,
             "finops": {
@@ -2581,11 +2651,26 @@ class IncidentRepository:
 
     async def save_action(self, action: RemediationAction) -> None:
         action_status = self._require("action.status", action.status.value)
+        parameters = action.parameters if isinstance(action.parameters, dict) else {}
+        execution_plan = parameters.get("execution_plan") if isinstance(parameters.get("execution_plan"), dict) else {}
+        recommendation_id = self._parse_uuid(
+            action.recommendation_id or parameters.get("recommendation_id") or execution_plan.get("recommendation_id")
+        )
+        resolution_plan_id = self._parse_uuid(
+            action.resolution_plan_id or parameters.get("resolution_plan_id") or execution_plan.get("plan_id")
+        )
+        plan_fingerprint = str(
+            action.plan_fingerprint or parameters.get("approved_plan_fingerprint") or execution_plan.get("plan_fingerprint") or ""
+        ).strip() or None
         await self.session.merge(
             ActionRecord(
                 id=self._require("action.id", action.id),
                 tenant_id=action.tenant_id or "default",
                 incident_id=self._require("action.incident_id", action.incident_id),
+                recommendation_id=recommendation_id,
+                resolution_plan_id=resolution_plan_id,
+                plan_fingerprint=plan_fingerprint,
+                approval_id=self._parse_uuid(action.approval_id),
                 action_type=self._require("action.action_type", action.action_type),
                 target=self._require("action.target", action.target),
                 idempotency_key=action.idempotency_key,
@@ -2891,11 +2976,25 @@ class IncidentRepository:
         verified_tenant = require_tenant_id(report.tenant_id, source="resolution report persistence")
         if tenant_id is not None and require_tenant_id(tenant_id, source="resolution report persistence") != verified_tenant:
             raise ValueError("report tenant does not match persistence tenant")
+        validation_checksum = str(report.validation_checksum or "").strip()
+        if not validation_checksum:
+            validation_material = json.dumps(report.validation, sort_keys=True, separators=(",", ":"))
+            validation_checksum = f"sha256:{hashlib.sha256(validation_material.encode()).hexdigest()}"
         await self.session.merge(
             RcaReportRecord(
                 id=self._require("report.id", report.id),
                 tenant_id=verified_tenant,
                 incident_id=self._require("report.incident_id", report.incident_id),
+                recommendation_id=self._parse_uuid(report.recommendation_id),
+                resolution_plan_id=self._parse_uuid(report.resolution_plan_id),
+                plan_fingerprint=str(report.plan_fingerprint or "").strip() or None,
+                approval_id=self._parse_uuid(report.approval_id),
+                remediation_action_id=self._parse_uuid(report.remediation_action_id),
+                validation_checksum=validation_checksum,
+                closure_kind=str(report.closure_kind or report.metadata.get("closure_kind") or "").strip() or None,
+                closure_status=str(
+                    report.closure_status or ("closed" if report.health_restored else "validation_failed")
+                ).strip(),
                 root_cause=self._require("report.root_cause", report.root_cause),
                 impact=self._require("report.impact", report.impact),
                 payload=report.model_dump(mode="json"),

@@ -44,6 +44,9 @@ async def test_remediation_engine_executes_rollback_strategy() -> None:
     action = engine.build_action(approval)
     completed = await engine.execute(action)
 
+    assert action.recommendation_id == approval.recommendation_id
+    assert action.resolution_plan_id == approval.plan_id
+    assert action.plan_fingerprint == approval.plan_fingerprint
     assert action.action_type == "rollback_deployment"
     assert completed.status == RemediationStatus.SKIPPED
     assert completed.parameters["execution_result"]["executed"] is False
@@ -58,6 +61,12 @@ async def test_closure_validation_generates_report() -> None:
 
     report = await ClosureValidationAgent().validate(action)
 
+    assert report.recommendation_id == approval.recommendation_id
+    assert report.resolution_plan_id == approval.plan_id
+    assert report.plan_fingerprint == approval.plan_fingerprint
+    assert report.approval_id == approval.id
+    assert report.remediation_action_id == action.id
+    assert report.closure_status == "validation_failed"
     assert report.health_restored is False
     assert report.alerts_cleared is False
     assert report.validation["remediation_succeeded"] is False

@@ -1198,6 +1198,9 @@ class RemediationEngine(BaseAgent):
             tenant_id=approval.tenant_id,
             incident_id=approval.incident_id,
             approval_id=approval.id,
+            recommendation_id=approval.recommendation_id,
+            resolution_plan_id=approval.plan_id,
+            plan_fingerprint=approval.plan_fingerprint,
             action_type=action_type,
             target=target,
             parameters={

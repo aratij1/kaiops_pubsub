@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import func, select
 from common.database import (
+    ActionRecord,
     AlertRecord,
     AuditLogRecord,
     ContextSnapshotRecord,
@@ -166,6 +167,14 @@ async def test_processed_result_uses_projection_recommendation_snapshot_and_emit
             tenant_id="tenant-a", service="payments", environment="prod", severity="critical",
             status="investigating", first_seen_at=now, projection_payload={},
         ))
+        legacy_action_id = uuid4()
+        session.add(ActionRecord(
+            id=legacy_action_id, tenant_id="tenant-a", incident_id=incident_id,
+            recommendation_id=None, resolution_plan_id=None, plan_fingerprint=None,
+            approval_id=None, action_type="restart", target="payments",
+            idempotency_key=f"legacy-{legacy_action_id}", status="succeeded",
+            payload={"id": str(legacy_action_id), "status": "succeeded"},
+        ))
         session.add(ContextSnapshotRecord(
             snapshot_id=uuid4(), tenant_id="tenant-a", incident_id=str(incident_id),
             source_incident_id=str(incident_id), alert_signature="newer",
@@ -183,6 +192,10 @@ async def test_processed_result_uses_projection_recommendation_snapshot_and_emit
     assert result["investigation_integrity"]["status"] == "verified"
     assert result["incident_investigation"]["context_snapshot_id"] == str(snapshot_v1)
     assert result["context"]["metadata"]["snapshot"]["snapshot_id"] == str(snapshot_v1)
+    assert result["remediation_action"] == {}
+    assert result["metrics"]["remediation_status"] == "unknown"
+    assert result["legacy_lifecycle_records"][0]["record_id"] == str(legacy_action_id)
+    assert result["legacy_lifecycle_records"][0]["status"] == "legacy_unbound"
 
 
 @pytest.mark.asyncio
