@@ -4146,6 +4146,7 @@ function groundedIntelligenceDisplay(label, value, structuredOverride) {
           ]
       : [
           ["Why", parsed.why_this_action],
+          ["Blocked corrective candidate", parsed.blocked_candidate_action],
           ["Validation", parsed.validation_queries],
           ["Rollback", parsed.rollback_plan],
           ["Missing evidence", parsed.missing_evidence],
@@ -4349,8 +4350,6 @@ function IntelligenceConnectionView({
     // literal text "[object Object]".
     ...(Array.isArray(rcaAnalysis.evidence_used) ? rcaAnalysis.evidence_used.filter((item) => typeof item === "string") : []),
     ...(Array.isArray(impactAnalysis.evidence_used) ? impactAnalysis.evidence_used.filter((item) => typeof item === "string") : []),
-    ...evidence.map((item) => item?.evidence_id),
-    ...detectedErrors.map((item) => item?.evidence_id),
   ].filter(Boolean)));
   const queryTerms = Array.isArray(discovery.query_terms)
     ? discovery.query_terms
@@ -4442,8 +4441,8 @@ function IntelligenceConnectionView({
             ),
             evidence_used: Array.isArray(rcaAnalysis.evidence_used) && rcaAnalysis.evidence_used.length
               ? rcaAnalysis.evidence_used
-              : (hypotheses[0]?.supporting_evidence || supportingIds || []).filter((item) => typeof item === "string"),
-            confidence_score: Number.isFinite(Number(rcaAnalysis.confidence_score)) && Number(rcaAnalysis.confidence_score) > 0
+              : (hypotheses[0]?.supporting_evidence || []).filter((item) => typeof item === "string"),
+            confidence_score: Number.isFinite(Number(rcaAnalysis.confidence_score))
               ? Number(rcaAnalysis.confidence_score)
               : Number(recommendation.confidence ?? report.confidence_score ?? hypotheses[0]?.confidence ?? 0),
           }
@@ -4470,8 +4469,8 @@ function IntelligenceConnectionView({
             ),
             evidence_used: Array.isArray(impactAnalysis.evidence_used) && impactAnalysis.evidence_used.length
               ? impactAnalysis.evidence_used
-              : (supportingIds || []).filter((item) => typeof item === "string"),
-            confidence_score: Number.isFinite(Number(impactAnalysis.confidence_score)) && Number(impactAnalysis.confidence_score) > 0
+              : [],
+            confidence_score: Number.isFinite(Number(impactAnalysis.confidence_score))
               ? Number(impactAnalysis.confidence_score)
               : Number(recommendation.confidence ?? report.confidence_score ?? 0),
           }
@@ -4515,7 +4514,16 @@ function IntelligenceConnectionView({
     {
       label: "Recommended action",
       value: Object.keys(remediationAnalysis).length
-        ? remediationAnalysis
+        ? remediationAnalysis.execution_ready === false
+          ? {
+              ...remediationAnalysis,
+              recommended_action: Array.isArray(rcaAnalysis.missing_evidence) && rcaAnalysis.missing_evidence.length
+                ? `Collect missing evidence (${rcaAnalysis.missing_evidence.join(", ")}) and rerun analysis.`
+                : "Collect the next required diagnostic evidence and rerun analysis.",
+              why_this_action: "Corrective execution is blocked because the causal hypothesis is not sufficiently corroborated.",
+              blocked_candidate_action: remediationAnalysis.recommended_action,
+            }
+          : remediationAnalysis
         : recommendation.recommended_action || (Array.isArray(report.recommended_next_checks)
           ? {
               recommended_action: report.recommended_next_checks[0],
