@@ -68,6 +68,21 @@ describe("canonical incident evidence", () => {
     expect(result.executionReady).toBe(false);
   });
 
+  it("never accepts synthetic or missing citations as RCA support", () => {
+    const result = canonicalIncidentEvidence({
+      context: { metadata: { context_evidence: { logs: [
+        { evidence_id: "log-1", source_id: "logs", citation: "context://incident/log-1", freshness: "fresh" },
+      ] } } },
+      recommendation: { metadata: {
+        rca_status: "grounded",
+        rca_analysis: { evidence_used: ["log-1"] },
+      } },
+    });
+    expect(result.evidence[0].accepted).toBe(false);
+    expect(result.grounded).toBe(false);
+    expect(result.rcaReady).toBe(false);
+  });
+
   it("opens resolution planning for grounded RCA before a plan exists", () => {
     const contract = {
       ...readyContract,

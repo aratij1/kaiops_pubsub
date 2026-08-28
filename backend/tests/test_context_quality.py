@@ -111,6 +111,23 @@ def test_missing_provider_timestamp_is_explicit_and_cannot_claim_full_freshness(
     assert source["inferred_timestamp_count"] == 1
 
 
+def test_untraceable_connector_rows_are_diagnostic_only() -> None:
+    context = make_context()
+    context.metadata["context_evidence"] = {
+        "logs": [{"source": "logs", "summary": "result without a source reference"}]
+    }
+
+    governed = govern_context(context, tenant_id="tenant-a")
+
+    assert governed.metadata["context_evidence"]["logs"] == []
+    source = governed.metadata["context_sources"]["logs"]
+    assert source["status"] == "unavailable"
+    assert source["result_count"] == 0
+    assert source["untraceable_count"] == 1
+    assert "traceable source reference" in source["error"]
+    assert "context://" not in str(governed.metadata)
+
+
 def test_governance_preserves_initial_collection_status() -> None:
     context = make_context()
     context.metadata["context_sources"] = {

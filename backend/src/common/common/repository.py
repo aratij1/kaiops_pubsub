@@ -65,7 +65,7 @@ from common.database import (
     ValidationObservationRecord,
 )
 from common.incident_status import reduce_incident_status
-from common.incident_investigation import IncidentInvestigationContract
+from common.incident_investigation import IncidentInvestigationContract, is_traceable_evidence_citation
 from common.orchestration.execution_plan_contract import canonical_plan_fingerprint, verify_plan_fingerprint
 from common.resolution_lifecycle import select_current_lifecycle
 from common.tenant_identity import require_tenant_id
@@ -3767,7 +3767,10 @@ class IncidentRepository:
             ),
             "epistemic_role": item.get("epistemic_role") or "current_observation",
             "current_observation": item.get("current_observation") is not False,
-        } for item in evidence_rows]
+        } for item in evidence_rows if is_traceable_evidence_citation(
+            item.get("citation") or item.get("source_uri") or item.get("uri")
+            or (item.get("provenance") or {}).get("primary_source")
+        )]
         analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
         investigation = (
             metadata.get("iterative_investigation")
@@ -3777,11 +3780,14 @@ class IncidentRepository:
             else {}
         )
         plan = metadata.get("execution_plan") if isinstance(metadata.get("execution_plan"), dict) else {}
-        accepted = (
+        requested_accepted = (
             metadata.get("evidence_ids")
             if isinstance(metadata.get("evidence_ids"), list)
             else analysis.get("evidence_used", [])
         )
+        evidence_ids = {str(item.get("evidence_id") or "") for item in evidence}
+        accepted = [str(item) for item in requested_accepted if str(item) in evidence_ids]
+        rejected_untraceable = [str(item) for item in requested_accepted if str(item) not in evidence_ids]
         missing = analysis.get("missing_evidence", []) if isinstance(analysis.get("missing_evidence"), list) else []
         conflicting = (
             analysis.get("conflicting_evidence", [])
@@ -3819,6 +3825,7 @@ class IncidentRepository:
             *[str(item) for item in missing],
             *[str(item) for item in conflicting],
             *[str(item) for item in plan_blocks],
+            *(["RCA references evidence without a traceable citation"] if rejected_untraceable else []),
             *([] if conclusive else ["investigation is not conclusive"]),
             *([] if grounded else ["RCA is not grounded in accepted evidence"]),
             *([] if plan_integrity_valid else ["exact resolution plan is not ready or its fingerprint is invalid"]),

@@ -7,6 +7,11 @@ function rows(value) {
   return Object.values(object(value)).flatMap((item) => Array.isArray(item) ? item : []);
 }
 
+export function isTraceableEvidenceCitation(value) {
+  const citation = String(value || "").trim().toLowerCase();
+  return Boolean(citation) && !["context://", "unknown://", "unavailable://"].some((prefix) => citation.startsWith(prefix));
+}
+
 export function canonicalIncidentEvidence(workflow) {
   const root = object(workflow);
   const parsedContract = IncidentInvestigationV1.safeParse(root.incident_investigation);
@@ -33,7 +38,7 @@ export function canonicalIncidentEvidence(workflow) {
       citation: String(item.citation || ""),
       freshness,
       cached: historical || freshness === "stale",
-      accepted: Boolean(id && acceptedIds.has(id)),
+      accepted: Boolean(id && acceptedIds.has(id) && isTraceableEvidenceCitation(item.citation)),
     };
   });
   const missing = contract?.missing_evidence || (Array.isArray(analysis.missing_evidence) ? analysis.missing_evidence.map(String) : []);
@@ -43,9 +48,10 @@ export function canonicalIncidentEvidence(workflow) {
   const conclusive = contract
     ? contract.investigation_conclusive && contract.investigation_status === "conclusive"
     : investigation.conclusive === true && String(investigation.status || "").toLowerCase() === "conclusive";
+  const traceableAcceptedCount = evidence.filter((item) => item.accepted).length;
   const grounded = contract
-    ? contract.rca_status === "grounded" && acceptedIds.size > 0
-    : String(metadata.rca_status || "").toLowerCase() === "grounded" && acceptedIds.size > 0;
+    ? contract.rca_status === "grounded" && traceableAcceptedCount > 0
+    : String(metadata.rca_status || "").toLowerCase() === "grounded" && traceableAcceptedCount > 0;
   const integrityVerified = integrity.status === "verified";
   const contextReady = Boolean(contract && integrityVerified && contract.readiness.context_ready);
   const rcaReady = Boolean(contextReady && contract?.readiness.rca_ready && conclusive && grounded);

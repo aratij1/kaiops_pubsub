@@ -209,6 +209,19 @@ def _relevance(row: dict[str, Any], context: Context) -> float:
     return max(_clamp(supplied), lexical, 0.25 if row.get("uri") else 0.1)
 
 
+def _traceable_citation(row: dict[str, Any]) -> str:
+    provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+    value = _bounded_text(
+        row.get("citation") or row.get("source_uri") or row.get("uri")
+        or row.get("url") or row.get("path") or row.get("source_ref")
+        or provenance.get("primary_source") or "",
+        1000,
+    ).strip()
+    if not value or value.lower().startswith(("context://", "unknown://", "unavailable://")):
+        return ""
+    return value
+
+
 def _normalise_row(
     row: dict[str, Any],
     *,
@@ -236,7 +249,7 @@ def _normalise_row(
     freshness_score = max(0.0, min(1.0, 1.0 - (age_seconds / max(1, ttl_seconds))))
     if observed_at_inferred and source in {"logs", "telemetry", "database", "deployments", "changes", "tickets"}:
         freshness_score = min(freshness_score, 0.5)
-    uri = _bounded_text(public.get("uri") or public.get("path") or public.get("source_ref") or "", 1000)
+    uri = _traceable_citation(public)
     summary = _bounded_text(
         public.get("summary") or public.get("snippet") or public.get("matched_line") or public.get("content") or "",
         4000,
@@ -253,13 +266,27 @@ def _normalise_row(
         {
             "evidence_id": evidence_id,
             "source": source,
-            "uri": uri or f"context://{context.incident_id}/{source}/{evidence_id}",
+            "category": str(public.get("category") or bucket),
+            "source_id": str(public.get("source_id") or source),
+            "connector": str(public.get("connector") or public.get("provider") or source),
+            "tenant_id": str(public.get("tenant_id") or context.tenant_id or "default"),
+            "project_id": str(
+                public.get("project_id") or context.alert.metadata.get("project_id")
+                or context.alert.labels.get("project_id") or "default"
+            ),
+            "service": str(public.get("service") or context.alert.service or "unknown"),
+            "resource_id": public.get("resource_id") or public.get("resource"),
+            "uri": uri,
+            "citation": uri,
+            "traceable": bool(uri),
             "summary": summary or f"{source} evidence collected for {context.alert.service}",
             "observed_at": observed_at.isoformat(),
             "observed_at_inferred": observed_at_inferred,
             "timestamp_quality": "retrieval_fallback" if observed_at_inferred else "source_timestamp",
             "timestamp": observed_at.isoformat(),
+            "collected_at": collected_at.isoformat(),
             "retrieved_at": retrieved_at.isoformat(),
+            "observation_window": public.get("observation_window"),
             "age_seconds": round(age_seconds, 3),
             "ttl_seconds": ttl_seconds,
             "freshness_score": round(freshness_score, 4),
@@ -269,6 +296,8 @@ def _normalise_row(
             "relevance_score": round(_relevance(public, context), 4),
             "content_sha256": content_sha256,
             "redaction_applied": True,
+            "epistemic_role": public.get("epistemic_role") or "current_observation",
+            "current_observation": public.get("current_observation") is not False,
             "provenance": {
                 "entity": evidence_id,
                 "activity": "kaiops-context-collection",
@@ -477,6 +506,7 @@ def govern_context(
         )
 
     normalised: dict[str, list[dict[str, Any]]] = {}
+    untraceable_counts: dict[str, int] = {}
     seen: set[str] = set()
     limit = max(1, min(int(max_evidence_per_source), 100))
     for raw_source, rows in combined.items():
@@ -491,6 +521,9 @@ def govern_context(
                 now=now,
                 reused=reused,
             )
+            if not item.get("traceable"):
+                untraceable_counts[bucket] = untraceable_counts.get(bucket, 0) + 1
+                continue
             identity = str(item["evidence_id"])
             if identity in seen:
                 continue
@@ -515,15 +548,22 @@ def govern_context(
         entry.setdefault("collection_status", entry.get("status", "unknown"))
         entry.setdefault("inferred_timestamp_count", 0)
         source_manifest[str(source)] = entry
-    for source, rows in normalised.items():
+    for source in set(normalised) | set(untraceable_counts):
+        rows = normalised.get(source, [])
         prior = source_manifest.get(source, {})
         stale = bool(rows) and all(_clamp(row.get("freshness_score")) <= 0.0 for row in rows)
+        untraceable = untraceable_counts.get(source, 0)
+        status = "stale" if stale else "fresh" if rows else "unavailable" if untraceable else str(prior.get("status") or "no_data")
         source_manifest[source] = {
             **prior,
             "attempted": bool(prior.get("attempted", True)),
             "collection_status": prior.get("collection_status", prior.get("status", "collected")),
-            "status": "stale" if stale else "fresh" if rows else str(prior.get("status") or "no_data"),
+            "status": status,
             "result_count": len(rows),
+            "untraceable_count": untraceable,
+            "error": prior.get("error") or ("Connector returned records without a traceable source reference." if untraceable else None),
+            "required_configuration": prior.get("required_configuration") or ("Configure the connector to return a durable source URI or citation." if untraceable else None),
+            "last_attempt_at": prior.get("last_attempt_at") or collected_at.isoformat(),
             "fresh_count": sum(1 for row in rows if _clamp(row.get("freshness_score")) > 0.0),
             "inferred_timestamp_count": sum(1 for row in rows if row.get("observed_at_inferred")),
             "oldest_observed_at": min((str(row.get("observed_at")) for row in rows), default=None),
@@ -561,7 +601,7 @@ def _reference(row: dict[str, Any]) -> EvidenceReference:
     return EvidenceReference(
         evidence_id=str(row.get("evidence_id") or "unknown"),
         source=str(row.get("source") or "unknown"),
-        uri=str(row.get("uri") or "context://unknown"),
+        uri=str(row.get("uri") or row.get("citation") or ""),
         summary=str(row.get("summary") or "Evidence collected")[:4000],
         observed_at=_as_utc(row.get("observed_at"), utc_now()),
         confidence=_clamp(row.get("confidence"), 0.5),

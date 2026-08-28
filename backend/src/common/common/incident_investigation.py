@@ -9,6 +9,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 INVESTIGATION_CONTRACT_VERSION = "kaiops.incident-investigation.v1"
 
 
+def is_traceable_evidence_citation(value: Any) -> bool:
+    citation = str(value or "").strip().lower()
+    return bool(citation) and not citation.startswith(("context://", "unknown://", "unavailable://"))
+
+
 class ContextQualityContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -136,6 +141,9 @@ class IncidentInvestigationContract(BaseModel):
             raise ValueError("investigation conclusiveness contradicts investigation status")
         if self.rca_status == "grounded" and not self.accepted_evidence_ids:
             raise ValueError("grounded RCA requires accepted evidence")
+        accepted = {item.evidence_id: item for item in self.context_evidence if item.evidence_id in self.accepted_evidence_ids}
+        if any(not is_traceable_evidence_citation(item.citation) for item in accepted.values()):
+            raise ValueError("accepted RCA evidence requires a traceable citation")
         if self.execution_ready != self.readiness.execution_ready:
             raise ValueError("execution readiness fields disagree")
         if self.execution_ready:
