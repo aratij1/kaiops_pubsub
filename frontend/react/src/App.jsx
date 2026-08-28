@@ -6000,13 +6000,15 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     fetchJson(`/api-gateway/rag/evidence-drafts?alert_id=${encodeURIComponent(alertId)}`, authenticatedOptions())
       .then(async (response) => {
         if (cancelled) return;
-        let draft = (unwrap(response)?.drafts || [])[0] || null;
-        if (!draft && selectedRcaDecision.rootCause && selectedRelevantRcaEvidence.length) {
+        let drafts = unwrap(response)?.drafts || [];
+        let draft = drafts[0] || null;
+        if (drafts.filter((item) => item?.document_kind).length < ALERT_DOC_KIND_OPTIONS.length && selectedRcaDecision.rootCause && selectedRelevantRcaEvidence.length) {
           const evidenceIds = selectedRelevantRcaEvidence.map((row) => row.id || row.evidence_id).filter(Boolean);
           const sourceUris = selectedRelevantRcaEvidence.map((row) => row.citation || row.uri).filter(Boolean);
           const content = buildRcaEvidenceDocumentDraft({ alertId, alert: selectedAlertRow, decision: selectedRcaDecision, workflow: selectedAlertWorkflow, evidence: selectedRelevantRcaEvidence });
-          const created = await fetchJson("/api-gateway/rag/evidence-drafts", authenticatedOptions({ method: "POST", body: JSON.stringify({ alert_id: alertId, incident_id: selectedIncidentId, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, title: `RCA review: ${selectedAlertRow?.name || "Alert"}`, content, services: [selectedAlertRow?.service].filter(Boolean), evidence_ids: evidenceIds, source_uris: sourceUris }) }));
-          draft = unwrap(created)?.draft || null;
+          const created = await fetchJson("/api-gateway/rag/evidence-drafts", authenticatedOptions({ method: "POST", body: JSON.stringify({ alert_id: alertId, incident_id: selectedIncidentId, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, environment: selectedAlertRow?.environment, title: `RCA review: ${selectedAlertRow?.name || "Alert"}`, content, services: [selectedAlertRow?.service].filter(Boolean), evidence_ids: evidenceIds, source_uris: sourceUris }) }));
+          drafts = unwrap(created)?.drafts || [unwrap(created)?.draft].filter(Boolean);
+          draft = unwrap(created)?.draft || drafts[0] || null;
         }
         const draftContent = String(draft?.content || "");
         const canonicalContent = buildRcaEvidenceDocumentDraft({
@@ -6022,7 +6024,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         const alreadyContainsRca = Boolean(selectedRcaDecision.rootCause && resolvedDraftContent.toLowerCase().includes(String(selectedRcaDecision.rootCause).trim().toLowerCase()));
         const rcaAppendix = draft && selectedRcaDecision.rootCause && !selectedRcaDecision.reviewRequired && selectedRelevantRcaEvidence.length && !alreadyContainsRca ? ["", "## Completed RCA", selectedRcaDecision.rootCause, "", "## Impact", selectedRcaDecision.customerImpact, "", "## Recommended response", selectedRcaDecision.action || "No action supplied.", "", `Confidence: ${Math.round(Number(selectedRcaDecision.confidence || 0) * 100)}%`].join("\n") : "";
         const insufficientMessage = selectedRelevantRcaEvidence.length ? "A root-cause hypothesis is not available yet. Continue investigation before creating a review draft." : "Relevant project evidence is missing. KaiMS will not generate or publish an RCA until real source evidence arrives.";
-        setEvidenceDraftReview({ loading: false, draft, content: draft ? `${resolvedDraftContent}${rcaAppendix}` : "", notes: "", error: draft ? "" : insufficientMessage, message: draft ? "Draft created automatically. Review, edit, and approve it before publication." : "" });
+        setEvidenceDraftReview({ loading: false, drafts, draft, content: draft ? `${resolvedDraftContent}${rcaAppendix}` : "", notes: "", error: draft ? "" : insufficientMessage, message: draft ? "Document drafts created and stored automatically. Review and edit each draft before publication." : "" });
       })
       .catch((error) => { if (!cancelled) setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) })); });
     return () => { cancelled = true; };
@@ -11216,7 +11218,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           </div>
                           <div className="alert-documents-kind-row">
                             {ALERT_DOC_KIND_OPTIONS.map((kind) => (
-                              <span key={`empty-doc-kind-${kind}`}>{kind === "jira" ? "Jira ticket" : kind}</span>
+                              <button type="button" key={`empty-doc-kind-${kind}`} className={(evidenceDraftReview.draft?.document_kind || "incident") === kind ? "active" : ""} disabled={!evidenceDraftReview.drafts?.some((item) => (item.document_kind || "incident") === kind)} onClick={() => { const next = evidenceDraftReview.drafts?.find((item) => (item.document_kind || "incident") === kind); if (next) setEvidenceDraftReview((current) => ({ ...current, draft: next, content: String(next.content || ""), notes: String(next.review_notes || ""), error: "", message: "" })); }}>{kind === "jira" ? "Jira ticket" : kind}</button>
                             ))}
                           </div>
                           {evidenceDraftReview.loading && !evidenceDraftReview.draft ? <div className="alert-document-generation-state"><span className="spinner" aria-hidden="true" /><span>Completing the RCA-derived document draft…</span></div> : null}

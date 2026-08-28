@@ -1471,6 +1471,56 @@ _GENERIC_EVIDENCE_TERMS = {
     "service", "validation", "warning",
 }
 
+INCIDENT_DOCUMENT_KINDS = ("incident", "jira", "runbook", "deployment", "change", "dependency", "remediation")
+
+
+def _typed_incident_document_content(kind: str, *, alert_name: str, service: str, environment: str, base: str) -> str:
+    headings = {
+        "incident": ("Incident record", "Timeline and impact", "Current lifecycle state"),
+        "jira": ("Jira ticket draft", "Problem statement", "Acceptance and verification criteria"),
+        "runbook": ("Runbook draft", "Safe diagnostic procedure", "Escalation and stop conditions"),
+        "deployment": ("Deployment record", "Version and rollout context", "Validation and rollback"),
+        "change": ("Change record", "Observed change window", "Risk, approval, and rollback"),
+        "dependency": ("Dependency record", "Upstream and downstream services", "Health and ownership checks"),
+        "remediation": ("Remediation plan draft", "Proposed governed action", "Preflight, validation, and rollback"),
+    }
+    title, section, controls = headings[kind]
+    return "\n".join([
+        f"# {title}: {alert_name}", "", f"Service: {service}", f"Environment: {environment}",
+        "Status: Draft — operator verification required", "", f"## {section}", base,
+        "", f"## {controls}", "Not established by verified evidence. Review and complete this section before publication.",
+        "", "## Evidence and provenance", "Only the cited evidence in this draft may be treated as observed fact.",
+    ])
+
+
+def _write_incident_document_bundle(common: dict[str, Any], base_content: str) -> list[dict[str, Any]]:
+    now = datetime.now(UTC).isoformat()
+    drafts: list[dict[str, Any]] = []
+    for kind in INCIDENT_DOCUMENT_KINDS:
+        draft_id = f"evidence-{slugify(str(common['tenant_scope']))}-{common['alert_id']}-{kind}"
+        path = _draft_path(draft_id)
+        if path.exists():
+            drafts.append(_read_evidence_draft(draft_id))
+            continue
+        title = f"{kind.replace('_', ' ').title()} draft: {common.get('alert_type') or common['alert_id']}"
+        drafts.append(_write_evidence_draft({
+            **common,
+            "draft_id": draft_id,
+            "document_kind": kind,
+            "title": title,
+            "content": _typed_incident_document_content(
+                kind,
+                alert_name=str(common.get("alert_type") or common["alert_id"]),
+                service=str((common.get("services") or ["unknown"])[0]),
+                environment=str(common.get("environment") or "unknown"),
+                base=base_content,
+            ),
+            "status": "draft", "created_at": now, "updated_at": now,
+            "reviewed_by": None, "review_notes": None, "approved_by": None,
+            "approved_at": None, "rag_document_path": None,
+        }))
+    return drafts
+
 
 def _alert_identity_terms(alert: Alert) -> set[str]:
     raw_labels = getattr(alert, "labels", {})
@@ -1515,10 +1565,6 @@ def create_evidence_rag_draft(*, alert: Alert, incident: Incident, context: Cont
     ]
     if not grounded:
         return None
-    draft_id = f"evidence-{slugify(alert.tenant_id)}-{alert.id}"
-    path = _draft_path(draft_id)
-    if path.exists():
-        return _read_evidence_draft(draft_id)
     evidence_lines = [
         f"- [{row.get('evidence_id')}] {row.get('source', 'evidence')}: "
         f"{str(row.get('snippet') or row.get('summary') or '').strip()[:1200]} "
@@ -1546,36 +1592,26 @@ def create_evidence_rag_draft(*, alert: Alert, incident: Incident, context: Cont
             *evidence_lines,
         ]
     )
-    now = datetime.now(UTC).isoformat()
-    return _write_evidence_draft(
+    drafts = _write_incident_document_bundle(
         {
-            "draft_id": draft_id,
-            "status": "draft",
             "tenant_scope": alert.tenant_id,
             "alert_id": str(alert.id),
             "incident_id": str(incident.id),
             "alert_type": alert.name,
             "severity": str(getattr(alert.severity, "value", alert.severity)),
-            "title": f"Evidence review: {alert.name}",
-            "content": content,
+            "environment": alert.environment,
             "services": [alert.service],
             "evidence_ids": [str(row["evidence_id"]) for row in grounded],
             "source_uris": [str(row.get("uri") or row.get("path") or "") for row in grounded if row.get("uri") or row.get("path")],
-            "created_at": now,
-            "updated_at": now,
-            "reviewed_by": None,
-            "review_notes": None,
-            "approved_by": None,
-            "approved_at": None,
-            "rag_document_path": None,
             "evidence_relevance": {
                 "verified": True,
                 "identity_terms": sorted(identity_terms),
                 "relevant_count": len(grounded),
                 "retrieved_count": len(evidence),
             },
-        }
+        }, content
     )
+    return next(item for item in drafts if item["document_kind"] == "incident")
 
 
 def _normalize_list(value: Any) -> list[str]:
@@ -1849,12 +1885,12 @@ async def approve_rag_document(
 
 
 def _list_evidence_rag_drafts_sync(
-    alert_id: str | None, status: str | None, tenant_scope: str
+    alert_id: str | None, status: str | None, tenant_scope: str, document_kind: str | None = None
 ) -> list[dict[str, Any]]:
     if alert_id:
         return [
             payload
-            for payload in _list_evidence_rag_drafts_sync(None, status, tenant_scope)
+            for payload in _list_evidence_rag_drafts_sync(None, status, tenant_scope, document_kind)
             if str(payload.get("alert_id") or "") == alert_id
         ]
 
@@ -1870,6 +1906,8 @@ def _list_evidence_rag_drafts_sync(
             continue
         if status and str(payload.get("status") or "").lower() != status.lower():
             continue
+        if document_kind and str(payload.get("document_kind") or "incident").lower() != document_kind.lower():
+            continue
         drafts.append(payload)
     return drafts
 
@@ -1878,12 +1916,13 @@ def _list_evidence_rag_drafts_sync(
 async def list_evidence_rag_drafts(
     alert_id: str | None = None,
     status: str | None = None,
+    document_kind: str | None = None,
     tenant_scope: str = "",
 ) -> dict[str, Any]:
     # The review directory can live on a high-latency bind mount. Never block
     # RabbitMQ heartbeats and incident consumers while walking/stat-ing it.
     tenant = require_tenant_id(tenant_scope, source="evidence draft listing")
-    drafts = await asyncio.to_thread(_list_evidence_rag_drafts_sync, alert_id, status, tenant)
+    drafts = await asyncio.to_thread(_list_evidence_rag_drafts_sync, alert_id, status, tenant, document_kind)
     return {"count": len(drafts), "drafts": drafts}
 
 
@@ -1899,29 +1938,18 @@ async def create_evidence_rag_draft_from_rca(request: dict[str, Any]) -> dict[st
     tenant_scope = require_tenant_id(
         str(request.get("tenant_scope") or ""), source="evidence draft creation"
     )
-    draft_id = f"evidence-{slugify(tenant_scope)}-{alert_id}"
-    path = _draft_path(draft_id)
-    if path.exists():
-        return {"status": "existing", "draft": _read_evidence_draft(draft_id)}
-    now = datetime.now(UTC).isoformat()
-    draft = _write_evidence_draft({
-        "draft_id": draft_id,
-        "status": "draft",
+    drafts = _write_incident_document_bundle({
         "tenant_scope": tenant_scope,
         "alert_id": alert_id,
         "incident_id": str(request.get("incident_id") or ""),
         "alert_type": str(request.get("alert_type") or "Alert"),
         "severity": str(request.get("severity") or "unknown"),
-        "title": str(request.get("title") or f"RCA review: {request.get('alert_type') or alert_id}"),
-        "content": content,
+        "environment": str(request.get("environment") or "unknown"),
         "services": [str(item) for item in request.get("services", []) if str(item).strip()],
         "evidence_ids": [str(item) for item in request.get("evidence_ids", []) if str(item).strip()],
         "source_uris": [str(item) for item in request.get("source_uris", []) if str(item).strip()],
-        "created_at": now, "updated_at": now, "reviewed_by": None,
-        "review_notes": None, "approved_by": None, "approved_at": None,
-        "rag_document_path": None,
-    })
-    return {"status": "created", "draft": draft}
+    }, content)
+    return {"status": "created", "draft": drafts[0], "drafts": drafts}
 
 
 @app.put("/rag/evidence-drafts/{draft_id}")
@@ -1962,7 +1990,7 @@ async def approve_evidence_rag_draft(
     tenant_scope = require_tenant_id(str(draft.get("tenant_scope") or ""), source="evidence approval")
     approved_at = datetime.now(UTC).isoformat()
     rag_request = RagDocumentRequest(
-        kind="incident",
+        kind="incident" if str(draft.get("document_kind") or "incident") == "jira" else str(draft.get("document_kind") or "incident"),
         alert_id=str(draft.get("alert_id") or "") or None,
         alert_type=str(draft.get("alert_type") or "") or None,
         severity=str(draft.get("severity") or "") or None,
@@ -1982,6 +2010,7 @@ async def approve_evidence_rag_draft(
         approved_at=approved_at,
         last_reviewed=approved_at,
         metadata={
+            "document_kind": str(draft.get("document_kind") or "incident"),
             "approval_status": "approved",
             "approved_by": request.approved_by.strip(),
             "approved_at": approved_at,

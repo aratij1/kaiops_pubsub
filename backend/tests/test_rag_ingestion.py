@@ -136,6 +136,11 @@ async def test_evidence_draft_requires_review_approval_before_grounding(tmp_path
     draft = module.create_evidence_rag_draft(alert=alert, incident=incident, context=context)
 
     assert draft["status"] == "draft"
+    stored_drafts = module._list_evidence_rag_drafts_sync(None, None, "tenant-a")
+    assert {item["document_kind"] for item in stored_drafts} == {
+        "incident", "jira", "runbook", "deployment", "change", "dependency", "remediation"
+    }
+    assert len({item["draft_id"] for item in stored_drafts}) == 7
     assert not list(tmp_path.rglob("*.md"))
     assert connector.search("checkout returned HTTP 500", limit=3, tenant_id="tenant-a") == []
 

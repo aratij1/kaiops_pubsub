@@ -3674,12 +3674,13 @@ async def list_evidence_rag_drafts(
     request: Request,
     alert_id: str | None = None,
     status: str | None = None,
+    document_kind: str | None = None,
     x_trace_id: str | None = Header(default=None),
     tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
     params = {
         key: value
-        for key, value in {"alert_id": alert_id, "status": status, "tenant_scope": tenant_id}.items()
+        for key, value in {"alert_id": alert_id, "status": status, "document_kind": document_kind, "tenant_scope": tenant_id}.items()
         if value
     }
     return await guarded_proxy(

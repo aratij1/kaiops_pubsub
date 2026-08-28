@@ -469,12 +469,12 @@
 :root.dm-theme-dark .bus-master-node,
 :root.dm-theme-dark .bus-topic-create-row,
 :root.dm-theme-dark .bus-observed-rail span,
-:root.dm-theme-dark .alert-documents-kind-row span,
+:root.dm-theme-dark .alert-documents-kind-row button,
 :root[data-ui-theme="dark"] .bus-endpoint-box,
 :root[data-ui-theme="dark"] .bus-master-node,
 :root[data-ui-theme="dark"] .bus-topic-create-row,
 :root[data-ui-theme="dark"] .bus-observed-rail span,
-:root[data-ui-theme="dark"] .alert-documents-kind-row span {
+:root[data-ui-theme="dark"] .alert-documents-kind-row button {
   background: rgba(9, 24, 41, 0.36);
   border-color: var(--line);
   color: var(--ink);
