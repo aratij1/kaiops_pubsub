@@ -21,6 +21,45 @@ def _event(*, incident_id: str, status: str, event_type: str) -> dict:
     )
 
 
+def _bound_event(*, incident_id, alert_id, status, event_type, recommendation_id=None) -> dict:
+    payload = {"status": status}
+    if recommendation_id is not None:
+        payload["recommendation_id"] = str(recommendation_id)
+    return build_event_envelope(
+        event_type=event_type,
+        identity={"incident_id": str(incident_id), "alert_id": str(alert_id), "trace_id": "trace-bound"},
+        scope={"tenant_id": "tenant-a", "service": "checkout", "environment": "prod"},
+        state={"severity": "warning", "status": status, "owner": None},
+        policy={"risk_tier": "high", "execution_mode": "human_approval", "requires_approval": True},
+        transport={"provider": "test", "channel": "test"},
+        payload=payload,
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_alert_enrichment_cannot_mix_alert_with_bound_recommendation(sqlite_session_factory) -> None:
+    incident_id, bound_alert_id, new_alert_id, recommendation_id = uuid4(), uuid4(), uuid4(), uuid4()
+    async with sqlite_session_factory() as session:
+        repo = IncidentRepository(session)
+        await repo.save_incident_event(_bound_event(
+            incident_id=incident_id, alert_id=bound_alert_id, status="awaiting_approval",
+            event_type="incident.recommendation.generated", recommendation_id=recommendation_id,
+        ))
+        await repo.save_incident_event(_bound_event(
+            incident_id=incident_id, alert_id=new_alert_id, status="investigating",
+            event_type="incident.alert.enriched",
+        ))
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        projection = await session.get(IncidentProjectionRecord, incident_id)
+
+    assert projection.alert_id == bound_alert_id
+    assert projection.recommendation_id == recommendation_id
+    assert projection.status == "awaiting_approval"
+    assert projection.projection_payload["latest_occurrence"]["alert_id"] == str(new_alert_id)
+
+
 @pytest.mark.asyncio
 async def test_stale_incident_write_cannot_reopen_closed_incident(sqlite_session_factory) -> None:
     incident_id = uuid4()
