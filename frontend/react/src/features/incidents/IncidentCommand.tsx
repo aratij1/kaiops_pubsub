@@ -128,17 +128,7 @@ export default function IncidentCommand() {
 
   const requestedIncidentId = useMemo(() => decodeURIComponent(routeIncidentId).trim(), [routeIncidentId]);
   const scopedRow = useMemo(() => incidents.rows.find((candidate) => incidentId(candidate).toLowerCase() === requestedIncidentId.toLowerCase()), [incidents.rows, requestedIncidentId]);
-  const scopedProjection = record(scopedRow?.projection_payload);
-  const scopedHasEnrichment = Boolean(scopedRow) && [
-    scopedRow?.source_alert,
-    scopedRow?.recommendation,
-    scopedRow?.context,
-    scopedProjection.source_alert,
-    scopedProjection.recommendation,
-    scopedProjection.context,
-  ].some((candidate) => Object.keys(record(candidate)).length > 0);
   useEffect(() => {
-    if (scopedHasEnrichment) return undefined;
     if (!requestedIncidentId) {
       setDirectIncident({ loading: false, loaded: true, row: null, error: "" });
       return undefined;
@@ -165,15 +155,15 @@ export default function IncidentCommand() {
     };
     void loadRequestedIncident();
     return () => controller.abort();
-  }, [directRequestVersion, requestedIncidentId, scopedHasEnrichment, session.accessToken]);
+  }, [directRequestVersion, requestedIncidentId, session.accessToken]);
 
   const directRow = directIncident.row && incidentId(directIncident.row).toLowerCase() === requestedIncidentId.toLowerCase()
     ? directIncident.row
     : null;
-  // The shared incident feed is refreshed after every operator command. Once it
-  // contains enrichment, it is the freshest projection and must supersede a
-  // detail response fetched before that command.
-  const row = scopedHasEnrichment ? scopedRow : directRow || undefined;
+  // Group rows are intentionally compact and may contain source/context data
+  // without the canonical recommendation. Always hydrate the detail route from
+  // /incidents/{id}; use the group row only while that request is in flight.
+  const row = directRow || scopedRow || undefined;
   const approval = useMemo(() => row ? approvals.rows.find((candidate) => incidentId(candidate).toLowerCase() === incidentId(row).toLowerCase()) : undefined, [approvals.rows, row]);
 
   if (!row && ((incidents.loading && !incidents.rows.length) || directIncident.loading || !directIncident.loaded)) return <LoadingState label="Loading incident command" />;
@@ -333,6 +323,6 @@ export default function IncidentCommand() {
       </aside>
     </div>
 
-    <footer className="ic-truth-note"><ShieldCheck aria-hidden="true" /><span><strong>Operational truth policy:</strong> unavailable backend fields stay unavailable. KaiMS does not invent confidence, execution progress, safety controls, or recovery results.</span><button type="button" onClick={incidents.refresh}><RefreshCw aria-hidden="true" /> Refresh incident</button></footer>
+    <footer className="ic-truth-note"><ShieldCheck aria-hidden="true" /><span><strong>Operational truth policy:</strong> unavailable backend fields stay unavailable. KaiMS does not invent confidence, execution progress, safety controls, or recovery results.</span><button type="button" onClick={() => { incidents.refresh(); setDirectRequestVersion((version) => version + 1); }}><RefreshCw aria-hidden="true" /> Refresh incident</button></footer>
   </article>;
 }
