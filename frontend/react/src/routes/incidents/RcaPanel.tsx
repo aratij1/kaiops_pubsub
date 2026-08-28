@@ -48,6 +48,43 @@ export function resolutionBindingFor(workflow: any, selectedAlertId: string | nu
   };
 }
 
+export function governedPlanFromWorkflow(workflow: any) {
+  const metadata = workflow?.recommendation?.metadata || {};
+  const candidate = metadata.governed_resolution_plan || metadata.execution_plan || {};
+  return candidate?.schema_version === "kaiops.governed-resolution-plan.v1" ? candidate : null;
+}
+
+export function governedPlanMatchesSelection(workflow: any, selected: any) {
+  const plan = governedPlanFromWorkflow(workflow);
+  const contract = workflow?.incident_investigation || {};
+  return Boolean(
+    plan
+    && selected?.plan_id
+    && plan.plan_id === selected.plan_id
+    && plan.plan_fingerprint === selected.plan_fingerprint
+    && plan.recommendation_id === selected.recommendation_id
+    && contract.recommendation_id === selected.recommendation_id
+    && Number(contract.rca_version) === Number(selected.rca_version)
+    && contract.context_snapshot_id === selected.context_snapshot_id
+    && contract.context_fingerprint === selected.context_fingerprint
+  );
+}
+
+export function resolutionSelectionPayload(binding: any, option: any, issue: string, service: string) {
+  return {
+    incident_id: binding.incident_id,
+    alert_id: binding.alert_id,
+    analysis_request_id: binding.analysis_request_id,
+    recommendation_id: binding.recommendation_id,
+    rca_version: binding.rca_version,
+    context_snapshot_id: binding.context_snapshot_id,
+    context_fingerprint: binding.context_fingerprint,
+    option_id: option.id,
+    issue,
+    service,
+  };
+}
+
 interface RcaPanelProps {
   rcaDetailView: RcaDetailView;
   onSetRcaDetailView: (view: RcaDetailView) => void;
@@ -67,6 +104,7 @@ interface RcaPanelProps {
   rcaAnalysisMode: "smart" | "fresh" | "cache";
   onSetRcaAnalysisMode: (mode: "smart" | "fresh" | "cache") => void;
   onRerunRca: () => any;
+  onRefreshSelectedAlert: () => Promise<any>;
   onDownloadRagDocument: (...args: any[]) => any;
   onLoadRagDocumentContent: (...args: any[]) => any;
   onSubmitAiRecommendationFeedback: (feedback: Record<string, string> | string) => any;
@@ -78,15 +116,16 @@ export default function RcaPanel({
   selectedAlertRow, selectedRcaDecision, selectedAiTrust, selectedAlertWorkflow,
   selectedAlertRegeneration, selectedAlertRecommendationId, selectedAlertDocumentContract,
   selectedAlertId, aiFeedbackState, rcaAnalysisMode, onSetRcaAnalysisMode,
-  onRerunRca, onDownloadRagDocument, onLoadRagDocumentContent,
+  onRerunRca, onRefreshSelectedAlert, onDownloadRagDocument, onLoadRagDocumentContent,
   onSubmitAiRecommendationFeedback,
 }: RcaPanelProps) {
   const { accessToken } = useRouteRuntimeSlice("session");
   const [resolutionOptions, setResolutionOptions] = useState<any[]>([]);
-  const [selectedResolution, setSelectedResolution] = useState<any>(null);
+  const [pendingPlanId, setPendingPlanId] = useState("");
   const [resolutionStatus, setResolutionStatus] = useState("");
   const [feedbackDraft, setFeedbackDraft] = useState({ decision: "", reason_category: "", corrected_cause: "", missing_evidence: "", comment: "" });
   const recommendationMetadata = selectedAlertWorkflow?.recommendation?.metadata || {};
+  const selectedResolution = governedPlanFromWorkflow(selectedAlertWorkflow);
   const investigationContract = selectedAlertWorkflow?.incident_investigation || {};
   const resolutionBinding = useMemo(() => resolutionBindingFor(selectedAlertWorkflow, selectedAlertId), [
     investigationContract.incident_id, investigationContract.alert_id,
@@ -170,7 +209,7 @@ export default function RcaPanel({
 
   useEffect(() => {
     let active = true;
-    setSelectedResolution(null);
+    setPendingPlanId("");
     setResolutionStatus("");
     if (selectedAiTrust?.rcaReady !== true) {
       setResolutionOptions([]);
@@ -202,18 +241,35 @@ export default function RcaPanel({
       return;
     }
     setResolutionStatus("Preparing the selected resolution...");
+    setPendingPlanId(option.id);
     try {
       const response: any = await fetchJson("/api-gateway/analysis/resolution-catalog/select", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
-        body: JSON.stringify({ ...resolutionBinding, option_id: option.id, issue: selectedRcaDecision?.rootCause, service: resolutionService }),
+        body: JSON.stringify(resolutionSelectionPayload(
+          resolutionBinding,
+          option,
+          selectedRcaDecision?.rootCause,
+          resolutionService,
+        )),
         timeoutMs: 10000,
       });
       const result = response?.data || response || {};
-      setSelectedResolution(result?.selected || option);
-      setResolutionStatus("Resolution plan prepared for operator review.");
+      const persisted = result?.selected;
+      if (!persisted?.plan_id || !persisted?.plan_fingerprint) {
+        throw new Error("The backend did not return a persisted governed plan.");
+      }
+      const refreshed: any = await onRefreshSelectedAlert();
+      const refreshedPayload = refreshed?.data || refreshed || {};
+      const refreshedWorkflow = refreshedPayload?.workflow || refreshedPayload;
+      if (!governedPlanMatchesSelection(refreshedWorkflow, persisted)) {
+        throw new Error("Stale selection: the refreshed incident does not reference the selected recommendation and plan. Review the current incident before continuing.");
+      }
+      setResolutionStatus("Governed plan persisted and verified from the incident projection.");
     } catch (error: any) {
       setResolutionStatus(error?.message || "The resolution plan could not be prepared.");
+    } finally {
+      setPendingPlanId("");
     }
   }
 
@@ -289,7 +345,7 @@ export default function RcaPanel({
           <article className="analysis-card"><span className="explainability-label is-observed">Observed and reported</span><h4>{selectedRcaDecision?.customerImpact || "Impact not established"}</h4><dl><div><dt>Service impact</dt><dd>{selectedRcaDecision?.serviceImpact || "Not supplied"}</dd></div><div><dt>Dependency impact</dt><dd>{selectedRcaDecision?.dependencyImpact || "Not supplied"}</dd></div><div><dt>Affected services</dt><dd>{impactedServices.length ? impactedServices.join(", ") : "None identified"}</dd></div><div><dt>Impact evidence</dt><dd>{impactEvidence.length ? impactEvidence.join(", ") : "No impact evidence identifiers supplied"}</dd></div></dl></article>
         </div>
         <section className="reasoning-trace" aria-labelledby="reasoning-trace-title"><header><span className="discovery-eyebrow">Explainability trace</span><h4 id="reasoning-trace-title">How the recommendation was formed</h4></header><ol><li><span>1</span><div><strong>Collect observations</strong><p>{evidenceRows.length ? `${evidenceRows.length} context records were collected; ${freshEvidenceCount} are live and ${supportingEvidenceRows.length} were accepted as RCA support.` : "No linked evidence records are available."}</p></div></li><li><span>2</span><div><strong>Infer the probable cause</strong><p>{selectedRcaDecision?.rootCause || "No probable cause was produced."}</p></div></li><li><span>3</span><div><strong>Propose a guarded response</strong><p>{selectedRcaDecision?.action || "Collect more evidence before acting."}</p></div></li></ol></section>
-        <section className="resolution-catalog" aria-labelledby="resolution-catalog-title"><header><div><span className="discovery-eyebrow">Resolution catalog</span><h4 id="resolution-catalog-title">Matched response options</h4><p>Selecting an option prepares it for review; it does not execute it.</p></div><span>{resolutionOptions.length} match{resolutionOptions.length === 1 ? "" : "es"}</span></header><div className="resolution-option-grid">{resolutionOptions.map((option) => <button key={option.id} type="button" className={selectedResolution?.id === option.id ? "selected" : ""} onClick={() => chooseResolution(option)}><span><strong>{option.title}</strong><small>{option.risk} risk</small></span><p>{option.applicability}</p><em>{option.match_reasons?.length ? `Matched: ${option.match_reasons.join(", ")}` : "Diagnostic fallback"}</em></button>)}</div>{!resolutionOptions.length && !resolutionStatus ? <p className="resolution-empty">No catalog match has been returned yet.</p> : null}{resolutionStatus ? <p className="resolution-status" role="status">{resolutionStatus}</p> : null}{selectedResolution ? <div className="resolution-plan"><div><strong>Prerequisites</strong><ol>{(selectedResolution.prerequisites || []).map((step: string) => <li key={step}>{step}</li>)}</ol></div><div><strong>Prepared steps</strong><ol>{(selectedResolution.plan || []).map((step: any) => <li key={`${step.phase}-${step.instruction}`}><span>{step.phase}</span>{step.instruction}</li>)}</ol></div><div><strong>Rollback</strong><ol>{(selectedResolution.rollback || []).map((step: string) => <li key={step}>{step}</li>)}</ol></div><button type="button" className="button-primary" onClick={() => onSetHomeDetailTab("execution")}>Review safeguards and execute</button></div> : null}</section>
+        <section className="resolution-catalog" aria-labelledby="resolution-catalog-title"><header><div><span className="discovery-eyebrow">Resolution catalog</span><h4 id="resolution-catalog-title">Matched response options</h4><p>Selecting an option persists a governed plan for review; it does not approve or execute it.</p></div><span>{resolutionOptions.length} match{resolutionOptions.length === 1 ? "" : "es"}</span></header><div className="resolution-option-grid">{resolutionOptions.map((option) => <button key={option.id} type="button" disabled={Boolean(pendingPlanId)} className={selectedResolution?.catalog_option_id === option.id ? "selected" : ""} onClick={() => chooseResolution(option)}><span><strong>{option.title}</strong><small>{option.risk} risk</small></span><p>{option.applicability}</p><em>{option.match_reasons?.length ? `Matched: ${option.match_reasons.join(", ")}` : "Diagnostic fallback"}</em></button>)}</div>{!resolutionOptions.length && !resolutionStatus ? <p className="resolution-empty">No catalog match has been returned yet.</p> : null}{resolutionStatus ? <p className="resolution-status" role="status">{resolutionStatus}</p> : null}{selectedResolution ? <div className="resolution-plan"><dl><div><dt>Recommendation / RCA</dt><dd>v{selectedResolution.recommendation_version} / v{selectedResolution.rca_version}</dd></div><div><dt>Plan</dt><dd>{selectedResolution.plan_id} · v{selectedResolution.plan_version}</dd></div><div><dt>Fingerprint</dt><dd><code>{selectedResolution.plan_fingerprint}</code></dd></div><div><dt>Catalog option</dt><dd>{selectedResolution.catalog_option_id} · {selectedResolution.catalog_option_version}</dd></div><div><dt>Context snapshot</dt><dd>{selectedResolution.context_snapshot_id}</dd></div><div><dt>Target / connector</dt><dd>{selectedResolution.target_resource} / {selectedResolution.connector_id}</dd></div><div><dt>Risk</dt><dd>{selectedResolution.risk}</dd></div></dl><div><strong>Validators</strong><ol>{(selectedResolution.validators || []).map((step: string) => <li key={step}>{step}</li>)}</ol></div><div><strong>Rollback</strong><ol>{(selectedResolution.rollback || []).map((step: string) => <li key={step}>{step}</li>)}</ol></div>{selectedResolution.readiness_blocks?.length ? <p className="ai-trust-warning">Readiness blockers: {selectedResolution.readiness_blocks.join(", ")}</p> : null}<button type="button" className="button-primary" onClick={() => onSetHomeDetailTab("execution")}>Review governed plan</button></div> : null}</section>
         {proposedCodeChanges.length ? <details className="rca-code-changes"><summary>Proposed source changes ({proposedCodeChanges.length})</summary>{proposedCodeChanges.map((change: any, index: number) => <article key={`${change.evidence_id || "change"}-${index}`}><div><strong>{change.title || "Proposed change"}</strong><code>{change.source_uri || "Source path unavailable"}</code></div><p>{change.explanation || change.limitations || "Review the cited source evidence before applying this change."}</p>{change.patch ? <pre className="result">{change.patch}</pre> : <p className="status-message">Patch withheld: {change.limitations || "more source context is required."}</p>}</article>)}</details> : null}
         <footer className="rca-analysis-meta"><span>Analysis: <strong>{String(selectedRcaDecision?.status || "unknown").replaceAll("-", " ")}</strong></span><span>Latest evidence: <strong>{evidenceRows[0]?.timestamp ? formatUtcTimestamp(evidenceRows[0].timestamp) : "timestamp not supplied"}</strong></span><span>Grounding: <strong>{formatQualityPercent(Number(selectedAlertEvaluation?.groundingScore || 0))}</strong></span><span>Citations: <strong>{formatQualityPercent(Number(selectedAlertEvaluation?.citationCoverage || 0))}</strong></span></footer>
       </section> : null}

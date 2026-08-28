@@ -1254,6 +1254,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         }
         return { loading: false, payload, error: "", alertId: normalized };
       });
+      return payload;
     } catch (error) {
       setSelectedAlertData((prev) => {
         if (String(prev.alertId || "") !== normalized) {
@@ -10918,6 +10919,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                       rcaAnalysisMode={rcaAnalysisMode}
                       onSetRcaAnalysisMode={setRcaAnalysisMode}
                       onRerunRca={regenerateSelectedAlertAnalysis}
+                      onRefreshSelectedAlert={() => loadAlertDetails(selectedAlertId, selectedAlertRow, { background: true })}
                       onDownloadRagDocument={downloadRagDocument}
                       onLoadRagDocumentContent={loadRagDocumentContent}
                       onSubmitAiRecommendationFeedback={submitAiRecommendationFeedback}
