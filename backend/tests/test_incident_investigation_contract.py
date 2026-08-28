@@ -51,10 +51,13 @@ def investigation_payload() -> dict:
         "remediation_status": "not_started",
         "validation_status": "not_started",
         "readiness": {
-            "investigation_ready": False,
+            "context_ready": False,
             "rca_ready": False,
             "resolution_ready": False,
+            "approval_ready": False,
             "execution_ready": False,
+            "validation_ready": False,
+            "closure_ready": False,
             "blocking_reasons": ["insufficient_evidence"],
         },
     }

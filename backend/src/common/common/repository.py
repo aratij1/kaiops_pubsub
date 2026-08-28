@@ -3527,9 +3527,27 @@ class IncidentRepository:
             and str(investigation.get("status") or "").lower() == "conclusive"
         )
         grounded = str(metadata.get("rca_status") or "").lower() == "grounded" and bool(accepted)
+        context_expires_at = IncidentRepository._parse_datetime(context_snapshot.get("expires_at"))
+        context_identity_valid = bool(evidence) and all(
+            str(item.get("tenant_id") or "") == tenant_id
+            and str(item.get("project_id") or "") == project_id
+            and bool(str(item.get("citation") or "").strip())
+            for item in evidence
+        )
+        context_ready = bool(
+            context_snapshot.get("snapshot_id")
+            and context_snapshot.get("context_fingerprint")
+            and quality.get("valid", quality.get("reusable", False)) is True
+            and not quality.get("blocking_reasons")
+            and context_identity_valid
+            and context_expires_at is not None
+            and _utc_dt(context_expires_at) > datetime.now(UTC)
+        )
+        rca_ready = bool(context_ready and conclusive and grounded and not missing and not conflicting)
         plan_blocks = plan.get("readiness_blocks") if isinstance(plan.get("readiness_blocks"), list) else []
         plan_id = plan.get("plan_id") or plan.get("id")
         plan_fingerprint = plan.get("plan_fingerprint") or plan.get("fingerprint")
+        resolution_ready = bool(rca_ready and recommendation.get("id") and plan_id and plan_fingerprint)
         readiness_blocks = list(dict.fromkeys([
             *[str(item) for item in missing],
             *[str(item) for item in conflicting],
@@ -3538,14 +3556,31 @@ class IncidentRepository:
             *([] if grounded else ["RCA is not grounded in accepted evidence"]),
             *([] if plan_id and plan_fingerprint else ["exact resolution plan is not ready"]),
         ]))
-        execution_ready = bool(
-            conclusive and grounded and plan.get("execution_ready") is True
-            and plan.get("mutating") is True and plan_id and plan_fingerprint and not readiness_blocks
-        )
         approval_payload = approval if isinstance(approval, dict) else {}
         approval_status = str(approval_payload.get("decision") or approval_payload.get("status") or "not_ready").lower()
         if approval_status not in {"not_ready", "pending", "approved", "rejected", "stale"}:
             approval_status = "not_ready"
+        readiness_receipt = (
+            approval_payload.get("approval_readiness")
+            if isinstance(approval_payload.get("approval_readiness"), dict)
+            else plan.get("approval_readiness")
+            if isinstance(plan.get("approval_readiness"), dict)
+            else {}
+        )
+        approval_ready = bool(
+            resolution_ready
+            and readiness_receipt.get("signature")
+            and str(readiness_receipt.get("state") or "").lower() == "execution_eligible"
+            and not readiness_receipt.get("missing_controls")
+        )
+        execution_ready = bool(
+            approval_ready and approval_status == "approved"
+            and plan.get("execution_ready") is True and plan.get("mutating") is True
+            and not readiness_blocks
+        )
+        remediation_status = str((remediation_action or {}).get("status") or "not_started").lower()
+        validation_ready = bool(execution_ready and remediation_status in {"succeeded", "completed"})
+        closure_ready = bool(validation_ready and str(validation_status or "").lower() in {"validated", "passed", "closed"})
         raw_investigation_status = str(investigation.get("status") or "pending").lower()
         investigation_status = {
             "budget_exhausted": "inconclusive",
@@ -3590,13 +3625,16 @@ class IncidentRepository:
             "execution_ready": execution_ready,
             "readiness_blocks": readiness_blocks,
             "approval_status": approval_status,
-            "remediation_status": str((remediation_action or {}).get("status") or "not_started"),
+            "remediation_status": remediation_status,
             "validation_status": validation_status,
             "readiness": {
-                "investigation_ready": bool(evidence),
-                "rca_ready": conclusive and grounded,
-                "resolution_ready": conclusive and grounded and bool(plan_id),
+                "context_ready": context_ready,
+                "rca_ready": rca_ready,
+                "resolution_ready": resolution_ready,
+                "approval_ready": approval_ready,
                 "execution_ready": execution_ready,
+                "validation_ready": validation_ready,
+                "closure_ready": closure_ready,
                 "blocking_reasons": readiness_blocks,
             },
         }

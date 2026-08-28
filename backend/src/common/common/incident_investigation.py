@@ -60,20 +60,29 @@ class ContextEvidenceContract(BaseModel):
 class InvestigationReadinessContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    investigation_ready: bool
+    context_ready: bool
     rca_ready: bool
     resolution_ready: bool
+    approval_ready: bool
     execution_ready: bool
+    validation_ready: bool
+    closure_ready: bool
     blocking_reasons: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def require_monotonic_readiness(self) -> InvestigationReadinessContract:
-        if self.execution_ready and not self.resolution_ready:
-            raise ValueError("execution readiness requires resolution readiness")
+        if self.closure_ready and not self.validation_ready:
+            raise ValueError("closure readiness requires validation readiness")
+        if self.validation_ready and not self.execution_ready:
+            raise ValueError("validation readiness requires execution readiness")
+        if self.execution_ready and not self.approval_ready:
+            raise ValueError("execution readiness requires approval readiness")
+        if self.approval_ready and not self.resolution_ready:
+            raise ValueError("approval readiness requires resolution readiness")
         if self.resolution_ready and not self.rca_ready:
             raise ValueError("resolution readiness requires RCA readiness")
-        if self.rca_ready and not self.investigation_ready:
-            raise ValueError("RCA readiness requires investigation readiness")
+        if self.rca_ready and not self.context_ready:
+            raise ValueError("RCA readiness requires context readiness")
         if not self.execution_ready and not self.blocking_reasons:
             raise ValueError("blocked execution requires at least one blocking reason")
         return self

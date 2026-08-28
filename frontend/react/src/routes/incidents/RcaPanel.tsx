@@ -172,7 +172,7 @@ export default function RcaPanel({
     let active = true;
     setSelectedResolution(null);
     setResolutionStatus("");
-    if (selectedAiTrust?.executionReady !== true) {
+    if (selectedAiTrust?.rcaReady !== true) {
       setResolutionOptions([]);
       setResolutionStatus("Resolution actions remain blocked until backend investigation readiness is verified.");
       return () => { active = false; };
@@ -194,10 +194,10 @@ export default function RcaPanel({
       if (active) setResolutionStatus("Resolution options are temporarily unavailable.");
     });
     return () => { active = false; };
-  }, [accessToken, selectedAlertId, selectedRcaDecision?.rootCause, selectedRcaDecision?.action, resolutionBinding, resolutionService, selectedAiTrust?.executionReady]);
+  }, [accessToken, selectedAlertId, selectedRcaDecision?.rootCause, selectedRcaDecision?.action, resolutionBinding, resolutionService, selectedAiTrust?.rcaReady]);
 
   async function chooseResolution(option: any) {
-    if (selectedAiTrust?.executionReady !== true) {
+    if (selectedAiTrust?.rcaReady !== true) {
       setResolutionStatus("Resolution selection is blocked until backend readiness is verified.");
       return;
     }

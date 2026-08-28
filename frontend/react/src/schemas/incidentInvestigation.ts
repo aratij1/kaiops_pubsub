@@ -40,15 +40,21 @@ const ContextEvidence = z.object({
 }).strict();
 
 const InvestigationReadiness = z.object({
-  investigation_ready: z.boolean(),
+  context_ready: z.boolean(),
   rca_ready: z.boolean(),
   resolution_ready: z.boolean(),
+  approval_ready: z.boolean(),
   execution_ready: z.boolean(),
+  validation_ready: z.boolean(),
+  closure_ready: z.boolean(),
   blocking_reasons: z.array(z.string()),
 }).strict().superRefine((value, context) => {
-  if (value.execution_ready && !value.resolution_ready) context.addIssue({ code: z.ZodIssueCode.custom, message: "execution readiness requires resolution readiness" });
+  if (value.closure_ready && !value.validation_ready) context.addIssue({ code: z.ZodIssueCode.custom, message: "closure readiness requires validation readiness" });
+  if (value.validation_ready && !value.execution_ready) context.addIssue({ code: z.ZodIssueCode.custom, message: "validation readiness requires execution readiness" });
+  if (value.execution_ready && !value.approval_ready) context.addIssue({ code: z.ZodIssueCode.custom, message: "execution readiness requires approval readiness" });
+  if (value.approval_ready && !value.resolution_ready) context.addIssue({ code: z.ZodIssueCode.custom, message: "approval readiness requires resolution readiness" });
   if (value.resolution_ready && !value.rca_ready) context.addIssue({ code: z.ZodIssueCode.custom, message: "resolution readiness requires RCA readiness" });
-  if (value.rca_ready && !value.investigation_ready) context.addIssue({ code: z.ZodIssueCode.custom, message: "RCA readiness requires investigation readiness" });
+  if (value.rca_ready && !value.context_ready) context.addIssue({ code: z.ZodIssueCode.custom, message: "RCA readiness requires context readiness" });
   if (!value.execution_ready && !value.blocking_reasons.length) context.addIssue({ code: z.ZodIssueCode.custom, message: "blocked execution requires a blocking reason" });
 });
 

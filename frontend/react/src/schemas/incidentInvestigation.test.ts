@@ -36,7 +36,7 @@ function payload() {
     approval_status: "not_ready",
     remediation_status: "not_started",
     validation_status: "not_started",
-    readiness: { investigation_ready: false, rca_ready: false, resolution_ready: false, execution_ready: false, blocking_reasons: ["insufficient_evidence"] },
+    readiness: { context_ready: false, rca_ready: false, resolution_ready: false, approval_ready: false, execution_ready: false, validation_ready: false, closure_ready: false, blocking_reasons: ["insufficient_evidence"] },
   };
 }
 

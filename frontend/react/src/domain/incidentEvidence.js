@@ -47,9 +47,14 @@ export function canonicalIncidentEvidence(workflow) {
     ? contract.rca_status === "grounded" && acceptedIds.size > 0
     : String(metadata.rca_status || "").toLowerCase() === "grounded" && acceptedIds.size > 0;
   const integrityVerified = integrity.status === "verified";
-  const executionReady = Boolean(contract && integrityVerified && conclusive && grounded
-    && contract.execution_ready && contract.readiness.execution_ready
-    && contract.readiness_blocks.length === 0);
+  const contextReady = Boolean(contract && integrityVerified && contract.readiness.context_ready);
+  const rcaReady = Boolean(contextReady && contract?.readiness.rca_ready && conclusive && grounded);
+  const resolutionReady = Boolean(rcaReady && contract?.readiness.resolution_ready);
+  const approvalReady = Boolean(resolutionReady && contract?.readiness.approval_ready);
+  const executionReady = Boolean(approvalReady && contract?.execution_ready
+    && contract?.readiness.execution_ready && contract.readiness_blocks.length === 0);
+  const validationReady = Boolean(executionReady && contract?.readiness.validation_ready);
+  const closureReady = Boolean(validationReady && contract?.readiness.closure_ready);
   const diagnosticConfidence = Number(
     analysis.confidence_score
     ?? investigation?.conclusion?.confidence
@@ -60,7 +65,8 @@ export function canonicalIncidentEvidence(workflow) {
     analysis, evidence, missing, conflicting,
     sources: object(contextMetadata.context_sources),
     acceptedEvidenceIds: [...acceptedIds],
-    conclusive, grounded, integrity, integrityVerified, executionReady,
+    conclusive, grounded, integrity, integrityVerified,
+    contextReady, rcaReady, resolutionReady, approvalReady, executionReady, validationReady, closureReady,
     contract, contractValid: parsedContract.success,
     contractError: parsedContract.success ? null : "Investigation contract invalid",
     // Confidence describes the bounded diagnostic assessment. Grounding and
