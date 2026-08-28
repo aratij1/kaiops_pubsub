@@ -10793,7 +10793,15 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                       || selectedAlertWorkflow?.decision?.requires_approval
                       || isApprovalPendingStatus(approvalStatus)
                     );
-                    const hasActionableApproval = Boolean(matchedApproval && !isResolved);
+                    const approvalInvestigationReady = Boolean(
+                      selectedAiTrust.contractValid === true
+                      && selectedAiTrust.integrityVerified === true
+                      && selectedAiTrust.executionReady === true
+                      && selectedExecutionPlan?.catalogPlan?.execution_ready === true
+                    );
+                    const hasUnresolvedApproval = Boolean(matchedApproval && !isResolved);
+                    const hasActionableApproval = Boolean(hasUnresolvedApproval && approvalInvestigationReady);
+                    const approvalBlocked = Boolean(hasUnresolvedApproval && !approvalInvestigationReady);
 
                     if (!requiresApproval) {
                       return null;
@@ -10802,17 +10810,19 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                     return (
                       <section className={`incident-decision-strip ${hasActionableApproval ? "is-actionable" : ""}`} aria-label="Incident decision gate">
                         <div className="incident-decision-copy">
-                          <span className="discovery-eyebrow">{hasActionableApproval ? "Decision required" : "Decision status"}</span>
-                          <strong>{hasActionableApproval ? "Manual approval is ready for review" : matchedApproval ? `Approval ${approvalStatus || "resolved"}` : "No active approval is linked"}</strong>
+                          <span className="discovery-eyebrow">{hasActionableApproval ? "Decision required" : approvalBlocked ? "Decision blocked" : "Decision status"}</span>
+                          <strong>{hasActionableApproval ? "Manual approval is ready for review" : approvalBlocked ? "Approval is blocked until investigation is ready" : matchedApproval ? `Approval ${approvalStatus || "resolved"}` : "No active approval is linked"}</strong>
                           <small>
                             {hasActionableApproval
                               ? "Review the proposed change and safety evidence in Resolve. Approval applies to this exact plan."
+                              : approvalBlocked
+                                ? "The linked approval is retained for audit, but this investigation contract or execution plan is not currently eligible for approval. Run fresh analysis and review the replacement plan."
                               : `Incident ${incidentId || "-"} is ${incidentStatusLabel(selectedCanonicalIncidentStatus).toLowerCase()}.`}
                           </small>
                         </div>
                         <div className="incident-decision-state">
                           <span className={`pill ${statusPillClass(selectedCanonicalIncidentStatus)}`}>{incidentStatusLabel(selectedCanonicalIncidentStatus)}</span>
-                          <span className="pill pill-info">Approval: {approvalStatus || (hasActionableApproval ? "pending" : "not active")}</span>
+                          <span className="pill pill-info">Approval: {approvalBlocked ? "blocked" : approvalStatus || (hasActionableApproval ? "pending" : "not active")}</span>
                         </div>
                         {hasActionableApproval ? (
                           <div className="incident-decision-actions">
