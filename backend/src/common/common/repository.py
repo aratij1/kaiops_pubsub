@@ -4931,11 +4931,19 @@ class IncidentRepository:
                     await self.session.merge(projection)
                     return
 
-        if event_record.alert_id is not None:
-            projection.alert_id = event_record.alert_id
-        projection.trace_id = event_record.trace_id
         recommendation_uuid = _extract_recommendation_uuid(event_record.payload)
         flow_id = _extract_flow_id(event_record.payload)
+        preserves_bound_generation = bool(
+            event_record.event_type == "incident.alert.enriched"
+            and projection.recommendation_id is not None
+            and recommendation_uuid is None
+            and event_record.alert_id is not None
+            and projection.alert_id is not None
+            and event_record.alert_id != projection.alert_id
+        )
+        if event_record.alert_id is not None and not preserves_bound_generation:
+            projection.alert_id = event_record.alert_id
+        projection.trace_id = event_record.trace_id
         if recommendation_uuid is not None:
             projection.recommendation_id = recommendation_uuid
         if flow_id:
@@ -4944,28 +4952,43 @@ class IncidentRepository:
         projection.service = event_record.service
         projection.environment = event_record.environment
         projection.severity = event_record.severity
-        incoming_status = event_record.status or projection.status or "open"
+        incoming_status = (
+            projection.status
+            if preserves_bound_generation
+            else event_record.status or projection.status or "open"
+        )
         if event_record.event_type == "incident.recommendation.generated" and str(incoming_status).lower() == "remediating":
             # A recommendation establishes readiness, never proof that an
             # executor started. This also protects projection rebuild/replay
             # from restoring the legacy false-remediating state.
             incoming_status = "awaiting_approval" if event_record.requires_approval else "approved"
         projection.status = incoming_status
-        projection.risk_tier = event_record.risk_tier
-        projection.execution_mode = event_record.execution_mode
-        projection.requires_approval = event_record.requires_approval
-        projection.policy_version = event_record.policy_version
-        projection.policy_reason = event_record.policy_reason
+        if not preserves_bound_generation:
+            projection.risk_tier = event_record.risk_tier
+            projection.execution_mode = event_record.execution_mode
+            projection.requires_approval = event_record.requires_approval
+            projection.policy_version = event_record.policy_version
+            projection.policy_reason = event_record.policy_reason
         projection.transport_provider = event_record.transport_provider
         projection.latest_event_id = event_record.id
         projection.latest_event_type = event_record.event_type
         projection.latest_event_at = event_record.created_at
-        projection.projection_payload = {
+        next_projection_payload = {
             "event_stage": event_record.event_stage,
             "event_type": event_record.event_type,
             "transport_channel": event_record.transport_channel,
             "event_payload": event_record.payload,
         }
+        if preserves_bound_generation:
+            next_projection_payload = dict(projection.projection_payload or {})
+            next_projection_payload["latest_occurrence"] = {
+                "alert_id": str(event_record.alert_id),
+                "event_id": str(event_record.id),
+                "event_type": event_record.event_type,
+                "event_payload": event_record.payload,
+                "observed_at": event_record.created_at.isoformat(),
+            }
+        projection.projection_payload = next_projection_payload
         await self.session.merge(projection)
 
     async def save_incident_event(self, envelope: dict[str, Any]) -> None:
