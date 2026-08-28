@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { CheckCircle2, ChevronRight, ShieldCheck, Target, TriangleAlert, Wrench } from "lucide-react";
 import { canonicalIncidentAnalysis, formatQualityPercent } from "../../appHelpers.jsx";
+import { canonicalApprovalEligibility } from "../../domain/approvalEligibility";
 import DecisionReadinessPanel, { type ReadinessCheck } from "./DecisionReadinessPanel";
 
 interface ExecutionPlan {
@@ -67,11 +68,7 @@ export default function ResolutionPanel({
   const preventiveRecommendations = Array.isArray(reviewArtifacts.preventive_recommendations) ? reviewArtifacts.preventive_recommendations : [];
   const evidenceCouncil = reviewArtifacts.evidence_council || {};
   const temporalGraph = reviewArtifacts.temporal_service_graph || {};
-  const backendEligibilityProven = Boolean(
-    readinessReceipt.decision_id
-    && readinessReceipt.signature
-    && ["eligible", "execution_eligible"].includes(String(readinessReceipt.state || readinessReceipt.decision || "").toLowerCase())
-  );
+  const approvalEligibility = canonicalApprovalEligibility({ workflow, plan: executionPlan.catalogPlan, receipt: readinessReceipt });
   const planComplete = Boolean(analysis.rootCause && analysis.rootCause !== "-" && action && action !== "-");
   const decisionChecks: ReadinessCheck[] = [
     ...readinessChecks,
@@ -90,8 +87,7 @@ export default function ResolutionPanel({
       action: "continue investigation until confidence reaches 85%",
     },
   ];
-  const readinessComplete = decisionChecks.length > 0 && decisionChecks.every((check) => check.passed);
-  const readyForDecision = planComplete && readinessComplete && backendEligibilityProven;
+  const readyForDecision = approvalEligibility.eligible;
 
   return (
     <section className="panel incident-workspace-section incident-resolution-section resolution-decision-brief" role="tabpanel" aria-labelledby="resolution-recommendation-title">
@@ -165,8 +161,8 @@ export default function ResolutionPanel({
         checks={[...decisionChecks, {
           id: "backend-readiness-receipt",
           label: "Signed backend readiness",
-          detail: backendEligibilityProven ? `Verified decision ${readinessReceipt.decision_id}.` : "No signed backend readiness decision proves execution eligibility.",
-          passed: backendEligibilityProven,
+          detail: approvalEligibility.eligible ? `Verified decision ${readinessReceipt.decision_id}.` : approvalEligibility.reasons.join("; "),
+          passed: approvalEligibility.eligible,
           action: "request a fresh backend approval-readiness evaluation",
         }]}
         eligibleLabel="Eligible for guarded approval"

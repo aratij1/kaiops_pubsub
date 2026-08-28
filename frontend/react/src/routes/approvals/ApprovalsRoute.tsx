@@ -5,6 +5,7 @@ import { useRouteRuntime } from "../../app/routeRuntime";
 import { OperationsWorkflowNav } from "../../components/operations/OperationsWorkflowNav";
 import { decisionReadiness } from "../../domain/incidentStatus";
 import { approvalDecisionFields } from "../../domain/approvalDecisionPacket";
+import { canonicalApprovalEligibility } from "../../domain/approvalEligibility";
 import { fetchJson } from "../../appHelpers.jsx";
 import "./ApprovalsRoute.css";
 
@@ -38,11 +39,8 @@ export default function ApprovalsRoute() {
     const quality = objectValue(metadata.evidence_quality, metadata.readiness, projection.evidence_quality);
     const policy = objectValue(plan.policy_decision, metadata.policy_decision);
     const readinessReceipt = objectValue(row.approval_readiness, metadata.approval_readiness, plan.approval_readiness, projection.approval_readiness);
-    const backendEligibilityProven = Boolean(
-      readinessReceipt.decision_id
-      && readinessReceipt.signature
-      && ["eligible", "execution_eligible"].includes(String(readinessReceipt.state || readinessReceipt.decision || "").toLowerCase())
-    );
+    const eligibility = canonicalApprovalEligibility({ workflow: row, plan, receipt: readinessReceipt, approval: row.approval });
+    const backendEligibilityProven = eligibility.receiptValid;
     const readiness = decisionReadiness({
       citationCoverage: quality.citation_coverage ?? recommendation.citation_coverage ?? 0,
       evidenceCoverage: quality.evidence_coverage ?? recommendation.evidence_coverage ?? 0,
@@ -54,10 +52,10 @@ export default function ApprovalsRoute() {
       dryRunComplete: Boolean(metadata.dry_run_complete),
       risk: plan.risk_tier || row.risk_tier,
     });
-    return { row, recommendation, plan, quality, policy, readiness, readinessReceipt, backendEligibilityProven, decision: approvalDecisionFields(row) };
+    return { row, recommendation, plan, quality, policy, readiness, readinessReceipt, eligibility, backendEligibilityProven, decision: approvalDecisionFields(row) };
   }, [selected, approvals.contextPayload]);
   const governedPlanAvailable = Boolean(String(packet.plan.plan_id || "").trim() && /^sha256:[0-9a-f]{64}$/i.test(String(packet.plan.plan_fingerprint || "").trim()));
-  const approvalDisabled = !approvals.selectedRecommendationId || approvals.actionLoading || !packet.readiness.eligible || !packet.backendEligibilityProven;
+  const approvalDisabled = !approvals.selectedRecommendationId || approvals.actionLoading || !packet.eligibility.eligible;
 
   async function generateGovernedPlan() {
     const alertId = String(selected?.alert_id || packet.row.alert_id || "").trim();

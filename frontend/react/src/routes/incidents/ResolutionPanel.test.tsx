@@ -11,7 +11,10 @@ describe("ResolutionPanel", () => {
     render(
       <ResolutionPanel
         workflow={{
+          incident_investigation: { readiness: { approval_ready: true, blocking_reasons: [] }, readiness_blocks: [] },
+          investigation_integrity: { status: "verified", verified: true, blocking_reasons: [] },
           recommendation: {
+            id: "rec-1",
             recommended_action: "Restart the payments API",
             root_cause: "The service process stopped responding",
             impact: "Payment requests are failing",
@@ -25,7 +28,8 @@ describe("ResolutionPanel", () => {
           executionMode: "jenkins",
           target: "payments-api",
           expectedOutcome: "The payments API passes independent recovery validation.",
-          readinessDecision: { decision_id: "decision-1", signature: "signed-value", state: "execution_eligible" },
+          catalogPlan: { plan_id: "plan-1", plan_fingerprint: `sha256:${"a".repeat(64)}`, recommendation_id: "rec-1" },
+          readinessDecision: { decision_id: "decision-1", signature: "signed-value", state: "execution_eligible", plan_id: "plan-1", plan_fingerprint: `sha256:${"a".repeat(64)}`, recommendation_id: "rec-1" },
         }}
         readinessChecks={[
           { id: "evidence", label: "Grounded evidence", detail: "Evidence threshold met.", passed: true },

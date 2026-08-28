@@ -15,6 +15,7 @@ import { approvalFlowFromPayload, approvalFlowId, approvalIncidentId, approvalRe
 import { buildOnboardingSources } from "./domain/onboardingSources";
 import { buildAlertDocumentDraft as buildRcaEvidenceDocumentDraft } from "./domain/alertDocumentDraft";
 import { canonicalIncidentEvidence } from "./domain/incidentEvidence";
+import { canonicalApprovalEligibility } from "./domain/approvalEligibility";
 import { buildIncidentGroupQuery } from "./features/incidents/incidentGroupQuery";
 import RcaPanel from "./routes/incidents/RcaPanel";
 import ResolutionPanel from "./routes/incidents/ResolutionPanel";
@@ -7625,14 +7626,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       return false;
     }
     const contextRoot = unwrap(approvalIncidentContext.payload) || {};
-    const readiness = contextRoot?.approval_readiness && typeof contextRoot.approval_readiness === "object"
-      ? contextRoot.approval_readiness
-      : {};
-    return Boolean(
-      readiness.decision_id
-      && readiness.signature
-      && String(readiness.state || "").toLowerCase() === "execution_eligible"
-    );
+    return canonicalApprovalEligibility({ workflow: contextRoot }).executionEligible;
   }, [activeTab, approvalForm, approvalIncidentContext, homeDetailTab, selectedApprovalIncidentId, selectedIncidentId]);
 
   async function executeApprovalAction({
@@ -7711,19 +7705,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           "Approval unavailable: this recommendation has no current governed execution plan. Open the incident, run fresh analysis, then review the new plan.",
         );
       }
-      const readiness = liveRoot?.approval_readiness && typeof liveRoot.approval_readiness === "object"
-        ? liveRoot.approval_readiness
-        : {};
-      const missingControls = Array.isArray(readiness.missing)
-        ? readiness.missing.map((item) => String(item || "").replaceAll("_", " ")).filter(Boolean)
-        : [];
-      const backendEligibilityProven = Boolean(
-        readiness.decision_id
-        && readiness.signature
-        && String(readiness.state || "").toLowerCase() === "execution_eligible"
-      );
-      if (!backendEligibilityProven) {
-        const missingDetail = missingControls.length ? ` Missing controls: ${missingControls.join(", ")}.` : "";
+      const eligibility = canonicalApprovalEligibility({ workflow: liveRoot, plan: selectedPlan });
+      if (!eligibility.executionEligible) {
+        const missingDetail = eligibility.reasons.length ? ` Missing controls: ${eligibility.reasons.join(", ")}.` : "";
         throw new Error(
           `Approval unavailable: the backend has not marked this plan execution-eligible.${missingDetail} Refresh evidence or regenerate analysis before approval.`,
         );
