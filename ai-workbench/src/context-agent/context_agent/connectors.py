@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
 from typing import Any, TypedDict
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 from ai_workbench_common.agent_runtime import AgentRuntime, ContextFailure
@@ -108,6 +108,28 @@ class PrometheusConnector(BaseConnector):
             ),
             None,
         )
+        # Alertmanager includes the exact rule expression in generatorURL.
+        # Preserve that source expression instead of guessing a metric name.
+        annotations = alert.annotations if isinstance(alert.annotations, dict) else {}
+        generator_url = str(annotations.get("generatorURL") or annotations.get("generator_url") or "").strip()
+        generator_expression = ""
+        if generator_url:
+            query = parse_qs(urlsplit(generator_url).query)
+            generator_expression = str((query.get("g0.expr") or query.get("query") or [""])[0]).strip()
+        settings = get_settings()
+        if connector is None and settings.environment.strip().lower() in {"local", "demo", "test"}:
+            endpoint = str(settings.prometheus_url or "").rstrip("/")
+            if endpoint and generator_expression and alert.source.lower() in {"prometheus", "alertmanager"}:
+                connector = {
+                    "integration_id": "local-runtime-prometheus",
+                    "provider": "prometheus",
+                    "endpoint_identity": endpoint,
+                    "config": {},
+                }
+                metadata = {
+                    **metadata,
+                    "connector_resolution": {"status": "completed", "source": "local_runtime_configuration"},
+                }
         if connector and (metadata.get("connector_resolution") or {}).get("status") == "completed":
             endpoint = str(connector.get("endpoint_identity") or "").rstrip("/")
             if not endpoint:
@@ -122,6 +144,7 @@ class PrometheusConnector(BaseConnector):
                 ),
                 "",
             )
+            expression = expression or generator_expression
             metric_name = str(
                 metadata.get("metric_name") or labels.get("__name__") or labels.get("metric") or ""
             ).strip()
@@ -139,8 +162,26 @@ class PrometheusConnector(BaseConnector):
                     "_source_status": "misconfigured",
                     "error": "alert rule expression and metric identity are missing",
                 }
-            end = datetime.now(UTC)
             window_seconds = max(60, min(int(config.get("observation_window_seconds") or 900), 86400))
+            now = datetime.now(UTC)
+            alert_time = alert.created_at
+            source_started_at = str(annotations.get("startsAt") or annotations.get("starts_at") or "").strip()
+            if source_started_at:
+                try:
+                    alert_time = datetime.fromisoformat(source_started_at.replace("Z", "+00:00"))
+                except ValueError:
+                    pass
+            if alert_time.tzinfo is None:
+                alert_time = alert_time.replace(tzinfo=UTC)
+            else:
+                alert_time = alert_time.astimezone(UTC)
+            # A fresh-analysis request can run long after the signal fired. Query
+            # the alert's observation window in that case; querying only "now"
+            # silently turns valid historical alerts into empty telemetry.
+            if now - alert_time > timedelta(seconds=window_seconds):
+                end = min(now, alert_time + timedelta(seconds=window_seconds / 2))
+            else:
+                end = now
             params = {
                 "query": expression,
                 "start": (end - timedelta(seconds=window_seconds)).timestamp(),

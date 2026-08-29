@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 from typing import Any
+from urllib.parse import urlencode
 
 from ai_workbench_common.models import Context
 from common.incident_contracts import ContextPackage
@@ -457,10 +458,22 @@ def govern_context(
     # checks merely because they are first-class Context fields.
     alert_uri = f"alert://{result.alert.id}"
     if result.observability:
+        telemetry_uri = alert_uri
+        query = str(result.observability.get("query") or "").strip()
+        window = result.observability.get("observation_window")
+        endpoint = str(result.observability.get("endpoint_identity") or "").rstrip("/")
+        if query and endpoint and isinstance(window, dict):
+            query_params = {
+                "query": query,
+                "start": window.get("start"),
+                "end": window.get("end"),
+                "step": window.get("step"),
+            }
+            telemetry_uri = f"{endpoint}/api/v1/query_range?{urlencode(query_params)}"
         combined.setdefault("telemetry", []).append(
             {
                 "source": "telemetry",
-                "uri": alert_uri,
+                "uri": telemetry_uri,
                 "summary": json.dumps(result.observability, sort_keys=True, default=str),
                 "observed_at": result.alert.created_at.isoformat(),
                 "confidence": 0.9,

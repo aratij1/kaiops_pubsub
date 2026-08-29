@@ -2,6 +2,7 @@
 .github
 .pytest_cache
 .ruff_cache
+.uv-cache
 .venv
 **/node_modules
 **/dist

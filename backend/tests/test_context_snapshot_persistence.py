@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from datetime import timedelta
 from pathlib import Path
 import sys
 
@@ -91,7 +92,7 @@ async def test_context_snapshot_and_outbox_are_committed_once(sqlite_session_fac
     assert outbox_rows == 1
     assert snapshot.context_fingerprint == context.metadata["context_fingerprint"]
     assert snapshot.contract_version == "kaiops.context.v2"
-    assert snapshot.expires_at >= snapshot.collected_at
+    assert snapshot.expires_at >= snapshot.collected_at + timedelta(minutes=5)
 
 
 @pytest.mark.asyncio

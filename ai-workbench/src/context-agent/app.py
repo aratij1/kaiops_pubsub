@@ -575,7 +575,14 @@ async def _persist_context_event(
         assessed_at = datetime.now(UTC)
     if assessed_at.tzinfo is None:
         assessed_at = assessed_at.replace(tzinfo=UTC)
-    expires_at = assessed_at + timedelta(seconds=max(0, int(quality.get("valid_for_seconds") or 0)))
+    # Snapshot expiry protects the immutable handoff, while context quality
+    # separately controls whether the evidence is usable. Even an insufficient
+    # package needs a processing lease long enough for the outbox delay and
+    # resolution agent to persist an explicit insufficient-evidence result.
+    processing_lease_seconds = 300
+    expires_at = assessed_at + timedelta(
+        seconds=max(processing_lease_seconds, int(quality.get("valid_for_seconds") or 0))
+    )
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
         incident_event = build_event_envelope(
