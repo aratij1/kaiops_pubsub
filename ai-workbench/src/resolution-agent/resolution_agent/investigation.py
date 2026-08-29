@@ -383,6 +383,7 @@ class IterativeInvestigator:
             "application": context.alert.labels.get("application") or context.alert.service,
             "project": context.alert.labels.get("project") or context.alert.metadata.get("project"),
             "trace_id": context.alert.trace_id,
+            "operation": context.alert.labels.get("operation"),
         }
         alert_started_at = context.alert.starts_at or context.alert.created_at
         if alert_started_at.tzinfo is None:

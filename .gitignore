@@ -20,6 +20,7 @@ data/
 logs/local/*.log
 node_modules/
 .tmp/
+.test-tmp*/
 storybook-static/
 test-results/
 playwright-report/

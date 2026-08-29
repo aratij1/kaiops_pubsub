@@ -14,7 +14,8 @@
       ],
       "service_catalog_root": "/workspace/backend/src",
       "telemetry": {
-        "prometheus_url": "http://prometheus:9090"
+        "prometheus_url": "http://prometheus:9090",
+        "jaeger_url": "http://jaeger:16686"
       },
       "ticket_sources": {
         "jira_url": "",

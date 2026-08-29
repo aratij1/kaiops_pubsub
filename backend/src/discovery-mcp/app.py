@@ -648,12 +648,70 @@ async def _call_mysql_tool(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"tool": "mysql.search", "query_terms": terms, "result_count": len(rows), "evidence": rows}
 
 
+def _jaeger_operation(value: str) -> str:
+    operation = str(value or "").strip()
+    if not operation:
+        return ""
+    path = operation.split("?", 1)[0]
+    path = re.sub(
+        r"/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        "/{alert_id}",
+        path,
+    )
+    return path if " " in path else f"GET {path}"
+
+
+def _trace_evidence_summary(trace: dict[str, Any], requested_operation: str = "") -> dict[str, Any]:
+    spans = [span for span in trace.get("spans", []) if isinstance(span, dict)]
+    processes = trace.get("processes") if isinstance(trace.get("processes"), dict) else {}
+    services = sorted({
+        str(process.get("serviceName"))
+        for process in processes.values()
+        if isinstance(process, dict) and process.get("serviceName")
+    })
+    operations = sorted({str(span.get("operationName")) for span in spans if span.get("operationName")})
+    status_codes: list[int] = []
+    error_spans = 0
+    for span in spans:
+        tags = {
+            str(tag.get("key")): tag.get("value")
+            for tag in span.get("tags", [])
+            if isinstance(tag, dict) and tag.get("key")
+        }
+        status = tags.get("http.status_code", tags.get("http.response.status_code"))
+        try:
+            if status is not None:
+                status_codes.append(int(status))
+        except (TypeError, ValueError):
+            pass
+        if tags.get("error") is True or any(code >= 500 for code in status_codes[-1:]) or span.get("logs"):
+            error_spans += 1
+    duration_us = max((int(span.get("duration") or 0) for span in spans), default=0)
+    signals: list[str] = []
+    if error_spans:
+        signals.append("http_5xx" if any(code >= 500 for code in status_codes) else "error")
+    if duration_us >= 3_000_000:
+        signals.append("high_latency")
+    return {
+        "trace_id": str(trace.get("traceID") or ""),
+        "services": services,
+        "span_count": len(spans),
+        "operations": operations[:20],
+        "requested_operation": requested_operation or None,
+        "duration_ms": round(duration_us / 1000, 3),
+        "http_status_codes": sorted(set(status_codes)),
+        "error_span_count": error_spans,
+        "diagnostic_signals": signals,
+    }
+
+
 async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
     project_id, project = _project_for(arguments)
     telemetry = project.get("telemetry") if isinstance(project.get("telemetry"), dict) else {}
     terms = _terms(arguments)
     service = str(arguments.get("service") or next(iter(terms), "")).strip()
     trace_id = str(arguments.get("trace_id") or "").strip()
+    requested_operation = str(arguments.get("operation") or "").strip()
     limit = max(1, min(int(arguments.get("limit", 8)), 20))
     evidence: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
@@ -685,6 +743,9 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                     response = await client.get(f"{jaeger_url}/api/traces/{trace_id}")
                 else:
                     trace_params = {"service": service, "limit": str(limit), "lookback": "1h"}
+                    jaeger_operation = _jaeger_operation(requested_operation)
+                    if jaeger_operation:
+                        trace_params["operation"] = jaeger_operation
                     if start_time and end_time:
                         try:
                             trace_params.update({
@@ -702,24 +763,15 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                 traces = response.json().get("data", [])
                 for index, trace in enumerate(traces[:limit], 1):
                     discovered_trace_id = str(trace.get("traceID") or trace_id or "")
-                    processes = trace.get("processes") if isinstance(trace.get("processes"), dict) else {}
-                    process_services = sorted(
-                        {
-                            str(process.get("serviceName"))
-                            for process in processes.values()
-                            if isinstance(process, dict) and process.get("serviceName")
-                        }
-                    )
-                    snippet = json.dumps(
-                        {
-                            "trace_id": discovered_trace_id,
-                            "services": process_services,
-                            "span_count": len(trace.get("spans", [])) if isinstance(trace.get("spans"), list) else 0,
-                        },
-                        ensure_ascii=False,
-                    )
+                    summary = _trace_evidence_summary(trace, requested_operation)
+                    snippet = json.dumps(summary, ensure_ascii=False)
                     item = _evidence("trace", Path(f"{project_id or 'telemetry'}/jaeger"), index, snippet, terms)
                     item["uri"] = f"jaeger://trace/{discovered_trace_id or index}"
+                    item["diagnostic_signals"] = summary["diagnostic_signals"]
+                    item["trace_id"] = discovered_trace_id
+                    item["duration_ms"] = summary["duration_ms"]
+                    item["operations"] = summary["operations"]
+                    item["http_status_codes"] = summary["http_status_codes"]
                     evidence.append(item)
                 sources.append({"source": "jaeger", "status": "completed", "result_count": len(traces)})
             except Exception as exc:
