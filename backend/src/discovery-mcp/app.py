@@ -953,6 +953,7 @@ async def _search_runtime_topology(arguments: dict[str, Any], *, health_only: bo
     service = str(arguments.get("service") or "").strip().lower()
     project = str(arguments.get("project") or arguments.get("application") or "").strip().lower()
     evidence: list[dict[str, Any]] = []
+    observed_at = datetime.now(UTC).isoformat()
     try:
         async with httpx.AsyncClient(
             base_url=f"http://{docker_host}", timeout=httpx.Timeout(8.0), trust_env=False
@@ -996,6 +997,12 @@ async def _search_runtime_topology(arguments: dict[str, Any], *, health_only: bo
                     "runtime_state": state,
                     "runtime_status": status,
                     "healthy": state == "running" and "unhealthy" not in status.lower(),
+                    "observed_at": observed_at,
+                    "observation_scope": "current_snapshot",
+                    "requested_window": {
+                        "start": str(arguments.get("start_time") or "") or None,
+                        "end": str(arguments.get("end_time") or "") or None,
+                    },
                 }
             )
             evidence.append(row)

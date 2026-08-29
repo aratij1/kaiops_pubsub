@@ -1013,10 +1013,17 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 candidates.append({
                     "claim": str(item.get("claim") or item.get("cause") or item.get("summary"))[:500],
                     "confidence": float(item.get("confidence") or 0.0),
-                    "evidence_ids": list(item.get("evidence_ids") or item.get("supporting_evidence") or []),
+                    "evidence_ids": list(
+                        item.get("supporting_evidence_ids")
+                        or item.get("evidence_ids")
+                        or item.get("supporting_evidence")
+                        or []
+                    ),
                     "source": "iterative_investigation",
                     "status": item.get("status"),
-                    "contradicting_evidence": list(item.get("contradicting_evidence") or []),
+                    "contradicting_evidence": list(
+                        item.get("contradicting_evidence_ids") or item.get("contradicting_evidence") or []
+                    ),
                     "falsification_check": item.get("falsification_check") or item.get("next_check"),
                 })
         for item in discovery.get("hypotheses", []) if isinstance(discovery.get("hypotheses"), list) else []:

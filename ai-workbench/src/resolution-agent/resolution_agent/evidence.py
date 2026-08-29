@@ -126,6 +126,7 @@ class EvidenceCompiler:
         environment: str,
         collected_at: datetime | None = None,
         incident_started_at: datetime | None = None,
+        incident_ended_at: datetime | None = None,
     ) -> list[EvidenceRecord]:
         collected = collected_at or datetime.now(UTC)
         if collected.tzinfo is None:
@@ -160,7 +161,9 @@ class EvidenceCompiler:
                 continue
             seen.add(dedup_key)
             freshness = max(0, int((collected - observed).total_seconds()))
-            outside_incident_window = bool(incident_started_at and observed < incident_started_at)
+            before_incident_window = bool(incident_started_at and observed < incident_started_at)
+            after_incident_window = bool(incident_ended_at and observed > incident_ended_at)
+            outside_incident_window = before_incident_window or after_incident_window
             guidance_only = source_type in self.GUIDANCE_TYPES
             reliability = float(row.get("reliability_score") or row.get("confidence") or self.RELIABILITY[source_type])
             reliability = max(0.0, min(reliability, 1.0))
@@ -184,7 +187,7 @@ class EvidenceCompiler:
                     observed_at=observed,
                     collected_at=collected,
                     observation_window_start=incident_started_at,
-                    observation_window_end=collected,
+                    observation_window_end=incident_ended_at or collected,
                     service=str(row.get("service") or service),
                     environment=str(row.get("environment") or environment or "unknown"),
                     summary=summary,
@@ -192,8 +195,8 @@ class EvidenceCompiler:
                     lineage_id=lineage_id,
                     incident_window_relation=(
                         "unknown" if timestamp_missing
-                        else "before" if outside_incident_window
-                        else "after" if observed > collected
+                        else "before" if before_incident_window
+                        else "after" if after_incident_window or observed > collected
                         else "during"
                     ),
                     freshness_status="unknown" if timestamp_missing else "fresh" if freshness <= 900 else "stale",

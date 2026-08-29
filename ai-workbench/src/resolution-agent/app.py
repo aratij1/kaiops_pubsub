@@ -291,8 +291,17 @@ async def _resolve_context(context: Context) -> Recommendation:
                 recommendation.recommended_action = (
                     f"Collect the next required read-only evidence ({missing or 'missing application sources'}) and rerun resolution."
                 )
-                recommendation.confidence = min(float(recommendation.confidence), 0.49)
+                conclusion = (
+                    investigation_report.get("conclusion")
+                    if isinstance(investigation_report.get("conclusion"), dict)
+                    else {}
+                )
+                recommendation.confidence = max(
+                    0.0, min(float(conclusion.get("confidence") or recommendation.confidence or 0.0), 0.99)
+                )
                 recommendation.metadata["resolution_outcome"] = "inconclusive"
+                recommendation.metadata["confidence_kind"] = "leading_hypothesis"
+                recommendation.metadata["confidence_actionable"] = False
             _attach_resolution_options(recommendation, context, investigation_report)
         recommendation.metadata = {
             **(recommendation.metadata if isinstance(recommendation.metadata, dict) else {}),

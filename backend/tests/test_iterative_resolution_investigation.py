@@ -196,6 +196,39 @@ def test_pre_alert_trace_inside_query_envelope_counts_as_operational_evidence() 
     assert evidence[0]["current_operational_evidence"] is True
 
 
+def test_current_dependency_snapshot_is_after_historical_incident_window() -> None:
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    context = make_context()
+    evidence = investigator._compile_evidence(context, [{
+        "evidence_id": "DEPENDENCY-NOW",
+        "source": "dependency",
+        "uri": "docker://kaiops/payments",
+        "observed_at": (context.alert.starts_at + timedelta(hours=2)).isoformat(),
+        "service": "payments",
+        "related_to": "checkout",
+        "runtime_state": "running",
+        "healthy": True,
+    }])
+
+    assert evidence[0]["incident_window_relation"] == "after"
+    assert evidence[0]["current_operational_evidence"] is False
+
+
+def test_unhealthy_dependency_in_incident_window_is_typed_support() -> None:
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    hypothesis = {"claim": "An unhealthy downstream dependency is degrading checkout."}
+    dependency = {
+        "source_type": "dependency",
+        "service": "payments",
+        "metadata": {
+            "service": "payments", "related_to": "checkout",
+            "runtime_state": "exited", "healthy": False,
+        },
+    }
+
+    assert investigator._structured_mechanism_support(hypothesis, dependency) is True
+
+
 @pytest.mark.asyncio
 async def test_keyword_overlap_alone_cannot_confirm_a_hypothesis() -> None:
     hypothesis = {"cause": "checkout connection pool exhaustion", "confidence": 0.6}

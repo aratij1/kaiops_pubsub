@@ -213,6 +213,7 @@ class IterativeInvestigator:
                 service=context.alert.service,
                 environment=context.alert.environment,
                 incident_started_at=observation_window_start,
+                incident_ended_at=alert_started_at + timedelta(minutes=15),
             )
         )
         unique: dict[str, dict[str, Any]] = {}
@@ -244,12 +245,23 @@ class IterativeInvestigator:
     @classmethod
     def _structured_mechanism_support(cls, hypothesis: dict[str, Any], row: dict[str, Any]) -> bool:
         """Admit structured diagnostics as support without treating symptom words as causation."""
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        claim = str(hypothesis.get("claim") or "").lower()
+        if row.get("source_type") == "dependency" and (
+            "dependency" in claim or "upstream" in claim or "downstream" in claim
+        ):
+            target = str(metadata.get("service") or row.get("service") or "").lower()
+            related_to = str(metadata.get("related_to") or "").lower()
+            return (
+                metadata.get("healthy") is False
+                and bool(target)
+                and target != related_to
+                and str(metadata.get("runtime_state") or "").lower() != "running"
+            )
         if row.get("source_type") != "trace":
             return False
-        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         spans = metadata.get("slowest_spans") if isinstance(metadata.get("slowest_spans"), list) else []
         edges = metadata.get("dependency_edges") if isinstance(metadata.get("dependency_edges"), list) else []
-        claim = str(hypothesis.get("claim") or "").lower()
         if "dependency" in claim or "upstream" in claim or "downstream" in claim:
             return bool(edges) and any(float(span.get("duration_ms") or 0) >= 500 for span in spans if isinstance(span, dict))
         if any(token in claim for token in ("resource", "data-path", "database", "mysql", "query")):
@@ -261,6 +273,18 @@ class IterativeInvestigator:
                 for span in spans
             )
         return False
+
+    @staticmethod
+    def _structured_mechanism_contradiction(hypothesis: dict[str, Any], row: dict[str, Any]) -> bool:
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        claim = str(hypothesis.get("claim") or "").lower()
+        if row.get("source_type") != "dependency" or not any(
+            token in claim for token in ("dependency", "upstream", "downstream")
+        ):
+            return False
+        target = str(metadata.get("service") or row.get("service") or "").lower()
+        related_to = str(metadata.get("related_to") or "").lower()
+        return metadata.get("healthy") is True and bool(target) and target != related_to
 
     @staticmethod
     def _initial_evidence(context: Context) -> list[dict[str, Any]]:
@@ -532,7 +556,11 @@ class IterativeInvestigator:
                     if evidence_id:
                         support.append(evidence_id)
                     sources.add(self._source(row))
-                if evidence_id and current_operational and any(token in text.lower() for token in ("healthy", "normal", "no errors", "recovered")) and overlap:
+                structured_contradiction = self._structured_mechanism_contradiction(hypothesis, row)
+                if evidence_id and current_operational and (
+                    structured_contradiction
+                    or (any(token in text.lower() for token in ("healthy", "normal", "no errors", "recovered")) and overlap)
+                ):
                     contradiction.append(evidence_id)
             supporting_rows = [row for row in evidence if str(row.get("evidence_id") or "") in set(support)]
             fresh_support = [
