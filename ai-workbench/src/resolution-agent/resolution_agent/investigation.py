@@ -23,7 +23,7 @@ from resolution_agent.contracts import (
     RCAResult,
     ResolutionOutcome,
 )
-from resolution_agent.evidence import EvidenceCompiler
+from resolution_agent.evidence import EvidenceCompiler, EvidenceRecord
 from resolution_agent.confidence import ConfidenceInputs, score_confidence
 from resolution_agent.metrics import (
     EVIDENCE_COUNT,
@@ -179,17 +179,46 @@ class IterativeInvestigator:
         )
 
     def _compile_evidence(self, context: Context, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [
+        compiled: list[dict[str, Any]] = []
+        raw_rows: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            # Investigation loops merge immutable compiled records with newly
+            # retrieved rows. Recompiling an EvidenceRecord nests metadata and
+            # loses structured diagnostics/citation identity on every step.
+            try:
+                if {
+                    "evidence_id", "source_type", "source_uri", "observed_at",
+                    "collected_at", "content_hash", "lineage_id", "metadata",
+                } <= row.keys():
+                    compiled.append(EvidenceRecord.model_validate(row).model_dump(mode="json"))
+                    continue
+            except ValueError:
+                pass
+            raw_rows.append(row)
+        alert_started_at = context.alert.starts_at or context.alert.created_at
+        if alert_started_at.tzinfo is None:
+            alert_started_at = alert_started_at.replace(tzinfo=UTC)
+        # Match the read-only investigation query envelope. Causal activity
+        # immediately preceding a threshold crossing is part of the incident
+        # observation window, not stale or unrelated evidence.
+        observation_window_start = alert_started_at - timedelta(minutes=5)
+        compiled.extend(
             record.model_dump(mode="json")
             for record in self.evidence_compiler.compile(
-                rows,
+                raw_rows,
                 tenant_id=context.tenant_id,
                 incident_id=context.incident_id,
                 service=context.alert.service,
                 environment=context.alert.environment,
-                incident_started_at=context.alert.starts_at or context.alert.created_at,
+                incident_started_at=observation_window_start,
             )
-        ]
+        )
+        unique: dict[str, dict[str, Any]] = {}
+        for row in compiled:
+            unique[str(row.get("evidence_id") or row.get("source_uri"))] = row
+        return list(unique.values())
 
     @staticmethod
     def _tokens(value: Any) -> set[str]:
@@ -498,12 +527,12 @@ class IterativeInvestigator:
                     hypothesis.get("source") != "mechanism_candidate"
                     and (len(overlap) >= 2 or (claim_tokens and len(overlap) / len(claim_tokens) >= 0.35))
                 )
-                if structured_support or lexical_support:
+                current_operational = row.get("metadata", {}).get("current_operational_evidence", True)
+                if (structured_support or lexical_support) and current_operational:
                     if evidence_id:
                         support.append(evidence_id)
-                    if row.get("metadata", {}).get("current_operational_evidence", True):
-                        sources.add(self._source(row))
-                if evidence_id and any(token in text.lower() for token in ("healthy", "normal", "no errors", "recovered")) and overlap:
+                    sources.add(self._source(row))
+                if evidence_id and current_operational and any(token in text.lower() for token in ("healthy", "normal", "no errors", "recovered")) and overlap:
                     contradiction.append(evidence_id)
             supporting_rows = [row for row in evidence if str(row.get("evidence_id") or "") in set(support)]
             fresh_support = [
@@ -603,6 +632,19 @@ class IterativeInvestigator:
             hypothesis["supporting_evidence_ids"] = [
                 evidence_id for evidence_id in dict.fromkeys(support)
                 if evidence_id not in set(contradiction_ids)
+            ][:20]
+            supporting_id_set = set(hypothesis["supporting_evidence_ids"])
+            hypothesis["evidence_bindings"] = [
+                {
+                    "evidence_id": str(row.get("evidence_id")),
+                    "source_type": str(row.get("source_type") or "unknown"),
+                    "source_uri": str(row.get("source_uri") or ""),
+                    "query_reference": str(row.get("query_reference") or ""),
+                    "observed_at": row.get("observed_at"),
+                    "citation_provenance": str(row.get("citation_provenance") or row.get("source_uri") or ""),
+                }
+                for row in evidence
+                if str(row.get("evidence_id") or "") in supporting_id_set
             ][:20]
             hypothesis["contradicting_evidence_ids"] = contradiction_ids
             hypothesis["independent_sources"] = sorted(sources)

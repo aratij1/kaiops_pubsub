@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -125,6 +125,77 @@ def test_incident_window_evidence_remains_temporally_aligned_after_wall_clock_ag
     assert investigator._incident_window_aligned(row) is True
 
 
+def test_compiled_trace_evidence_is_idempotent_and_keeps_causal_metadata() -> None:
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    context = make_context()
+    raw = [{
+        "evidence_id": "TRACE-BOUND",
+        "source": "trace",
+        "uri": "jaeger://trace/bound",
+        "observed_at": context.alert.starts_at.isoformat(),
+        "slowest_spans": [{"service": "payments", "operation": "POST /charge", "duration_ms": 910}],
+        "dependency_edges": [{"upstream": "checkout", "downstream": "payments"}],
+    }]
+
+    first = investigator._compile_evidence(context, raw)
+    second = investigator._compile_evidence(context, first)
+
+    assert second == first
+    assert second[0]["metadata"]["dependency_edges"][0]["downstream"] == "payments"
+    assert "metadata" not in second[0]["metadata"]
+
+
+def test_structured_trace_binding_includes_traceable_citation() -> None:
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    context = make_context()
+    evidence = investigator._compile_evidence(context, [{
+        "evidence_id": "TRACE-CITED",
+        "source": "trace",
+        "uri": "jaeger://trace/cited",
+        "observed_at": context.alert.starts_at.isoformat(),
+        "slowest_spans": [{"service": "payments", "operation": "POST /charge", "duration_ms": 910}],
+        "dependency_edges": [{"upstream": "checkout", "downstream": "payments"}],
+    }])
+    hypotheses = [{
+        "hypothesis_id": "dependency",
+        "claim": "An unhealthy downstream dependency is degrading checkout.",
+        "source": "mechanism_candidate",
+        "confidence": 0.0,
+        "supporting_evidence_ids": [],
+        "contradicting_evidence_ids": [],
+        "affected_resource_ids": [],
+        "causal_sequence": [],
+        "confidence_components": {},
+        "falsification_check": {},
+        "next_evidence_requests": [],
+    }]
+
+    revised = investigator._revise_hypotheses(hypotheses, evidence, context=context)
+    bound = next(row for row in revised if row["hypothesis_id"] == "dependency")
+
+    assert bound["supporting_evidence_ids"] == ["TRACE-CITED"]
+    assert bound["evidence_bindings"][0]["source_uri"] == "jaeger://trace/cited"
+    assert bound["independent_sources"] == ["traces"]
+
+
+def test_pre_alert_trace_inside_query_envelope_counts_as_operational_evidence() -> None:
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    context = make_context()
+    observed_at = context.alert.starts_at - timedelta(minutes=3)
+
+    evidence = investigator._compile_evidence(context, [{
+        "evidence_id": "TRACE-PRE-ALERT",
+        "source": "trace",
+        "uri": "jaeger://trace/pre-alert",
+        "observed_at": observed_at.isoformat(),
+        "slowest_spans": [{"service": "payments", "operation": "POST /charge", "duration_ms": 910}],
+        "dependency_edges": [{"upstream": "checkout", "downstream": "payments"}],
+    }])
+
+    assert evidence[0]["incident_window_relation"] == "during"
+    assert evidence[0]["current_operational_evidence"] is True
+
+
 @pytest.mark.asyncio
 async def test_keyword_overlap_alone_cannot_confirm_a_hypothesis() -> None:
     hypothesis = {"cause": "checkout connection pool exhaustion", "confidence": 0.6}
@@ -177,18 +248,19 @@ async def test_alert_label_never_becomes_confirmed_root_cause_without_corroborat
 @pytest.mark.asyncio
 async def test_conflicting_operational_evidence_is_surfaced_and_blocks_root_cause() -> None:
     hypothesis = {"cause": "checkout connection pool exhaustion", "confidence": 0.8}
+    context = make_context(hypotheses=[hypothesis])
     client = FakeDiscoveryClient({
         "changes.search": [{
             "evidence_id": "LOG-CONTRADICTION",
             "source": "log",
             "snippet": "checkout connection pool healthy and normal",
-            "timestamp": "2026-08-20T09:59:30Z",
+            "timestamp": context.alert.starts_at.isoformat(),
         }],
     })
     investigator = IterativeInvestigator(client=client)
     investigator.max_steps = 1
 
-    report = await investigator.investigate(make_context(hypotheses=[hypothesis]))
+    report = await investigator.investigate(context)
 
     assert report["rca_result"]["outcome"] == "CONFLICTING_EVIDENCE"
     assert report["rca_result"]["root_cause"] is None
