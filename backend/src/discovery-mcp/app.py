@@ -672,6 +672,13 @@ def _trace_evidence_summary(trace: dict[str, Any], requested_operation: str = ""
     operations = sorted({str(span.get("operationName")) for span in spans if span.get("operationName")})
     status_codes: list[int] = []
     error_spans = 0
+    span_rows: list[dict[str, Any]] = []
+    span_index = {str(span.get("spanID") or ""): span for span in spans}
+    dependency_edges: set[tuple[str, str]] = set()
+    safe_tag_names = {
+        "db.system", "db.operation", "server.address", "net.peer.name",
+        "http.route", "http.target", "http.status_code", "http.response.status_code", "span.kind",
+    }
     for span in spans:
         tags = {
             str(tag.get("key")): tag.get("value")
@@ -686,6 +693,24 @@ def _trace_evidence_summary(trace: dict[str, Any], requested_operation: str = ""
             pass
         if tags.get("error") is True or any(code >= 500 for code in status_codes[-1:]) or span.get("logs"):
             error_spans += 1
+        process = processes.get(span.get("processID"), {})
+        service_name = str(process.get("serviceName") or "unknown") if isinstance(process, dict) else "unknown"
+        span_rows.append({
+            "service": service_name,
+            "operation": str(span.get("operationName") or "unknown"),
+            "duration_ms": round(int(span.get("duration") or 0) / 1000, 3),
+            "tags": {key: tags[key] for key in safe_tag_names if tags.get(key) not in (None, "")},
+        })
+        for reference in span.get("references", []):
+            if not isinstance(reference, dict) or reference.get("refType") != "CHILD_OF":
+                continue
+            parent = span_index.get(str(reference.get("spanID") or ""))
+            if not parent:
+                continue
+            parent_process = processes.get(parent.get("processID"), {})
+            parent_service = str(parent_process.get("serviceName") or "unknown") if isinstance(parent_process, dict) else "unknown"
+            if parent_service != service_name and "unknown" not in {parent_service, service_name}:
+                dependency_edges.add((parent_service, service_name))
     duration_us = max((int(span.get("duration") or 0) for span in spans), default=0)
     signals: list[str] = []
     if error_spans:
@@ -702,6 +727,11 @@ def _trace_evidence_summary(trace: dict[str, Any], requested_operation: str = ""
         "http_status_codes": sorted(set(status_codes)),
         "error_span_count": error_spans,
         "diagnostic_signals": signals,
+        "slowest_spans": sorted(span_rows, key=lambda row: -row["duration_ms"])[:10],
+        "dependency_edges": [
+            {"upstream": upstream, "downstream": downstream}
+            for upstream, downstream in sorted(dependency_edges)
+        ],
     }
 
 
@@ -772,6 +802,11 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                     item["duration_ms"] = summary["duration_ms"]
                     item["operations"] = summary["operations"]
                     item["http_status_codes"] = summary["http_status_codes"]
+                    item["slowest_spans"] = summary["slowest_spans"]
+                    item["dependency_edges"] = summary["dependency_edges"]
+                    start_times = [int(span.get("startTime") or 0) for span in trace.get("spans", []) if isinstance(span, dict)]
+                    if start_times and min(start_times) > 0:
+                        item["observed_at"] = datetime.fromtimestamp(min(start_times) / 1_000_000, tz=UTC).isoformat()
                     evidence.append(item)
                 sources.append({"source": "jaeger", "status": "completed", "result_count": len(traces)})
             except Exception as exc:

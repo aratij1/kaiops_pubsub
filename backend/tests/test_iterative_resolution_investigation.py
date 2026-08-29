@@ -89,6 +89,42 @@ def test_generic_change_candidate_does_not_override_latency_evidence_priority() 
     assert datetime.fromisoformat(arguments["end_time"]) > datetime.fromisoformat(arguments["start_time"])
 
 
+def test_root_trace_latency_is_not_mistaken_for_a_causal_mechanism() -> None:
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    hypothesis = {"claim": "An unhealthy downstream dependency is degrading checkout."}
+    trace = {
+        "source_type": "trace",
+        "metadata": {"slowest_spans": [{"service": "checkout", "operation": "GET", "duration_ms": 3200}], "dependency_edges": []},
+    }
+
+    assert investigator._structured_mechanism_support(hypothesis, trace) is False
+
+
+def test_slow_cross_service_trace_supports_dependency_candidate() -> None:
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    hypothesis = {"claim": "An unhealthy downstream dependency is degrading checkout."}
+    trace = {
+        "source_type": "trace",
+        "metadata": {
+            "slowest_spans": [{"service": "payments", "operation": "POST /charge", "duration_ms": 910}],
+            "dependency_edges": [{"upstream": "checkout", "downstream": "payments"}],
+        },
+    }
+
+    assert investigator._structured_mechanism_support(hypothesis, trace) is True
+
+
+def test_incident_window_evidence_remains_temporally_aligned_after_wall_clock_age() -> None:
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    row = {
+        "incident_window_relation": "during",
+        "freshness_seconds": 86400,
+        "metadata": {"current_operational_evidence": True},
+    }
+
+    assert investigator._incident_window_aligned(row) is True
+
+
 @pytest.mark.asyncio
 async def test_keyword_overlap_alone_cannot_confirm_a_hypothesis() -> None:
     hypothesis = {"cause": "checkout connection pool exhaustion", "confidence": 0.6}

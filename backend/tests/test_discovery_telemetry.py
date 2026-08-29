@@ -47,10 +47,15 @@ def test_trace_summary_preserves_causal_diagnostics():
         "traceID": "trace-1",
         "processes": {"p1": {"serviceName": "api-gateway"}, "p2": {"serviceName": "mysql"}},
         "spans": [{
+            "spanID": "root", "processID": "p1",
             "operationName": "GET /alerts/{alert_id}/processed-result",
             "duration": 4_200_000,
             "tags": [{"key": "http.status_code", "value": 503}],
             "logs": [],
+        }, {
+            "spanID": "child", "processID": "p2", "operationName": "SELECT", "duration": 900_000,
+            "references": [{"refType": "CHILD_OF", "spanID": "root"}],
+            "tags": [{"key": "db.system", "value": "mysql"}], "logs": [],
         }],
     }
 
@@ -60,6 +65,8 @@ def test_trace_summary_preserves_causal_diagnostics():
     assert summary["http_status_codes"] == [503]
     assert summary["services"] == ["api-gateway", "mysql"]
     assert set(summary["diagnostic_signals"]) == {"http_5xx", "high_latency"}
+    assert summary["slowest_spans"][1]["tags"]["db.system"] == "mysql"
+    assert summary["dependency_edges"] == [{"upstream": "api-gateway", "downstream": "mysql"}]
 
 
 def test_jaeger_operation_normalizes_alert_uuid_and_query_string():

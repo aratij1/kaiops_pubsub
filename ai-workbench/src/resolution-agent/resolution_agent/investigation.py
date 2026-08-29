@@ -187,6 +187,7 @@ class IterativeInvestigator:
                 incident_id=context.incident_id,
                 service=context.alert.service,
                 environment=context.alert.environment,
+                incident_started_at=context.alert.starts_at or context.alert.created_at,
             )
         ]
 
@@ -203,6 +204,34 @@ class IterativeInvestigator:
         return cls.SOURCE_ALIASES.get(
             str(row.get("source") or row.get("source_type") or "").strip().lower(), "alert"
         )
+
+    @staticmethod
+    def _incident_window_aligned(row: dict[str, Any]) -> bool:
+        return (
+            row.get("incident_window_relation") == "during"
+            and row.get("metadata", {}).get("current_operational_evidence", True)
+        )
+
+    @classmethod
+    def _structured_mechanism_support(cls, hypothesis: dict[str, Any], row: dict[str, Any]) -> bool:
+        """Admit structured diagnostics as support without treating symptom words as causation."""
+        if row.get("source_type") != "trace":
+            return False
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        spans = metadata.get("slowest_spans") if isinstance(metadata.get("slowest_spans"), list) else []
+        edges = metadata.get("dependency_edges") if isinstance(metadata.get("dependency_edges"), list) else []
+        claim = str(hypothesis.get("claim") or "").lower()
+        if "dependency" in claim or "upstream" in claim or "downstream" in claim:
+            return bool(edges) and any(float(span.get("duration_ms") or 0) >= 500 for span in spans if isinstance(span, dict))
+        if any(token in claim for token in ("resource", "data-path", "database", "mysql", "query")):
+            return any(
+                isinstance(span, dict)
+                and float(span.get("duration_ms") or 0) >= 250
+                and isinstance(span.get("tags"), dict)
+                and bool(span["tags"].get("db.system") or span["tags"].get("db.operation"))
+                for span in spans
+            )
+        return False
 
     @staticmethod
     def _initial_evidence(context: Context) -> list[dict[str, Any]]:
@@ -464,7 +493,12 @@ class IterativeInvestigator:
                 evidence_id = str(row.get("evidence_id") or "")
                 text = " ".join(str(row.get(key) or "") for key in ("snippet", "summary", "content", "title"))
                 overlap = claim_tokens.intersection(self._tokens(text))
-                if len(overlap) >= 2 or (claim_tokens and len(overlap) / len(claim_tokens) >= 0.35):
+                structured_support = self._structured_mechanism_support(hypothesis, row)
+                lexical_support = (
+                    hypothesis.get("source") != "mechanism_candidate"
+                    and (len(overlap) >= 2 or (claim_tokens and len(overlap) / len(claim_tokens) >= 0.35))
+                )
+                if structured_support or lexical_support:
                     if evidence_id:
                         support.append(evidence_id)
                     if row.get("metadata", {}).get("current_operational_evidence", True):
@@ -474,7 +508,7 @@ class IterativeInvestigator:
             supporting_rows = [row for row in evidence if str(row.get("evidence_id") or "") in set(support)]
             fresh_support = [
                 row for row in supporting_rows
-                if int(row.get("freshness_seconds") or 0) <= 900
+                if (int(row.get("freshness_seconds") or 0) <= 900 or self._incident_window_aligned(row))
                 and row.get("metadata", {}).get("current_operational_evidence", True)
             ]
             temporal_alignment = len(fresh_support) / max(1, len(supporting_rows))
@@ -506,7 +540,7 @@ class IterativeInvestigator:
             supporting_rows = [row for row in evidence if str(row.get("evidence_id") or "") in set(support)]
             fresh_support = [
                 row for row in supporting_rows
-                if int(row.get("freshness_seconds") or 0) <= 900
+                if (int(row.get("freshness_seconds") or 0) <= 900 or self._incident_window_aligned(row))
                 and row.get("metadata", {}).get("current_operational_evidence", True)
             ]
             temporal_alignment = len(fresh_support) / max(1, len(supporting_rows))
