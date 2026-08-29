@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -65,6 +66,27 @@ async def test_investigation_queries_missing_sources_and_returns_inconclusive() 
     assert report["investigation_plan"]["questions_to_answer"]
     assert report["investigation_plan"]["recommended_tool_calls"]
     assert report["correlation_id"]
+    assert all("start_time" in arguments and "end_time" in arguments for _, arguments in client.calls)
+
+
+def test_generic_change_candidate_does_not_override_latency_evidence_priority() -> None:
+    context = make_context(hypotheses=[{"cause": "A recent configuration change affected checkout"}])
+    context.alert.name = "CheckoutLatencyHigh"
+    context.alert.description = "checkout p99 latency is above threshold"
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+
+    selection = investigator._select_tool(
+        context=context,
+        evidence=[],
+        hypotheses=investigator._initial_hypotheses(context),
+        tool_counts={},
+    )
+
+    assert selection is not None
+    tool_name, arguments = selection
+    assert tool_name == "logs.search"
+    assert datetime.fromisoformat(arguments["start_time"]).tzinfo == UTC
+    assert datetime.fromisoformat(arguments["end_time"]) > datetime.fromisoformat(arguments["start_time"])
 
 
 @pytest.mark.asyncio

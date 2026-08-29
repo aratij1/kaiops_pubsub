@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from time import monotonic
 from typing import Any, Awaitable, Callable
@@ -328,19 +328,21 @@ class IterativeInvestigator:
         tool_counts: dict[str, int],
     ) -> tuple[str, dict[str, Any]] | None:
         coverage = self._coverage(evidence)
-        haystack = " ".join([
+        alert_text = " ".join([
             context.alert.name, context.alert.description, context.alert.service,
-            *(str(item.get("claim") or "") for item in hypotheses[:3]),
         ]).lower()
         priority = [
             "logs", "telemetry", "traces", "topology", "dependency", "changes", "runbooks",
             "code", "history", "data",
         ]
-        if any(token in haystack for token in ("deploy", "release", "config", "stack", "traceback")):
+        # Evidence-plane priority must be selected from observed alert facts.
+        # Generic candidate hypotheses (for example "a configuration change")
+        # must not redirect every latency investigation to change search first.
+        if any(token in alert_text for token in ("deploy", "release", "config", "stack", "traceback")):
             priority = ["changes", "code", "logs", "telemetry", "traces", "topology", "dependency", "runbooks", "history", "data"]
-        elif any(token in haystack for token in ("database", "mysql", "query", "replica", "table")):
+        elif any(token in alert_text for token in ("database", "mysql", "query", "replica", "table")):
             priority = ["data", "logs", "telemetry", "topology", "dependency", "changes", "runbooks", "code", "history", "traces"]
-        elif any(token in haystack for token in ("recurring", "repeat", "known issue")):
+        elif any(token in alert_text for token in ("recurring", "repeat", "known issue")):
             priority = ["history", "logs", "telemetry", "topology", "dependency", "changes", "runbooks", "code", "data", "traces"]
         required = self._required_sources(context)
         priority = [source for source in priority if source in required]
@@ -382,6 +384,13 @@ class IterativeInvestigator:
             "project": context.alert.labels.get("project") or context.alert.metadata.get("project"),
             "trace_id": context.alert.trace_id,
         }
+        alert_started_at = context.alert.starts_at or context.alert.created_at
+        if alert_started_at.tzinfo is None:
+            alert_started_at = alert_started_at.replace(tzinfo=UTC)
+        else:
+            alert_started_at = alert_started_at.astimezone(UTC)
+        arguments["start_time"] = (alert_started_at - timedelta(minutes=5)).isoformat()
+        arguments["end_time"] = (alert_started_at + timedelta(minutes=15)).isoformat()
         return tool, {key: value for key, value in arguments.items() if value not in (None, "", [])}
 
     def _revise_hypotheses(

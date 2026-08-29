@@ -260,6 +260,16 @@ async def _search_docker_logs(arguments: dict[str, Any], terms: list[str], limit
     tail = max(20, min(int(os.getenv("DOCKER_LOG_DISCOVERY_TAIL", "250")), 2000))
     timeout = httpx.Timeout(max(2.0, min(float(os.getenv("DOCKER_LOG_DISCOVERY_TIMEOUT_SECONDS", "10")), 30.0)))
     evidence: list[dict[str, Any]] = []
+    log_params = {"stdout": "true", "stderr": "true", "timestamps": "true", "tail": str(tail)}
+    for argument_name, docker_name in (("start_time", "since"), ("end_time", "until")):
+        raw_time = str(arguments.get(argument_name) or "").strip()
+        if not raw_time:
+            continue
+        try:
+            parsed_time = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            log_params[docker_name] = str(int(parsed_time.timestamp()))
+        except ValueError:
+            continue
     try:
         async with httpx.AsyncClient(base_url=f"http://{docker_host}", timeout=timeout) as client:
             response = await client.get("/containers/json", params={"all": "true", "limit": str(max_containers)})
@@ -292,7 +302,7 @@ async def _search_docker_logs(arguments: dict[str, Any], terms: list[str], limit
                     continue
                 logs = await client.get(
                     f"/containers/{container_id}/logs",
-                    params={"stdout": "true", "stderr": "true", "timestamps": "true", "tail": str(tail)},
+                    params=log_params,
                 )
                 logs.raise_for_status()
                 container_name = names[0] if names else container_id[:12]
@@ -647,6 +657,8 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
     limit = max(1, min(int(arguments.get("limit", 8)), 20))
     evidence: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
+    start_time = str(arguments.get("start_time") or "").strip()
+    end_time = str(arguments.get("end_time") or "").strip()
     timeout = httpx.Timeout(max(2.0, min(float(os.getenv("DISCOVERY_MCP_TELEMETRY_TIMEOUT_SECONDS", "6")), 20.0)))
 
     async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
@@ -672,9 +684,19 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                 if trace_id:
                     response = await client.get(f"{jaeger_url}/api/traces/{trace_id}")
                 else:
+                    trace_params = {"service": service, "limit": str(limit), "lookback": "1h"}
+                    if start_time and end_time:
+                        try:
+                            trace_params.update({
+                                "start": str(int(datetime.fromisoformat(start_time.replace("Z", "+00:00")).timestamp() * 1_000_000)),
+                                "end": str(int(datetime.fromisoformat(end_time.replace("Z", "+00:00")).timestamp() * 1_000_000)),
+                            })
+                            trace_params.pop("lookback", None)
+                        except ValueError:
+                            pass
                     response = await client.get(
                         f"{jaeger_url}/api/traces",
-                        params={"service": service, "limit": str(limit), "lookback": "1h"},
+                        params=trace_params,
                     )
                 response.raise_for_status()
                 traces = response.json().get("data", [])
@@ -730,6 +752,10 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                 "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}],
                 "query": {"bool": {"must": must or [{"match_all": {}}]}},
             }
+            if start_time and end_time:
+                body["query"]["bool"].setdefault("filter", []).append(
+                    {"range": {"@timestamp": {"gte": start_time, "lte": end_time}}}
+                )
             try:
                 response = await client.post(f"{opensearch_url}/{opensearch_index}/_search", json=body)
                 response.raise_for_status()
