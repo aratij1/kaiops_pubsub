@@ -2,6 +2,7 @@ import asyncio
 import importlib.util
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -442,6 +443,10 @@ async def test_analysis_regeneration_reconstructs_historical_source_payload(
                 "description": "latency",
                 "provider_payload": {"unexpected": True},
                 "labels": {"team": "platform"},
+                "annotations": {
+                    "startsAt": "2026-08-20T09:14:15Z",
+                    "endsAt": "0001-01-01T00:00:00Z",
+                },
             },
         ))
         session.add(IncidentRecord(
@@ -469,6 +474,8 @@ async def test_analysis_regeneration_reconstructs_historical_source_payload(
 
     assert result["status"] == "accepted"
     assert captured["alert"].severity.value == "critical"
+    assert captured["alert"].starts_at == datetime(2026, 8, 20, 9, 14, 15, tzinfo=UTC)
+    assert captured["alert"].ends_at is None
     assert captured["incident"].status.value == "investigating"
     assert captured["incident"].alert_ids == [alert_uuid]
 

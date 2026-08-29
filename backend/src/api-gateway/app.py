@@ -1967,6 +1967,33 @@ async def _load_analysis_regeneration_subject(
         incident_status = str(incident_record.status or "investigating").strip().lower().replace("-", "_")
         if incident_status not in valid_statuses:
             incident_status = "investigating"
+        stored_annotations = (
+            stored_alert.get("annotations") if isinstance(stored_alert.get("annotations"), dict) else {}
+        )
+
+        def persisted_alert_time(*keys: str) -> datetime | None:
+            for key in keys:
+                value = stored_annotations.get(key) or stored_alert.get(key)
+                if isinstance(value, datetime):
+                    parsed = value
+                elif isinstance(value, str) and value.strip():
+                    try:
+                        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                else:
+                    continue
+                if parsed.year <= 1:
+                    continue
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+            return None
+
+        # The source observation time is part of the alert identity.  Never
+        # let Alert's default factory replace it with regeneration time, or a
+        # historical RCA will query the wrong telemetry and trace window.
+        alert_started_at = persisted_alert_time("startsAt", "starts_at", "observed_at", "timestamp")
+        alert_started_at = alert_started_at or alert_record.created_at
+        alert_ends_at = persisted_alert_time("endsAt", "ends_at")
         alert_payload = {
             "id": str(alert_record.id),
             "created_at": alert_record.created_at,
@@ -1979,10 +2006,12 @@ async def _load_analysis_regeneration_subject(
             "description": str(
                 stored_alert.get("description") or stored_alert.get("summary") or alert_record.name
             ),
+            "starts_at": alert_started_at,
+            "ends_at": alert_ends_at,
             "fingerprint": alert_record.fingerprint,
             "correlation_id": alert_record.correlation_id,
             "labels": stored_alert.get("labels") if isinstance(stored_alert.get("labels"), dict) else {},
-            "annotations": stored_alert.get("annotations") if isinstance(stored_alert.get("annotations"), dict) else {},
+            "annotations": stored_annotations,
         }
         alert_ids = []
         for candidate in stored_incident.get("alert_ids") or []:
