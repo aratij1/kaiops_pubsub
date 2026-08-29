@@ -61,12 +61,16 @@ export function canonicalIncidentEvidence(workflow) {
     && contract?.readiness.execution_ready && contract.readiness_blocks.length === 0);
   const validationReady = Boolean(executionReady && contract?.readiness.validation_ready);
   const closureReady = Boolean(validationReady && contract?.readiness.closure_ready);
-  const diagnosticConfidence = Number(
-    analysis.confidence_score
-    ?? investigation?.conclusion?.confidence
-    ?? recommendation.confidence
-    ?? 0,
-  );
+  const hasCanonicalConfidenceContract = Boolean(String(metadata.confidence_kind || "").trim());
+  const confidenceKind = String(metadata.confidence_kind || (
+    conclusive && grounded ? "confirmed_rca" : "leading_hypothesis"
+  )).trim().toLowerCase();
+  const confidenceActionable = metadata.confidence_actionable === true && conclusive && grounded;
+  // The recommendation is the canonical projection of the completed
+  // investigation. Older nested model/evaluation scores must not override it.
+  const diagnosticConfidence = Number(hasCanonicalConfidenceContract
+    ? (recommendation.confidence ?? investigation?.conclusion?.confidence ?? analysis.confidence_score ?? 0)
+    : (analysis.confidence_score ?? investigation?.conclusion?.confidence ?? recommendation.confidence ?? 0));
   return {
     analysis, evidence, missing, conflicting,
     sources: object(contextMetadata.context_sources),
@@ -80,6 +84,9 @@ export function canonicalIncidentEvidence(workflow) {
     // honest low/ungrounded score can never authorize remediation.
     confidence: Number.isFinite(diagnosticConfidence) ? diagnosticConfidence : 0,
     confidenceGrounded: grounded,
+    confidenceKind,
+    confidenceActionable,
+    confidenceLabel: confidenceKind === "confirmed_rca" ? "Confirmed RCA confidence" : "Leading hypothesis confidence",
   };
 }
 import { IncidentInvestigationV1 } from "../schemas/incidentInvestigation";

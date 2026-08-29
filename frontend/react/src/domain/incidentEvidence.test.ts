@@ -66,6 +66,23 @@ describe("canonical incident evidence", () => {
     expect(result.confidenceGrounded).toBe(false);
     expect(result.grounded).toBe(false);
     expect(result.executionReady).toBe(false);
+    expect(result.confidenceLabel).toBe("Leading hypothesis confidence");
+    expect(result.confidenceActionable).toBe(false);
+  });
+
+  it("prefers canonical recommendation confidence over stale nested model confidence", () => {
+    const result = canonicalIncidentEvidence({
+      recommendation: { confidence: .5707, metadata: {
+        confidence_kind: "leading_hypothesis",
+        confidence_actionable: false,
+        rca_analysis: { confidence_score: .07 },
+        iterative_investigation: { conclusive: false, status: "budget_exhausted", conclusion: { confidence: .5707 } },
+      } },
+    });
+
+    expect(result.confidence).toBe(.5707);
+    expect(result.confidenceKind).toBe("leading_hypothesis");
+    expect(result.confidenceLabel).toBe("Leading hypothesis confidence");
   });
 
   it("never accepts synthetic or missing citations as RCA support", () => {

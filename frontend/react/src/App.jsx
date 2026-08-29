@@ -5937,7 +5937,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       ...analysis,
       confidence,
       reviewRequired,
-      confidenceLabel: !hasLinkedEvidence ? "Ungrounded" : confidence >= 0.85 ? "High confidence" : confidence >= 0.7 ? "Moderate confidence" : "Low confidence",
+      confidenceKind: selectedAiTrust.confidenceKind,
+      confidenceActionable: selectedAiTrust.confidenceActionable,
+      confidenceLabel: !hasLinkedEvidence ? "Ungrounded" : selectedAiTrust.confidenceLabel,
       impactedServices,
       causalDetails,
       impactEvidence: evidenceUsed,
@@ -10924,7 +10926,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <span><strong>{incidentStatusLabel(selectedCanonicalIncidentStatus)}</strong> lifecycle</span>
                           <span><strong>{selectedAlertTimelineRows.length}</strong> events</span>
                           <span><strong>{selectedAiTrust.evidence.filter((row) => row.accepted).length}</strong> RCA-supporting evidence</span>
-                          <span className={Number(selectedRcaDecision.confidence || 0) < 0.5 ? "is-quality-warning" : ""}><strong>{formatQualityPercent(selectedRcaDecision.confidence)}</strong> RCA confidence</span>
+                          <span className={Number(selectedRcaDecision.confidence || 0) < 0.5 ? "is-quality-warning" : ""}><strong>{formatQualityPercent(selectedRcaDecision.confidence)}</strong> {selectedAiTrust.confidenceLabel}</span>
                         </div>
                       </header>
                       <details className="panel incident-workspace-section workspace-collapsible" open>
@@ -10998,9 +11000,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <small>{selectedAiTrust.evidence.length ? `${selectedAlertEvaluation.qualityLabel} | ${selectedAlertEvaluation.provider}` : "No linked evidence"}</small>
                         </article>
                         <article className="alert-rule-summary-card">
-                          <span>Confidence</span>
+                          <span>{selectedAiTrust.confidenceLabel}</span>
                           <strong>{selectedAiTrust.evidence.length ? formatQualityPercent(selectedRcaDecision.confidence) : "Unavailable"}</strong>
-                          <small>{selectedAiTrust.evidence.length ? "Evidence-grounded recommendation certainty" : "Ungrounded recommendation"}</small>
+                          <small>{selectedAiTrust.confidenceActionable ? "Confirmed and evidence-grounded" : "Diagnostic score; not execution permission"}</small>
                         </article>
                         <article className="alert-rule-summary-card">
                           <span>Grounding</span>

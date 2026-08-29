@@ -196,7 +196,9 @@ export default function IncidentCommand() {
   const after = record(validation.after || validation.post_state);
   const analysis = firstRecord(projection.analysis, projection.rca, eventPayload.analysis, eventPayload.rca, recommendation.analysis, recommendation.rca, source.analysis);
   const rootCause = text(row.root_cause, projection.root_cause, eventPayload.root_cause, analysis.root_cause, analysis.leading_hypothesis, recommendation.root_cause, recommendationMetadata.root_cause, sourceAnnotations.root_cause);
-  const confidence = confidenceValue(row.confidence, projection.confidence, eventPayload.confidence, analysis.confidence, recommendation.confidence, recommendationMetadata.confidence);
+  const confidence = confidenceValue(recommendation.confidence, recommendationMetadata.confidence, analysis.confidence, eventPayload.confidence, projection.confidence, row.confidence);
+  const confidenceKind = text(recommendationMetadata.confidence_kind, projection.confidence_kind).toLowerCase();
+  const confidenceLabel = confidenceKind === "confirmed_rca" ? "Confirmed RCA confidence" : "Leading hypothesis confidence";
   const supportingReasons = [
     ...arrayOfText(analysis.supporting_signals),
     ...arrayOfText(analysis.evidence),
@@ -271,10 +273,10 @@ export default function IncidentCommand() {
         </section>
 
         <section className="ic-section ic-rca">
-          <header><div><span>Root cause story</span><h3>{rootCause || "Kai has not published a root-cause hypothesis"}</h3></div>{confidence !== null ? <div className="ic-confidence"><small>{confidence >= 80 ? "High" : confidence >= 60 ? "Medium" : "Low"} confidence</small><strong>{confidence}%</strong></div> : <StatusBadge tone="inactive">Confidence unavailable</StatusBadge>}</header>
+          <header><div><span>Root cause story</span><h3>{rootCause || "Kai has not published a root-cause hypothesis"}</h3></div>{confidence !== null ? <div className="ic-confidence"><small>{confidenceLabel}</small><strong>{confidence}%</strong></div> : <StatusBadge tone="inactive">Confidence unavailable</StatusBadge>}</header>
           {rootCause ? <>
             <div className="ic-reasoning"><article><h4>Why Kai thinks this</h4>{supportingReasons.length ? <ul>{supportingReasons.map((reason) => <li key={reason}><CheckCircle2 aria-hidden="true" />{reason}</li>)}</ul> : <p>Supporting reasons were not included in the backend analysis.</p>}</article><article><h4>What Kai ruled out</h4>{contradictions.length ? <ul>{contradictions.map((reason) => <li key={reason}><X aria-hidden="true" />{reason}</li>)}</ul> : <p>No ruled-out hypotheses were included.</p>}</article></div>
-            <TechnicalDetails summary="Why this confidence?"><p>{confidence === null ? "The backend did not publish a confidence score." : `${confidence}% is the normalized score published with this incident analysis.`}</p><p>{supportingReasons.length} supporting reason(s) and {contradictions.length} contradiction or ruled-out item(s) are available.</p></TechnicalDetails>
+            <TechnicalDetails summary="Why this confidence?"><p>{confidence === null ? "The backend did not publish a confidence score." : `${confidence}% is the normalized ${confidenceLabel.toLowerCase()} published with this incident analysis.`}</p><p>{confidenceKind === "confirmed_rca" ? "The RCA is confirmed but remains governed by policy gates." : "The investigation is not conclusive; this score cannot authorize remediation."}</p><p>{supportingReasons.length} supporting reason(s) and {contradictions.length} contradiction or ruled-out item(s) are available.</p></TechnicalDetails>
           </> : <EmptyState title="Investigation is still forming a hypothesis" description="Kai will show a falsifiable root-cause story when the backend publishes one." />}
         </section>
 
