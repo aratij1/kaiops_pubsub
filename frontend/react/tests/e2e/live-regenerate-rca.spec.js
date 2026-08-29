@@ -1,6 +1,16 @@
 import { expect, test } from "@playwright/test";
 
 const liveAlertId = String(process.env.KAIOPS_LIVE_ALERT_ID || "").trim();
+const liveIncidentId = String(process.env.KAIOPS_LIVE_INCIDENT_ID || "").trim();
+
+async function visibleConfidence(page) {
+  const meter = page.getByRole("progressbar", { name: /Leading hypothesis confidence|Confirmed RCA confidence/ });
+  await expect(meter).toBeVisible({ timeout: 45_000 });
+  const label = await meter.getAttribute("aria-label");
+  const value = Number(await meter.getAttribute("aria-valuenow"));
+  expect(value, `expected a positive ${label} percentage`).toBeGreaterThan(0);
+  return { label, value };
+}
 
 test.skip(!process.env.KAIOPS_LIVE_E2E || !liveAlertId, "Set KAIOPS_LIVE_E2E=1 and KAIOPS_LIVE_ALERT_ID to run against a live API stack");
 
@@ -45,4 +55,19 @@ test("live fresh RCA stays authenticated and renders the persisted analysis", as
   expect(orchestrationRequests).toHaveLength(1);
   expect(analysisRequests.every(({ authorization }) => authorization.startsWith("Bearer "))).toBeTruthy();
   expect(analysisResponses.filter(({ url }) => url.includes(`/analysis/alerts/${liveAlertId}/regenerate`)).every(({ status }) => status >= 200 && status < 300)).toBeTruthy();
+
+  const workspaceConfidence = await visibleConfidence(page);
+  expect(workspaceConfidence.label).toBe("Leading hypothesis confidence");
+  await expect(page.getByText("This is a diagnostic hypothesis score, not a confirmed RCA or execution permission.")).toBeVisible();
+
+  if (liveIncidentId) {
+    await page.goto(`/incidents/${encodeURIComponent(liveIncidentId)}`);
+    const incidentConfidence = page.locator(".ic-confidence");
+    await expect(incidentConfidence).toBeVisible({ timeout: 45_000 });
+    await expect(incidentConfidence).toContainText("Leading hypothesis confidence");
+    const incidentText = await incidentConfidence.innerText();
+    expect(Number(incidentText.match(/(\d+)%/)?.[1])).toBe(workspaceConfidence.value);
+    await incidentConfidence.locator("xpath=ancestor::section").getByText("Why this confidence?").click();
+    await expect(page.getByText("The investigation is not conclusive; this score cannot authorize remediation.")).toBeVisible();
+  }
 });
