@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from sqlalchemy import and_, case, delete, exists, func, literal, or_, select, text, union_all
+from sqlalchemy import and_, case, delete, exists, func, literal, or_, select, text, union_all, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -29,9 +29,11 @@ from common.database import (
     ContextKnowledgeRecord,
     ContextSnapshotRecord,
     DraftPullRequestOutboxRecord,
+    EvidenceRagDraftRecord,
     EvaluationRecord,
     GrafanaDashboardRecord,
     GovernedResolutionPlanRecord,
+    GovernedRagDocumentRecord,
     IncidentCorrelationOwnershipRecord,
     IncidentEventRecord,
     IncidentInvestigationBindingRecord,
@@ -3597,6 +3599,300 @@ class IncidentRepository:
             "alert_id": str(row.alert_id),
             "recommendation_id": str(row.recommendation_id),
         }
+
+    @staticmethod
+    def _evidence_draft_payload(row: EvidenceRagDraftRecord) -> dict[str, Any]:
+        return {
+            "draft_id": str(row.draft_id), "tenant_id": row.tenant_id,
+            "tenant_scope": row.tenant_id, "project_id": row.project_id,
+            "incident_id": str(row.incident_id), "alert_id": str(row.alert_id),
+            "analysis_request_id": str(row.analysis_request_id),
+            "context_snapshot_id": str(row.context_snapshot_id),
+            "context_fingerprint": row.context_fingerprint,
+            "recommendation_id": str(row.recommendation_id), "rca_version": row.rca_version,
+            "document_kind": row.document_kind, "document_version": row.document_version,
+            "status": row.status, "title": row.title, "content": row.content,
+            "content_checksum": row.content_checksum, "evidence_ids": list(row.evidence_ids or []),
+            "source_uris": list(row.source_uris or []), "owner_team": row.owner_team,
+            "created_by": row.created_by, "reviewed_by": row.reviewed_by,
+            "review_notes": row.review_notes,
+            "reviewed_at": row.reviewed_at.isoformat() if row.reviewed_at else None,
+            "approved_by": row.approved_by,
+            "approved_at": row.approved_at.isoformat() if row.approved_at else None,
+            "indexed_at": row.indexed_at.isoformat() if row.indexed_at else None,
+            "row_version": row.row_version,
+            "created_at": row.created_at.isoformat(), "updated_at": row.updated_at.isoformat(),
+        }
+
+    async def _verified_draft_binding(
+        self, *, tenant_id: str, incident_id: UUID | str, alert_id: UUID | str,
+        analysis_request_id: UUID | str, context_snapshot_id: UUID | str,
+        context_fingerprint: str, recommendation_id: UUID | str, rca_version: int,
+        evidence_ids: list[str], source_uris: list[str], lock: bool = False,
+    ) -> IncidentInvestigationBindingRecord:
+        tenant = require_tenant_id(tenant_id, source="evidence draft binding")
+        identities = [self._parse_uuid(value) for value in (
+            incident_id, alert_id, analysis_request_id, context_snapshot_id, recommendation_id,
+        )]
+        if any(value is None for value in identities):
+            raise ValueError("malformed investigation UUID identity")
+        incident_uuid, alert_uuid, analysis_uuid, snapshot_uuid, recommendation_uuid = identities
+        fingerprint = str(context_fingerprint or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            raise ValueError("context_fingerprint must be 64 lowercase hexadecimal characters")
+        projection_stmt = select(IncidentProjectionRecord).where(
+            IncidentProjectionRecord.tenant_id == tenant,
+            IncidentProjectionRecord.incident_id == incident_uuid,
+            IncidentProjectionRecord.alert_id == alert_uuid,
+        )
+        if lock:
+            projection_stmt = projection_stmt.with_for_update()
+        projection = (await self.session.execute(projection_stmt)).scalar_one_or_none()
+        binding = await self.session.get(IncidentInvestigationBindingRecord, recommendation_uuid)
+        if projection is None or projection.recommendation_id != recommendation_uuid or binding is None:
+            raise RuntimeError("stale or missing investigation binding")
+        actual = (
+            binding.tenant_id, binding.incident_id, binding.alert_id, binding.analysis_request_id,
+            binding.context_snapshot_id, binding.context_fingerprint, binding.recommendation_id,
+            int(binding.rca_version),
+        )
+        expected = (
+            tenant, incident_uuid, alert_uuid, analysis_uuid, snapshot_uuid, fingerprint,
+            recommendation_uuid, int(rca_version),
+        )
+        if actual != expected:
+            raise RuntimeError("stale or mismatched investigation binding")
+        verified = await self.get_bound_incident_investigation(
+            tenant_id=tenant, incident_id=incident_uuid, alert_id=alert_uuid,
+            recommendation_id=recommendation_uuid,
+        )
+        if not verified.get("investigation_integrity", {}).get("verified"):
+            raise RuntimeError("investigation binding is no longer current")
+        recommendation = verified.get("recommendation") or {}
+        metadata = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
+        accepted_ids = metadata.get("evidence_ids")
+        if not isinstance(accepted_ids, list):
+            analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
+            accepted_ids = analysis.get("evidence_used", [])
+        accepted_id_set = {str(value).strip() for value in accepted_ids if str(value).strip()}
+        snapshot = verified.get("context_snapshot") or {}
+        context = snapshot.get("context") if isinstance(snapshot.get("context"), dict) else {}
+        context_metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+        buckets = context_metadata.get("context_evidence") or context.get("context_evidence") or {}
+        evidence_rows = [
+            item for rows in (buckets.values() if isinstance(buckets, dict) else [])
+            if isinstance(rows, list) for item in rows if isinstance(item, dict)
+        ]
+        accepted_uri_set = {
+            str(item.get(key)).strip() for item in evidence_rows
+            if str(item.get("evidence_id") or item.get("id") or "").strip() in accepted_id_set
+            for key in ("uri", "source_uri", "path", "citation") if str(item.get(key) or "").strip()
+        }
+        requested_ids = {str(value).strip() for value in evidence_ids if str(value).strip()}
+        requested_uris = {str(value).strip() for value in source_uris if str(value).strip()}
+        if not requested_ids.issubset(accepted_id_set) or not requested_uris.issubset(accepted_uri_set):
+            raise RuntimeError("evidence does not belong to the accepted bound snapshot")
+        return binding
+
+    async def create_evidence_rag_drafts(
+        self, *, tenant_id: str, created_by: str, binding: dict[str, Any],
+        documents: list[dict[str, str]], evidence_ids: list[str], source_uris: list[str],
+    ) -> list[dict[str, Any]]:
+        verified = await self._verified_draft_binding(
+            tenant_id=tenant_id, incident_id=binding.get("incident_id"),
+            alert_id=binding.get("alert_id"), analysis_request_id=binding.get("analysis_request_id"),
+            context_snapshot_id=binding.get("context_snapshot_id"),
+            context_fingerprint=str(binding.get("context_fingerprint") or ""),
+            recommendation_id=binding.get("recommendation_id"),
+            rca_version=int(binding.get("rca_version") or 0),
+            evidence_ids=evidence_ids, source_uris=source_uris,
+        )
+        alert_uuid = self._parse_uuid(binding["alert_id"])
+        results: list[dict[str, Any]] = []
+        for document in documents:
+            kind = str(document["document_kind"])
+            existing = (await self.session.execute(select(EvidenceRagDraftRecord).where(
+                EvidenceRagDraftRecord.tenant_id == tenant_id,
+                EvidenceRagDraftRecord.alert_id == alert_uuid,
+                EvidenceRagDraftRecord.document_kind == kind,
+                EvidenceRagDraftRecord.context_snapshot_id == verified.context_snapshot_id,
+                EvidenceRagDraftRecord.recommendation_id == verified.recommendation_id,
+                EvidenceRagDraftRecord.status.in_(("draft", "reviewed", "approved_pending_index")),
+            ).order_by(EvidenceRagDraftRecord.document_version.desc()).limit(1))).scalar_one_or_none()
+            if existing is not None:
+                results.append(self._evidence_draft_payload(existing))
+                continue
+            latest = await self.session.scalar(select(func.max(EvidenceRagDraftRecord.document_version)).where(
+                EvidenceRagDraftRecord.tenant_id == tenant_id,
+                EvidenceRagDraftRecord.alert_id == alert_uuid,
+                EvidenceRagDraftRecord.document_kind == kind,
+            ))
+            now = datetime.now(UTC)
+            row = EvidenceRagDraftRecord(
+                draft_id=uuid4(), tenant_id=tenant_id, project_id=verified.project_id,
+                incident_id=verified.incident_id, alert_id=verified.alert_id,
+                analysis_request_id=verified.analysis_request_id,
+                context_snapshot_id=verified.context_snapshot_id,
+                context_fingerprint=verified.context_fingerprint,
+                recommendation_id=verified.recommendation_id, rca_version=verified.rca_version,
+                document_kind=kind, document_version=int(latest or 0) + 1, status="draft",
+                title=document["title"], content=document["content"],
+                content_checksum=f"sha256:{hashlib.sha256(document['content'].encode()).hexdigest()}",
+                evidence_ids=evidence_ids, source_uris=source_uris, created_by=created_by,
+                created_at=now, updated_at=now,
+            )
+            self.session.add(row)
+            await self.session.flush()
+            results.append(self._evidence_draft_payload(row))
+        return results
+
+    async def list_evidence_rag_drafts(
+        self, *, tenant_id: str, alert_id: UUID | str | None = None,
+        status: str | None = None, document_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = select(EvidenceRagDraftRecord).where(EvidenceRagDraftRecord.tenant_id == tenant_id)
+        if alert_id is not None:
+            parsed = self._parse_uuid(alert_id)
+            if parsed is None:
+                raise ValueError("malformed alert UUID")
+            query = query.where(EvidenceRagDraftRecord.alert_id == parsed)
+        if status:
+            query = query.where(EvidenceRagDraftRecord.status == status.lower())
+        if document_kind:
+            query = query.where(EvidenceRagDraftRecord.document_kind == document_kind.lower())
+        rows = (await self.session.execute(query.order_by(EvidenceRagDraftRecord.updated_at.desc()))).scalars()
+        return [self._evidence_draft_payload(row) for row in rows]
+
+    async def review_evidence_rag_draft(
+        self, *, tenant_id: str, draft_id: UUID | str, expected_row_version: int,
+        title: str, content: str, review_notes: str | None, reviewed_by: str,
+    ) -> dict[str, Any] | None:
+        parsed = self._parse_uuid(draft_id)
+        if parsed is None:
+            return None
+        now = datetime.now(UTC)
+        result = await self.session.execute(update(EvidenceRagDraftRecord).where(
+            EvidenceRagDraftRecord.draft_id == parsed,
+            EvidenceRagDraftRecord.tenant_id == tenant_id,
+            EvidenceRagDraftRecord.row_version == expected_row_version,
+            EvidenceRagDraftRecord.status.in_(("draft", "reviewed")),
+        ).values(
+            title=title, content=content,
+            content_checksum=f"sha256:{hashlib.sha256(content.encode()).hexdigest()}",
+            status="reviewed", reviewed_by=reviewed_by, review_notes=review_notes,
+            reviewed_at=now, updated_at=now,
+            row_version=EvidenceRagDraftRecord.row_version + 1,
+        ))
+        if result.rowcount != 1:
+            return None
+        row = await self.session.get(EvidenceRagDraftRecord, parsed)
+        return self._evidence_draft_payload(row)
+
+    async def approve_evidence_rag_draft(
+        self, *, tenant_id: str, draft_id: UUID | str, expected_row_version: int,
+        approved_by: str, owner_team: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        parsed = self._parse_uuid(draft_id)
+        if parsed is None:
+            return None
+        row = (await self.session.execute(select(EvidenceRagDraftRecord).where(
+            EvidenceRagDraftRecord.draft_id == parsed,
+            EvidenceRagDraftRecord.tenant_id == tenant_id,
+        ).with_for_update())).scalar_one_or_none()
+        if row is None:
+            return None
+        if row.status != "reviewed" or row.row_version != expected_row_version:
+            raise RuntimeError("stale evidence draft or direct approval is prohibited")
+        if not row.evidence_ids or not row.source_uris:
+            raise RuntimeError("accepted evidence IDs and validated source URIs are required")
+        await self._verified_draft_binding(
+            tenant_id=tenant_id, incident_id=row.incident_id, alert_id=row.alert_id,
+            analysis_request_id=row.analysis_request_id, context_snapshot_id=row.context_snapshot_id,
+            context_fingerprint=row.context_fingerprint, recommendation_id=row.recommendation_id,
+            rca_version=row.rca_version, evidence_ids=list(row.evidence_ids),
+            source_uris=list(row.source_uris), lock=True,
+        )
+        checksum = f"sha256:{hashlib.sha256(row.content.encode()).hexdigest()}"
+        if checksum != row.content_checksum:
+            raise RuntimeError("evidence draft checksum mismatch")
+        if await self.session.scalar(select(func.count()).select_from(GovernedRagDocumentRecord).where(
+            GovernedRagDocumentRecord.draft_id == row.draft_id,
+        )):
+            raise RuntimeError("approved evidence documents are immutable")
+        now = datetime.now(UTC)
+        document = GovernedRagDocumentRecord(
+            document_id=uuid4(), draft_id=row.draft_id, tenant_id=row.tenant_id,
+            incident_id=row.incident_id, alert_id=row.alert_id,
+            context_snapshot_id=row.context_snapshot_id,
+            context_fingerprint=row.context_fingerprint, recommendation_id=row.recommendation_id,
+            rca_version=row.rca_version, document_kind=row.document_kind,
+            document_version=row.document_version, title=row.title, content=row.content,
+            content_checksum=checksum, evidence_ids=list(row.evidence_ids),
+            source_uris=list(row.source_uris), corpus_classification="TENANT_CURATED",
+            review_status="approved", approved_by=approved_by, approved_at=now,
+            index_status="pending", created_at=now,
+        )
+        self.session.add(document)
+        row.status = "approved_pending_index"
+        row.owner_team = owner_team
+        row.approved_by = approved_by
+        row.approved_at = now
+        row.updated_at = now
+        row.row_version += 1
+        payload = {
+            "document_id": str(document.document_id), "draft_id": str(row.draft_id),
+            "tenant_id": row.tenant_id, "incident_id": str(row.incident_id),
+            "alert_id": str(row.alert_id), "context_snapshot_id": str(row.context_snapshot_id),
+            "context_fingerprint": row.context_fingerprint,
+            "recommendation_id": str(row.recommendation_id), "rca_version": row.rca_version,
+            "document_kind": row.document_kind, "document_version": row.document_version,
+            "content_checksum": checksum,
+        }
+        self.session.add(AuditLogRecord(
+            tenant_id=tenant_id, actor=approved_by, action="rag.document.approved",
+            resource_type="governed_rag_document", resource_id=str(document.document_id),
+            payload=payload,
+        ))
+        await self.enqueue_resolution_event(
+            event_id=f"rag-document-approved:{document.document_id}",
+            aggregate_id=str(row.incident_id), topic="rag.document.approved",
+            partition_key=str(row.incident_id), payload=payload, tenant_id=tenant_id,
+            available_after_seconds=0,
+        )
+        await self.session.flush()
+        return self._evidence_draft_payload(row), payload
+
+    async def mark_governed_rag_document_indexed(
+        self, *, tenant_id: str, document_id: UUID | str,
+    ) -> dict[str, Any] | None:
+        parsed = self._parse_uuid(document_id)
+        document = await self.session.get(GovernedRagDocumentRecord, parsed) if parsed else None
+        if document is None or document.tenant_id != tenant_id:
+            return None
+        now = datetime.now(UTC)
+        document.index_status = "indexed"
+        document.indexed_at = now
+        draft = await self.session.get(EvidenceRagDraftRecord, document.draft_id)
+        if draft is not None and draft.tenant_id == tenant_id:
+            draft.status = "approved"
+            draft.indexed_at = now
+            draft.updated_at = now
+            draft.row_version += 1
+        await self.session.flush()
+        return {"document_id": str(document.document_id), "index_status": "indexed"}
+
+    async def list_retrievable_governed_rag_documents(
+        self, *, tenant_id: str, document_kind: str | None = None,
+    ) -> list[GovernedRagDocumentRecord]:
+        query = select(GovernedRagDocumentRecord).where(
+            GovernedRagDocumentRecord.tenant_id == tenant_id,
+            GovernedRagDocumentRecord.review_status == "approved",
+            GovernedRagDocumentRecord.index_status == "indexed",
+            GovernedRagDocumentRecord.corpus_classification == "TENANT_CURATED",
+        )
+        if document_kind:
+            query = query.where(GovernedRagDocumentRecord.document_kind == document_kind)
+        return list((await self.session.execute(query)).scalars())
 
     async def persist_governed_resolution_selection(
         self,

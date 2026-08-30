@@ -460,6 +460,92 @@ class IncidentInvestigationBindingRecord(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
+class EvidenceRagDraftRecord(Base, TimestampMixin):
+    """Mutable review workspace bound to one immutable investigation version."""
+
+    __tablename__ = "evidence_rag_drafts"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "alert_id", "document_kind", "document_version",
+            name="uq_evidence_draft_version",
+        ),
+        Index("ix_evidence_draft_incident", "tenant_id", "incident_id", "status"),
+        Index("ix_evidence_draft_alert", "tenant_id", "alert_id", "status"),
+        Index(
+            "ix_evidence_draft_context", "tenant_id", "context_snapshot_id", "recommendation_id",
+        ),
+    )
+
+    draft_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    project_id: Mapped[str | None] = mapped_column(String(128))
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    alert_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    analysis_request_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    context_snapshot_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    context_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    recommendation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    rca_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    document_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    document_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    title: Mapped[str] = mapped_column(String(160), nullable=False)
+    content: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False)
+    content_checksum: Mapped[str] = mapped_column(String(71), nullable=False)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    source_uris: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    owner_team: Mapped[str | None] = mapped_column(String(160))
+    created_by: Mapped[str] = mapped_column(String(160), nullable=False)
+    reviewed_by: Mapped[str | None] = mapped_column(String(160))
+    review_notes: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_by: Mapped[str | None] = mapped_column(String(160))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    row_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+
+class GovernedRagDocumentRecord(Base):
+    """Immutable approved tenant-curated document awaiting or present in the index."""
+
+    __tablename__ = "governed_rag_documents"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "alert_id", "document_kind", "document_version",
+            name="uq_governed_document_version",
+        ),
+        UniqueConstraint("draft_id", name="uq_governed_document_draft"),
+        Index(
+            "ix_governed_rag_retrieval",
+            "tenant_id", "review_status", "index_status", "document_kind",
+        ),
+    )
+
+    document_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    draft_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    alert_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    context_snapshot_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    context_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    recommendation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    rca_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    document_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    document_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(160), nullable=False)
+    content: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False)
+    content_checksum: Mapped[str] = mapped_column(String(71), nullable=False)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    source_uris: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    corpus_classification: Mapped[str] = mapped_column(String(32), nullable=False)
+    review_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    approved_by: Mapped[str] = mapped_column(String(160), nullable=False)
+    approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    index_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class GovernedResolutionPlanRecord(Base):
     """Immutable catalog selection bound to one exact RCA generation."""
 
