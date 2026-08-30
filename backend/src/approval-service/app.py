@@ -453,19 +453,35 @@ async def _approval_from_request(
     )
     recommendation = pending.get("recommendation", {}) if isinstance(pending, dict) else {}
     metadata = recommendation.get("metadata", {}) if isinstance(recommendation, dict) else {}
-    plan = metadata.get("execution_plan", {}) if isinstance(metadata, dict) else {}
+    plan: dict[str, Any] = {}
     if decision == ApprovalDecision.MODIFIED:
         raise HTTPException(status_code=409, detail="Modified approvals cannot authorize execution.")
     if decision == ApprovalDecision.APPROVED:
         pending_recommendation_id = (
             _first_recommendation_id(pending, recommendation)
-            or str(plan.get("recommendation_version") or "").strip()
         )
         if not pending_recommendation_id or str(recommendation_id) != pending_recommendation_id:
             raise HTTPException(
                 status_code=409,
                 detail="Approval recommendation is stale and does not match the current governed plan.",
             )
+        try:
+            rca_version = int(metadata.get("rca_version") or 0)
+        except (TypeError, ValueError):
+            rca_version = 0
+        if not rca_version:
+            raise HTTPException(status_code=409, detail="Approval blocked: the current RCA version is unavailable.")
+        try:
+            async with app.state.session_factory() as session:
+                plan = await IncidentRepository(session).get_current_execution_plan_for_incident(
+                    tenant_id=request.tenant_id, incident_id=request.incident_id,
+                    recommendation_id=recommendation_id, rca_version=rca_version,
+                ) or {}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("failed to load canonical execution plan")
+            raise HTTPException(status_code=503, detail="Canonical execution plan is temporarily unavailable.") from exc
         if not plan:
             raise HTTPException(
                 status_code=409,
@@ -486,11 +502,31 @@ async def _approval_from_request(
                     "Regenerate incident analysis before approval."
                 ),
             )
-        if str(plan.get("recommendation_version") or "") != pending_recommendation_id:
+        selection = metadata.get("resolution_selection") if isinstance(metadata.get("resolution_selection"), dict) else {}
+        exact_bindings = {
+            "tenant": str(plan.get("tenant_id") or "") == request.tenant_id,
+            "incident": str(plan.get("incident_id") or "") == str(request.incident_id),
+            "recommendation": str(plan.get("recommendation_id") or "") == pending_recommendation_id,
+            "rca_version": int(plan.get("rca_version") or 0) == rca_version,
+            "context_snapshot": str(plan.get("evidence_snapshot_id") or "") == str(metadata.get("context_snapshot_id") or ""),
+            "context_fingerprint": str(plan.get("context_fingerprint") or "") == str(metadata.get("context_fingerprint") or ""),
+            "selection": str(plan.get("resolution_selection_id") or "") == str(selection.get("selection_id") or ""),
+            "plan_id": str(plan.get("plan_id") or "") == str(request.plan_id or ""),
+            "plan_fingerprint": str(plan.get("plan_fingerprint") or "") == str(request.plan_fingerprint or ""),
+            "policy_version": bool(str(plan.get("policy_version") or "").strip()),
+        }
+        mismatches = [name for name, matched in exact_bindings.items() if not matched]
+        if mismatches:
             raise HTTPException(
                 status_code=409,
-                detail="Approval recommendation version does not match the current governed recommendation.",
+                detail="Approval bindings do not match the canonical execution plan: " + ", ".join(mismatches),
             )
+        pending = dict(pending)
+        recommendation = dict(recommendation)
+        metadata = dict(metadata)
+        metadata["execution_plan"] = plan
+        recommendation["metadata"] = metadata
+        pending["recommendation"] = recommendation
         readiness = _signed_approval_readiness(pending)
         if readiness.get("state") != "execution_eligible":
             missing = [str(item).replace("_", " ") for item in readiness.get("missing", []) if str(item).strip()]
@@ -539,6 +575,9 @@ async def _approval_from_request(
             "rca_version": plan.get("rca_version") if decision == ApprovalDecision.APPROVED else None,
             "evidence_snapshot_id": plan.get("evidence_snapshot_id") if decision == ApprovalDecision.APPROVED else None,
             "recommendation_version": plan.get("recommendation_version") if decision == ApprovalDecision.APPROVED else None,
+            "resolution_selection_id": plan.get("resolution_selection_id") if decision == ApprovalDecision.APPROVED else None,
+            "context_fingerprint": plan.get("context_fingerprint") if decision == ApprovalDecision.APPROVED else None,
+            "policy_version": plan.get("policy_version") if decision == ApprovalDecision.APPROVED else None,
             "target_resource_id": (
                 plan.get("target_resource_id") or plan.get("remediation_target")
                 if decision == ApprovalDecision.APPROVED else None
