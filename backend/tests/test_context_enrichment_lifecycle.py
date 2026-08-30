@@ -4,10 +4,12 @@ from uuid import uuid4
 import pytest
 from ai_workbench_common.models import Context
 from common.context_enrichment_contract import EvidenceRequirement, HitlRoutingConfiguration
+from common.database import ContextSnapshotRecord, IncidentInvestigationBindingRecord
 from common.models import Alert, AlertSeverity
 from common.repository import ContextEnrichmentRepository
 from context_agent.connectors import execute_enrichment_plan
 from context_agent.context_quality import plan_missing_evidence
+from sqlalchemy import select
 
 
 def context_for(incident_id, *, tenant_id="tenant-a") -> Context:
@@ -92,6 +94,23 @@ async def test_human_response_is_tenant_scoped_and_recorded_as_assertion(sqlite_
     )
     async with sqlite_session_factory() as session:
         repo = ContextEnrichmentRepository(session)
+        now = datetime.now(UTC)
+        snapshot_id, alert_id, analysis_id, recommendation_id = uuid4(), uuid4(), uuid4(), uuid4()
+        session.add(ContextSnapshotRecord(
+            snapshot_id=snapshot_id, tenant_id="tenant-a", incident_id=str(incident_id),
+            source_incident_id=str(incident_id), alert_signature="alert-signature",
+            subject_fingerprint="s" * 64, context_fingerprint="c" * 64,
+            snapshot_stage="final", snapshot_version=1, evidence_ids=["metric-1"],
+            evidence_checksums={"metric-1": "m" * 64}, contract_version="kaiops.context.v2",
+            quality_score=0.5, reusable=False, source_manifest={}, payload={"metadata": {}},
+            collected_at=now, expires_at=now + timedelta(hours=1),
+        ))
+        session.add(IncidentInvestigationBindingRecord(
+            tenant_id="tenant-a", project_id="project-a", incident_id=incident_id,
+            alert_id=alert_id, analysis_request_id=analysis_id, context_snapshot_id=snapshot_id,
+            context_fingerprint="c" * 64, recommendation_id=recommendation_id,
+            rca_version=1, status="grounded", created_at=now, expires_at=now + timedelta(hours=1),
+        ))
         await repo.upsert_context_evidence_requirements([requirement])
         await repo.create_human_evidence_request(
             tenant_id="tenant-a", incident_id=incident_id, requirement_id=requirement.requirement_id,
@@ -109,11 +128,20 @@ async def test_human_response_is_tenant_scoped_and_recorded_as_assertion(sqlite_
             response={"response": "yes", "responder_id": "owner-a", "responded_at": datetime.now(UTC).isoformat()},
         )
         assert recorded["evidence_id"].startswith("HUMAN-")
+        assert recorded["context_snapshot_id"] is not None
         gaps = await repo.list_context_evidence_requirements(
             tenant_id="tenant-a", incident_id=incident_id,
         )
         assert gaps[0]["status"] == "answered"
         assert gaps[0]["evidence_ids"] == [recorded["evidence_id"]]
+        latest = (await session.execute(
+            select(ContextSnapshotRecord).where(
+                ContextSnapshotRecord.tenant_id == "tenant-a",
+                ContextSnapshotRecord.incident_id == str(incident_id),
+            ).order_by(ContextSnapshotRecord.snapshot_version.desc())
+        )).scalars().first()
+        assert latest.snapshot_version == 2
+        assert latest.parent_snapshot_id == snapshot_id
 
 
 def test_hitl_routing_configuration_rejects_placeholder_identity():

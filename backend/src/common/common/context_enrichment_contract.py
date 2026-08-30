@@ -6,7 +6,6 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-
 EvidenceCategory = Literal[
     "metrics", "logs", "traces", "topology", "deployment", "change",
     "source_code", "database", "ticket", "runbook", "ownership",
@@ -122,3 +121,58 @@ class HumanEvidenceResponse(BaseModel):
     responder_id: str = Field(min_length=1, max_length=255)
     source_reference: str | None = Field(default=None, max_length=1536)
     responded_at: datetime
+
+
+class HitlJiraRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    incident_id: UUID
+    service: str
+    environment: str
+    severity: str
+    approval_type: str
+    summary: str
+    recommendation_id: UUID
+    rca_version: int = Field(ge=1)
+    context_snapshot_id: UUID
+    context_fingerprint: str = Field(min_length=64, max_length=64)
+    resolution_selection_id: UUID
+    execution_plan_id: UUID
+    plan_fingerprint: str = Field(min_length=64, max_length=71)
+    risk: str
+    rollback_plan: str
+    approval_expires_at: datetime
+    evidence_summary_url: str
+    routing: HitlRoutingConfiguration
+    closure_policy: TicketClosurePolicy
+
+
+class JiraClosureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    incident_id: UUID
+    jira_issue_key: str
+    transition_id: str
+    expected_jira_status: str
+    remediation_status: str
+    validation_status: str
+    required_validators_complete: bool
+    alerts_cleared: bool
+    stability_window_passed: bool
+    rollback_not_active: bool
+    critical_contradictions: list[str] = Field(default_factory=list)
+    current_plan_matches_approved_plan: bool
+    human_confirmation: bool = False
+
+
+class JiraRegressionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    incident_id: UUID
+    jira_issue_key: str
+    transition_id: str
+    regression_evidence_ids: list[str] = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=2000)

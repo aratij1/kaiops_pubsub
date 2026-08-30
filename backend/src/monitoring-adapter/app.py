@@ -23,6 +23,7 @@ from ai_workbench_common.prompts import PROMPT_SUMMARIZE_RCA
 from common.ai_layer_client import AiLayerClient
 from common.config import get_settings
 from common.database import create_engine, create_schema, create_session_factory
+from common.context_enrichment_contract import HitlJiraRequest, JiraClosureRequest, JiraRegressionRequest, TicketClosurePolicy
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.logging import get_logger
 from common.models import (
@@ -39,9 +40,18 @@ from common.models import (
     RemediationStatus,
     ResolutionReport,
 )
+from common.jira_governance import (
+    governed_jira_action,
+    jira_actor_id,
+    jira_issue_status,
+    jira_webhook_event_id,
+    kaims_may_close_ticket,
+    validate_jira_approval,
+)
+from common.hitl_routing import resolve_hitl_assignee
 from common.object_storage import build_object_storage
 from common.orchestration.execution_plan import resolve_execution_plan
-from common.repository import IncidentRepository, ObjectStorageRepository
+from common.repository import ContextEnrichmentRepository, IncidentRepository, ObjectStorageRepository
 from common.service import create_app
 from common.telemetry import EVENT_CONTRACTS_EMITTED, EVENT_PUBLISH_LATENCY
 from common.topics import (
@@ -308,6 +318,19 @@ JIRA_API_EMAIL = str(os.getenv("JIRA_API_EMAIL", "") or "").strip()
 JIRA_API_TOKEN = str(os.getenv("JIRA_API_TOKEN", "") or "").strip()
 JIRA_PROJECT_KEY = str(os.getenv("JIRA_PROJECT_KEY", "KAN") or "").strip()
 JIRA_ISSUE_TYPE = str(os.getenv("JIRA_ISSUE_TYPE", "Bug") or "").strip()
+try:
+    JIRA_TRANSITION_MAPPING = json.loads(os.getenv("JIRA_TRANSITION_MAPPING", "{}") or "{}")
+except json.JSONDecodeError:
+    JIRA_TRANSITION_MAPPING = {}
+if not isinstance(JIRA_TRANSITION_MAPPING, dict):
+    JIRA_TRANSITION_MAPPING = {}
+JIRA_TRANSITION_MAPPING = {
+    "approved": str(JIRA_TRANSITION_MAPPING.get("approved") or "approved"),
+    "rejected": str(JIRA_TRANSITION_MAPPING.get("rejected") or "rejected"),
+    "resolved": str(JIRA_TRANSITION_MAPPING.get("resolved") or "resolved"),
+    "closed": str(JIRA_TRANSITION_MAPPING.get("closed") or "closed"),
+    "reopened": str(JIRA_TRANSITION_MAPPING.get("reopened") or "reopened"),
+}
 CENTRALIZED_JIRA_ROUTING_ENABLED = str(os.getenv("CENTRALIZED_JIRA_ROUTING_ENABLED", "false")).strip().lower() in {
     "1",
     "true",
@@ -1793,14 +1816,50 @@ async def _jira_poll_worker() -> None:
         return
     while not stop_event.is_set():
         try:
-            issues = await client.list_recent_issues(limit=JIRA_POLL_BATCH_SIZE)
+            session_factory = getattr(app.state, "session_factory", None)
+            cursors = []
+            if settings.database_enabled and session_factory is not None:
+                async with session_factory() as session:
+                    cursors = await ContextEnrichmentRepository(session).list_jira_sync_cursors(
+                        jira_project_key=JIRA_PROJECT_KEY,
+                    )
+            earliest = min(
+                (row.last_jira_updated_timestamp for row in cursors if row.last_jira_updated_timestamp),
+                default=datetime.now(UTC) - timedelta(minutes=5),
+            )
+            overlap_start = earliest - timedelta(minutes=2)
+            issues = await client.search_updated_issues(
+                updated_since=overlap_start, limit=JIRA_POLL_BATCH_SIZE,
+            )
             ingested = 0
-            for issue in reversed(issues):
+            for issue in issues:
                 fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
                 version = f"{issue.get('key')}:{fields.get('updated') or fields.get('created') or ''}"
                 if version in _JIRA_SESSION_VERSIONS:
                     continue
-                payload = {"webhookEvent": "jira:poll", "issue": issue, "event_origin": "jira"}
+                payload = {
+                    "webhookEvent": "jira:poll", "issue": issue,
+                    "event_origin": "jira-reconciliation", "timestamp": fields.get("updated"),
+                }
+                governed = await _process_governed_jira_event(payload)
+                tenant_id, project_key, issue_key = _governed_jira_scope(payload)
+                if tenant_id and project_key == JIRA_PROJECT_KEY and session_factory is not None:
+                    updated_raw = str(fields.get("updated") or "").replace("Z", "+00:00")
+                    try:
+                        updated_at = datetime.fromisoformat(updated_raw)
+                    except ValueError:
+                        updated_at = datetime.now(UTC)
+                    async with session_factory() as session:
+                        await ContextEnrichmentRepository(session).save_jira_sync_cursor(
+                            tenant_id=tenant_id, jira_project_key=project_key, poll_status="succeeded",
+                            last_successful_poll_at=datetime.now(UTC),
+                            last_jira_updated_timestamp=updated_at, last_issue_key=issue_key,
+                            poll_error=None,
+                        )
+                        await session.commit()
+                if governed:
+                    _JIRA_SESSION_VERSIONS.add(version)
+                    continue
                 mapped_payload, _ = _jira_payload_to_alert_payload(payload)
                 alert = _build_alert_from_payload(mapped_payload)
                 labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
@@ -5271,6 +5330,151 @@ def _jira_api_client() -> JiraClient | None:
     )
 
 
+@app.post("/api/v1/jira/hitl-assignments")
+async def create_hitl_jira_assignment(request: HitlJiraRequest) -> dict[str, Any]:
+    client = _jira_api_client()
+    session_factory = getattr(app.state, "session_factory", None)
+    if client is None or session_factory is None:
+        raise HTTPException(status_code=503, detail="Jira lifecycle integration is not configured")
+    if request.routing.jira_project_key != JIRA_PROJECT_KEY:
+        raise HTTPException(status_code=409, detail="HITL routing project does not match configured Jira project")
+    assignment = await resolve_hitl_assignee(
+        request.tenant_id, {"id": request.incident_id}, request.approval_type,
+        request.severity, routing=request.routing,
+    )
+    description = "\n".join([
+        "KaiMS governed human decision request",
+        f"Incident: {request.incident_id}", f"Recommendation: {request.recommendation_id}",
+        f"RCA version: {request.rca_version}",
+        f"Context snapshot: {request.context_snapshot_id}",
+        f"Context fingerprint: {request.context_fingerprint}",
+        f"Resolution selection: {request.resolution_selection_id}",
+        f"Execution plan: {request.execution_plan_id}",
+        f"Plan fingerprint: {request.plan_fingerprint}", f"Risk: {request.risk}",
+        f"Rollback: {request.rollback_plan}",
+        f"Approval expiry: {request.approval_expires_at.isoformat()}",
+    ])
+    try:
+        issue_key, operation = await client.create_or_update_incident(
+            incident_id=str(request.incident_id), summary=request.summary,
+            description=description, severity=request.severity,
+            labels={"tenant": request.tenant_id, "service": request.service,
+                    "environment": request.environment},
+        )
+        await client.assign_issue(issue_key, account_id=assignment.assignee)
+        await client.add_comment(issue_key, description)
+        if request.evidence_summary_url.startswith(("https://", "http://")):
+            await client.add_remote_link(
+                issue_key, url=request.evidence_summary_url,
+                title=f"KaiMS evidence for {request.incident_id}",
+            )
+        approval_transition = str(request.routing.jira_transition_mapping.get("approval_pending") or "")
+        if approval_transition:
+            await client.transition_issue(issue_key, transition_id=approval_transition)
+    except JiraClientError as exc:
+        raise HTTPException(status_code=502, detail="Jira rejected the governed HITL request") from exc
+    async with session_factory() as session:
+        binding = await ContextEnrichmentRepository(session).bind_jira_incident(
+            tenant_id=request.tenant_id, incident_id=request.incident_id,
+            jira_issue_key=issue_key, jira_project_key=request.routing.jira_project_key,
+            assignee_id=assignment.assignee,
+            assignee_group=assignment.assignee if assignment.assignment_type == "group" else None,
+            recommendation_id=request.recommendation_id, rca_version=request.rca_version,
+            context_snapshot_id=request.context_snapshot_id,
+            context_fingerprint=request.context_fingerprint,
+            resolution_selection_id=request.resolution_selection_id,
+            execution_plan_id=request.execution_plan_id, plan_fingerprint=request.plan_fingerprint,
+            approval_expires_at=request.approval_expires_at,
+            ownership=request.closure_policy.ownership,
+            closure_policy=request.closure_policy.model_dump(mode="json"),
+        )
+        await session.commit()
+    return {"operation": operation, "jira_issue_key": issue_key,
+            "assignment": assignment.model_dump(mode="json"), "binding": binding}
+
+
+@app.post("/api/v1/jira/closure")
+async def synchronize_jira_closure(request: JiraClosureRequest) -> dict[str, Any]:
+    client = _jira_api_client()
+    session_factory = getattr(app.state, "session_factory", None)
+    if client is None or session_factory is None:
+        raise HTTPException(status_code=503, detail="Jira lifecycle integration is not configured")
+    async with session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        binding = await repo.get_jira_incident_binding(
+            tenant_id=request.tenant_id, jira_issue_key=request.jira_issue_key,
+            jira_project_key=JIRA_PROJECT_KEY,
+        )
+        if binding is None or binding["incident_id"] != str(request.incident_id):
+            raise HTTPException(status_code=404, detail="Tenant-scoped Jira incident binding not found")
+        allowed, blockers = kaims_may_close_ticket(
+            TicketClosurePolicy.model_validate(binding["closure_policy"]),
+            request.model_dump(mode="json"),
+        )
+        if not allowed:
+            raise HTTPException(status_code=409, detail={"message": "Jira closure is blocked", "blockers": blockers})
+        try:
+            await client.add_comment(
+                request.jira_issue_key,
+                "[kaiops-managed-update] Remediation and authoritative validation succeeded; "
+                "the configured stability window passed.",
+            )
+            await client.transition_issue(request.jira_issue_key, transition_id=request.transition_id)
+            issue = await client.get_issue(request.jira_issue_key)
+            fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+            status = fields.get("status") if isinstance(fields.get("status"), dict) else {}
+            confirmed = str(status.get("name") or status.get("id") or "")
+            if confirmed.lower() != request.expected_jira_status.lower():
+                raise JiraClientError("Jira did not confirm the configured closure state")
+        except JiraClientError:
+            result = await repo.update_jira_binding_status(
+                tenant_id=request.tenant_id, jira_issue_key=request.jira_issue_key,
+                status="closure_pending_sync", jira_status=binding["jira_status"],
+            )
+            await session.commit()
+            return {"closed": False, "retryable": True, "binding": result}
+        result = await repo.update_jira_binding_status(
+            tenant_id=request.tenant_id, jira_issue_key=request.jira_issue_key,
+            status="closed", jira_status=confirmed,
+        )
+        await session.commit()
+    return {"closed": True, "retryable": False, "binding": result}
+
+
+@app.post("/api/v1/jira/regressions")
+async def reopen_jira_for_regression(request: JiraRegressionRequest) -> dict[str, Any]:
+    client = _jira_api_client()
+    session_factory = getattr(app.state, "session_factory", None)
+    if client is None or session_factory is None:
+        raise HTTPException(status_code=503, detail="Jira lifecycle integration is not configured")
+    async with session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        binding = await repo.get_jira_incident_binding(
+            tenant_id=request.tenant_id, jira_issue_key=request.jira_issue_key,
+            jira_project_key=JIRA_PROJECT_KEY,
+        )
+        if binding is None or binding["incident_id"] != str(request.incident_id):
+            raise HTTPException(status_code=404, detail="Tenant-scoped Jira incident binding not found")
+        policy = TicketClosurePolicy.model_validate(binding["closure_policy"])
+        if not policy.reopen_on_regression:
+            raise HTTPException(status_code=409, detail="Jira reopening is disabled by closure policy")
+        try:
+            await client.add_comment(
+                request.jira_issue_key,
+                "[kaiops-managed-update] Regression detected: " + request.reason,
+            )
+            await client.transition_issue(request.jira_issue_key, transition_id=request.transition_id)
+            next_status = "reopened"
+        except JiraClientError:
+            next_status = "reopen_pending_sync"
+        result = await repo.update_jira_binding_status(
+            tenant_id=request.tenant_id, jira_issue_key=request.jira_issue_key,
+            status=next_status, jira_status=next_status,
+        )
+        await session.commit()
+    return {"reopened": next_status == "reopened", "retryable": next_status != "reopened", "binding": result}
+
+
 def _jira_issue_description(
     normalized: dict[str, Any],
     raw_item: dict[str, Any],
@@ -5658,6 +5862,86 @@ def _is_kaiops_managed_jira_update(payload: dict[str, Any]) -> bool:
     )
 
 
+def _governed_jira_scope(payload: dict[str, Any]) -> tuple[str, str, str]:
+    issue = payload.get("issue") if isinstance(payload.get("issue"), dict) else {}
+    fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+    labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
+    project = fields.get("project") if isinstance(fields.get("project"), dict) else {}
+    tenant_label = next(
+        (str(label) for label in labels if str(label).startswith("kaiops-tenant-")), ""
+    )
+    tenant_id = tenant_label.removeprefix("kaiops-tenant-").strip()
+    return tenant_id, str(project.get("key") or "").strip(), str(issue.get("key") or "").strip()
+
+
+async def _process_governed_jira_event(payload: dict[str, Any]) -> bool:
+    tenant_id, project_key, issue_key = _governed_jira_scope(payload)
+    session_factory = getattr(app.state, "session_factory", None)
+    if not tenant_id or not project_key or not issue_key or session_factory is None:
+        return False
+    if project_key != JIRA_PROJECT_KEY:
+        return False
+    event_id = jira_webhook_event_id(payload)
+    actor_id = jira_actor_id(payload)
+    if not actor_id and payload.get("event_origin") == "jira-reconciliation":
+        issue = payload.get("issue") if isinstance(payload.get("issue"), dict) else {}
+        fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+        assignee = fields.get("assignee") if isinstance(fields.get("assignee"), dict) else {}
+        actor_id = str(assignee.get("accountId") or "").strip()
+    jira_status = jira_issue_status(payload)
+    action = governed_jira_action(jira_status, JIRA_TRANSITION_MAPPING)
+    async with session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        binding = await repo.get_jira_incident_binding(
+            tenant_id=tenant_id, jira_issue_key=issue_key, jira_project_key=project_key,
+        )
+        if binding is None:
+            return False
+        current_identity = await repo.current_governed_identity(
+            tenant_id=tenant_id, incident_id=binding["incident_id"],
+        )
+        outcome = "observed"
+        next_status = "pending"
+        if action in {"approved", "rejected"}:
+            valid, reason = validate_jira_approval(
+                binding=binding, actor_id=actor_id, action=action,
+                current_identity=current_identity,
+            )
+            outcome = "accepted" if valid else "rejected"
+            next_status = action if valid else "stale" if reason.startswith("stale") else "unauthorized"
+        elif action in {"resolved", "closed"}:
+            authorized = actor_id == str(binding.get("assignee_id") or "")
+            human_owned = binding.get("ownership") == "human"
+            outcome = "accepted" if authorized and human_owned else "rejected"
+            next_status = action if outcome == "accepted" else "closure_blocked"
+        elif action == "reopened":
+            outcome, next_status = "accepted", "reopened"
+        created, _ = await repo.record_jira_webhook_outcome(
+            tenant_id=tenant_id, event_id=event_id, jira_issue_key=issue_key,
+            action=action, actor_id=actor_id or None, outcome=outcome, payload=payload,
+        )
+        if not created:
+            await session.rollback()
+            return True
+        await repo.update_jira_binding_status(
+            tenant_id=tenant_id, jira_issue_key=issue_key, status=next_status,
+            jira_status=jira_status,
+        )
+        await session.commit()
+    if next_status == "stale":
+        client = _jira_api_client()
+        if client is not None:
+            try:
+                await client.add_comment(
+                    issue_key,
+                    "This approval is stale because the KaiMS evidence or execution plan changed. "
+                    "A new approval request has been created.",
+                )
+            except JiraClientError:
+                logger.exception("failed to comment stale approval on Jira issue %s", issue_key)
+    return True
+
+
 async def _process_jira_webhook(payload: dict[str, Any], trace_id: str | None) -> None:
     """Runs after the HTTP response has already been sent (via BackgroundTasks)
     so the webhook receiver can ack Jira with 200 immediately instead of
@@ -5666,6 +5950,12 @@ async def _process_jira_webhook(payload: dict[str, Any], trace_id: str | None) -
     if _is_kaiops_managed_jira_update(payload):
         issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
         logger.info("ignored KaiOps-originated Jira webhook issue=%s", issue.get("key"))
+        return
+    try:
+        if await _process_governed_jira_event(payload):
+            return
+    except Exception:
+        logger.exception("failed to process governed Jira lifecycle event")
         return
     try:
         mapped_payload, issue_key = _jira_payload_to_alert_payload(payload)

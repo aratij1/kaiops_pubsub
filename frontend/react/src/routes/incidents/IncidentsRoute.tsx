@@ -72,7 +72,14 @@ const stageOrder = [
 type StageState = "complete" | "current" | "reused" | "stopped" | "failed";
 type LifecycleStage = (typeof stageOrder)[number] & { state: StageState; caption: string };
 type Presentation = "summary" | "flow" | "details";
-type GroupedIncidentRow = IncidentRow & { duplicateIncidents: IncidentRow[] };
+type GroupedIncidentRow = IncidentRow & {
+  duplicateIncidents: IncidentRow[];
+  jira_assignment_group?: string;
+  approval_expires_at?: string;
+  jira_last_sync_at?: string;
+  next_action_owner?: string;
+  closure_authority?: string;
+};
 type IncidentGroupPage = {
   rows: IncidentRow[];
   next_cursor: string | null;
@@ -630,11 +637,11 @@ export default function IncidentsRoute() {
           ingest: [["Source", value(evidence.alert.source, row.source, row.origin_system, event.source)], ["Channel", value(labels.ingestion_channel, row.ingestion_channel, event.ingestion_channel)], ["Received", value(evidence.alert.created_at, row.created_at, event.created_at)], ["Alert ID", value(row.alert_id)], ["Status", value(labels.alert_status, evidence.alert.status)], ["Trace ID", evidence.trace]],
           normalize: [["Service", value(row.service, event.service)], ["Environment", value(row.environment, event.environment)], ["Severity", value(row.severity, event.severity)], ["Canonical alert", value(row.alert_id)]],
           deduplicate: [["Outcome", Number(row.deduplicated_count || 0) > 1 ? "Duplicate occurrence merged" : "Unique incident signal"], ["Occurrences", value(row.deduplicated_count || 1)], ["Fingerprint", value(row.fingerprint, event.fingerprint)], ["Correlation", value(row.correlation_id, event.correlation_id, row.deduplication_reason)]],
-          jira: [["Ticket", jiraKey], ["Status", value(row.jira_status, jiraKey === "Pending" ? "Creation pending" : "Created")], ["Priority", value(row.jira_priority, row.risk_tier, row.severity)], ["Assignee", value(row.jira_assignee)]],
+          jira: [["Ticket", jiraKey], ["Status", value(row.jira_status, jiraKey === "Pending" ? "Creation pending" : "Created")], ["Priority", value(row.jira_priority, row.risk_tier, row.severity)], ["Assignee", value(row.jira_assignee, row.jira_assignment_group)], ["Approval due", value(row.approval_expires_at)], ["Last synchronized", value(row.jira_last_sync_at)], ["Next action owner", value(row.next_action_owner)], ["Closure authority", value(row.closure_authority)]],
           decision: [["Outcome", disposition.noise ? "Noise / no action" : "Incident created"], ["Reason", disposition.noise ? disposition.reason : "Actionable signal accepted for investigation"], ["Incident", incidentId], ["Jira", jiraKey]],
           context: [["Status", context.label], ["Strategy", context.strategy], ["Source", context.source === "provenance_not_recorded" ? "Provenance not recorded" : context.source], ["Realtime collection", context.realtime === true ? "Performed" : context.realtime === false ? "Not required" : "Not recorded"]],
           understand: [["Status", lifecycle.some((stage) => stage.id === "understand" && stage.state === "complete") ? "RCA generated" : "Waiting for context"], ["Risk", value(row.risk_tier)], ["Recommendation", value(event.recommendation_id, row.recommendation_id)], ["Incident status", value(row.status)]],
-          approval: [["Decision", value(row.approval_status, event.approval_status, String(row.execution_mode || event.execution_mode || "").includes("human") ? "Pending review" : "Not required")], ["Approver", value(row.approved_by, event.approved_by, event.approver)], ["Execution mode", value(row.execution_mode, event.execution_mode)], ["Comment", value(row.approval_comment, event.approval_comment, event.comment)]],
+          approval: [["Decision", value(row.approval_status, event.approval_status, String(row.execution_mode || event.execution_mode || "").includes("human") ? "Pending review" : "Not required")], ["Approver", value(row.approved_by, event.approved_by, event.approver, row.jira_assignee)], ["Assigned group", value(row.jira_assignment_group)], ["Jira ticket", jiraKey], ["Approval SLA", value(row.approval_expires_at)], ["Next action owner", value(row.next_action_owner)], ["Execution mode", value(row.execution_mode, event.execution_mode)], ["Comment", value(row.approval_comment, event.approval_comment, event.comment)]],
           resolve: [["Status", value(row.status)], ["Execution mode", value(row.execution_mode)], ["Recommendation", value(event.recommendation_id)], ["Service", value(row.service)]],
           validate: [["Status", lifecycle.some((stage) => stage.id === "validate" && stage.state === "complete") ? "Verified and closed" : "Pending validation"], ["Incident status", value(row.status)], ["Updated", value(row.updated_at)], ["Incident", incidentId]],
         };

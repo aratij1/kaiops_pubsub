@@ -47,6 +47,7 @@ from common.database import (
     HumanEvidenceRequestRecord,
     JiraIncidentBindingRecord,
     JiraSyncCursorRecord,
+    JiraWebhookEventRecord,
     KnowledgeRagDraftRecord,
     KnowledgeBaseRecord,
     LearningAuditRecord,
@@ -2368,7 +2369,36 @@ class IncidentRepository:
             query = query.where(IncidentRecord.tenant_id == self._require("tenant_id", tenant_id))
         result = await self.session.execute(query)
         record = result.scalar_one_or_none()
-        return record.payload if record else None
+        if record is None:
+            return None
+        payload = dict(record.payload or {})
+        jira_binding = (await self.session.execute(select(JiraIncidentBindingRecord).where(
+            JiraIncidentBindingRecord.tenant_id == record.tenant_id,
+            JiraIncidentBindingRecord.incident_id == incident_uuid,
+            JiraIncidentBindingRecord.status != "superseded",
+        ).order_by(JiraIncidentBindingRecord.binding_version.desc()).limit(1))).scalar_one_or_none()
+        if jira_binding is not None:
+            jira_state = {
+                "key": jira_binding.jira_issue_key, "status": jira_binding.jira_status,
+                "binding_status": jira_binding.status, "assignee": jira_binding.assignee_id,
+                "assignee_group": jira_binding.assignee_group,
+                "approval_due_at": jira_binding.approval_expires_at,
+                "last_synchronized_at": jira_binding.last_synced_at,
+                "next_action_owner": "person" if jira_binding.status in {"pending", "unauthorized"} else "kaims",
+                "closure_authority": jira_binding.ownership,
+                "closure_policy": dict(jira_binding.closure_policy or {}),
+                "binding_version": jira_binding.binding_version,
+            }
+            payload.update({
+                "ticket_id": jira_binding.jira_issue_key, "jira_key": jira_binding.jira_issue_key,
+                "jira_status": jira_binding.jira_status, "jira_assignee": jira_binding.assignee_id,
+                "jira_assignment_group": jira_binding.assignee_group,
+                "jira_last_sync_at": jira_binding.last_synced_at,
+                "approval_expires_at": jira_binding.approval_expires_at,
+                "next_action_owner": jira_state["next_action_owner"],
+                "closure_authority": jira_binding.ownership, "jira": jira_state,
+            })
+        return payload
 
     async def find_open_jira_by_correlation_key(
         self,
@@ -8294,5 +8324,277 @@ class ContextEnrichmentRepository(EvaluationRepository):
         requirement.status = "answered"
         requirement.evidence_ids = list(dict.fromkeys([*(requirement.evidence_ids or []), evidence_id]))
         requirement.version += 1
+        previous_snapshot = (await self.session.execute(
+            select(ContextSnapshotRecord).where(
+                ContextSnapshotRecord.tenant_id == tenant,
+                ContextSnapshotRecord.incident_id == str(incident_uuid),
+            ).order_by(ContextSnapshotRecord.snapshot_version.desc()).limit(1)
+        )).scalar_one_or_none()
+        snapshot_id: UUID | None = None
+        if previous_snapshot is not None:
+            snapshot_payload = json.loads(json.dumps(previous_snapshot.payload or {}, default=str))
+            metadata = snapshot_payload.setdefault("metadata", {})
+            evidence = metadata.setdefault("context_evidence", {})
+            assertions = evidence.setdefault("human_assertion", [])
+            assertions.append({
+                "evidence_id": evidence_id, "source_type": "human_assertion",
+                "responder_id": responder, "responded_at": response.get("responded_at"),
+                "content": response.get("response"),
+                "source_reference": response.get("source_reference"),
+            })
+            fingerprint = hashlib.sha256(
+                json.dumps(snapshot_payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            previous_expiry = previous_snapshot.expires_at
+            if previous_expiry.tzinfo is None:
+                previous_expiry = previous_expiry.replace(tzinfo=UTC)
+            snapshot = ContextSnapshotRecord(
+                tenant_id=tenant, incident_id=str(incident_uuid),
+                source_incident_id=previous_snapshot.source_incident_id,
+                alert_signature=previous_snapshot.alert_signature,
+                subject_fingerprint=previous_snapshot.subject_fingerprint,
+                context_fingerprint=fingerprint, parent_snapshot_id=previous_snapshot.snapshot_id,
+                snapshot_stage="human_enriched",
+                snapshot_version=int(previous_snapshot.snapshot_version or 0) + 1,
+                evidence_ids=list(dict.fromkeys([*(previous_snapshot.evidence_ids or []), evidence_id])),
+                evidence_checksums={
+                    **dict(previous_snapshot.evidence_checksums or {}),
+                    evidence_id: hashlib.sha256(str(response.get("response") or "").encode()).hexdigest(),
+                },
+                contract_version=previous_snapshot.contract_version,
+                quality_score=previous_snapshot.quality_score, reusable=False,
+                source_manifest={**dict(previous_snapshot.source_manifest or {}), "human_assertion": True},
+                payload=snapshot_payload, collected_at=datetime.now(UTC),
+                expires_at=max(previous_expiry, datetime.now(UTC) + timedelta(hours=1)),
+            )
+            self.session.add(snapshot)
+            await self.session.flush()
+            snapshot_id = snapshot.snapshot_id
+            bindings = (await self.session.execute(select(IncidentInvestigationBindingRecord).where(
+                IncidentInvestigationBindingRecord.tenant_id == tenant,
+                IncidentInvestigationBindingRecord.incident_id == incident_uuid,
+                IncidentInvestigationBindingRecord.status.notin_(["superseded", "invalidated"]),
+            ))).scalars().all()
+            for binding in bindings:
+                binding.status = "invalidated"
+            jira_bindings = (await self.session.execute(select(JiraIncidentBindingRecord).where(
+                JiraIncidentBindingRecord.tenant_id == tenant,
+                JiraIncidentBindingRecord.incident_id == incident_uuid,
+                JiraIncidentBindingRecord.status.notin_(["closed", "superseded", "stale"]),
+            ))).scalars().all()
+            for jira_binding in jira_bindings:
+                jira_binding.status = "stale"
+        self.session.add(AuditLogRecord(
+            tenant_id=tenant, actor=responder, action="context.human-evidence.recorded",
+            resource_type="incident", resource_id=str(incident_uuid),
+            payload={"requirement_id": str(requirement_uuid), "evidence_id": evidence_id,
+                     "context_snapshot_id": str(snapshot_id) if snapshot_id else None,
+                     "stale_approvals_invalidated": snapshot_id is not None},
+        ))
         await self.session.flush()
-        return {"request_id": str(request.request_id), "evidence_id": evidence_id, "status": "answered"}
+        return {
+            "request_id": str(request.request_id), "evidence_id": evidence_id,
+            "context_snapshot_id": str(snapshot_id) if snapshot_id else None, "status": "answered",
+        }
+
+    @staticmethod
+    def _jira_binding_dict(row: JiraIncidentBindingRecord) -> dict[str, Any]:
+        return {
+            "binding_id": str(row.binding_id), "tenant_id": row.tenant_id,
+            "incident_id": str(row.incident_id), "jira_issue_key": row.jira_issue_key,
+            "jira_project_key": row.jira_project_key, "assignee_id": row.assignee_id,
+            "assignee_group": row.assignee_group,
+            "recommendation_id": str(row.recommendation_id) if row.recommendation_id else None,
+            "rca_version": row.rca_version, "context_snapshot_id": str(row.context_snapshot_id),
+            "context_fingerprint": row.context_fingerprint,
+            "resolution_selection_id": str(row.resolution_selection_id) if row.resolution_selection_id else None,
+            "execution_plan_id": str(row.execution_plan_id) if row.execution_plan_id else None,
+            "plan_fingerprint": row.plan_fingerprint, "approval_expires_at": row.approval_expires_at,
+            "status": row.status, "jira_status": row.jira_status, "ownership": row.ownership,
+            "closure_policy": dict(row.closure_policy or {}),
+            "last_jira_updated_at": row.last_jira_updated_at, "last_synced_at": row.last_synced_at,
+            "binding_version": row.binding_version,
+        }
+
+    async def bind_jira_incident(
+        self, *, tenant_id: str, incident_id: UUID | str, jira_issue_key: str,
+        jira_project_key: str, assignee_id: str, assignee_group: str | None,
+        recommendation_id: UUID | str, rca_version: int, context_snapshot_id: UUID | str,
+        context_fingerprint: str, resolution_selection_id: UUID | str | None,
+        execution_plan_id: UUID | str, plan_fingerprint: str,
+        approval_expires_at: datetime, ownership: str, closure_policy: dict[str, Any],
+        jira_status: str = "approval pending",
+    ) -> dict[str, Any]:
+        tenant = require_tenant_id(tenant_id, source="Jira incident binding")
+        incident_uuid = self._to_uuid(incident_id)
+        current = (await self.session.execute(
+            select(IncidentInvestigationBindingRecord).where(
+                IncidentInvestigationBindingRecord.tenant_id == tenant,
+                IncidentInvestigationBindingRecord.incident_id == incident_uuid,
+                IncidentInvestigationBindingRecord.status.notin_(["superseded", "invalidated"]),
+            ).order_by(IncidentInvestigationBindingRecord.rca_version.desc()).limit(1)
+        )).scalar_one_or_none()
+        if current is None:
+            raise ValueError("Jira HITL binding requires a current investigation")
+        supplied = {
+            "recommendation_id": str(recommendation_id), "rca_version": int(rca_version),
+            "context_snapshot_id": str(context_snapshot_id), "context_fingerprint": context_fingerprint,
+        }
+        expected = {
+            "recommendation_id": str(current.recommendation_id), "rca_version": current.rca_version,
+            "context_snapshot_id": str(current.context_snapshot_id),
+            "context_fingerprint": current.context_fingerprint,
+        }
+        if supplied != expected:
+            raise ValueError("Jira HITL binding does not match the current investigation")
+        plan = await self.session.get(ExecutionPlanRecord, self._to_uuid(execution_plan_id))
+        if (
+            plan is None or plan.tenant_id != tenant or plan.incident_id != incident_uuid
+            or str(plan.fingerprint) != str(plan_fingerprint)
+            or plan.context_snapshot_id != current.context_snapshot_id
+        ):
+            raise ValueError("Jira HITL binding does not match the current execution plan")
+        previous = (await self.session.execute(select(JiraIncidentBindingRecord).where(
+            JiraIncidentBindingRecord.tenant_id == tenant,
+            JiraIncidentBindingRecord.incident_id == incident_uuid,
+            JiraIncidentBindingRecord.status.notin_(["superseded", "closed"]),
+        ).order_by(JiraIncidentBindingRecord.binding_version.desc()).limit(1))).scalar_one_or_none()
+        next_version = 1
+        if previous is not None:
+            if previous.jira_issue_key == jira_issue_key and previous.execution_plan_id == plan.id:
+                return self._jira_binding_dict(previous)
+            previous.status = "superseded"
+            next_version = previous.binding_version + 1
+        row = JiraIncidentBindingRecord(
+            tenant_id=tenant, incident_id=incident_uuid,
+            jira_issue_key=self._require("jira_issue_key", jira_issue_key),
+            jira_project_key=self._require("jira_project_key", jira_project_key),
+            assignee_id=self._require("assignee_id", assignee_id), assignee_group=assignee_group,
+            recommendation_id=self._to_uuid(recommendation_id), rca_version=rca_version,
+            context_snapshot_id=self._to_uuid(context_snapshot_id),
+            context_fingerprint=self._require("context_fingerprint", context_fingerprint),
+            resolution_selection_id=self._to_uuid(resolution_selection_id),
+            execution_plan_id=plan.id, plan_fingerprint=plan.fingerprint,
+            approval_expires_at=approval_expires_at, status="pending", jira_status=jira_status,
+            ownership=ownership, closure_policy=dict(closure_policy), binding_version=next_version,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        audit_payload = json.loads(json.dumps(self._jira_binding_dict(row), default=str))
+        self.session.add(AuditLogRecord(
+            tenant_id=tenant, actor="jira-lifecycle", action="hitl.assignment.created",
+            resource_type="incident", resource_id=str(incident_uuid),
+            payload=audit_payload,
+        ))
+        await self.session.flush()
+        return self._jira_binding_dict(row)
+
+    async def get_jira_incident_binding(
+        self, *, tenant_id: str, jira_issue_key: str, jira_project_key: str,
+    ) -> dict[str, Any] | None:
+        tenant = require_tenant_id(tenant_id, source="Jira binding lookup")
+        row = (await self.session.execute(select(JiraIncidentBindingRecord).where(
+            JiraIncidentBindingRecord.tenant_id == tenant,
+            JiraIncidentBindingRecord.jira_issue_key == jira_issue_key,
+            JiraIncidentBindingRecord.jira_project_key == jira_project_key,
+        ).order_by(JiraIncidentBindingRecord.binding_version.desc()).limit(1))).scalar_one_or_none()
+        return self._jira_binding_dict(row) if row else None
+
+    async def current_governed_identity(
+        self, *, tenant_id: str, incident_id: UUID | str,
+    ) -> dict[str, Any]:
+        tenant = require_tenant_id(tenant_id, source="current governed identity")
+        incident_uuid = self._to_uuid(incident_id)
+        investigation = (await self.session.execute(
+            select(IncidentInvestigationBindingRecord).where(
+                IncidentInvestigationBindingRecord.tenant_id == tenant,
+                IncidentInvestigationBindingRecord.incident_id == incident_uuid,
+                IncidentInvestigationBindingRecord.status.notin_(["superseded", "invalidated"]),
+            ).order_by(IncidentInvestigationBindingRecord.rca_version.desc()).limit(1)
+        )).scalar_one_or_none()
+        plan = (await self.session.execute(
+            select(ExecutionPlanRecord).where(
+                ExecutionPlanRecord.tenant_id == tenant,
+                ExecutionPlanRecord.incident_id == incident_uuid,
+            ).order_by(ExecutionPlanRecord.created_at.desc()).limit(1)
+        )).scalar_one_or_none()
+        if investigation is None or plan is None:
+            return {}
+        return {
+            "recommendation_id": str(investigation.recommendation_id),
+            "rca_version": investigation.rca_version,
+            "context_snapshot_id": str(investigation.context_snapshot_id),
+            "context_fingerprint": investigation.context_fingerprint,
+            "execution_plan_id": str(plan.id), "plan_fingerprint": plan.fingerprint,
+        }
+
+    async def record_jira_webhook_outcome(
+        self, *, tenant_id: str, event_id: str, jira_issue_key: str, action: str,
+        actor_id: str | None, outcome: str, payload: dict[str, Any],
+    ) -> tuple[bool, JiraWebhookEventRecord]:
+        tenant = require_tenant_id(tenant_id, source="Jira webhook event")
+        existing = (await self.session.execute(select(JiraWebhookEventRecord).where(
+            JiraWebhookEventRecord.tenant_id == tenant,
+            JiraWebhookEventRecord.event_id == event_id,
+        ))).scalar_one_or_none()
+        if existing is not None:
+            return False, existing
+        checksum = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+        row = JiraWebhookEventRecord(
+            tenant_id=tenant, event_id=event_id, jira_issue_key=jira_issue_key,
+            action=action, actor_id=actor_id, outcome=outcome, payload_checksum=checksum,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return True, row
+
+    async def update_jira_binding_status(
+        self, *, tenant_id: str, jira_issue_key: str, status: str,
+        jira_status: str, jira_updated_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        tenant = require_tenant_id(tenant_id, source="Jira binding update")
+        row = (await self.session.execute(select(JiraIncidentBindingRecord).where(
+            JiraIncidentBindingRecord.tenant_id == tenant,
+            JiraIncidentBindingRecord.jira_issue_key == jira_issue_key,
+        ).order_by(JiraIncidentBindingRecord.binding_version.desc()).limit(1))).scalar_one_or_none()
+        if row is None:
+            raise LookupError("Jira incident binding not found")
+        row.status = status
+        row.jira_status = jira_status
+        row.last_jira_updated_at = jira_updated_at or datetime.now(UTC)
+        row.last_synced_at = datetime.now(UTC)
+        self.session.add(AuditLogRecord(
+            tenant_id=tenant, actor="jira-lifecycle", action=f"jira.issue.{status}",
+            resource_type="incident", resource_id=str(row.incident_id),
+            payload={"jira_issue_key": jira_issue_key, "binding_id": str(row.binding_id)},
+        ))
+        await self.session.flush()
+        return self._jira_binding_dict(row)
+
+    async def save_jira_sync_cursor(
+        self, *, tenant_id: str, jira_project_key: str, poll_status: str,
+        last_successful_poll_at: datetime | None, last_jira_updated_timestamp: datetime | None,
+        last_issue_key: str | None, poll_error: str | None,
+    ) -> JiraSyncCursorRecord:
+        tenant = require_tenant_id(tenant_id, source="Jira sync cursor")
+        row = (await self.session.execute(select(JiraSyncCursorRecord).where(
+            JiraSyncCursorRecord.tenant_id == tenant,
+            JiraSyncCursorRecord.jira_project_key == jira_project_key,
+        ))).scalar_one_or_none()
+        if row is None:
+            row = JiraSyncCursorRecord(tenant_id=tenant, jira_project_key=jira_project_key)
+            self.session.add(row)
+        row.poll_status = poll_status
+        row.last_successful_poll_at = last_successful_poll_at
+        row.last_jira_updated_timestamp = last_jira_updated_timestamp
+        row.last_issue_key = last_issue_key
+        row.poll_error = poll_error
+        row.version = int(row.version or 0) + 1
+        await self.session.flush()
+        return row
+
+    async def list_jira_sync_cursors(self, *, jira_project_key: str) -> list[JiraSyncCursorRecord]:
+        result = await self.session.execute(select(JiraSyncCursorRecord).where(
+            JiraSyncCursorRecord.jira_project_key == jira_project_key,
+        ))
+        return list(result.scalars().all())

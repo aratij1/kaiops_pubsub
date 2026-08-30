@@ -1727,6 +1727,21 @@ class JiraSyncCursorRecord(Base, TimestampMixin):
     version: Mapped[int] = mapped_column(Integer, default=1)
 
 
+class JiraWebhookEventRecord(Base):
+    __tablename__ = "jira_webhook_events"
+    __table_args__ = (UniqueConstraint("tenant_id", "event_id", name="uq_jira_webhook_event"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    event_id: Mapped[str] = mapped_column(String(64), index=True)
+    jira_issue_key: Mapped[str] = mapped_column(String(64), index=True)
+    action: Mapped[str] = mapped_column(String(32), index=True)
+    actor_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    outcome: Mapped[str] = mapped_column(String(32), index=True)
+    payload_checksum: Mapped[str] = mapped_column(String(64))
+    processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
 class EvaluationRecord(Base, TimestampMixin):
     __tablename__ = "evaluation_records"
     __table_args__ = (Index("idx_evaluation_records_incident_created", "incident_id", "created_at"),)

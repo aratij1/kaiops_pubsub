@@ -3845,6 +3845,22 @@ async def post_incident_context_gap_response(
     )
 
 
+@app.post("/incidents/{incident_id}/hitl/jira")
+async def create_incident_hitl_jira_assignment(
+    incident_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    scoped_payload = {**payload, "tenant_id": tenant_id, "incident_id": incident_id}
+    return await guarded_proxy(
+        request=request, method="POST", path="/api/v1/jira/hitl-assignments",
+        target_base=settings.monitoring_adapter_url, payload=scoped_payload,
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=45.0,
+    )
+
+
 @app.get("/rag/knowledge-drafts")
 async def list_knowledge_rag_drafts(
     request: Request,
