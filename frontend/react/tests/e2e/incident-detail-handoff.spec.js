@@ -252,7 +252,8 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
     const path = new URL(request.url()).pathname.replace(/^\/api-gateway/, "");
     const isProtected = path.startsWith(`/alerts/${alertId}/processed-result`)
       || path.startsWith(`/alerts/${alertId}/linked-documents`)
-      || path.startsWith("/rag/evidence-drafts")
+      || path.startsWith("/rag/")
+      || path.startsWith("/alerts/severity-overrides")
       || path.startsWith("/analysis/");
     if (isProtected) {
       protectedRequests.push({ path, authorization: request.headers().authorization || "" });

@@ -1012,7 +1012,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   async function loadAlertSeverityOverrides() {
     setAlertSeverityOverrides((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/alerts/severity-overrides");
+      const payload = await fetchJson("/api-gateway/alerts/severity-overrides", authenticatedOptions());
       const data = unwrap(payload);
       const rows = (Array.isArray(data?.rows) ? data.rows : []).map(visibleManagedApplication).filter(Boolean);
       setAlertSeverityOverrides((prev) => ({ ...prev, loading: false, rows, error: "" }));
@@ -1038,7 +1038,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
     setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: key, error: "" }));
     try {
-      await fetchJson("/api-gateway/alerts/severity-overrides", {
+      await fetchJson("/api-gateway/alerts/severity-overrides", authenticatedOptions({
         method: "PUT",
         body: JSON.stringify({
           name: alertName,
@@ -1049,7 +1049,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           requested_role: String(currentRole || "").trim(),
           updated_at: new Date().toISOString(),
         }),
-      });
+      }));
       await fetchJson("/api-gateway/triage/corrections", authenticatedOptions({
         method: "POST",
         body: JSON.stringify({
@@ -1085,7 +1085,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: key, error: "" }));
     try {
       const params = new URLSearchParams({ name: alertName, service, environment });
-      await fetchJson(`/api-gateway/alerts/severity-overrides?${params.toString()}`, { method: "DELETE" });
+      await fetchJson(`/api-gateway/alerts/severity-overrides?${params.toString()}`, authenticatedOptions({ method: "DELETE" }));
       await loadAlertSeverityOverrides();
       setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: "", error: "" }));
     } catch (error) {
@@ -1999,7 +1999,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   async function loadRagDocs() {
     setRagDocs((prev) => ({ ...prev, loading: true, error: "" }));
     try {
-      const payload = await fetchJson("/api-gateway/rag/documents");
+      const payload = await fetchJson("/api-gateway/rag/documents", authenticatedOptions());
       const rows = payload?.documents || payload?.data?.documents || [];
       setRagDocs({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
     } catch (error) {
@@ -2059,7 +2059,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     setGuidanceState({ loading: true, rows: [], error: "" });
     try {
       const params = new URLSearchParams({ query, limit: "8" });
-      const payload = await fetchJson(`/api-gateway/rag/search?${params.toString()}`);
+      const payload = await fetchJson(`/api-gateway/rag/search?${params.toString()}`, authenticatedOptions());
       const rows = payload?.matches || payload?.data?.matches || [];
       setGuidanceState({ loading: false, rows: Array.isArray(rows) ? rows : [], error: "" });
     } catch (error) {
@@ -4182,7 +4182,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       // Show the real saved document instead of a freshly generated draft.
       setAlertOnboardingState({ loading: true, result: null, error: "" });
       try {
-        const full = unwrap(await fetchJson(`/api-gateway/rag/documents/content?path=${encodeURIComponent(existingDoc.path)}`));
+        const full = unwrap(await fetchJson(`/api-gateway/rag/documents/content?path=${encodeURIComponent(existingDoc.path)}`, authenticatedOptions()));
         setAlertOnboarding((curr) => ({
           ...curr,
           kind: normalizedKind,
