@@ -76,6 +76,34 @@ describe("RcaPanel canonical evidence gate", () => {
     expect(screen.getAllByText("0%").length).toBeGreaterThan(0);
   });
 
+  it("separates reusable-context quality from evidence coverage and RCA readiness", () => {
+    render(<RcaPanel
+      rcaDetailView="evidence" onSetRcaDetailView={vi.fn()} onSetHomeDetailTab={vi.fn()}
+      selectedAlertTimelineRows={[]} selectedAlertRagDocuments={[]} selectedAlertEvaluation={{}}
+      selectedAlertRow={{ service: "api", tenant_id: "tenant-a" }}
+      selectedRcaDecision={{ confidence: .15, rootCause: "Investigation is inconclusive", action: "Collect evidence" }}
+      selectedAiTrust={{ evidence: [], missing: [], conflicting: [], confidenceReasons: [], sources: {}, confidence: .15, integrityVerified: true, executionReady: false }}
+      selectedAlertWorkflow={{ recommendation: { metadata: {} }, context: { metadata: { context_quality: {
+        contract_version: "kaiops.context.v2", reusable: true, quality_score: .81,
+        coverage_score: .85, source_coverage_score: .375, rca_readiness_score: .46,
+        rca_ready: false, provenance_score: .91, evidence_count: 4,
+      } } } }}
+      selectedAlertRegeneration={{ loading: false }} selectedAlertRecommendationId="recommendation-1"
+      selectedAlertDocumentContract={null} selectedAlertId="incident-1" aiFeedbackState={{}}
+      rcaAnalysisMode="smart" onSetRcaAnalysisMode={vi.fn()} onRerunRca={vi.fn()}
+      onRefreshSelectedAlert={vi.fn()} onDownloadRagDocument={vi.fn()}
+      onLoadRagDocumentContent={vi.fn()} onSubmitAiRecommendationFeedback={vi.fn()}
+    />);
+
+    expect(screen.getByText("Context reusable")).toBeInTheDocument();
+    expect(screen.getByText(/reuse quality, not RCA confidence/)).toBeInTheDocument();
+    expect(screen.getByText("Evidence-plane coverage")).toBeInTheDocument();
+    expect(screen.getByText("38%")).toBeInTheDocument();
+    expect(screen.getByText("RCA readiness")).toBeInTheDocument();
+    expect(screen.getByText("46%")).toBeInTheDocument();
+    expect(screen.getByText(/RCA is not ready: 46% diagnostic readiness/)).toBeInTheDocument();
+  });
+
   it("recovers an expired contract with an explicit fresh-context request", () => {
     const setMode = vi.fn();
     const rerun = vi.fn();

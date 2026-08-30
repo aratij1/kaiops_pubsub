@@ -28,6 +28,8 @@ SOURCE_POLICIES: dict[str, dict[str, Any]] = {
     "other": {"ttl_seconds": 900, "weight": 0.5, "group": "supplemental"},
 }
 
+EVIDENCE_PLANES = ("rag", "code", "logs", "other", "tickets", "database", "topology", "telemetry")
+
 _SOURCE_ALIASES = {
     "log": "logs",
     "logs": "logs",
@@ -391,6 +393,42 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
         }
     )
     conflicts = metadata.get("context_conflicts") if isinstance(metadata.get("context_conflicts"), list) else []
+    represented_planes = {
+        canonical_source(source)
+        for source, rows in buckets.items()
+        if isinstance(rows, list) and any(isinstance(row, dict) for row in rows)
+    }
+    source_coverage = len(represented_planes.intersection(EVIDENCE_PLANES)) / len(EVIDENCE_PLANES)
+    direct_signal_planes = represented_planes.intersection({"logs", "telemetry", "database"})
+    causal_planes = represented_planes.intersection({"code", "tickets", "deployments", "changes"})
+    inferred_timestamp_ratio = (
+        sum(1 for row in all_rows if row.get("observed_at_inferred")) / len(all_rows)
+        if all_rows else 0.0
+    )
+    rca_readiness = (
+        (source_coverage * 0.40)
+        + (min(len(direct_signal_planes) / 3, 1.0) * 0.25)
+        + (min(len(causal_planes) / 2, 1.0) * 0.15)
+        + (0.10 if "topology" in represented_planes else 0.0)
+        + (provenance * 0.10)
+        - (inferred_timestamp_ratio * 0.15)
+    )
+    if not direct_signal_planes:
+        rca_readiness = min(rca_readiness, 0.25)
+    elif len(direct_signal_planes) < 2:
+        rca_readiness = min(rca_readiness, 0.59)
+    if len(represented_planes) < 2:
+        rca_readiness = min(rca_readiness, 0.49)
+    rca_readiness = _clamp(rca_readiness)
+    impact_readiness = _clamp(
+        (min(len(direct_signal_planes) / 2, 1.0) * 0.55)
+        + (0.20 if "topology" in represented_planes else 0.0)
+        + (source_coverage * 0.15)
+        + (provenance * 0.10)
+        - (inferred_timestamp_ratio * 0.10)
+    )
+    if not direct_signal_planes:
+        impact_readiness = min(impact_readiness, 0.20)
     confidence = (coverage * 0.45) + (freshness * 0.25) + (provenance * 0.20) + (relevance * 0.10)
     confidence = max(0.0, min(confidence, 1.0))
     if discovery_degraded:
@@ -407,11 +445,23 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
         "contract_version": CONTEXT_CONTRACT_VERSION,
         "quality_score": round(confidence, 4),
         "coverage_score": round(coverage, 4),
+        "source_coverage_score": round(source_coverage, 4),
         "freshness_score": round(freshness, 4),
         "provenance_score": round(provenance, 4),
         "relevance_score": round(relevance, 4),
         "threshold": round(max(0.0, min(threshold, 1.0)), 4),
         "reusable": reusable,
+        "rca_readiness_score": round(rca_readiness, 4),
+        "rca_ready": bool(
+            rca_readiness >= 0.70
+            and len(direct_signal_planes) >= 2
+            and bool(causal_planes)
+            and not conflicts
+        ),
+        "impact_readiness_score": round(impact_readiness, 4),
+        "impact_ready": bool(impact_readiness >= 0.65 and len(direct_signal_planes) >= 2),
+        "represented_evidence_planes": sorted(represented_planes.intersection(EVIDENCE_PLANES)),
+        "evidence_plane_count": len(EVIDENCE_PLANES),
         "execution_ready": bool(reusable and not discovery_degraded),
         "discovery_degraded": discovery_degraded,
         "present": present,

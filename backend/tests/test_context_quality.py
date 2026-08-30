@@ -111,6 +111,37 @@ def test_missing_provider_timestamp_is_explicit_and_cannot_claim_full_freshness(
     assert source["inferred_timestamp_count"] == 1
 
 
+def test_sparse_reusable_context_does_not_claim_high_rca_readiness() -> None:
+    context = make_context()
+    context.runbook = None
+    context.metadata["context_evidence"] = {
+        "code": context.metadata["context_evidence"]["code"],
+        "topology": [{
+            "source": "topology",
+            "uri": "cmdb://orders/worker",
+            "summary": "worker depends on redis",
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "confidence": 0.9,
+        }],
+        "telemetry": [{
+            "source": "telemetry",
+            "uri": "prometheus://worker/queue-lag",
+            "summary": "queue lag is above threshold",
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "confidence": 0.9,
+        }],
+    }
+
+    governed = govern_context(context, tenant_id="tenant-a")
+    quality = governed.metadata["context_quality"]
+
+    assert quality["source_coverage_score"] == 0.375
+    assert quality["coverage_score"] > quality["source_coverage_score"]
+    assert quality["rca_readiness_score"] < 0.70
+    assert quality["rca_ready"] is False
+    assert quality["impact_ready"] is False
+
+
 def test_untraceable_connector_rows_are_diagnostic_only() -> None:
     context = make_context()
     context.metadata["context_evidence"] = {
