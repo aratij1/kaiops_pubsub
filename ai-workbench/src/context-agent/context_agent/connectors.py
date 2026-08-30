@@ -2217,9 +2217,9 @@ class ContextIntelligenceAgent(BaseAgent):
                 }
             except Exception as exc:  # A connector failure must not erase healthy evidence.
                 failure_status = (
-                    "timed_out" if isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+                    "timed_out" if isinstance(exc, TimeoutError | asyncio.TimeoutError)
                     else "unauthorized" if isinstance(exc, PermissionError)
-                    else "misconfigured" if isinstance(exc, (KeyError, ValueError))
+                    else "misconfigured" if isinstance(exc, KeyError | ValueError)
                     else "unavailable"
                 )
                 return {}, {

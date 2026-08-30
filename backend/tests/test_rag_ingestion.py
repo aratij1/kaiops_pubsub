@@ -196,7 +196,10 @@ async def test_approved_remediation_is_reused_as_historical_knowledge_for_future
         item for item in module._list_evidence_rag_drafts_sync(None, None, "tenant-a")
         if item["document_kind"] == "remediation"
     )
-    reviewed_content = remediation["content"] + "\n\nVerified action: inspect retention policy before any governed change."
+    reviewed_content = (
+        remediation["content"]
+        + "\n\nVerified action: inspect retention policy before any governed change."
+    )
     await module.review_evidence_rag_draft(
         remediation["draft_id"],
         module.EvidenceRagDraftReviewRequest(

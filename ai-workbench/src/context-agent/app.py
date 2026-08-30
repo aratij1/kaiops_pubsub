@@ -333,7 +333,9 @@ async def _collect_context_with_strategy_unlocked(
                                 "prior_resolution": cached_resolution if resolution_reusable else {},
                                 "prior_resolution_score": _resolution_quality_score(cached.get("resolution_payload", {})),
                                 "prior_resolution_reusable": resolution_reusable,
-                                "resolution_reuse_threshold": float(getattr(settings, "context_resolution_reuse_min_score", 0.7) or 0.7),
+                                "resolution_reuse_threshold": float(
+                                    getattr(settings, "context_resolution_reuse_min_score", 0.7) or 0.7
+                                ),
                             }
                             await session.commit()
                             CONTEXT_KNOWLEDGE_REUSE_COUNT.observe(reuse_count)
@@ -1504,7 +1506,9 @@ def _typed_incident_document_content(kind: str, *, alert_name: str, service: str
     return "\n".join([
         f"# {title}: {alert_name}", "", f"Service: {service}", f"Environment: {environment}",
         "Status: Draft — operator verification required", "", f"## {section}", base,
-        "", f"## {controls}", "Not established by verified evidence. Review and complete this section before publication.",
+        "",
+        f"## {controls}",
+        "Not established by verified evidence. Review and complete this section before publication.",
         "", "## Evidence and provenance", "Only the cited evidence in this draft may be treated as observed fact.",
     ])
 

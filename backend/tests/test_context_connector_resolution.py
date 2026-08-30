@@ -89,7 +89,12 @@ async def test_local_prometheus_uses_alertmanager_generator_expression(monkeypat
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["request"] = request
-        return httpx.Response(200, json={"status": "success", "data": {"resultType": "matrix", "result": [{"metric": {"service": "api-gateway"}, "values": [[1, "4.2"]]}]}})
+        return httpx.Response(200, json={
+            "status": "success",
+            "data": {"resultType": "matrix", "result": [
+                {"metric": {"service": "api-gateway"}, "values": [[1, "4.2"]]},
+            ]},
+        })
 
     transport = httpx.MockTransport(handler)
     real_client = httpx.AsyncClient
@@ -101,9 +106,17 @@ async def test_local_prometheus_uses_alertmanager_generator_expression(monkeypat
     alert = Alert(
         tenant_id="default", source="prometheus", name="KaiOpsHighLatencyP99", service="api-gateway",
         environment="prod", severity=AlertSeverity.CRITICAL, description="latency",
-        annotations={"generatorURL": f"http://prometheus:9090/graph?g0.expr={httpx.QueryParams({'g0.expr': expression})['g0.expr']}"},
+        annotations={
+            "generatorURL": (
+                "http://prometheus:9090/graph?g0.expr="
+                f"{httpx.QueryParams({'g0.expr': expression})['g0.expr']}"
+            ),
+        },
     )
-    incident = Incident(tenant_id="default", service=alert.service, environment=alert.environment, severity=alert.severity, title=alert.name)
+    incident = Incident(
+        tenant_id="default", service=alert.service, environment=alert.environment,
+        severity=alert.severity, title=alert.name,
+    )
 
     result = await PrometheusConnector().fetch(alert, incident)
 
@@ -138,7 +151,10 @@ async def test_prometheus_historical_rerun_queries_alert_observation_window(monk
             }],
         },
     )
-    incident = Incident(tenant_id="tenant-a", service=alert.service, environment=alert.environment, severity=alert.severity, title=alert.name)
+    incident = Incident(
+        tenant_id="tenant-a", service=alert.service, environment=alert.environment,
+        severity=alert.severity, title=alert.name,
+    )
 
     await PrometheusConnector().fetch(alert, incident)
 

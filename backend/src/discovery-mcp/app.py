@@ -708,7 +708,11 @@ def _trace_evidence_summary(trace: dict[str, Any], requested_operation: str = ""
             if not parent:
                 continue
             parent_process = processes.get(parent.get("processID"), {})
-            parent_service = str(parent_process.get("serviceName") or "unknown") if isinstance(parent_process, dict) else "unknown"
+            parent_service = (
+                str(parent_process.get("serviceName") or "unknown")
+                if isinstance(parent_process, dict)
+                else "unknown"
+            )
             if parent_service != service_name and "unknown" not in {parent_service, service_name}:
                 dependency_edges.add((parent_service, service_name))
     duration_us = max((int(span.get("duration") or 0) for span in spans), default=0)
@@ -779,8 +783,12 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                     if start_time and end_time:
                         try:
                             trace_params.update({
-                                "start": str(int(datetime.fromisoformat(start_time.replace("Z", "+00:00")).timestamp() * 1_000_000)),
-                                "end": str(int(datetime.fromisoformat(end_time.replace("Z", "+00:00")).timestamp() * 1_000_000)),
+                                "start": str(int(
+                                    datetime.fromisoformat(start_time.replace("Z", "+00:00")).timestamp() * 1_000_000
+                                )),
+                                "end": str(int(
+                                    datetime.fromisoformat(end_time.replace("Z", "+00:00")).timestamp() * 1_000_000
+                                )),
                             })
                             trace_params.pop("lookback", None)
                         except ValueError:
@@ -804,7 +812,11 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                     item["http_status_codes"] = summary["http_status_codes"]
                     item["slowest_spans"] = summary["slowest_spans"]
                     item["dependency_edges"] = summary["dependency_edges"]
-                    start_times = [int(span.get("startTime") or 0) for span in trace.get("spans", []) if isinstance(span, dict)]
+                    start_times = [
+                        int(span.get("startTime") or 0)
+                        for span in trace.get("spans", [])
+                        if isinstance(span, dict)
+                    ]
                     if start_times and min(start_times) > 0:
                         item["observed_at"] = datetime.fromtimestamp(min(start_times) / 1_000_000, tz=UTC).isoformat()
                     evidence.append(item)

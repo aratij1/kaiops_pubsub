@@ -263,7 +263,11 @@ class IterativeInvestigator:
         spans = metadata.get("slowest_spans") if isinstance(metadata.get("slowest_spans"), list) else []
         edges = metadata.get("dependency_edges") if isinstance(metadata.get("dependency_edges"), list) else []
         if "dependency" in claim or "upstream" in claim or "downstream" in claim:
-            return bool(edges) and any(float(span.get("duration_ms") or 0) >= 500 for span in spans if isinstance(span, dict))
+            return bool(edges) and any(
+                float(span.get("duration_ms") or 0) >= 500
+                for span in spans
+                if isinstance(span, dict)
+            )
         if any(token in claim for token in ("resource", "data-path", "database", "mysql", "query")):
             return any(
                 isinstance(span, dict)

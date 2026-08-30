@@ -35,7 +35,9 @@ def make_context(*, hypotheses: list[dict[str, Any]] | None = None) -> Context:
         severity=AlertSeverity.HIGH,
         description="checkout connection pool timeout after deployment",
     )
-    incident = Incident(tenant_id="tenant-a", service="checkout", severity=AlertSeverity.HIGH, title=alert.name)
+    incident = Incident(
+        tenant_id="tenant-a", service="checkout", severity=AlertSeverity.HIGH, title=alert.name,
+    )
     return Context(
         tenant_id=alert.tenant_id,
         incident_id=incident.id,
@@ -94,7 +96,10 @@ def test_root_trace_latency_is_not_mistaken_for_a_causal_mechanism() -> None:
     hypothesis = {"claim": "An unhealthy downstream dependency is degrading checkout."}
     trace = {
         "source_type": "trace",
-        "metadata": {"slowest_spans": [{"service": "checkout", "operation": "GET", "duration_ms": 3200}], "dependency_edges": []},
+        "metadata": {
+            "slowest_spans": [{"service": "checkout", "operation": "GET", "duration_ms": 3200}],
+            "dependency_edges": [],
+        },
     }
 
     assert investigator._structured_mechanism_support(hypothesis, trace) is False

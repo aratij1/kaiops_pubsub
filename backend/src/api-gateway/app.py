@@ -1,33 +1,41 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
-from contextlib import suppress
 import hashlib
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from collections import deque
+from contextlib import suppress
+from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import Any
 from urllib.parse import quote, unquote, urlencode, urlparse
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-import httpx
 import aio_pika
+import httpx
 import pymysql
-from redis.asyncio import Redis
 from api_gateway import SafetyAnalyzer
 from api_gateway.auth_policy import canonical_route_auth_rule
 from api_gateway.control_routes import build_control_router
-from api_gateway.modules.users.models import SystemRole
-from api_gateway.modules.users.permissions import AuthContext, current_tenant_id, require_roles
-from common.authorization import OperationalRole, role_is_allowed
-from api_gateway.modules.users.router import router as user_management_router
 from api_gateway.modules.triage.router import TriageCorrectionCreate as TriageCorrectionCreate
 from api_gateway.modules.triage.router import router as triage_router
+from api_gateway.modules.users.models import SystemRole
+from api_gateway.modules.users.permissions import AuthContext, current_tenant_id, require_roles
+from api_gateway.modules.users.router import router as user_management_router
 from api_gateway.modules.users.service import UserService
+from common.authorization import OperationalRole, role_is_allowed
 from common.config import get_settings
-from common.database import ActionRecord, AlertRecord, ApprovalRecord, AuditLogRecord, IncidentOccurrenceRecord, IncidentProjectionRecord, IncidentRecord, MonitoringConnectionHealthRecord
+from common.database import (
+    ActionRecord,
+    AlertRecord,
+    ApprovalRecord,
+    AuditLogRecord,
+    IncidentOccurrenceRecord,
+    IncidentProjectionRecord,
+    IncidentRecord,
+    MonitoringConnectionHealthRecord,
+)
 from common.event_publishers import build_agent_event_contract, build_orchestration_envelope
 from common.kafka import normalize_payload
 from common.models import Alert, GatewayAuditEvent, Incident, SafetyDecision
@@ -38,8 +46,9 @@ from common.topics import ORCHESTRATION_EVENTS
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from opentelemetry import trace
-from pydantic import ValidationError
 from prometheus_client import REGISTRY, Counter, Gauge
+from pydantic import ValidationError
+from redis.asyncio import Redis
 from sqlalchemy import func, select
 
 REQUEST_BODY = Body(default={})
@@ -409,9 +418,9 @@ async def stream_operational_events(request: Request) -> StreamingResponse:
     last_event_id = str(request.headers.get("last-event-id") or request.query_params.get("last_event_id") or "").strip()
     try:
         cursor_ms = int(last_event_id.split("-", 1)[0])
-        cursor = datetime.fromtimestamp(cursor_ms / 1000, timezone.utc)
+        cursor = datetime.fromtimestamp(cursor_ms / 1000, UTC)
     except (TypeError, ValueError, OSError):
-        cursor = datetime.now(timezone.utc) - timedelta(seconds=5)
+        cursor = datetime.now(UTC) - timedelta(seconds=5)
 
     async def events():
         nonlocal cursor
@@ -434,7 +443,7 @@ async def stream_operational_events(request: Request) -> StreamingResponse:
                         for event_type, model, identity, state in queries:
                             stmt = select(model).where(model.tenant_id == tenant_id, model.updated_at > cursor).order_by(model.updated_at.asc()).limit(100)
                             for row in (await session.execute(stmt)).scalars().all():
-                                updated_at = row.updated_at.replace(tzinfo=timezone.utc) if row.updated_at.tzinfo is None else row.updated_at
+                                updated_at = row.updated_at.replace(tzinfo=UTC) if row.updated_at.tzinfo is None else row.updated_at
                                 newest = max(newest, updated_at)
                                 sequence += 1
                                 event_id = f"{int(updated_at.timestamp() * 1000)}-{sequence}"
@@ -446,7 +455,7 @@ async def stream_operational_events(request: Request) -> StreamingResponse:
                         if role == "Administrator":
                             stmt = select(MonitoringConnectionHealthRecord).where(MonitoringConnectionHealthRecord.updated_at > cursor).order_by(MonitoringConnectionHealthRecord.updated_at.asc()).limit(100)
                             for row in (await session.execute(stmt)).scalars().all():
-                                updated_at = row.updated_at.replace(tzinfo=timezone.utc) if row.updated_at.tzinfo is None else row.updated_at
+                                updated_at = row.updated_at.replace(tzinfo=UTC) if row.updated_at.tzinfo is None else row.updated_at
                                 newest = max(newest, updated_at)
                                 sequence += 1
                                 event_id = f"{int(updated_at.timestamp() * 1000)}-{sequence}"
@@ -460,7 +469,7 @@ async def stream_operational_events(request: Request) -> StreamingResponse:
                         yield message
                 else:
                     sequence += 1
-                    now = datetime.now(timezone.utc)
+                    now = datetime.now(UTC)
                     yield _sse_message(f"{int(now.timestamp() * 1000)}-{sequence}", "heartbeat", {"at": now.isoformat(), "queue_health": "polling-fallback"})
                 await asyncio.sleep(5)
         finally:
@@ -1004,7 +1013,7 @@ async def update_application(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
-    _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),
+    _: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
@@ -1814,7 +1823,7 @@ async def _publish_analysis_regeneration_command(
         "analysis_request": {
             "id": request_id,
             "mode": decision.get("analysis_mode"),
-            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "requested_at": datetime.now(UTC).isoformat(),
         },
         "transport": transport_provider,
         "event_envelope": event_envelope,
@@ -1985,7 +1994,7 @@ async def _load_analysis_regeneration_subject(
                     continue
                 if parsed.year <= 1:
                     continue
-                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
             return None
 
         # The source observation time is part of the alert identity.  Never
@@ -3302,7 +3311,11 @@ async def cancel_queued_alert(request: Request, payload: dict[str, Any] = REQUES
     client = Redis.from_url(settings.redis_url, decode_responses=True)
     try:
         await client.sadd("kaims:cancelled-processing", alert_id)
-        await client.hset("kaims:cancelled-processing:metadata", alert_id, json.dumps({"reason": reason, "cancelled_at": datetime.now(timezone.utc).isoformat()}))
+        await client.hset(
+            "kaims:cancelled-processing:metadata",
+            alert_id,
+            json.dumps({"reason": reason, "cancelled_at": datetime.now(UTC).isoformat()}),
+        )
     finally:
         await client.aclose()
     await _queue_audit(request, "queue.alert.cancelled", alert_id, {"reason": reason})

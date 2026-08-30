@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import hashlib
 import json
 import re
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlencode
 
 from ai_workbench_common.models import Context
 from common.incident_contracts import ContextPackage
 from common.models import EvidenceReference
-
 
 CONTEXT_CONTRACT_VERSION = "kaiops.context.v2"
 
@@ -66,7 +65,7 @@ _SECRET_PATTERNS = (
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def canonical_source(value: Any) -> str:
@@ -112,8 +111,8 @@ def _as_utc(value: Any, fallback: datetime) -> datetime:
         except ValueError:
             return fallback
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _clamp(value: Any, default: float = 0.0) -> float:
@@ -566,7 +565,12 @@ def govern_context(
         prior = source_manifest.get(source, {})
         stale = bool(rows) and all(_clamp(row.get("freshness_score")) <= 0.0 for row in rows)
         untraceable = untraceable_counts.get(source, 0)
-        status = "stale" if stale else "fresh" if rows else "unavailable" if untraceable else str(prior.get("status") or "no_data")
+        status = (
+            "stale" if stale
+            else "fresh" if rows
+            else "unavailable" if untraceable
+            else str(prior.get("status") or "no_data")
+        )
         source_manifest[source] = {
             **prior,
             "attempted": bool(prior.get("attempted", True)),
@@ -574,8 +578,12 @@ def govern_context(
             "status": status,
             "result_count": len(rows),
             "untraceable_count": untraceable,
-            "error": prior.get("error") or ("Connector returned records without a traceable source reference." if untraceable else None),
-            "required_configuration": prior.get("required_configuration") or ("Configure the connector to return a durable source URI or citation." if untraceable else None),
+            "error": prior.get("error") or (
+                "Connector returned records without a traceable source reference." if untraceable else None
+            ),
+            "required_configuration": prior.get("required_configuration") or (
+                "Configure the connector to return a durable source URI or citation." if untraceable else None
+            ),
             "last_attempt_at": prior.get("last_attempt_at") or collected_at.isoformat(),
             "fresh_count": sum(1 for row in rows if _clamp(row.get("freshness_score")) > 0.0),
             "inferred_timestamp_count": sum(1 for row in rows if row.get("observed_at_inferred")),

@@ -4,21 +4,21 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select
 from common.database import (
     ActionRecord,
     AlertRecord,
     AuditLogRecord,
     ContextSnapshotRecord,
+    GovernedResolutionPlanRecord,
     IncidentInvestigationBindingRecord,
     IncidentProjectionRecord,
     IncidentRecord,
-    GovernedResolutionPlanRecord,
     ResolutionOutboxRecord,
     ResolutionPlanSupersessionRecord,
 )
-from common.repository import IncidentRepository
 from common.orchestration.execution_plan_contract import verify_plan_fingerprint
+from common.repository import IncidentRepository
+from sqlalchemy import func, select
 
 
 async def _seed_pair(

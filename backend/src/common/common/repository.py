@@ -2660,7 +2660,10 @@ class IncidentRepository:
             action.resolution_plan_id or parameters.get("resolution_plan_id") or execution_plan.get("plan_id")
         )
         plan_fingerprint = str(
-            action.plan_fingerprint or parameters.get("approved_plan_fingerprint") or execution_plan.get("plan_fingerprint") or ""
+            action.plan_fingerprint
+            or parameters.get("approved_plan_fingerprint")
+            or execution_plan.get("plan_fingerprint")
+            or ""
         ).strip() or None
         await self.session.merge(
             ActionRecord(

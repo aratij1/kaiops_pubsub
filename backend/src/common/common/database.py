@@ -220,7 +220,10 @@ class ActionRecord(Base, TimestampMixin):
     __tablename__ = "actions"
     __table_args__ = (
         Index("idx_actions_tenant_updated", "tenant_id", "updated_at"),
-        Index("idx_actions_lifecycle_binding", "tenant_id", "incident_id", "recommendation_id", "resolution_plan_id", "approval_id", "updated_at"),
+        Index(
+            "idx_actions_lifecycle_binding", "tenant_id", "incident_id", "recommendation_id",
+            "resolution_plan_id", "approval_id", "updated_at",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -286,7 +289,10 @@ class RcaReportRecord(Base, TimestampMixin):
     __tablename__ = "rca_reports"
 
     __table_args__ = (
-        Index("idx_reports_lifecycle_binding", "tenant_id", "incident_id", "recommendation_id", "resolution_plan_id", "approval_id", "remediation_action_id", "updated_at"),
+        Index(
+            "idx_reports_lifecycle_binding", "tenant_id", "incident_id", "recommendation_id",
+            "resolution_plan_id", "approval_id", "remediation_action_id", "updated_at",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
