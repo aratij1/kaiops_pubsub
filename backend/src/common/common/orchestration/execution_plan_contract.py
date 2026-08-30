@@ -114,8 +114,12 @@ class ExecutionPlanV2(BaseModel):
     plan_id: UUID
     incident_id: UUID
     tenant_id: str
-    rca_version: str | None = None
-    evidence_snapshot_id: str | None = None
+    recommendation_id: UUID | None = None
+    rca_version: int | None = Field(default=None, ge=1)
+    evidence_snapshot_id: UUID | None = None
+    context_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    resolution_selection_id: UUID | None = None
+    policy_version: str | None = None
     recommendation_version: str | None = None
     service: str
     environment: str

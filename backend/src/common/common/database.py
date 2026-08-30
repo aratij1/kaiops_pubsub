@@ -417,6 +417,11 @@ class ContextSnapshotRecord(Base):
     alert_signature: Mapped[str] = mapped_column(String(64), index=True)
     subject_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
     context_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    parent_snapshot_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    snapshot_stage: Mapped[str] = mapped_column(String(32), nullable=False, default="collected")
+    snapshot_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    evidence_checksums: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
     contract_version: Mapped[str] = mapped_column(String(32), default="kaiops.context.v2")
     quality_score: Mapped[float] = mapped_column(Numeric(5, 4), default=0.0)
     reusable: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -603,11 +608,6 @@ class GovernedResolutionPlanRecord(Base):
     analysis_request_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     context_snapshot_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     context_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
-    parent_snapshot_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
-    snapshot_stage: Mapped[str] = mapped_column(String(32), nullable=False, default="collected")
-    snapshot_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    evidence_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
-    evidence_checksums: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
     rca_version: Mapped[int] = mapped_column(Integer)
     recommendation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     recommendation_version: Mapped[int] = mapped_column(Integer)
@@ -636,6 +636,39 @@ class ResolutionPlanSupersessionRecord(Base):
     incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     supersedes: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     superseded_by: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ExecutionPlanRecord(Base):
+    """Durable canonical ExecutionPlanV2, separate from catalog selection."""
+
+    __tablename__ = "execution_plans"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "fingerprint", name="uq_execution_plans_fingerprint"),
+        Index("idx_execution_plans_incident_created", "tenant_id", "incident_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    recommendation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    rca_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    context_snapshot_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    context_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    resolution_selection_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    playbook_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(71), nullable=False)
+    target_service: Mapped[str] = mapped_column(String(255), nullable=False)
+    target_environment: Mapped[str] = mapped_column(String(64), nullable=False)
+    risk_tier: Mapped[str] = mapped_column(String(32), nullable=False)
+    execution_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    approval_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    execution_ready: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    readiness_blocks: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    plan_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    supersedes_plan_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 

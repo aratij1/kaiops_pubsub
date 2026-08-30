@@ -16,7 +16,7 @@ from common.event_publishers import build_agent_event_contract, build_event_enve
 from common.resolution_lifecycle import ResolutionState, create_lifecycle, decide_resolution_control
 from common.kafka import KafkaConsumer
 from common.kafka import consume_forever as consume_kafka_forever
-from common.models import Incident, Recommendation
+from common.models import Alert, Incident, Recommendation
 from common.capability_registry import default_capability_registry
 from common.remediation_plan import (
     AutonomyRecommendation,
@@ -340,7 +340,6 @@ async def persist_final_investigation_snapshot(
 
 def bind_context_to_snapshot(context: Context, *, snapshot: Any) -> Context:
     metadata = dict(context.metadata if isinstance(context.metadata, dict) else {})
-    metadata.pop("_final_investigation_report", None)
     metadata.update({
         "context_snapshot_id": str(snapshot.snapshot_id),
         "context_fingerprint": snapshot.context_fingerprint,
@@ -682,9 +681,13 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
     # ExecutionPlanV2 carries the immutable version as a string.  Normalize at
     # this boundary so a fresh, bound RCA cannot fail after analysis merely
     # because Pydantic does not coerce numbers in strict string fields.
-    plan["rca_version"] = str(metadata.get("rca_version") or "") or None
+    try:
+        plan["rca_version"] = int(metadata.get("rca_version") or 0) or None
+    except (TypeError, ValueError):
+        plan["rca_version"] = None
     plan["evidence_snapshot_id"] = metadata.get("context_snapshot_id")
-    plan["recommendation_version"] = metadata.get("recommendation_version")
+    plan["recommendation_id"] = recommendation.id
+    plan["recommendation_version"] = str(recommendation.id)
     investigation = metadata.get("investigation_report") if isinstance(metadata.get("investigation_report"), dict) else {}
     plan["evidence_basis"] = list(rca_analysis.get("evidence_used") or [])
     plan["investigation_report"] = investigation
@@ -1569,9 +1572,9 @@ async def resolution_catalog(request: ResolutionCatalogRequest) -> dict[str, Any
 @app.post("/resolution-catalog/select")
 async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, Any]:
     tenant_id = require_tenant_id(request.tenant_id, source="resolution selection request")
-    await _require_catalog_readiness(request)
+    bound = await _require_catalog_readiness(request)
     try:
-        plan = prepare_resolution_plan(
+        option = prepare_resolution_plan(
             tenant_id=tenant_id,
             option_id=request.option_id,
             issue=request.issue,
@@ -1581,13 +1584,10 @@ async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, An
         from fastapi import HTTPException
 
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    plan["target_resource"] = request.service
-    plan["connector_id"] = "diagnostic-only"
-    plan["commands"] = []
     async with app.state.session_factory() as session:
         repository = IncidentRepository(session)
         try:
-            persisted = await repository.persist_governed_resolution_selection(
+            selection = await repository.persist_governed_resolution_selection(
                 tenant_id=tenant_id,
                 incident_id=request.incident_id,
                 alert_id=request.alert_id,
@@ -1596,8 +1596,44 @@ async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, An
                 context_fingerprint=request.context_fingerprint,
                 recommendation_id=request.recommendation_id,
                 rca_version=request.rca_version,
-                option=plan,
+                option=option,
                 selected_by=request.actor,
+            )
+            recommendation = bound.get("recommendation") if isinstance(bound.get("recommendation"), dict) else {}
+            metadata = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
+            evidence_ids = [str(value) for value in metadata.get("evidence_ids", []) if str(value).strip()]
+            alert = Alert(
+                id=request.alert_id, tenant_id=tenant_id, source="resolution-selection",
+                name=request.issue or "selected resolution", service=request.service,
+                environment=request.environment, description=request.issue or request.option_id,
+                metadata={"incident_id": str(request.incident_id)},
+            )
+            compiled = resolve_execution_plan(
+                alert=alert, workflow_name="operator-resolution-selection", requires_approval=True,
+                risk_tier=str(option.get("risk") or recommendation.get("risk") or "high"),
+                execution_mode="human-approval",
+                resolution_hints=" ".join(filter(None, (
+                    str(option.get("title") or option.get("name") or request.option_id),
+                    str(option.get("description") or ""), str(recommendation.get("recommended_action") or ""),
+                ))),
+                evidence_basis=evidence_ids, incident_id=request.incident_id,
+                root_cause=str(recommendation.get("root_cause") or "RCA not established"),
+                confidence=float(recommendation.get("confidence") or 0.0),
+            )
+            compiled.update({
+                "plan_id": uuid5(NAMESPACE_URL, f"execution-plan:{selection['selection_id']}"),
+                "recommendation_id": request.recommendation_id,
+                "recommendation_version": str(request.recommendation_id),
+                "rca_version": request.rca_version,
+                "evidence_snapshot_id": request.context_snapshot_id,
+                "context_fingerprint": request.context_fingerprint,
+                "resolution_selection_id": selection["selection_id"],
+                "policy_version": "resolution-policy.v1",
+            })
+            compiled = ExecutionPlanV2.model_validate(compiled).finalized().model_dump(mode="json")
+            blocking_reasons = list(compiled.get("readiness_blocks") or [])
+            execution_plan = await repository.persist_compiled_execution_plan(
+                selection_id=selection["selection_id"], plan=compiled, blocking_reasons=blocking_reasons,
             )
             await session.commit()
         except ValueError as exc:
@@ -1606,7 +1642,14 @@ async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, An
                 status_code=409,
                 detail={"code": "stale_or_invalid_resolution_selection", "blocking_reasons": [str(exc)]},
             ) from exc
-    return {"incident_id": str(request.incident_id), "selected": persisted}
+    return {
+        "selection": selection,
+        "compilation": {
+            "status": "compiled" if execution_plan is not None else "blocked",
+            "blocking_reasons": [] if execution_plan is not None else blocking_reasons,
+        },
+        "execution_plan": execution_plan,
+    }
 
 
 @app.post("/resolve", response_model=Recommendation)
