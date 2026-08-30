@@ -3366,6 +3366,11 @@ class IncidentRepository:
             "alert_signature": row.alert_signature,
             "subject_fingerprint": row.subject_fingerprint,
             "context_fingerprint": row.context_fingerprint,
+            "parent_snapshot_id": str(row.parent_snapshot_id) if row.parent_snapshot_id else None,
+            "snapshot_stage": row.snapshot_stage,
+            "snapshot_version": row.snapshot_version,
+            "evidence_ids": list(row.evidence_ids or []),
+            "evidence_checksums": dict(row.evidence_checksums or {}),
             "contract_version": row.contract_version,
             "quality_score": float(row.quality_score or 0.0),
             "reusable": bool(row.reusable),
@@ -3398,10 +3403,77 @@ class IncidentRepository:
             "tenant_id": row.tenant_id,
             "incident_id": row.incident_id,
             "context_fingerprint": row.context_fingerprint,
+            "parent_snapshot_id": str(row.parent_snapshot_id) if row.parent_snapshot_id else None,
+            "snapshot_stage": row.snapshot_stage,
+            "snapshot_version": row.snapshot_version,
+            "evidence_ids": list(row.evidence_ids or []),
+            "evidence_checksums": dict(row.evidence_checksums or {}),
             "context": row.payload if isinstance(row.payload, dict) else {},
             "collected_at": row.collected_at.isoformat(),
             "expires_at": row.expires_at.isoformat(),
         }
+
+    async def persist_final_investigation_snapshot(
+        self, *, context: Any, report: dict[str, Any], parent_snapshot_id: UUID | str,
+    ) -> ContextSnapshotRecord:
+        parent_uuid = self._parse_uuid(parent_snapshot_id)
+        parent = (await self.session.execute(select(ContextSnapshotRecord).where(
+            ContextSnapshotRecord.snapshot_id == parent_uuid,
+        ).with_for_update())).scalar_one_or_none() if parent_uuid else None
+        if parent is None:
+            raise RuntimeError("parent context snapshot does not exist")
+        context_payload = context.model_dump(mode="json") if hasattr(context, "model_dump") else dict(context)
+        if str(context_payload.get("tenant_id") or "") != parent.tenant_id:
+            raise RuntimeError("final context snapshot tenant mismatch")
+        if str(context_payload.get("incident_id") or "") != parent.incident_id:
+            raise RuntimeError("final context snapshot incident mismatch")
+        metadata = dict(context_payload.get("metadata") or {})
+        metadata.pop("context_snapshot_id", None)
+        metadata.pop("context_fingerprint", None)
+        evidence_rows = [
+            item for rows in (metadata.get("context_evidence") or {}).values()
+            if isinstance(rows, list) for item in rows if isinstance(item, dict)
+        ]
+        evidence_ids = sorted({
+            str(item.get("evidence_id") or item.get("id") or "").strip()
+            for item in evidence_rows if str(item.get("evidence_id") or item.get("id") or "").strip()
+        })
+        evidence_by_id = {
+            str(item.get("evidence_id") or item.get("id") or "").strip(): item
+            for item in evidence_rows
+        }
+        evidence_checksums = {
+            identity: f"sha256:{hashlib.sha256(json.dumps(
+                evidence_by_id[identity], sort_keys=True, default=str, separators=(',', ':'),
+            ).encode()).hexdigest()}"
+            for identity in evidence_ids
+        }
+        metadata["investigation_report"] = dict(report)
+        canonical = {**context_payload, "metadata": metadata}
+        fingerprint = hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, default=str, separators=(",", ":")).encode()
+        ).hexdigest()
+        snapshot_id = uuid4()
+        version = int(parent.snapshot_version or 1) + 1
+        metadata.update({
+            "context_snapshot_id": str(snapshot_id), "context_fingerprint": fingerprint,
+            "snapshot_stage": "investigation_complete", "snapshot_version": version,
+        })
+        row = ContextSnapshotRecord(
+            snapshot_id=snapshot_id, tenant_id=parent.tenant_id, incident_id=parent.incident_id,
+            source_incident_id=parent.source_incident_id, alert_signature=parent.alert_signature,
+            subject_fingerprint=parent.subject_fingerprint, context_fingerprint=fingerprint,
+            parent_snapshot_id=parent.snapshot_id, snapshot_stage="investigation_complete",
+            snapshot_version=version, evidence_ids=evidence_ids,
+            evidence_checksums=evidence_checksums, contract_version=parent.contract_version,
+            quality_score=parent.quality_score, reusable=False,
+            source_manifest=dict(parent.source_manifest or {}),
+            payload={**context_payload, "metadata": metadata}, collected_at=datetime.now(UTC),
+            expires_at=parent.expires_at,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
 
     async def get_bound_incident_investigation(
         self,

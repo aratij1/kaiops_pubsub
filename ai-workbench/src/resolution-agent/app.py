@@ -127,10 +127,10 @@ def _attach_rca_governance_binding(recommendation: Recommendation, context: Cont
     }
 
 
-async def _require_context_snapshot_binding(context: Context) -> dict[str, Any] | None:
+async def _require_context_snapshot_binding(context: Context) -> dict[str, Any]:
     """Fail closed before persisting an RCA against orphaned or stale context."""
     if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
-        return None
+        raise HTTPException(status_code=503, detail="durable context snapshot storage is unavailable")
     metadata = context.metadata if isinstance(context.metadata, dict) else {}
     snapshot_id = str(metadata.get("context_snapshot_id") or "").strip()
     if not snapshot_id:
@@ -218,6 +218,90 @@ def _attach_resolution_options(
             rca_result["resolution_options"] = options
 
 
+async def investigate_context(context: Context) -> tuple[Context, dict[str, Any]]:
+    """Collect investigator evidence before the immutable RCA snapshot is finalized."""
+    enabled = str(os.getenv("RESOLUTION_ITERATIVE_INVESTIGATION_ENABLED", "true")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if not enabled:
+        return context, {}
+    report: dict[str, Any] = {}
+
+    async def persist(event: str, payload: dict[str, Any]) -> None:
+        if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+            return
+        async with app.state.session_factory() as session:
+            repo = IncidentRepository(session)
+            if event == "started":
+                await repo.create_resolution_investigation(payload)
+            elif event == "step":
+                await repo.append_resolution_investigation_step(payload)
+            elif event == "completed":
+                await repo.complete_resolution_investigation(payload)
+            await session.commit()
+
+    try:
+        report = await investigator.investigate(context, persist=persist)
+    except Exception as exc:
+        logger.exception("iterative investigation failed")
+        report = {"status": "failed", "conclusive": False, "persistence_errors": [str(exc)[:300]]}
+    metadata = dict(context.metadata if isinstance(context.metadata, dict) else {})
+    context_evidence = dict(
+        metadata.get("context_evidence") if isinstance(metadata.get("context_evidence"), dict) else {}
+    )
+    for row in report.get("evidence", []):
+        if not isinstance(row, dict):
+            continue
+        source = investigator._source(row)
+        bucket = {"history": "tickets", "data": "database", "alert": "telemetry"}.get(source, source)
+        rows = list(context_evidence.get(bucket) if isinstance(context_evidence.get(bucket), list) else [])
+        known = {str(item.get("evidence_id") or item.get("uri") or "") for item in rows if isinstance(item, dict)}
+        identity = str(row.get("evidence_id") or row.get("uri") or "")
+        if identity and identity not in known:
+            rows.append(row)
+        context_evidence[bucket] = rows
+    metadata["context_evidence"] = context_evidence
+    metadata["iterative_investigation"] = {key: value for key, value in report.items() if key != "evidence"}
+    metadata["_final_investigation_report"] = report
+    return context.model_copy(update={"metadata": metadata}), report
+
+
+async def persist_final_investigation_snapshot(
+    context: Context, report: dict[str, Any], parent_snapshot_id: UUID | str,
+) -> Any:
+    async with app.state.session_factory() as session:
+        row = await IncidentRepository(session).persist_final_investigation_snapshot(
+            context=context, report=report, parent_snapshot_id=parent_snapshot_id,
+        )
+        await session.commit()
+        return row
+
+
+def bind_context_to_snapshot(context: Context, *, snapshot_id: UUID, fingerprint: str) -> Context:
+    metadata = dict(context.metadata if isinstance(context.metadata, dict) else {})
+    metadata.pop("_final_investigation_report", None)
+    metadata.update({
+        "context_snapshot_id": str(snapshot_id), "context_fingerprint": fingerprint,
+        "snapshot_stage": "investigation_complete",
+    })
+    return context.model_copy(update={"metadata": metadata})
+
+
+def _validate_recommendation_snapshot_evidence(recommendation: Recommendation, snapshot: Any) -> None:
+    metadata = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
+    evidence_ids = metadata.get("evidence_ids")
+    if not isinstance(evidence_ids, list):
+        analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
+        evidence_ids = analysis.get("evidence_used", [])
+    outside = sorted({str(value) for value in evidence_ids or []} - set(snapshot.evidence_ids or []))
+    if outside:
+        raise HTTPException(status_code=409, detail={
+            "code": "evidence_snapshot_mismatch",
+            "message": "RCA evidence is not contained in the final investigation snapshot",
+            "evidence_ids": outside,
+        })
+
+
 async def _resolve_context(context: Context) -> Recommendation:
     metadata = context.metadata if isinstance(context.metadata, dict) else {}
     prior = metadata.get("prior_resolution") if isinstance(metadata.get("prior_resolution"), dict) else {}
@@ -229,11 +313,14 @@ async def _resolve_context(context: Context) -> Recommendation:
         and score > _resolution_reuse_threshold()
     )
     if not may_reuse:
-        investigation_report: dict[str, Any] = {}
+        investigation_report = (
+            dict(metadata.get("_final_investigation_report"))
+            if isinstance(metadata.get("_final_investigation_report"), dict) else {}
+        )
         investigation_enabled = str(os.getenv("RESOLUTION_ITERATIVE_INVESTIGATION_ENABLED", "true")).strip().lower() in {
             "1", "true", "yes", "on",
         }
-        if investigation_enabled:
+        if investigation_enabled and not investigation_report:
             async def persist_investigation(event: str, payload: dict[str, Any]) -> None:
                 if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
                     return
@@ -1017,10 +1104,19 @@ async def startup(app: FastAPI) -> None:
     async def handle(payload: dict) -> None:
         context = Context.model_validate(payload["context"])
         incident = Incident.model_validate(payload["incident"])
-        await _require_context_snapshot_binding(context)
+        initial_snapshot = await _require_context_snapshot_binding(context)
         decision_payload = payload.get("decision", {}) if isinstance(payload.get("decision"), dict) else {}
+        investigated_context, investigation_report = await investigate_context(context)
+        final_snapshot = await persist_final_investigation_snapshot(
+            investigated_context, investigation_report, initial_snapshot["snapshot_id"],
+        )
+        context = bind_context_to_snapshot(
+            investigated_context, snapshot_id=final_snapshot.snapshot_id,
+            fingerprint=final_snapshot.context_fingerprint,
+        )
         recommendation = await _resolve_context(context)
         _attach_rca_governance_binding(recommendation, context)
+        _validate_recommendation_snapshot_evidence(recommendation, final_snapshot)
         recommendation.trace_id = str(incident.trace_id or context.alert.trace_id or "") or None
         recommendation.metadata["rag_documents"] = context.metadata.get("rag_documents", 0)
         recommendation.metadata["rag_matches"] = context.metadata.get("rag_matches", [])
@@ -1431,9 +1527,18 @@ async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, An
 
 @app.post("/resolve", response_model=Recommendation)
 async def resolve(context: Context, publish_events: bool = True) -> Recommendation:
-    await _require_context_snapshot_binding(context)
+    initial_snapshot = await _require_context_snapshot_binding(context)
+    investigated_context, investigation_report = await investigate_context(context)
+    final_snapshot = await persist_final_investigation_snapshot(
+        investigated_context, investigation_report, initial_snapshot["snapshot_id"],
+    )
+    context = bind_context_to_snapshot(
+        investigated_context, snapshot_id=final_snapshot.snapshot_id,
+        fingerprint=final_snapshot.context_fingerprint,
+    )
     recommendation = await _resolve_context(context)
     _attach_rca_governance_binding(recommendation, context)
+    _validate_recommendation_snapshot_evidence(recommendation, final_snapshot)
     _apply_catalog_plan(recommendation, context)
     recommendation.trace_id = str(context.alert.trace_id or "") or None
     recommendation.metadata["rag_documents"] = context.metadata.get("rag_documents", 0)
