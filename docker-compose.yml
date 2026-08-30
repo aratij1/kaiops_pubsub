@@ -863,7 +863,6 @@ services:
       # Review drafts are runtime state. Keep them on a Docker-managed volume
       # so hardened/rootless hosts can write them even when the source bind
       # mount is read-only or owned by the deployment account.
-      - context-evidence-review:/app/rag/_review
       - ./fault-lab:/data/fault-lab:ro
       - ./backend/ingested_alerts:/data/landing:ro
       - ./observability:/app/observability:ro
@@ -1566,4 +1565,3 @@ volumes:
   ui-dev-node-modules:
   ui-dev-npm-cache:
   jenkins-data:
-  context-evidence-review:

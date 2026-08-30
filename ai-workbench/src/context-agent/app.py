@@ -12,7 +12,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlparse
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ai_workbench_common.models import Context
 from common.config import get_settings
@@ -894,13 +894,8 @@ async def startup(app: FastAPI) -> None:
             decision=decision,
             analysis_request=payload.get("analysis_request"),
         )
-        try:
-            create_evidence_rag_draft(alert=alert, incident=incident, context=context)
-        except Exception:
-            logger.exception(
-                "failed to create evidence RAG draft for alert_id=%s",
-                alert.id,
-            )
+        # Evidence drafts are created only after the recommendation and its
+        # normalized investigation binding have committed.
         provider = _extract_message_bus_provider(payload)
         publishers: dict[str, EventPublisher] = getattr(app.state, "message_bus_publishers", {})
         provider_used = provider if publishers.get(provider) is not None else "rabbitmq"
@@ -1021,18 +1016,37 @@ class RagDocumentApproveRequest(BaseModel):
 
 class EvidenceRagDraftReviewRequest(BaseModel):
     tenant_scope: str = Field(min_length=1, max_length=128)
-    title: str | None = Field(default=None, min_length=3, max_length=160)
-    content: str | None = Field(default=None, min_length=20)
+    expected_row_version: int = Field(ge=1)
+    title: str = Field(min_length=3, max_length=160)
+    content: str = Field(min_length=20)
     reviewed_by: str = Field(min_length=2, max_length=120)
     review_notes: str | None = Field(default=None, max_length=2000)
 
 
 class EvidenceRagDraftApproveRequest(BaseModel):
     tenant_scope: str = Field(min_length=1, max_length=128)
+    expected_row_version: int = Field(ge=1)
     approved_by: str = Field(min_length=2, max_length=120)
-    owner_team: str = Field(min_length=2, max_length=160)
-    title: str | None = Field(default=None, min_length=3, max_length=160)
-    content: str | None = Field(default=None, min_length=20)
+    owner_team: str | None = Field(default=None, min_length=2, max_length=160)
+
+
+class EvidenceRagDraftCreateRequest(BaseModel):
+    tenant_scope: str = Field(min_length=1, max_length=128)
+    created_by: str = Field(min_length=2, max_length=160)
+    incident_id: UUID
+    alert_id: UUID
+    analysis_request_id: UUID
+    context_snapshot_id: UUID
+    context_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    recommendation_id: UUID
+    rca_version: int = Field(ge=1)
+    evidence_ids: list[str] = Field(min_length=1)
+    source_uris: list[str] = Field(min_length=1)
+    content: str = Field(min_length=20)
+    alert_type: str = Field(default="Alert", max_length=255)
+    severity: str = Field(default="unknown", max_length=32)
+    environment: str = Field(default="unknown", max_length=64)
+    services: list[str] = Field(default_factory=list)
 
 
 def _metadata_value(metadata: dict[str, str], *keys: str, default: str = "") -> str:
@@ -1850,77 +1864,20 @@ async def latest_context_snapshot(incident_id: str, tenant_id: str = "default") 
 
 @app.post("/rag/documents")
 async def ingest_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
-    governed_request = request.model_copy(update={
-        "review_status": "pending_review",
-        "corpus_classification": "GENERATED_UNVERIFIED",
-        "reviewed_by": None,
-        "approved_by": None,
-        "approved_at": None,
-        "last_reviewed": None,
-    })
-    tenant_scope = require_tenant_id(governed_request.tenant_scope, source="RAG draft ingestion")
-    draft_id = f"rag-{uuid4()}"
-    now = datetime.now(UTC).isoformat()
-    draft = {
-        "draft_id": draft_id,
-        "status": "pending_review",
-        "tenant_scope": tenant_scope,
-        "created_at": now,
-        "updated_at": now,
-        "request": governed_request.model_dump(mode="json"),
-    }
-    await asyncio.to_thread(
-        _draft_path(draft_id).write_text,
-        json.dumps(draft, indent=2),
-        encoding="utf-8",
+    raise HTTPException(
+        status_code=410,
+        detail="Use the versioned evidence draft workflow for tenant-curated knowledge",
     )
-    return {
-        "status": "pending_review",
-        "document_flag_updated": False,
-        "draft": draft,
-        "document_count": vector_connector().reload(),
-        "index": vector_connector().index_info(),
-    }
 
 
 @app.post("/rag/documents/{draft_id}/approve")
 async def approve_rag_document(
     draft_id: str, request: RagDocumentApproveRequest
 ) -> dict[str, Any]:
-    draft = _read_evidence_draft(draft_id)
-    if str(draft.get("tenant_scope") or "") != request.tenant_scope:
-        raise HTTPException(status_code=404, detail="RAG draft not found")
-    if str(draft.get("status") or "") == "approved":
-        return {"status": "approved", "draft": draft, "already_approved": True}
-    payload = draft.get("request") if isinstance(draft.get("request"), dict) else {}
-    now = datetime.now(UTC).isoformat()
-    version = max(1, int(payload.get("content_version") or 1))
-    governed = RagDocumentRequest.model_validate({
-        **payload,
-        "tenant_scope": request.tenant_scope,
-        "owner_team": request.owner_team,
-        "review_status": "approved",
-        "corpus_classification": "TENANT_CURATED",
-        "content_version": version,
-        "last_reviewed": now,
-        "reviewed_by": request.approved_by,
-        "approved_by": request.approved_by,
-        "approved_at": now,
-        "updated_at": now,
-    })
-    result = write_rag_document(governed)
-    draft.update({
-        "status": "approved",
-        "updated_at": now,
-        "approved_by": request.approved_by,
-        "approved_at": now,
-        "rag_document_path": result["path"],
-        "content_checksum": content_checksum(governed.content),
-    })
-    _write_evidence_draft(draft)
-    if governed.kind == "incident":
-        rebuild_flow_catalog_from_rag(vector_connector())
-    return {"status": "approved", "draft": draft, "rag_document": result}
+    raise HTTPException(
+        status_code=410,
+        detail="Legacy mutable RAG approval is disabled; use versioned evidence drafts",
+    )
 
 
 def _list_evidence_rag_drafts_sync(
@@ -1958,36 +1915,54 @@ async def list_evidence_rag_drafts(
     document_kind: str | None = None,
     tenant_scope: str = "",
 ) -> dict[str, Any]:
-    # The review directory can live on a high-latency bind mount. Never block
-    # RabbitMQ heartbeats and incident consumers while walking/stat-ing it.
     tenant = require_tenant_id(tenant_scope, source="evidence draft listing")
-    drafts = await asyncio.to_thread(_list_evidence_rag_drafts_sync, alert_id, status, tenant, document_kind)
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        raise HTTPException(status_code=503, detail="durable evidence draft storage is unavailable")
+    async with app.state.session_factory() as session:
+        try:
+            drafts = await IncidentRepository(session).list_evidence_rag_drafts(
+                tenant_id=tenant, alert_id=alert_id, status=status, document_kind=document_kind,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"count": len(drafts), "drafts": drafts}
 
 
 @app.post("/rag/evidence-drafts")
-async def create_evidence_rag_draft_from_rca(request: dict[str, Any]) -> dict[str, Any]:
+async def create_evidence_rag_draft_from_rca(request: EvidenceRagDraftCreateRequest) -> dict[str, Any]:
     """Create the reviewable alert document when the RCA pipeline has no draft."""
-    alert_id = str(request.get("alert_id") or "").strip()
-    content = str(request.get("content") or "").strip()
-    if not alert_id:
-        raise HTTPException(status_code=422, detail="alert_id is required")
-    if len(content) < 20:
-        raise HTTPException(status_code=422, detail="grounded RCA content is required")
-    tenant_scope = require_tenant_id(
-        str(request.get("tenant_scope") or ""), source="evidence draft creation"
-    )
-    drafts = _write_incident_document_bundle({
-        "tenant_scope": tenant_scope,
-        "alert_id": alert_id,
-        "incident_id": str(request.get("incident_id") or ""),
-        "alert_type": str(request.get("alert_type") or "Alert"),
-        "severity": str(request.get("severity") or "unknown"),
-        "environment": str(request.get("environment") or "unknown"),
-        "services": [str(item) for item in request.get("services", []) if str(item).strip()],
-        "evidence_ids": [str(item) for item in request.get("evidence_ids", []) if str(item).strip()],
-        "source_uris": [str(item) for item in request.get("source_uris", []) if str(item).strip()],
-    }, content)
+    tenant = require_tenant_id(request.tenant_scope, source="evidence draft creation")
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        raise HTTPException(status_code=503, detail="durable evidence draft storage is unavailable")
+    documents = []
+    for kind in INCIDENT_DOCUMENT_KINDS:
+        documents.append({
+            "document_kind": kind,
+            "title": f"{kind.replace('_', ' ').title()} draft: {request.alert_type}",
+            "content": _typed_incident_document_content(
+                kind, alert_name=request.alert_type,
+                service=request.services[0] if request.services else "unknown",
+                environment=request.environment, base=request.content,
+            ),
+        })
+    binding = {
+        "incident_id": request.incident_id, "alert_id": request.alert_id,
+        "analysis_request_id": request.analysis_request_id,
+        "context_snapshot_id": request.context_snapshot_id,
+        "context_fingerprint": request.context_fingerprint,
+        "recommendation_id": request.recommendation_id, "rca_version": request.rca_version,
+    }
+    async with app.state.session_factory() as session:
+        try:
+            drafts = await IncidentRepository(session).create_evidence_rag_drafts(
+                tenant_id=tenant, created_by=request.created_by, binding=binding,
+                documents=documents, evidence_ids=request.evidence_ids,
+                source_uris=request.source_uris,
+            )
+            await session.commit()
+        except RuntimeError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"status": "created", "draft": drafts[0], "drafts": drafts}
 
 
@@ -1996,20 +1971,26 @@ async def review_evidence_rag_draft(
     draft_id: str,
     request: EvidenceRagDraftReviewRequest,
 ) -> dict[str, Any]:
-    draft = _read_evidence_draft(draft_id)
-    if str(draft.get("tenant_scope") or "") != request.tenant_scope:
-        raise HTTPException(status_code=404, detail="evidence RAG draft not found")
-    if str(draft.get("status") or "") == "approved":
-        raise HTTPException(status_code=409, detail="approved evidence documents cannot be edited")
-    if request.title is not None:
-        draft["title"] = request.title.strip()
-    if request.content is not None:
-        draft["content"] = request.content.strip()
-    draft["status"] = "reviewed"
-    draft["reviewed_by"] = request.reviewed_by.strip()
-    draft["review_notes"] = str(request.review_notes or "").strip() or None
-    draft["updated_at"] = datetime.now(UTC).isoformat()
-    return {"status": "reviewed", "draft": _write_evidence_draft(draft)}
+    tenant = require_tenant_id(request.tenant_scope, source="evidence draft review")
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        raise HTTPException(status_code=503, detail="durable evidence draft storage is unavailable")
+    async with app.state.session_factory() as session:
+        draft = await IncidentRepository(session).review_evidence_rag_draft(
+            tenant_id=tenant, draft_id=draft_id,
+            expected_row_version=request.expected_row_version, title=request.title.strip(),
+            content=request.content.strip(), review_notes=str(request.review_notes or "").strip() or None,
+            reviewed_by=request.reviewed_by.strip(),
+        )
+        if draft is None:
+            exists_for_tenant = await IncidentRepository(session).list_evidence_rag_drafts(tenant_id=tenant)
+            if not any(item["draft_id"] == draft_id for item in exists_for_tenant):
+                raise HTTPException(status_code=404, detail="evidence RAG draft not found")
+            raise HTTPException(status_code=409, detail={
+                "code": "stale_evidence_draft",
+                "message": "The evidence draft was changed by another reviewer.",
+            })
+        await session.commit()
+    return {"status": "reviewed", "draft": draft}
 
 
 @app.post("/rag/evidence-drafts/{draft_id}/approve")
@@ -2017,60 +1998,24 @@ async def approve_evidence_rag_draft(
     draft_id: str,
     request: EvidenceRagDraftApproveRequest,
 ) -> dict[str, Any]:
-    draft = _read_evidence_draft(draft_id)
-    if str(draft.get("tenant_scope") or "") != request.tenant_scope:
-        raise HTTPException(status_code=404, detail="evidence RAG draft not found")
-    if str(draft.get("status") or "") == "approved":
-        return {"status": "approved", "draft": draft, "already_approved": True}
-    title = str(request.title or draft.get("title") or "").strip()
-    content = str(request.content or draft.get("content") or "").strip()
-    if len(content) < 20:
-        raise HTTPException(status_code=422, detail="approved evidence content is too short")
-    tenant_scope = require_tenant_id(str(draft.get("tenant_scope") or ""), source="evidence approval")
-    approved_at = datetime.now(UTC).isoformat()
-    rag_request = RagDocumentRequest(
-        kind="incident" if str(draft.get("document_kind") or "incident") == "jira" else str(draft.get("document_kind") or "incident"),
-        alert_id=str(draft.get("alert_id") or "") or None,
-        alert_type=str(draft.get("alert_type") or "") or None,
-        severity=str(draft.get("severity") or "") or None,
-        title=title,
-        summary="User-reviewed evidence document approved for future grounding.",
-        content=content,
-        services=[str(item) for item in draft.get("services", []) if str(item).strip()],
-        source_system="kaiops-evidence-review",
-        source_ref=f"evidence-draft://{draft_id}",
-        resolved_by=request.approved_by.strip(),
-        tenant_scope=tenant_scope,
-        owner_team=request.owner_team.strip(),
-        review_status="approved",
-        corpus_classification="TENANT_CURATED",
-        reviewed_by=str(draft.get("reviewed_by") or request.approved_by).strip(),
-        approved_by=request.approved_by.strip(),
-        approved_at=approved_at,
-        last_reviewed=approved_at,
-        metadata={
-            "document_kind": str(draft.get("document_kind") or "incident"),
-            "approval_status": "approved",
-            "approved_by": request.approved_by.strip(),
-            "approved_at": approved_at,
-            "incident_id": str(draft.get("incident_id") or ""),
-            "evidence_ids": ", ".join(str(item) for item in draft.get("evidence_ids", [])),
-        },
-    )
-    result = write_rag_document(rag_request)
-    draft.update(
-        {
-            "status": "approved",
-            "title": title,
-            "content": content,
-            "approved_by": request.approved_by.strip(),
-            "approved_at": approved_at,
-            "updated_at": approved_at,
-            "rag_document_path": result["path"],
-        }
-    )
-    _write_evidence_draft(draft)
-    return {"status": "approved", "draft": draft, "rag_document": result}
+    tenant = require_tenant_id(request.tenant_scope, source="evidence approval")
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        raise HTTPException(status_code=503, detail="durable evidence draft storage is unavailable")
+    async with app.state.session_factory() as session:
+        try:
+            approved = await IncidentRepository(session).approve_evidence_rag_draft(
+                tenant_id=tenant, draft_id=draft_id,
+                expected_row_version=request.expected_row_version,
+                approved_by=request.approved_by.strip(), owner_team=request.owner_team,
+            )
+            if approved is None:
+                raise HTTPException(status_code=404, detail="evidence RAG draft not found")
+            await session.commit()
+        except RuntimeError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    draft, document = approved
+    return {"status": "approved_pending_index", "draft": draft, "document": document}
 
 
 @app.post("/knowledge-pack/draft")

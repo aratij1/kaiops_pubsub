@@ -1286,7 +1286,7 @@ async def get_alert_linked_documents(
     try:
         _, docs_payload = await proxy(
             method="GET",
-            path="/rag/documents",
+            path=f"/rag/documents?{urlencode({'tenant_scope': tenant_id})}",
             target_base=settings.context_agent_url,
             payload={},
             trace_id=trace_id,
@@ -3795,14 +3795,22 @@ async def create_evidence_rag_draft(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
-    tenant_id: str = Depends(current_tenant_id),
+    auth: AuthContext = Depends(require_roles(  # noqa: B008
+        SystemRole.ADMINISTRATOR.value,
+        SystemRole.L2_ENGINEER.value,
+        SystemRole.L3_ENGINEER.value,
+    )),
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
         method="POST",
         path="/rag/evidence-drafts",
         target_base=settings.context_agent_url,
-        payload={**payload, "tenant_scope": tenant_id},
+        payload={
+            **payload,
+            "tenant_scope": auth.tenant_id,
+            "created_by": auth.email or auth.username or str(auth.user_id),
+        },
         trace_id=trace_id_from_header(x_trace_id),
     )
 
@@ -3813,12 +3821,16 @@ async def review_evidence_rag_draft(
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
-    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
+    auth: AuthContext = Depends(require_roles(  # noqa: B008
+        SystemRole.ADMINISTRATOR.value,
+        SystemRole.L2_ENGINEER.value,
+        SystemRole.L3_ENGINEER.value,
+    )),
 ) -> dict[str, Any]:
     return await guarded_proxy(
         request=request,
         method="PUT",
-        path=f"/rag/evidence-drafts/{draft_id}",
+        path=f"/rag/evidence-drafts/{quote(draft_id, safe='')}",
         target_base=settings.context_agent_url,
         payload={
             **payload,
@@ -3840,7 +3852,7 @@ async def approve_evidence_rag_draft(
     return await guarded_proxy(
         request=request,
         method="POST",
-        path=f"/rag/evidence-drafts/{draft_id}/approve",
+        path=f"/rag/evidence-drafts/{quote(draft_id, safe='')}/approve",
         target_base=settings.context_agent_url,
         payload={
             **payload,
