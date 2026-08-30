@@ -8,6 +8,7 @@ import { beginOidcLogin, clearStoredSession, completeOidcLogin, restoreStoredSes
 import { RouteRuntimeProvider } from "./app/routeRuntime";
 import { projectIdentityFromAlert } from "./domain/projectIdentity";
 import { isExpectedAnalysisVersion } from "./domain/analysisVersion";
+import { analysisFailureMessage, analysisRequestOutcome } from "./domain/analysisRequestStatus";
 import { durableIncidentPath, effectiveExecutionStatus, effectiveIncidentStatus, executionProcessPresentation, incidentStatusLabel } from "./domain/incidentStatus";
 import { resolveResolutionControl } from "./domain/resolutionControl";
 import { incidentDraftHasSubstantiveContent, simpleIncidentReport } from "./domain/incidentReport";
@@ -2191,8 +2192,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
             `/api-gateway/analysis/requests/${encodeURIComponent(requestId)}/status?incident_id=${encodeURIComponent(incidentId)}`,
             authenticatedOptions({ timeoutMs: 10000, maxAttempts: 1 }),
           );
-          statusReady = status?.ready === true
-            && String(status?.recommendation_id || "").trim() === expectedRecommendationId;
+          const outcome = analysisRequestOutcome(status, expectedRecommendationId);
+          if (outcome.terminalFailure) {
+            return { ready: false, terminal: true, status, error: analysisFailureMessage(status), payload: latestPayload, attempts: index + 1 };
+          }
+          statusReady = outcome.ready;
         }
         if (statusReady) {
           // Hydrate the full cockpit once, after the indexed completion signal.
@@ -2263,6 +2267,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         incidentId: acceptedIncidentId,
         expectedRecommendationId,
       });
+      if (persistedAnalysis.terminal) {
+        throw new Error(persistedAnalysis.error);
+      }
       if (persistedAnalysis.payload) {
         // Keep React Query and the local cockpit state on the same immutable
         // recommendation revision. Without this write-through, a subsequent

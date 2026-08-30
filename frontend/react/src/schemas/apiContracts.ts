@@ -70,9 +70,12 @@ const AnalysisRegenerationAccepted = z.object({
 const AnalysisRegenerationStatus = z.object({
   request_id: z.string().uuid(),
   incident_id: z.string().uuid(),
-  recommendation_id: z.string().uuid(),
-  status: z.enum(["running", "complete"]),
+  recommendation_id: z.string().uuid().nullable().optional(),
+  status: z.enum(["running", "complete", "failed", "timed_out", "superseded"]),
   ready: z.boolean(),
+  terminal: z.boolean().optional(),
+  retryable: z.boolean().optional(),
+  terminal_reason: z.string().nullable().optional(),
 }).passthrough();
 const ObjectOrList = z.union([ObjectResponse, RecordList]);
 const RowsEnvelope = z.union([

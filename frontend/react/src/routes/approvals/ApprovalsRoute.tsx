@@ -6,6 +6,7 @@ import { OperationsWorkflowNav } from "../../components/operations/OperationsWor
 import { decisionReadiness } from "../../domain/incidentStatus";
 import { approvalDecisionFields } from "../../domain/approvalDecisionPacket";
 import { canonicalApprovalEligibility } from "../../domain/approvalEligibility";
+import { analysisFailureMessage, analysisRequestOutcome } from "../../domain/analysisRequestStatus";
 import { fetchJson } from "../../appHelpers.jsx";
 import "./ApprovalsRoute.css";
 
@@ -70,7 +71,9 @@ export default function ApprovalsRoute() {
       let ready = false;
       for (let attempt = 0; attempt < 100 && requestId && incidentId; attempt += 1) {
         const status = await fetchJson(`/api-gateway/analysis/requests/${encodeURIComponent(requestId)}/status?incident_id=${encodeURIComponent(incidentId)}`, requestOptions).catch(() => null) as Packet | null;
-        ready = status?.ready === true && (!expectedRecommendationId || String(status?.recommendation_id || "").trim() === expectedRecommendationId);
+        const outcome = analysisRequestOutcome(status, expectedRecommendationId);
+        if (outcome.terminalFailure) throw new Error(analysisFailureMessage(status));
+        ready = outcome.ready;
         if (ready) break;
         await new Promise((resolve) => window.setTimeout(resolve, Number(command?.poll_after_ms || 3000)));
       }
