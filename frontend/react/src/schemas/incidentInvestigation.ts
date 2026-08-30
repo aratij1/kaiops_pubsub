@@ -3,6 +3,10 @@ import { z } from "zod";
 const ContextQuality = z.object({
   evidence_count: z.number().int().nonnegative(),
   category_coverage: z.number().min(0).max(1),
+  rca_readiness_score: z.number().min(0).max(1).default(0),
+  impact_readiness_score: z.number().min(0).max(1).default(0),
+  rca_ready: z.boolean().default(false),
+  impact_ready: z.boolean().default(false),
   freshness_score: z.number().min(0).max(1),
   provenance_score: z.number().min(0).max(1),
   independent_source_count: z.number().int().nonnegative(),

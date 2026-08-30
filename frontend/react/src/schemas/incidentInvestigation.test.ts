@@ -45,6 +45,14 @@ describe("incident investigation v1", () => {
     expect(IncidentInvestigationV1.parse(payload()).execution_ready).toBe(false);
   });
 
+  it("defaults evidence readiness for a legacy context-quality payload", () => {
+    const parsed = IncidentInvestigationV1.parse(payload());
+    expect(parsed.context_quality.rca_readiness_score).toBe(0);
+    expect(parsed.context_quality.impact_readiness_score).toBe(0);
+    expect(parsed.context_quality.rca_ready).toBe(false);
+    expect(parsed.context_quality.impact_ready).toBe(false);
+  });
+
   it.each([
     ["unknown field", (value: any) => { value.undeclared = true; }],
     ["foreign evidence", (value: any) => { value.accepted_evidence_ids = ["not-in-snapshot"]; }],

@@ -19,6 +19,10 @@ class ContextQualityContract(BaseModel):
 
     evidence_count: int = Field(ge=0)
     category_coverage: float = Field(ge=0.0, le=1.0)
+    rca_readiness_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    impact_readiness_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    rca_ready: bool = False
+    impact_ready: bool = False
     freshness_score: float = Field(ge=0.0, le=1.0)
     provenance_score: float = Field(ge=0.0, le=1.0)
     independent_source_count: int = Field(ge=0)

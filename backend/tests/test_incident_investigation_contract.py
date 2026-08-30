@@ -87,6 +87,14 @@ def test_rejects_invalid_cross_stage_contract(mutation: str) -> None:
 
 def test_repository_normalizes_iterative_status_and_authoritative_evidence_uri() -> None:
     expected = investigation_payload()
+    expected["context_quality"].update({
+        "coverage_score": 0.85,
+        "source_coverage_score": 0.375,
+        "rca_readiness_score": 0.46,
+        "impact_readiness_score": 0.41,
+        "rca_ready": False,
+        "impact_ready": False,
+    })
     evidence = {
         "evidence_id": "metric-1", "source": "prometheus", "service": "payments",
         "uri": "prometheus://query/payments-latency", "freshness": "Fresh",
@@ -140,4 +148,7 @@ def test_repository_normalizes_iterative_status_and_authoritative_evidence_uri()
     assert contract["investigation_status"] == "inconclusive"
     assert contract["context_evidence"][0]["citation"] == evidence["uri"]
     assert [source["status"] for source in contract["context_sources"]] == ["completed", "empty"]
+    assert contract["context_quality"]["category_coverage"] == 0.375
+    assert contract["context_quality"]["rca_readiness_score"] == 0.46
+    assert contract["context_quality"]["impact_readiness_score"] == 0.41
     assert contract["execution_ready"] is False

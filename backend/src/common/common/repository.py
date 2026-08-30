@@ -3878,7 +3878,17 @@ class IncidentRepository:
             "context_expires_at": context_snapshot.get("expires_at"),
             "context_quality": {
                 "evidence_count": len(evidence),
-                "category_coverage": float(quality.get("coverage_score") or quality.get("category_coverage") or 0),
+                "category_coverage": float(
+                    quality.get("source_coverage_score")
+                    if quality.get("source_coverage_score") is not None
+                    else quality.get("category_coverage")
+                    if quality.get("category_coverage") is not None
+                    else quality.get("coverage_score") or 0
+                ),
+                "rca_readiness_score": float(quality.get("rca_readiness_score") or 0),
+                "impact_readiness_score": float(quality.get("impact_readiness_score") or 0),
+                "rca_ready": bool(quality.get("rca_ready", False)),
+                "impact_ready": bool(quality.get("impact_ready", False)),
                 "freshness_score": float(quality.get("freshness_score") or 0),
                 "provenance_score": float(quality.get("provenance_score") or 0),
                 "independent_source_count": int(quality.get("independent_source_count") or 0),
