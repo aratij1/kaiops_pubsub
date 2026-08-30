@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchJson } from "../../appHelpers.jsx";
+import { useRouteRuntimeSlice } from "../../app/routeRuntime";
 import "./EvidenceDraftReview.css";
 
 interface EvidenceDraft { draft_id: string; document_kind?: string; title?: string; status?: string; content?: string; evidence_ids?: string[]; reviewed_by?: string; updated_at?: string; }
 const DOCUMENT_KINDS = ["incident", "jira", "runbook", "deployment", "change", "dependency", "remediation"];
 
 export default function EvidenceDraftReview({ alertId }: { alertId?: string | null }) {
+  const { accessToken } = useRouteRuntimeSlice("session");
   const [draft, setDraft] = useState<EvidenceDraft | null>(null);
   const [drafts, setDrafts] = useState<EvidenceDraft[]>([]);
   const [content, setContent] = useState("");
@@ -15,12 +17,17 @@ export default function EvidenceDraftReview({ alertId }: { alertId?: string | nu
   const approved = draft?.status === "approved";
   const changed = Boolean(draft && content !== String(draft.content || ""));
   const words = useMemo(() => content.trim() ? content.trim().split(/\s+/).length : 0, [content]);
+  const authenticatedOptions = (options: Record<string, unknown> = {}) => ({
+    ...options,
+    authenticated: true,
+    headers: { Authorization: `Bearer ${accessToken}`, ...((options.headers as Record<string, string>) || {}) },
+  });
 
   async function loadDraft() {
-    if (!alertId) return;
+    if (!alertId || !accessToken) return;
     setLoading(true); setMessage(null);
     try {
-      const response: any = await fetchJson(`/api-gateway/rag/evidence-drafts?alert_id=${encodeURIComponent(alertId)}`, { timeoutMs: 10000 });
+      const response: any = await fetchJson(`/api-gateway/rag/evidence-drafts?alert_id=${encodeURIComponent(alertId)}`, authenticatedOptions({ timeoutMs: 10000 }));
       const loaded: EvidenceDraft[] = (response?.data || response)?.drafts || [];
       const next = loaded.find((item) => item.document_kind === draft?.document_kind) || loaded[0] || null;
       setDrafts(loaded);
@@ -29,7 +36,7 @@ export default function EvidenceDraftReview({ alertId }: { alertId?: string | nu
     finally { setLoading(false); }
   }
 
-  useEffect(() => { void loadDraft(); }, [alertId]);
+  useEffect(() => { void loadDraft(); }, [accessToken, alertId]);
 
   function selectDraft(next: EvidenceDraft) {
     if (changed && !window.confirm("Discard unsaved changes and open another document?")) return;
@@ -41,10 +48,10 @@ export default function EvidenceDraftReview({ alertId }: { alertId?: string | nu
     if (content.trim().length < 40) { setMessage({ tone: "error", text: "Add a meaningful evidence summary before continuing." }); return; }
     setLoading(true); setMessage(null);
     try {
-      const response: any = await fetchJson(`/api-gateway/rag/evidence-drafts/${encodeURIComponent(draft.draft_id)}${approve ? "/approve" : ""}`, {
+      const response: any = await fetchJson(`/api-gateway/rag/evidence-drafts/${encodeURIComponent(draft.draft_id)}${approve ? "/approve" : ""}`, authenticatedOptions({
         method: approve ? "POST" : "PUT",
         body: JSON.stringify(approve ? { approved_by: reviewer.trim(), content } : { reviewed_by: reviewer.trim(), content }),
-      });
+      }));
       const next = (response?.data || response)?.draft || draft;
       setDraft(next); setContent(String(next.content || content));
       setDrafts((current) => current.map((item) => item.draft_id === next.draft_id ? next : item));

@@ -6005,7 +6005,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
 
   useEffect(() => {
     const alertId = String(selectedAlertId || "").trim();
-    if (!alertId || selectedAlertDocumentLinks.loading || selectedAlertDocumentLinks.rows.length) {
+    if (!adminSession.accessToken || !alertId || selectedAlertDocumentLinks.loading || selectedAlertDocumentLinks.rows.length) {
       if (selectedAlertDocumentLinks.rows.length) setEvidenceDraftReview({ loading: false, draft: null, content: "", notes: "", error: "", message: "" });
       return;
     }
@@ -6055,7 +6055,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       })
       .catch((error) => { if (!cancelled) setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) })); });
     return () => { cancelled = true; };
-  }, [selectedAlertId, selectedAlertDocumentLinks.loading, selectedAlertDocumentLinks.rows.length, selectedRcaDecision.rootCause, selectedRcaDecision.customerImpact, selectedRcaDecision.action, selectedRcaDecision.reviewRequired, selectedRelevantRcaEvidence]);
+  }, [adminSession.accessToken, selectedAlertId, selectedAlertDocumentLinks.loading, selectedAlertDocumentLinks.rows.length, selectedRcaDecision.rootCause, selectedRcaDecision.customerImpact, selectedRcaDecision.action, selectedRcaDecision.reviewRequired, selectedRelevantRcaEvidence]);
 
   const selectedExecutionPlan = useMemo(() => {
     const projectionPayload =
