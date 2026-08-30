@@ -284,20 +284,81 @@ async def _resolve_context(context: Context) -> Recommendation:
             recommendation.metadata["investigation_id"] = investigation_report.get("investigation_id")
             recommendation.metadata["investigation_status"] = investigation_report.get("status")
             if not investigation_report.get("conclusive"):
-                missing = ", ".join(str(item.get("source")) for item in investigation_report.get("next_evidence", []))
+                next_evidence = [
+                    item for item in investigation_report.get("next_evidence", [])
+                    if isinstance(item, dict) and str(item.get("source") or "").strip()
+                ]
+                missing = ", ".join(str(item["source"]) for item in next_evidence)
                 recommendation.root_cause = (
                     "Investigation inconclusive: the collected evidence does not independently corroborate a causal hypothesis."
                 )
                 recommendation.recommended_action = (
-                    f"Collect the next required read-only evidence ({missing or 'missing application sources'}) and rerun resolution."
+                    f"Collect the next required read-only evidence ({missing}) and rerun resolution."
+                    if missing
+                    else "Review the collected evidence, run the highest-value targeted diagnostic, and rerun resolution."
                 )
                 conclusion = (
                     investigation_report.get("conclusion")
                     if isinstance(investigation_report.get("conclusion"), dict)
                     else {}
                 )
-                recommendation.confidence = max(
+                diagnostic_confidence = max(
                     0.0, min(float(conclusion.get("confidence") or recommendation.confidence or 0.0), 0.99)
+                )
+                recommendation.confidence = diagnostic_confidence
+                available_evidence_ids = {
+                    str(item.get("evidence_id"))
+                    for item in investigation_report.get("evidence", [])
+                    if isinstance(item, dict) and str(item.get("evidence_id") or "").strip()
+                }
+                diagnostic_evidence_ids = [
+                    str(value) for value in conclusion.get("evidence_ids", [])
+                    if str(value) in available_evidence_ids
+                ]
+                evidence_by_id = {
+                    str(item.get("evidence_id")): item
+                    for item in investigation_report.get("evidence", [])
+                    if isinstance(item, dict) and str(item.get("evidence_id") or "").strip()
+                }
+                hypotheses = [
+                    item for item in investigation_report.get("hypotheses", [])
+                    if isinstance(item, dict)
+                ]
+                leading = next(
+                    (
+                        item for item in hypotheses
+                        if str(item.get("hypothesis_id") or "") == str(conclusion.get("hypothesis_id") or "")
+                    ),
+                    hypotheses[0] if hypotheses else {},
+                )
+                rca_analysis = dict(
+                    recommendation.metadata.get("rca_analysis")
+                    if isinstance(recommendation.metadata.get("rca_analysis"), dict)
+                    else {}
+                )
+                rca_analysis.update({
+                    "root_cause": recommendation.root_cause,
+                    "confidence_score": diagnostic_confidence,
+                    "confidence_kind": "leading_hypothesis",
+                    "evidence_used": diagnostic_evidence_ids,
+                    "supporting_signals": (
+                        [str(leading.get("reasoning_summary") or "").strip()]
+                        if str(leading.get("reasoning_summary") or "").strip()
+                        else [
+                            "The leading hypothesis cites validated "
+                            f"{investigator._source(evidence_by_id[evidence_id])} evidence {evidence_id}."
+                            for evidence_id in diagnostic_evidence_ids
+                            if evidence_id in evidence_by_id
+                        ]
+                    ),
+                    "contradictions": list(leading.get("contradicting_evidence_ids") or []),
+                    "missing_evidence": list(investigation_report.get("missing_sources") or []),
+                })
+                recommendation.metadata["rca_analysis"] = rca_analysis
+                recommendation.rationale = (
+                    f"The leading diagnostic hypothesis is supported by {len(diagnostic_evidence_ids)} "
+                    f"validated evidence citation(s); confidence={diagnostic_confidence:.2f}. "
+                    "It remains non-actionable until the conclusive evidence gate passes."
                 )
                 recommendation.metadata["resolution_outcome"] = "inconclusive"
                 recommendation.metadata["confidence_kind"] = "leading_hypothesis"

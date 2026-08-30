@@ -38,6 +38,80 @@ def test_resolution_snapshot_expiry_normalizes_naive_database_datetime() -> None
     assert normalized.tzinfo is UTC
     assert normalized == datetime(2026, 8, 27, 12, 0, 0, tzinfo=UTC)
 
+
+@pytest.mark.asyncio
+async def test_inconclusive_investigation_preserves_diagnostic_evidence_handoff(monkeypatch) -> None:
+    alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus",
+        name="ApiLatencyHigh",
+        service="api-gateway",
+        severity=AlertSeverity.CRITICAL,
+        description="p99 latency is above threshold",
+    )
+    incident = Incident(
+        tenant_id="tenant-a",
+        service=alert.service,
+        severity=alert.severity,
+        title=alert.name,
+    )
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+    context = context.model_copy(update={
+        "metadata": {
+            **context.metadata,
+            "analysis_request_id": "11111111-1111-4111-8111-111111111111",
+            "force_full_analysis": True,
+        },
+    })
+    report = {
+        "investigation_id": "investigation-1",
+        "status": "budget_exhausted",
+        "stop_reason": "evidence_budget_exhausted",
+        "conclusive": False,
+        "missing_sources": [],
+        "next_evidence": [],
+        "conclusion": {
+            "hypothesis_id": "hypothesis-1",
+            "confidence": 0.58,
+            "evidence_ids": ["EV-1", "UNKNOWN"],
+        },
+        "hypotheses": [{"hypothesis_id": "hypothesis-1", "claim": "A latency mechanism is under test."}],
+        "evidence": [{"evidence_id": "EV-1", "source_type": "telemetry"}],
+    }
+
+    async def fake_investigate(_context, *, persist=None):
+        return report
+
+    async def fake_resolve(_context):
+        return Recommendation(
+            tenant_id=_context.tenant_id,
+            incident_id=_context.incident_id,
+            root_cause="Ungrounded model result",
+            confidence=0.12,
+            impact="Latency observed",
+            recommended_action="Collect missing application sources",
+            severity=_context.alert.severity,
+            rationale="No citations",
+            commands=[],
+            risk="high",
+            metadata={"rca_analysis": {"evidence_used": [], "confidence_score": 0.12}},
+        )
+
+    monkeypatch.setattr(resolution_agent_app.investigator, "investigate", fake_investigate)
+    monkeypatch.setattr(resolution_agent_app.agent, "resolve_with_runtime", fake_resolve)
+
+    recommendation = await resolution_agent_app._resolve_context(context)
+    analysis = recommendation.metadata["rca_analysis"]
+
+    assert recommendation.confidence == analysis["confidence_score"] == 0.58
+    assert analysis["evidence_used"] == ["EV-1"]
+    assert analysis["supporting_signals"] == [
+        "The leading hypothesis cites validated telemetry evidence EV-1."
+    ]
+    assert recommendation.metadata["confidence_kind"] == "leading_hypothesis"
+    assert recommendation.metadata["confidence_actionable"] is False
+    assert "missing application sources" not in recommendation.recommended_action
+
 _APPROVAL_APP_PATH = Path(__file__).resolve().parents[1] / "src" / "approval-service" / "app.py"
 _APPROVAL_SPEC = importlib.util.spec_from_file_location("approval_service_app", _APPROVAL_APP_PATH)
 assert _APPROVAL_SPEC is not None and _APPROVAL_SPEC.loader is not None

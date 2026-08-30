@@ -194,17 +194,18 @@ export default function IncidentCommand() {
   const validation = record(projection.validation || projection.validation_result || projection.recovery_validation);
   const before = record(validation.before || validation.pre_state);
   const after = record(validation.after || validation.post_state);
-  const analysis = firstRecord(projection.analysis, projection.rca, eventPayload.analysis, eventPayload.rca, recommendation.analysis, recommendation.rca, source.analysis);
+  const analysis = firstRecord(projection.analysis, projection.rca, eventPayload.analysis, eventPayload.rca, recommendation.analysis, recommendation.rca, recommendationMetadata.rca_analysis, source.analysis);
   const rootCause = text(row.root_cause, projection.root_cause, eventPayload.root_cause, analysis.root_cause, analysis.leading_hypothesis, recommendation.root_cause, recommendationMetadata.root_cause, sourceAnnotations.root_cause);
   const confidence = confidenceValue(recommendation.confidence, recommendationMetadata.confidence, analysis.confidence, eventPayload.confidence, projection.confidence, row.confidence);
   const confidenceKind = text(recommendationMetadata.confidence_kind, projection.confidence_kind).toLowerCase();
   const confidenceLabel = confidenceKind === "confirmed_rca" ? "Confirmed RCA confidence" : "Leading hypothesis confidence";
+  const analysisSupportingSignals = arrayOfText(analysis.supporting_signals);
   const supportingReasons = [
-    ...arrayOfText(analysis.supporting_signals),
+    ...(analysisSupportingSignals.length ? analysisSupportingSignals : arrayOfText(analysis.evidence_used)),
     ...arrayOfText(analysis.evidence),
     ...arrayOfText(recommendationMetadata.supporting_evidence),
   ].slice(0, 6);
-  const contradictions = arrayOfText(analysis.contradictions || analysis.ruled_out);
+  const contradictions = arrayOfText(analysis.contradictions || analysis.ruled_out || analysis.alternative_causes);
   const status = normalizedStatus(row);
   const inFailure = FAILED.some((value) => status.includes(value));
   const isTerminal = TERMINAL.some((value) => status.includes(value));
