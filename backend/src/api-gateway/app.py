@@ -3621,56 +3621,6 @@ async def approval_action(
     )
 
 
-@app.post("/rag/documents")
-async def ingest_rag_document(
-    request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
-    x_trace_id: str | None = Header(default=None),
-    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
-) -> dict[str, Any]:
-    payload = {
-        **payload,
-        "tenant_scope": auth.tenant_id,
-        "review_status": "pending_review",
-        "corpus_classification": "GENERATED_UNVERIFIED",
-        "reviewed_by": None,
-        "approved_by": None,
-        "approved_at": None,
-        "last_reviewed": None,
-    }
-    return await guarded_proxy(
-        request=request,
-        method="POST",
-        path="/rag/documents",
-        target_base=settings.context_agent_url,
-        payload=payload,
-        trace_id=trace_id_from_header(x_trace_id),
-    )
-
-
-@app.post("/rag/documents/{draft_id}/approve")
-async def approve_rag_document(
-    draft_id: str,
-    request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
-    x_trace_id: str | None = Header(default=None),
-    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
-) -> dict[str, Any]:
-    actor = auth.email or auth.username or str(auth.user_id)
-    return await guarded_proxy(
-        request=request,
-        method="POST",
-        path=f"/rag/documents/{quote(draft_id, safe='')}/approve",
-        target_base=settings.context_agent_url,
-        payload={
-            **payload,
-            "tenant_scope": auth.tenant_id,
-            "approved_by": actor,
-        },
-        trace_id=trace_id_from_header(x_trace_id),
-    )
-
-
 @app.get("/incidents/groups")
 async def get_incident_groups(
     request: Request,
@@ -3863,6 +3813,94 @@ async def approve_evidence_rag_draft(
     )
 
 
+@app.get("/rag/knowledge-drafts")
+async def list_knowledge_rag_drafts(
+    request: Request,
+    status: str | None = None,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="GET", path="/rag/knowledge-drafts",
+        target_base=settings.context_agent_url, payload={},
+        params={"tenant_scope": tenant_id, **({"status": status} if status else {})},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/rag/knowledge-drafts")
+async def create_knowledge_rag_draft(
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(  # noqa: B008
+        SystemRole.ADMINISTRATOR.value, SystemRole.L2_ENGINEER.value, SystemRole.L3_ENGINEER.value,
+    )),
+) -> dict[str, Any]:
+    actor = auth.email or auth.username or str(auth.user_id)
+    clean = {key: value for key, value in payload.items() if key not in {
+        "tenant_id", "tenant_scope", "created_by", "reviewed_by", "approved_by", "review_status",
+    }}
+    source_ref = str(clean.get("source_ref") or "").strip()
+    if not source_ref:
+        source_system = str(clean.get("source_system") or "kaims-knowledge").strip()
+        source_identity = str(
+            clean.get("alert_id") or clean.get("application_id") or clean.get("title") or "document"
+        )
+        source_ref = f"{source_system}://{source_identity}"
+    metadata = clean.get("metadata") if isinstance(clean.get("metadata"), dict) else {}
+    normalized = {
+        "kind": str(clean.get("kind") or "application").strip().lower(),
+        "source_ref": source_ref,
+        "title": str(clean.get("title") or clean.get("alert_type") or "Operational knowledge").strip(),
+        "content": str(clean.get("content") or clean.get("summary") or "").strip(),
+        "metadata": {**metadata, **{
+            key: value for key, value in clean.items()
+            if key not in {"kind", "source_ref", "title", "content", "metadata"}
+        }},
+    }
+    return await guarded_proxy(
+        request=request, method="POST", path="/rag/knowledge-drafts",
+        target_base=settings.context_agent_url,
+        payload={**normalized, "tenant_scope": auth.tenant_id, "created_by": actor},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.put("/rag/knowledge-drafts/{draft_id}")
+async def review_knowledge_rag_draft(
+    draft_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(  # noqa: B008
+        SystemRole.ADMINISTRATOR.value, SystemRole.L2_ENGINEER.value, SystemRole.L3_ENGINEER.value,
+    )),
+) -> dict[str, Any]:
+    actor = auth.email or auth.username or str(auth.user_id)
+    return await guarded_proxy(
+        request=request, method="PUT", path=f"/rag/knowledge-drafts/{quote(draft_id, safe='')}",
+        target_base=settings.context_agent_url,
+        payload={**payload, "tenant_scope": auth.tenant_id, "reviewed_by": actor},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
+@app.post("/rag/knowledge-drafts/{draft_id}/approve")
+async def approve_knowledge_rag_draft(
+    draft_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
+) -> dict[str, Any]:
+    actor = auth.email or auth.username or str(auth.user_id)
+    return await guarded_proxy(
+        request=request, method="POST",
+        path=f"/rag/knowledge-drafts/{quote(draft_id, safe='')}/approve",
+        target_base=settings.context_agent_url,
+        payload={"expected_row_version": payload.get("expected_row_version"),
+                 "tenant_scope": auth.tenant_id, "approved_by": actor},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.post("/rag/governed-documents/{document_id}/retry-index")
 async def retry_governed_rag_index(
     document_id: str,
@@ -3988,32 +4026,6 @@ async def get_rag_document_content(
         payload={},
         trace_id=trace_id_from_header(x_trace_id),
         params={"path": path, "tenant_scope": tenant_id},
-    )
-
-
-@app.put("/rag/documents")
-async def update_rag_document(
-    request: Request,
-    payload: dict[str, Any] = REQUEST_BODY,
-    x_trace_id: str | None = Header(default=None),
-    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
-) -> dict[str, Any]:
-    return await guarded_proxy(
-        request=request,
-        method="PUT",
-        path="/rag/documents",
-        target_base=settings.context_agent_url,
-        payload={
-            **payload,
-            "tenant_scope": auth.tenant_id,
-            "review_status": "pending_review",
-            "corpus_classification": "GENERATED_UNVERIFIED",
-            "reviewed_by": None,
-            "approved_by": None,
-            "approved_at": None,
-            "last_reviewed": None,
-        },
-        trace_id=trace_id_from_header(x_trace_id),
     )
 
 

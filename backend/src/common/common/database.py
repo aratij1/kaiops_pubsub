@@ -524,12 +524,14 @@ class GovernedRagDocumentRecord(Base):
     document_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     draft_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
-    alert_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
-    context_snapshot_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
-    context_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
-    recommendation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
-    rca_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    incident_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    alert_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    context_snapshot_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    context_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    recommendation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    rca_version: Mapped[int | None] = mapped_column(Integer)
+    source_ref: Mapped[str | None] = mapped_column(String(512))
+    document_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     document_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     document_version: Mapped[int] = mapped_column(Integer, nullable=False)
     title: Mapped[str] = mapped_column(String(160), nullable=False)
@@ -549,6 +551,37 @@ class GovernedRagDocumentRecord(Base):
     next_index_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class KnowledgeRagDraftRecord(Base, TimestampMixin):
+    """Durable operational knowledge draft that is not bound to an incident RCA."""
+
+    __tablename__ = "knowledge_rag_drafts"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "source_ref", "document_kind", "document_version",
+            name="uq_knowledge_rag_draft_version",
+        ),
+        Index("ix_knowledge_rag_draft_status", "tenant_id", "status", "updated_at"),
+    )
+
+    draft_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    document_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    document_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_ref: Mapped[str] = mapped_column(String(512), nullable=False)
+    title: Mapped[str] = mapped_column(String(160), nullable=False)
+    content: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False)
+    content_checksum: Mapped[str] = mapped_column(String(71), nullable=False)
+    metadata_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    created_by: Mapped[str] = mapped_column(String(160), nullable=False)
+    reviewed_by: Mapped[str | None] = mapped_column(String(160))
+    review_notes: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_by: Mapped[str | None] = mapped_column(String(160))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    row_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
 
 class GovernedResolutionPlanRecord(Base):

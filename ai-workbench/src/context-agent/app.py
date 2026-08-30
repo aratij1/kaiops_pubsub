@@ -1116,6 +1116,31 @@ class GovernedRagIndexRetryRequest(BaseModel):
     requested_by: str = Field(min_length=2, max_length=160)
 
 
+class KnowledgeRagDraftCreateRequest(BaseModel):
+    tenant_scope: str = Field(min_length=1, max_length=128)
+    created_by: str = Field(min_length=2, max_length=160)
+    kind: str = Field(pattern="^(runbook|incident|deployment|change|dependency|remediation|application|monitoring)$")
+    source_ref: str = Field(min_length=3, max_length=512)
+    title: str = Field(min_length=3, max_length=160)
+    content: str = Field(min_length=20)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class KnowledgeRagDraftReviewRequest(BaseModel):
+    tenant_scope: str = Field(min_length=1, max_length=128)
+    reviewed_by: str = Field(min_length=2, max_length=160)
+    expected_row_version: int = Field(ge=1)
+    title: str = Field(min_length=3, max_length=160)
+    content: str = Field(min_length=20)
+    review_notes: str | None = Field(default=None, max_length=2000)
+
+
+class KnowledgeRagDraftApproveRequest(BaseModel):
+    tenant_scope: str = Field(min_length=1, max_length=128)
+    approved_by: str = Field(min_length=2, max_length=160)
+    expected_row_version: int = Field(ge=1)
+
+
 class EvidenceRagDraftCreateRequest(BaseModel):
     tenant_scope: str = Field(min_length=1, max_length=128)
     created_by: str = Field(min_length=2, max_length=160)
@@ -1948,22 +1973,71 @@ async def latest_context_snapshot(incident_id: str, tenant_id: str = "default") 
     return snapshot
 
 
-@app.post("/rag/documents")
-async def ingest_rag_document(request: RagDocumentRequest) -> dict[str, Any]:
-    raise HTTPException(
-        status_code=410,
-        detail="Use the versioned evidence draft workflow for tenant-curated knowledge",
-    )
+@app.get("/rag/knowledge-drafts")
+async def list_knowledge_rag_drafts(tenant_scope: str, status: str | None = None) -> dict[str, Any]:
+    tenant = require_tenant_id(tenant_scope, source="knowledge draft inventory")
+    async with app.state.session_factory() as session:
+        drafts = await IncidentRepository(session).list_knowledge_rag_drafts(
+            tenant_id=tenant, status=status,
+        )
+    return {"drafts": drafts, "count": len(drafts)}
 
 
-@app.post("/rag/documents/{draft_id}/approve")
-async def approve_rag_document(
-    draft_id: str, request: RagDocumentApproveRequest
+@app.post("/rag/knowledge-drafts")
+async def create_knowledge_rag_draft(request: KnowledgeRagDraftCreateRequest) -> dict[str, Any]:
+    tenant = require_tenant_id(request.tenant_scope, source="knowledge draft creation")
+    async with app.state.session_factory() as session:
+        try:
+            draft = await IncidentRepository(session).create_knowledge_rag_draft(
+                tenant_id=tenant, created_by=request.created_by, document_kind=request.kind,
+                source_ref=request.source_ref, title=request.title, content=request.content,
+                metadata=request.metadata,
+            )
+            await session.commit()
+        except RuntimeError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"status": draft["status"], "draft": draft}
+
+
+@app.put("/rag/knowledge-drafts/{draft_id}")
+async def review_knowledge_rag_draft(
+    draft_id: str, request: KnowledgeRagDraftReviewRequest,
 ) -> dict[str, Any]:
-    raise HTTPException(
-        status_code=410,
-        detail="Legacy mutable RAG approval is disabled; use versioned evidence drafts",
-    )
+    tenant = require_tenant_id(request.tenant_scope, source="knowledge draft review")
+    async with app.state.session_factory() as session:
+        draft = await IncidentRepository(session).review_knowledge_rag_draft(
+            tenant_id=tenant, draft_id=draft_id,
+            expected_row_version=request.expected_row_version, title=request.title,
+            content=request.content, review_notes=request.review_notes,
+            reviewed_by=request.reviewed_by,
+        )
+        if draft is None:
+            raise HTTPException(status_code=409, detail="knowledge draft is stale or unavailable")
+        await session.commit()
+    return {"status": "reviewed", "draft": draft}
+
+
+@app.post("/rag/knowledge-drafts/{draft_id}/approve")
+async def approve_knowledge_rag_draft(
+    draft_id: str, request: KnowledgeRagDraftApproveRequest,
+) -> dict[str, Any]:
+    tenant = require_tenant_id(request.tenant_scope, source="knowledge draft approval")
+    async with app.state.session_factory() as session:
+        try:
+            approved = await IncidentRepository(session).approve_knowledge_rag_draft(
+                tenant_id=tenant, draft_id=draft_id,
+                expected_row_version=request.expected_row_version,
+                approved_by=request.approved_by,
+            )
+            if approved is None:
+                raise HTTPException(status_code=404, detail="knowledge draft not found")
+            await session.commit()
+        except RuntimeError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    draft, document = approved
+    return {"status": "approved_pending_index", "draft": draft, "document": document}
 
 
 def _list_evidence_rag_drafts_sync(
@@ -2162,65 +2236,33 @@ async def approve_knowledge_pack(request: KnowledgePackApproveRequest) -> dict[s
     # otherwise the persisted knowledge_pack_confidence reflects the stale
     # pre-override extraction average instead of what was actually approved.
     pack["validation"] = _compute_knowledge_pack_validation(facts)
-    pack["status"] = "approved"
+    pack["status"] = "reviewed_pending_governance"
     rag_request = _knowledge_pack_to_rag_request(
         pack,
         request.approved_by,
         require_tenant_id(request.tenant_id, source="knowledge pack approval"),
     )
-    result = write_rag_document(rag_request)
     runbook_id = str(uuid5(NAMESPACE_URL, rag_request.content))
     checksum = f"sha256:{hashlib.sha256(rag_request.content.encode('utf-8')).hexdigest()}"
-    governance = {"runbook_id": runbook_id, "version": 1, "status": "approved"}
+    governance = {"runbook_id": runbook_id, "version": 1, "status": "draft"}
+    draft: dict[str, Any] | None = None
     if settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
         async with app.state.session_factory() as session:
-            governance = await IncidentRepository(session).approve_runbook_version(
-                runbook_id=runbook_id, version=1, approved_by=request.approved_by,
-                tenant_id=require_tenant_id(request.tenant_id, source="knowledge pack approval"),
-                payload={
-                    "rag_document": result,
-                    "knowledge_pack": pack,
-                    "checksum_sha256": checksum,
+            tenant = require_tenant_id(request.tenant_id, source="knowledge pack approval")
+            draft = await IncidentRepository(session).create_knowledge_rag_draft(
+                tenant_id=tenant, created_by=request.approved_by, document_kind=rag_request.kind,
+                source_ref=rag_request.source_ref or f"knowledge-pack://{runbook_id}",
+                title=rag_request.title, content=rag_request.content,
+                metadata={
+                    "knowledge_pack": pack, "checksum_sha256": checksum,
                     "approval_expires_at": request.approval_expires_at.isoformat(),
                 },
             )
             await session.commit()
-    return {"status": "approved", "knowledge_pack": pack, "rag_document": result, "runbook_governance": governance}
-
-
-@app.put("/rag/documents")
-async def update_rag_document(request: RagDocumentUpdateRequest) -> dict[str, Any]:
-    connector = vector_connector()
-    root, target = await asyncio.gather(
-        asyncio.to_thread(lambda: connector.root_path().resolve()),
-        asyncio.to_thread(lambda: Path(request.path).expanduser().resolve()),
-    )
-    if root not in target.parents or target.suffix.lower() != ".md":
-        raise HTTPException(status_code=400, detail="Document path is outside the RAG directory")
-    existing = await asyncio.to_thread(connector._load_full_document, str(target))
-    if not existing:
-        raise HTTPException(status_code=404, detail="RAG document not found")
-    if str(existing.get("tenant_scope") or "") != request.tenant_scope:
-        raise HTTPException(status_code=404, detail="RAG document not found")
-    try:
-        next_version = int(existing.get("content_version") or 1) + 1
-    except (TypeError, ValueError):
-        next_version = 2
-    payload = request.model_dump(exclude={"path"})
-    pending = RagDocumentRequest.model_validate({
-        **payload,
-        "content_version": next_version,
-        "created_at": datetime.now(UTC).isoformat(),
-        "updated_at": datetime.now(UTC).isoformat(),
-        "review_status": "pending_review",
-        "corpus_classification": "GENERATED_UNVERIFIED",
-        "reviewed_by": None,
-        "approved_by": None,
-        "approved_at": None,
-        "last_reviewed": None,
-    })
-    result = await ingest_rag_document(pending)
-    return {**result, "status": "pending_review", "supersedes": str(target)}
+    return {
+        "status": "pending_review", "knowledge_pack": pack,
+        "knowledge_draft": draft, "runbook_governance": governance,
+    }
 
 
 _RAG_DOCUMENT_INTERNAL_FIELDS = {"_embedding", "_metadata_embedding", "_synthetic"}

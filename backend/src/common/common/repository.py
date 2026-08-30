@@ -41,6 +41,7 @@ from common.database import (
     IncidentProjectionRecord,
     IncidentRecord,
     JiraTicketLinkRecord,
+    KnowledgeRagDraftRecord,
     KnowledgeBaseRecord,
     LearningAuditRecord,
     MonitoringAlertMappingRecord,
@@ -3624,6 +3625,153 @@ class IncidentRepository:
             "created_at": row.created_at.isoformat(), "updated_at": row.updated_at.isoformat(),
         }
 
+    @staticmethod
+    def _knowledge_draft_payload(row: KnowledgeRagDraftRecord) -> dict[str, Any]:
+        return {
+            "draft_id": str(row.draft_id), "tenant_id": row.tenant_id,
+            "tenant_scope": row.tenant_id, "document_kind": row.document_kind,
+            "document_version": row.document_version, "source_ref": row.source_ref,
+            "title": row.title, "content": row.content,
+            "content_checksum": row.content_checksum, "metadata": dict(row.metadata_payload or {}),
+            "status": row.status, "created_by": row.created_by, "reviewed_by": row.reviewed_by,
+            "review_notes": row.review_notes,
+            "reviewed_at": row.reviewed_at.isoformat() if row.reviewed_at else None,
+            "approved_by": row.approved_by,
+            "approved_at": row.approved_at.isoformat() if row.approved_at else None,
+            "row_version": row.row_version, "created_at": row.created_at.isoformat(),
+            "updated_at": row.updated_at.isoformat(),
+        }
+
+    async def create_knowledge_rag_draft(
+        self, *, tenant_id: str, created_by: str, document_kind: str, source_ref: str,
+        title: str, content: str, metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        tenant = require_tenant_id(tenant_id, source="knowledge RAG draft")
+        kind = self._require("document_kind", document_kind).lower()
+        source = self._require("source_ref", source_ref)
+        existing = (await self.session.execute(select(KnowledgeRagDraftRecord).where(
+            KnowledgeRagDraftRecord.tenant_id == tenant,
+            KnowledgeRagDraftRecord.source_ref == source,
+            KnowledgeRagDraftRecord.document_kind == kind,
+            KnowledgeRagDraftRecord.status.in_(("draft", "reviewed", "approved_pending_index")),
+        ).order_by(KnowledgeRagDraftRecord.document_version.desc()).limit(1))).scalar_one_or_none()
+        if existing is not None:
+            return self._knowledge_draft_payload(existing)
+        for attempt in range(3):
+            latest = await self.session.scalar(select(func.max(KnowledgeRagDraftRecord.document_version)).where(
+                KnowledgeRagDraftRecord.tenant_id == tenant,
+                KnowledgeRagDraftRecord.source_ref == source,
+                KnowledgeRagDraftRecord.document_kind == kind,
+            ))
+            now = datetime.now(UTC)
+            row = KnowledgeRagDraftRecord(
+                draft_id=uuid4(), tenant_id=tenant, document_kind=kind,
+                document_version=int(latest or 0) + 1, source_ref=source,
+                title=self._require("title", title), content=self._require("content", content),
+                content_checksum=f"sha256:{hashlib.sha256(content.encode()).hexdigest()}",
+                metadata_payload=dict(metadata or {}), status="draft", created_by=created_by,
+                row_version=1, created_at=now, updated_at=now,
+            )
+            try:
+                async with self.session.begin_nested():
+                    self.session.add(row)
+                    await self.session.flush()
+                return self._knowledge_draft_payload(row)
+            except IntegrityError:
+                existing = (await self.session.execute(select(KnowledgeRagDraftRecord).where(
+                    KnowledgeRagDraftRecord.tenant_id == tenant,
+                    KnowledgeRagDraftRecord.source_ref == source,
+                    KnowledgeRagDraftRecord.document_kind == kind,
+                    KnowledgeRagDraftRecord.status.in_(("draft", "reviewed", "approved_pending_index")),
+                ).order_by(KnowledgeRagDraftRecord.document_version.desc()).limit(1))).scalar_one_or_none()
+                if existing is not None:
+                    return self._knowledge_draft_payload(existing)
+                if attempt == 2:
+                    raise RuntimeError("concurrent knowledge draft creation could not be resolved")
+        raise RuntimeError("knowledge draft creation failed")
+
+    async def list_knowledge_rag_drafts(
+        self, *, tenant_id: str, status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = select(KnowledgeRagDraftRecord).where(KnowledgeRagDraftRecord.tenant_id == tenant_id)
+        if status:
+            query = query.where(KnowledgeRagDraftRecord.status == status)
+        rows = (await self.session.execute(query.order_by(KnowledgeRagDraftRecord.updated_at.desc()))).scalars()
+        return [self._knowledge_draft_payload(row) for row in rows]
+
+    async def review_knowledge_rag_draft(
+        self, *, tenant_id: str, draft_id: UUID | str, expected_row_version: int,
+        title: str, content: str, review_notes: str | None, reviewed_by: str,
+    ) -> dict[str, Any] | None:
+        parsed = self._parse_uuid(draft_id)
+        now = datetime.now(UTC)
+        result = await self.session.execute(update(KnowledgeRagDraftRecord).where(
+            KnowledgeRagDraftRecord.draft_id == parsed,
+            KnowledgeRagDraftRecord.tenant_id == tenant_id,
+            KnowledgeRagDraftRecord.row_version == expected_row_version,
+            KnowledgeRagDraftRecord.status.in_(("draft", "reviewed")),
+        ).values(
+            title=title, content=content,
+            content_checksum=f"sha256:{hashlib.sha256(content.encode()).hexdigest()}",
+            review_notes=review_notes, reviewed_by=reviewed_by, reviewed_at=now,
+            status="reviewed", row_version=KnowledgeRagDraftRecord.row_version + 1,
+            updated_at=now,
+        )) if parsed else None
+        if result is None or result.rowcount != 1:
+            return None
+        return self._knowledge_draft_payload(await self.session.get(KnowledgeRagDraftRecord, parsed))
+
+    async def approve_knowledge_rag_draft(
+        self, *, tenant_id: str, draft_id: UUID | str, expected_row_version: int,
+        approved_by: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        parsed = self._parse_uuid(draft_id)
+        row = (await self.session.execute(select(KnowledgeRagDraftRecord).where(
+            KnowledgeRagDraftRecord.draft_id == parsed,
+            KnowledgeRagDraftRecord.tenant_id == tenant_id,
+        ).with_for_update())).scalar_one_or_none() if parsed else None
+        if row is None:
+            return None
+        if row.status != "reviewed" or row.row_version != expected_row_version:
+            raise RuntimeError("stale knowledge draft or direct approval is prohibited")
+        checksum = f"sha256:{hashlib.sha256(row.content.encode()).hexdigest()}"
+        if checksum != row.content_checksum:
+            raise RuntimeError("knowledge draft checksum mismatch")
+        now = datetime.now(UTC)
+        document = GovernedRagDocumentRecord(
+            document_id=uuid4(), draft_id=row.draft_id, tenant_id=row.tenant_id,
+            source_ref=row.source_ref, document_metadata=dict(row.metadata_payload or {}),
+            document_kind=row.document_kind, document_version=row.document_version,
+            title=row.title, content=row.content, content_checksum=checksum,
+            evidence_ids=[], source_uris=[row.source_ref], corpus_classification="TENANT_CURATED",
+            review_status="approved", approved_by=approved_by, approved_at=now,
+            index_status="pending", created_at=now,
+        )
+        self.session.add(document)
+        row.status = "approved_pending_index"
+        row.approved_by = approved_by
+        row.approved_at = now
+        row.row_version += 1
+        row.updated_at = now
+        payload = {
+            "document_id": str(document.document_id), "draft_id": str(row.draft_id),
+            "tenant_id": row.tenant_id, "document_kind": row.document_kind,
+            "document_version": row.document_version, "content_checksum": checksum,
+            "source_ref": row.source_ref,
+        }
+        self.session.add(AuditLogRecord(
+            tenant_id=tenant_id, actor=approved_by, action="rag.document.approved",
+            resource_type="governed_rag_document", resource_id=str(document.document_id), payload=payload,
+        ))
+        await self.enqueue_resolution_event(
+            event_id=f"rag-document-approved:{document.document_id}",
+            aggregate_id=str(document.document_id), topic="rag.document.approved",
+            partition_key=str(document.document_id), payload=payload, tenant_id=tenant_id,
+            available_after_seconds=0,
+        )
+        await self.session.flush()
+        return self._knowledge_draft_payload(row), payload
+
     async def _verified_draft_binding(
         self, *, tenant_id: str, incident_id: UUID | str, alert_id: UUID | str,
         analysis_request_id: UUID | str, context_snapshot_id: UUID | str,
@@ -3884,6 +4032,11 @@ class IncidentRepository:
             draft.indexed_at = now
             draft.updated_at = now
             draft.row_version += 1
+        knowledge_draft = await self.session.get(KnowledgeRagDraftRecord, document.draft_id)
+        if knowledge_draft is not None and knowledge_draft.tenant_id == tenant_id:
+            knowledge_draft.status = "approved"
+            knowledge_draft.updated_at = now
+            knowledge_draft.row_version += 1
         await self.session.flush()
         return {"document_id": str(document.document_id), "index_status": "indexed"}
 

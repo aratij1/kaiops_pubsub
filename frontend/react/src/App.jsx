@@ -2737,7 +2737,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     let failed = 0;
     for (const row of rows) {
       try {
-        await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
+        await fetchJson("/api-gateway/rag/knowledge-drafts", authenticatedOptions({
           method: "POST",
           body: JSON.stringify(row),
         }));
@@ -4516,9 +4516,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const draft = await buildAlertDocumentDraftWithAnalysis(alertRow, preferredKind);
       const existingDoc = findMatchingRagDocument(alertRow, draft.kind);
       const payload = buildDocPayloadFromDraft(draft);
-      const response = await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
-        method: existingDoc?.path ? "PUT" : "POST",
-        body: JSON.stringify(existingDoc?.path ? { ...payload, path: existingDoc.path } : payload),
+      const response = await fetchJson("/api-gateway/rag/knowledge-drafts", authenticatedOptions({
+        method: "POST",
+        body: JSON.stringify(payload),
       }));
       const responseData = response?.data || response || {};
       setAlertOnboardingState({
@@ -4562,9 +4562,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         const draft = await buildAlertDocumentDraftWithAnalysis(alertRow, kind);
         const existingDoc = findMatchingRagDocument(alertRow, kind);
         const payload = buildDocPayloadFromDraft(draft);
-        const response = await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
-          method: existingDoc?.path ? "PUT" : "POST",
-          body: JSON.stringify(existingDoc?.path ? { ...payload, path: existingDoc.path } : payload),
+        const response = await fetchJson("/api-gateway/rag/knowledge-drafts", authenticatedOptions({
+          method: "POST",
+          body: JSON.stringify(payload),
         }));
         results.push({ kind, path: response?.data?.path || response?.path || existingDoc?.path || "" });
       }
@@ -4655,9 +4655,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         severity: String(alertOnboarding.severity || "").trim(),
       };
       const isUpdate = docPromptMode === "update" && Boolean(docPromptExistingDoc?.path);
-      const response = await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
-        method: isUpdate ? "PUT" : "POST",
-        body: JSON.stringify(isUpdate ? { ...payload, path: docPromptExistingDoc.path } : payload),
+      const response = await fetchJson("/api-gateway/rag/knowledge-drafts", authenticatedOptions({
+        method: "POST",
+        body: JSON.stringify(payload),
       }));
       const responseData = response?.data || response || {};
       const normalizedKind = String(payload.kind || docPromptKind || "runbook").trim().toLowerCase();
@@ -4733,7 +4733,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     };
 
     try {
-      const response = await fetchJson("/api-gateway/rag/documents", authenticatedOptions({
+      const response = await fetchJson("/api-gateway/rag/knowledge-drafts", authenticatedOptions({
         method: "POST",
         body: JSON.stringify(buildDocPayloadFromDraft(autoDraft)),
       }));
@@ -7949,7 +7949,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const reviewer = adminSession?.user?.username || "operator";
       const content = [`# Validated remediation: ${selectedAlertRow?.name || "incident"}`, "", `Service: ${selectedApplicationConnection.service}`, `Environment: ${selectedApplicationConnection.environment}`, `Outcome: ${executionOutcomeReview.outcome}`, `Reviewed by: ${reviewer}`, "", "## Approved execution plan", plan || "No reusable execution command supplied.", "", "## Validation", ...editedExecutionPlan.queries, "", "## Rollback", executionRollbackPlan || "Not supplied", "", "## Operator review", executionOutcomeReview.notes || "No additional notes."].join("\n");
       if (executionOutcomeReview.reusable && plan) {
-        await fetchJson("/api-gateway/rag/documents", authenticatedOptions({ method: "POST", body: JSON.stringify({ kind: "remediation", alert_id: selectedAlertId, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, title: `Validated remediation for ${selectedAlertRow?.name || selectedApplicationConnection.service}`, summary: "Operator-reviewed remediation outcome approved for future use.", content, services: [selectedApplicationConnection.service], source_system: "kaims-execution-review", source_ref: `execution-review://${selectedAlertId}`, resolved_by: reviewer, metadata: { approval_status: "approved", execution_outcome: String(executionOutcomeReview.outcome), reusable: "true" } }) }));
+        await fetchJson("/api-gateway/rag/knowledge-drafts", authenticatedOptions({ method: "POST", body: JSON.stringify({ kind: "remediation", alert_id: selectedAlertId, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, title: `Validated remediation for ${selectedAlertRow?.name || selectedApplicationConnection.service}`, summary: "Operator-reviewed remediation outcome awaiting governed review.", content, services: [selectedApplicationConnection.service], source_system: "kaims-execution-review", source_ref: `execution-review://${selectedAlertId}`, resolved_by: reviewer, metadata: { approval_status: "pending_review", execution_outcome: String(executionOutcomeReview.outcome), reusable: "false" } }) }));
       }
       if (selectedAlertRecommendationId) await fetchJson(`/api-gateway/evaluations/by-recommendation/${encodeURIComponent(selectedAlertRecommendationId)}/feedback`, authenticatedOptions({ method: "POST", body: JSON.stringify({ decision: executionOutcomeReview.outcome === "successful" ? "approve" : "reject", approver: reviewer, comment: executionOutcomeReview.notes || `Execution outcome: ${executionOutcomeReview.outcome}` }) })).catch(() => null);
       setExecutionOutcomeReview((current) => ({ ...current, loading: false, reviewedAlertId: String(selectedAlertId || ""), message: current.reusable && plan ? "Outcome reviewed. The approved script is now reusable knowledge." : "Outcome review recorded without publishing a reusable script." }));

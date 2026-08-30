@@ -235,9 +235,10 @@ CREATE TABLE IF NOT EXISTS evidence_rag_drafts (
 
 CREATE TABLE IF NOT EXISTS governed_rag_documents (
     document_id CHAR(36) NOT NULL, draft_id CHAR(36) NOT NULL, tenant_id VARCHAR(128) NOT NULL,
-    incident_id CHAR(36) NOT NULL, alert_id CHAR(36) NOT NULL,
-    context_snapshot_id CHAR(36) NOT NULL, context_fingerprint CHAR(64) NOT NULL,
-    recommendation_id CHAR(36) NOT NULL, rca_version INT NOT NULL,
+    incident_id CHAR(36) NULL, alert_id CHAR(36) NULL,
+    context_snapshot_id CHAR(36) NULL, context_fingerprint CHAR(64) NULL,
+    recommendation_id CHAR(36) NULL, rca_version INT NULL,
+    source_ref VARCHAR(512) NULL, document_metadata JSON NOT NULL,
     document_kind VARCHAR(32) NOT NULL, document_version INT NOT NULL,
     title VARCHAR(160) NOT NULL, content LONGTEXT NOT NULL, content_checksum CHAR(71) NOT NULL,
     evidence_ids JSON NOT NULL, source_uris JSON NOT NULL,
@@ -251,6 +252,21 @@ CREATE TABLE IF NOT EXISTS governed_rag_documents (
     UNIQUE KEY uq_governed_document_draft (draft_id),
     KEY ix_governed_rag_retrieval (tenant_id, review_status, index_status, document_kind),
     KEY ix_governed_rag_next_index_attempt (next_index_attempt_at)
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_rag_drafts (
+    draft_id CHAR(36) NOT NULL, tenant_id VARCHAR(128) NOT NULL,
+    document_kind VARCHAR(32) NOT NULL, document_version INT NOT NULL,
+    source_ref VARCHAR(512) NOT NULL, title VARCHAR(160) NOT NULL,
+    content LONGTEXT NOT NULL, content_checksum CHAR(71) NOT NULL,
+    metadata_payload JSON NOT NULL, status VARCHAR(32) NOT NULL DEFAULT 'draft',
+    created_by VARCHAR(160) NOT NULL, reviewed_by VARCHAR(160) NULL,
+    review_notes TEXT NULL, reviewed_at DATETIME(6) NULL,
+    approved_by VARCHAR(160) NULL, approved_at DATETIME(6) NULL,
+    row_version INT NOT NULL DEFAULT 1, created_at DATETIME(6) NOT NULL,
+    updated_at DATETIME(6) NOT NULL, PRIMARY KEY (draft_id),
+    UNIQUE KEY uq_knowledge_rag_draft_version (tenant_id, source_ref, document_kind, document_version),
+    KEY ix_knowledge_rag_draft_status (tenant_id, status, updated_at)
 );
 
 CREATE TABLE IF NOT EXISTS incident_projections (
