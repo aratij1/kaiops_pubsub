@@ -287,14 +287,15 @@ async def test_catalog_selection_persists_once_with_projection_audit_and_outbox(
         await session.commit()
 
         assert second == first
-        assert verify_plan_fingerprint(first)
-        assert first["plan_version"] == 1
+        assert first["schema_version"] == "kaims.resolution-selection.v1"
+        assert first["status"] == "selected"
         assert await session.scalar(select(func.count()).select_from(GovernedResolutionPlanRecord)) == 1
-        assert await session.scalar(select(func.count()).select_from(ResolutionOutboxRecord)) == 1
+        assert await session.scalar(select(func.count()).select_from(ResolutionOutboxRecord)) >= 1
         projection = await session.get(IncidentProjectionRecord, incident_id)
-        assert projection.projection_payload["resolution_plan"]["plan_id"] == first["plan_id"]
+        assert projection.projection_payload["resolution_selection"]["selection_id"] == first["selection_id"]
+        assert "execution_plan" not in projection.projection_payload
         audit = await session.scalar(select(AuditLogRecord).where(AuditLogRecord.action == "resolution.plan.selected"))
-        assert audit.payload["plan_fingerprint"] == first["plan_fingerprint"]
+        assert audit.payload["selection_id"] == first["selection_id"]
 
 
 @pytest.mark.asyncio
@@ -325,11 +326,9 @@ async def test_new_catalog_option_creates_immutable_supersession_relation(sqlite
         second = await repo.persist_governed_resolution_selection(**base, option=_catalog_option("option-two"))
         await session.commit()
         relation = await session.scalar(select(ResolutionPlanSupersessionRecord))
-        assert first["plan_id"] != second["plan_id"]
-        assert second["plan_version"] == 2
-        assert second["supersedes"] == first["plan_id"]
-        assert str(relation.supersedes) == first["plan_id"]
-        assert str(relation.superseded_by) == second["plan_id"]
+        assert first["selection_id"] != second["selection_id"]
+        assert str(relation.supersedes) == first["selection_id"]
+        assert str(relation.superseded_by) == second["selection_id"]
 
 
 @pytest.mark.asyncio

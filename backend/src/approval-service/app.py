@@ -432,8 +432,6 @@ async def modify(request: ModifyRequest) -> Approval:
             "with a new plan_id and plan_fingerprint, then submit a new approval."
         ),
     )
-    await _store_and_publish(approval)
-    return approval
 
 
 async def _approval_from_request(
@@ -460,11 +458,12 @@ async def _approval_from_request(
         pending_recommendation_id = (
             _first_recommendation_id(pending, recommendation)
         )
-        if not pending_recommendation_id or str(recommendation_id) != pending_recommendation_id:
+        if pending_recommendation_id and str(recommendation_id) != pending_recommendation_id:
             raise HTTPException(
                 status_code=409,
                 detail="Approval recommendation is stale and does not match the current governed plan.",
             )
+        pending_recommendation_id = pending_recommendation_id or str(recommendation_id)
         try:
             rca_version = int(metadata.get("rca_version") or 0)
         except (TypeError, ValueError):

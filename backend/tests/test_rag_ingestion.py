@@ -64,7 +64,7 @@ async def test_general_ingestion_requires_separate_approval_before_retrieval(tmp
     module = load_context_app_module()
     connector = VectorDBConnector(rag_root=tmp_path)
     module.agent = ContextIntelligenceAgent(connectors=[connector])
-    request = module.RagDocumentRequest(
+    module.RagDocumentRequest(
         kind="runbook",
         title="Checkout diagnostics",
         services=["checkout"],
@@ -78,144 +78,13 @@ async def test_general_ingestion_requires_separate_approval_before_retrieval(tmp
         approved_by="forged-client-identity",
     )
 
-    with pytest.raises(module.HTTPException) as blocked:
-        await module.ingest_rag_document(request)
-    assert blocked.value.status_code == 410
+    mutation_routes = [
+        route for route in module.app.routes
+        if getattr(route, "path", None) == "/rag/documents" and "POST" in getattr(route, "methods", set())
+    ]
+    assert mutation_routes == []
     assert not list(tmp_path.rglob("*.md"))
     assert connector.search("checkout diagnostics", tenant_id="tenant-a") == []
-
-
-@pytest.mark.asyncio
-async def legacy_evidence_draft_requires_review_approval_before_grounding(tmp_path) -> None:
-    module = load_context_app_module()
-    connector = VectorDBConnector(rag_root=tmp_path)
-    module.agent = ContextIntelligenceAgent(connectors=[connector])
-    alert = SimpleNamespace(
-        id="11111111-1111-1111-1111-111111111111",
-        name="Checkout error rate",
-        service="checkout-api",
-        environment="production",
-        severity=SimpleNamespace(value="high"),
-        tenant_id="tenant-a",
-        labels={},
-    )
-    incident = SimpleNamespace(id="22222222-2222-2222-2222-222222222222")
-    context = SimpleNamespace(
-        metadata={
-            "discovery_report": {
-                "report": {
-                    "summary": "Error rate increased after the latest deployment.",
-                    "hypotheses": [{"cause": "Bad checkout deployment", "confidence": 0.82}],
-                },
-                "evidence": [
-                    {
-                        "evidence_id": "LOG-123",
-                        "source": "logs",
-                        "snippet": "checkout returned HTTP 500",
-                        "uri": "logs://checkout/123",
-                    }
-                ],
-            }
-        }
-    )
-
-    draft = module.create_evidence_rag_draft(alert=alert, incident=incident, context=context)
-
-    assert draft["status"] == "draft"
-    stored_drafts = module._list_evidence_rag_drafts_sync(None, None, "tenant-a")
-    assert {item["document_kind"] for item in stored_drafts} == {
-        "incident", "jira", "runbook", "deployment", "change", "dependency", "remediation"
-    }
-    assert len({item["draft_id"] for item in stored_drafts}) == 7
-    assert not list(tmp_path.rglob("*.md"))
-    assert connector.search("checkout returned HTTP 500", limit=3, tenant_id="tenant-a") == []
-
-    reviewed = await module.review_evidence_rag_draft(
-        draft["draft_id"],
-        module.EvidenceRagDraftReviewRequest(
-            tenant_scope="tenant-a",
-            reviewed_by="Operations Reviewer",
-            content=draft["content"] + "\n\nReviewed against the incident timeline.",
-        ),
-    )
-    assert reviewed["draft"]["status"] == "reviewed"
-    assert not list(tmp_path.rglob("*.md"))
-
-    approved = await module.approve_evidence_rag_draft(
-        draft["draft_id"],
-        module.EvidenceRagDraftApproveRequest(
-            tenant_scope="tenant-a",
-            approved_by="Operations Approver",
-            owner_team="checkout-ops",
-        ),
-    )
-    assert approved["draft"]["status"] == "approved"
-    assert list(tmp_path.rglob("*.md"))
-    assert connector.search("checkout returned HTTP 500", limit=3, tenant_id="tenant-a")[0]["kind"] == "incident"
-
-
-@pytest.mark.asyncio
-async def legacy_approved_remediation_is_reused_as_historical_knowledge_for_future_incident(tmp_path) -> None:
-    module = load_context_app_module()
-    connector = VectorDBConnector(rag_root=tmp_path)
-    module.agent = ContextIntelligenceAgent(connectors=[connector])
-    alert = SimpleNamespace(
-        id="11111111-1111-1111-1111-111111111111",
-        name="MySQL table rows high",
-        service="mysql",
-        environment="production",
-        severity=SimpleNamespace(value="high"),
-        tenant_id="tenant-a",
-        labels={},
-    )
-    incident = SimpleNamespace(id="22222222-2222-2222-2222-222222222222", tenant_id="tenant-a")
-    context = SimpleNamespace(metadata={"discovery_report": {"report": {
-        "summary": "Rows increased after an unbounded retention job.",
-        "hypotheses": [{"cause": "Retention job did not purge old rows", "confidence": 0.7}],
-    }, "evidence": [{
-        "evidence_id": "DB-123", "source": "database",
-        "snippet": "events table row count exceeded the reviewed threshold",
-        "uri": "database://mysql/events/rows",
-    }]}})
-    module.create_evidence_rag_draft(alert=alert, incident=incident, context=context)
-    remediation = next(
-        item for item in module._list_evidence_rag_drafts_sync(None, None, "tenant-a")
-        if item["document_kind"] == "remediation"
-    )
-    reviewed_content = (
-        remediation["content"]
-        + "\n\nVerified action: inspect retention policy before any governed change."
-    )
-    await module.review_evidence_rag_draft(
-        remediation["draft_id"],
-        module.EvidenceRagDraftReviewRequest(
-            tenant_scope="tenant-a", reviewed_by="Operations Reviewer", content=reviewed_content,
-        ),
-    )
-    await module.approve_evidence_rag_draft(
-        remediation["draft_id"],
-        module.EvidenceRagDraftApproveRequest(
-            tenant_scope="tenant-a", approved_by="Operations Approver", owner_team="database-ops",
-        ),
-    )
-
-    future_alert = SimpleNamespace(
-        id="33333333-3333-3333-3333-333333333333",
-        name="MySQL table rows high",
-        description="events table row count exceeded the reviewed threshold",
-        service="mysql",
-        tenant_id="tenant-a",
-        labels={}, annotations={},
-    )
-    future_incident = SimpleNamespace(
-        id="44444444-4444-4444-4444-444444444444", tenant_id="tenant-a"
-    )
-
-    result = await connector.fetch(future_alert, future_incident)
-
-    assert result["matches"]
-    assert result["matches"][0]["kind"] == "remediation"
-    assert result["matches"][0]["review_status"] == "approved"
 
 
 def test_evidence_draft_rejects_unrelated_cross_project_evidence(tmp_path) -> None:

@@ -3946,28 +3946,46 @@ class IncidentRepository:
             if existing is not None:
                 results.append(self._evidence_draft_payload(existing))
                 continue
-            latest = await self.session.scalar(select(func.max(EvidenceRagDraftRecord.document_version)).where(
-                EvidenceRagDraftRecord.tenant_id == tenant_id,
-                EvidenceRagDraftRecord.alert_id == alert_uuid,
-                EvidenceRagDraftRecord.document_kind == kind,
-            ))
-            now = datetime.now(UTC)
-            row = EvidenceRagDraftRecord(
-                draft_id=uuid4(), tenant_id=tenant_id, project_id=verified.project_id,
-                incident_id=verified.incident_id, alert_id=verified.alert_id,
-                analysis_request_id=verified.analysis_request_id,
-                context_snapshot_id=verified.context_snapshot_id,
-                context_fingerprint=verified.context_fingerprint,
-                recommendation_id=verified.recommendation_id, rca_version=verified.rca_version,
-                document_kind=kind, document_version=int(latest or 0) + 1, status="draft",
-                title=document["title"], content=document["content"],
-                content_checksum=f"sha256:{hashlib.sha256(document['content'].encode()).hexdigest()}",
-                evidence_ids=evidence_ids, source_uris=source_uris, created_by=created_by,
-                created_at=now, updated_at=now,
-            )
-            self.session.add(row)
-            await self.session.flush()
-            results.append(self._evidence_draft_payload(row))
+            for attempt in range(3):
+                latest = await self.session.scalar(select(func.max(EvidenceRagDraftRecord.document_version)).where(
+                    EvidenceRagDraftRecord.tenant_id == tenant_id,
+                    EvidenceRagDraftRecord.alert_id == alert_uuid,
+                    EvidenceRagDraftRecord.document_kind == kind,
+                ))
+                now = datetime.now(UTC)
+                row = EvidenceRagDraftRecord(
+                    draft_id=uuid4(), tenant_id=tenant_id, project_id=verified.project_id,
+                    incident_id=verified.incident_id, alert_id=verified.alert_id,
+                    analysis_request_id=verified.analysis_request_id,
+                    context_snapshot_id=verified.context_snapshot_id,
+                    context_fingerprint=verified.context_fingerprint,
+                    recommendation_id=verified.recommendation_id, rca_version=verified.rca_version,
+                    document_kind=kind, document_version=int(latest or 0) + 1, status="draft",
+                    title=document["title"], content=document["content"],
+                    content_checksum=f"sha256:{hashlib.sha256(document['content'].encode()).hexdigest()}",
+                    evidence_ids=evidence_ids, source_uris=source_uris, created_by=created_by,
+                    created_at=now, updated_at=now,
+                )
+                try:
+                    async with self.session.begin_nested():
+                        self.session.add(row)
+                        await self.session.flush()
+                    results.append(self._evidence_draft_payload(row))
+                    break
+                except IntegrityError:
+                    existing = (await self.session.execute(select(EvidenceRagDraftRecord).where(
+                        EvidenceRagDraftRecord.tenant_id == tenant_id,
+                        EvidenceRagDraftRecord.alert_id == alert_uuid,
+                        EvidenceRagDraftRecord.document_kind == kind,
+                        EvidenceRagDraftRecord.context_snapshot_id == verified.context_snapshot_id,
+                        EvidenceRagDraftRecord.recommendation_id == verified.recommendation_id,
+                        EvidenceRagDraftRecord.status.in_(("draft", "reviewed", "approved_pending_index")),
+                    ).order_by(EvidenceRagDraftRecord.document_version.desc()).limit(1))).scalar_one_or_none()
+                    if existing is not None:
+                        results.append(self._evidence_draft_payload(existing))
+                        break
+                    if attempt == 2:
+                        raise RuntimeError("concurrent evidence draft creation could not be resolved")
         return results
 
     async def list_evidence_rag_drafts(
@@ -5106,7 +5124,6 @@ class IncidentRepository:
             return None
         return {
             "id": str(row.id),
-            "tenant_id": row.tenant_id,
             "expires_at": row.expires_at,
             "artifact_signature": row.artifact_signature,
             "tenant_id": row.tenant_id,

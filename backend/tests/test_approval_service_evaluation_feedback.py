@@ -23,8 +23,12 @@ def _set_pending_plan(incident_id, recommendation_id) -> dict:
         "tenant_id": "tenant-a",
         "incident_id": str(incident_id),
         "plan_id": "33333333-3333-3333-3333-333333333333",
-        "rca_version": str(recommendation_id),
-        "evidence_snapshot_id": "snapshot-feedback-v1",
+        "recommendation_id": str(recommendation_id),
+        "rca_version": 1,
+        "evidence_snapshot_id": "55555555-5555-4555-8555-555555555555",
+        "context_fingerprint": "a" * 64,
+        "resolution_selection_id": "44444444-4444-4444-8444-444444444444",
+        "policy_version": "resolution-policy.v1",
         "recommendation_version": str(recommendation_id),
         "execution_ready": True,
         "diagnostic_only": False,
@@ -44,6 +48,10 @@ def _set_pending_plan(incident_id, recommendation_id) -> dict:
             "incident_id": str(incident_id),
             "metadata": {
                 "execution_plan": plan,
+                "rca_version": 1,
+                "context_snapshot_id": plan["evidence_snapshot_id"],
+                "context_fingerprint": plan["context_fingerprint"],
+                "resolution_selection": {"selection_id": plan["resolution_selection_id"]},
                 "runbook_status": "approved",
                 "connection_profile": {"credential_ref": "vault://tenant-a/prod-remediator"},
                 "evidence_quality": {
@@ -55,6 +63,15 @@ def _set_pending_plan(incident_id, recommendation_id) -> dict:
             },
         }
     }
+    class _Session:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+    base_repository = approval_service_app.IncidentRepository
+    class CanonicalPlanRepository(base_repository):
+        async def get_current_execution_plan_for_incident(self, **_kwargs):
+            return plan
+    approval_service_app.app.state.session_factory = lambda: _Session()
+    approval_service_app.IncidentRepository = CanonicalPlanRepository
     return plan
 
 

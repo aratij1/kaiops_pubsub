@@ -53,10 +53,12 @@ def test_knowledge_pack_extracts_required_operational_facts() -> None:
 
 
 @pytest.mark.asyncio
-async def test_knowledge_pack_approval_writes_rag_document(tmp_path) -> None:
+async def test_knowledge_pack_approval_creates_durable_review_draft(tmp_path, sqlite_session_factory) -> None:
     module = load_context_app_module()
     connector = VectorDBConnector(rag_root=tmp_path)
     module.agent = ContextIntelligenceAgent(connectors=[connector])
+    module.settings.database_enabled = True
+    module.app.state.session_factory = sqlite_session_factory
     request = module.KnowledgePackApproveRequest(
         service="checkout-api",
         environment="prod",
@@ -80,9 +82,7 @@ async def test_knowledge_pack_approval_writes_rag_document(tmp_path) -> None:
 
     response = await module.approve_knowledge_pack(request)
 
-    assert response["status"] == "approved"
-    assert response["rag_document"]["document_count"] == 1
-    assert Path(response["rag_document"]["path"]).exists()
-    matches = connector.search("checkout 5xx mysql recovery", limit=3, tenant_id="tenant-a")
-    assert matches[0]["title"] == "checkout-api Knowledge Pack"
-    assert matches[0]["source_system"] == "knowledge-pack"
+    assert response["status"] == "pending_review"
+    assert response["knowledge_draft"]["status"] == "draft"
+    assert response["knowledge_draft"]["created_by"] == "administrator"
+    assert connector.search("checkout 5xx mysql recovery", limit=3, tenant_id="tenant-a") == []

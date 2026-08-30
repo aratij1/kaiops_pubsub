@@ -1,4 +1,7 @@
 from datetime import UTC, datetime, timedelta
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -65,6 +68,115 @@ def documents():
     return [{"document_kind": kind, "title": f"{kind} title", "content": "x" * 40} for kind in (
         "incident", "jira", "runbook", "deployment", "change", "dependency", "remediation",
     )]
+
+
+def load_context_app_module():
+    path = Path("ai-workbench/src/context-agent/app.py")
+    spec = importlib.util.spec_from_file_location("governed_context_agent_app", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ConfirmingIndexConnector:
+    def __init__(self) -> None:
+        self.documents: list[dict] = []
+
+    async def index_governed_document(self, document):
+        indexed = {
+            "document_id": str(document.document_id), "tenant_id": document.tenant_id,
+            "content": document.content, "content_checksum": document.content_checksum,
+            "kind": document.document_kind,
+        }
+        self.documents.append(indexed)
+        return {**indexed, "indexed": 1, "metadata": indexed}
+
+    async def verify_index_receipt(self, receipt, *, expected_checksum):
+        assert receipt["content_checksum"] == expected_checksum
+        assert receipt["indexed"] == 1
+
+    def search(self, query: str, *, tenant_id: str) -> list[dict]:
+        return [row for row in self.documents if row["tenant_id"] == tenant_id and query in row["content"]]
+
+
+@pytest.mark.asyncio
+async def test_approved_remediation_is_reused_as_historical_knowledge_for_future_incident(
+    sqlite_session_factory,
+):
+    async with sqlite_session_factory() as session:
+        binding = await seed_binding(session, "tenant-a")
+        repo = IncidentRepository(session)
+        draft = (await repo.create_evidence_rag_drafts(
+            tenant_id="tenant-a", created_by="author", binding=binding,
+            documents=[{"document_kind": "remediation", "title": "Prior checkout recovery",
+                        "content": "future-checkout-evidence confirmed rollback recovery"}],
+            evidence_ids=binding["evidence_ids"], source_uris=binding["source_uris"],
+        ))[0]
+        reviewed = await repo.review_evidence_rag_draft(
+            tenant_id="tenant-a", draft_id=draft["draft_id"], expected_row_version=1,
+            title=draft["title"], content=draft["content"], review_notes="verified",
+            reviewed_by="reviewer-a",
+        )
+        _, event = await repo.approve_evidence_rag_draft(
+            tenant_id="tenant-a", draft_id=draft["draft_id"],
+            expected_row_version=reviewed["row_version"], approved_by="approver-a",
+        )
+        await session.commit()
+
+    module = load_context_app_module()
+    connector = ConfirmingIndexConnector()
+    module.vector_connector = lambda: connector
+    worker_app = SimpleNamespace(state=SimpleNamespace(session_factory=sqlite_session_factory))
+    await module._index_governed_document(worker_app, event)
+
+    async with sqlite_session_factory() as session:
+        tenant_rows = await IncidentRepository(session).list_retrievable_governed_rag_documents(
+            tenant_id="tenant-a",
+        )
+        other_rows = await IncidentRepository(session).list_retrievable_governed_rag_documents(
+            tenant_id="tenant-b",
+        )
+    assert len(tenant_rows) == 1
+    assert tenant_rows[0].index_receipt["content_checksum"] == tenant_rows[0].content_checksum
+    assert connector.search("future-checkout-evidence", tenant_id="tenant-a")
+    assert connector.search("future-checkout-evidence", tenant_id="tenant-b") == []
+    assert other_rows == []
+
+
+@pytest.mark.asyncio
+async def test_evidence_draft_requires_review_approval_before_grounding(sqlite_session_factory):
+    async with sqlite_session_factory() as session:
+        binding = await seed_binding(session, "tenant-a")
+        repo = IncidentRepository(session)
+        draft = (await repo.create_evidence_rag_drafts(
+            tenant_id="tenant-a", created_by="author", binding=binding,
+            documents=[{"document_kind": "remediation", "title": "Reviewed recovery",
+                        "content": "verify recovery evidence before reusing this remediation"}],
+            evidence_ids=binding["evidence_ids"], source_uris=binding["source_uris"],
+        ))[0]
+        assert await repo.list_retrievable_governed_rag_documents(tenant_id="tenant-a") == []
+        with pytest.raises(RuntimeError, match="direct approval"):
+            await repo.approve_evidence_rag_draft(
+                tenant_id="tenant-a", draft_id=draft["draft_id"],
+                expected_row_version=1, approved_by="approver",
+            )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_draft_creation_returns_same_active_draft(sqlite_session_factory):
+    async with sqlite_session_factory() as session:
+        binding = await seed_binding(session, "tenant-a")
+        repo = IncidentRepository(session)
+        kwargs = dict(
+            tenant_id="tenant-a", created_by="author", binding=binding,
+            documents=[{"document_kind": "incident", "title": "Stable identity",
+                        "content": "same incident evidence draft content"}],
+            evidence_ids=binding["evidence_ids"], source_uris=binding["source_uris"],
+        )
+        first = await repo.create_evidence_rag_drafts(**kwargs)
+        second = await repo.create_evidence_rag_drafts(**kwargs)
+    assert first[0]["draft_id"] == second[0]["draft_id"]
 
 
 @pytest.mark.asyncio
@@ -180,6 +292,10 @@ async def test_approved_replacement_increments_version_and_index_gate_is_explici
         assert await repo.list_retrievable_governed_rag_documents(tenant_id="tenant-a") == []
         await repo.mark_governed_rag_document_indexed(
             tenant_id="tenant-a", document_id=approved[1]["document_id"],
+            index_receipt={
+                "document_id": approved[1]["document_id"],
+                "content_checksum": approved[1]["content_checksum"], "indexed": 1,
+            },
         )
         assert len(await repo.list_retrievable_governed_rag_documents(tenant_id="tenant-a")) == 1
         replacements = await repo.create_evidence_rag_drafts(

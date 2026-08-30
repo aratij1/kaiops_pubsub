@@ -343,7 +343,8 @@ async def test_analysis_request_identity_flows_from_context_to_recommendation() 
         != resolution_agent_app._deterministic_recommendation_id(second)
     )
 
-    first = first.model_copy(update={"metadata": {**first.metadata, "context_snapshot_id": "snapshot-v1"}})
+    snapshot_id = "55555555-5555-4555-8555-555555555555"
+    first = first.model_copy(update={"metadata": {**first.metadata, "context_snapshot_id": snapshot_id}})
     recommendation = Recommendation(
         id=resolution_agent_app._deterministic_recommendation_id(first),
         tenant_id=first.tenant_id, incident_id=first.incident_id,
@@ -353,13 +354,13 @@ async def test_analysis_request_identity_flows_from_context_to_recommendation() 
     )
     resolution_agent_app._attach_rca_governance_binding(recommendation, first)
     assert recommendation.metadata["analysis_request_id"] == first_request_id
-    assert recommendation.metadata["context_snapshot_id"] == "snapshot-v1"
+    assert recommendation.metadata["context_snapshot_id"] == snapshot_id
     assert recommendation.metadata["context_fingerprint"] == first.metadata["context_fingerprint"]
     assert recommendation.metadata["rca_version"] == 1
     assert recommendation.metadata["recommendation_version"] == str(recommendation.id)
     assert recommendation.metadata["recommendation_version"] == str(recommendation.id)
     plan = resolution_agent_app._apply_catalog_plan(recommendation, first)
-    assert plan["rca_version"] == "1"
+    assert plan["rca_version"] == 1
 
 
 @pytest.mark.asyncio

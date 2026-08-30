@@ -11,6 +11,7 @@ def test_target_resolution_state_machine_allows_happy_hitl_path() -> None:
         ResolutionWorkflowState.EVIDENCE_READY,
         ResolutionWorkflowState.HYPOTHESES_READY,
         ResolutionWorkflowState.PLAN_SELECTED,
+        ResolutionWorkflowState.PLAN_COMPILED,
         ResolutionWorkflowState.POLICY_CHECKED,
         ResolutionWorkflowState.AWAITING_APPROVAL,
         ResolutionWorkflowState.READY_TO_EXECUTE,
@@ -18,7 +19,7 @@ def test_target_resolution_state_machine_allows_happy_hitl_path() -> None:
         ResolutionWorkflowState.VALIDATING,
         ResolutionWorkflowState.RESOLVED,
     ]
-    for previous, new in zip(path, path[1:]):
+    for previous, new in zip(path, path[1:], strict=False):
         validate_workflow_transition(previous, new)
 
 

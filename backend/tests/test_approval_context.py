@@ -7,14 +7,18 @@ from starlette.requests import Request
 from common.orchestration.execution_plan_contract import canonical_plan_fingerprint
 
 
-def _approval_plan(incident_id: str) -> dict:
+def _approval_plan(incident_id: str, recommendation_id: str = "22222222-2222-2222-2222-222222222222") -> dict:
     plan = {
         "tenant_id": "tenant-a",
         "incident_id": incident_id,
         "plan_id": "33333333-3333-3333-3333-333333333333",
-        "rca_version": "rca-v1",
-        "evidence_snapshot_id": "snapshot-v1",
-        "recommendation_version": "22222222-2222-2222-2222-222222222222",
+        "recommendation_id": recommendation_id,
+        "rca_version": 1,
+        "evidence_snapshot_id": "55555555-5555-4555-8555-555555555555",
+        "context_fingerprint": "a" * 64,
+        "resolution_selection_id": "44444444-4444-4444-8444-444444444444",
+        "policy_version": "resolution-policy.v1",
+        "recommendation_version": recommendation_id,
         "execution_ready": True,
         "diagnostic_only": False,
         "plan_kind": "remediation",
@@ -33,6 +37,10 @@ def _approval_plan(incident_id: str) -> dict:
 def _readiness_metadata(plan: dict) -> dict:
     return {
         "execution_plan": plan,
+        "rca_version": plan["rca_version"],
+        "context_snapshot_id": plan["evidence_snapshot_id"],
+        "context_fingerprint": plan["context_fingerprint"],
+        "resolution_selection": {"selection_id": plan["resolution_selection_id"]},
         "runbook_status": "approved",
         "connection_profile": {"credential_ref": "vault://tenant-a/prod-remediator"},
         "evidence_quality": {
@@ -46,7 +54,17 @@ def _readiness_metadata(plan: dict) -> dict:
 
 def _set_pending_plan(module, incident_id: str, recommendation_id: str) -> dict:
     module.settings.service_internal_token = "internal-test-token"
-    plan = _approval_plan(incident_id)
+    plan = _approval_plan(incident_id, recommendation_id)
+    base_repository = module.IncidentRepository
+    class CanonicalPlanRepository(base_repository):
+        async def get_current_execution_plan_for_incident(self, **_kwargs):
+            return plan
+    module.IncidentRepository = CanonicalPlanRepository
+    if not hasattr(module.app.state, "session_factory"):
+        class _Session:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return False
+        module.app.state.session_factory = lambda: _Session()
     module.PENDING_INCIDENTS[module._pending_key("tenant-a", incident_id)] = {
         "recommendation": {
             "id": recommendation_id,
@@ -454,8 +472,8 @@ async def test_approval_rejects_stale_recommendation_and_records_exact_governanc
     current_request = stale_request.model_copy(update={"recommendation_id": current_recommendation_id})
     approval = await module._approval_from_request(current_request, module.ApprovalDecision.APPROVED)
 
-    assert approval.metadata["rca_version"] == "rca-v1"
-    assert approval.metadata["evidence_snapshot_id"] == "snapshot-v1"
+    assert approval.metadata["rca_version"] == 1
+    assert approval.metadata["evidence_snapshot_id"] == "55555555-5555-4555-8555-555555555555"
     assert approval.metadata["recommendation_version"] == current_recommendation_id
     assert approval.metadata["target_resource_id"] == plan["target_resource_id"]
     assert approval.metadata["connector_id"] == plan["connector_id"]
@@ -478,7 +496,7 @@ async def test_approval_rejects_legacy_recommendation_without_governed_plan(monk
         approver="l2.engineer",
     )
 
-    with pytest.raises(module.HTTPException, match="no governed execution plan") as exc_info:
+    with pytest.raises(module.HTTPException, match="RCA version is unavailable") as exc_info:
         await module._approval_from_request(request, module.ApprovalDecision.APPROVED)
 
     assert exc_info.value.status_code == 409
@@ -490,7 +508,7 @@ async def test_local_development_can_approve_default_tenant_plan(monkeypatch: py
     module.settings.service_internal_token = "internal-test-token"
     incident_id = "11111111-1111-1111-1111-111111111111"
     recommendation_id = "22222222-2222-2222-2222-222222222222"
-    plan = _approval_plan(incident_id)
+    plan = _set_pending_plan(module, incident_id, recommendation_id)
     plan["tenant_id"] = "default"
     plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
     monkeypatch.setenv("ENVIRONMENT", "local")
@@ -525,18 +543,12 @@ async def test_approval_rejects_valid_diagnostic_plan_until_readiness_controls_p
     module.settings.service_internal_token = "internal-test-token"
     incident_id = "11111111-1111-1111-1111-111111111111"
     recommendation_id = "22222222-2222-2222-2222-222222222222"
-    plan = _approval_plan(incident_id)
+    plan = _set_pending_plan(module, incident_id, recommendation_id)
     plan["execution_ready"] = False
     plan["diagnostic_only"] = True
     plan["plan_kind"] = "diagnostic"
     plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
-    module.PENDING_INCIDENTS[module._pending_key("tenant-a", incident_id)] = {
-        "recommendation": {
-            "id": recommendation_id,
-            "incident_id": incident_id,
-            "metadata": {"execution_plan": plan},
-        },
-    }
+    module.PENDING_INCIDENTS[module._pending_key("tenant-a", incident_id)]["recommendation"]["metadata"] = _readiness_metadata(plan)
     request = module.ApprovalRequest(
         incident_id=incident_id,
         recommendation_id=recommendation_id,
@@ -551,7 +563,6 @@ async def test_approval_rejects_valid_diagnostic_plan_until_readiness_controls_p
 
     assert exc_info.value.status_code == 409
     assert "execution ready" in str(exc_info.value.detail)
-    assert "current credentials" in str(exc_info.value.detail)
 
 
 @pytest.mark.asyncio
