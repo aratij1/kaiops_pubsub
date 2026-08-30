@@ -546,6 +546,35 @@ async def test_resolution_agent_blocks_high_confidence_when_discovery_is_degrade
 
 
 @pytest.mark.asyncio
+async def test_resolution_agent_propagates_readiness_and_blocks_mutation_when_rca_is_not_ready() -> None:
+    alert = Alert(
+        tenant_id="tenant-a", source="prometheus", name="PaymentLatencyHigh",
+        service="payments", severity=AlertSeverity.CRITICAL,
+        description="payment latency after deployment", labels={"deployment": "payments-api"},
+    )
+    incident = Incident(service="payments", severity=AlertSeverity.CRITICAL, title="payments latency")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+    context.metadata["context_quality"].update({
+        "source_coverage_score": 0.375,
+        "rca_readiness_score": 0.46,
+        "rca_ready": False,
+        "impact_readiness_score": 0.41,
+        "impact_ready": False,
+    })
+
+    recommendation = await ResolutionIntelligenceAgent(model_router=static_router()).resolve(context)
+
+    rca = recommendation.metadata["rca_analysis"]
+    impact = recommendation.metadata["impact_analysis"]
+    plan = recommendation.metadata["execution_plan"]
+    assert rca["context_readiness"] == {"score": 0.46, "ready": False, "source_coverage": 0.375}
+    assert impact["context_readiness"] == {"score": 0.41, "ready": False}
+    assert impact["confidence_score"] <= 0.49
+    assert plan["execution_ready"] is False
+    assert any("46% RCA-ready" in reason for reason in plan["readiness_blocks"])
+
+
+@pytest.mark.asyncio
 async def test_resolution_agent_uses_severity_heuristic_risk_when_model_omits_risk_level() -> None:
     """Default (deterministic fast-path) behavior must be unchanged: the fix step never
     returns a risk_level, so recommendation.risk keeps falling back to the severity-only

@@ -1197,6 +1197,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
         model_confidence = min(model_confidence, evidence_quality.confidence_ceiling)
         context_quality = state["gathered_context"].get("context_quality", {})
+        state["rca_analysis"]["context_readiness"] = {
+            "score": float(context_quality.get("rca_readiness_score") or 0.0),
+            "ready": bool(context_quality.get("rca_ready", False)),
+            "source_coverage": float(
+                context_quality.get("source_coverage_score")
+                if context_quality.get("source_coverage_score") is not None
+                else context_quality.get("coverage_score") or 0.0
+            ),
+        }
         discovery_degraded = bool(
             context_quality.get("discovery_degraded")
             or context_quality.get("execution_ready") is False
@@ -1342,10 +1351,19 @@ class ResolutionIntelligenceAgent(BaseAgent):
             impact_confidence = 0.3 if model_fallback else 0.52
         if not impact_citations:
             impact_confidence = min(impact_confidence, 0.49)
+        context_quality = state.get("gathered_context", {}).get("context_quality", {})
+        impact_readiness_score = float(context_quality.get("impact_readiness_score") or 0.0)
+        impact_ready = bool(context_quality.get("impact_ready", False))
+        if "impact_ready" in context_quality and not impact_ready:
+            impact_confidence = min(impact_confidence, 0.49)
         state["impact_analysis"] = {
             **parsed,
             "evidence_used": impact_citations,
             "confidence_score": impact_confidence,
+            "context_readiness": {
+                "score": impact_readiness_score,
+                "ready": impact_ready,
+            },
             "observed_vs_risk": "Observed claims require accepted evidence citations; remaining claims are risk or assumptions.",
             "external_knowledge_used": bool(impact_external_meta.get("used") and use_external_impact),
             "external_knowledge_eligible": bool(impact_external_meta.get("eligible")),
@@ -1465,6 +1483,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
             readiness_blocks.append("No application runtime, log, telemetry, or code evidence supports this corrective action.")
         if mutating and evidence_quality.get("sufficiency") != "sufficient":
             readiness_blocks.append("The causal hypothesis is not independently corroborated by sufficient evidence.")
+        if mutating and "rca_ready" in context_quality and context_quality.get("rca_ready") is not True:
+            readiness_score = float(context_quality.get("rca_readiness_score") or 0.0)
+            readiness_blocks.append(
+                f"Context evidence is only {readiness_score:.0%} RCA-ready; collect independent direct and causal evidence."
+            )
         if context_quality.get("discovery_degraded") or context_quality.get("execution_ready") is False:
             readiness_blocks.append(
                 "Discovery evidence is degraded or unavailable; collect fresh diagnostics before execution."
