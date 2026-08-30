@@ -1070,8 +1070,27 @@ async def startup(app: FastAPI) -> None:
         await app.state.producer.publish(RESOLUTION_EVENTS, payload_out, key=str(context.incident_id))
         EVENTS_PROCESSED.labels(settings.service_name, CONTEXT_EVENTS, "ok").inc()
 
+    async def record_terminal_failure(payload: dict[str, Any], error: str) -> None:
+        context_payload = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        metadata = context_payload.get("metadata") if isinstance(context_payload.get("metadata"), dict) else {}
+        decision = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
+        request_id = str(metadata.get("analysis_request_id") or decision.get("analysis_request_id") or "").strip()
+        tenant_id = str(context_payload.get("tenant_id") or "").strip()
+        if not request_id or not tenant_id or not settings.database_enabled:
+            return
+        async with app.state.session_factory() as session:
+            await IncidentRepository(session).fail_analysis_request(
+                request_id, tenant_id=tenant_id, reason=error,
+            )
+            await session.commit()
+
     for source, consumer, consume_forever in consumers:
-        task = asyncio.create_task(consume_forever(consumer, handle), name=f"resolution-agent-{source}-consumer")
+        runner = (
+            consume_forever(consumer, handle, record_terminal_failure)
+            if source.startswith("rabbitmq")
+            else consume_forever(consumer, handle)
+        )
+        task = asyncio.create_task(runner, name=f"resolution-agent-{source}-consumer")
         tasks.append(task)
 
 

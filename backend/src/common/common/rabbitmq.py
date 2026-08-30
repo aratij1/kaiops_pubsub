@@ -259,6 +259,7 @@ class RabbitMQConsumer:
 async def consume_forever(
     consumer: RabbitMQConsumer,
     handler: Callable[[dict[str, Any]], Awaitable[None]],
+    failure_handler: Callable[[dict[str, Any], str], Awaitable[None]] | None = None,
 ) -> None:
     processed_cache = ProcessedMessageCache()
     while True:
@@ -358,6 +359,14 @@ async def consume_forever(
                         continue
                     if consumer._exchange is not None and consumer._dlq_routing_key:
                         try:
+                            if failure_handler is not None:
+                                try:
+                                    await failure_handler(payload, last_error or "handler_failed")
+                                except Exception:
+                                    logger.exception(
+                                        "failed to persist rabbitmq terminal handler state",
+                                        extra={"topic": consumer._topic, "message_identity": identity},
+                                    )
                             envelope = {
                                 "failed_topic": consumer._topic,
                                 "payload": payload,

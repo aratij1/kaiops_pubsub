@@ -3141,6 +3141,7 @@ class IncidentRepository:
             mode=mode,
             status="accepted",
             delivery="pending",
+            expires_at=utc_now() + timedelta(minutes=15),
         )
         self.session.add(row)
         await self.session.flush()
@@ -3155,6 +3156,32 @@ class IncidentRepository:
                 )
             )
         ).scalar_one_or_none()
+
+    async def fail_analysis_request(
+        self, request_id: UUID | str, *, tenant_id: str, reason: str,
+    ) -> bool:
+        request_uuid = self._parse_uuid(request_id)
+        if request_uuid is None:
+            return False
+        row = await self.get_analysis_request(request_uuid, tenant_id=tenant_id)
+        if row is None or row.status in {"complete", "failed", "timed_out", "superseded"}:
+            return False
+        row.status = "failed"
+        row.terminal_reason = (str(reason).strip() or "analysis_handler_failed")[:255]
+        row.completed_at = utc_now()
+        return True
+
+    async def expire_analysis_request(self, row: AnalysisRequestRecord, *, now: datetime | None = None) -> bool:
+        current = now or utc_now()
+        expires_at = row.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if row.status not in {"accepted", "queued", "published", "running"} or expires_at > current:
+            return False
+        row.status = "timed_out"
+        row.terminal_reason = "analysis_deadline_exceeded"
+        row.completed_at = current
+        return True
 
     async def save_knowledge_base(self, report: ResolutionReport, service: str = "unknown", *, tenant_id: str | None = None) -> None:
         verified_tenant = require_tenant_id(report.tenant_id, source="resolution knowledge persistence")

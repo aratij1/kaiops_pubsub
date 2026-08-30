@@ -2229,12 +2229,16 @@ async def get_analysis_request_status(
         if lifecycle is not None:
             if lifecycle.incident_id != incident_uuid:
                 raise HTTPException(status_code=404, detail="Analysis request was not found for this incident")
+            if await repository.expire_analysis_request(lifecycle):
+                await session.commit()
             return {
                 "request_id": str(lifecycle.request_id),
                 "incident_id": str(lifecycle.incident_id),
                 "recommendation_id": str(lifecycle.recommendation_id or lifecycle.expected_recommendation_id),
                 "status": lifecycle.status,
                 "ready": lifecycle.status == "complete",
+                "terminal": lifecycle.status in {"complete", "failed", "timed_out", "superseded"},
+                "retryable": lifecycle.status in {"failed", "timed_out"},
                 "delivery": lifecycle.delivery,
                 "terminal_reason": lifecycle.terminal_reason,
                 "created_at": lifecycle.created_at,

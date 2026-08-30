@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS analysis_requests (
     recommendation_id CHAR(32) NULL,
     terminal_reason VARCHAR(255) NULL,
     completed_at DATETIME NULL,
+    expires_at DATETIME NOT NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uq_analysis_requests_recommendation (expected_recommendation_id),

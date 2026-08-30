@@ -934,8 +934,27 @@ async def startup(app: FastAPI) -> None:
             CONTEXT_REUSE_DECISIONS.labels("publish", "duplicate_event_suppressed").inc()
         EVENTS_PROCESSED.labels(settings.service_name, f"{ORCHESTRATION_EVENTS}:{provider_used}", "ok").inc()
 
+    async def record_terminal_failure(payload: dict[str, Any], error: str) -> None:
+        decision = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
+        incident = payload.get("incident") if isinstance(payload.get("incident"), dict) else {}
+        alert = payload.get("alert") if isinstance(payload.get("alert"), dict) else {}
+        request_id = str(decision.get("analysis_request_id") or "").strip()
+        tenant_id = str(incident.get("tenant_id") or alert.get("tenant_id") or "").strip()
+        if not request_id or not tenant_id or not settings.database_enabled:
+            return
+        async with app.state.session_factory() as session:
+            await IncidentRepository(session).fail_analysis_request(
+                request_id, tenant_id=tenant_id, reason=error,
+            )
+            await session.commit()
+
     for source, consumer, consume_forever in _build_ingress_consumers():
-        task = asyncio.create_task(consume_forever(consumer, handle), name=f"context-agent-{source}-consumer")
+        runner = (
+            consume_forever(consumer, handle, record_terminal_failure)
+            if source.startswith("rabbitmq")
+            else consume_forever(consumer, handle)
+        )
+        task = asyncio.create_task(runner, name=f"context-agent-{source}-consumer")
         tasks.append(task)
 
 
