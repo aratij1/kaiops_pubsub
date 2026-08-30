@@ -295,7 +295,7 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
   await signInIfNeeded(page);
   await expect(page.getByRole("heading", { name: "api-gateway: HighRequestLatency" })).toBeVisible();
   await expect(page.getByText("0 linked record(s) · RCA and impact")).toBeVisible();
-  await expect(page.getByText("0% RCA confidence")).toBeVisible();
+  await expect(page.getByText("0% Ungrounded")).toBeVisible();
 
   const tabs = page.getByRole("tablist", { name: "Incident workspace sections" });
   await tabs.getByRole("tab", { name: "Evidence, RCA, and impact" }).click();
@@ -306,7 +306,7 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
   await expect(page.getByText("API connection-pool saturation caused request queueing.").first()).toBeVisible();
   await expect(page.getByText("Increase the API connection pool and recycle saturated workers through the governed rollout.").first()).toBeVisible();
   await expect(page.getByText("1 linked record(s) · RCA and impact")).toBeVisible();
-  await page.getByRole("button", { name: "Review remediation plan" }).click();
+  await tabs.getByRole("tab", { name: "Resolve incident" }).click();
   await expect(page.getByRole("heading", { name: "Resolution command center" })).toBeVisible();
   integrityMismatch = true;
   await page.reload();

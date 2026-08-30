@@ -5898,6 +5898,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       : {};
     const metadata = recommendation?.metadata && typeof recommendation.metadata === "object" ? recommendation.metadata : {};
     const canonical = canonicalIncidentEvidence(selectedAlertWorkflow);
+    const hasAcceptedEvidence = canonical.evidence.some((row) => row.accepted === true);
     const providerRow = selectedAlertUsage.find((row) => row.provider !== "-" || row.model !== "-");
     const fallbackUsed = selectedAlertUsage.some((row) => row.fallback);
     const confidenceReasons = [
@@ -5906,7 +5907,15 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       `${formatQualityPercent(selectedAlertEvaluation.groundingScore)} grounding`,
       canonical.missing.length ? `${canonical.missing.length} evidence gap(s)` : "No declared evidence gaps",
     ];
-    return { ...canonical, providerRow, fallbackUsed, confidenceReasons };
+    return {
+      ...canonical,
+      confidence: hasAcceptedEvidence ? canonical.confidence : 0,
+      confidenceLabel: hasAcceptedEvidence ? canonical.confidenceLabel : "Ungrounded",
+      confidenceActionable: hasAcceptedEvidence && canonical.confidenceActionable === true,
+      providerRow,
+      fallbackUsed,
+      confidenceReasons,
+    };
   }, [selectedAlertWorkflow, selectedAlertUsage, selectedAlertEvaluation]);
 
   const selectedRcaDecision = useMemo(() => {
@@ -5920,7 +5929,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       analysis.rca?.causal_chain || analysis.rca?.mechanism || analysis.rca?.reasoning || analysis.rca?.contributing_factors,
       "The causal mechanism was not supplied by the current analysis.",
     );
-    const hasLinkedEvidence = selectedAiTrust.evidence.length > 0;
+    const hasLinkedEvidence = selectedAiTrust.evidence.some((row) => row.accepted === true);
     // This is the backend's bounded diagnostic confidence. Grounding and
     // execution eligibility are enforced independently below.
     const confidence = Number(selectedAiTrust.confidence ?? 0);
@@ -10931,7 +10940,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           <span><strong>{incidentStatusLabel(selectedCanonicalIncidentStatus)}</strong> lifecycle</span>
                           <span><strong>{selectedAlertTimelineRows.length}</strong> events</span>
                           <span><strong>{selectedAiTrust.evidence.filter((row) => row.accepted).length}</strong> RCA-supporting evidence</span>
-                          <span className={Number(selectedRcaDecision.confidence || 0) < 0.5 ? "is-quality-warning" : ""}><strong>{formatQualityPercent(selectedRcaDecision.confidence)}</strong> {selectedAiTrust.confidenceLabel}</span>
+                          <span className={Number(selectedRcaDecision.confidence || 0) < 0.5 ? "is-quality-warning" : ""}><strong>{formatQualityPercent(selectedRcaDecision.confidence)}</strong> {selectedRcaDecision.confidenceLabel}</span>
                         </div>
                       </header>
                       <details className="panel incident-workspace-section workspace-collapsible" open>
