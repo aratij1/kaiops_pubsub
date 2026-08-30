@@ -18,6 +18,7 @@ import { buildAlertDocumentDraft as buildRcaEvidenceDocumentDraft } from "./doma
 import { canonicalIncidentEvidence } from "./domain/incidentEvidence";
 import { canonicalApprovalEligibility } from "./domain/approvalEligibility";
 import { buildIncidentGroupQuery } from "./features/incidents/incidentGroupQuery";
+import { isEvidenceDraftConflict, useEvidenceDraftBundle } from "./features/incidents/useEvidenceDraftBundle";
 import RcaPanel from "./routes/incidents/RcaPanel";
 import ResolutionPanel from "./routes/incidents/ResolutionPanel";
 import VerifyWorkspace from "./routes/incidents/VerifyWorkspace";
@@ -32,7 +33,6 @@ import { allowedLegacyTabsForRole, canAccessDestination } from "./app/permission
 import { KAI_BRAND } from "./config/brand";
 import KaiCommandPalette from "./app/KaiCommandPalette";
 import { KaiOperationsShell } from "./components/shell/KaiOperationsShell";
-
 const LOCAL_JENKINS_ENDPOINT = "http://jenkins:8080", LOCAL_JENKINS_JOB = "kaiops-auto-remediation", LOCAL_JENKINS_CREDENTIAL_REF = "vault://kaiops/local/jenkins#api-token";
 import {
   ALERT_DOC_KIND_OPTIONS,
@@ -175,7 +175,6 @@ import {
   summarizeAlertRuleContext,
 } from "./appHelpers.jsx";
 import { buildWorkflowFlowStages } from "./domain/workflowStages";
-
 function readableImpactText(value, fallback) {
   if (value == null || value === "") return fallback;
   if (Array.isArray(value)) {
@@ -205,7 +204,6 @@ function readableImpactText(value, fallback) {
   if (/^[\[{]/.test(raw) || /[}\]]$/.test(raw)) return fallback;
   return cleanRecommendationText(raw, fallback);
 }
-
 const NAVIGATION_ICONS = {
   dashboard: Database,
   alerts: RadioTower,
@@ -229,19 +227,16 @@ const NAVIGATION_ICONS = {
   settings: Settings,
   executive: ChartNoAxesCombined,
 };
-
 const INGESTION_SAVED_VIEWS = [
   { id: "critical-active", label: "Critical active", section: "active", channel: "all", filters: { timeRange: "24h", severity: "critical", application: "selected", environment: "all" } },
   { id: "failed-ingestion", label: "Failed ingestion", section: "failed", channel: "failed", filters: { timeRange: "24h", severity: "all", application: "selected", environment: "all" } },
   { id: "my-applications", label: "My applications", section: "active", channel: "all", filters: { timeRange: "24h", severity: "all", application: "selected", environment: "all" } },
 ];
-
 function redactOperationalSecrets(value) {
   return String(value || "")
     .replace(/((?:password|passwd|token|secret|api[_-]?key)\s*[=:]\s*)([^\s'";]+)/gi, "$1[REDACTED]")
     .replace(/(authorization:\s*bearer\s+)[^\s'";]+/gi, "$1[REDACTED]");
 }
-
 function isTestApplicationRecord(row) {
   const metadata = row?.metadata && typeof row.metadata === "object" ? row.metadata : {};
   const labels = row?.labels && typeof row.labels === "object" ? row.labels : {};
@@ -475,10 +470,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const [dashboardAlertQuery, setDashboardAlertQuery] = useState("");
   const [globalOperationsView, setGlobalOperationsView] = useState("search");
   const [globalOperationsQuery, setGlobalOperationsQuery] = useState("");
-  // The input stays bound to dashboardAlertQuery for immediate visual
-  // feedback; the (currently client-side, O(rows)) filter below runs off
-  // this debounced copy instead, so a fast typist doesn't re-filter the
-  // full alert list on every keystroke.
+  // Debounce the client-side alert filter so typing does not rescan every row.
   const [dashboardAlertQueryDebounced, setDashboardAlertQueryDebounced] = useState("");
   useEffect(() => {
     const handle = setTimeout(() => setDashboardAlertQueryDebounced(dashboardAlertQuery), 250);
@@ -2408,6 +2400,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       },
     };
   }
+  const evidenceDraftApi = useEvidenceDraftBundle({ fetchJson, authenticatedOptions, unwrap });
 
   async function adminLogin(event) {
     event.preventDefault();
@@ -5991,10 +5984,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const selectedInvestigationConfidence = Number(selectedInvestigationReport?.conclusion?.confidence || 0);
 
   const selectedRelevantRcaEvidence = useMemo(() => {
-    // These sources already come from the selected alert's linked-document
-    // endpoint and its persisted discovery report. Re-matching them by free
-    // text can discard valid evidence after normalization (for example, an
-    // evidence ID and citation with no service name in the display string).
+    // Preserve backend-linked evidence; free-text rematching can discard normalized records.
     return selectedAiTrust.evidence;
   }, [selectedAiTrust.evidence]);
   const selectedAlertAuthenticity = String(
@@ -6031,9 +6021,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         let draft = drafts[0] || null;
         if (drafts.filter((item) => item?.document_kind).length < ALERT_DOC_KIND_OPTIONS.length && selectedRcaDecision.rootCause && selectedRelevantRcaEvidence.length) {
           const evidenceIds = selectedRelevantRcaEvidence.map((row) => row.id || row.evidence_id).filter(Boolean);
-          const sourceUris = selectedRelevantRcaEvidence.map((row) => row.citation || row.uri).filter(Boolean);
+          const sourceUris = selectedRelevantRcaEvidence.map((row) => row.source_uri || row.uri || row.path).filter(Boolean);
           const content = buildRcaEvidenceDocumentDraft({ alertId, alert: selectedAlertRow, decision: selectedRcaDecision, workflow: selectedAlertWorkflow, evidence: selectedRelevantRcaEvidence });
-          const created = await fetchJson("/api-gateway/rag/evidence-drafts", authenticatedOptions({ method: "POST", body: JSON.stringify({ alert_id: alertId, incident_id: selectedIncidentId, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, environment: selectedAlertRow?.environment, title: `RCA review: ${selectedAlertRow?.name || "Alert"}`, content, services: [selectedAlertRow?.service].filter(Boolean), evidence_ids: evidenceIds, source_uris: sourceUris }) }));
+          const binding = selectedAlertWorkflow?.incident_investigation || {}; const created = await fetchJson("/api-gateway/rag/evidence-drafts", authenticatedOptions({ method: "POST", body: JSON.stringify({ incident_id: binding.incident_id || selectedIncidentId, alert_id: binding.alert_id || alertId, analysis_request_id: binding.analysis_request_id, context_snapshot_id: binding.context_snapshot_id, context_fingerprint: binding.context_fingerprint, recommendation_id: binding.recommendation_id, rca_version: binding.rca_version, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, environment: selectedAlertRow?.environment, content, services: [selectedAlertRow?.service].filter(Boolean), evidence_ids: evidenceIds, source_uris: sourceUris }) }));
           drafts = unwrap(created)?.drafts || [unwrap(created)?.draft].filter(Boolean);
           draft = unwrap(created)?.draft || drafts[0] || null;
         }
@@ -7925,26 +7915,31 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }
 
   async function approveEvidenceDraft() {
-    const draft = evidenceDraftReview.draft;
-    if (!draft?.draft_id) return;
+    const draft = evidenceDraftReview.draft; if (!draft?.draft_id) return;
     setEvidenceDraftReview((current) => ({ ...current, loading: true, error: "", message: "" }));
     try {
-      const reviewedBy = adminSession?.user?.username || "operator";
-      await fetchJson(`/api-gateway/rag/evidence-drafts/${encodeURIComponent(draft.draft_id)}`, authenticatedOptions({ method: "PUT", body: JSON.stringify({ content: evidenceDraftReview.content, reviewed_by: reviewedBy, review_notes: evidenceDraftReview.notes }) }));
-      const response = await fetchJson(`/api-gateway/rag/evidence-drafts/${encodeURIComponent(draft.draft_id)}/approve`, authenticatedOptions({ method: "POST", body: JSON.stringify({ content: evidenceDraftReview.content, approved_by: reviewedBy }) }));
-      setEvidenceDraftReview((current) => ({ ...current, loading: false, draft: { ...draft, status: "approved" }, message: "Reviewed alert knowledge was approved and stored for future RCA grounding." }));
+      const reviewed = unwrap(await evidenceDraftApi.review(draft, evidenceDraftReview.content, evidenceDraftReview.notes))?.draft;
+      const response = await evidenceDraftApi.approve(reviewed); const next = unwrap(response)?.draft || reviewed;
+      setEvidenceDraftReview((current) => ({ ...current, loading: false, draft: next, message: "Approved — indexing pending." }));
       await Promise.allSettled([loadRagDocs(), loadSelectedAlertDocumentLinks(selectedAlertId)]);
     } catch (error) {
-      setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
+      if (isEvidenceDraftConflict(error)) {
+        const latest = await evidenceDraftApi.load(String(selectedAlertId)); const next = latest.find((item) => item.draft_id === draft.draft_id) || latest[0] || draft;
+        setEvidenceDraftReview((current) => ({ ...current, loading: false, drafts: latest, draft: next, content: next.content || "", error: evidenceDraftApi.conflictMessage }));
+      } else setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
     }
   }
   async function saveEvidenceDraft() {
     const draft = evidenceDraftReview.draft; if (!draft?.draft_id) return;
     setEvidenceDraftReview((current) => ({ ...current, loading: true, error: "", message: "" }));
     try {
-      const reviewedBy = adminSession?.user?.username || "operator"; const response = await fetchJson(`/api-gateway/rag/evidence-drafts/${encodeURIComponent(draft.draft_id)}`, authenticatedOptions({ method: "PUT", body: JSON.stringify({ content: evidenceDraftReview.content, reviewed_by: reviewedBy, review_notes: evidenceDraftReview.notes }) }));
-      setEvidenceDraftReview((current) => ({ ...current, loading: false, draft: unwrap(response)?.draft || { ...draft, status: "reviewed" }, message: "Draft saved. It remains blocked from reusable knowledge until an authorized user approves it." }));
-    } catch (error) { setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) })); }
+      const response = await evidenceDraftApi.review(draft, evidenceDraftReview.content, evidenceDraftReview.notes); setEvidenceDraftReview((current) => ({ ...current, loading: false, draft: unwrap(response)?.draft || { ...draft, status: "reviewed" }, message: "Draft saved. It remains blocked from reusable knowledge until an authorized user approves it." }));
+    } catch (error) {
+      if (isEvidenceDraftConflict(error)) {
+        const latest = await evidenceDraftApi.load(String(selectedAlertId)); const next = latest.find((item) => item.draft_id === draft.draft_id) || latest[0] || draft;
+        setEvidenceDraftReview((current) => ({ ...current, loading: false, drafts: latest, draft: next, content: next.content || "", error: evidenceDraftApi.conflictMessage }));
+      } else setEvidenceDraftReview((current) => ({ ...current, loading: false, error: String(error?.message || error) }));
+    }
   }
   async function approveExecutionOutcomeForReuse() {
     if (!selectedRemediationOutcome) return;
@@ -11246,11 +11241,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                           </div>
                           {evidenceDraftReview.loading && !evidenceDraftReview.draft ? <div className="alert-document-generation-state"><span className="spinner" aria-hidden="true" /><span>Completing the RCA-derived document draft…</span></div> : null}
                           {canProvideAlertDocuments && evidenceDraftReview.draft ? <div className="alert-document-draft-editor">
-                            <div className="alert-document-draft-heading"><div><span className="eyebrow">Editable draft</span><h4>{evidenceDraftReview.draft.title || "Incident knowledge document"}</h4></div><span className={`workflow-pill ${evidenceDraftReview.draft.status === "reviewed" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft.status || "draft"}</span></div>
+                            <div className="alert-document-draft-heading"><div><span className="eyebrow">{evidenceDraftReview.draft.document_kind || "incident"} · version {evidenceDraftReview.draft.document_version || 1}</span><h4>{evidenceDraftReview.draft.title || "Incident knowledge document"}</h4><small>Reviewer: {evidenceDraftReview.draft.reviewed_by || "Not reviewed"}</small></div><span className={`workflow-pill ${evidenceDraftReview.draft.status === "reviewed" || evidenceDraftReview.draft.status === "approved" ? "workflow-pill-clear" : "workflow-pill-attention"}`}>{evidenceDraftReview.draft.status === "approved_pending_index" ? "Approved — indexing pending" : evidenceDraftReview.draft.status || "draft"}</span></div>
                             <div className="report-view-switch" role="tablist" aria-label="Incident report detail"><button type="button" role="tab" aria-selected={incidentReportView === "simple"} className={incidentReportView === "simple" ? "active" : ""} onClick={() => setIncidentReportView("simple")}>Simple</button><button type="button" role="tab" aria-selected={incidentReportView === "detailed"} className={incidentReportView === "detailed" ? "active" : ""} onClick={() => setIncidentReportView("detailed")}>Detailed</button></div>
-                            {incidentReportView === "simple" ? <pre className="simple-incident-report">{simpleIncidentReport(evidenceDraftReview.content)}</pre> : <><label>Document content<textarea rows={18} value={evidenceDraftReview.content} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, content: event.target.value }))} disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status === "approved"} /></label><label>Reviewer notes<textarea rows={3} value={evidenceDraftReview.notes} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, notes: event.target.value }))} placeholder="Record corrections, exclusions, and evidence that still needs confirmation." disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status === "approved"} /></label></>}
+                            {incidentReportView === "simple" ? <pre className="simple-incident-report">{simpleIncidentReport(evidenceDraftReview.content)}</pre> : <><label>Document content<textarea rows={18} value={evidenceDraftReview.content} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, content: event.target.value }))} disabled={evidenceDraftReview.loading || ["approved", "approved_pending_index"].includes(evidenceDraftReview.draft.status)} /></label><label>Reviewer notes<textarea rows={3} value={evidenceDraftReview.notes} onChange={(event) => setEvidenceDraftReview((current) => ({ ...current, notes: event.target.value }))} placeholder="Record corrections, exclusions, and evidence that still needs confirmation." disabled={evidenceDraftReview.loading || ["approved", "approved_pending_index"].includes(evidenceDraftReview.draft.status)} /></label></>}
                             {selectedRcaDecision.reviewRequired ? <p className="subtitle" role="status">The current RCA remains inconclusive. You may still correct and publish verified historical facts for future investigations; publication does not increase this incident's confidence or authorize execution.</p> : null}
-                            <div className="alert-documents-empty-actions"><button type="button" className="button-secondary" onClick={saveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20}>Save draft</button><button type="button" className="button-primary" onClick={approveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20}>Approve & publish</button><button type="button" className="button-ghost" onClick={() => selectedAlertRow && openDocumentPrompt(selectedAlertRow)}>Add source document</button></div>
+                            <div className="alert-documents-empty-actions"><button type="button" className="button-secondary" onClick={saveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.content.trim().length < 20 || ["approved", "approved_pending_index"].includes(evidenceDraftReview.draft.status)}>Save review</button><button type="button" className="button-primary" onClick={approveEvidenceDraft} disabled={evidenceDraftReview.loading || evidenceDraftReview.draft.status !== "reviewed" || !evidenceDraftReview.draft.evidence_ids?.length || !evidenceDraftReview.draft.source_uris?.length}>Approve reviewed version</button><button type="button" className="button-ghost" onClick={() => selectedAlertRow && openDocumentPrompt(selectedAlertRow)}>Add source document</button></div>
                           </div> : null}
                           <div className="alert-documents-empty-actions">
                             {!canProvideAlertDocuments ? (
