@@ -14,6 +14,7 @@ class ResolutionWorkflowState(StrEnum):
     EVIDENCE_READY = "evidence_ready"
     HYPOTHESES_READY = "hypotheses_ready"
     PLAN_SELECTED = "plan_selected"
+    PLAN_COMPILED = "plan_compiled"
     POLICY_CHECKED = "policy_checked"
     AWAITING_APPROVAL = "awaiting_approval"
     READY_TO_EXECUTE = "ready_to_execute"
@@ -28,7 +29,8 @@ ALLOWED_WORKFLOW_TRANSITIONS = {
     ResolutionWorkflowState.EVIDENCE_PENDING: {ResolutionWorkflowState.EVIDENCE_READY, ResolutionWorkflowState.ESCALATED},
     ResolutionWorkflowState.EVIDENCE_READY: {ResolutionWorkflowState.HYPOTHESES_READY, ResolutionWorkflowState.ESCALATED},
     ResolutionWorkflowState.HYPOTHESES_READY: {ResolutionWorkflowState.PLAN_SELECTED, ResolutionWorkflowState.EVIDENCE_PENDING, ResolutionWorkflowState.ESCALATED},
-    ResolutionWorkflowState.PLAN_SELECTED: {ResolutionWorkflowState.POLICY_CHECKED, ResolutionWorkflowState.ESCALATED},
+    ResolutionWorkflowState.PLAN_SELECTED: {ResolutionWorkflowState.PLAN_COMPILED, ResolutionWorkflowState.ESCALATED},
+    ResolutionWorkflowState.PLAN_COMPILED: {ResolutionWorkflowState.POLICY_CHECKED, ResolutionWorkflowState.ESCALATED},
     ResolutionWorkflowState.POLICY_CHECKED: {ResolutionWorkflowState.AWAITING_APPROVAL, ResolutionWorkflowState.READY_TO_EXECUTE, ResolutionWorkflowState.EVIDENCE_PENDING, ResolutionWorkflowState.ESCALATED},
     ResolutionWorkflowState.AWAITING_APPROVAL: {ResolutionWorkflowState.READY_TO_EXECUTE, ResolutionWorkflowState.ESCALATED},
     ResolutionWorkflowState.READY_TO_EXECUTE: {ResolutionWorkflowState.EXECUTING, ResolutionWorkflowState.ESCALATED},

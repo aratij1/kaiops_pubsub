@@ -1112,27 +1112,10 @@ async def _persist_resolution_event(
         policy_decision = plan.get("policy_decision") if isinstance(plan.get("policy_decision"), dict) else {}
         evidence_ids = list((iterative.get("conclusion") or {}).get("evidence_ids") or [])
         transition_path: list[tuple[ResolutionWorkflowState, ResolutionWorkflowState, str]]
-        if iterative.get("conclusive") is not True:
-            transition_path = [(
-                ResolutionWorkflowState.EVIDENCE_PENDING,
-                ResolutionWorkflowState.ESCALATED,
-                "evidence_inconclusive",
-            )]
-        else:
-            policy_target = (
-                ResolutionWorkflowState.AWAITING_APPROVAL
-                if policy_decision.get("decision") == "hitl"
-                else ResolutionWorkflowState.READY_TO_EXECUTE
-                if policy_decision.get("decision") == "hotl"
-                else ResolutionWorkflowState.ESCALATED
-            )
-            transition_path = [
-                (ResolutionWorkflowState.EVIDENCE_PENDING, ResolutionWorkflowState.EVIDENCE_READY, "evidence_compiled"),
-                (ResolutionWorkflowState.EVIDENCE_READY, ResolutionWorkflowState.HYPOTHESES_READY, "hypotheses_ranked"),
-                (ResolutionWorkflowState.HYPOTHESES_READY, ResolutionWorkflowState.PLAN_SELECTED, "approved_runbook_selected"),
-                (ResolutionWorkflowState.PLAN_SELECTED, ResolutionWorkflowState.POLICY_CHECKED, "policy_evaluated"),
-                (ResolutionWorkflowState.POLICY_CHECKED, policy_target, str((policy_decision.get("reason_codes") or ["policy_decision"])[0])),
-            ]
+        transition_path = [
+            (ResolutionWorkflowState.EVIDENCE_PENDING, ResolutionWorkflowState.EVIDENCE_READY, "evidence_compiled"),
+            (ResolutionWorkflowState.EVIDENCE_READY, ResolutionWorkflowState.HYPOTHESES_READY, "hypotheses_ranked"),
+        ]
         for sequence, (previous_state, new_state, reason_code) in enumerate(transition_path, 1):
             event_id = uuid5(NAMESPACE_URL, f"kaims:resolution-transition:{recommendation.id}:{sequence}:{new_state.value}")
             transition_payload = {

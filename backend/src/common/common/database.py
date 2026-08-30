@@ -672,6 +672,32 @@ class ExecutionPlanRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class ResolutionStateTransitionRecord(Base):
+    __tablename__ = "resolution_state_transitions"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "event_id", name="uq_resolution_transition_event"),
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_resolution_transition_idempotency"),
+    )
+
+    transition_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False, default="default")
+    incident_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    recommendation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    execution_plan_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    previous_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    new_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    correlation_id: Mapped[str | None] = mapped_column(String(128))
+    causation_id: Mapped[str | None] = mapped_column(String(128))
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    actor: Mapped[str] = mapped_column(String(64), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    reason_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    policy_decision: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
 class AuditLogRecord(Base, TimestampMixin):
     __tablename__ = "audit_logs"
     __table_args__ = (Index("idx_audit_logs_resource_action_created", "resource_type", "action", "created_at"),)

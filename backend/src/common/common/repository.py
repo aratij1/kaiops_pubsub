@@ -4342,6 +4342,17 @@ class IncidentRepository:
             topic="resolution.events", partition_key=str(incident_uuid), payload=event_payload,
             tenant_id=tenant, available_after_seconds=0,
         )
+        transition_event_id = uuid5(NAMESPACE_URL, f"resolution-selection:{plan_id}")
+        await self.record_resolution_transition({
+            "tenant_id": tenant, "incident_id": str(incident_uuid),
+            "recommendation_id": str(recommendation_uuid), "execution_plan_id": None,
+            "previous_state": "hypotheses_ready", "new_state": "plan_selected",
+            "event_id": str(transition_event_id), "actor": selected_by,
+            "reason_code": "operator_catalog_selection", "evidence_ids": [],
+            "idempotency_key": hashlib.sha256(
+                f"{incident_uuid}:{transition_event_id}:plan_selected".encode()
+            ).hexdigest(),
+        })
         projection_payload = dict(projection.projection_payload or {})
         projection_payload["resolution_selection"] = selection
         projection_payload.pop("resolution_plan", None)
@@ -4428,6 +4439,26 @@ class IncidentRepository:
                      "incident_id": str(selection.incident_id), "resolution_selection": row.payload,
                      "execution_plan": payload}, available_after_seconds=0,
         )
+        transitions = [
+            ("plan_selected", "plan_compiled", "registered_plan_compiled"),
+            ("plan_compiled", "policy_checked", "execution_policy_checked"),
+            ("policy_checked", "awaiting_approval" if validated.approval_required else "ready_to_execute",
+             "human_approval_required" if validated.approval_required else "policy_execution_ready"),
+        ]
+        for index, (previous_state, new_state, reason_code) in enumerate(transitions, 1):
+            event_id = uuid5(NAMESPACE_URL, f"execution-plan:{validated.plan_id}:{index}:{new_state}")
+            await self.record_resolution_transition({
+                "tenant_id": selection.tenant_id, "incident_id": str(selection.incident_id),
+                "recommendation_id": str(selection.recommendation_id),
+                "execution_plan_id": str(validated.plan_id), "previous_state": previous_state,
+                "new_state": new_state, "event_id": str(event_id), "actor": "resolution-agent",
+                "reason_code": reason_code, "evidence_ids": validated.evidence_references,
+                "policy_decision": {"version": validated.policy_version,
+                                    "decision": validated.approval_policy.decision},
+                "idempotency_key": hashlib.sha256(
+                    f"{selection.incident_id}:{event_id}:{new_state}".encode()
+                ).hexdigest(),
+            })
         await self.session.flush()
         return payload
 
@@ -4829,9 +4860,10 @@ class IncidentRepository:
 
     async def record_resolution_transition(self, payload: dict[str, Any]) -> bool:
         """Append one idempotent lifecycle transition; duplicate events are no-ops."""
+        insert_verb = "INSERT OR IGNORE" if self.session.bind and self.session.bind.dialect.name == "sqlite" else "INSERT IGNORE"
         result = await self.session.execute(
             text(
-                "INSERT IGNORE INTO resolution_state_transitions "
+                f"{insert_verb} INTO resolution_state_transitions "
                 "(transition_id,tenant_id,incident_id,recommendation_id,execution_plan_id,previous_state,new_state,"
                 "event_id,correlation_id,causation_id,idempotency_key,actor,reason_code,evidence_ids,policy_decision,payload) "
                 "VALUES (:transition_id,:tenant_id,:incident_id,:recommendation_id,:execution_plan_id,:previous_state,"
