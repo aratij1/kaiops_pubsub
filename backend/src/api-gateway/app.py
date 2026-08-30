@@ -3863,6 +3863,26 @@ async def approve_evidence_rag_draft(
     )
 
 
+@app.post("/rag/governed-documents/{document_id}/retry-index")
+async def retry_governed_rag_index(
+    document_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value)),  # noqa: B008
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/rag/governed-documents/{quote(document_id, safe='')}/retry-index",
+        target_base=settings.context_agent_url,
+        payload={
+            "tenant_scope": auth.tenant_id,
+            "requested_by": auth.email or auth.username or str(auth.user_id),
+        },
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.post("/knowledge-pack/draft")
 async def draft_knowledge_pack(
     request: Request,

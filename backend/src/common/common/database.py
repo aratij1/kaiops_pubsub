@@ -542,6 +542,11 @@ class GovernedRagDocumentRecord(Base):
     approved_by: Mapped[str] = mapped_column(String(160), nullable=False)
     approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     index_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    index_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    index_error: Mapped[str | None] = mapped_column(Text)
+    index_receipt: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    last_index_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_index_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 

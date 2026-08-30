@@ -243,11 +243,14 @@ CREATE TABLE IF NOT EXISTS governed_rag_documents (
     evidence_ids JSON NOT NULL, source_uris JSON NOT NULL,
     corpus_classification VARCHAR(32) NOT NULL, review_status VARCHAR(32) NOT NULL,
     approved_by VARCHAR(160) NOT NULL, approved_at DATETIME(6) NOT NULL,
-    index_status VARCHAR(32) NOT NULL DEFAULT 'pending', indexed_at DATETIME(6) NULL,
+    index_status VARCHAR(32) NOT NULL DEFAULT 'pending', index_attempts INT NOT NULL DEFAULT 0,
+    index_error TEXT NULL, index_receipt JSON NULL, last_index_attempt_at DATETIME(6) NULL,
+    next_index_attempt_at DATETIME(6) NULL, indexed_at DATETIME(6) NULL,
     created_at DATETIME(6) NOT NULL, PRIMARY KEY (document_id),
     UNIQUE KEY uq_governed_document_version (tenant_id, alert_id, document_kind, document_version),
     UNIQUE KEY uq_governed_document_draft (draft_id),
-    KEY ix_governed_rag_retrieval (tenant_id, review_status, index_status, document_kind)
+    KEY ix_governed_rag_retrieval (tenant_id, review_status, index_status, document_kind),
+    KEY ix_governed_rag_next_index_attempt (next_index_attempt_at)
 );
 
 CREATE TABLE IF NOT EXISTS incident_projections (

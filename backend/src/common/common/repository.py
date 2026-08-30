@@ -3863,14 +3863,20 @@ class IncidentRepository:
         return self._evidence_draft_payload(row), payload
 
     async def mark_governed_rag_document_indexed(
-        self, *, tenant_id: str, document_id: UUID | str,
+        self, *, tenant_id: str, document_id: UUID | str, index_receipt: dict[str, Any],
     ) -> dict[str, Any] | None:
         parsed = self._parse_uuid(document_id)
         document = await self.session.get(GovernedRagDocumentRecord, parsed) if parsed else None
         if document is None or document.tenant_id != tenant_id:
             return None
+        receipt_checksum = str(index_receipt.get("content_checksum") or "")
+        if receipt_checksum != document.content_checksum:
+            raise RuntimeError("indexed document checksum does not match the authoritative document")
         now = datetime.now(UTC)
         document.index_status = "indexed"
+        document.index_error = None
+        document.index_receipt = dict(index_receipt)
+        document.next_index_attempt_at = None
         document.indexed_at = now
         draft = await self.session.get(EvidenceRagDraftRecord, document.draft_id)
         if draft is not None and draft.tenant_id == tenant_id:
@@ -3880,6 +3886,89 @@ class IncidentRepository:
             draft.row_version += 1
         await self.session.flush()
         return {"document_id": str(document.document_id), "index_status": "indexed"}
+
+    async def claim_governed_rag_document_for_indexing(
+        self, *, tenant_id: str, document_id: UUID | str,
+    ) -> GovernedRagDocumentRecord | None:
+        parsed = self._parse_uuid(document_id)
+        if parsed is None:
+            return None
+        now = datetime.now(UTC)
+        row = (await self.session.execute(select(GovernedRagDocumentRecord).where(
+            GovernedRagDocumentRecord.document_id == parsed,
+            GovernedRagDocumentRecord.tenant_id == tenant_id,
+            GovernedRagDocumentRecord.review_status == "approved",
+            GovernedRagDocumentRecord.corpus_classification == "TENANT_CURATED",
+            GovernedRagDocumentRecord.index_status.in_(("pending", "failed", "indexing")),
+            or_(
+                GovernedRagDocumentRecord.next_index_attempt_at.is_(None),
+                GovernedRagDocumentRecord.next_index_attempt_at <= now,
+            ),
+        ).with_for_update())).scalar_one_or_none()
+        if row is None or row.index_status == "indexed":
+            return None
+        row.index_status = "indexing"
+        row.index_attempts += 1
+        row.index_error = None
+        row.last_index_attempt_at = now
+        await self.session.flush()
+        return row
+
+    async def mark_governed_rag_document_index_failed(
+        self, *, tenant_id: str, document_id: UUID | str, error: str, retry_at: datetime,
+        retry_limit: int = 5,
+    ) -> dict[str, Any] | None:
+        parsed = self._parse_uuid(document_id)
+        row = (await self.session.execute(select(GovernedRagDocumentRecord).where(
+            GovernedRagDocumentRecord.document_id == parsed,
+            GovernedRagDocumentRecord.tenant_id == tenant_id,
+        ).with_for_update())).scalar_one_or_none() if parsed else None
+        if row is None:
+            return None
+        row.index_status = "failed"
+        row.index_error = str(error)[:4000]
+        row.next_index_attempt_at = retry_at
+        dead_lettered = row.index_attempts >= max(1, retry_limit)
+        self.session.add(AuditLogRecord(
+            tenant_id=tenant_id, actor="rag-index-worker",
+            action="rag.document.index_dead_lettered" if dead_lettered else "rag.document.index_failed",
+            resource_type="governed_rag_document", resource_id=str(row.document_id),
+            payload={"attempts": row.index_attempts, "error": row.index_error,
+                     "retry_at": retry_at.isoformat(), "dead_lettered": dead_lettered},
+        ))
+        await self.session.flush()
+        return {"document_id": str(row.document_id), "index_status": "failed",
+                "index_attempts": row.index_attempts, "dead_lettered": dead_lettered}
+
+    async def list_due_governed_rag_index_retries(
+        self, *, retry_limit: int, limit: int = 25,
+    ) -> list[GovernedRagDocumentRecord]:
+        now = datetime.now(UTC)
+        rows = await self.session.execute(select(GovernedRagDocumentRecord).where(
+            GovernedRagDocumentRecord.review_status == "approved",
+            GovernedRagDocumentRecord.corpus_classification == "TENANT_CURATED",
+            GovernedRagDocumentRecord.index_status == "failed",
+            GovernedRagDocumentRecord.index_attempts < max(1, retry_limit),
+            GovernedRagDocumentRecord.next_index_attempt_at <= now,
+        ).order_by(GovernedRagDocumentRecord.next_index_attempt_at).limit(max(1, min(limit, 100))))
+        return list(rows.scalars())
+
+    async def retry_failed_governed_rag_document(
+        self, *, tenant_id: str, document_id: UUID | str,
+    ) -> dict[str, Any] | None:
+        parsed = self._parse_uuid(document_id)
+        row = (await self.session.execute(select(GovernedRagDocumentRecord).where(
+            GovernedRagDocumentRecord.document_id == parsed,
+            GovernedRagDocumentRecord.tenant_id == tenant_id,
+            GovernedRagDocumentRecord.index_status == "failed",
+        ).with_for_update())).scalar_one_or_none() if parsed else None
+        if row is None:
+            return None
+        row.index_status = "pending"
+        row.index_error = None
+        row.next_index_attempt_at = None
+        await self.session.flush()
+        return {"document_id": str(row.document_id), "content_checksum": row.content_checksum}
 
     async def list_retrievable_governed_rag_documents(
         self, *, tenant_id: str, document_kind: str | None = None,

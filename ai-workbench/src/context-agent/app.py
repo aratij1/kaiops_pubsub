@@ -59,6 +59,7 @@ MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
     os.getenv("MESSAGE_BUS_DUAL_CONSUME_ENABLED", "false")
 ).strip().lower() in {"1", "true", "yes", "on"}
 _CONTEXT_COLLECTION_LOCKS: dict[str, asyncio.Lock] = {}
+GOVERNED_RAG_APPROVED_TOPIC = "rag.document.approved"
 
 
 def _incident_from_workflow_payload(payload: dict[str, Any]) -> Incident:
@@ -861,6 +862,79 @@ def _build_ingress_consumers() -> list[tuple[str, object, object]]:
     return consumers
 
 
+def _validate_governed_index_event(payload: dict[str, Any]) -> tuple[str, UUID]:
+    tenant_id = require_tenant_id(payload.get("tenant_id"), source="governed RAG index event")
+    try:
+        document_id = UUID(str(payload.get("document_id") or ""))
+    except ValueError as exc:
+        raise ValueError("rag.document.approved requires a valid document_id") from exc
+    if not str(payload.get("content_checksum") or "").startswith("sha256:"):
+        raise ValueError("rag.document.approved requires a content checksum")
+    return tenant_id, document_id
+
+
+async def _index_governed_document(app: FastAPI, payload: dict[str, Any]) -> None:
+    tenant_id, document_id = _validate_governed_index_event(payload)
+    retry_limit = max(1, int(getattr(settings, "rag_index_retry_limit", 5) or 5))
+    async with app.state.session_factory() as session:
+        repo = IncidentRepository(session)
+        document = await repo.claim_governed_rag_document_for_indexing(
+            tenant_id=tenant_id, document_id=document_id,
+        )
+        if document is None:
+            await session.rollback()
+            return
+        await session.commit()
+        try:
+            expected = f"sha256:{hashlib.sha256(document.content.encode('utf-8')).hexdigest()}"
+            if expected != document.content_checksum or expected != payload.get("content_checksum"):
+                raise RuntimeError("authoritative governed document checksum mismatch")
+            connector = vector_connector()
+            receipt = await connector.index_governed_document(document)
+            await connector.verify_index_receipt(receipt, expected_checksum=expected)
+            await repo.mark_governed_rag_document_indexed(
+                tenant_id=tenant_id, document_id=document_id, index_receipt=receipt,
+            )
+            await session.commit()
+        except Exception as exc:
+            retry_seconds = max(1.0, float(getattr(settings, "rag_index_retry_seconds", 30.0) or 30.0))
+            retry_at = datetime.now(UTC) + timedelta(seconds=retry_seconds * max(1, document.index_attempts))
+            await repo.mark_governed_rag_document_index_failed(
+                tenant_id=tenant_id, document_id=document_id, error=str(exc), retry_at=retry_at,
+                retry_limit=retry_limit,
+            )
+            await session.commit()
+            raise
+
+
+async def _governed_rag_retry_loop(app: FastAPI) -> None:
+    retry_limit = max(1, int(getattr(settings, "rag_index_retry_limit", 5) or 5))
+    while True:
+        try:
+            async with app.state.session_factory() as session:
+                due = await IncidentRepository(session).list_due_governed_rag_index_retries(
+                    retry_limit=retry_limit,
+                )
+            for document in due:
+                payload = {
+                    "tenant_id": document.tenant_id,
+                    "document_id": str(document.document_id),
+                    "content_checksum": document.content_checksum,
+                }
+                try:
+                    await _index_governed_document(app, payload)
+                except Exception:
+                    logger.exception(
+                        "governed RAG index retry failed",
+                        extra={"document_id": str(document.document_id)},
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("governed RAG retry scan failed")
+        await asyncio.sleep(max(5.0, float(getattr(settings, "rag_index_retry_seconds", 30.0) or 30.0)))
+
+
 async def startup(app: FastAPI) -> None:
     provider = str(getattr(settings, "event_bus_provider", "rabbitmq") or "rabbitmq").strip().lower()
     app.state.message_bus_publishers = {provider: app.state.producer, "rabbitmq": app.state.producer}
@@ -881,6 +955,13 @@ async def startup(app: FastAPI) -> None:
         app.state.rabbitmq_publisher = None
 
     tasks.append(asyncio.create_task(_context_outbox_dispatch_loop(app), name="context-agent-event-outbox"))
+
+    index_consumer = RabbitMQConsumer(settings, GOVERNED_RAG_APPROVED_TOPIC)
+    tasks.append(asyncio.create_task(
+        consume_rabbitmq_forever(index_consumer, lambda payload: _index_governed_document(app, payload)),
+        name="context-agent-governed-rag-indexer",
+    ))
+    tasks.append(asyncio.create_task(_governed_rag_retry_loop(app), name="context-agent-rag-index-retries"))
 
     async def handle(payload: dict) -> None:
         alert = Alert.model_validate(payload["alert"])
@@ -1028,6 +1109,11 @@ class EvidenceRagDraftApproveRequest(BaseModel):
     expected_row_version: int = Field(ge=1)
     approved_by: str = Field(min_length=2, max_length=120)
     owner_team: str | None = Field(default=None, min_length=2, max_length=160)
+
+
+class GovernedRagIndexRetryRequest(BaseModel):
+    tenant_scope: str = Field(min_length=1, max_length=128)
+    requested_by: str = Field(min_length=2, max_length=160)
 
 
 class EvidenceRagDraftCreateRequest(BaseModel):
@@ -2016,6 +2102,27 @@ async def approve_evidence_rag_draft(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
     draft, document = approved
     return {"status": "approved_pending_index", "draft": draft, "document": document}
+
+
+@app.post("/rag/governed-documents/{document_id}/retry-index")
+async def retry_governed_rag_index(
+    document_id: str, request: GovernedRagIndexRetryRequest,
+) -> dict[str, Any]:
+    tenant = require_tenant_id(request.tenant_scope, source="governed RAG index retry")
+    async with app.state.session_factory() as session:
+        repo = IncidentRepository(session)
+        retry = await repo.retry_failed_governed_rag_document(
+            tenant_id=tenant, document_id=document_id,
+        )
+        if retry is None:
+            raise HTTPException(status_code=404, detail="failed governed document was not found")
+        await session.commit()
+    await _index_governed_document(app, {
+        "tenant_id": tenant,
+        "document_id": document_id,
+        "content_checksum": retry["content_checksum"],
+    })
+    return {"status": "retry_requested", "document_id": document_id}
 
 
 @app.post("/knowledge-pack/draft")

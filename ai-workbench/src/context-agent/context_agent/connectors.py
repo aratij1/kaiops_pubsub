@@ -1597,6 +1597,45 @@ class VectorDBConnector(BaseConnector):
         ]
         return remote.upsert_documents([doc for doc in full_docs if doc and production_retrievable(doc)])
 
+    async def index_governed_document(self, document: Any) -> dict[str, Any]:
+        """Project one authoritative DB document into the configured vector index."""
+        remote = self.remote_store()
+        if not remote.configured:
+            raise RuntimeError("durable vector index is not configured")
+        metadata = {
+            "path": f"governed://{document.tenant_id}/{document.document_id}/v{document.document_version}",
+            "document_id": str(document.document_id),
+            "tenant_scope": document.tenant_id,
+            "kind": document.document_kind,
+            "title": document.title,
+            "content": document.content,
+            "content_version": str(document.document_version),
+            "corpus_classification": document.corpus_classification,
+            "review_status": document.review_status,
+            "evidence_ids": list(document.evidence_ids or []),
+            "source_uris": list(document.source_uris or []),
+            "recommendation_id": str(document.recommendation_id),
+            "rca_version": int(document.rca_version),
+            "approved_by": document.approved_by,
+            "approved_at": document.approved_at.isoformat(),
+            "content_checksum": document.content_checksum,
+            "incident_id": str(document.incident_id),
+            "alert_id": str(document.alert_id),
+            "source_system": "kaims-governed-rag",
+            "source_ref": f"governed-rag://{document.document_id}",
+        }
+        result = await asyncio.to_thread(remote.upsert_documents, [metadata])
+        if result.get("error") or int(result.get("indexed") or 0) < 1:
+            raise RuntimeError(str(result.get("error") or result.get("reason") or "index did not accept document"))
+        return {**result, "document_id": str(document.document_id),
+                "content_checksum": document.content_checksum, "metadata": metadata}
+
+    async def verify_index_receipt(self, receipt: dict[str, Any], *, expected_checksum: str) -> None:
+        if str(receipt.get("content_checksum") or "") != expected_checksum:
+            raise RuntimeError("indexed checksum verification failed")
+        if int(receipt.get("indexed") or 0) < 1:
+            raise RuntimeError("index receipt confirms no indexed chunks")
+
     def index_info(self) -> dict[str, Any]:
         docs = [doc for doc in self.documents if not doc.get("_synthetic")]
         active_docs = [doc for doc in docs if production_retrievable(doc)]

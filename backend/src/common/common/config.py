@@ -134,6 +134,8 @@ class Settings(BaseSettings):
     rag_embedding_batch_size: int = Field(default=24, alias="RAG_EMBEDDING_BATCH_SIZE")
     rag_embedding_max_retries: int = Field(default=3, alias="RAG_EMBEDDING_MAX_RETRIES")
     rag_embedding_retry_backoff_seconds: float = Field(default=1.0, alias="RAG_EMBEDDING_RETRY_BACKOFF_SECONDS")
+    rag_index_retry_limit: int = Field(default=5, alias="RAG_INDEX_RETRY_LIMIT")
+    rag_index_retry_seconds: float = Field(default=30.0, alias="RAG_INDEX_RETRY_SECONDS")
     openai_embedding_model: str = Field(default="text-embedding-3-large", alias="OPENAI_EMBEDDING_MODEL")
     openai_embeddings_timeout_seconds: float = Field(default=15.0, alias="OPENAI_EMBEDDINGS_TIMEOUT_SECONDS")
     rag_embedding_max_input_chars: int = Field(default=12000, alias="RAG_EMBEDDING_MAX_INPUT_CHARS")
