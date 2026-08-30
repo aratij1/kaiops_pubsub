@@ -474,7 +474,36 @@ def _catalog_plan_for(
 def _apply_catalog_plan(recommendation: Recommendation, context: Context, decision: dict[str, Any] | None = None) -> dict[str, Any]:
     plan = dict(_catalog_plan_for(context, decision, recommendation))
     metadata = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
-    metadata["model_proposed_execution_plan"] = metadata.get("execution_plan", {})
+    model_plan = metadata.get("execution_plan") if isinstance(metadata.get("execution_plan"), dict) else {}
+    metadata["model_proposed_execution_plan"] = model_plan
+    rca_analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
+    context_readiness = (
+        rca_analysis.get("context_readiness")
+        if isinstance(rca_analysis.get("context_readiness"), dict)
+        else {}
+    )
+    evidence_gate_prefixes = (
+        "Context evidence is only ",
+        "The causal hypothesis is not independently corroborated",
+        "No application runtime, log, telemetry, or code evidence supports",
+        "Discovery evidence is degraded or unavailable",
+    )
+    evidence_gate_blocks = [
+        str(reason)
+        for reason in model_plan.get("readiness_blocks", [])
+        if str(reason).startswith(evidence_gate_prefixes)
+    ]
+    if context_readiness and context_readiness.get("ready") is not True:
+        readiness_score = float(context_readiness.get("score") or 0.0)
+        evidence_gate_blocks.append(
+            f"Context evidence is only {readiness_score:.0%} RCA-ready; collect independent direct and causal evidence."
+        )
+    if evidence_gate_blocks:
+        plan["execution_ready"] = False
+        plan["readiness_blocks"] = list(dict.fromkeys([
+            *(plan.get("readiness_blocks") or []),
+            *evidence_gate_blocks,
+        ]))
     # The normalized investigation contract uses an integer generation, while
     # ExecutionPlanV2 carries the immutable version as a string.  Normalize at
     # this boundary so a fresh, bound RCA cannot fail after analysis merely
@@ -483,7 +512,6 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
     plan["evidence_snapshot_id"] = metadata.get("context_snapshot_id")
     plan["recommendation_version"] = metadata.get("recommendation_version")
     investigation = metadata.get("investigation_report") if isinstance(metadata.get("investigation_report"), dict) else {}
-    rca_analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
     plan["evidence_basis"] = list(rca_analysis.get("evidence_used") or [])
     plan["investigation_report"] = investigation
     plan["historical_precedents"] = list(
