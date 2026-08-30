@@ -92,7 +92,9 @@ async def test_context_snapshot_and_outbox_are_committed_once(sqlite_session_fac
     assert outbox_rows == 1
     assert snapshot.context_fingerprint == context.metadata["context_fingerprint"]
     assert snapshot.contract_version == "kaiops.context.v2"
-    assert snapshot.expires_at >= snapshot.collected_at + timedelta(minutes=5)
+    assert snapshot.expires_at >= snapshot.collected_at + timedelta(
+        seconds=module.settings.context_knowledge_ttl_seconds
+    )
 
 
 @pytest.mark.asyncio
