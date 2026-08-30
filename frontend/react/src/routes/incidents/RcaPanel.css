@@ -15,6 +15,33 @@
   font-size: 14px;
 }
 
+.context-contract-recovery {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 16px 18px;
+  border: 1px solid #e3c06e;
+  border-radius: 12px;
+  background: #fff9e9;
+}
+
+.context-contract-recovery p {
+  margin: 4px 0 0;
+  color: var(--muted, #526d82);
+}
+
+.context-contract-recovery button {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 720px) {
+  .context-contract-recovery {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
 .context-workspace-hero {
   display: flex;
   align-items: center;

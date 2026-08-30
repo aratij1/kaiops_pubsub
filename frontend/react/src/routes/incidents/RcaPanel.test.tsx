@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import RcaPanel, {
@@ -74,5 +74,29 @@ describe("RcaPanel canonical evidence gate", () => {
     expect(screen.getByText("No direct observations are linked.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Plan blocked by readiness" })).toBeDisabled();
     expect(screen.getAllByText("0%").length).toBeGreaterThan(0);
+  });
+
+  it("recovers an expired contract with an explicit fresh-context request", () => {
+    const setMode = vi.fn();
+    const rerun = vi.fn();
+    render(<RcaPanel
+      rcaDetailView="simple" onSetRcaDetailView={vi.fn()} onSetHomeDetailTab={vi.fn()}
+      selectedAlertTimelineRows={[]} selectedAlertRagDocuments={[]} selectedAlertEvaluation={{}}
+      selectedAlertRow={{ service: "api", tenant_id: "tenant-a" }}
+      selectedRcaDecision={{ confidence: .4, rootCause: "Pending", action: "Collect evidence" }}
+      selectedAiTrust={{ evidence: [], missing: [], conflicting: [], confidenceReasons: [], sources: {}, confidence: .4, contractValid: false, integrityVerified: false, integrity: { status: "context_expired" }, executionReady: false }}
+      selectedAlertWorkflow={{ recommendation: { metadata: {} }, context: { metadata: {} } }}
+      selectedAlertRegeneration={{ loading: false }} selectedAlertRecommendationId="recommendation-1"
+      selectedAlertDocumentContract={null} selectedAlertId="alert-1" aiFeedbackState={{}}
+      rcaAnalysisMode="smart" onSetRcaAnalysisMode={setMode} onRerunRca={rerun}
+      onRefreshSelectedAlert={vi.fn()} onDownloadRagDocument={vi.fn()}
+      onLoadRagDocumentContent={vi.fn()} onSubmitAiRecommendationFeedback={vi.fn()}
+    />);
+
+    const recovery = screen.getAllByRole("region", { name: "Recover investigation contract" }).at(-1)!;
+    fireEvent.click(within(recovery).getByRole("button", { name: "Collect fresh context now" }));
+
+    expect(setMode).toHaveBeenCalledWith("fresh");
+    expect(rerun).toHaveBeenCalledWith("fresh");
   });
 });

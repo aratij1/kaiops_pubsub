@@ -103,7 +103,7 @@ interface RcaPanelProps {
   aiFeedbackState: any;
   rcaAnalysisMode: "smart" | "fresh" | "cache";
   onSetRcaAnalysisMode: (mode: "smart" | "fresh" | "cache") => void;
-  onRerunRca: () => any;
+  onRerunRca: (modeOverride?: "smart" | "fresh" | "cache") => any;
   onRefreshSelectedAlert: () => Promise<any>;
   onDownloadRagDocument: (...args: any[]) => any;
   onLoadRagDocumentContent: (...args: any[]) => any;
@@ -120,6 +120,9 @@ export default function RcaPanel({
   onSubmitAiRecommendationFeedback,
 }: RcaPanelProps) {
   const { accessToken } = useRouteRuntimeSlice("session");
+  const integrityStatus = String(selectedAiTrust?.integrity?.status || "").trim().toLowerCase();
+  const requiresFreshRecovery = selectedAiTrust?.contractValid !== true
+    || ["context_expired", "missing_snapshot_reference", "snapshot_not_found"].includes(integrityStatus);
   const [resolutionOptions, setResolutionOptions] = useState<any[]>([]);
   const [pendingPlanId, setPendingPlanId] = useState("");
   const [resolutionStatus, setResolutionStatus] = useState("");
@@ -287,6 +290,7 @@ export default function RcaPanel({
     <section className="combined-analysis-page context-workspace">
       {selectedAiTrust?.contractValid !== true ? <p className="ai-trust-warning" role="alert"><ShieldAlert size={16} />Investigation contract invalid. Resolution and approval actions are disabled until fresh analysis publishes a valid bound contract.</p> : null}
       {selectedAiTrust?.integrityVerified !== true && selectedAiTrust?.integrity?.status ? <p className="ai-trust-warning" role="alert"><ShieldAlert size={16} />Investigation integrity error: {String(selectedAiTrust.integrity.status).replaceAll("_", " ")}. Resolution is blocked.</p> : null}
+      {requiresFreshRecovery ? <section className="context-contract-recovery" aria-label="Recover investigation contract"><div><strong>Fresh context is required</strong><p>KaiMS will collect a new immutable context snapshot and bind the replacement RCA to it.</p></div><button type="button" className="button-primary" disabled={selectedAlertRegeneration.loading} onClick={() => { onSetRcaAnalysisMode("fresh"); return onRerunRca("fresh"); }}><RotateCw size={15} aria-hidden="true" className={selectedAlertRegeneration.loading ? "is-spinning" : ""} />{selectedAlertRegeneration.loading ? "Collecting fresh context…" : "Collect fresh context now"}</button></section> : null}
       <header className="context-workspace-hero">
         <div className="context-workspace-title">
           <span className="discovery-eyebrow">Incident understanding</span>

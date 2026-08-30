@@ -2218,7 +2218,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     return { ready: false, payload: latestPayload, attempts };
   }
 
-  async function regenerateSelectedAlertAnalysis() {
+  async function regenerateSelectedAlertAnalysis(modeOverride) {
     if (!selectedAlertRow || selectedAlertRegeneration.loading) {
       return;
     }
@@ -2232,6 +2232,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       return;
     }
     const alertId = String(selectedAlertRow?.id || selectedAlertRow?.alert_id || selectedAlertId || "").trim();
+    const requestedMode = typeof modeOverride === "string" && ["smart", "fresh", "cache"].includes(modeOverride)
+      ? modeOverride
+      : rcaAnalysisMode;
     setSelectedAlertRegeneration({ loading: true, message: "", error: "" });
     try {
       if (!ALERT_UUID_PATTERN.test(alertId)) {
@@ -2239,7 +2242,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       }
       const command = await fetchJson(`/api-gateway/analysis/alerts/${encodeURIComponent(alertId)}/regenerate`, authenticatedOptions({
         method: "POST",
-        body: JSON.stringify({ mode: rcaAnalysisMode }),
+        body: JSON.stringify({ mode: requestedMode }),
         timeoutMs: 30000,
         maxAttempts: 1,
       }));
@@ -2275,9 +2278,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       setSelectedAlertRegeneration({
         loading: false,
         message: persistedAnalysis.ready
-          ? rcaAnalysisMode === "fresh"
+          ? requestedMode === "fresh"
             ? `Fresh context and RCA analysis completed for alert ${alertId}.`
-            : rcaAnalysisMode === "cache"
+            : requestedMode === "cache"
               ? `Verified cached context and RCA loaded for alert ${alertId}.`
               : `Smart analysis completed for alert ${alertId}; verified context was reused when eligible.`
           : `Analysis for alert ${alertId} is still running in the backend. You can leave this page and refresh the incident later.`,
