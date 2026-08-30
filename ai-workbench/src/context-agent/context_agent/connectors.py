@@ -1484,7 +1484,7 @@ class VectorDBConnector(BaseConnector):
         ranked = self.search(
             query,
             limit=8,
-            preferred_kinds={"runbook", "incident", "deployment", "dependency", "change"},
+            preferred_kinds={"runbook", "incident", "deployment", "dependency", "change", "remediation"},
             service=str(alert.service or "").strip(),
             tenant_id=tenant_id,
         )
@@ -1646,7 +1646,7 @@ class VectorDBConnector(BaseConnector):
                 "full_document_rerank": True,
                 "service_filter": True,
                 "score_components": ["semantic_score", "metadata_match_score", "match_confidence"],
-                "preferred_kinds": ["runbook", "incident", "deployment", "dependency", "change"],
+                "preferred_kinds": ["runbook", "incident", "deployment", "dependency", "change", "remediation"],
             },
         }
 
