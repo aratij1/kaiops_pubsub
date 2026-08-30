@@ -1857,7 +1857,10 @@ class ResolutionIntelligenceAgent(BaseAgent):
             raise ContextFailure("resolution agent requires serialized context payload")
         return {
             "phase": "resolution",
-            "steps": ["collect_context", "plan_investigation", "rank_hypotheses", "generate_rca", "impact_analysis", "generate_fix", "confidence_scoring"],
+            "steps": [
+                "collect_context", "plan_investigation", "rank_hypotheses", "generate_rca",
+                "impact_analysis", "generate_fix", "confidence_scoring",
+            ],
             "model_task_count": model_task_count,
         }
 

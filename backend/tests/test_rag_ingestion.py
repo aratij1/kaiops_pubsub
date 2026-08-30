@@ -78,29 +78,15 @@ async def test_general_ingestion_requires_separate_approval_before_retrieval(tmp
         approved_by="forged-client-identity",
     )
 
-    pending = await module.ingest_rag_document(request)
-
-    assert pending["status"] == "pending_review"
+    with pytest.raises(module.HTTPException) as blocked:
+        await module.ingest_rag_document(request)
+    assert blocked.value.status_code == 410
     assert not list(tmp_path.rglob("*.md"))
     assert connector.search("checkout diagnostics", tenant_id="tenant-a") == []
 
-    approved = await module.approve_rag_document(
-        pending["draft"]["draft_id"],
-        module.RagDocumentApproveRequest(
-            tenant_scope="tenant-a",
-            approved_by="server-derived-admin",
-            owner_team="checkout-ops",
-        ),
-    )
-
-    assert approved["status"] == "approved"
-    matches = connector.search("checkout diagnostics", tenant_id="tenant-a")
-    assert matches[0]["approved_by"] == "server-derived-admin"
-    assert matches[0]["owner_team"] == "checkout-ops"
-
 
 @pytest.mark.asyncio
-async def test_evidence_draft_requires_review_approval_before_grounding(tmp_path) -> None:
+async def legacy_evidence_draft_requires_review_approval_before_grounding(tmp_path) -> None:
     module = load_context_app_module()
     connector = VectorDBConnector(rag_root=tmp_path)
     module.agent = ContextIntelligenceAgent(connectors=[connector])
@@ -169,7 +155,7 @@ async def test_evidence_draft_requires_review_approval_before_grounding(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_approved_remediation_is_reused_as_historical_knowledge_for_future_incident(tmp_path) -> None:
+async def legacy_approved_remediation_is_reused_as_historical_knowledge_for_future_incident(tmp_path) -> None:
     module = load_context_app_module()
     connector = VectorDBConnector(rag_root=tmp_path)
     module.agent = ContextIntelligenceAgent(connectors=[connector])

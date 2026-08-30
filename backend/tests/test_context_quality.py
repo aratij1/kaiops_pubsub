@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from ai_workbench_common.models import Context
 from common.models import Alert, AlertSeverity, Incident
@@ -13,7 +13,7 @@ from context_agent.context_quality import (
 
 
 def make_context(*, stale: bool = False) -> Context:
-    observed_at = datetime.now(timezone.utc) - (timedelta(minutes=20) if stale else timedelta(seconds=5))
+    observed_at = datetime.now(UTC) - (timedelta(minutes=20) if stale else timedelta(seconds=5))
     alert = Alert(
         tenant_id="tenant-a",
         source="prometheus",
@@ -120,14 +120,14 @@ def test_sparse_reusable_context_does_not_claim_high_rca_readiness() -> None:
             "source": "topology",
             "uri": "cmdb://orders/worker",
             "summary": "worker depends on redis",
-            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "observed_at": datetime.now(UTC).isoformat(),
             "confidence": 0.9,
         }],
         "telemetry": [{
             "source": "telemetry",
             "uri": "prometheus://worker/queue-lag",
             "summary": "queue lag is above threshold",
-            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "observed_at": datetime.now(UTC).isoformat(),
             "confidence": 0.9,
         }],
     }

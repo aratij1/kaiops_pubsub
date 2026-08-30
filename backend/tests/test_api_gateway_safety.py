@@ -65,6 +65,68 @@ def test_gateway_exposes_guarded_evaluation_artifact_routes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_linked_documents_scopes_context_inventory_to_authenticated_tenant(monkeypatch) -> None:
+    module = load_api_gateway_app_module()
+    alert_id = str(uuid4())
+    paths = []
+
+    async def proxy_stub(**kwargs):
+        paths.append(kwargs["path"])
+        if kwargs["target_base"] == module.settings.monitoring_adapter_url:
+            return 200, {"rows": [{
+                "id": alert_id,
+                "alert_id": alert_id,
+                "name": "HighRequestLatency",
+                "service": "api-gateway",
+                "environment": "prod",
+                "source": "prometheus",
+            }]}
+        return 200, {"documents": []}
+
+    monkeypatch.setattr(module, "proxy", proxy_stub)
+    result = await module.get_alert_linked_documents(
+        alert_id,
+        SimpleNamespace(app=module.app),
+        tenant_id="tenant-a",
+    )
+
+    assert "/rag/documents?tenant_scope=tenant-a" in paths
+    assert result["document_link_summary"]["degraded"] is False
+
+
+@pytest.mark.asyncio
+async def test_evidence_draft_gateway_overrides_client_identity_and_encodes_id(monkeypatch) -> None:
+    module = load_api_gateway_app_module()
+    calls = []
+
+    async def guarded_stub(**kwargs):
+        calls.append(kwargs)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(module, "guarded_proxy", guarded_stub)
+    auth = module.AuthContext(
+        user_id=7, role="L2 Engineer", tenant_id="tenant-a", jwt_id="jwt",
+        session_jti="session", token_type="access", username="engineer",
+        email="engineer@example.com",
+    )
+    await module.create_evidence_rag_draft(
+        request=SimpleNamespace(app=module.app),
+        payload={"tenant_scope": "tenant_a", "created_by": "forged", "alert_id": str(uuid4())},
+        x_trace_id=None, auth=auth,
+    )
+    await module.review_evidence_rag_draft(
+        draft_id="draft/id", request=SimpleNamespace(app=module.app),
+        payload={"tenant_scope": "tenant_a", "reviewed_by": "forged"},
+        x_trace_id=None, auth=auth,
+    )
+
+    assert calls[0]["payload"]["tenant_scope"] == "tenant-a"
+    assert calls[0]["payload"]["created_by"] == "engineer@example.com"
+    assert calls[1]["path"] == "/rag/evidence-drafts/draft%2Fid"
+    assert calls[1]["payload"]["reviewed_by"] == "engineer@example.com"
+
+
+@pytest.mark.asyncio
 async def test_gateway_audit_worker_persists_queued_telemetry(monkeypatch) -> None:
     module = load_api_gateway_app_module()
     persisted = []
