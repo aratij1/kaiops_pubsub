@@ -62,7 +62,7 @@ describe("canonical incident evidence", () => {
     expect(result.evidence).toHaveLength(1);
     expect(result.evidence[0].accepted).toBe(false);
     expect(result.acceptedEvidenceIds).toEqual([]);
-    expect(result.confidence).toBe(.35);
+    expect(result.confidence).toBe(.74);
     expect(result.confidenceGrounded).toBe(false);
     expect(result.grounded).toBe(false);
     expect(result.executionReady).toBe(false);
@@ -83,6 +83,19 @@ describe("canonical incident evidence", () => {
     expect(result.confidence).toBe(.5707);
     expect(result.confidenceKind).toBe("leading_hypothesis");
     expect(result.confidenceLabel).toBe("Leading hypothesis confidence");
+  });
+
+  it("does not revive stale nested confidence for a legacy recommendation", () => {
+    const result = canonicalIncidentEvidence({
+      recommendation: { confidence: .07, metadata: {
+        rca_analysis: { confidence_score: 0, evidence_used: [] },
+        investigation_report: { evidence_count: 5 },
+      } },
+    });
+
+    expect(result.confidence).toBe(.07);
+    expect(result.confidenceLabel).toBe("Leading hypothesis confidence");
+    expect(result.confidenceActionable).toBe(false);
   });
 
   it("never accepts synthetic or missing citations as RCA support", () => {

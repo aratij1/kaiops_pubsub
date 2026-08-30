@@ -1247,7 +1247,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         // Background hydration must bypass the query cache. Incident stages
         // can complete between polls, and returning a 15-second-old partial
         // payload makes the cockpit appear permanently stuck.
-        staleTime: background ? 0 : 5000,
+        // Processed results are mutable projections. Never treat a previous
+        // recommendation revision as fresh after correlation or regeneration.
+        staleTime: 0,
       });
       setSelectedAlertData((prev) => {
         if (String(prev.alertId || "") !== normalized) {
@@ -2259,6 +2261,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         expectedRecommendationId,
       });
       if (persistedAnalysis.payload) {
+        // Keep React Query and the local cockpit state on the same immutable
+        // recommendation revision. Without this write-through, a subsequent
+        // detail hydration can restore the pre-regeneration cached payload.
+        queryClient.setQueryData(["alert-processed-result", alertId], persistedAnalysis.payload);
         setSelectedAlertData((current) => String(current.alertId || "") === alertId
           ? { loading: false, payload: persistedAnalysis.payload, error: "", alertId }
           : current);
