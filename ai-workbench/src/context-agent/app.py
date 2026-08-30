@@ -16,6 +16,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ai_workbench_common.models import Context
 from common.config import get_settings
+from common.context_enrichment_contract import HumanEvidenceResponse
 from common.event_publishers import EventPublisher, RabbitMQPublisher, build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer
 from common.kafka import consume_forever as consume_kafka_forever
@@ -23,7 +24,7 @@ from common.models import Alert, Incident
 from common.rabbitmq import RabbitMQConsumer
 from common.rabbitmq import consume_forever as consume_rabbitmq_forever
 from common.rag_governance import content_checksum, retrieval_allowed
-from common.repository import IncidentRepository
+from common.repository import ContextEnrichmentRepository, IncidentRepository
 from common.service import create_app
 from common.telemetry import (
     CONTEXT_KNOWLEDGE_OPERATIONS,
@@ -1971,6 +1972,40 @@ async def latest_context_snapshot(incident_id: str, tenant_id: str = "default") 
     if snapshot is None:
         raise HTTPException(status_code=404, detail="context snapshot not found")
     return snapshot
+
+
+@app.get("/incidents/{incident_id}/context-gaps")
+async def list_context_gaps(incident_id: str, tenant_id: str) -> dict[str, Any]:
+    tenant = require_tenant_id(tenant_id, source="context gap inventory")
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        raise HTTPException(status_code=503, detail="context enrichment database is unavailable")
+    async with app.state.session_factory() as session:
+        rows = await ContextEnrichmentRepository(session).list_context_evidence_requirements(
+            tenant_id=tenant, incident_id=incident_id,
+        )
+    return {"incident_id": incident_id, "tenant_id": tenant, "requirements": rows, "count": len(rows)}
+
+
+@app.post("/incidents/{incident_id}/context-gaps/{requirement_id}/responses")
+async def respond_to_context_gap(
+    incident_id: str,
+    requirement_id: str,
+    request: HumanEvidenceResponse,
+    tenant_id: str,
+) -> dict[str, Any]:
+    tenant = require_tenant_id(tenant_id, source="context gap response")
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        raise HTTPException(status_code=503, detail="context enrichment database is unavailable")
+    async with app.state.session_factory() as session:
+        try:
+            result = await ContextEnrichmentRepository(session).record_human_evidence_response(
+                tenant_id=tenant, incident_id=incident_id, requirement_id=requirement_id,
+                response=request.model_dump(mode="json"),
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        await session.commit()
+    return result
 
 
 @app.get("/rag/knowledge-drafts")

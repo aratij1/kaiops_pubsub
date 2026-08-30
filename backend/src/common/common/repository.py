@@ -27,6 +27,8 @@ from common.database import (
     ApprovalRecord,
     AuditLogRecord,
     ContextKnowledgeRecord,
+    ContextEnrichmentJobRecord,
+    ContextEvidenceRequirementRecord,
     ContextSnapshotRecord,
     DraftPullRequestOutboxRecord,
     EvidenceRagDraftRecord,
@@ -42,6 +44,9 @@ from common.database import (
     IncidentProjectionRecord,
     IncidentRecord,
     JiraTicketLinkRecord,
+    HumanEvidenceRequestRecord,
+    JiraIncidentBindingRecord,
+    JiraSyncCursorRecord,
     KnowledgeRagDraftRecord,
     KnowledgeBaseRecord,
     LearningAuditRecord,
@@ -8139,3 +8144,155 @@ class EvaluationRepository:
             return False
         row.feedback_payload = feedback
         return True
+
+class ContextEnrichmentRepository(EvaluationRepository):
+    """Tenant-scoped persistence for autonomous and human evidence gaps."""
+
+    async def upsert_context_evidence_requirements(
+        self, requirements: list[Any],
+    ) -> list[ContextEvidenceRequirementRecord]:
+        rows: list[ContextEvidenceRequirementRecord] = []
+        for requirement in requirements:
+            item = requirement.model_dump() if hasattr(requirement, "model_dump") else dict(requirement)
+            tenant_id = require_tenant_id(item.get("tenant_id"), source="evidence requirement")
+            incident_id = self._to_uuid(item["incident_id"])
+            category = self._require("evidence_requirement.category", item.get("category"))
+            question = self._require("evidence_requirement.question", item.get("question"))
+            requirement_key = hashlib.sha256(f"{category}:{question}".encode()).hexdigest()
+            existing = (await self.session.execute(select(ContextEvidenceRequirementRecord).where(
+                ContextEvidenceRequirementRecord.tenant_id == tenant_id,
+                ContextEvidenceRequirementRecord.incident_id == incident_id,
+                ContextEvidenceRequirementRecord.rca_version == int(item.get("rca_version") or 1),
+                ContextEvidenceRequirementRecord.requirement_key == requirement_key,
+            ))).scalar_one_or_none()
+            if existing is None:
+                existing = ContextEvidenceRequirementRecord(
+                    requirement_id=self._to_uuid(item["requirement_id"]), tenant_id=tenant_id,
+                    incident_id=incident_id, rca_version=int(item.get("rca_version") or 1),
+                    requirement_key=requirement_key, category=category, question=question,
+                    reason=self._require("evidence_requirement.reason", item.get("reason")),
+                    priority=str(item.get("priority") or "high"),
+                    collection_mode=str(item.get("collection_mode") or "connector_required"),
+                    candidate_connectors=list(item.get("candidate_connectors") or []),
+                    status=str(item.get("status") or "identified"),
+                    retry_count=int(item.get("retry_count") or 0), retry_after=item.get("retry_after"),
+                    assigned_to=item.get("assigned_to"), jira_issue_key=item.get("jira_issue_key"),
+                    evidence_ids=list(item.get("evidence_ids") or []), version=1,
+                )
+                self.session.add(existing)
+                await self.session.flush()
+            rows.append(existing)
+        return rows
+
+    async def list_context_evidence_requirements(
+        self, *, tenant_id: str, incident_id: UUID | str,
+    ) -> list[dict[str, Any]]:
+        tenant = require_tenant_id(tenant_id, source="context gaps")
+        result = await self.session.execute(
+            select(ContextEvidenceRequirementRecord).where(
+                ContextEvidenceRequirementRecord.tenant_id == tenant,
+                ContextEvidenceRequirementRecord.incident_id == self._to_uuid(incident_id),
+            ).order_by(ContextEvidenceRequirementRecord.created_at.asc())
+        )
+        return [{
+            "requirement_id": str(row.requirement_id), "tenant_id": row.tenant_id,
+            "incident_id": str(row.incident_id), "rca_version": row.rca_version,
+            "category": row.category, "question": row.question, "reason": row.reason,
+            "priority": row.priority, "collection_mode": row.collection_mode,
+            "candidate_connectors": list(row.candidate_connectors or []), "status": row.status,
+            "retry_count": row.retry_count, "retry_after": row.retry_after,
+            "assigned_to": row.assigned_to, "jira_issue_key": row.jira_issue_key,
+            "evidence_ids": list(row.evidence_ids or []), "version": row.version,
+            "created_at": row.created_at, "updated_at": row.updated_at,
+        } for row in result.scalars().all()]
+
+    async def schedule_context_enrichment_job(
+        self, *, tenant_id: str, incident_id: UUID | str, requirement_id: UUID | str,
+        connector_id: str, query_payload: dict[str, Any], observation_start: datetime,
+        observation_end: datetime,
+    ) -> ContextEnrichmentJobRecord:
+        tenant = require_tenant_id(tenant_id, source="context enrichment job")
+        material = json.dumps({
+            "tenant": tenant, "incident": str(incident_id), "requirement": str(requirement_id),
+            "connector": connector_id, "query": query_payload,
+            "start": observation_start.isoformat(), "end": observation_end.isoformat(),
+        }, sort_keys=True, separators=(",", ":"))
+        key = hashlib.sha256(material.encode()).hexdigest()
+        existing = (await self.session.execute(select(ContextEnrichmentJobRecord).where(
+            ContextEnrichmentJobRecord.tenant_id == tenant,
+            ContextEnrichmentJobRecord.idempotency_key == key,
+        ))).scalar_one_or_none()
+        if existing is not None:
+            return existing
+        row = ContextEnrichmentJobRecord(
+            tenant_id=tenant, incident_id=self._to_uuid(incident_id),
+            requirement_id=self._to_uuid(requirement_id), connector_id=self._require("connector_id", connector_id),
+            idempotency_key=key, query_payload=dict(query_payload), observation_start=observation_start,
+            observation_end=observation_end, status="scheduled", attempt_count=0,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def create_human_evidence_request(
+        self, *, tenant_id: str, incident_id: UUID | str, requirement_id: UUID | str,
+        expected_responder: str, due_at: datetime, acceptable_format: str,
+        evidence_already_checked: list[str], hypothesis_impact: str,
+        investigation_can_continue: bool = True,
+    ) -> HumanEvidenceRequestRecord:
+        tenant = require_tenant_id(tenant_id, source="human evidence request")
+        requirement_uuid = self._to_uuid(requirement_id)
+        existing = (await self.session.execute(select(HumanEvidenceRequestRecord).where(
+            HumanEvidenceRequestRecord.tenant_id == tenant,
+            HumanEvidenceRequestRecord.requirement_id == requirement_uuid,
+        ))).scalar_one_or_none()
+        if existing is not None:
+            return existing
+        row = HumanEvidenceRequestRecord(
+            tenant_id=tenant, incident_id=self._to_uuid(incident_id), requirement_id=requirement_uuid,
+            expected_responder=self._require("expected_responder", expected_responder), due_at=due_at,
+            acceptable_format=self._require("acceptable_format", acceptable_format),
+            investigation_can_continue=investigation_can_continue,
+            evidence_already_checked=list(evidence_already_checked),
+            hypothesis_impact=self._require("hypothesis_impact", hypothesis_impact),
+            status="pending", response_payload={}, version=1,
+        )
+        self.session.add(row)
+        requirement = await self.session.get(ContextEvidenceRequirementRecord, requirement_uuid)
+        if requirement is not None and requirement.tenant_id == tenant:
+            requirement.status = "human_requested"
+            requirement.assigned_to = expected_responder
+            requirement.version += 1
+        await self.session.flush()
+        return row
+
+    async def record_human_evidence_response(
+        self, *, tenant_id: str, incident_id: UUID | str, requirement_id: UUID | str,
+        response: dict[str, Any],
+    ) -> dict[str, Any]:
+        tenant = require_tenant_id(tenant_id, source="human evidence response")
+        incident_uuid = self._to_uuid(incident_id)
+        requirement_uuid = self._to_uuid(requirement_id)
+        request = (await self.session.execute(select(HumanEvidenceRequestRecord).where(
+            HumanEvidenceRequestRecord.tenant_id == tenant,
+            HumanEvidenceRequestRecord.incident_id == incident_uuid,
+            HumanEvidenceRequestRecord.requirement_id == requirement_uuid,
+        ))).scalar_one_or_none()
+        if request is None:
+            raise LookupError("human evidence request not found")
+        responder = self._require("responder_id", response.get("responder_id"))
+        response_identity = (
+            f"{tenant}:{requirement_uuid}:{responder}:{response.get('responded_at')}"
+        )
+        evidence_id = f"HUMAN-{uuid5(NAMESPACE_URL, response_identity)}"
+        request.response_payload = {**dict(response), "source_type": "human_assertion", "evidence_id": evidence_id}
+        request.status = "answered"
+        request.version += 1
+        requirement = await self.session.get(ContextEvidenceRequirementRecord, requirement_uuid)
+        if requirement is None or requirement.tenant_id != tenant:
+            raise LookupError("evidence requirement not found")
+        requirement.status = "answered"
+        requirement.evidence_ids = list(dict.fromkeys([*(requirement.evidence_ids or []), evidence_id]))
+        requirement.version += 1
+        await self.session.flush()
+        return {"request_id": str(request.request_id), "evidence_id": evidence_id, "status": "answered"}

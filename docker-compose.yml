@@ -59,10 +59,11 @@ x-service-env: &service-env
   # Outbound Jira API — distinct from JIRA_WEBHOOK_SECRET (inbound auth).
   # Used by the centralized dedup step to create/update Jira tickets from
   # Prometheus/log/email alerts, making Jira the single source of truth.
-  JIRA_API_BASE_URL: ${JIRA_API_BASE_URL:-}
+  JIRA_API_BASE_URL: ${JIRA_API_BASE_URL:-https://kaiops-test.atlassian.net}
   JIRA_API_EMAIL: ${JIRA_API_EMAIL:-}
   JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
-  JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:-}
+  JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:-KAN}
+  JIRA_ISSUE_TYPE: ${JIRA_ISSUE_TYPE:-Bug}
   CENTRALIZED_JIRA_ROUTING_ENABLED: ${CENTRALIZED_JIRA_ROUTING_ENABLED:-false}
   LOG_INGESTION_ENABLED: ${LOG_INGESTION_ENABLED:-false}
   LOG_WATCH_PATHS: ${LOG_WATCH_PATHS:-}

@@ -301,10 +301,13 @@ JIRA_WEBHOOK_SECRET = str(os.getenv("JIRA_WEBHOOK_SECRET", "") or "").strip()
 # Jira's own webhook (unchanged, JIRA_WEBHOOK_SECRET above) becomes the
 # only door back into the landing pad. Off by default so this can be
 # rolled out only once real Jira credentials are configured.
-JIRA_API_BASE_URL = str(os.getenv("JIRA_API_BASE_URL", "") or "").strip()
+JIRA_API_BASE_URL = str(
+    os.getenv("JIRA_API_BASE_URL", "https://kaiops-test.atlassian.net") or ""
+).strip()
 JIRA_API_EMAIL = str(os.getenv("JIRA_API_EMAIL", "") or "").strip()
 JIRA_API_TOKEN = str(os.getenv("JIRA_API_TOKEN", "") or "").strip()
-JIRA_PROJECT_KEY = str(os.getenv("JIRA_PROJECT_KEY", "") or "").strip()
+JIRA_PROJECT_KEY = str(os.getenv("JIRA_PROJECT_KEY", "KAN") or "").strip()
+JIRA_ISSUE_TYPE = str(os.getenv("JIRA_ISSUE_TYPE", "Bug") or "").strip()
 CENTRALIZED_JIRA_ROUTING_ENABLED = str(os.getenv("CENTRALIZED_JIRA_ROUTING_ENABLED", "false")).strip().lower() in {
     "1",
     "true",
@@ -5264,6 +5267,7 @@ def _jira_api_client() -> JiraClient | None:
         email=JIRA_API_EMAIL,
         api_token=JIRA_API_TOKEN,
         project_key=JIRA_PROJECT_KEY,
+        issue_type=JIRA_ISSUE_TYPE,
     )
 
 

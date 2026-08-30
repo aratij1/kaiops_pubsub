@@ -14,6 +14,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, TypedDict
 from urllib.parse import parse_qs, urlsplit
+from uuid import UUID
 
 import httpx
 from ai_workbench_common.agent_runtime import AgentRuntime, ContextFailure
@@ -21,6 +22,7 @@ from ai_workbench_common.agentic import AgentContext, BaseAgent
 from ai_workbench_common.embeddings import cosine_similarity, describe_embedding_model, get_embedding_model
 from ai_workbench_common.models import Context
 from common.config import get_settings
+from common.context_enrichment_contract import EnrichmentResult, EvidenceRequirement
 from common.models import Alert, Incident
 from common.rag_governance import production_retrievable, retrieval_allowed
 from common.resilience import retry_async
@@ -38,6 +40,42 @@ class BaseConnector:
 
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         raise NotImplementedError
+
+
+async def execute_enrichment_plan(
+    requirements: list[EvidenceRequirement],
+    *,
+    authorized_connectors: set[str] | None = None,
+) -> EnrichmentResult:
+    """Classify bounded read-only work without fabricating connector results."""
+    authorized = authorized_connectors or set()
+    scheduled: list[UUID] = []
+    human: list[UUID] = []
+    blocked: list[UUID] = []
+    idempotency_keys: dict[UUID, str] = {}
+    for requirement in requirements:
+        if requirement.collection_mode == "human_required":
+            human.append(requirement.requirement_id)
+            continue
+        connector = next(
+            (name for name in requirement.candidate_connectors if name in authorized),
+            None,
+        )
+        if connector is None:
+            human.append(requirement.requirement_id)
+            continue
+        material = (
+            f"{requirement.tenant_id}:{requirement.incident_id}:"
+            f"{requirement.requirement_id}:{connector}"
+        )
+        idempotency_keys[requirement.requirement_id] = hashlib.sha256(material.encode()).hexdigest()
+        scheduled.append(requirement.requirement_id)
+    return EnrichmentResult(
+        scheduled_requirement_ids=scheduled,
+        human_requirement_ids=human,
+        blocked_requirement_ids=blocked,
+        idempotency_keys=idempotency_keys,
+    )
 
 
 def _metadata_dict(alert: Alert, *keys: str) -> dict[str, Any]:

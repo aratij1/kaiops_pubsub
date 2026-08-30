@@ -1611,6 +1611,122 @@ class JiraTicketLinkRecord(Base, TimestampMixin):
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
+class ContextEvidenceRequirementRecord(Base, TimestampMixin):
+    __tablename__ = "context_evidence_requirements"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "incident_id", "rca_version", "requirement_key", name="uq_context_requirement"),
+        Index("idx_context_requirement_work", "tenant_id", "status", "retry_after"),
+    )
+
+    requirement_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    rca_version: Mapped[int] = mapped_column(Integer)
+    requirement_key: Mapped[str] = mapped_column(String(64))
+    category: Mapped[str] = mapped_column(String(32), index=True)
+    question: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text)
+    priority: Mapped[str] = mapped_column(String(16), index=True)
+    collection_mode: Mapped[str] = mapped_column(String(32), index=True)
+    candidate_connectors: Mapped[list[str]] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="identified")
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    assigned_to: Mapped[str | None] = mapped_column(String(255), index=True)
+    jira_issue_key: Mapped[str | None] = mapped_column(String(64), index=True)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class ContextEnrichmentJobRecord(Base, TimestampMixin):
+    __tablename__ = "context_enrichment_jobs"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_context_enrichment_job"),
+        Index("idx_context_enrichment_job_work", "tenant_id", "status", "available_at"),
+    )
+
+    job_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    requirement_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    connector_id: Mapped[str] = mapped_column(String(255), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    query_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    observation_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    observation_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(32), index=True, default="scheduled")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class HumanEvidenceRequestRecord(Base, TimestampMixin):
+    __tablename__ = "human_evidence_requests"
+    __table_args__ = (UniqueConstraint("tenant_id", "requirement_id", name="uq_human_evidence_requirement"),)
+
+    request_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    requirement_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    expected_responder: Mapped[str] = mapped_column(String(255), index=True)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    acceptable_format: Mapped[str] = mapped_column(String(512))
+    investigation_can_continue: Mapped[bool] = mapped_column(Boolean, default=True)
+    evidence_already_checked: Mapped[list[str]] = mapped_column(JSON, default=list)
+    hypothesis_impact: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="pending")
+    response_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class JiraIncidentBindingRecord(Base, TimestampMixin):
+    __tablename__ = "jira_incident_bindings"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "jira_issue_key", name="uq_jira_binding_issue"),
+        UniqueConstraint("tenant_id", "incident_id", "binding_version", name="uq_jira_binding_version"),
+        Index("idx_jira_binding_current", "tenant_id", "incident_id", "status"),
+    )
+
+    binding_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    jira_issue_key: Mapped[str] = mapped_column(String(64), index=True)
+    jira_project_key: Mapped[str] = mapped_column(String(64), index=True)
+    assignee_id: Mapped[str] = mapped_column(String(255), index=True)
+    assignee_group: Mapped[str | None] = mapped_column(String(255), index=True)
+    recommendation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    rca_version: Mapped[int] = mapped_column(Integer)
+    context_snapshot_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    context_fingerprint: Mapped[str] = mapped_column(String(64))
+    resolution_selection_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    execution_plan_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    plan_fingerprint: Mapped[str | None] = mapped_column(String(71))
+    approval_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="pending")
+    jira_status: Mapped[str] = mapped_column(String(128), index=True)
+    ownership: Mapped[str] = mapped_column(String(16), default="human")
+    closure_policy: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    last_jira_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    binding_version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class JiraSyncCursorRecord(Base, TimestampMixin):
+    __tablename__ = "jira_sync_cursors"
+    __table_args__ = (UniqueConstraint("tenant_id", "jira_project_key", name="uq_jira_sync_cursor"),)
+
+    cursor_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    jira_project_key: Mapped[str] = mapped_column(String(64), index=True)
+    last_successful_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_jira_updated_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_issue_key: Mapped[str | None] = mapped_column(String(64))
+    poll_status: Mapped[str] = mapped_column(String(32), default="never", index=True)
+    poll_error: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
 class EvaluationRecord(Base, TimestampMixin):
     __tablename__ = "evaluation_records"
     __table_args__ = (Index("idx_evaluation_records_incident_created", "incident_id", "created_at"),)

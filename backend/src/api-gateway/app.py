@@ -3813,6 +3813,38 @@ async def approve_evidence_rag_draft(
     )
 
 
+@app.get("/incidents/{incident_id}/context-gaps")
+async def get_incident_context_gaps(
+    incident_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="GET", path=f"/incidents/{incident_id}/context-gaps",
+        payload=None,
+        target_base=settings.context_agent_url, params={"tenant_id": tenant_id},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30.0,
+    )
+
+
+@app.post("/incidents/{incident_id}/context-gaps/{requirement_id}/responses")
+async def post_incident_context_gap_response(
+    incident_id: str,
+    requirement_id: str,
+    request: Request,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="POST",
+        path=f"/incidents/{incident_id}/context-gaps/{requirement_id}/responses",
+        target_base=settings.context_agent_url, payload=payload, params={"tenant_id": tenant_id},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30.0,
+    )
+
+
 @app.get("/rag/knowledge-drafts")
 async def list_knowledge_rag_drafts(
     request: Request,
