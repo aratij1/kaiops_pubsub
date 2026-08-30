@@ -1782,7 +1782,8 @@ async def _publish_analysis_regeneration_command(
     alert: Alert,
     incident: Incident,
     decision: dict[str, Any],
-) -> str:
+    expected_recommendation_id: UUID,
+) -> tuple[str, str, bool]:
     """Durably hand an operator-requested analysis rerun to the event pipeline."""
     transport_provider = str(getattr(settings, "event_bus_provider", "rabbitmq") or "rabbitmq")
     event_envelope = build_orchestration_envelope(
@@ -1834,7 +1835,19 @@ async def _publish_analysis_regeneration_command(
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
-            stored = await IncidentRepository(session).enqueue_resolution_event(
+            repository = IncidentRepository(session)
+            lifecycle, created = await repository.create_or_reuse_analysis_request(
+                request_id=UUID(request_id),
+                tenant_id=tenant_id,
+                incident_id=incident.id,
+                alert_id=alert.id,
+                expected_recommendation_id=expected_recommendation_id,
+                mode=str(decision.get("analysis_mode") or "smart"),
+            )
+            if not created:
+                await session.commit()
+                return lifecycle.delivery, str(lifecycle.request_id), False
+            stored = await repository.enqueue_resolution_event(
                 event_id=outbox_event_id,
                 aggregate_id=str(incident.id),
                 topic=ORCHESTRATION_EVENTS,
@@ -1851,7 +1864,12 @@ async def _publish_analysis_regeneration_command(
         if not stored or session_factory is None:
             raise HTTPException(status_code=503, detail="Analysis command broker is unavailable") from exc
         async with session_factory() as session:
-            await IncidentRepository(session).mark_resolution_event_retry(outbox_event_id, str(exc))
+            repository = IncidentRepository(session)
+            await repository.mark_resolution_event_retry(outbox_event_id, str(exc))
+            lifecycle = await repository.get_analysis_request(UUID(request_id), tenant_id=tenant_id)
+            if lifecycle is not None:
+                lifecycle.status = "queued"
+                lifecycle.delivery = "queued"
             await session.commit()
         logger.warning(
             "analysis_regeneration_queued request_id=%s incident_id=%s error_type=%s",
@@ -1859,13 +1877,18 @@ async def _publish_analysis_regeneration_command(
             incident.id,
             type(exc).__name__,
         )
-        return "queued"
+        return "queued", request_id, True
 
     if stored and session_factory is not None:
         async with session_factory() as session:
-            await IncidentRepository(session).mark_resolution_event_published(outbox_event_id)
+            repository = IncidentRepository(session)
+            await repository.mark_resolution_event_published(outbox_event_id)
+            lifecycle = await repository.get_analysis_request(UUID(request_id), tenant_id=tenant_id)
+            if lifecycle is not None:
+                lifecycle.status = "published"
+                lifecycle.delivery = "published"
             await session.commit()
-    return "published"
+    return "published", request_id, True
 
 
 def _analysis_recommendation_id(*, incident_id: UUID, request_id: UUID) -> UUID:
@@ -2143,20 +2166,30 @@ async def regenerate_alert_analysis(
         "regeneration_requested": True,
         "rca_version": max(1, int(existing_decision.get("rca_version") or 1)),
     }
-    delivery = await _publish_analysis_regeneration_command(
+    expected_recommendation_id = _analysis_recommendation_id(
+        incident_id=incident.id,
+        request_id=UUID(request_id),
+    )
+    publish_result = await _publish_analysis_regeneration_command(
         request_id=request_id,
         tenant_id=tenant_id,
         alert=alert,
         incident=incident,
         decision=decision,
+        expected_recommendation_id=expected_recommendation_id,
     )
-    expected_recommendation_id = _analysis_recommendation_id(
-        incident_id=incident.id,
-        request_id=UUID(request_id),
-    )
+    if isinstance(publish_result, tuple):
+        delivery, effective_request_id, created = publish_result
+    else:  # Compatibility for alternate publishers and focused test doubles.
+        delivery, effective_request_id, created = str(publish_result), request_id, True
+    if effective_request_id != request_id:
+        request_id = effective_request_id
+        expected_recommendation_id = _analysis_recommendation_id(
+            incident_id=incident.id, request_id=UUID(request_id)
+        )
     return {
         "request_id": request_id,
-        "status": "accepted",
+        "status": "accepted" if created else "coalesced",
         "delivery": delivery,
         "alert_id": str(alert.id),
         "incident_id": str(incident.id),
@@ -2191,6 +2224,23 @@ async def get_analysis_request_status(
         raise HTTPException(status_code=503, detail="Database is unavailable for analysis status")
 
     async with session_factory() as session:
+        repository = IncidentRepository(session)
+        lifecycle = await repository.get_analysis_request(request_uuid, tenant_id=tenant_id)
+        if lifecycle is not None:
+            if lifecycle.incident_id != incident_uuid:
+                raise HTTPException(status_code=404, detail="Analysis request was not found for this incident")
+            return {
+                "request_id": str(lifecycle.request_id),
+                "incident_id": str(lifecycle.incident_id),
+                "recommendation_id": str(lifecycle.recommendation_id or lifecycle.expected_recommendation_id),
+                "status": lifecycle.status,
+                "ready": lifecycle.status == "complete",
+                "delivery": lifecycle.delivery,
+                "terminal_reason": lifecycle.terminal_reason,
+                "created_at": lifecycle.created_at,
+                "updated_at": lifecycle.updated_at,
+                "completed_at": lifecycle.completed_at,
+            }
         recommendation_id = (
             await session.execute(
                 select(AuditLogRecord.id)

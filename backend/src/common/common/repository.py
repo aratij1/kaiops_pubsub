@@ -18,6 +18,7 @@ from sqlalchemy.orm import load_only
 from common.database import (
     ActionRecord,
     AgentWorkItemRecord,
+    AnalysisRequestRecord,
     AlertRecord,
     AlertRuleRecord,
     ApplicationEnvironmentRecord,
@@ -3046,6 +3047,13 @@ class IncidentRepository:
         )
         metadata = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
         analysis_request_id = self._parse_uuid(metadata.get("analysis_request_id"))
+        if analysis_request_id is not None:
+            analysis_request = await self.session.get(AnalysisRequestRecord, analysis_request_id)
+            if analysis_request is not None and analysis_request.tenant_id == verified_tenant:
+                analysis_request.status = "complete"
+                analysis_request.recommendation_id = recommendation.id
+                analysis_request.terminal_reason = None
+                analysis_request.completed_at = utc_now()
         context_snapshot_id = self._parse_uuid(metadata.get("context_snapshot_id"))
         alert_id = self._parse_uuid(metadata.get("alert_id"))
         context_fingerprint = str(metadata.get("context_fingerprint") or "").strip()
@@ -3098,6 +3106,55 @@ class IncidentRepository:
                 raise ValueError("immutable investigation binding already exists with different identities")
             return
         self.session.add(IncidentInvestigationBindingRecord(**values))
+
+    async def create_or_reuse_analysis_request(
+        self,
+        *,
+        request_id: UUID,
+        tenant_id: str,
+        incident_id: UUID,
+        alert_id: UUID,
+        expected_recommendation_id: UUID,
+        mode: str,
+    ) -> tuple[AnalysisRequestRecord, bool]:
+        active = (
+            await self.session.execute(
+                select(AnalysisRequestRecord)
+                .where(
+                    AnalysisRequestRecord.tenant_id == tenant_id,
+                    AnalysisRequestRecord.incident_id == incident_id,
+                    AnalysisRequestRecord.status.in_(("accepted", "queued", "published", "running")),
+                )
+                .order_by(AnalysisRequestRecord.created_at.desc())
+                .with_for_update()
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if active is not None:
+            return active, False
+        row = AnalysisRequestRecord(
+            request_id=request_id,
+            tenant_id=tenant_id,
+            incident_id=incident_id,
+            alert_id=alert_id,
+            expected_recommendation_id=expected_recommendation_id,
+            mode=mode,
+            status="accepted",
+            delivery="pending",
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row, True
+
+    async def get_analysis_request(self, request_id: UUID, *, tenant_id: str) -> AnalysisRequestRecord | None:
+        return (
+            await self.session.execute(
+                select(AnalysisRequestRecord).where(
+                    AnalysisRequestRecord.request_id == request_id,
+                    AnalysisRequestRecord.tenant_id == tenant_id,
+                )
+            )
+        ).scalar_one_or_none()
 
     async def save_knowledge_base(self, report: ResolutionReport, service: str = "unknown", *, tenant_id: str | None = None) -> None:
         verified_tenant = require_tenant_id(report.tenant_id, source="resolution knowledge persistence")

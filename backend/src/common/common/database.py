@@ -262,6 +262,31 @@ class ResolutionOutboxRecord(Base, TimestampMixin):
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
+class AnalysisRequestRecord(Base, TimestampMixin):
+    """Durable lifecycle for one operator-requested incident analysis."""
+
+    __tablename__ = "analysis_requests"
+    __table_args__ = (
+        Index(
+            "idx_analysis_requests_incident_status",
+            "tenant_id", "incident_id", "status", "created_at",
+        ),
+        Index("idx_analysis_requests_alert_created", "tenant_id", "alert_id", "created_at"),
+    )
+
+    request_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    alert_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    expected_recommendation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), unique=True, index=True)
+    mode: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(32), index=True, default="accepted")
+    delivery: Mapped[str] = mapped_column(String(32), default="pending")
+    recommendation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    terminal_reason: Mapped[str | None] = mapped_column(String(255))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class DraftPullRequestOutboxRecord(Base, TimestampMixin):
     """Durable, idempotent request to create one review-only pull request."""
 
