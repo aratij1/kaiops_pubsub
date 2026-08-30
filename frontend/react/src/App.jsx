@@ -10904,7 +10904,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                       </button></> : null}
                     </div>
                   ) : null}
-                  {selectedAlertRegeneration.error ? <p className="error">{selectedAlertRegeneration.error}</p> : null}
+                  {selectedAlertRegeneration.error ? <p className="error" role="alert">{selectedAlertRegeneration.error}</p> : null}
                   {selectedAlertRegeneration.message ? <p className="subtitle">{selectedAlertRegeneration.message}</p> : null}
 
                   {homeDetailTab === "evidence" ? (

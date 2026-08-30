@@ -157,10 +157,12 @@ test("detail URL reconstructs the selected alert after a page refresh", async ({
 });
 
 test("fresh RCA analysis stays authenticated and renders the persisted resolution", async ({ page }) => {
+  test.setTimeout(60_000);
   const alertId = "77777777-7777-4777-8777-777777777777";
   const incidentId = "88888888-8888-4888-8888-888888888888";
   const protectedRequests = [];
   let analysisComplete = false;
+  let regenerationCount = 0;
 
   const alert = {
     id: alertId,
@@ -262,6 +264,7 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
     else if (path.startsWith(`/alerts/${alertId}/processed-result`)) body = { data: analyzedWorkflow() };
     else if (path.startsWith(`/alerts/${alertId}/linked-documents`)) body = { data: { canonical_alert: alert, linked_documents: analysisComplete ? evidence : [] } };
     else if (path === `/analysis/alerts/${alertId}/regenerate`) {
+      regenerationCount += 1;
       analysisComplete = true;
       return route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({
         request_id: "99999999-9999-4999-8999-999999999999",
@@ -276,7 +279,16 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
         poll_after_ms: 10,
       }) });
     } else if (path.startsWith("/analysis/requests/99999999-9999-4999-8999-999999999999/status")) {
-      body = {
+      body = regenerationCount > 1 ? {
+        request_id: "99999999-9999-4999-8999-999999999999",
+        incident_id: incidentId,
+        recommendation_id: null,
+        status: "failed",
+        ready: false,
+        terminal: true,
+        retryable: true,
+        terminal_reason: "Context collection failed after bounded retries.",
+      } : {
         request_id: "99999999-9999-4999-8999-999999999999",
         incident_id: incidentId,
         recommendation_id: "88888888-8888-5888-8888-888888888888",
@@ -306,6 +318,10 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
   await expect(page.getByText("API connection-pool saturation caused request queueing.").first()).toBeVisible();
   await expect(page.getByText("Increase the API connection pool and recycle saturated workers through the governed rollout.").first()).toBeVisible();
   await expect(page.getByText("1 linked record(s) · RCA and impact")).toBeVisible();
+  await page.getByRole("button", { name: "Run fresh analysis" }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "Analysis failed: Context collection failed after bounded retries." })).toBeVisible();
+  await expect(page.getByText(/active requests are safely coalesced/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Run fresh analysis" })).toBeEnabled();
   await tabs.getByRole("tab", { name: "Resolve incident" }).click();
   await expect(page.getByRole("heading", { name: "Resolution command center" })).toBeVisible();
   integrityMismatch = true;
@@ -319,7 +335,7 @@ test("fresh RCA analysis stays authenticated and renders the persisted resolutio
   const orchestrationRequests = protectedRequests.filter(({ path }) => path === `/analysis/alerts/${alertId}/regenerate`
     || path === "/analysis/context/collect"
     || path === "/analysis/resolution/resolve");
-  expect(orchestrationRequests).toHaveLength(1);
+  expect(orchestrationRequests).toHaveLength(2);
   expect(protectedRequests.filter(({ path }) => path.includes("processed-result")).length).toBeGreaterThanOrEqual(2);
   expect(protectedRequests.every(({ authorization }) => authorization === "Bearer admin-token")).toBeTruthy();
 });
