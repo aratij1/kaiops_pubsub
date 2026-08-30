@@ -1,4 +1,5 @@
 from resolution_agent.confidence import ConfidenceInputs, score_confidence
+from resolution_agent.graph import _canonicalize_rationale_confidence
 
 
 def test_confidence_uses_documented_deterministic_weights() -> None:
@@ -79,3 +80,15 @@ def test_ambiguous_target_has_strictest_confidence_ceiling() -> None:
 
     assert result.score == 0.49
     assert result.ceiling_reasons == ("ambiguous_target",)
+
+
+def test_operator_rationale_uses_canonical_bounded_confidence() -> None:
+    rationale = (
+        "Model reasoning-critical proposed the RCA with 3 validated evidence "
+        "citation(s); confidence=0.49."
+    )
+
+    result = _canonicalize_rationale_confidence(rationale, 0.5707)
+
+    assert "canonical diagnostic confidence=0.57" in result
+    assert "confidence=0.49" not in result

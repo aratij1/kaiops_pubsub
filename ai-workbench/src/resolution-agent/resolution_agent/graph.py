@@ -32,6 +32,21 @@ from langgraph.graph import END, StateGraph
 logger = logging.getLogger("kaiops.resolution_agent")
 
 
+def _canonicalize_rationale_confidence(rationale: str, confidence: float) -> str:
+    """Replace an intermediate RCA score with the final bounded diagnostic score."""
+
+    text = str(rationale or "").strip()
+    canonical = f"canonical diagnostic confidence={confidence:.2f}"
+    if re.search(r"(?:canonical diagnostic )?confidence=\d+(?:\.\d+)?", text):
+        return re.sub(
+            r"(?:canonical diagnostic )?confidence=\d+(?:\.\d+)?",
+            canonical,
+            text,
+            count=1,
+        )
+    return f"{text} {canonical}.".strip()
+
+
 class ModelTask(StrEnum):
     """Mirrors model_router.ModelTask's wire values without importing that service's package."""
 
@@ -1525,6 +1540,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
         # bounded diagnostic score so the aggregate confidence agrees with the
         # structured RCA confidence shown to operators.
         state["confidence"] = round(max(0.0, min(score, 0.99)), 4)
+        # generate_rca runs before this deterministic aggregation and its
+        # rationale initially contains the intermediate RCA-only score. Every
+        # operator-facing surface treats recommendation.confidence as the
+        # canonical bounded diagnostic score, so persist that same value in
+        # the narrative. The intermediate score remains available in
+        # metadata.rca_analysis.confidence_score for technical diagnostics.
+        state["rationale"] = _canonicalize_rationale_confidence(
+            str(state.get("rationale") or ""), state["confidence"]
+        )
         return state
 
     async def resolve(self, context: Context) -> Recommendation:
