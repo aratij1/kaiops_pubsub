@@ -1985,7 +1985,7 @@ async def _load_analysis_regeneration_subject(
                     continue
                 if parsed.year <= 1:
                     continue
-                return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
             return None
 
         # The source observation time is part of the alert identity.  Never

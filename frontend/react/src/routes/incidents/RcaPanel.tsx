@@ -322,7 +322,7 @@ export default function RcaPanel({
           <div>
             <label htmlFor="rca-analysis-mode">Context strategy</label>
             <select id="rca-analysis-mode" value={rcaAnalysisMode} onChange={(event) => onSetRcaAnalysisMode(event.target.value as "smart" | "fresh" | "cache")} disabled={selectedAlertRegeneration.loading}><option value="smart">Smart reuse</option><option value="fresh">Collect fresh context</option><option value="cache">Verified cache only</option></select>
-            <button type="button" className="button-primary" onClick={onRerunRca} disabled={selectedAlertRegeneration.loading}><RotateCw size={15} aria-hidden="true" className={selectedAlertRegeneration.loading ? "is-spinning" : ""} />{selectedAlertRegeneration.loading ? "Analyzing..." : "Run analysis"}</button>
+            <button type="button" className="button-primary" onClick={() => onRerunRca()} disabled={selectedAlertRegeneration.loading}><RotateCw size={15} aria-hidden="true" className={selectedAlertRegeneration.loading ? "is-spinning" : ""} />{selectedAlertRegeneration.loading ? "Analyzing..." : "Run analysis"}</button>
           </div>
         </details>
       </div>
