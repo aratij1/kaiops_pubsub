@@ -69,6 +69,11 @@ MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(os.getenv("MESSAGE_BUS_DUAL_CONSUME_ENABL
 ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any, Any, None]]
 
 
+class RcaReuseDecision(BaseModel):
+    reusable: bool
+    reasons: list[str] = Field(default_factory=list)
+
+
 def _utc_aware(value: datetime | str) -> datetime:
     parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
@@ -87,6 +92,55 @@ def _resolution_quality_score(payload: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return max(0.0, min(score / 100.0 if score > 1.0 else score, 1.0))
+
+
+def validate_rca_reuse(
+    prior_recommendation: Recommendation | dict[str, Any], final_snapshot: Any,
+) -> RcaReuseDecision:
+    prior = (
+        prior_recommendation.model_dump(mode="json")
+        if isinstance(prior_recommendation, Recommendation) else dict(prior_recommendation)
+    )
+    metadata = prior.get("metadata") if isinstance(prior.get("metadata"), dict) else {}
+    def snapshot_value(name: str, default: Any = None) -> Any:
+        return final_snapshot.get(name, default) if isinstance(final_snapshot, dict) else getattr(final_snapshot, name, default)
+
+    snapshot_payload = snapshot_value("payload", snapshot_value("context", {}))
+    snapshot_metadata = (
+        snapshot_payload.get("metadata") if isinstance(snapshot_payload.get("metadata"), dict) else {}
+    )
+    alert = snapshot_payload.get("alert") if isinstance(snapshot_payload.get("alert"), dict) else {}
+    reasons: list[str] = []
+    expected_pairs = (
+        (str(prior.get("tenant_id") or metadata.get("tenant_id") or ""), str(snapshot_value("tenant_id")), "tenant"),
+        (str(metadata.get("context_subject_fingerprint") or ""), str(snapshot_value("subject_fingerprint")), "subject"),
+        (str(metadata.get("context_fingerprint") or ""), str(snapshot_value("context_fingerprint")), "context"),
+        (str(metadata.get("service") or ""), str(alert.get("service") or ""), "service"),
+        (str(metadata.get("environment") or ""), str(alert.get("environment") or ""), "environment"),
+        (str(metadata.get("deployment_id") or ""), str(snapshot_metadata.get("deployment_id") or ""), "deployment"),
+        (str(metadata.get("change_id") or ""), str(snapshot_metadata.get("change_id") or ""), "change"),
+    )
+    for prior_value, current_value, label in expected_pairs:
+        required = label in {"tenant", "subject", "context", "service", "environment"}
+        if (required and not prior_value) or prior_value != current_value:
+            reasons.append(f"{label}_mismatch")
+    prior_ids = {str(value) for value in metadata.get("evidence_ids") or []}
+    if not prior_ids or prior_ids != set(snapshot_value("evidence_ids", []) or []):
+        reasons.append("evidence_ids_mismatch")
+    prior_checksums = metadata.get("evidence_content_checksums")
+    if not isinstance(prior_checksums, dict) or prior_checksums != dict(snapshot_value("evidence_checksums", {}) or {}):
+        reasons.append("evidence_checksums_mismatch")
+    prior_contradictions = set(metadata.get("contradicting_evidence_ids") or [])
+    current_report = snapshot_metadata.get("investigation_report")
+    conclusion = current_report.get("conclusion") if isinstance(current_report, dict) else {}
+    current_contradictions = set(
+        conclusion.get("contradicting_evidence_ids") if isinstance(conclusion, dict) else []
+    )
+    if prior_contradictions != current_contradictions:
+        reasons.append("contradiction_state_mismatch")
+    if _utc_aware(snapshot_value("expires_at")) <= datetime.now(UTC):
+        reasons.append("snapshot_expired")
+    return RcaReuseDecision(reusable=not reasons, reasons=reasons)
 
 
 def _resolution_reuse_threshold() -> float:
@@ -122,6 +176,13 @@ def _attach_rca_governance_binding(recommendation: Recommendation, context: Cont
         "alert_id": str(context.alert.id),
         "context_snapshot_id": str(context_metadata.get("context_snapshot_id") or "") or None,
         "context_fingerprint": str(context_metadata.get("context_fingerprint") or "") or None,
+        "context_subject_fingerprint": str(context_metadata.get("context_subject_fingerprint") or "") or None,
+        "evidence_ids": list(context_metadata.get("evidence_ids") or []),
+        "evidence_content_checksums": dict(context_metadata.get("evidence_content_checksums") or {}),
+        "service": str(context.alert.service or ""),
+        "environment": str(context.alert.environment or ""),
+        "deployment_id": str(context_metadata.get("deployment_id") or ""),
+        "change_id": str(context_metadata.get("change_id") or ""),
         "rca_version": max(1, int(context_metadata.get("rca_version") or 1)),
         "recommendation_version": str(recommendation.id),
     }
@@ -277,12 +338,19 @@ async def persist_final_investigation_snapshot(
         return row
 
 
-def bind_context_to_snapshot(context: Context, *, snapshot_id: UUID, fingerprint: str) -> Context:
+def bind_context_to_snapshot(context: Context, *, snapshot: Any) -> Context:
     metadata = dict(context.metadata if isinstance(context.metadata, dict) else {})
     metadata.pop("_final_investigation_report", None)
     metadata.update({
-        "context_snapshot_id": str(snapshot_id), "context_fingerprint": fingerprint,
+        "context_snapshot_id": str(snapshot.snapshot_id),
+        "context_fingerprint": snapshot.context_fingerprint,
         "snapshot_stage": "investigation_complete",
+        "context_subject_fingerprint": snapshot.subject_fingerprint,
+        "evidence_ids": list(snapshot.evidence_ids or []),
+        "evidence_content_checksums": dict(snapshot.evidence_checksums or {}),
+        "context_expires_at": snapshot.expires_at.isoformat(),
+        "service": str(context.alert.service or ""),
+        "environment": str(context.alert.environment or ""),
     })
     return context.model_copy(update={"metadata": metadata})
 
@@ -306,12 +374,31 @@ async def _resolve_context(context: Context) -> Recommendation:
     metadata = context.metadata if isinstance(context.metadata, dict) else {}
     prior = metadata.get("prior_resolution") if isinstance(metadata.get("prior_resolution"), dict) else {}
     score = _resolution_quality_score(prior)
+    reuse_decision = validate_rca_reuse(prior, {
+        "payload": context.model_dump(mode="json"), "tenant_id": context.tenant_id,
+        "subject_fingerprint": metadata.get("context_subject_fingerprint"),
+        "context_fingerprint": metadata.get("context_fingerprint"),
+        "evidence_ids": metadata.get("evidence_ids", []),
+        "evidence_checksums": metadata.get("evidence_content_checksums", {}),
+        "expires_at": metadata.get("context_expires_at"),
+    }) if prior else RcaReuseDecision(reusable=False, reasons=["no_prior_recommendation"])
     may_reuse = (
         bool(getattr(settings, "context_resolution_reuse_enabled", True))
         and bool(metadata.get("context_reused"))
         and not bool(metadata.get("force_full_analysis"))
         and score > _resolution_reuse_threshold()
+        and reuse_decision.reusable
     )
+    if prior and not reuse_decision.reusable:
+        metadata = {
+            **metadata,
+            "prior_resolution": {},
+            "historical_precedents": [
+                *list(metadata.get("historical_precedents") or []),
+                {"recommendation": prior, "reuse_rejected_reasons": reuse_decision.reasons},
+            ][-5:],
+        }
+        context = context.model_copy(update={"metadata": metadata})
     if not may_reuse:
         investigation_report = (
             dict(metadata.get("_final_investigation_report"))
@@ -1110,10 +1197,7 @@ async def startup(app: FastAPI) -> None:
         final_snapshot = await persist_final_investigation_snapshot(
             investigated_context, investigation_report, initial_snapshot["snapshot_id"],
         )
-        context = bind_context_to_snapshot(
-            investigated_context, snapshot_id=final_snapshot.snapshot_id,
-            fingerprint=final_snapshot.context_fingerprint,
-        )
+        context = bind_context_to_snapshot(investigated_context, snapshot=final_snapshot)
         recommendation = await _resolve_context(context)
         _attach_rca_governance_binding(recommendation, context)
         _validate_recommendation_snapshot_evidence(recommendation, final_snapshot)
@@ -1532,10 +1616,7 @@ async def resolve(context: Context, publish_events: bool = True) -> Recommendati
     final_snapshot = await persist_final_investigation_snapshot(
         investigated_context, investigation_report, initial_snapshot["snapshot_id"],
     )
-    context = bind_context_to_snapshot(
-        investigated_context, snapshot_id=final_snapshot.snapshot_id,
-        fingerprint=final_snapshot.context_fingerprint,
-    )
+    context = bind_context_to_snapshot(investigated_context, snapshot=final_snapshot)
     recommendation = await _resolve_context(context)
     _attach_rca_governance_binding(recommendation, context)
     _validate_recommendation_snapshot_evidence(recommendation, final_snapshot)
