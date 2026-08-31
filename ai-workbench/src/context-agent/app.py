@@ -16,7 +16,11 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ai_workbench_common.models import Context
 from common.config import get_settings
-from common.context_enrichment_contract import HumanEvidenceResponse
+from common.context_enrichment_contract import (
+    EvidenceRequirement,
+    HumanEvidenceResponse,
+    validate_enrichment_observation,
+)
 from common.event_publishers import EventPublisher, RabbitMQPublisher, build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer
 from common.kafka import consume_forever as consume_kafka_forever
@@ -709,20 +713,34 @@ async def _context_enrichment_worker(app: FastAPI) -> None:
                 continue
             for job in jobs:
                 collected = False
+                accepted_evidence_ids: list[str] = []
                 failure = "connector returned no attributable evidence"
                 try:
                     query = job.get("query_payload") if isinstance(job.get("query_payload"), dict) else {}
                     alert = Alert.model_validate(query.get("alert"))
                     incident = Incident.model_validate(query.get("incident"))
+                    async with app.state.session_factory() as session:
+                        requirement_payload = await ContextEnrichmentRepository(session).context_evidence_requirement(
+                            tenant_id=job["tenant_id"], requirement_id=job["requirement_id"],
+                        )
+                    if requirement_payload is None:
+                        raise RuntimeError("the claimed enrichment requirement no longer exists")
+                    requirement = EvidenceRequirement.model_validate(requirement_payload)
                     connector_name = connector_aliases.get(job["connector_id"], job["connector_id"])
                     connector = next((item for item in agent.connectors if item.name == connector_name), None)
                     if connector is None:
                         raise RuntimeError(f"connector {job['connector_id']} is not installed")
                     observation = await connector.fetch(alert, incident)
-                    collected = bool(observation) and str(observation.get("_source_status") or "") not in {
-                        "unavailable", "unauthorized", "misconfigured", "timed_out",
-                    }
-                    if collected:
+                    validation = validate_enrichment_observation(
+                        requirement, job["connector_id"], observation, incident, alert, datetime.now(UTC),
+                    )
+                    if not validation.accepted:
+                        failure = (
+                            "; ".join(validation.rejection_reasons)
+                            or "connector returned no attributable evidence"
+                        )
+                    if validation.accepted:
+                        accepted_evidence_ids = [row["evidence_id"] for row in validation.accepted_evidence]
                         decision = dict(query.get("decision") or {})
                         analysis_request_id = str(uuid5(NAMESPACE_URL, f"kaims:enrichment:{job['job_id']}"))
                         decision.update({
@@ -736,6 +754,16 @@ async def _context_enrichment_worker(app: FastAPI) -> None:
                             context, decision=decision,
                             analysis_request={"id": analysis_request_id, "mode": "fresh"},
                         )
+                        context = context.model_copy(
+                            update={"metadata": {
+                                **context.metadata,
+                                "accepted_enrichment_evidence": validation.accepted_evidence,
+                                "evidence_ids": list(dict.fromkeys([
+                                    *(context.metadata.get("evidence_ids") or []),
+                                    *accepted_evidence_ids,
+                                ])),
+                            }}
+                        )
                         provider = str(getattr(settings, "event_bus_provider", "rabbitmq") or "rabbitmq")
                         publishers = getattr(app.state, "message_bus_publishers", {})
                         provider_used = provider if publishers.get(provider) is not None else "rabbitmq"
@@ -748,6 +776,7 @@ async def _context_enrichment_worker(app: FastAPI) -> None:
                             decision=decision, provider_used=provider_used, outgoing_payload=outgoing,
                         )
                         if enqueued:
+                            collected = True
                             await _publish_context_event(
                                 app=app, provider=provider_used, alert=alert, incident=incident,
                                 context=context, decision=decision, payload=outgoing,
@@ -761,6 +790,7 @@ async def _context_enrichment_worker(app: FastAPI) -> None:
                         await ContextEnrichmentRepository(session).finish_context_enrichment_job(
                             job_id=job["job_id"], worker_id=worker_id,
                             collected=collected, error=failure,
+                            evidence_ids=accepted_evidence_ids,
                             retry_after_seconds=min(300, 15 * (2 ** max(0, int(job["attempt_count"]) - 1))),
                         )
                         await session.commit()

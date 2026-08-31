@@ -8258,6 +8258,25 @@ class ContextEnrichmentRepository(EvaluationRepository):
             "created_at": row.created_at, "updated_at": row.updated_at,
         } for row in result.scalars().all()]
 
+    async def context_evidence_requirement(
+        self, *, tenant_id: str, requirement_id: UUID | str,
+    ) -> dict[str, Any] | None:
+        tenant = require_tenant_id(tenant_id, source="context evidence requirement")
+        row = await self.session.get(ContextEvidenceRequirementRecord, self._to_uuid(requirement_id))
+        if row is None or row.tenant_id != tenant:
+            return None
+        return {
+            "requirement_id": str(row.requirement_id), "tenant_id": row.tenant_id,
+            "incident_id": str(row.incident_id), "rca_version": row.rca_version,
+            "category": row.category, "question": row.question, "reason": row.reason,
+            "priority": row.priority, "collection_mode": row.collection_mode,
+            "candidate_connectors": list(row.candidate_connectors or []), "status": row.status,
+            "retry_count": row.retry_count, "retry_after": row.retry_after,
+            "assigned_to": row.assigned_to, "jira_issue_key": row.jira_issue_key,
+            "evidence_ids": list(row.evidence_ids or []), "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
+
     async def list_context_enrichment_activity(
         self, *, tenant_id: str, incident_id: UUID | str,
     ) -> dict[str, list[dict[str, Any]]]:
@@ -8365,6 +8384,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
     async def finish_context_enrichment_job(
         self, *, job_id: UUID | str, worker_id: str, collected: bool, error: str | None = None,
         retry_after_seconds: int = 60, maximum_attempts: int = 4,
+        evidence_ids: list[str] | None = None,
     ) -> None:
         row = await self.session.get(ContextEnrichmentJobRecord, self._to_uuid(job_id))
         if row is None:
@@ -8377,6 +8397,9 @@ class ContextEnrichmentRepository(EvaluationRepository):
             row.last_error = None
             if requirement is not None:
                 requirement.status = "collected"
+                requirement.evidence_ids = list(dict.fromkeys([
+                    *(requirement.evidence_ids or []), *(evidence_ids or []),
+                ]))
                 requirement.version += 1
         elif int(row.attempt_count or 0) < maximum_attempts:
             row.status = "retry"
