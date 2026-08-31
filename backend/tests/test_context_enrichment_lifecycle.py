@@ -146,6 +146,66 @@ async def test_missing_automatic_evidence_creates_idempotent_enrichment_jobs(
 
 
 @pytest.mark.asyncio
+async def test_operations_state_selects_current_requirement_and_latest_job(
+    sqlite_session_factory,
+):
+    incident_id = uuid4()
+    now = datetime.now(UTC)
+    old_requirement, current_requirement = build_evidence_requirements(
+        tenant_id="tenant-a", incident_id=incident_id, rca_version=1,
+        missing_evidence=[{"category": "logs", "question": "What failed previously?"}], now=now,
+    )[0], build_evidence_requirements(
+        tenant_id="tenant-a", incident_id=incident_id, rca_version=2,
+        missing_evidence=[{"category": "metrics", "question": "What is failing now?"}], now=now,
+    )[0]
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        session.add(IncidentRecord(
+            id=incident_id, tenant_id="tenant-a", service="checkout-api", environment="prod",
+            severity="critical", status="investigating", title="Checkout latency", payload={},
+        ))
+        await repo.upsert_context_evidence_requirements([old_requirement, current_requirement])
+        first = await repo.schedule_context_enrichment_job(
+            tenant_id="tenant-a", incident_id=incident_id,
+            requirement_id=current_requirement.requirement_id, connector_id="prometheus-a",
+            query_payload={"query": "up"}, observation_start=now - timedelta(minutes=5), observation_end=now,
+        )
+        second = await repo.schedule_context_enrichment_job(
+            tenant_id="tenant-a", incident_id=incident_id,
+            requirement_id=current_requirement.requirement_id, connector_id="prometheus-b",
+            query_payload={"query": "rate(errors[5m])"},
+            observation_start=now - timedelta(minutes=5), observation_end=now,
+        )
+        first.created_at = now - timedelta(seconds=1)
+        second.created_at = now
+        await session.commit()
+
+        state = await repo.incident_operations_state(tenant_id="tenant-a", incident_id=incident_id)
+
+    assert state is not None
+    assert state["lifecycle_state"] == "COLLECTING"
+    assert state["investigation"]["rca_version"] == 0
+    assert [row["requirement_id"] for row in state["requirements"]] == [str(current_requirement.requirement_id)]
+    assert state["requirements"][0]["latest_job"]["job_id"] == str(second.job_id)
+    assert state["requirement_history"][0]["requirement_id"] == str(old_requirement.requirement_id)
+    assert state["next_action"]["type"] == "AUTONOMOUS_COLLECTION"
+
+
+@pytest.mark.asyncio
+async def test_operations_state_is_tenant_scoped(sqlite_session_factory):
+    incident_id = uuid4()
+    async with sqlite_session_factory() as session:
+        session.add(IncidentRecord(
+            id=incident_id, tenant_id="tenant-a", service="checkout-api", environment="prod",
+            severity="critical", status="investigating", title="Checkout latency", payload={},
+        ))
+        await session.commit()
+        assert await ContextEnrichmentRepository(session).incident_operations_state(
+            tenant_id="tenant-b", incident_id=incident_id,
+        ) is None
+
+
+@pytest.mark.asyncio
 async def test_atomic_enrichment_persists_exact_evidence_snapshot_and_outbox(
     sqlite_session_factory,
 ):

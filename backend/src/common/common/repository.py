@@ -8365,13 +8365,13 @@ class ContextEnrichmentRepository(EvaluationRepository):
             select(ContextEnrichmentJobRecord).where(
                 ContextEnrichmentJobRecord.tenant_id == tenant,
                 ContextEnrichmentJobRecord.incident_id == incident_uuid,
-            ).order_by(ContextEnrichmentJobRecord.created_at.asc())
+            ).order_by(ContextEnrichmentJobRecord.created_at.asc(), ContextEnrichmentJobRecord.job_id.asc())
         )).scalars().all()
         requests = (await self.session.execute(
             select(HumanEvidenceRequestRecord).where(
                 HumanEvidenceRequestRecord.tenant_id == tenant,
                 HumanEvidenceRequestRecord.incident_id == incident_uuid,
-            ).order_by(HumanEvidenceRequestRecord.created_at.asc())
+            ).order_by(HumanEvidenceRequestRecord.created_at.asc(), HumanEvidenceRequestRecord.request_id.asc())
         )).scalars().all()
         return {
             "jobs": [{
@@ -8612,6 +8612,183 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 "snapshot_version": snapshot.snapshot_version, "outbox_event_id": event_id,
                 "outbox_payload": outbox_payload}
 
+    async def incident_operations_state(
+        self, *, tenant_id: str, incident_id: UUID | str,
+    ) -> dict[str, Any] | None:
+        """Build the deterministic backend-owned incident operations projection."""
+        tenant = require_tenant_id(tenant_id, source="incident operations state")
+        incident_uuid = self._to_uuid(incident_id)
+        incident = await self.session.scalar(select(IncidentRecord).where(
+            IncidentRecord.id == incident_uuid, IncidentRecord.tenant_id == tenant,
+        ))
+        projection = await self.session.scalar(select(IncidentProjectionRecord).where(
+            IncidentProjectionRecord.incident_id == incident_uuid,
+            IncidentProjectionRecord.tenant_id == tenant,
+        ))
+        if incident is None and projection is None:
+            return None
+
+        snapshot = await self.session.scalar(
+            select(ContextSnapshotRecord).where(
+                ContextSnapshotRecord.tenant_id == tenant,
+                ContextSnapshotRecord.incident_id == str(incident_uuid),
+            ).order_by(
+                ContextSnapshotRecord.snapshot_version.desc(),
+                ContextSnapshotRecord.collected_at.desc(),
+                ContextSnapshotRecord.snapshot_id.desc(),
+            ).limit(1)
+        )
+        binding = await self.session.scalar(
+            select(IncidentInvestigationBindingRecord).where(
+                IncidentInvestigationBindingRecord.tenant_id == tenant,
+                IncidentInvestigationBindingRecord.incident_id == incident_uuid,
+            ).order_by(
+                IncidentInvestigationBindingRecord.rca_version.desc(),
+                IncidentInvestigationBindingRecord.created_at.desc(),
+                IncidentInvestigationBindingRecord.binding_id.desc(),
+            ).limit(1)
+        )
+        recommendation = await self.session.get(AuditLogRecord, binding.recommendation_id) if binding else None
+        recommendation_payload = (
+            dict(recommendation.payload or {})
+            if recommendation is not None and isinstance(recommendation.payload, dict) else {}
+        )
+        recommendation_metadata = (
+            recommendation_payload.get("metadata")
+            if isinstance(recommendation_payload.get("metadata"), dict) else {}
+        )
+        analysis = (
+            recommendation_metadata.get("rca_analysis")
+            if isinstance(recommendation_metadata.get("rca_analysis"), dict) else {}
+        )
+        quality = (
+            recommendation_metadata.get("quality_gate")
+            if isinstance(recommendation_metadata.get("quality_gate"), dict) else {}
+        )
+        approval = await self.session.scalar(
+            select(ApprovalRecord).where(
+                ApprovalRecord.tenant_id == tenant,
+                ApprovalRecord.incident_id == incident_uuid,
+                ApprovalRecord.recommendation_id == binding.recommendation_id,
+            ).order_by(ApprovalRecord.updated_at.desc(), ApprovalRecord.id.desc()).limit(1)
+        ) if binding else None
+
+        requirements = await self.list_context_evidence_requirements(
+            tenant_id=tenant, incident_id=incident_uuid,
+        )
+        activity = await self.list_context_enrichment_activity(
+            tenant_id=tenant, incident_id=incident_uuid,
+        )
+        jobs_by_requirement: dict[str, dict[str, Any]] = {}
+        for job in activity["jobs"]:
+            # Activity is ascending, so assignment deterministically retains the latest attempt.
+            jobs_by_requirement[job["requirement_id"]] = job
+        active_human_statuses = {"pending", "assigned", "open", "in_progress", "assignment_blocked"}
+        human_by_requirement: dict[str, dict[str, Any]] = {}
+        human_history_by_requirement: dict[str, list[dict[str, Any]]] = {}
+        for request in activity["human_requests"]:
+            key = request["requirement_id"]
+            human_history_by_requirement.setdefault(key, []).append(request)
+            if str(request["status"]).lower() in active_human_statuses:
+                human_by_requirement[key] = request
+
+        current_rca_version = binding.rca_version if binding else max(
+            (int(row["rca_version"]) for row in requirements), default=0,
+        )
+        active_requirements = [row for row in requirements if int(row["rca_version"]) == current_rca_version]
+        requirement_projection = [{
+            **row,
+            "latest_job": jobs_by_requirement.get(row["requirement_id"]),
+            "active_human_request": human_by_requirement.get(row["requirement_id"]),
+            "human_request_history": human_history_by_requirement.get(row["requirement_id"], []),
+        } for row in active_requirements]
+
+        current_evidence_ids = list(snapshot.evidence_ids or []) if snapshot else []
+        evidence_rows = (
+            (await self.session.execute(select(CanonicalEvidenceRecord).where(
+                CanonicalEvidenceRecord.tenant_id == tenant,
+                CanonicalEvidenceRecord.incident_id == incident_uuid,
+                CanonicalEvidenceRecord.evidence_id.in_(current_evidence_ids),
+            ).order_by(CanonicalEvidenceRecord.category, CanonicalEvidenceRecord.evidence_id))).scalars().all()
+            if current_evidence_ids else []
+        )
+        evidence_count_by_category: dict[str, int] = {}
+        for row in evidence_rows:
+            evidence_count_by_category[row.category] = evidence_count_by_category.get(row.category, 0) + 1
+
+        unresolved = [
+            row for row in requirement_projection
+            if str(row["status"]).lower() not in {"collected", "answered", "satisfied"}
+        ]
+        active_jobs = [row["latest_job"] for row in unresolved if row.get("latest_job")]
+        waiting_human = any(row.get("active_human_request") for row in unresolved)
+        if waiting_human:
+            lifecycle_state = "WAITING_FOR_HUMAN"
+            next_action = {"type": "HUMAN_EVIDENCE", "message": "KaiMS is waiting for assigned human evidence."}
+        elif any(str(job.get("status")).lower() in {"scheduled", "collecting", "retry"} for job in active_jobs):
+            lifecycle_state = "COLLECTING"
+            next_action = {"type": "AUTONOMOUS_COLLECTION", "message": "KaiMS is collecting governed evidence."}
+        elif unresolved:
+            blocked = any(str(row["status"]).lower() in {"blocked", "failed", "dead_letter"} for row in unresolved)
+            lifecycle_state = "COLLECTION_BLOCKED" if blocked else "REQUIREMENTS_IDENTIFIED"
+            next_action = {"type": "REVIEW_EVIDENCE_GAPS", "message": "Review unresolved evidence requirements."}
+        elif binding is None:
+            lifecycle_state = "CONTEXT_READY" if snapshot else "DETECTED"
+            next_action = {"type": "INVESTIGATE", "message": "KaiMS is preparing a governed investigation."}
+        else:
+            lifecycle_state = "RCA_READY" if str(binding.status).lower() in {"grounded", "ready", "conclusive"} else "INVESTIGATING"
+            next_action = {"type": "REVIEW_RCA", "message": "Review the current governed RCA version."}
+
+        resolution_ready = lifecycle_state == "RCA_READY" and bool(quality.get("passed"))
+        blocked_reasons = list(quality.get("blocking_reasons") or analysis.get("missing_evidence") or [])
+        timestamps = [
+            value if value.tzinfo else value.replace(tzinfo=UTC)
+            for value in (
+            getattr(projection, "updated_at", None), getattr(snapshot, "collected_at", None),
+            getattr(binding, "created_at", None), getattr(incident, "updated_at", None),
+            ) if value is not None
+        ]
+        updated_at = max(timestamps) if timestamps else datetime.now(UTC)
+        snapshot_payload = dict(snapshot.payload or {}) if snapshot and isinstance(snapshot.payload, dict) else {}
+        snapshot_metadata = snapshot_payload.get("metadata") if isinstance(snapshot_payload.get("metadata"), dict) else {}
+        return {
+            "schema_version": "kaiops.operations-state.v1",
+            "incident_id": str(incident_uuid), "tenant_id": tenant,
+            "lifecycle_state": lifecycle_state,
+            "context": {
+                "snapshot_id": str(snapshot.snapshot_id) if snapshot else None,
+                "version": int(snapshot.snapshot_version) if snapshot else 0,
+                "evidence_ids": list(snapshot.evidence_ids or []) if snapshot else [],
+                "evidence_count_by_category": evidence_count_by_category,
+                "quality": dict(snapshot_metadata.get("context_quality") or {}),
+                "missing_requirements": [row["requirement_id"] for row in unresolved],
+            },
+            "investigation": {
+                "investigation_id": str(binding.investigation_id) if binding and binding.investigation_id else None,
+                "rca_version": int(binding.rca_version) if binding else 0,
+                "status": str(binding.status) if binding else "not_started",
+                "confidence": float(recommendation_payload.get("confidence") or 0.0),
+                "snapshot_id": str(binding.context_snapshot_id) if binding else None,
+                "evidence_ids": list(binding.evidence_ids or []) if binding else [],
+                "evidence_set_digest": binding.evidence_set_digest if binding else None,
+            },
+            "requirements": requirement_projection,
+            "requirement_history": [row for row in requirements if int(row["rca_version"]) != current_rca_version],
+            "resolution": {
+                "status": "ready" if resolution_ready else "blocked",
+                "readiness": quality,
+                "recommendation_version": str(binding.recommendation_id) if binding else None,
+                "plan_version": str(binding.resolution_plan_id) if binding and binding.resolution_plan_id else None,
+            },
+            "approval": {
+                "status": str(approval.decision).lower() if approval else "not_requested",
+                "blocked_reasons": (
+                    [] if approval or resolution_ready else blocked_reasons or ["RCA_NOT_READY"]
+                ),
+            },
+            "next_action": next_action,
+            "updated_at": updated_at,
+        }
     async def finish_context_enrichment_job(
         self, *, job_id: UUID | str, worker_id: str, collected: bool, error: str | None = None,
         retry_after_seconds: int = 60, maximum_attempts: int = 4,

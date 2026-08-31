@@ -3830,6 +3830,20 @@ async def get_incident_context_gaps(
     )
 
 
+@app.get("/incidents/{incident_id}/operations-state")
+async def get_incident_operations_state(
+    incident_id: str,
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+    tenant_id: str = Depends(current_tenant_id),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request, method="GET", path=f"/incidents/{quote(incident_id, safe='')}/operations-state",
+        payload=None, target_base=settings.context_agent_url, params={"tenant_id": tenant_id},
+        trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30.0,
+    )
+
+
 @app.post("/incidents/{incident_id}/context-gaps/{requirement_id}/responses")
 async def post_incident_context_gap_response(
     incident_id: str,

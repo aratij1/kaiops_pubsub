@@ -62,6 +62,7 @@ def test_gateway_exposes_guarded_evaluation_artifact_routes() -> None:
     assert ("GET", "/evaluations") in routes
     assert ("GET", "/evaluations/{evaluation_id}") in routes
     assert ("POST", "/evaluations/autonomy/assess") in routes
+    assert ("GET", "/incidents/{incident_id}/operations-state") in routes
 
 
 @pytest.mark.asyncio

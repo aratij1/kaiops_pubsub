@@ -2096,6 +2096,35 @@ async def list_context_gaps(incident_id: str, tenant_id: str) -> dict[str, Any]:
     }
 
 
+@app.get("/incidents/{incident_id}/operations-state")
+async def incident_operations_state(incident_id: str, tenant_id: str) -> dict[str, Any]:
+    tenant = require_tenant_id(tenant_id, source="incident operations state")
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        raise HTTPException(status_code=503, detail={
+            "code": "operations_state_unavailable",
+            "message": "Incident operations state is temporarily unavailable.",
+        })
+    try:
+        async with app.state.session_factory() as session:
+            state = await ContextEnrichmentRepository(session).incident_operations_state(
+                tenant_id=tenant, incident_id=incident_id,
+            )
+    except (TypeError, ValueError):
+        state = None
+    if state is None:
+        raise HTTPException(status_code=404, detail={
+            "code": "incident_not_found", "message": "The incident was not found.",
+        })
+    return {
+        **state,
+        "release": {
+            "release_sha": os.getenv("KAIMS_RELEASE_SHA", "dev"),
+            "schema_version": "20260919",
+            "contract_version": state["schema_version"],
+        },
+    }
+
+
 class ContextEnrichmentReconcileRequest(BaseModel):
     tenant_id: str = Field(min_length=1, max_length=128)
     limit: int = Field(default=100, ge=1, le=500)
