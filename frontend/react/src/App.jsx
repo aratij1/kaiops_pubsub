@@ -6023,7 +6023,29 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           const evidenceIds = selectedRelevantRcaEvidence.map((row) => row.id || row.evidence_id).filter(Boolean);
           const sourceUris = selectedRelevantRcaEvidence.map((row) => row.source_uri || row.uri || row.path).filter(Boolean);
           const content = buildRcaEvidenceDocumentDraft({ alertId, alert: selectedAlertRow, decision: selectedRcaDecision, workflow: selectedAlertWorkflow, evidence: selectedRelevantRcaEvidence });
-          const binding = selectedAlertWorkflow?.incident_investigation || {}; const created = await fetchJson("/api-gateway/rag/evidence-drafts", authenticatedOptions({ method: "POST", body: JSON.stringify({ incident_id: binding.incident_id || selectedIncidentId, alert_id: binding.alert_id || alertId, analysis_request_id: binding.analysis_request_id, context_snapshot_id: binding.context_snapshot_id, context_fingerprint: binding.context_fingerprint, recommendation_id: binding.recommendation_id, rca_version: binding.rca_version, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, environment: selectedAlertRow?.environment, content, services: [selectedAlertRow?.service].filter(Boolean), evidence_ids: evidenceIds, source_uris: sourceUris }) }));
+          const workflowBinding = selectedAlertWorkflow?.incident_investigation || {};
+          const incidentId = String(workflowBinding.incident_id || selectedIncidentId || "").trim();
+          let binding = workflowBinding;
+          if (incidentId) {
+            const operationsResponse = await fetchJson(
+              `/api-gateway/incidents/${encodeURIComponent(incidentId)}/operations-state`,
+              authenticatedOptions({ maxAttempts: 1, staleTimeMs: 0 }),
+            );
+            binding = unwrap(operationsResponse)?.investigation_workspace?.binding || workflowBinding;
+          }
+          const requiredBinding = {
+            incident_id: binding.incident_id || incidentId,
+            alert_id: binding.alert_id || alertId,
+            analysis_request_id: binding.analysis_request_id,
+            context_snapshot_id: binding.context_snapshot_id || binding.snapshot_id,
+            context_fingerprint: binding.context_fingerprint,
+            recommendation_id: binding.recommendation_id,
+            rca_version: binding.rca_version,
+          };
+          if (Object.values(requiredBinding).some((value) => value === undefined || value === null || value === "" || value === 0)) {
+            throw new Error("A current governed RCA binding is not available yet. Run fresh analysis before creating review documents.");
+          }
+          const created = await fetchJson("/api-gateway/rag/evidence-drafts", authenticatedOptions({ method: "POST", body: JSON.stringify({ ...requiredBinding, alert_type: selectedAlertRow?.name || selectedAlertRow?.alert_name, severity: selectedAlertRow?.severity, environment: selectedAlertRow?.environment, content, services: [selectedAlertRow?.service].filter(Boolean), evidence_ids: evidenceIds, source_uris: sourceUris }) }));
           drafts = unwrap(created)?.drafts || [unwrap(created)?.draft].filter(Boolean);
           draft = unwrap(created)?.draft || drafts[0] || null;
         }

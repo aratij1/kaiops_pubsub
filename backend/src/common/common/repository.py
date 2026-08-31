@@ -9005,7 +9005,11 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 "schema_version": "kaiops.investigation-workspace.v1",
                 "binding": {
                     "incident_id": str(incident_uuid),
+                    "alert_id": str(binding.alert_id) if binding else None,
+                    "analysis_request_id": str(binding.analysis_request_id) if binding else None,
                     "snapshot_id": str(binding.context_snapshot_id) if binding else None,
+                    "context_snapshot_id": str(binding.context_snapshot_id) if binding else None,
+                    "context_fingerprint": str(binding.context_fingerprint) if binding else None,
                     "snapshot_version": int(snapshot.snapshot_version) if snapshot else 0,
                     "investigation_id": str(binding.investigation_id) if binding and binding.investigation_id else None,
                     "rca_version": int(binding.rca_version) if binding else 0,

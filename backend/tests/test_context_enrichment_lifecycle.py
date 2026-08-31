@@ -195,6 +195,9 @@ async def test_operations_state_selects_current_requirement_and_latest_job(
     workspace = state["investigation_workspace"]
     assert workspace["schema_version"] == "kaiops.investigation-workspace.v1"
     assert workspace["binding"]["incident_id"] == str(incident_id)
+    assert workspace["binding"]["analysis_request_id"] is None
+    assert workspace["binding"]["context_snapshot_id"] is None
+    assert workspace["binding"]["context_fingerprint"] is None
     assert workspace["rca"]["status"] == "not_started"
     assert workspace["resolution"]["status"] == "blocked"
     assert workspace["operator_review"]["required"] is True
