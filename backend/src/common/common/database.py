@@ -748,6 +748,60 @@ class IncidentEvidenceRecord(Base):
     collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
+class CanonicalEvidenceRecord(Base, TimestampMixin):
+    """One immutable, normalized evidence observation admitted by enrichment."""
+
+    __tablename__ = "canonical_evidence"
+    __table_args__ = (
+        Index("idx_canonical_evidence_incident", "tenant_id", "incident_id", "collected_at"),
+        Index("idx_canonical_evidence_requirement", "tenant_id", "requirement_id"),
+    )
+
+    evidence_id: Mapped[str] = mapped_column(String(68), primary_key=True)
+    requirement_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    category: Mapped[str] = mapped_column(String(32), index=True)
+    source_id: Mapped[str] = mapped_column(String(512))
+    connector: Mapped[str] = mapped_column(String(128), index=True)
+    source_reference: Mapped[str] = mapped_column(String(1536))
+    service: Mapped[str | None] = mapped_column(String(255), index=True)
+    resource: Mapped[str | None] = mapped_column(String(512))
+    project_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    observation_window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    observation_window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    freshness: Mapped[str] = mapped_column(String(16), index=True)
+    content: Mapped[dict[str, Any]] = mapped_column(JSON)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSON)
+    current_observation: Mapped[bool] = mapped_column(Boolean, default=True)
+    contradiction_status: Mapped[str | None] = mapped_column(String(32))
+    content_digest: Mapped[str] = mapped_column(String(64), index=True)
+
+
+class EvidenceRejectionRecord(Base, TimestampMixin):
+    """Machine-readable audit decision for evidence that was not admitted."""
+
+    __tablename__ = "evidence_rejections"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "attempt_key", "record_index", name="uq_evidence_rejection_attempt"),
+        Index("idx_evidence_rejection_requirement", "tenant_id", "requirement_id", "created_at"),
+    )
+
+    rejection_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    requirement_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    job_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    attempt_key: Mapped[str] = mapped_column(String(128), index=True)
+    record_index: Mapped[int] = mapped_column(Integer)
+    reason_code: Mapped[str] = mapped_column(String(128), index=True)
+    reason_detail: Mapped[str | None] = mapped_column(Text)
+    sanitized_record: Mapped[dict[str, Any]] = mapped_column(JSON)
+    source_response_metadata: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
 class FailurePatternRecord(Base):
     """Latest deterministic analysis for a recurring issue signature."""
 

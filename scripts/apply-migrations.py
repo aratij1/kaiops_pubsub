@@ -22,8 +22,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
-import re
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -35,6 +35,7 @@ MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "backend" / "database"
 _CREATE_TRACKING_TABLE = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     filename VARCHAR(255) PRIMARY KEY,
+    checksum_sha256 CHAR(64) NOT NULL,
     applied_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
@@ -69,9 +70,19 @@ def list_migration_files() -> list[Path]:
     return sorted(MIGRATIONS_DIR.glob("*.sql"), key=lambda path: path.name)
 
 
-def already_applied(cursor) -> set[str]:  # noqa: ANN001
-    cursor.execute("SELECT filename FROM schema_migrations")
-    return {row[0] for row in cursor.fetchall()}
+def ensure_checksum_column(cursor) -> None:  # noqa: ANN001
+    cursor.execute("SHOW COLUMNS FROM schema_migrations LIKE 'checksum_sha256'")
+    if cursor.fetchone() is None:
+        cursor.execute("ALTER TABLE schema_migrations ADD COLUMN checksum_sha256 CHAR(64) NULL AFTER filename")
+
+
+def already_applied(cursor) -> dict[str, str | None]:  # noqa: ANN001
+    cursor.execute("SELECT filename, checksum_sha256 FROM schema_migrations")
+    return {row[0]: row[1] for row in cursor.fetchall()}
+
+
+def migration_checksum(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def apply_migration(cursor, path: Path) -> None:  # noqa: ANN001
@@ -80,7 +91,10 @@ def apply_migration(cursor, path: Path) -> None:  # noqa: ANN001
         cursor.execute(sql)
         while cursor.nextset():
             pass
-    cursor.execute("INSERT INTO schema_migrations (filename) VALUES (%s)", (path.name,))
+    cursor.execute(
+        "INSERT INTO schema_migrations (filename, checksum_sha256) VALUES (%s, %s)",
+        (path.name, migration_checksum(path)),
+    )
 
 
 def main() -> None:
@@ -107,7 +121,21 @@ def main() -> None:
     try:
         with connection.cursor() as cursor:
             cursor.execute(_CREATE_TRACKING_TABLE)
+            ensure_checksum_column(cursor)
             applied = already_applied(cursor)
+
+            changed = [
+                path.name for path in files
+                if path.name in applied and applied[path.name] not in (None, migration_checksum(path))
+            ]
+            if changed:
+                raise RuntimeError(f"applied migration checksum mismatch: {', '.join(changed)}")
+            for path in files:
+                if path.name in applied and applied[path.name] is None:
+                    cursor.execute(
+                        "UPDATE schema_migrations SET checksum_sha256=%s WHERE filename=%s",
+                        (migration_checksum(path), path.name),
+                    )
 
             pending = [path for path in files if path.name not in applied]
             if not pending:
