@@ -2169,7 +2169,9 @@ async def reconcile_context_enrichment(
                     if (row.rca_version, row.category, row.question) not in existing_keys
                 ]
                 stalled = [
-                    EvidenceRequirement.model_validate(row) for row in existing
+                    EvidenceRequirement.model_validate({
+                        key: value for key, value in row.items() if key != "version"
+                    }) for row in existing
                     if int(row["rca_version"]) == int(candidate["rca_version"])
                     and row["status"] == "blocked"
                     and str(row["requirement_id"]) not in requested_requirement_ids
