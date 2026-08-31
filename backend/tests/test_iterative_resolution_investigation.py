@@ -26,6 +26,15 @@ def test_investigation_honors_configured_step_budget(monkeypatch: pytest.MonkeyP
     assert IterativeInvestigator(client=FakeDiscoveryClient({})).max_steps == 5
 
 
+def test_non_conclusive_full_plane_scan_still_declares_actionable_gap() -> None:
+    missing = IterativeInvestigator._ensure_actionable_gap(
+        [], {"logs", "telemetry", "topology", "dependency", "changes", "runbooks", "traces"},
+        {"independent_sources": ["telemetry"]}, status="budget_exhausted",
+    )
+
+    assert missing == ["traces"]
+
+
 def make_context(*, hypotheses: list[dict[str, Any]] | None = None) -> Context:
     alert = Alert(
         tenant_id="tenant-a",

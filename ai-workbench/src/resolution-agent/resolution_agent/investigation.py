@@ -405,6 +405,25 @@ class IterativeInvestigator:
             required.add("history")
         return required
 
+    @staticmethod
+    def _ensure_actionable_gap(
+        missing: list[str], required_sources: set[str], leading: dict[str, Any] | None,
+        status: InvestigationStatus,
+    ) -> list[str]:
+        """A non-conclusive investigation must name evidence that can advance it."""
+        if status == InvestigationStatus.CONCLUSIVE or missing:
+            return missing
+        independent = {str(item) for item in (leading or {}).get("independent_sources", [])}
+        category_by_source = {
+            "telemetry": "metrics", "changes": "change", "code": "source_code",
+            "runbooks": "runbook", "history": "ticket", "dependency": "topology",
+        }
+        priority = ("traces", "logs", "changes", "telemetry", "topology", "code", "runbooks")
+        source = next((item for item in priority if item in required_sources and item not in independent), None)
+        if source is None:
+            source = next((item for item in priority if item in required_sources), "traces")
+        return [category_by_source.get(source, source)]
+
     def _select_tool(
         self,
         *,
@@ -805,6 +824,7 @@ class IterativeInvestigator:
         required_sources = self._required_sources(context)
         missing = [source for source in required_sources if coverage.get(source, 0) == 0]
         leading = hypotheses[0] if hypotheses else None
+        missing = self._ensure_actionable_gap(missing, required_sources, leading, status)
         contradictory = list(leading.get("contradicting_evidence_ids") or []) if leading else []
         failed_steps = [step for step in steps if step.get("status") == "failed"]
         if status == InvestigationStatus.CONCLUSIVE:
