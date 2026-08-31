@@ -3121,6 +3121,26 @@ class IncidentRepository:
             or snapshot.context_fingerprint != context_fingerprint
         ):
             raise ValueError("recommendation context binding is not valid for persistence")
+        latest_snapshot_id = await self.session.scalar(
+            select(ContextSnapshotRecord.snapshot_id)
+            .where(
+                ContextSnapshotRecord.tenant_id == verified_tenant,
+                ContextSnapshotRecord.incident_id == str(recommendation.incident_id),
+            )
+            .order_by(ContextSnapshotRecord.snapshot_version.desc(), ContextSnapshotRecord.collected_at.desc())
+            .with_for_update()
+            .limit(1)
+        )
+        if latest_snapshot_id != context_snapshot_id:
+            raise ValueError("recommendation context snapshot was superseded before persistence")
+        evidence_ids = sorted({str(value) for value in metadata.get("evidence_ids") or [] if str(value).strip()})
+        if not set(evidence_ids).issubset(set(snapshot.evidence_ids or [])):
+            raise ValueError("recommendation cites evidence outside its context snapshot")
+        evidence_set_digest = "sha256:" + hashlib.sha256(
+            json.dumps(evidence_ids, separators=(",", ":")).encode()
+        ).hexdigest()
+        if str(metadata.get("evidence_set_digest") or "") != evidence_set_digest:
+            raise ValueError("recommendation evidence-set digest is invalid")
         plan = metadata.get("execution_plan") if isinstance(metadata.get("execution_plan"), dict) else {}
         values = {
             "binding_id": recommendation.id,
@@ -3131,6 +3151,13 @@ class IncidentRepository:
             "analysis_request_id": analysis_request_id,
             "context_snapshot_id": context_snapshot_id,
             "context_fingerprint": context_fingerprint,
+            "evidence_ids": evidence_ids,
+            "evidence_set_digest": evidence_set_digest,
+            "investigation_id": self._parse_uuid(metadata.get("investigation_id")),
+            "model_version": self._require("recommendation.model_version", metadata.get("model_version")),
+            "prompt_version": self._require("recommendation.prompt_version", metadata.get("prompt_version")),
+            "tool_versions": dict(metadata.get("tool_versions") or {}),
+            "generated_at": recommendation.created_at,
             "recommendation_id": recommendation.id,
             "rca_version": rca_version,
             "resolution_plan_id": self._parse_uuid(plan.get("plan_id") or plan.get("id")),
@@ -3144,11 +3171,17 @@ class IncidentRepository:
             immutable = (
                 existing.tenant_id, existing.project_id, existing.incident_id, existing.alert_id,
                 existing.analysis_request_id, existing.context_snapshot_id, existing.context_fingerprint,
-                existing.recommendation_id, existing.rca_version,
+                tuple(existing.evidence_ids or []), existing.evidence_set_digest,
+                existing.investigation_id, existing.model_version, existing.prompt_version,
+                existing.tool_versions, existing.generated_at, existing.recommendation_id, existing.rca_version,
             )
-            incoming = tuple(values[key] for key in (
+            incoming_values = dict(values)
+            incoming_values["evidence_ids"] = tuple(evidence_ids)
+            incoming = tuple(incoming_values[key] for key in (
                 "tenant_id", "project_id", "incident_id", "alert_id", "analysis_request_id",
-                "context_snapshot_id", "context_fingerprint", "recommendation_id", "rca_version",
+                "context_snapshot_id", "context_fingerprint", "evidence_ids", "evidence_set_digest",
+                "investigation_id", "model_version", "prompt_version", "tool_versions", "generated_at",
+                "recommendation_id", "rca_version",
             ))
             if immutable != incoming:
                 raise ValueError("immutable investigation binding already exists with different identities")

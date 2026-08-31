@@ -456,6 +456,16 @@ class IncidentInvestigationBindingRecord(Base):
     analysis_request_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     context_snapshot_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     context_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    evidence_set_digest: Mapped[str] = mapped_column(
+        String(71), index=True,
+        default="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    )
+    investigation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    model_version: Mapped[str] = mapped_column(String(160), default="legacy-unavailable")
+    prompt_version: Mapped[str] = mapped_column(String(160), default="legacy-unavailable")
+    tool_versions: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     recommendation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     rca_version: Mapped[int] = mapped_column(Integer)
     resolution_plan_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)

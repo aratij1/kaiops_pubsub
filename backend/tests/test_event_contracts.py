@@ -358,7 +358,11 @@ async def test_analysis_request_identity_flows_from_context_to_recommendation() 
     assert recommendation.metadata["context_fingerprint"] == first.metadata["context_fingerprint"]
     assert recommendation.metadata["rca_version"] == 1
     assert recommendation.metadata["recommendation_version"] == str(recommendation.id)
-    assert recommendation.metadata["recommendation_version"] == str(recommendation.id)
+    assert recommendation.metadata["evidence_ids"] == sorted(first.metadata.get("evidence_ids", []))
+    assert recommendation.metadata["evidence_set_digest"].startswith("sha256:")
+    assert recommendation.metadata["model_version"] == "deterministic-fallback-v1"
+    assert recommendation.metadata["prompt_version"] == "resolution-graph-v2"
+    assert recommendation.metadata["generated_at"] == recommendation.created_at.isoformat()
     plan = resolution_agent_app._apply_catalog_plan(recommendation, first)
     assert plan["rca_version"] == 1
 

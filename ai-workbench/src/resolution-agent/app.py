@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 from collections.abc import Awaitable, Callable, Coroutine
@@ -170,15 +172,32 @@ def _attach_rca_governance_binding(recommendation: Recommendation, context: Cont
     """Bind one immutable RCA generation to the context snapshot it evaluated."""
 
     context_metadata = context.metadata if isinstance(context.metadata, dict) else {}
+    runtime = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
+    evidence_ids = sorted({str(value) for value in context_metadata.get("evidence_ids") or [] if str(value).strip()})
+    model_usage = runtime.get("model_usage") if isinstance(runtime.get("model_usage"), list) else []
+    model_versions = sorted({
+        str(item.get("model") or item.get("provider") or "").strip()
+        for item in model_usage if isinstance(item, dict) and str(item.get("model") or item.get("provider") or "").strip()
+    })
+    tool_names = {
+        str(value).strip() for value in runtime.get("external_tools_used") or [] if str(value).strip()
+    }
+    iterative = runtime.get("iterative_investigation")
+    if isinstance(iterative, dict):
+        tool_names.update(str(value).strip() for value in iterative.get("tools_used") or [] if str(value).strip())
+    evidence_set_digest = "sha256:" + hashlib.sha256(
+        json.dumps(evidence_ids, separators=(",", ":")).encode()
+    ).hexdigest()
     recommendation.metadata = {
-        **(recommendation.metadata if isinstance(recommendation.metadata, dict) else {}),
+        **runtime,
         "analysis_request_id": str(context_metadata.get("analysis_request_id") or "") or None,
         "project_id": str(context_metadata.get("project_id") or context.alert.labels.get("project_id") or "default"),
         "alert_id": str(context.alert.id),
         "context_snapshot_id": str(context_metadata.get("context_snapshot_id") or "") or None,
         "context_fingerprint": str(context_metadata.get("context_fingerprint") or "") or None,
         "context_subject_fingerprint": str(context_metadata.get("context_subject_fingerprint") or "") or None,
-        "evidence_ids": list(context_metadata.get("evidence_ids") or []),
+        "evidence_ids": evidence_ids,
+        "evidence_set_digest": evidence_set_digest,
         "evidence_content_checksums": dict(context_metadata.get("evidence_content_checksums") or {}),
         "service": str(context.alert.service or ""),
         "environment": str(context.alert.environment or ""),
@@ -186,6 +205,14 @@ def _attach_rca_governance_binding(recommendation: Recommendation, context: Cont
         "change_id": str(context_metadata.get("change_id") or ""),
         "rca_version": max(1, int(context_metadata.get("rca_version") or 1)),
         "recommendation_version": str(recommendation.id),
+        "investigation_id": runtime.get("investigation_id"),
+        "model_version": ",".join(model_versions) or "deterministic-fallback-v1",
+        "prompt_version": str(runtime.get("prompt_version") or "resolution-graph-v2"),
+        "tool_versions": {
+            **{name: "contract-v1" for name in sorted(tool_names)},
+            **dict(runtime.get("tool_versions") or {}),
+        },
+        "generated_at": recommendation.created_at.isoformat(),
     }
 
 
@@ -380,6 +407,15 @@ def _validate_recommendation_snapshot_evidence(recommendation: Recommendation, s
             "code": "evidence_snapshot_mismatch",
             "message": "RCA evidence is not contained in the final investigation snapshot",
             "evidence_ids": outside,
+        })
+    ordered = sorted({str(value) for value in evidence_ids or [] if str(value).strip()})
+    expected_digest = "sha256:" + hashlib.sha256(
+        json.dumps(ordered, separators=(",", ":")).encode()
+    ).hexdigest()
+    if metadata.get("evidence_set_digest") != expected_digest:
+        raise HTTPException(status_code=409, detail={
+            "code": "evidence_digest_mismatch",
+            "message": "RCA evidence digest does not resolve to its cited evidence IDs",
         })
 
 
