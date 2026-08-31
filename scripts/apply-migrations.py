@@ -31,6 +31,7 @@ import pymysql
 from pymysql.constants import CLIENT
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "backend" / "database" / "migrations"
+BASE_SCHEMA_PATH = MIGRATIONS_DIR.parent / "schema.sql"
 
 _CREATE_TRACKING_TABLE = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -85,6 +86,11 @@ def migration_checksum(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def current_schema_version(files: list[Path] | None = None) -> str:
+    ordered = files if files is not None else list_migration_files()
+    return ordered[-1].stem if ordered else "unversioned"
+
+
 def apply_migration(cursor, path: Path) -> None:  # noqa: ANN001
     sql = path.read_text(encoding="utf-8")
     if sql.strip():
@@ -95,6 +101,19 @@ def apply_migration(cursor, path: Path) -> None:  # noqa: ANN001
         "INSERT INTO schema_migrations (filename, checksum_sha256) VALUES (%s, %s)",
         (path.name, migration_checksum(path)),
     )
+
+
+def ensure_baseline_schema(cursor, path: Path = BASE_SCHEMA_PATH) -> bool:  # noqa: ANN001
+    """Install the repository baseline only for a genuinely fresh database."""
+    cursor.execute("SHOW TABLES LIKE 'incidents'")
+    if cursor.fetchone() is not None:
+        return False
+    if not path.is_file():
+        raise RuntimeError(f"fresh database requires baseline schema: {path}")
+    cursor.execute(path.read_text(encoding="utf-8"))
+    while cursor.nextset():
+        pass
+    return True
 
 
 def main() -> None:
@@ -122,6 +141,8 @@ def main() -> None:
         with connection.cursor() as cursor:
             cursor.execute(_CREATE_TRACKING_TABLE)
             ensure_checksum_column(cursor)
+            if ensure_baseline_schema(cursor):
+                print(f"Applied fresh database baseline: {BASE_SCHEMA_PATH.name}")
             applied = already_applied(cursor)
 
             changed = [
@@ -139,7 +160,10 @@ def main() -> None:
 
             pending = [path for path in files if path.name not in applied]
             if not pending:
-                print(f"Up to date: {len(applied)} migration(s) already applied, nothing pending.")
+                print(
+                    f"Up to date: {len(applied)} migration(s) already applied, nothing pending. "
+                    f"Schema version: {current_schema_version(files)}"
+                )
                 return
 
             print(f"{len(pending)} pending migration(s) out of {len(files)} total:")
@@ -154,6 +178,7 @@ def main() -> None:
                 print(f"Applying {path.name} ...")
                 apply_migration(cursor, path)
                 print(f"Applied {path.name}")
+            print(f"Schema version: {current_schema_version(files)}")
     finally:
         connection.close()
 

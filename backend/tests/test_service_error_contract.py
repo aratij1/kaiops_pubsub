@@ -91,7 +91,8 @@ def test_build_info_exposes_safe_release_contract(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json() == {
         "service": "error-contract-test",
-        "release_sha": "abc123",
-        "build_time": "2026-08-31T11:00:00Z",
-        "contract_versions": {"context_enrichment": "kaiops.context-enrichment.v1"},
+            "release_sha": "abc123",
+            "build_time": "2026-08-31T11:00:00Z",
+            "schema_version": "20260923_schema_migration_checksums",
+            "contract_versions": {"context_enrichment": "kaiops.context-enrichment.v1"},
     }

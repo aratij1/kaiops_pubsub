@@ -22,6 +22,7 @@ COPY backend/config ./backend/config
 COPY backend/rag ./rag
 COPY scripts/remediation ./scripts/remediation
 COPY scripts/apply-migrations.py ./scripts/apply-migrations.py
+COPY backend/database/schema.sql ./backend/database/schema.sql
 COPY backend/database/migrations ./backend/database/migrations
 COPY ai-workbench/src ./ai-workbench/src
 

@@ -16,6 +16,7 @@ from common.database import create_engine, create_schema, create_session_factory
 from common.errors import install_exception_handlers, request_trace_id
 from common.event_publishers import build_event_publisher
 from common.logging import configure_logging
+from common.migration_state import current_schema_version, require_compatible_schema, schema_compatibility
 from common.telemetry import metrics_response, setup_tracing
 
 _MAX_HTTP_BODY_LOG_BYTES = 4096
@@ -96,6 +97,8 @@ def create_app(
                 app.state.db_engine = create_engine(settings)
                 app.state.session_factory = create_session_factory(app.state.db_engine)
                 await create_schema(app.state.db_engine)
+                app.state.schema_compatibility = await schema_compatibility(app.state.db_engine)
+                require_compatible_schema(app.state.schema_compatibility)
             if startup:
                 await startup(app)
         except Exception:
@@ -185,6 +188,9 @@ def create_app(
             "service": settings.service_name,
             "release_sha": os.getenv("KAIMS_RELEASE_SHA", "dev"),
             "build_time": os.getenv("KAIMS_BUILD_TIME", "unknown"),
+            "schema_version": (
+                getattr(app.state, "schema_compatibility", {}) or {}
+            ).get("schema_version", current_schema_version()),
             "contract_versions": {"context_enrichment": "kaiops.context-enrichment.v1"},
         }
 
@@ -197,8 +203,10 @@ def create_app(
             try:
                 async with engine.connect() as connection:
                     await connection.execute(text("SELECT 1"))
+                compatibility = await schema_compatibility(engine)
+                require_compatible_schema(compatibility)
             except Exception as exc:
-                raise HTTPException(status_code=503, detail="database is not ready") from exc
+                raise HTTPException(status_code=503, detail="database schema is not ready") from exc
         return {"status": "ready", "service": settings.service_name}
 
     @app.get("/metrics")

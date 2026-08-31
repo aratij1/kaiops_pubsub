@@ -65,3 +65,22 @@ def test_list_migration_files_returns_sorted_sql_files() -> None:
     assert names == sorted(names)
     assert all(name.endswith(".sql") for name in names)
     assert "20260701_user_rbac.sql" in names
+    assert module.current_schema_version(files) == files[-1].stem
+
+
+def test_migration_checksum_is_stable_and_content_sensitive(tmp_path: Path) -> None:
+    module = load_migrations_module()
+    migration = tmp_path / "20260101_example.sql"
+    migration.write_text("SELECT 1;\n", encoding="utf-8")
+    first = module.migration_checksum(migration)
+
+    assert module.migration_checksum(migration) == first
+    migration.write_text("SELECT 2;\n", encoding="utf-8")
+    assert module.migration_checksum(migration) != first
+
+
+def test_fresh_database_baseline_is_packaged() -> None:
+    module = load_migrations_module()
+
+    assert module.BASE_SCHEMA_PATH.is_file()
+    assert "CREATE TABLE IF NOT EXISTS incidents" in module.BASE_SCHEMA_PATH.read_text(encoding="utf-8")
