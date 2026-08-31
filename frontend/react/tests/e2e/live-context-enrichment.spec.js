@@ -35,6 +35,20 @@ test("authenticated operator can submit an explicit connector-unavailable observ
   await expect(responseField).toBeVisible({ timeout: 45_000 });
   await responseField.fill(response);
   await sourceField.fill(process.env.KAIOPS_LIVE_HUMAN_SOURCE || "jira://release-validation/operator-response");
-  await page.getByRole("button", { name: "Submit evidence" }).click();
+  await page.getByRole("button", { name: /Submit reviewed evidence and rerun RCA/i }).click();
   await expect(responseField).toHaveCount(0, { timeout: 45_000 });
+});
+
+test("full investigation renders the canonical backend workspace", async ({ page }, testInfo) => {
+  test.setTimeout(120_000);
+  await page.goto(`/incidents/${encodeURIComponent(incidentId)}`);
+  await page.getByLabel("Username").fill(process.env.KAIOPS_E2E_USERNAME || "admin");
+  await page.getByLabel("Password").fill(process.env.KAIOPS_E2E_PASSWORD || "Admin@123456");
+  await page.getByRole("button", { name: /sign in/i }).click();
+  await page.getByRole("button", { name: /Open full investigation/i }).click();
+  await page.getByRole("tab", { name: /Evidence, RCA, and impact/i }).click();
+  await expect(page.getByText("Governed full investigation", { exact: true })).toBeVisible({ timeout: 45_000 });
+  await expect(page.getByText(/Snapshot v\d+ · RCA v\d+/)).toBeVisible();
+  await expect(page.getByText("Canonical investigation workspace was not published", { exact: false })).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("canonical-full-investigation.png"), fullPage: true });
 });
