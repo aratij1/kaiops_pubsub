@@ -2155,8 +2155,14 @@ async def reconcile_context_enrichment(
                 existing = await repository.list_context_evidence_requirements(
                     tenant_id=request.tenant_id, incident_id=candidate["incident_id"],
                 )
-                existing_ids = {row["requirement_id"] for row in existing}
-                missing = [row for row in requirements if str(row.requirement_id) not in existing_ids]
+                existing_keys = {
+                    (int(row["rca_version"]), str(row["category"]), str(row["question"]))
+                    for row in existing
+                }
+                missing = [
+                    row for row in requirements
+                    if (row.rca_version, row.category, row.question) not in existing_keys
+                ]
                 summary["requirements_created"] += len(missing)
                 context_payload = candidate["context"] if isinstance(candidate["context"], dict) else {}
                 alert_payload = context_payload.get("alert") if isinstance(context_payload.get("alert"), dict) else {}
