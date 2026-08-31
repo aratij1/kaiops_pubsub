@@ -92,6 +92,9 @@ async function installScenario(page, options = {}) {
     missing: [],
     decision_id: "readiness-decision-1",
     signature: "hmac-sha256:signed-readiness",
+    plan_id: PLAN_ID,
+    plan_fingerprint: PLAN_FINGERPRINT,
+    recommendation_id: RECOMMENDATION_ID,
   };
   const application = {
     id: APPLICATION_ID,
@@ -176,6 +179,10 @@ async function installScenario(page, options = {}) {
       incident_id: INCIDENT_ID,
       recommendation_id: RECOMMENDATION_ID,
       status: currentIncident.status,
+      incident_investigation: {
+        readiness: { approval_ready: true, blocking_reasons: [] },
+        readiness_blocks: [],
+      },
       recommendation: {
         id: RECOMMENDATION_ID,
         metadata: governedPlanReady ? {
