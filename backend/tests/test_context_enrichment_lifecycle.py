@@ -468,6 +468,75 @@ async def test_connector_unavailable_becomes_human_request_without_stopping_othe
 
 
 @pytest.mark.asyncio
+async def test_human_request_blocks_without_real_responder_and_rejects_placeholder(
+    sqlite_session_factory,
+):
+    incident_id = uuid4()
+    requirement = build_evidence_requirements(
+        tenant_id="tenant-a", incident_id=incident_id, rca_version=1,
+        missing_evidence=["ownership"], now=datetime.now(UTC),
+    )[0]
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        await repo.upsert_context_evidence_requirements([requirement])
+        with pytest.raises(ValueError, match="placeholder"):
+            await repo.create_human_evidence_request(
+                tenant_id="tenant-a", incident_id=incident_id,
+                requirement_id=requirement.requirement_id, expected_responder="incident-owner",
+                due_at=datetime.now(UTC) + timedelta(hours=1), acceptable_format="source reference",
+                evidence_already_checked=[], hypothesis_impact="ownership",
+            )
+        blocked = await repo.create_human_evidence_request(
+            tenant_id="tenant-a", incident_id=incident_id,
+            requirement_id=requirement.requirement_id, expected_responder=None,
+            assignment_failure_reason="NO_AUTHORIZED_RESPONDER",
+            due_at=datetime.now(UTC) + timedelta(hours=1), acceptable_format="source reference",
+            evidence_already_checked=[], hypothesis_impact="ownership",
+        )
+        assert blocked.status == "assignment_blocked"
+        assert blocked.expected_responder is None
+
+
+@pytest.mark.asyncio
+async def test_human_evidence_jira_binding_is_idempotent_and_reassignment_is_synchronized(
+    sqlite_session_factory,
+):
+    incident_id = uuid4()
+    requirement = build_evidence_requirements(
+        tenant_id="tenant-a", incident_id=incident_id, rca_version=1,
+        missing_evidence=["ownership"], now=datetime.now(UTC),
+    )[0]
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        await repo.upsert_context_evidence_requirements([requirement])
+        request = await repo.create_human_evidence_request(
+            tenant_id="tenant-a", incident_id=incident_id,
+            requirement_id=requirement.requirement_id, expected_responder="account-a",
+            assignment_source="service_ownership",
+            due_at=datetime.now(UTC) + timedelta(hours=1), acceptable_format="source reference",
+            evidence_already_checked=[], hypothesis_impact="ownership",
+        )
+        values = dict(
+            tenant_id="tenant-a", incident_id=incident_id, request_id=request.request_id,
+            requirement_id=requirement.requirement_id, jira_issue_key="KAN-77",
+            jira_issue_url="https://example.atlassian.net/browse/KAN-77", jira_version="1",
+            jira_assignee_id="account-a", sync_status="synchronized",
+        )
+        first = await repo.bind_human_evidence_jira(**values)
+        second = await repo.bind_human_evidence_jira(**values)
+        assert first == second
+        synchronized = await repo.synchronize_human_evidence_jira_assignee(
+            tenant_id="tenant-a", jira_issue_key="KAN-77", jira_assignee_id="account-b",
+            jira_version="2", sync_status="synchronized",
+        )
+        assert synchronized["expected_responder"] == "account-b"
+        row = await repo.context_evidence_requirement(
+            tenant_id="tenant-a", requirement_id=requirement.requirement_id,
+        )
+        assert row["assigned_to"] == "account-b"
+
+
+@pytest.mark.asyncio
 async def test_human_response_is_tenant_scoped_and_recorded_as_assertion(sqlite_session_factory):
     incident_id = uuid4()
     requirement = EvidenceRequirement(
@@ -498,25 +567,37 @@ async def test_human_response_is_tenant_scoped_and_recorded_as_assertion(sqlite_
         await repo.upsert_context_evidence_requirements([requirement])
         await repo.create_human_evidence_request(
             tenant_id="tenant-a", incident_id=incident_id, requirement_id=requirement.requirement_id,
-            expected_responder="checkout-product-owner", due_at=datetime.now(UTC) + timedelta(hours=1),
+            expected_responder="owner-a", due_at=datetime.now(UTC) + timedelta(hours=1),
             acceptable_format="yes/no with service catalog link", evidence_already_checked=["cmdb"],
             hypothesis_impact="Changes customer-impact classification",
         )
         with pytest.raises(LookupError):
             await repo.record_human_evidence_response(
                 tenant_id="tenant-b", incident_id=incident_id, requirement_id=requirement.requirement_id,
-                response={"response": "yes", "responder_id": "owner-a", "responded_at": datetime.now(UTC).isoformat()},
+                response={"response": "yes", "responder_id": "owner-a", "responded_at": datetime.now(UTC).isoformat(),
+                          "source_reference": "service-catalog://checkout"},
+            )
+        with pytest.raises(PermissionError, match="not assigned"):
+            await repo.record_human_evidence_response(
+                tenant_id="tenant-a", incident_id=incident_id,
+                requirement_id=requirement.requirement_id,
+                response={
+                    "response": "yes", "responder_id": "owner-b",
+                    "responded_at": datetime.now(UTC).isoformat(),
+                    "source_reference": "service-catalog://checkout",
+                },
             )
         recorded = await repo.record_human_evidence_response(
             tenant_id="tenant-a", incident_id=incident_id, requirement_id=requirement.requirement_id,
-            response={"response": "yes", "responder_id": "owner-a", "responded_at": datetime.now(UTC).isoformat()},
+            response={"response": "yes", "responder_id": "owner-a", "responded_at": datetime.now(UTC).isoformat(),
+                      "source_reference": "service-catalog://checkout"},
         )
-        assert recorded["evidence_id"].startswith("HUMAN-")
+        assert recorded["evidence_id"].startswith("EVD-")
         assert recorded["context_snapshot_id"] is not None
         gaps = await repo.list_context_evidence_requirements(
             tenant_id="tenant-a", incident_id=incident_id,
         )
-        assert gaps[0]["status"] == "answered"
+        assert gaps[0]["status"] == "collected"
         assert gaps[0]["evidence_ids"] == [recorded["evidence_id"]]
         latest = (await session.execute(
             select(ContextSnapshotRecord).where(
@@ -526,6 +607,13 @@ async def test_human_response_is_tenant_scoped_and_recorded_as_assertion(sqlite_
         )).scalars().first()
         assert latest.snapshot_version == 2
         assert latest.parent_snapshot_id == snapshot_id
+        canonical = await session.get(CanonicalEvidenceRecord, recorded["evidence_id"])
+        assert canonical.category == "tickets"
+        assert canonical.source_reference == "service-catalog://checkout"
+        outbox = await session.get(
+            ResolutionOutboxRecord, f"context-human-enriched:{incident_id}:{latest.snapshot_id}",
+        )
+        assert outbox is not None
 
 
 @pytest.mark.asyncio

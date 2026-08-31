@@ -167,6 +167,7 @@ class Settings(BaseSettings):
     context_reconciliation_interval_seconds: float = Field(default=30.0, alias="CONTEXT_RECONCILIATION_INTERVAL_SECONDS")
     context_reconciliation_lease_seconds: int = Field(default=120, alias="CONTEXT_RECONCILIATION_LEASE_SECONDS")
     context_reconciliation_batch_size: int = Field(default=100, alias="CONTEXT_RECONCILIATION_BATCH_SIZE")
+    jira_polling_enabled: bool = Field(default=False, alias="JIRA_POLLING_ENABLED")
     resolution_outbox_batch_size: int = Field(default=100, alias="RESOLUTION_OUTBOX_BATCH_SIZE")
     resolution_outbox_poll_seconds: float = Field(default=5.0, alias="RESOLUTION_OUTBOX_POLL_SECONDS")
     resolution_outbox_initial_delay_seconds: float = Field(default=60.0, alias="RESOLUTION_OUTBOX_INITIAL_DELAY_SECONDS")

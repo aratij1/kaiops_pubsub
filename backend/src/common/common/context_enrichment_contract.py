@@ -436,7 +436,9 @@ class HitlRoutingConfiguration(BaseModel):
     @classmethod
     def reject_placeholder_assignees(cls, value: str) -> str:
         normalized = str(value or "").strip()
-        if not normalized or normalized.lower() in {"admin", "operator", "unknown"}:
+        if not normalized or normalized.lower() in {
+            "admin", "operator", "unknown", "incident-owner", "incident_owner", "unassigned",
+        }:
             raise ValueError("HITL assignees must be explicit governed identities")
         return normalized
 
@@ -449,6 +451,7 @@ class HitlAssignment(BaseModel):
     assignee: str
     assignment_type: Literal["user", "group"]
     source: Literal[
+        "incident_assignment",
         "service_owner",
         "environment_support",
         "application_support",
@@ -477,6 +480,20 @@ class HumanEvidenceResponse(BaseModel):
     responder_id: str = Field(min_length=1, max_length=255)
     source_reference: str | None = Field(default=None, max_length=1536)
     responded_at: datetime
+
+
+class HumanEvidenceJiraRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    incident_id: UUID
+    request_id: UUID
+    requirement_id: UUID
+    assignee_id: str = Field(min_length=1, max_length=255)
+    due_at: datetime
+    requested_evidence: str = Field(min_length=1, max_length=4000)
+    reason: str = Field(min_length=1, max_length=4000)
+    kaims_deep_link: str = Field(pattern=r"^https?://", max_length=1536)
 
 
 _REQUIREMENT_CONNECTORS: dict[str, list[str]] = {

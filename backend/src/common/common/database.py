@@ -1795,7 +1795,9 @@ class HumanEvidenceRequestRecord(Base, TimestampMixin):
     tenant_id: Mapped[str] = mapped_column(String(128), index=True)
     incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     requirement_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
-    expected_responder: Mapped[str] = mapped_column(String(255), index=True)
+    expected_responder: Mapped[str | None] = mapped_column(String(255), index=True)
+    assignment_source: Mapped[str | None] = mapped_column(String(64), index=True)
+    assignment_failure_reason: Mapped[str | None] = mapped_column(String(512))
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     acceptable_format: Mapped[str] = mapped_column(String(512))
     investigation_can_continue: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -1803,6 +1805,11 @@ class HumanEvidenceRequestRecord(Base, TimestampMixin):
     hypothesis_impact: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), index=True, default="pending")
     response_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    jira_issue_key: Mapped[str | None] = mapped_column(String(64), index=True)
+    jira_issue_url: Mapped[str | None] = mapped_column(String(1536))
+    jira_version: Mapped[str | None] = mapped_column(String(64))
+    jira_assignee_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    jira_sync_status: Mapped[str | None] = mapped_column(String(32), index=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
 
 

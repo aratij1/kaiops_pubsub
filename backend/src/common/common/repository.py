@@ -25,6 +25,7 @@ from common.database import (
     ApplicationLabelRecord,
     ApplicationRecord,
     ApprovalRecord,
+    ApprovalAssignmentRecord,
     AuditLogRecord,
     ContextEnrichmentJobRecord,
     ContextEvidenceRequirementRecord,
@@ -8505,8 +8506,15 @@ class ContextEnrichmentRepository(EvaluationRepository):
             "human_requests": [{
                 "request_id": str(row.request_id), "requirement_id": str(row.requirement_id),
                 "expected_responder": row.expected_responder, "due_at": row.due_at,
+                "assignment_source": row.assignment_source,
+                "assignment_failure_reason": row.assignment_failure_reason,
                 "acceptable_format": row.acceptable_format, "status": row.status,
                 "investigation_can_continue": row.investigation_can_continue,
+                "jira": {
+                    "issue_key": row.jira_issue_key, "url": row.jira_issue_url,
+                    "version": row.jira_version, "assignee_id": row.jira_assignee_id,
+                    "sync_status": row.jira_sync_status,
+                } if row.jira_issue_key else None,
                 "updated_at": row.updated_at,
             } for row in requests],
         }
@@ -9206,9 +9214,10 @@ class ContextEnrichmentRepository(EvaluationRepository):
 
     async def create_human_evidence_request(
         self, *, tenant_id: str, incident_id: UUID | str, requirement_id: UUID | str,
-        expected_responder: str, due_at: datetime, acceptable_format: str,
+        expected_responder: str | None, due_at: datetime, acceptable_format: str,
         evidence_already_checked: list[str], hypothesis_impact: str,
-        investigation_can_continue: bool = True,
+        investigation_can_continue: bool = True, assignment_source: str | None = None,
+        assignment_failure_reason: str | None = None,
     ) -> HumanEvidenceRequestRecord:
         tenant = require_tenant_id(tenant_id, source="human evidence request")
         requirement_uuid = self._to_uuid(requirement_id)
@@ -9218,23 +9227,202 @@ class ContextEnrichmentRepository(EvaluationRepository):
         ))).scalar_one_or_none()
         if existing is not None:
             return existing
+        responder = str(expected_responder or "").strip() or None
+        placeholders = {"incident-owner", "incident_owner", "unassigned", "admin", "operator", "unknown"}
+        if responder and responder.lower() in placeholders:
+            raise ValueError("placeholder HITL responder is not actionable")
+        blocked = responder is None
         row = HumanEvidenceRequestRecord(
             tenant_id=tenant, incident_id=self._to_uuid(incident_id), requirement_id=requirement_uuid,
-            expected_responder=self._require("expected_responder", expected_responder), due_at=due_at,
+            expected_responder=responder, due_at=due_at,
+            assignment_source=assignment_source,
+            assignment_failure_reason=(
+                str(assignment_failure_reason or "NO_AUTHORIZED_RESPONDER")[:512] if blocked else None
+            ),
             acceptable_format=self._require("acceptable_format", acceptable_format),
             investigation_can_continue=investigation_can_continue,
             evidence_already_checked=list(evidence_already_checked),
             hypothesis_impact=self._require("hypothesis_impact", hypothesis_impact),
-            status="pending", response_payload={}, version=1,
+            status="assignment_blocked" if blocked else "pending", response_payload={},
+            jira_sync_status=None if blocked else "pending", version=1,
         )
         self.session.add(row)
         requirement = await self.session.get(ContextEvidenceRequirementRecord, requirement_uuid)
         if requirement is not None and requirement.tenant_id == tenant:
-            requirement.status = "human_requested"
-            requirement.assigned_to = expected_responder
+            requirement.status = "assignment_blocked" if blocked else "human_requested"
+            requirement.assigned_to = responder
             requirement.version += 1
         await self.session.flush()
         return row
+
+    async def resolve_human_evidence_responder(
+        self, *, tenant_id: str, incident_id: UUID | str,
+    ) -> dict[str, str] | None:
+        """Resolve a real responder in governed precedence order."""
+        tenant = require_tenant_id(tenant_id, source="human evidence responder")
+        incident_uuid = self._to_uuid(incident_id)
+        projection = await self.session.scalar(select(IncidentProjectionRecord).where(
+            IncidentProjectionRecord.tenant_id == tenant,
+            IncidentProjectionRecord.incident_id == incident_uuid,
+        ))
+        candidates: list[tuple[Any, str]] = []
+        if projection is not None:
+            candidates.append((projection.owner, "incident_assignment"))
+        assignment = await self.session.scalar(select(ApprovalAssignmentRecord).where(
+            ApprovalAssignmentRecord.tenant_id == tenant,
+            ApprovalAssignmentRecord.incident_id == str(incident_uuid),
+            ApprovalAssignmentRecord.status.in_(("assigned", "active")),
+        ).order_by(ApprovalAssignmentRecord.updated_at.desc()).limit(1))
+        if assignment is not None:
+            candidates.append((assignment.assignee, "incident_assignment"))
+        service = str(getattr(projection, "service", None) or "").strip()
+        if service:
+            application = await self.session.scalar(select(ApplicationRecord).where(
+                ApplicationRecord.tenant_id == tenant,
+                ApplicationRecord.name == service,
+                ApplicationRecord.status.in_(("registered", "active", "ready")),
+            ).order_by(ApplicationRecord.updated_at.desc()).limit(1))
+            if application is not None:
+                candidates.append((application.owner_email, "service_ownership"))
+                candidates.append((application.owner_team, "service_ownership"))
+            onboarding = await self.session.scalar(select(OnboardingStateRecord).where(
+                OnboardingStateRecord.tenant_id == tenant,
+                OnboardingStateRecord.project_name == service,
+            ).order_by(OnboardingStateRecord.updated_at.desc()).limit(1))
+            if onboarding is not None:
+                candidates.append((onboarding.owner_team, "service_onboarding"))
+        control = await self.session.scalar(select(OnboardingControlPlaneRecord).where(
+            OnboardingControlPlaneRecord.tenant_id == tenant,
+            OnboardingControlPlaneRecord.status.in_(("ACTIVE", "COMPLETED", "READY")),
+        ).order_by(OnboardingControlPlaneRecord.updated_at.desc()).limit(1))
+        payload = dict(control.payload or {}) if control and isinstance(control.payload, dict) else {}
+        candidates.extend([
+            (payload.get("escalation_responder") or payload.get("escalation_manager"), "escalation_policy"),
+            (payload.get("default_responder") or payload.get("default_approver_group"), "tenant_default"),
+        ])
+        placeholders = {"", "incident-owner", "incident_owner", "unassigned", "admin", "operator", "unknown"}
+        for value, source in candidates:
+            identity = str(value or "").strip()
+            if identity.lower() not in placeholders:
+                return {"identity": identity, "source": source}
+        return None
+
+    async def claim_human_evidence_jira_requests(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        now = datetime.now(UTC)
+        statement = select(HumanEvidenceRequestRecord).where(
+            HumanEvidenceRequestRecord.status == "pending",
+            HumanEvidenceRequestRecord.expected_responder.is_not(None),
+            or_(
+                HumanEvidenceRequestRecord.jira_sync_status.in_(("pending", "failed")),
+                and_(
+                    HumanEvidenceRequestRecord.jira_sync_status == "syncing",
+                    HumanEvidenceRequestRecord.updated_at < now - timedelta(minutes=5),
+                ),
+            ),
+        ).order_by(HumanEvidenceRequestRecord.created_at, HumanEvidenceRequestRecord.request_id).limit(
+            max(1, min(int(limit), 100))
+        )
+        if self.session.bind and self.session.bind.dialect.name != "sqlite":
+            statement = statement.with_for_update(skip_locked=True)
+        rows = (await self.session.execute(statement)).scalars().all()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            requirement = await self.session.get(ContextEvidenceRequirementRecord, row.requirement_id)
+            row.jira_sync_status = "syncing"
+            row.version = int(row.version or 0) + 1
+            result.append({
+                "tenant_id": row.tenant_id, "incident_id": str(row.incident_id),
+                "request_id": str(row.request_id), "requirement_id": str(row.requirement_id),
+                "assignee_id": row.expected_responder, "due_at": row.due_at,
+                "requested_evidence": requirement.question if requirement else row.acceptable_format,
+                "reason": requirement.reason if requirement else row.hypothesis_impact,
+            })
+        await self.session.flush()
+        return result
+
+    async def fail_human_evidence_jira_sync(self, *, request_id: UUID | str, error: str) -> None:
+        row = await self.session.get(HumanEvidenceRequestRecord, self._to_uuid(request_id))
+        if row is not None and row.jira_sync_status != "synchronized":
+            row.jira_sync_status = "failed"
+            row.assignment_failure_reason = f"JIRA_SYNC_FAILED:{str(error)[:450]}"
+            row.version = int(row.version or 0) + 1
+
+    async def bind_human_evidence_jira(
+        self, *, tenant_id: str, incident_id: UUID | str, request_id: UUID | str,
+        requirement_id: UUID | str, jira_issue_key: str, jira_issue_url: str,
+        jira_version: str | None, jira_assignee_id: str, sync_status: str,
+    ) -> dict[str, Any]:
+        tenant = require_tenant_id(tenant_id, source="human evidence Jira binding")
+        row = await self.session.scalar(select(HumanEvidenceRequestRecord).where(
+            HumanEvidenceRequestRecord.request_id == self._to_uuid(request_id),
+            HumanEvidenceRequestRecord.requirement_id == self._to_uuid(requirement_id),
+            HumanEvidenceRequestRecord.incident_id == self._to_uuid(incident_id),
+            HumanEvidenceRequestRecord.tenant_id == tenant,
+        ).with_for_update())
+        if row is None:
+            raise LookupError("human evidence request not found")
+        if not row.expected_responder or row.expected_responder.casefold() != jira_assignee_id.casefold():
+            raise ValueError("Jira assignee does not match the governed responder")
+        key = self._require("jira_issue_key", jira_issue_key)
+        if row.jira_issue_key and row.jira_issue_key != key:
+            raise ValueError("human evidence request is already bound to another Jira issue")
+        row.jira_issue_key = key
+        row.jira_issue_url = self._require("jira_issue_url", jira_issue_url)
+        row.jira_version = str(jira_version or "").strip() or None
+        row.jira_assignee_id = jira_assignee_id
+        row.jira_sync_status = self._require("jira_sync_status", sync_status)
+        requirement = await self.session.get(ContextEvidenceRequirementRecord, row.requirement_id)
+        if requirement is not None and requirement.tenant_id == tenant:
+            requirement.jira_issue_key = key
+        await self.session.flush()
+        return {
+            "request_id": str(row.request_id), "requirement_id": str(row.requirement_id),
+            "jira_issue_key": key, "jira_issue_url": row.jira_issue_url,
+            "jira_version": row.jira_version, "jira_assignee_id": row.jira_assignee_id,
+            "jira_sync_status": row.jira_sync_status,
+        }
+
+    async def synchronize_human_evidence_jira_assignee(
+        self, *, tenant_id: str, jira_issue_key: str, jira_assignee_id: str,
+        jira_version: str | None, sync_status: str,
+    ) -> dict[str, Any]:
+        tenant = require_tenant_id(tenant_id, source="human evidence Jira synchronization")
+        row = await self.session.scalar(select(HumanEvidenceRequestRecord).where(
+            HumanEvidenceRequestRecord.tenant_id == tenant,
+            HumanEvidenceRequestRecord.jira_issue_key == jira_issue_key,
+        ).with_for_update())
+        if row is None:
+            raise LookupError("human evidence Jira request not found")
+        if row.status != "pending":
+            raise ValueError("completed human evidence request cannot be reassigned")
+        row.expected_responder = self._require("jira_assignee_id", jira_assignee_id)
+        row.jira_assignee_id = jira_assignee_id
+        row.jira_version = str(jira_version or "").strip() or None
+        row.jira_sync_status = self._require("jira_sync_status", sync_status)
+        row.assignment_source = "jira_reassignment"
+        row.version = int(row.version or 0) + 1
+        requirement = await self.session.get(ContextEvidenceRequirementRecord, row.requirement_id)
+        if requirement is not None and requirement.tenant_id == tenant:
+            requirement.assigned_to = jira_assignee_id
+            requirement.version = int(requirement.version or 0) + 1
+        return {"request_id": str(row.request_id), "expected_responder": row.expected_responder,
+                "jira_issue_key": jira_issue_key, "jira_sync_status": row.jira_sync_status}
+
+    async def human_evidence_request_by_jira(
+        self, *, tenant_id: str, jira_issue_key: str,
+    ) -> dict[str, Any] | None:
+        tenant = require_tenant_id(tenant_id, source="human evidence Jira lookup")
+        row = await self.session.scalar(select(HumanEvidenceRequestRecord).where(
+            HumanEvidenceRequestRecord.tenant_id == tenant,
+            HumanEvidenceRequestRecord.jira_issue_key == jira_issue_key,
+        ))
+        if row is None:
+            return None
+        return {
+            "request_id": str(row.request_id), "incident_id": str(row.incident_id),
+            "requirement_id": str(row.requirement_id), "status": row.status,
+            "expected_responder": row.expected_responder, "jira_version": row.jira_version,
+        }
 
     async def record_human_evidence_response(
         self, *, tenant_id: str, incident_id: UUID | str, requirement_id: UUID | str,
@@ -9251,17 +9439,60 @@ class ContextEnrichmentRepository(EvaluationRepository):
         if request is None:
             raise LookupError("human evidence request not found")
         responder = self._require("responder_id", response.get("responder_id"))
-        response_identity = (
-            f"{tenant}:{requirement_uuid}:{responder}:{response.get('responded_at')}"
+        if not request.expected_responder or request.status == "assignment_blocked":
+            raise ValueError("human evidence request has no authorized responder")
+        if responder.casefold() != request.expected_responder.casefold():
+            raise PermissionError("authenticated responder is not assigned to this evidence request")
+        if request.status == "answered" and request.response_payload.get("evidence_id"):
+            return {
+                "request_id": str(request.request_id),
+                "evidence_id": str(request.response_payload["evidence_id"]),
+                "context_snapshot_id": request.response_payload.get("context_snapshot_id"),
+                "status": "answered", "idempotent": True,
+            }
+        source_reference = str(response.get("source_reference") or "").strip()
+        if not source_reference:
+            raise ValueError("human evidence requires a governed source reference")
+        responded_at = response.get("responded_at")
+        observed_at = responded_at if isinstance(responded_at, datetime) else datetime.fromisoformat(
+            str(responded_at).replace("Z", "+00:00")
         )
-        evidence_id = f"HUMAN-{uuid5(NAMESPACE_URL, response_identity)}"
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=UTC)
+        content = {
+            "assertion": self._require("human_evidence.response", response.get("response")),
+            "requirement_category": requirement.category if (requirement := await self.session.get(
+                ContextEvidenceRequirementRecord, requirement_uuid,
+            )) is not None else "unknown",
+            "question": requirement.question if requirement is not None else "",
+        }
+        identity = json.dumps({
+            "tenant_id": tenant, "incident_id": str(incident_uuid),
+            "requirement_id": str(requirement_uuid), "connector": "human-response",
+            "source_reference": source_reference, "responder": responder,
+            "content_digest": hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest(),
+        }, sort_keys=True, separators=(",", ":"))
+        evidence_id = f"EVD-{hashlib.sha256(identity.encode()).hexdigest()}"
+        if requirement is None or requirement.tenant_id != tenant:
+            raise LookupError("evidence requirement not found")
+        if await self.session.get(CanonicalEvidenceRecord, evidence_id) is None:
+            self.session.add(CanonicalEvidenceRecord(
+                evidence_id=evidence_id, requirement_id=requirement_uuid,
+                tenant_id=tenant, incident_id=incident_uuid, category="tickets",
+                source_id=f"human:{responder}", connector="human-response",
+                source_reference=source_reference, service=None, resource=str(request.request_id),
+                project_id=None, observed_at=observed_at, collected_at=datetime.now(UTC),
+                observation_window_start=None, observation_window_end=None, freshness="fresh",
+                content=content, provenance={
+                    "responder_id": responder, "request_id": str(request.request_id),
+                    "retrieval": "authenticated-human-submission",
+                }, current_observation=True, contradiction_status=None,
+                content_digest=hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest(),
+            ))
         request.response_payload = {**dict(response), "source_type": "human_assertion", "evidence_id": evidence_id}
         request.status = "answered"
         request.version += 1
-        requirement = await self.session.get(ContextEvidenceRequirementRecord, requirement_uuid)
-        if requirement is None or requirement.tenant_id != tenant:
-            raise LookupError("evidence requirement not found")
-        requirement.status = "answered"
+        requirement.status = "collected"
         requirement.evidence_ids = list(dict.fromkeys([*(requirement.evidence_ids or []), evidence_id]))
         requirement.version += 1
         previous_snapshot = (await self.session.execute(
@@ -9275,35 +9506,48 @@ class ContextEnrichmentRepository(EvaluationRepository):
             snapshot_payload = json.loads(json.dumps(previous_snapshot.payload or {}, default=str))
             metadata = snapshot_payload.setdefault("metadata", {})
             evidence = metadata.setdefault("context_evidence", {})
-            assertions = evidence.setdefault("human_assertion", [])
+            assertions = evidence.setdefault("tickets", [])
             assertions.append({
-                "evidence_id": evidence_id, "source_type": "human_assertion",
-                "responder_id": responder, "responded_at": response.get("responded_at"),
-                "content": response.get("response"),
-                "source_reference": response.get("source_reference"),
+                "evidence_id": evidence_id, "requirement_id": str(requirement_uuid),
+                "tenant_id": tenant, "incident_id": str(incident_uuid), "category": "tickets",
+                "source_id": f"human:{responder}", "connector": "human-response",
+                "source_reference": source_reference, "observed_at": observed_at.isoformat(),
+                "collected_at": datetime.now(UTC).isoformat(), "freshness": "fresh",
+                "content": content, "provenance": {"responder_id": responder},
+                "current_observation": True,
+            })
+            new_snapshot_id = uuid4()
+            new_snapshot_version = int(previous_snapshot.snapshot_version or 0) + 1
+            new_evidence_ids = list(dict.fromkeys([*(previous_snapshot.evidence_ids or []), evidence_id]))
+            metadata.update({
+                "context_snapshot_id": str(new_snapshot_id),
+                "snapshot_stage": "human_enriched", "snapshot_version": new_snapshot_version,
+                "evidence_ids": new_evidence_ids,
             })
             fingerprint = hashlib.sha256(
                 json.dumps(snapshot_payload, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
+            metadata["context_fingerprint"] = fingerprint
             previous_expiry = previous_snapshot.expires_at
             if previous_expiry.tzinfo is None:
                 previous_expiry = previous_expiry.replace(tzinfo=UTC)
             snapshot = ContextSnapshotRecord(
-                tenant_id=tenant, incident_id=str(incident_uuid),
+                snapshot_id=new_snapshot_id, tenant_id=tenant, incident_id=str(incident_uuid),
                 source_incident_id=previous_snapshot.source_incident_id,
                 alert_signature=previous_snapshot.alert_signature,
                 subject_fingerprint=previous_snapshot.subject_fingerprint,
                 context_fingerprint=fingerprint, parent_snapshot_id=previous_snapshot.snapshot_id,
                 snapshot_stage="human_enriched",
-                snapshot_version=int(previous_snapshot.snapshot_version or 0) + 1,
-                evidence_ids=list(dict.fromkeys([*(previous_snapshot.evidence_ids or []), evidence_id])),
+                snapshot_version=new_snapshot_version, evidence_ids=new_evidence_ids,
                 evidence_checksums={
                     **dict(previous_snapshot.evidence_checksums or {}),
                     evidence_id: hashlib.sha256(str(response.get("response") or "").encode()).hexdigest(),
                 },
                 contract_version=previous_snapshot.contract_version,
                 quality_score=previous_snapshot.quality_score, reusable=False,
-                source_manifest={**dict(previous_snapshot.source_manifest or {}), "human_assertion": True},
+                source_manifest={**dict(previous_snapshot.source_manifest or {}), "tickets": {
+                    "connector": "human-response", "source_reference": source_reference,
+                }},
                 payload=snapshot_payload, collected_at=datetime.now(UTC),
                 expires_at=max(previous_expiry, datetime.now(UTC) + timedelta(hours=1)),
             )
@@ -9317,6 +9561,16 @@ class ContextEnrichmentRepository(EvaluationRepository):
             ))).scalars().all()
             for binding in bindings:
                 binding.status = "invalidated"
+            recommendation_ids = [binding.recommendation_id for binding in bindings]
+            approvals = (await self.session.execute(select(ApprovalRecord).where(
+                ApprovalRecord.tenant_id == tenant,
+                ApprovalRecord.incident_id == incident_uuid,
+                ApprovalRecord.recommendation_id.in_(recommendation_ids),
+            ))).scalars().all() if recommendation_ids else []
+            for approval in approvals:
+                approval.decision = "stale"
+                approval.payload = {**dict(approval.payload or {}),
+                                    "invalidated_by_context_snapshot_id": str(snapshot_id)}
             jira_bindings = (await self.session.execute(select(JiraIncidentBindingRecord).where(
                 JiraIncidentBindingRecord.tenant_id == tenant,
                 JiraIncidentBindingRecord.incident_id == incident_uuid,
@@ -9324,6 +9578,21 @@ class ContextEnrichmentRepository(EvaluationRepository):
             ))).scalars().all()
             for jira_binding in jira_bindings:
                 jira_binding.status = "stale"
+            outbox_event_id = f"context-human-enriched:{incident_uuid}:{snapshot.snapshot_id}"
+            self.session.add(ResolutionOutboxRecord(
+                event_id=outbox_event_id, tenant_id=tenant, aggregate_id=str(incident_uuid),
+                topic="context-events", partition_key=str(incident_uuid),
+                payload={
+                    "context": snapshot_payload,
+                    "incident": {"id": str(incident_uuid), "tenant_id": tenant},
+                    "decision": {"context_snapshot_id": str(snapshot.snapshot_id), "human_evidence": True},
+                    "transport": "outbox", "event_contract": {"event_id": outbox_event_id},
+                }, status="pending", attempts=0, next_attempt_at=datetime.now(UTC),
+            ))
+            request.response_payload = {
+                **request.response_payload, "context_snapshot_id": str(snapshot.snapshot_id),
+                "outbox_event_id": outbox_event_id,
+            }
         self.session.add(AuditLogRecord(
             tenant_id=tenant, actor=responder, action="context.human-evidence.recorded",
             resource_type="incident", resource_id=str(incident_uuid),
@@ -9335,6 +9604,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
         return {
             "request_id": str(request.request_id), "evidence_id": evidence_id,
             "context_snapshot_id": str(snapshot_id) if snapshot_id else None, "status": "answered",
+            "idempotent": False,
         }
 
     @staticmethod

@@ -38,6 +38,25 @@ async def test_hitl_request_resolves_exact_service_owner_and_sla():
     assert assignment.due_at <= datetime.now(UTC) + timedelta(minutes=16)
 
 
+@pytest.mark.asyncio
+async def test_incident_assignment_precedes_service_owner_and_placeholder_is_rejected():
+    incident_id = uuid4()
+    assignment = await resolve_hitl_assignee(
+        "tenant-a", SimpleNamespace(id=incident_id), "evidence", "critical",
+        routing=routing(), incident_assignee="incident-user-account-id",
+    )
+    assert assignment.assignee == "incident-user-account-id"
+    assert assignment.source == "incident_assignment"
+    with pytest.raises(ValueError, match="No governed HITL assignee"):
+        await resolve_hitl_assignee(
+            "tenant-a", SimpleNamespace(id=incident_id), "evidence", "critical",
+            routing=routing().model_copy(update={
+                "service_owner": "incident-owner", "l2_group": "unknown",
+                "l3_group": "operator", "fallback_assignment_group": "unassigned",
+            }),
+        )
+
+
 async def seed_identity(session):
     now = datetime.now(UTC)
     incident_id, alert_id, analysis_id = uuid4(), uuid4(), uuid4()

@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlparse
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+import httpx
 from ai_workbench_common.models import Context
 from common.config import get_settings
 from common.context_enrichment_contract import (
@@ -1089,6 +1090,40 @@ async def _context_reconciliation_loop(app: FastAPI) -> None:
         await asyncio.sleep(interval)
 
 
+async def _human_evidence_jira_sync_loop(app: FastAPI) -> None:
+    """Deliver durable assigned evidence requests to the Jira integration."""
+    endpoint = f"{str(settings.monitoring_adapter_url).rstrip('/')}/api/v1/jira/evidence-requests"
+    ui_base = os.getenv("KAIMS_UI_BASE_URL", "http://localhost").rstrip("/")
+    while True:
+        try:
+            async with app.state.session_factory() as session:
+                rows = await ContextEnrichmentRepository(session).claim_human_evidence_jira_requests(limit=20)
+                await session.commit()
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                for row in rows:
+                    try:
+                        response = await client.post(endpoint, json={
+                            **row,
+                            "due_at": row["due_at"].isoformat(),
+                            "kaims_deep_link": f"{ui_base}/incidents/{row['incident_id']}",
+                        })
+                        response.raise_for_status()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning("human evidence Jira synchronization failed request_id=%s", row["request_id"])
+                        async with app.state.session_factory() as session:
+                            await ContextEnrichmentRepository(session).fail_human_evidence_jira_sync(
+                                request_id=row["request_id"], error=type(exc).__name__,
+                            )
+                            await session.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("human evidence Jira synchronization scan failed")
+        await asyncio.sleep(10.0)
+
+
 async def startup(app: FastAPI) -> None:
     if settings.database_enabled:
         try:
@@ -1126,6 +1161,10 @@ async def startup(app: FastAPI) -> None:
     if settings.context_reconciliation_enabled:
         tasks.append(asyncio.create_task(
             _context_reconciliation_loop(app), name="context-agent-enrichment-reconciler",
+        ))
+    if settings.jira_polling_enabled:
+        tasks.append(asyncio.create_task(
+            _human_evidence_jira_sync_loop(app), name="context-agent-human-evidence-jira-sync",
         ))
 
     index_consumer = RabbitMQConsumer(settings, GOVERNED_RAG_APPROVED_TOPIC)
@@ -2332,16 +2371,36 @@ async def _reconcile_context_enrichment_tenant(
                                 observation_end=window_end,
                             )
                         else:
+                            assignment = await repository.resolve_human_evidence_responder(
+                                tenant_id=request.tenant_id, incident_id=incident.id,
+                            )
                             await repository.create_human_evidence_request(
                                 tenant_id=request.tenant_id, incident_id=incident.id,
                                 requirement_id=requirement.requirement_id,
-                                expected_responder="incident-owner",
+                                expected_responder=assignment["identity"] if assignment else None,
+                                assignment_source=assignment["source"] if assignment else None,
+                                assignment_failure_reason=None if assignment else "NO_AUTHORIZED_RESPONDER",
                                 due_at=datetime.now(UTC) + timedelta(hours=1),
                                 acceptable_format="A source reference and a concise factual observation.",
                                 evidence_already_checked=requirement.candidate_connectors,
                                 hypothesis_impact=requirement.reason,
                                 investigation_can_continue=True,
                             )
+                            if assignment is None:
+                                event_id = f"hitl-assignment-blocked:{requirement.requirement_id}"
+                                await repository.enqueue_resolution_event(
+                                    event_id=event_id, tenant_id=request.tenant_id,
+                                    aggregate_id=str(incident.id), topic="human-evidence-assignment-events",
+                                    partition_key=str(incident.id), available_after_seconds=0,
+                                    payload={
+                                        "schema_version": "kaiops.hitl-assignment.v1",
+                                        "event_id": event_id, "tenant_id": request.tenant_id,
+                                        "incident_id": str(incident.id),
+                                        "requirement_id": str(requirement.requirement_id),
+                                        "status": "ASSIGNMENT_BLOCKED",
+                                        "reason": "NO_AUTHORIZED_RESPONDER",
+                                    },
+                                )
             except Exception as exc:
                 summary["errors"].append({"incident_id": candidate["incident_id"], "error": str(exc)[:500]})
         if request.dry_run:
@@ -2385,6 +2444,14 @@ async def respond_to_context_gap(
             )
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail={
+                "code": "responder_not_authorized", "message": str(exc),
+            }) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "human_evidence_rejected", "message": str(exc),
+            }) from exc
         await session.commit()
     return result
 

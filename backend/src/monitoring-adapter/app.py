@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import heapq
 import json
@@ -23,7 +22,13 @@ from ai_workbench_common.prompts import PROMPT_SUMMARIZE_RCA
 from common.ai_layer_client import AiLayerClient
 from common.config import get_settings
 from common.database import create_engine, create_schema, create_session_factory
-from common.context_enrichment_contract import HitlJiraRequest, JiraClosureRequest, JiraRegressionRequest, TicketClosurePolicy
+from common.context_enrichment_contract import (
+    HitlJiraRequest,
+    HumanEvidenceJiraRequest,
+    JiraClosureRequest,
+    JiraRegressionRequest,
+    TicketClosurePolicy,
+)
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.logging import get_logger
 from common.models import (
@@ -5393,6 +5398,44 @@ async def create_hitl_jira_assignment(request: HitlJiraRequest) -> dict[str, Any
             "assignment": assignment.model_dump(mode="json"), "binding": binding}
 
 
+@app.post("/api/v1/jira/evidence-requests")
+async def create_human_evidence_jira_request(request: HumanEvidenceJiraRequest) -> dict[str, Any]:
+    client = _jira_api_client()
+    session_factory = getattr(app.state, "session_factory", None)
+    if client is None or session_factory is None:
+        raise HTTPException(status_code=503, detail="Jira lifecycle integration is not configured")
+    description = "\n".join([
+        "KaiMS governed evidence request",
+        f"Incident: {request.incident_id}", f"Requirement: {request.requirement_id}",
+        f"Requested evidence: {request.requested_evidence}", f"Reason: {request.reason}",
+        f"Due: {request.due_at.isoformat()}", f"KaiMS: {request.kaims_deep_link}",
+    ])
+    try:
+        issue_key, operation = await client.create_or_update_incident(
+            incident_id=f"evidence-{request.request_id}",
+            summary=f"KaiMS evidence required: {request.requested_evidence[:120]}",
+            description=description, severity="medium",
+            labels={"tenant": request.tenant_id, "incident": str(request.incident_id),
+                    "requirement": str(request.requirement_id), "kind": "human-evidence"},
+        )
+        await client.assign_issue(issue_key, account_id=request.assignee_id)
+        issue = await client.get_issue(issue_key)
+        fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+        jira_version = str(issue.get("version") or fields.get("updated") or "") or None
+        issue_url = f"{JIRA_API_BASE_URL.rstrip('/')}/browse/{quote(issue_key, safe='')}"
+    except JiraClientError as exc:
+        raise HTTPException(status_code=502, detail="Jira rejected the governed evidence request") from exc
+    async with session_factory() as session:
+        binding = await ContextEnrichmentRepository(session).bind_human_evidence_jira(
+            tenant_id=request.tenant_id, incident_id=request.incident_id,
+            request_id=request.request_id, requirement_id=request.requirement_id,
+            jira_issue_key=issue_key, jira_issue_url=issue_url, jira_version=jira_version,
+            jira_assignee_id=request.assignee_id, sync_status="synchronized",
+        )
+        await session.commit()
+    return {"operation": operation, **binding}
+
+
 @app.post("/api/v1/jira/closure")
 async def synchronize_jira_closure(request: JiraClosureRequest) -> dict[str, Any]:
     client = _jira_api_client()
@@ -5892,6 +5935,51 @@ async def _process_governed_jira_event(payload: dict[str, Any]) -> bool:
     action = governed_jira_action(jira_status, JIRA_TRANSITION_MAPPING)
     async with session_factory() as session:
         repo = ContextEnrichmentRepository(session)
+        evidence_request = await repo.human_evidence_request_by_jira(
+            tenant_id=tenant_id, jira_issue_key=issue_key,
+        )
+        if evidence_request is not None:
+            issue = payload.get("issue") if isinstance(payload.get("issue"), dict) else {}
+            fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+            assignee = fields.get("assignee") if isinstance(fields.get("assignee"), dict) else {}
+            assignee_id = str(assignee.get("accountId") or "").strip()
+            jira_version = str(issue.get("version") or fields.get("updated") or "").strip() or None
+            if assignee_id and assignee_id != evidence_request.get("expected_responder"):
+                await repo.synchronize_human_evidence_jira_assignee(
+                    tenant_id=tenant_id, jira_issue_key=issue_key,
+                    jira_assignee_id=assignee_id, jira_version=jira_version,
+                    sync_status="synchronized",
+                )
+                evidence_request["expected_responder"] = assignee_id
+            comment = payload.get("comment") if isinstance(payload.get("comment"), dict) else {}
+            body = comment.get("body")
+            author = comment.get("author") if isinstance(comment.get("author"), dict) else {}
+            comment_actor = str(author.get("accountId") or actor_id or "").strip()
+            if isinstance(body, str) and body.strip() and comment_actor:
+                try:
+                    await repo.record_human_evidence_response(
+                        tenant_id=tenant_id, incident_id=evidence_request["incident_id"],
+                        requirement_id=evidence_request["requirement_id"],
+                        response={
+                            "response": body.strip(), "responder_id": comment_actor,
+                            "responded_at": comment.get("updated") or comment.get("created")
+                            or datetime.now(UTC).isoformat(),
+                            "source_reference": (
+                                f"{JIRA_API_BASE_URL.rstrip('/')}/browse/{quote(issue_key, safe='')}"
+                                f"?focusedCommentId={quote(str(comment.get('id') or ''), safe='')}"
+                            ),
+                        },
+                    )
+                except (PermissionError, ValueError):
+                    await repo.record_jira_webhook_outcome(
+                        tenant_id=tenant_id, event_id=event_id, jira_issue_key=issue_key,
+                        action="evidence_comment", actor_id=comment_actor,
+                        outcome="rejected", payload=payload,
+                    )
+                    await session.commit()
+                    return True
+            await session.commit()
+            return True
         binding = await repo.get_jira_incident_binding(
             tenant_id=tenant_id, jira_issue_key=issue_key, jira_project_key=project_key,
         )
