@@ -27,6 +27,7 @@ import {
 
 import { useRouteRuntimeSlice, type ApprovalRow, type IncidentRow } from "../../app/routeRuntime";
 import { EmptyState, ErrorState, LoadingState, StatusBadge, TechnicalDetails } from "../../components/design-system";
+import ContextEnrichmentPanel, { type EvidenceGap } from "./ContextEnrichmentPanel";
 import "./IncidentCommand.css";
 
 type UnknownRecord = Record<string, unknown>;
@@ -185,6 +186,14 @@ export default function IncidentCommand() {
   const contextSourceManifest = record(contextSnapshot.source_manifest);
   const recommendation = firstRecord(row.recommendation, projection.recommendation, projection.remediation_recommendation, projection.resolution_plan, eventPayload.recommendation, source.recommendation);
   const recommendationMetadata = record(recommendation.metadata);
+  const canonicalIncidentId = incidentId(row);
+  const canonicalAlertId = text(
+    recommendationMetadata.alert_id,
+    record(record(row).incident_investigation).alert_id,
+    row.alert_id,
+    source.id,
+    contextAlert.id,
+  );
   const executionPlan = firstRecord(
     recommendation.execution_plan,
     recommendationMetadata.execution_plan,
@@ -206,6 +215,11 @@ export default function IncidentCommand() {
     ...arrayOfText(recommendationMetadata.supporting_evidence),
   ].slice(0, 6);
   const contradictions = arrayOfText(analysis.contradictions || analysis.ruled_out || analysis.alternative_causes);
+  const declaredGaps: EvidenceGap[] = (Array.isArray(analysis.missing_evidence) ? analysis.missing_evidence : [])
+    .map((gap) => typeof gap === "string"
+      ? { category: gap }
+      : { category: text(record(gap).category, record(gap).type), reason: text(record(gap).reason, record(gap).description) })
+    .filter((gap) => gap.category);
   const status = normalizedStatus(row);
   const inFailure = FAILED.some((value) => status.includes(value));
   const isTerminal = TERMINAL.some((value) => status.includes(value));
@@ -241,6 +255,33 @@ export default function IncidentCommand() {
     row.latest_event_type ? { at: row.latest_event_at || row.updated_at, title: text(row.latest_event_type).replaceAll("_", " "), detail: `Latest recorded lifecycle event for ${incidentId(row)}.` } : null,
     row.updated_at && row.updated_at !== row.created_at ? { at: row.updated_at, title: "Incident state updated", detail: `Current backend state is ${status.replaceAll("_", " ")}.` } : null,
   ].filter(Boolean) as Array<{ at: unknown; title: string; detail: string }>;
+
+  const refreshIncident = async () => {
+    await incidents.refresh();
+    setDirectRequestVersion((version) => version + 1);
+  };
+  const requestFreshAnalysis = async () => {
+    if (!canonicalAlertId || !canonicalIncidentId) return;
+    const response = await fetch(`/api-gateway/analysis/alerts/${encodeURIComponent(canonicalAlertId)}/regenerate`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${session.accessToken}`, Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "fresh" }),
+    });
+    if (!response.ok) throw new Error(`Fresh analysis request returned HTTP ${response.status}`);
+    const accepted = record(await response.json() as unknown);
+    const requestId = text(accepted.request_id, record(accepted.data).request_id);
+    if (requestId) {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1_500));
+        const statusResponse = await fetch(`/api-gateway/analysis/requests/${encodeURIComponent(requestId)}/status`, { headers: { Authorization: `Bearer ${session.accessToken}`, Accept: "application/json" } });
+        if (!statusResponse.ok) break;
+        const statusPayload = record(await statusResponse.json() as unknown);
+        const requestStatus = text(statusPayload.status, record(statusPayload.data).status).toLowerCase();
+        if (["complete", "completed", "failed", "blocked", "cancelled"].includes(requestStatus)) break;
+      }
+    }
+    await refreshIncident();
+  };
 
   return <article className="incident-command">
     <header className="ic-command-header">
@@ -280,6 +321,15 @@ export default function IncidentCommand() {
             <TechnicalDetails summary="Why this confidence?"><p>{confidence === null ? "The backend did not publish a confidence score." : `${confidence}% is the normalized ${confidenceLabel.toLowerCase()} published with this incident analysis.`}</p><p>{confidenceKind === "confirmed_rca" ? "The RCA is confirmed but remains governed by policy gates." : "The investigation is not conclusive; this score cannot authorize remediation."}</p><p>{supportingReasons.length} supporting reason(s) and {contradictions.length} contradiction or ruled-out item(s) are available.</p></TechnicalDetails>
           </> : <EmptyState title="Investigation is still forming a hypothesis" description="Kai will show a falsifiable root-cause story when the backend publishes one." />}
         </section>
+
+        <ContextEnrichmentPanel
+          incidentId={canonicalIncidentId}
+          alertId={canonicalAlertId || undefined}
+          accessToken={session.accessToken || ""}
+          declaredGaps={declaredGaps}
+          onIncidentRefresh={refreshIncident}
+          onFreshAnalysisRequested={requestFreshAnalysis}
+        />
 
         <section className="ic-section ic-causal">
           <header><div><span>Relevant causal path</span><h3>How the signal connects to impact</h3></div><GitBranch aria-hidden="true" /></header>

@@ -318,9 +318,11 @@ export default function RcaPanel({
 
       {resolutionBinding.incident_id ? <ContextEnrichmentPanel
         incidentId={resolutionBinding.incident_id}
+        alertId={resolutionBinding.alert_id}
         accessToken={accessToken}
-        declaredGaps={missingEvidence.map((gap: any) => String(gap?.category || gap))}
-        onEvidenceChanged={() => onRerunRca("fresh")}
+        declaredGaps={missingEvidence.map((gap: any) => ({ category: String(gap?.category || gap), reason: String(gap?.reason || "") }))}
+        onIncidentRefresh={async () => undefined}
+        onFreshAnalysisRequested={async () => { await onRerunRca("fresh"); }}
       /> : null}
 
       <div className="context-workspace-toolbar">

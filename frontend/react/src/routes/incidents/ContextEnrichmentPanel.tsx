@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { CircleAlert, CircleCheck, RefreshCw, UserRound } from "lucide-react";
 import { fetchJson, formatUtcTimestamp } from "../../appHelpers.jsx";
 
+export type EvidenceGap = { category: string; reason?: string };
+
 type Requirement = {
   requirement_id: string;
   category: string;
@@ -29,14 +31,18 @@ function friendlyFailure(error: unknown) {
   return message.replace(/^HTTP \d+:\s*/, "") || "Context enrichment is temporarily unavailable.";
 }
 
-export default function ContextEnrichmentPanel({
-  incidentId, accessToken, declaredGaps, onEvidenceChanged,
-}: {
+export type ContextEnrichmentPanelProps = {
   incidentId: string;
+  alertId?: string;
   accessToken: string;
-  declaredGaps: string[];
-  onEvidenceChanged: () => Promise<unknown> | unknown;
-}) {
+  declaredGaps: EvidenceGap[];
+  onIncidentRefresh: () => Promise<void>;
+  onFreshAnalysisRequested: () => Promise<void>;
+};
+
+export default function ContextEnrichmentPanel({
+  incidentId, alertId, accessToken, declaredGaps, onIncidentRefresh, onFreshAnalysisRequested,
+}: ContextEnrichmentPanelProps) {
   const [activity, setActivity] = useState<Activity>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -73,7 +79,8 @@ export default function ContextEnrichmentPanel({
       );
       setAnswers((current) => ({ ...current, [requirementId]: "" }));
       await load();
-      await onEvidenceChanged();
+      await onIncidentRefresh();
+      if (alertId) await onFreshAnalysisRequested();
     } catch (reason) {
       setError(friendlyFailure(reason));
       setLoading(false);
@@ -94,6 +101,7 @@ export default function ContextEnrichmentPanel({
       </button>
     </header>
     {error ? <p className="context-enrichment-error" role="alert"><CircleAlert size={17} />{error}</p> : null}
+    {!alertId && declaredGaps.length ? <p className="context-enrichment-error" role="status"><CircleAlert size={17} />Canonical alert binding is missing. Evidence activity remains visible, but fresh RCA regeneration is disabled.</p> : null}
     {!error && requirements.length === 0 ? <p className="context-enrichment-empty">
       {declaredGaps.length ? "The RCA declared gaps but no durable work items were created. Run a fresh analysis after deploying the matching backend release." : "No unresolved evidence gaps are declared."}
     </p> : null}
