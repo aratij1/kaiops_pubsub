@@ -13,7 +13,7 @@ import {
 import { useRouteRuntimeSlice } from "../../app/routeRuntime";
 import EvidenceDraftReview from "./EvidenceDraftReview";
 import DecisionReadinessPanel from "./DecisionReadinessPanel";
-import ContextEnrichmentPanel from "./ContextEnrichmentPanel";
+import ContextEnrichmentPanel from "../../features/incidents/ContextEnrichmentPanel";
 import "./RcaPanel.css";
 import "./RcaReuseBanner.css";
 import "./EvidenceReview.css";
@@ -322,7 +322,6 @@ export default function RcaPanel({
         accessToken={accessToken}
         declaredGaps={missingEvidence.map((gap: any) => ({ category: String(gap?.category || gap), reason: String(gap?.reason || "") }))}
         onIncidentRefresh={async () => undefined}
-        onFreshAnalysisRequested={async () => { await onRerunRca("fresh"); }}
       /> : null}
 
       <div className="context-workspace-toolbar">

@@ -262,29 +262,6 @@ export default function IncidentCommand() {
     await incidents.refresh();
     setDirectRequestVersion((version) => version + 1);
   };
-  const requestFreshAnalysis = async () => {
-    if (!canonicalAlertId || !canonicalIncidentId) return;
-    const response = await fetch(`/api-gateway/analysis/alerts/${encodeURIComponent(canonicalAlertId)}/regenerate`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${session.accessToken}`, Accept: "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: "fresh" }),
-    });
-    if (!response.ok) throw new Error(`Fresh analysis request returned HTTP ${response.status}`);
-    const accepted = record(await response.json() as unknown);
-    const requestId = text(accepted.request_id, record(accepted.data).request_id);
-    if (requestId) {
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        await new Promise((resolve) => window.setTimeout(resolve, 1_500));
-        const statusResponse = await fetch(`/api-gateway/analysis/requests/${encodeURIComponent(requestId)}/status`, { headers: { Authorization: `Bearer ${session.accessToken}`, Accept: "application/json" } });
-        if (!statusResponse.ok) break;
-        const statusPayload = record(await statusResponse.json() as unknown);
-        const requestStatus = text(statusPayload.status, record(statusPayload.data).status).toLowerCase();
-        if (["complete", "completed", "failed", "blocked", "cancelled"].includes(requestStatus)) break;
-      }
-    }
-    await refreshIncident();
-  };
-
   return <article className="incident-command">
     <header className="ic-command-header">
       <button type="button" className="ic-back" onClick={() => navigate("/incidents")}><ArrowLeft aria-hidden="true" /> Incident inbox</button>
@@ -330,7 +307,6 @@ export default function IncidentCommand() {
           accessToken={session.accessToken || ""}
           declaredGaps={declaredGaps}
           onIncidentRefresh={refreshIncident}
-          onFreshAnalysisRequested={requestFreshAnalysis}
         />
 
         <section className="ic-section ic-causal">

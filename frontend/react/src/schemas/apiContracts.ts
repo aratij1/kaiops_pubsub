@@ -93,6 +93,14 @@ const GatewayContextEnrichmentActivity = z.union([
   ContextEnrichmentActivity,
   z.object({ data: ContextEnrichmentActivity }).passthrough().transform((payload) => payload.data),
 ]);
+const IncidentOperationsState = z.object({
+  schema_version: z.literal("kaiops.operations-state.v1"),
+  incident_id: z.string().uuid(), lifecycle_state: z.string().min(1),
+  context: JsonRecord, investigation: JsonRecord,
+  requirements: RecordList, requirement_history: RecordList,
+  resolution: JsonRecord, approval: JsonRecord,
+  updated_at: z.string().or(z.date()),
+}).passthrough();
 
 type Contract = { method?: string; path: RegExp; schema: ZodTypeAny; name: string };
 
@@ -105,6 +113,7 @@ const contracts: readonly Contract[] = [
   { method: "GET", path: /^\/api-gateway\/healthz$/, schema: Health, name: "health" },
   { method: "GET", path: /^\/api-gateway\/operations\/queue-health$/, schema: QueueHealth, name: "queue-health" },
   { method: "GET", path: /^\/api-gateway\/incidents\/[0-9a-f-]+\/context-gaps$/i, schema: GatewayContextEnrichmentActivity, name: "context-enrichment-activity" },
+  { method: "GET", path: /^\/api-gateway\/incidents\/[0-9a-f-]+\/operations-state$/i, schema: IncidentOperationsState, name: "incident-operations-state" },
   { method: "POST", path: /^\/api-gateway\/evaluations\/by-recommendation\/[0-9a-f-]+\/feedback$/i, schema: EvaluationFeedback, name: "evaluation-feedback" },
   { method: "POST", path: /^\/context-agent\/collect$/, schema: CollectedContext, name: "collected-context" },
   { method: "POST", path: /^\/resolution-agent\/resolve$/, schema: ResolutionRecommendation, name: "resolution-recommendation" },
