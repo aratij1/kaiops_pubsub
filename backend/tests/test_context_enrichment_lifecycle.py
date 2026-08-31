@@ -6,6 +6,7 @@ from ai_workbench_common.models import Context
 from common.context_enrichment_contract import (
     EvidenceRequirement,
     HitlRoutingConfiguration,
+    build_evidence_requirements,
     validate_enrichment_observation,
 )
 from common.database import (
@@ -28,6 +29,21 @@ def context_for(incident_id, *, tenant_id="tenant-a") -> Context:
         description="p99 latency is above threshold",
     )
     return Context(tenant_id=tenant_id, incident_id=incident_id, alert=alert)
+
+
+def test_duplicate_rca_gaps_produce_one_durable_requirement() -> None:
+    incident_id = uuid4()
+    gap = {"category": "logs", "question": "Which errors preceded the alert?"}
+
+    requirements = build_evidence_requirements(
+        tenant_id="tenant-a",
+        incident_id=incident_id,
+        rca_version=3,
+        missing_evidence=[gap, gap],
+        now=datetime.now(UTC),
+    )
+
+    assert len(requirements) == 1
 
 
 def test_trace_gap_rejects_metric_only_observation() -> None:

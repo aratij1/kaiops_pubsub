@@ -357,6 +357,7 @@ def build_evidence_requirements(
     incident = UUID(str(incident_id))
     version = max(1, int(rca_version or 1))
     requirements: list[EvidenceRequirement] = []
+    seen_requirement_ids: set[UUID] = set()
     valid_categories = set(EvidenceCategory.__args__)
     for raw in missing_evidence or []:
         gap = raw if isinstance(raw, dict) else {}
@@ -370,9 +371,13 @@ def build_evidence_requirements(
         )
         question = str(gap.get("question") or f"Collect {category} evidence for this incident.")
         identity = f"{tenant}:{incident}:{version}:{category}:{question}"
+        requirement_id = uuid5(NAMESPACE_URL, identity)
+        if requirement_id in seen_requirement_ids:
+            continue
+        seen_requirement_ids.add(requirement_id)
         requirements.append(
             EvidenceRequirement(
-                requirement_id=uuid5(NAMESPACE_URL, identity),
+                requirement_id=requirement_id,
                 tenant_id=tenant,
                 incident_id=incident,
                 rca_version=version,
