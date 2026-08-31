@@ -1,4 +1,6 @@
 x-service-env: &service-env
+  KAIMS_RELEASE_SHA: ${KAIMS_RELEASE_SHA:-dev}
+  KAIMS_BUILD_TIME: ${KAIMS_BUILD_TIME:-unknown}
   CLOUD_PROVIDER: ${CLOUD_PROVIDER:-cloud-neutral}
   DEPLOYMENT_PROFILE: ${DEPLOYMENT_PROFILE:-cloud-neutral}
   CONNECTION_CONFIG_PATH: ${CONNECTION_CONFIG_PATH:-backend/config/kaiops-connections.json}
@@ -245,6 +247,9 @@ x-service-env: &service-env
 x-service-build: &service-build
   context: .
   dockerfile: deploy/docker/Dockerfile.service
+  args:
+    KAIMS_RELEASE_SHA: ${KAIMS_RELEASE_SHA:-dev}
+    KAIMS_BUILD_TIME: ${KAIMS_BUILD_TIME:-unknown}
 
 services:
   mysql:
@@ -273,6 +278,15 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+
+  migrations:
+    build: *service-build
+    restart: "no"
+    environment: { <<: *service-env, SERVICE_NAME: migrations }
+    command: ["python", "scripts/apply-migrations.py"]
+    working_dir: /app
+    depends_on:
+      mysql: { condition: service_healthy }
 
   temporal:
     image: temporalio/auto-setup:1.27.2
@@ -759,6 +773,7 @@ services:
       retries: 40
       start_period: 60s
     depends_on:
+      migrations: { condition: service_completed_successfully }
       monitoring-adapter: { condition: service_started }
       application-onboarding: { condition: service_started }
       approval-service: { condition: service_started }
@@ -871,6 +886,7 @@ services:
       - ./backend/runtime:/app/backend/runtime:ro
       - ./backend/ingested_alerts:/app/backend/ingested_alerts:ro
     depends_on:
+      migrations: { condition: service_completed_successfully }
       discovery-mcp: { condition: service_started }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
@@ -990,6 +1006,7 @@ services:
       retries: 5
       start_period: 30s
     depends_on:
+      migrations: { condition: service_completed_successfully }
       rabbitmq: { condition: service_healthy }
       mysql: { condition: service_healthy }
       model-router: { condition: service_started }
@@ -1144,6 +1161,8 @@ services:
     build:
       context: .
       dockerfile: deploy/docker/Dockerfile.ui
+      args:
+        KAIMS_RELEASE_SHA: ${KAIMS_RELEASE_SHA:-dev}
     # Docker Desktop's IPv6 localhost forwarder can accept connections without
     # forwarding them. Bind IPv4 explicitly so Windows falls back from ::1.
     ports: ["${UI_BIND_ADDRESS:-127.0.0.1}:${UI_HOST_PORT:-80}:80"]
