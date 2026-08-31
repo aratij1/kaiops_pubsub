@@ -94,6 +94,20 @@ describe("internal API contract registry", () => {
     expect(OperationalEventSchema.safeParse({ id: "", type: "alert.created", data: {} }).success).toBe(false);
   });
 
+  it("unwraps the authenticated gateway operations-state envelope", () => {
+    const state = {
+      schema_version: "kaiops.operations-state.v1",
+      incident_id: "1f11cbe9-274a-490a-ae4c-aebb3d70e58a",
+      lifecycle_state: "COLLECTION_BLOCKED",
+      context: {}, investigation: {}, requirements: [], requirement_history: [],
+      resolution: {}, approval: {}, updated_at: "2026-08-31T16:00:00Z",
+    };
+    expect(parseInternalApiResponse(
+      "/api-gateway/incidents/1f11cbe9-274a-490a-ae4c-aebb3d70e58a/operations-state",
+      "GET", { trace_id: "safe-trace", data: state },
+    )).toEqual(state);
+  });
+
   it("validates identity-provider discovery and token contracts", () => {
     expect(OidcDiscoverySchema.parse({ authorization_endpoint: "https://id.example/authorize", token_endpoint: "https://id.example/token" })).toBeTruthy();
     expect(OidcTokenResponseSchema.safeParse({ access_token: "" }).success).toBe(false);

@@ -101,6 +101,10 @@ const IncidentOperationsState = z.object({
   resolution: JsonRecord, approval: JsonRecord,
   updated_at: z.string().or(z.date()),
 }).passthrough();
+const GatewayIncidentOperationsState = z.union([
+  IncidentOperationsState,
+  z.object({ data: IncidentOperationsState }).passthrough().transform((payload) => payload.data),
+]);
 
 type Contract = { method?: string; path: RegExp; schema: ZodTypeAny; name: string };
 
@@ -113,7 +117,7 @@ const contracts: readonly Contract[] = [
   { method: "GET", path: /^\/api-gateway\/healthz$/, schema: Health, name: "health" },
   { method: "GET", path: /^\/api-gateway\/operations\/queue-health$/, schema: QueueHealth, name: "queue-health" },
   { method: "GET", path: /^\/api-gateway\/incidents\/[0-9a-f-]+\/context-gaps$/i, schema: GatewayContextEnrichmentActivity, name: "context-enrichment-activity" },
-  { method: "GET", path: /^\/api-gateway\/incidents\/[0-9a-f-]+\/operations-state$/i, schema: IncidentOperationsState, name: "incident-operations-state" },
+  { method: "GET", path: /^\/api-gateway\/incidents\/[0-9a-f-]+\/operations-state$/i, schema: GatewayIncidentOperationsState, name: "incident-operations-state" },
   { method: "POST", path: /^\/api-gateway\/evaluations\/by-recommendation\/[0-9a-f-]+\/feedback$/i, schema: EvaluationFeedback, name: "evaluation-feedback" },
   { method: "POST", path: /^\/context-agent\/collect$/, schema: CollectedContext, name: "collected-context" },
   { method: "POST", path: /^\/resolution-agent\/resolve$/, schema: ResolutionRecommendation, name: "resolution-recommendation" },
