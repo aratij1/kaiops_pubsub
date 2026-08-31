@@ -93,12 +93,19 @@ const GatewayContextEnrichmentActivity = z.union([
   ContextEnrichmentActivity,
   z.object({ data: ContextEnrichmentActivity }).passthrough().transform((payload) => payload.data),
 ]);
+const InvestigationWorkspace = z.object({
+  schema_version: z.literal("kaiops.investigation-workspace.v1"),
+  binding: JsonRecord, impact: JsonRecord, rca: JsonRecord,
+  evidence: RecordList, requirements: RecordList,
+  resolution: JsonRecord, operator_review: JsonRecord,
+}).passthrough();
 const IncidentOperationsState = z.object({
   schema_version: z.literal("kaiops.operations-state.v1"),
   incident_id: z.string().uuid(), lifecycle_state: z.string().min(1),
   context: JsonRecord, investigation: JsonRecord,
   requirements: RecordList, requirement_history: RecordList,
   resolution: JsonRecord, approval: JsonRecord,
+  investigation_workspace: InvestigationWorkspace.optional(),
   updated_at: z.string().or(z.date()),
 }).passthrough();
 const GatewayIncidentOperationsState = z.union([

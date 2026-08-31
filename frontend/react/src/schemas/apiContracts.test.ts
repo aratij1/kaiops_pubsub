@@ -101,6 +101,10 @@ describe("internal API contract registry", () => {
       lifecycle_state: "COLLECTION_BLOCKED",
       context: {}, investigation: {}, requirements: [], requirement_history: [],
       resolution: {}, approval: {}, updated_at: "2026-08-31T16:00:00Z",
+      investigation_workspace: {
+        schema_version: "kaiops.investigation-workspace.v1", binding: {}, impact: {}, rca: {},
+        evidence: [], requirements: [], resolution: {}, operator_review: {},
+      },
     };
     expect(parseInternalApiResponse(
       "/api-gateway/incidents/1f11cbe9-274a-490a-ae4c-aebb3d70e58a/operations-state",

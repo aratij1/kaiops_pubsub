@@ -127,6 +127,8 @@ export default function RcaPanel({
   const [resolutionOptions, setResolutionOptions] = useState<any[]>([]);
   const [pendingPlanId, setPendingPlanId] = useState("");
   const [resolutionStatus, setResolutionStatus] = useState("");
+  const [canonicalWorkspace, setCanonicalWorkspace] = useState<any>(null);
+  const [workspaceError, setWorkspaceError] = useState("");
   const [feedbackDraft, setFeedbackDraft] = useState({ decision: "", reason_category: "", corrected_cause: "", missing_evidence: "", comment: "" });
   const recommendationMetadata = selectedAlertWorkflow?.recommendation?.metadata || {};
   const selectedResolution = governedPlanFromWorkflow(selectedAlertWorkflow);
@@ -219,6 +221,23 @@ export default function RcaPanel({
   ];
 
   useEffect(() => {
+    const incidentId = resolutionBinding.incident_id;
+    if (!incidentId || !accessToken) { setCanonicalWorkspace(null); return undefined; }
+    const controller = new AbortController();
+    fetchJson(`/api-gateway/incidents/${encodeURIComponent(incidentId)}/operations-state`, {
+      headers: { Authorization: `Bearer ${accessToken}` }, signal: controller.signal,
+      maxAttempts: 1, staleTimeMs: 0,
+    }).then((response: any) => {
+      const payload = response?.data || response || {};
+      setCanonicalWorkspace(payload.investigation_workspace || null);
+      setWorkspaceError(payload.investigation_workspace ? "" : "Canonical investigation workspace was not published by this backend release.");
+    }).catch((error: any) => {
+      if (error?.name !== "AbortError") setWorkspaceError("The canonical investigation workspace is temporarily unavailable.");
+    });
+    return () => controller.abort();
+  }, [accessToken, resolutionBinding.incident_id]);
+
+  useEffect(() => {
     let active = true;
     setPendingPlanId("");
     setResolutionStatus("");
@@ -294,7 +313,11 @@ export default function RcaPanel({
       {selectedAiTrust?.contractValid !== true ? <p className="ai-trust-warning" role="alert"><ShieldAlert size={16} />Investigation contract invalid. Resolution and approval actions are disabled until fresh analysis publishes a valid bound contract.</p> : null}
       {selectedAiTrust?.integrityVerified !== true && selectedAiTrust?.integrity?.status ? <p className="ai-trust-warning" role="alert"><ShieldAlert size={16} />Investigation integrity error: {String(selectedAiTrust.integrity.status).replaceAll("_", " ")}. Resolution is blocked.</p> : null}
       {requiresFreshRecovery ? <section className="context-contract-recovery" aria-label="Recover investigation contract"><div><strong>Fresh context is required</strong><p>KaiMS will collect a new immutable context snapshot and bind the replacement RCA to it.</p></div><button type="button" className="button-primary" disabled={selectedAlertRegeneration.loading} onClick={() => { onSetRcaAnalysisMode("fresh"); return onRerunRca("fresh"); }}><RotateCw size={15} aria-hidden="true" className={selectedAlertRegeneration.loading ? "is-spinning" : ""} />{selectedAlertRegeneration.loading ? "Collecting fresh context…" : "Collect fresh context now"}</button></section> : null}
-      <header className="context-workspace-hero">
+      {canonicalWorkspace ? <header className="context-workspace-hero canonical-investigation-hero">
+        <div className="context-workspace-title"><span className="discovery-eyebrow">Governed full investigation</span><h2>{canonicalWorkspace.rca?.status === "grounded" ? "Grounded RCA workspace" : "Evidence review required"}</h2><p>{canonicalWorkspace.operator_review?.message}</p><small>Snapshot v{canonicalWorkspace.binding?.snapshot_version || 0} · RCA v{canonicalWorkspace.binding?.rca_version || 0} · {canonicalWorkspace.binding?.snapshot_id || "snapshot unavailable"}</small></div>
+        <div className="canonical-investigation-gates"><article><span>Impact</span><strong>{canonicalWorkspace.impact?.status === "established" ? "Established" : "Not established"}</strong><p>{canonicalWorkspace.impact?.statement || "No accepted evidence establishes customer or business impact."}</p></article><article><span>Root cause</span><strong>{String(canonicalWorkspace.rca?.status || "not started").replaceAll("_", " ")}</strong><p>{canonicalWorkspace.rca?.hypothesis || "No falsifiable hypothesis has been published."}</p></article><article><span>Resolution</span><strong>{canonicalWorkspace.resolution?.status || "blocked"}</strong><p>{canonicalWorkspace.resolution?.status === "ready" ? "A governed plan is bound to this RCA." : (canonicalWorkspace.resolution?.blocking_reasons || []).join(", ") || "Grounded RCA required."}</p></article></div>
+        <div className="canonical-investigation-ledger"><span><strong>{canonicalWorkspace.evidence?.length || 0}</strong> snapshot records</span><span><strong>{canonicalWorkspace.rca?.accepted_evidence_ids?.length || 0}</strong> RCA-bound records</span><span><strong>{canonicalWorkspace.rca?.traceable_citation_count || 0}</strong> traceable citations</span><span><strong>{canonicalWorkspace.requirements?.length || 0}</strong> active requirements</span></div>
+      </header> : <header className="context-workspace-hero">
         <div className="context-workspace-title">
           <span className="discovery-eyebrow">Incident understanding</span>
           <h2>Context and evidence</h2>
@@ -310,7 +333,8 @@ export default function RcaPanel({
             <div><dt>Evidence gaps</dt><dd>{missingEvidence.length}</dd></div>
           </dl>
         </div>
-      </header>
+      </header>}
+      {workspaceError ? <p className="ai-trust-warning" role="status"><ShieldAlert size={16} />{workspaceError}</p> : null}
 
       {analysisReused ? <aside className="rca-reuse-banner" role="status"><CheckCircle2 size={18} /><div><strong>Verified analysis reused</strong><span>Scope and freshness checks passed at {formatQualityPercent(analysisReuseScore)} similarity. Refresh if the deployment or symptoms changed.</span></div></aside> : null}
 
@@ -321,6 +345,7 @@ export default function RcaPanel({
         alertId={resolutionBinding.alert_id}
         accessToken={accessToken}
         declaredGaps={missingEvidence.map((gap: any) => ({ category: String(gap?.category || gap), reason: String(gap?.reason || "") }))}
+        proposedRcaDraft={canonicalWorkspace?.rca?.hypothesis || selectedRcaDecision?.rootCause || ""}
         onIncidentRefresh={async () => undefined}
       /> : null}
 

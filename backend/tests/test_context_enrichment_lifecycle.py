@@ -192,6 +192,13 @@ async def test_operations_state_selects_current_requirement_and_latest_job(
     assert state["requirements"][0]["latest_job"]["job_id"] == str(second.job_id)
     assert state["requirement_history"][0]["requirement_id"] == str(old_requirement.requirement_id)
     assert state["next_action"]["type"] == "AUTONOMOUS_COLLECTION"
+    workspace = state["investigation_workspace"]
+    assert workspace["schema_version"] == "kaiops.investigation-workspace.v1"
+    assert workspace["binding"]["incident_id"] == str(incident_id)
+    assert workspace["rca"]["status"] == "not_started"
+    assert workspace["resolution"]["status"] == "blocked"
+    assert workspace["operator_review"]["required"] is True
+    assert workspace["requirements"][0]["requirement_id"] == str(current_requirement.requirement_id)
 
 
 @pytest.mark.asyncio

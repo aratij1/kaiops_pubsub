@@ -8918,6 +8918,38 @@ class ContextEnrichmentRepository(EvaluationRepository):
 
         resolution_ready = lifecycle_state == "RCA_READY" and bool(quality.get("passed"))
         blocked_reasons = list(quality.get("blocking_reasons") or analysis.get("missing_evidence") or [])
+        accepted_evidence_ids = list(binding.evidence_ids or []) if binding else []
+        accepted_evidence_set = set(accepted_evidence_ids)
+        workspace_evidence = [{
+            "evidence_id": row.evidence_id,
+            "category": row.category,
+            "source_id": row.source_id,
+            "connector": row.connector,
+            "citation": row.source_reference,
+            "freshness": row.freshness,
+            "observed_at": row.observed_at,
+            "collected_at": row.collected_at,
+            "current_observation": bool(row.current_observation),
+            "accepted_for_rca": row.evidence_id in accepted_evidence_set,
+            "contradiction_status": row.contradiction_status,
+        } for row in evidence_rows]
+        traceable_citation_count = sum(
+            1 for row in workspace_evidence
+            if row["accepted_for_rca"] and is_traceable_evidence_citation(row["citation"])
+        )
+        hypothesis = str(
+            analysis.get("root_cause") or analysis.get("leading_hypothesis")
+            or recommendation_payload.get("root_cause") or ""
+        ).strip()
+        investigation_status = str(binding.status).lower() if binding else "not_started"
+        grounded = investigation_status in {"grounded", "conclusive"} and bool(
+            accepted_evidence_ids and traceable_citation_count
+        )
+        impact_statement = str(
+            analysis.get("customer_impact") or analysis.get("business_impact")
+            or recommendation_payload.get("customer_impact") or recommendation_payload.get("business_impact")
+            or ""
+        ).strip()
         timestamps = [
             value if value.tzinfo else value.replace(tzinfo=UTC)
             for value in (
@@ -8969,6 +9001,43 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 ),
             },
             "next_action": next_action,
+            "investigation_workspace": {
+                "schema_version": "kaiops.investigation-workspace.v1",
+                "binding": {
+                    "incident_id": str(incident_uuid),
+                    "snapshot_id": str(binding.context_snapshot_id) if binding else None,
+                    "snapshot_version": int(snapshot.snapshot_version) if snapshot else 0,
+                    "investigation_id": str(binding.investigation_id) if binding and binding.investigation_id else None,
+                    "rca_version": int(binding.rca_version) if binding else 0,
+                    "recommendation_id": str(binding.recommendation_id) if binding else None,
+                },
+                "impact": {
+                    "status": "established" if impact_statement else "not_established",
+                    "statement": impact_statement or None,
+                },
+                "rca": {
+                    "status": "grounded" if grounded else investigation_status,
+                    "hypothesis": hypothesis or None,
+                    "confidence": float(recommendation_payload.get("confidence") or 0.0),
+                    "accepted_evidence_ids": accepted_evidence_ids,
+                    "traceable_citation_count": traceable_citation_count,
+                    "missing_evidence": list(analysis.get("missing_evidence") or []),
+                    "conflicting_evidence": list(analysis.get("conflicting_evidence") or []),
+                },
+                "evidence": workspace_evidence,
+                "requirements": requirement_projection,
+                "resolution": {
+                    "status": "ready" if resolution_ready and grounded else "blocked",
+                    "recommendation_id": str(binding.recommendation_id) if binding else None,
+                    "plan_id": str(binding.resolution_plan_id) if binding and binding.resolution_plan_id else None,
+                    "blocking_reasons": [] if resolution_ready and grounded else blocked_reasons or ["RCA_NOT_GROUNDED"],
+                },
+                "operator_review": {
+                    "required": not grounded,
+                    "mode": "evidence_response",
+                    "message": "Review the AI hypothesis, replace unsupported claims with verified observations, and cite the source.",
+                },
+            },
             "updated_at": updated_at,
         }
 
