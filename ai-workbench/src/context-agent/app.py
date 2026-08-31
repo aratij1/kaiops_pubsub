@@ -2270,6 +2270,10 @@ async def _reconcile_context_enrichment_tenant(
                 existing = await repository.list_context_evidence_requirements(
                     tenant_id=request.tenant_id, incident_id=candidate["incident_id"],
                 )
+                ledger_coverage = await repository.reconcile_requirement_coverage_from_ledger(
+                    tenant_id=request.tenant_id, incident_id=candidate["incident_id"],
+                    apply=not request.dry_run,
+                )
                 existing_keys = {
                     (int(row["rca_version"]), str(row["category"]), str(row["question"]))
                     for row in existing
@@ -2284,6 +2288,7 @@ async def _reconcile_context_enrichment_tenant(
                 }
                 work = [
                     row for row in requirements
+                    if str(row.requirement_id) not in ledger_coverage
                     if str((existing_by_key.get((row.rca_version, row.category, row.question)) or {}).get("status") or "identified").lower()
                     not in {"collected", "answered", "satisfied", "blocked", "dead_letter"}
                 ]

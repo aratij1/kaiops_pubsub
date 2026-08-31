@@ -427,6 +427,15 @@ async def test_atomic_enrichment_persists_exact_evidence_snapshot_and_outbox(
         assert snapshot.evidence_ids == [record.evidence_id]
         assert snapshot.payload["metadata"]["context_evidence"]["metrics"][0]["evidence_id"] == record.evidence_id
 
+        requirement_row = await repo.context_evidence_requirement(
+            tenant_id="tenant-a", requirement_id=requirement.requirement_id,
+        )
+        assert requirement_row["status"] == "collected"
+        coverage = await repo.reconcile_requirement_coverage_from_ledger(
+            tenant_id="tenant-a", incident_id=incident_id, apply=True,
+        )
+        assert coverage[str(requirement.requirement_id)] == [record.evidence_id]
+
 
 @pytest.mark.asyncio
 async def test_connector_unavailable_becomes_human_request_without_stopping_other_work(

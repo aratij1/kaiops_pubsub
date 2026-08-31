@@ -8367,6 +8367,36 @@ class ContextEnrichmentRepository(EvaluationRepository):
             rows.append(existing)
         return rows
 
+    async def reconcile_requirement_coverage_from_ledger(
+        self, *, tenant_id: str, incident_id: UUID | str, apply: bool,
+    ) -> dict[str, list[str]]:
+        """Treat the canonical ledger as truth and optionally repair requirement coverage."""
+        tenant = require_tenant_id(tenant_id, source="requirement evidence reconciliation")
+        incident_uuid = self._to_uuid(incident_id)
+        evidence = (await self.session.execute(select(CanonicalEvidenceRecord).where(
+            CanonicalEvidenceRecord.tenant_id == tenant,
+            CanonicalEvidenceRecord.incident_id == incident_uuid,
+        ).order_by(CanonicalEvidenceRecord.requirement_id, CanonicalEvidenceRecord.evidence_id))).scalars().all()
+        by_requirement: dict[str, list[str]] = {}
+        for row in evidence:
+            by_requirement.setdefault(str(row.requirement_id), []).append(row.evidence_id)
+        if apply and by_requirement:
+            requirements = (await self.session.execute(select(ContextEvidenceRequirementRecord).where(
+                ContextEvidenceRequirementRecord.tenant_id == tenant,
+                ContextEvidenceRequirementRecord.incident_id == incident_uuid,
+                ContextEvidenceRequirementRecord.requirement_id.in_([
+                    self._to_uuid(value) for value in by_requirement
+                ]),
+            ).with_for_update())).scalars().all()
+            for row in requirements:
+                evidence_ids = by_requirement[str(row.requirement_id)]
+                if row.status != "collected" or list(row.evidence_ids or []) != evidence_ids:
+                    row.status = "collected"
+                    row.evidence_ids = evidence_ids
+                    row.retry_after = None
+                    row.version = int(row.version or 0) + 1
+        return by_requirement
+
     async def list_context_evidence_requirements(
         self, *, tenant_id: str, incident_id: UUID | str,
     ) -> list[dict[str, Any]]:
