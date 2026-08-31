@@ -693,13 +693,16 @@ async def _persist_context_event(
 async def _context_enrichment_worker(app: FastAPI) -> None:
     """Execute durable read-only gap jobs and hand fresh context back to RCA."""
     connector_aliases = {"opensearch": "discovery-mcp", "jaeger": "discovery-mcp", "jira": "discovery-mcp"}
+    worker_id = f"{settings.service_name}:{os.getpid()}"
     while True:
         try:
             if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
                 await asyncio.sleep(5)
                 continue
             async with app.state.session_factory() as session:
-                jobs = await ContextEnrichmentRepository(session).claim_context_enrichment_jobs(limit=5)
+                jobs = await ContextEnrichmentRepository(session).claim_context_enrichment_jobs(
+                    worker_id=worker_id, limit=5, lease_seconds=120,
+                )
                 await session.commit()
             if not jobs:
                 await asyncio.sleep(3)
@@ -756,7 +759,8 @@ async def _context_enrichment_worker(app: FastAPI) -> None:
                 finally:
                     async with app.state.session_factory() as session:
                         await ContextEnrichmentRepository(session).finish_context_enrichment_job(
-                            job_id=job["job_id"], collected=collected, error=failure,
+                            job_id=job["job_id"], worker_id=worker_id,
+                            collected=collected, error=failure,
                             retry_after_seconds=min(300, 15 * (2 ** max(0, int(job["attempt_count"]) - 1))),
                         )
                         await session.commit()

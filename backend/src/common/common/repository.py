@@ -3148,6 +3148,28 @@ class IncidentRepository:
             return
         self.session.add(IncidentInvestigationBindingRecord(**values))
 
+    async def next_incident_rca_version(
+        self, *, tenant_id: str, incident_id: UUID | str,
+    ) -> int:
+        """Return the next durable RCA generation for an incident.
+
+        Context events produced by enrichment can legitimately omit an RCA
+        version or carry the version whose evidence gap they are satisfying.
+        Derive the new generation from persisted history so a regeneration
+        never falls back to version 1 for an established incident.
+        """
+        tenant = require_tenant_id(tenant_id, source="RCA version allocation")
+        incident_uuid = self._parse_uuid(incident_id)
+        if incident_uuid is None:
+            raise ValueError("RCA version allocation requires a valid incident UUID")
+        current = await self.session.scalar(
+            select(func.max(IncidentInvestigationBindingRecord.rca_version)).where(
+                IncidentInvestigationBindingRecord.tenant_id == tenant,
+                IncidentInvestigationBindingRecord.incident_id == incident_uuid,
+            )
+        )
+        return max(1, int(current or 0) + 1)
+
     async def create_or_reuse_analysis_request(
         self,
         *,
@@ -8259,6 +8281,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 "job_id": str(row.job_id), "requirement_id": str(row.requirement_id),
                 "connector_id": row.connector_id, "status": row.status,
                 "attempt_count": row.attempt_count, "available_at": row.available_at,
+                "lease_owner": row.lease_owner, "lease_expires_at": row.lease_expires_at,
                 "last_error": row.last_error, "updated_at": row.updated_at,
             } for row in jobs],
             "human_requests": [{
@@ -8298,19 +8321,34 @@ class ContextEnrichmentRepository(EvaluationRepository):
         await self.session.flush()
         return row
 
-    async def claim_context_enrichment_jobs(self, *, limit: int = 10) -> list[dict[str, Any]]:
+    async def claim_context_enrichment_jobs(
+        self, *, worker_id: str, limit: int = 10, lease_seconds: int = 120,
+    ) -> list[dict[str, Any]]:
         """Lease due jobs for one worker using row locks across replicas."""
         now = datetime.now(UTC)
+        owner = self._require("context_enrichment.worker_id", worker_id)
         statement = select(ContextEnrichmentJobRecord).where(
-            ContextEnrichmentJobRecord.status.in_(["scheduled", "retry"]),
             ContextEnrichmentJobRecord.available_at <= now,
+            or_(
+                ContextEnrichmentJobRecord.status.in_(["scheduled", "retry"]),
+                and_(
+                    ContextEnrichmentJobRecord.status == "collecting",
+                    or_(
+                        ContextEnrichmentJobRecord.lease_expires_at.is_(None),
+                        ContextEnrichmentJobRecord.lease_expires_at < now,
+                    ),
+                ),
+            ),
         ).order_by(ContextEnrichmentJobRecord.available_at.asc()).limit(max(1, min(limit, 50)))
         if self.session.bind and self.session.bind.dialect.name != "sqlite":
             statement = statement.with_for_update(skip_locked=True)
         rows = (await self.session.execute(statement)).scalars().all()
         result = []
+        lease_expires_at = now + timedelta(seconds=max(1, int(lease_seconds)))
         for row in rows:
             row.status = "collecting"
+            row.lease_owner = owner
+            row.lease_expires_at = lease_expires_at
             row.attempt_count = int(row.attempt_count or 0) + 1
             row.version += 1
             result.append({
@@ -8319,17 +8357,20 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 "requirement_id": str(row.requirement_id),
                 "connector_id": row.connector_id, "attempt_count": row.attempt_count,
                 "query_payload": dict(row.query_payload or {}),
+                "lease_owner": owner, "lease_expires_at": lease_expires_at,
             })
         await self.session.flush()
         return result
 
     async def finish_context_enrichment_job(
-        self, *, job_id: UUID | str, collected: bool, error: str | None = None,
+        self, *, job_id: UUID | str, worker_id: str, collected: bool, error: str | None = None,
         retry_after_seconds: int = 60, maximum_attempts: int = 4,
     ) -> None:
         row = await self.session.get(ContextEnrichmentJobRecord, self._to_uuid(job_id))
         if row is None:
             raise LookupError("context enrichment job not found")
+        if row.status != "collecting" or row.lease_owner != worker_id:
+            raise RuntimeError("context enrichment job lease is not owned by this worker")
         requirement = await self.session.get(ContextEvidenceRequirementRecord, row.requirement_id)
         if collected:
             row.status = "collected"
@@ -8354,7 +8395,40 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 requirement.retry_count = int(requirement.retry_count or 0) + 1
                 requirement.version += 1
         row.version += 1
+        row.lease_owner = None
+        row.lease_expires_at = None
         await self.session.flush()
+
+    async def enqueue_resolution_event(
+        self,
+        *,
+        event_id: str,
+        aggregate_id: str,
+        topic: str,
+        partition_key: str,
+        payload: dict[str, Any],
+        tenant_id: str = "default",
+        available_after_seconds: float = 60.0,
+    ) -> bool:
+        """Persist the governed context-to-resolution handoff transactionally."""
+        normalized_event_id = self._require("outbox.event_id", event_id)
+        if await self.session.get(ResolutionOutboxRecord, normalized_event_id) is not None:
+            return False
+        self.session.add(
+            ResolutionOutboxRecord(
+                event_id=normalized_event_id,
+                tenant_id=require_tenant_id(tenant_id, source="resolution outbox"),
+                aggregate_id=self._require("outbox.aggregate_id", aggregate_id),
+                topic=self._require("outbox.topic", topic),
+                partition_key=self._require("outbox.partition_key", partition_key),
+                payload=payload,
+                status="pending",
+                attempts=0,
+                next_attempt_at=utc_now() + timedelta(seconds=max(0.0, float(available_after_seconds))),
+            )
+        )
+        await self.session.flush()
+        return True
 
     async def create_human_evidence_request(
         self, *, tenant_id: str, incident_id: UUID | str, requirement_id: UUID | str,

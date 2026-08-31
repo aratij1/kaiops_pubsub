@@ -110,6 +110,23 @@ async def _seed_pair(
 
 
 @pytest.mark.asyncio
+async def test_next_rca_version_uses_durable_incident_history(sqlite_session_factory) -> None:
+    incident_id, alert_id = uuid4(), uuid4()
+    async with sqlite_session_factory() as session:
+        await _seed_pair(
+            session, tenant_id="tenant-a", incident_id=incident_id, alert_id=alert_id,
+            snapshot_id=uuid4(), recommendation_id=uuid4(), fingerprint="1" * 64,
+            evidence_id="evidence-v1",
+        )
+        assert await IncidentRepository(session).next_incident_rca_version(
+            tenant_id="tenant-a", incident_id=incident_id,
+        ) == 2
+        assert await IncidentRepository(session).next_incident_rca_version(
+            tenant_id="tenant-a", incident_id=uuid4(),
+        ) == 1
+
+
+@pytest.mark.asyncio
 async def test_bound_recommendation_keeps_its_snapshot_when_a_newer_snapshot_exists(
     sqlite_session_factory,
 ) -> None:

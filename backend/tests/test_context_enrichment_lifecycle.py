@@ -56,14 +56,22 @@ async def test_missing_automatic_evidence_creates_idempotent_enrichment_jobs(
 
     async with sqlite_session_factory() as session:
         repo = ContextEnrichmentRepository(session)
-        claimed = await repo.claim_context_enrichment_jobs(limit=1)
+        claimed = await repo.claim_context_enrichment_jobs(worker_id="worker-a", limit=1)
         assert claimed[0]["job_id"] == str(job_id)
         assert claimed[0]["attempt_count"] == 1
-        await repo.finish_context_enrichment_job(job_id=job_id, collected=True)
+        assert claimed[0]["lease_owner"] == "worker-a"
+        with pytest.raises(RuntimeError, match="lease is not owned"):
+            await repo.finish_context_enrichment_job(
+                job_id=job_id, worker_id="worker-b", collected=True,
+            )
+        await repo.finish_context_enrichment_job(
+            job_id=job_id, worker_id="worker-a", collected=True,
+        )
         activity = await repo.list_context_enrichment_activity(
             tenant_id="tenant-a", incident_id=incident_id,
         )
         assert activity["jobs"][0]["status"] == "collected"
+        assert activity["jobs"][0]["lease_owner"] is None
 
 
 @pytest.mark.asyncio

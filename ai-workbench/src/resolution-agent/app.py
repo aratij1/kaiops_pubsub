@@ -355,6 +355,19 @@ def bind_context_to_snapshot(context: Context, *, snapshot: Any) -> Context:
     return context.model_copy(update={"metadata": metadata})
 
 
+async def _bind_next_rca_version(context: Context) -> Context:
+    """Bind regeneration to the next version in durable incident history."""
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        return context
+    async with app.state.session_factory() as session:
+        version = await IncidentRepository(session).next_incident_rca_version(
+            tenant_id=context.tenant_id, incident_id=context.incident_id,
+        )
+    metadata = dict(context.metadata) if isinstance(context.metadata, dict) else {}
+    metadata["rca_version"] = version
+    return context.model_copy(update={"metadata": metadata})
+
+
 def _validate_recommendation_snapshot_evidence(recommendation: Recommendation, snapshot: Any) -> None:
     metadata = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
     evidence_ids = metadata.get("evidence_ids")
@@ -1235,6 +1248,7 @@ async def startup(app: FastAPI) -> None:
         context = Context.model_validate(payload["context"])
         incident = Incident.model_validate(payload["incident"])
         initial_snapshot = await _require_context_snapshot_binding(context)
+        context = await _bind_next_rca_version(context)
         decision_payload = payload.get("decision", {}) if isinstance(payload.get("decision"), dict) else {}
         investigated_context, investigation_report = await investigate_context(context)
         final_snapshot = await persist_final_investigation_snapshot(
@@ -1695,6 +1709,7 @@ async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, An
 @app.post("/resolve", response_model=Recommendation)
 async def resolve(context: Context, publish_events: bool = True) -> Recommendation:
     initial_snapshot = await _require_context_snapshot_binding(context)
+    context = await _bind_next_rca_version(context)
     investigated_context, investigation_report = await investigate_context(context)
     final_snapshot = await persist_final_investigation_snapshot(
         investigated_context, investigation_report, initial_snapshot["snapshot_id"],
