@@ -57,6 +57,7 @@ function incident(overrides = {}) {
         expected_duration: "3 minutes",
         rollback: "automatic",
         execution_plan: {
+          execution_ready: true,
           target: "checkout-api production",
           strategy: "canary",
           expected_duration: "3 minutes",
