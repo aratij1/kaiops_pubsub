@@ -3,9 +3,13 @@ from uuid import uuid4
 
 import pytest
 from ai_workbench_common.models import Context
-from common.context_enrichment_contract import EvidenceRequirement, HitlRoutingConfiguration
+from common.context_enrichment_contract import (
+    EvidenceRequirement,
+    HitlRoutingConfiguration,
+    validate_enrichment_observation,
+)
 from common.database import ContextSnapshotRecord, IncidentInvestigationBindingRecord
-from common.models import Alert, AlertSeverity
+from common.models import Alert, AlertSeverity, Incident
 from common.repository import ContextEnrichmentRepository
 from context_agent.connectors import execute_enrichment_plan
 from context_agent.context_quality import plan_missing_evidence
@@ -19,6 +23,49 @@ def context_for(incident_id, *, tenant_id="tenant-a") -> Context:
         description="p99 latency is above threshold",
     )
     return Context(tenant_id=tenant_id, incident_id=incident_id, alert=alert)
+
+
+def test_trace_gap_rejects_metric_only_observation() -> None:
+    incident_id = uuid4()
+    context = context_for(incident_id)
+    now = datetime.now(UTC)
+    requirement = EvidenceRequirement(
+        requirement_id=uuid4(), tenant_id="tenant-a", incident_id=incident_id,
+        rca_version=1, category="traces", question="Which span failed?", reason="Test the causal path",
+        priority="high", collection_mode="automatic", candidate_connectors=["jaeger"],
+        created_at=now, updated_at=now,
+    )
+    result = validate_enrichment_observation(
+        requirement, "jaeger", {
+            "evidence": [{"category": "metrics", "metric_name": "latency", "value": 4,
+                          "source_uri": "prometheus://latency", "collected_at": now.isoformat()}],
+        }, Incident(id=incident_id, tenant_id="tenant-a", service="checkout-api", title="test"),
+        context.alert, now,
+    )
+    assert result.accepted is False
+    assert "does not match traces" in result.rejection_reasons[0]
+
+
+def test_trace_gap_accepts_attributable_trace_and_redacts_secrets() -> None:
+    incident_id = uuid4()
+    context = context_for(incident_id)
+    now = datetime.now(UTC)
+    requirement = EvidenceRequirement(
+        requirement_id=uuid4(), tenant_id="tenant-a", incident_id=incident_id,
+        rca_version=1, category="traces", question="Which span failed?", reason="Test the causal path",
+        priority="high", collection_mode="automatic", candidate_connectors=["jaeger"],
+        created_at=now, updated_at=now,
+    )
+    result = validate_enrichment_observation(
+        requirement, "jaeger", {"spans": [{
+            "category": "traces", "trace_id": "trace-1", "span_id": "span-1",
+            "service": "checkout-api", "tenant_id": "tenant-a", "timestamp": now.isoformat(),
+            "source_uri": "jaeger://trace/trace-1", "token": "do-not-persist",
+        }]}, Incident(id=incident_id, tenant_id="tenant-a", service="checkout-api", title="test"), context.alert, now,
+    )
+    assert result.accepted is True
+    assert result.accepted_evidence[0]["token"] == "[REDACTED]"
+    assert result.accepted_evidence[0]["category"] == "traces"
 
 
 @pytest.mark.asyncio
