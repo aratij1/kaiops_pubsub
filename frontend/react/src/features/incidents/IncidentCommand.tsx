@@ -120,6 +120,7 @@ export default function IncidentCommand() {
   const incidents = useRouteRuntimeSlice("incidents");
   const approvals = useRouteRuntimeSlice("approvals");
   const session = useRouteRuntimeSlice("session");
+  const [backendReleaseSha, setBackendReleaseSha] = useState("");
   const [approvalExpanded, setApprovalExpanded] = useState(false);
   const [directRequestVersion, setDirectRequestVersion] = useState(0);
   const [directIncident, setDirectIncident] = useState<{
@@ -128,6 +129,25 @@ export default function IncidentCommand() {
     row: IncidentRow | null;
     error: string;
   }>({ loading: false, loaded: false, row: null, error: "" });
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const loadRelease = async () => {
+      try {
+        const response = await fetch("/api-gateway/build-info", {
+          headers: session.accessToken ? { Authorization: `Bearer ${session.accessToken}`, Accept: "application/json" } : { Accept: "application/json" },
+          signal: controller.signal,
+        });
+        if (!response.ok) return;
+        const payload = record(await response.json() as unknown);
+        setBackendReleaseSha(text(payload.release_sha));
+      } catch (reason) {
+        if ((reason as Error)?.name !== "AbortError") setBackendReleaseSha("");
+      }
+    };
+    void loadRelease();
+    return () => controller.abort();
+  }, [session.accessToken]);
 
   const requestedIncidentId = useMemo(() => decodeURIComponent(routeIncidentId).trim(), [routeIncidentId]);
   const scopedRow = useMemo(() => incidents.rows.find((candidate) => incidentId(candidate).toLowerCase() === requestedIncidentId.toLowerCase()), [incidents.rows, requestedIncidentId]);
@@ -354,6 +374,6 @@ export default function IncidentCommand() {
       </aside>
     </div>
 
-    <footer className="ic-truth-note"><ShieldCheck aria-hidden="true" /><span><strong>Operational truth policy:</strong> unavailable backend fields stay unavailable. KaiMS does not invent confidence, execution progress, safety controls, or recovery results. <small>Release {RELEASE_SHA.slice(0, 12)}</small></span><button type="button" onClick={() => { incidents.refresh(); setDirectRequestVersion((version) => version + 1); }}><RefreshCw aria-hidden="true" /> Refresh incident</button></footer>
+    <footer className="ic-truth-note"><ShieldCheck aria-hidden="true" /><span><strong>Operational truth policy:</strong> unavailable backend fields stay unavailable. KaiMS does not invent confidence, execution progress, safety controls, or recovery results. <small>UI {RELEASE_SHA.slice(0, 12)} · Gateway {backendReleaseSha ? backendReleaseSha.slice(0, 12) : "unavailable"}</small></span><button type="button" onClick={() => { incidents.refresh(); setDirectRequestVersion((version) => version + 1); }}><RefreshCw aria-hidden="true" /> Refresh incident</button></footer>
   </article>;
 }

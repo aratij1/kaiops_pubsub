@@ -2227,8 +2227,9 @@ async def incident_operations_state(incident_id: str, tenant_id: str) -> dict[st
         **state,
         "release": {
             "release_sha": os.getenv("KAIMS_RELEASE_SHA", "dev"),
-            "schema_version": "20260919",
-            "contract_version": state["schema_version"],
+            "schema_version": "20260923_schema_migration_checksums",
+            "contract_version": "kaiops.incident-operations.v1",
+            "build_time": os.getenv("KAIMS_BUILD_TIME", "unknown"),
         },
     }
 

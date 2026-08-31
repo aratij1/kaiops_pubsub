@@ -1,5 +1,10 @@
 FROM node:20-alpine AS build
 ARG KAIMS_RELEASE_SHA=dev
+ARG KAIMS_BUILD_TIME=unknown
+ARG KAIMS_REQUIRE_RELEASE_PROVENANCE=false
+RUN if [ "$KAIMS_REQUIRE_RELEASE_PROVENANCE" = "true" ]; then \
+      echo "$KAIMS_RELEASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; \
+    fi
 ENV VITE_KAIMS_RELEASE_SHA=${KAIMS_RELEASE_SHA}
 WORKDIR /app
 ENV NODE_OPTIONS=--max-old-space-size=1536
@@ -8,8 +13,19 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     npm ci --no-audit --no-fund
 COPY frontend/react/ .
 RUN npm run build && npm run check:bundle
+RUN printf '%s\n' \
+  '{' \
+  '  "release_sha": "'"${KAIMS_RELEASE_SHA}"'",' \
+  '  "schema_version": "20260923_schema_migration_checksums",' \
+  '  "contract_version": "kaiops.incident-operations.v1",' \
+  '  "build_time": "'"${KAIMS_BUILD_TIME}"'"' \
+  '}' > dist/build-info.json
 
 FROM nginx:1.27-alpine
+ARG KAIMS_RELEASE_SHA=dev
+ARG KAIMS_BUILD_TIME=unknown
+LABEL org.opencontainers.image.revision=${KAIMS_RELEASE_SHA} \
+      org.opencontainers.image.created=${KAIMS_BUILD_TIME}
 COPY frontend/react/nginx/default.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=6 \

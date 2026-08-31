@@ -27,6 +27,7 @@ _OMIT_HTTP_REQUEST_BODY_PATHS = {
     "/api/v1/alerts/prometheus",
 }
 _MASKED_VALUE = "***"
+_INCIDENT_CONTRACT_VERSION = "kaiops.incident-operations.v1"
 _SENSITIVE_KEYS = {
     "password",
     "token",
@@ -87,11 +88,29 @@ def create_app(
     configure_logging(settings.service_name)
     logger = logging.getLogger(settings.service_name)
 
+    def provenance() -> dict[str, str]:
+        compatibility = getattr(app.state, "schema_compatibility", {}) or {}
+        return {
+            "release_sha": os.getenv("KAIMS_RELEASE_SHA", "dev"),
+            "schema_version": compatibility.get("schema_version", current_schema_version()),
+            "contract_version": _INCIDENT_CONTRACT_VERSION,
+            "build_time": os.getenv("KAIMS_BUILD_TIME", "unknown"),
+        }
+
+    def require_release_provenance() -> None:
+        required = os.getenv("KAIMS_REQUIRE_RELEASE_PROVENANCE", "false").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        release_sha = os.getenv("KAIMS_RELEASE_SHA", "dev").strip().lower()
+        if required and (len(release_sha) != 40 or any(char not in "0123456789abcdef" for char in release_sha)):
+            raise RuntimeError("full Git release SHA is required")
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.settings = settings
         app.state.producer = build_event_publisher(settings)
         try:
+            require_release_provenance()
             await app.state.producer.start()
             if settings.database_enabled:
                 app.state.db_engine = create_engine(settings)
@@ -184,18 +203,14 @@ def create_app(
     @app.get("/build-info")
     async def build_info() -> dict[str, Any]:
         """Expose safe release provenance and public contract compatibility."""
-        return {
-            "service": settings.service_name,
-            "release_sha": os.getenv("KAIMS_RELEASE_SHA", "dev"),
-            "build_time": os.getenv("KAIMS_BUILD_TIME", "unknown"),
-            "schema_version": (
-                getattr(app.state, "schema_compatibility", {}) or {}
-            ).get("schema_version", current_schema_version()),
-            "contract_versions": {"context_enrichment": "kaiops.context-enrichment.v1"},
-        }
+        return provenance()
 
     @app.get("/readyz")
     async def readyz() -> dict[str, str]:
+        try:
+            require_release_provenance()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail="release provenance is not ready") from exc
         if settings.database_enabled:
             engine = getattr(app.state, "db_engine", None)
             if engine is None:

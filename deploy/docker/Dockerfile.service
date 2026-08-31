@@ -28,7 +28,14 @@ COPY ai-workbench/src ./ai-workbench/src
 
 ARG KAIMS_RELEASE_SHA=dev
 ARG KAIMS_BUILD_TIME=unknown
+ARG KAIMS_REQUIRE_RELEASE_PROVENANCE=false
+RUN if [ "$KAIMS_REQUIRE_RELEASE_PROVENANCE" = "true" ]; then \
+      echo "$KAIMS_RELEASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; \
+    fi
 ENV KAIMS_RELEASE_SHA=${KAIMS_RELEASE_SHA} \
-    KAIMS_BUILD_TIME=${KAIMS_BUILD_TIME}
+    KAIMS_BUILD_TIME=${KAIMS_BUILD_TIME} \
+    KAIMS_REQUIRE_RELEASE_PROVENANCE=${KAIMS_REQUIRE_RELEASE_PROVENANCE}
+LABEL org.opencontainers.image.revision=${KAIMS_RELEASE_SHA} \
+      org.opencontainers.image.created=${KAIMS_BUILD_TIME}
 
 EXPOSE 8000

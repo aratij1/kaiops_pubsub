@@ -83,16 +83,25 @@ def test_structured_conflict_can_be_declared_retryable() -> None:
 
 
 def test_build_info_exposes_safe_release_contract(monkeypatch) -> None:
-    monkeypatch.setenv("KAIMS_RELEASE_SHA", "abc123")
+    monkeypatch.setenv("KAIMS_RELEASE_SHA", "a" * 40)
     monkeypatch.setenv("KAIMS_BUILD_TIME", "2026-08-31T11:00:00Z")
 
     response = TestClient(error_contract_app()).get("/build-info")
 
     assert response.status_code == 200
     assert response.json() == {
-        "service": "error-contract-test",
-            "release_sha": "abc123",
-            "build_time": "2026-08-31T11:00:00Z",
-            "schema_version": "20260923_schema_migration_checksums",
-            "contract_versions": {"context_enrichment": "kaiops.context-enrichment.v1"},
+        "release_sha": "a" * 40,
+        "schema_version": "20260923_schema_migration_checksums",
+        "contract_version": "kaiops.incident-operations.v1",
+        "build_time": "2026-08-31T11:00:00Z",
     }
+
+
+def test_readiness_rejects_missing_required_release_sha(monkeypatch) -> None:
+    monkeypatch.setenv("KAIMS_RELEASE_SHA", "dev")
+    monkeypatch.setenv("KAIMS_REQUIRE_RELEASE_PROVENANCE", "true")
+
+    response = TestClient(error_contract_app()).get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "release provenance is not ready"

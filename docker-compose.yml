@@ -1,6 +1,7 @@
 x-service-env: &service-env
   KAIMS_RELEASE_SHA: ${KAIMS_RELEASE_SHA:-dev}
   KAIMS_BUILD_TIME: ${KAIMS_BUILD_TIME:-unknown}
+  KAIMS_REQUIRE_RELEASE_PROVENANCE: ${KAIMS_REQUIRE_RELEASE_PROVENANCE:-false}
   CLOUD_PROVIDER: ${CLOUD_PROVIDER:-cloud-neutral}
   DEPLOYMENT_PROFILE: ${DEPLOYMENT_PROFILE:-cloud-neutral}
   CONNECTION_CONFIG_PATH: ${CONNECTION_CONFIG_PATH:-backend/config/kaiops-connections.json}
@@ -250,6 +251,7 @@ x-service-build: &service-build
   args:
     KAIMS_RELEASE_SHA: ${KAIMS_RELEASE_SHA:-dev}
     KAIMS_BUILD_TIME: ${KAIMS_BUILD_TIME:-unknown}
+    KAIMS_REQUIRE_RELEASE_PROVENANCE: ${KAIMS_REQUIRE_RELEASE_PROVENANCE:-false}
 
 services:
   mysql:
@@ -1164,6 +1166,8 @@ services:
       dockerfile: deploy/docker/Dockerfile.ui
       args:
         KAIMS_RELEASE_SHA: ${KAIMS_RELEASE_SHA:-dev}
+        KAIMS_BUILD_TIME: ${KAIMS_BUILD_TIME:-unknown}
+        KAIMS_REQUIRE_RELEASE_PROVENANCE: ${KAIMS_REQUIRE_RELEASE_PROVENANCE:-false}
     # Docker Desktop's IPv6 localhost forwarder can accept connections without
     # forwarding them. Bind IPv4 explicitly so Windows falls back from ::1.
     ports: ["${UI_BIND_ADDRESS:-127.0.0.1}:${UI_HOST_PORT:-80}:80"]
