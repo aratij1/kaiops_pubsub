@@ -112,6 +112,7 @@ pythonpath = [
     "backend/src/application-onboarding",
     "backend/src/alert-intelligence",
     "backend/src/cloud-operations",
+    "backend/src/connector-hub",
     "ai-workbench/src/context-agent",
     "backend/src/dashboard-generator",
     "backend/src/discovery-service",

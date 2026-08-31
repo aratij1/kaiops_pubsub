@@ -3841,7 +3841,10 @@ async def post_incident_context_gap_response(
 ) -> dict[str, Any]:
     auth = getattr(request.state, "auth", None)
     if auth is None:
-        raise HTTPException(status_code=401, detail="Authentication is required")
+        # Local/demo mode bypasses the global operational-auth middleware, but
+        # governed evidence mutations still require a validated server-side
+        # identity just like approval mutations do.
+        auth = await _auth_context_from_request(request)
     responder_id = str(auth.email or auth.username or auth.user_id)
     governed_payload = {
         **payload,
